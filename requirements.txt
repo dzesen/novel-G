@@ -1,0 +1,6 @@
+typing_extensions
+langchain-openai
+langgraph
+openai
+chromadb
+langchain-community

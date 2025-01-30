@@ -1,5 +1,8 @@
-/__pycache__
 /Novel_Src
 /vectorstore
 /.conda
+/build
+/dist
+/.vscode
+__pycache__
 config.json
