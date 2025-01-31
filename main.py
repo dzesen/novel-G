@@ -5,7 +5,7 @@ from ui import NovelGeneratorGUI
 
 def main():
     root = tk.Tk()
-    root.title("Novel Generator - Innovative Flow")
+    root.title("Novel Generator")
     app = NovelGeneratorGUI(root)
     root.mainloop()
 
