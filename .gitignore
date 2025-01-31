@@ -1,8 +1,8 @@
 /Novel_Src
-/vectorstore
-/.conda
+/.venv
 /build
 /dist
 /.vscode
 /__pycache__
+/vectorstore
 config.json
