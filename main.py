@@ -1,3 +1,5 @@
+# main.py
+# -*- coding: utf-8 -*-
 import tkinter as tk
 from ui import NovelGeneratorGUI
 
