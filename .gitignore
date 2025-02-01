@@ -4,5 +4,6 @@
 /dist
 /.vscode
 /__pycache__
+/markdown
 /vectorstore
 config.json
