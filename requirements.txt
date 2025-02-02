@@ -1,6 +1,7 @@
 typing_extensions
 langchain-openai
 langgraph
+customtkinter
 openai
 chromadb
 langchain-community
