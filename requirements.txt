@@ -5,6 +5,7 @@ customtkinter
 openai
 chromadb
 langchain-community
+langchain_chroma
 sentence_transformers
 scikit-learn
 nltk
