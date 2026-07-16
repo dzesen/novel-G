@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 
 from google import genai
 from google.genai import types
@@ -197,7 +197,11 @@ class GeminiClient(BaseLLMClient):
         log_llm_response(result)
         return result
 
-    async def stream_text(self, request: LLMRequest) -> AsyncGenerator[str, None]:
+    async def stream_text(
+        self,
+        request: LLMRequest,
+        usage_sink: Callable[[TokenUsage], None] | None = None,
+    ) -> AsyncGenerator[str, None]:
         """流式调用 Gemini API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
@@ -211,13 +215,23 @@ class GeminiClient(BaseLLMClient):
                 config=self._build_config(request),
             )
 
+            # Gemini 把累计用量挂在每个 chunk 上，末块最全，故边流边留最后一个非空值。
+            latest_usage: TokenUsage | None = None
+
             async def raw_chunks() -> AsyncGenerator[str, None]:
+                nonlocal latest_usage
                 async for chunk in stream:
+                    metadata = getattr(chunk, "usage_metadata", None)
+                    if metadata is not None:
+                        latest_usage = self._extract_usage(metadata)
                     if chunk.text:
                         yield chunk.text
 
             async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
                 yield clean_chunk
+
+            if usage_sink is not None and latest_usage is not None:
+                usage_sink(latest_usage)
         except Exception as exc:
             mapped = self._map_error(exc, model)
             log_llm_error(mapped, provider=self.provider_name, model=model)

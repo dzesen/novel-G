@@ -35,6 +35,10 @@ llm:
       supports_streaming: true
       supports_json_schema: true
       supports_function_calling: true
+      # 流式响应是否回报 token 用量（仅 openai 类型需要）。开启后请求会带
+      # stream_options={"include_usage": true}，官方 API 支持；若把 base_url
+      # 改指到不认该参数的第三方兼容端点，需改回 false。
+      supports_stream_usage: true
       # 生成参数默认值（可选，不设置则由模型自行决定）
       # temperature: 0.7
       # top_p: 0.9
@@ -55,6 +59,9 @@ llm:
       supports_streaming: true
       supports_json_schema: true
       supports_function_calling: true
+      # 第三方兼容端点默认关闭：不确认支持 stream_options 就发，会打断本来能跑的流式。
+      # 确认端点支持后改 true，即可统计流式 token 用量。
+      supports_stream_usage: false
     gemini_flash:
       type: gemini
       base_url: ""

@@ -12,7 +12,7 @@ from weakref import WeakKeyDictionary
 from pydantic import BaseModel
 
 from backend.llm.factory import create_llm_client
-from backend.llm.models import LLMRequest, LLMResponse
+from backend.llm.models import LLMRequest, LLMResponse, TokenUsage
 
 
 _limiter_lock = Lock()
@@ -51,6 +51,12 @@ class LLMService:
 
     将底层客户端的请求构造、日志记录等细节隐藏，
     对外暴露 generate_text / generate_structured / stream_text 三个简洁方法。
+
+    三个方法均记录 token 用量，调用后可经 last_usage / total_usage 读取。
+    正文生成是烧钱大户，用量若不透传，用户跑完一本书也不知道花了多少。
+
+    **并发约束**：用量记在实例上，因此单个实例不可并发复用——两个并发调用会
+    互相覆盖 last_usage。当前每个工作流步骤各建一个实例，天然满足该约束。
     """
 
     def __init__(self, provider_name: str | None = None, timeout_seconds: int | None = None) -> None:
@@ -58,6 +64,31 @@ class LLMService:
         self._provider_name = getattr(self._client, "provider_name", provider_name or "default")
         client_config = getattr(self._client, "config", None)
         self._max_concurrency = int(getattr(client_config, "max_concurrency", 0))
+        self._last_usage = TokenUsage()
+        self._total_usage = TokenUsage()
+
+    @property
+    def last_usage(self) -> TokenUsage:
+        """最近一次调用的 token 用量。
+
+        provider 不报用量时为零值——**零用量与"真的没花钱"不可区分**，这是已知取舍。
+        客户端层的 log_llm_response 仍记录真实用量，必要时可交叉核对。
+        """
+        return self._last_usage
+
+    @property
+    def total_usage(self) -> TokenUsage:
+        """本实例全部调用的累计 token 用量。"""
+        return self._total_usage
+
+    def _record_usage(self, usage: TokenUsage) -> None:
+        """记录单次用量并累加到总量。"""
+        self._last_usage = usage
+        self._total_usage = TokenUsage(
+            input_tokens=self._total_usage.input_tokens + usage.input_tokens,
+            output_tokens=self._total_usage.output_tokens + usage.output_tokens,
+            total_tokens=self._total_usage.total_tokens + usage.total_tokens,
+        )
 
     def _make_request(
         self,
@@ -79,10 +110,11 @@ class LLMService:
         system_prompt: str = "",
         **kwargs: Any,
     ) -> str:
-        """普通文本生成，返回纯文本内容。"""
+        """普通文本生成，返回纯文本内容；用量见 last_usage。"""
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.text_generate(request)
+        self._record_usage(response.usage)
         return response.content
 
     async def generate_structured(
@@ -92,10 +124,11 @@ class LLMService:
         system_prompt: str = "",
         **kwargs: Any,
     ) -> BaseModel:
-        """结构化生成，返回解析后的 Pydantic 模型实例。"""
+        """结构化生成，返回解析后的 Pydantic 模型实例；用量见 last_usage。"""
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.schema_generate(request, schema)
+        self._record_usage(response.usage)
         return schema.model_validate(json.loads(response.content))
 
     async def stream_text(
@@ -104,8 +137,12 @@ class LLMService:
         system_prompt: str = "",
         **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        """流式文本生成，逐块 yield 文本片段。"""
+        """流式文本生成，逐块 yield 文本片段。
+
+        用量只在流末尾到达，故 last_usage 需在生成器耗尽后读取；
+        中途 break 或 provider 不报用量时，它保持零值。
+        """
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
-            async for chunk in self._client.stream_text(request):
+            async for chunk in self._client.stream_text(request, usage_sink=self._record_usage):
                 yield chunk

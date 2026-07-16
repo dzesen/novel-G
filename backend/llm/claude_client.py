@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 
 import anthropic
 from anthropic import AsyncAnthropic
@@ -22,6 +23,8 @@ from backend.llm.exceptions import (
 )
 from backend.llm.logger import log_llm_error, log_llm_request, log_llm_response
 from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
+
+logger = logging.getLogger(__name__)
 
 
 def _pydantic_to_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
@@ -226,7 +229,11 @@ class ClaudeClient(BaseLLMClient):
         log_llm_response(result)
         return result
 
-    async def stream_text(self, request: LLMRequest) -> AsyncGenerator[str, None]:
+    async def stream_text(
+        self,
+        request: LLMRequest,
+        usage_sink: Callable[[TokenUsage], None] | None = None,
+    ) -> AsyncGenerator[str, None]:
         """流式调用 Claude Messages API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
@@ -243,10 +250,27 @@ class ClaudeClient(BaseLLMClient):
 
                 async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
                     yield clean_chunk
+
+                # 流尽后 SDK 已聚合出完整消息，用量在其中；无需额外请求参数。
+                if usage_sink is not None:
+                    await self._emit_stream_usage(stream, usage_sink)
         except Exception as exc:
             mapped = self._map_error(exc, model)
             log_llm_error(mapped, provider=self.provider_name, model=model)
             raise mapped from exc
+
+    async def _emit_stream_usage(
+        self,
+        stream: Any,
+        usage_sink: Callable[[TokenUsage], None],
+    ) -> None:
+        """尽力回报流式用量：拿不到就静默放弃，绝不让计量问题打断已成功的生成。"""
+        try:
+            final_message = await stream.get_final_message()
+        except Exception:
+            logger.warning("Claude 流式用量获取失败，本次调用按零用量计。", exc_info=True)
+            return
+        usage_sink(self._extract_usage(getattr(final_message, "usage", None)))
 
     async def function_call_probe(
         self,

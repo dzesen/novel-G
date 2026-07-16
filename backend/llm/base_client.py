@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 
 from pydantic import BaseModel
 
 from backend.llm.config import LLMProviderConfig
-from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse
+from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
 
 
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -245,8 +245,19 @@ class BaseLLMClient(ABC):
         """结构化 JSON 输出，按 Pydantic Schema 约束生成。"""
 
     @abstractmethod
-    async def stream_text(self, request: LLMRequest) -> AsyncGenerator[str, None]:
-        """流式文本输出，逐块 yield 生成内容。"""
+    async def stream_text(
+        self,
+        request: LLMRequest,
+        usage_sink: Callable[[TokenUsage], None] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """流式文本输出，逐块 yield 生成内容。
+
+        Args:
+            request: LLM 请求。
+            usage_sink: 可选回调，拿到 token 用量时调用一次。用量只在流末尾到达，
+                无法随返回值给出，故以回调回传。**尽力而为**：provider 不报用量时
+                不调用，调用方据此降级为零值，绝不可因此中断生成。
+        """
 
     @abstractmethod
     async def function_call_probe(

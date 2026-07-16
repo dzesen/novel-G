@@ -30,6 +30,14 @@ class LLMProviderConfig(BaseModel):
     use_system_proxy: bool = Field(default=False, description="是否允许 SDK 读取系统代理配置")
     supports_streaming: bool = Field(default=True, description="是否支持流式输出")
     supports_json_schema: bool = Field(default=False, description="是否支持 JSON Schema 输出")
+    supports_stream_usage: bool = Field(
+        default=False,
+        description=(
+            "流式响应是否回报 token 用量。仅 OpenAI 兼容端点需要：开启后请求会带 "
+            "stream_options={'include_usage': True}。默认关闭，因为部分第三方兼容端点"
+            "会拒绝该参数，无脑发送会打断今天能跑的 provider。Claude / Gemini 无需此开关。"
+        ),
+    )
     supports_function_calling: bool = Field(default=False, description="是否支持 function calling")
 
     # 生成参数默认值（请求未指定时使用，请求级别优先）

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import json
 import re
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import openai
@@ -243,7 +243,11 @@ class OpenAICompatibleClient(BaseLLMClient):
         log_llm_response(result)
         return result
 
-    async def stream_text(self, request: LLMRequest) -> AsyncGenerator[str, None]:
+    async def stream_text(
+        self,
+        request: LLMRequest,
+        usage_sink: Callable[[TokenUsage], None] | None = None,
+    ) -> AsyncGenerator[str, None]:
         """流式调用 Chat Completions API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
@@ -253,15 +257,29 @@ class OpenAICompatibleClient(BaseLLMClient):
         try:
             params = self._build_params(request)
             params["stream"] = True
+            # 不发 stream_options，API 就不会回报用量。默认关闭：部分第三方兼容端点
+            # 会拒绝该参数，无脑发送会打断今天能跑的 provider。
+            want_usage = usage_sink is not None and self.config.supports_stream_usage
+            if want_usage:
+                params["stream_options"] = {"include_usage": True}
             stream = await self._client.chat.completions.create(**params)
 
+            latest_usage: TokenUsage | None = None
+
             async def raw_chunks() -> AsyncGenerator[str, None]:
+                nonlocal latest_usage
                 async for chunk in stream:
+                    # 用量块的 choices 为空，与正文块互斥，必须先于 choices 判断取用。
+                    if getattr(chunk, "usage", None) is not None:
+                        latest_usage = self._extract_usage(chunk.usage)
                     if chunk.choices and chunk.choices[0].delta.content:
                         yield chunk.choices[0].delta.content
 
             async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
                 yield clean_chunk
+
+            if usage_sink is not None and latest_usage is not None:
+                usage_sink(latest_usage)
         except Exception as exc:
             mapped = self._map_error(exc, model)
             log_llm_error(mapped, provider=self.provider_name, model=model)
