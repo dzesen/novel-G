@@ -76,10 +76,16 @@ class VolumeService:
     async def update_volume_stats(
         volume_id: str,
         arcs_count_delta: int = 0,
-        word_count_delta: int = 0
+        word_count_delta: int = 0,
+        chapter_count_delta: int = 0,
     ) -> bool:
         """更新卷统计（由下级 arcs 增删时回调使用）。"""
-        return await volume_repo.update_volume_stats(volume_id, arcs_count_delta, word_count_delta)
+        return await volume_repo.update_volume_stats(
+            volume_id,
+            arcs_count_delta,
+            word_count_delta,
+            chapter_count_delta,
+        )
 
     # 软删除（级联） 
 
@@ -104,15 +110,37 @@ class VolumeService:
 
             obj_id = to_object_id(volume_id)
             arcs_repo = BaseRepository("arcs")
+            chapters_repo = BaseRepository("chapters")
+            active_chapter_count = await chapters_repo.count_documents(
+                {"volume_id": obj_id},
+                session=session,
+            )
             arcs_deleted = await arcs_repo.update_many(
                 {"volume_id": obj_id},
-                {"is_deleted": True, "deleted_at": get_utc_now()},
+                {
+                    "is_deleted": True,
+                    "deleted_at": get_utc_now(),
+                    "deleted_with_volume_id": obj_id,
+                },
                 include_deleted=False,
                 session=session,
             )
             logger.info(f"级联软删除卷 {volume_id} 下 {arcs_deleted} 个 arcs")
+            chapters_deleted = await chapters_repo.update_many(
+                {"volume_id": obj_id},
+                {
+                    "is_deleted": True,
+                    "deleted_at": get_utc_now(),
+                    "deleted_with_volume_id": obj_id,
+                },
+                include_deleted=False,
+                session=session,
+            )
+            logger.info("级联软删除卷 %s 下 %s 个 chapters", volume_id, chapters_deleted)
 
             stats_delta = {"current_volume_count": -1}
+            if active_chapter_count > 0:
+                stats_delta["current_chapter_count"] = -active_chapter_count
             if volume_word_count > 0:
                 stats_delta["current_word_count"] = -volume_word_count
             await novel_repo.increment_novel_stats(novel_id, stats_delta, session=session)
@@ -146,15 +174,33 @@ class VolumeService:
                 return False
 
             arcs_repo = BaseRepository("arcs")
+            chapters_repo = BaseRepository("chapters")
             arcs_restored = await arcs_repo.update_many(
-                {"volume_id": obj_id, "is_deleted": True},
-                {"is_deleted": False, "deleted_at": None},
+                {"volume_id": obj_id, "deleted_with_volume_id": obj_id},
+                {
+                    "is_deleted": False,
+                    "deleted_at": None,
+                    "deleted_with_volume_id": None,
+                },
                 include_deleted=True,
                 session=session,
             )
             logger.info(f"级联恢复卷 {volume_id} 下 {arcs_restored} 个 arcs")
+            chapters_restored = await chapters_repo.update_many(
+                {"volume_id": obj_id, "deleted_with_volume_id": obj_id},
+                {
+                    "is_deleted": False,
+                    "deleted_at": None,
+                    "deleted_with_volume_id": None,
+                },
+                include_deleted=True,
+                session=session,
+            )
+            logger.info("级联恢复卷 %s 下 %s 个 chapters", volume_id, chapters_restored)
 
             stats_delta = {"current_volume_count": 1}
+            if chapters_restored > 0:
+                stats_delta["current_chapter_count"] = chapters_restored
             if volume_word_count > 0:
                 stats_delta["current_word_count"] = volume_word_count
             await novel_repo.increment_novel_stats(novel_id, stats_delta, session=session)
@@ -187,7 +233,12 @@ class VolumeService:
             stats = {}
 
             arcs_repo = BaseRepository("arcs")
+            chapters_repo = BaseRepository("chapters")
             stats["arcs_deleted"] = await arcs_repo.hard_delete_many({"volume_id": obj_id}, session=session)
+            stats["chapters_deleted"] = await chapters_repo.hard_delete_many(
+                {"volume_id": obj_id},
+                session=session,
+            )
 
             volume_deleted = await volume_repo.hard_delete_volume(volume_id, session=session)
             stats["volume_deleted"] = 1 if volume_deleted else 0

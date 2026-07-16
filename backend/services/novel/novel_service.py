@@ -44,16 +44,20 @@ class NovelService:
             query = {"novel_id": obj_id}
 
             volumes_repo = BaseRepository("volumes")
+            arcs_repo = BaseRepository("arcs")
             chapters_repo = BaseRepository("chapters")
             outlines_repo = BaseRepository("outlines")
             tasks_repo = BaseRepository("generation_tasks")
             memories_repo = BaseRepository("memory_fragments")
             factions_repo = BaseRepository("factions")
             faction_relations_repo = BaseRepository("faction_relations")
+            characters_repo = BaseRepository("characters")
+            worldbook_repo = BaseRepository("worldbook")
 
             stats = {}
 
             # 这些集合当前有的还是空仓储，统一按 novel_id 清理即可。
+            stats["arcs_deleted"] = await arcs_repo.hard_delete_many(query, session=session)
             stats["volumes_deleted"] = await volumes_repo.hard_delete_many(query, session=session)
             stats["chapters_deleted"] = await chapters_repo.hard_delete_many(query, session=session)
             stats["outlines_deleted"] = await outlines_repo.hard_delete_many(query, session=session)
@@ -61,6 +65,8 @@ class NovelService:
             stats["memories_deleted"] = await memories_repo.hard_delete_many(query, session=session)
             stats["faction_relations_deleted"] = await faction_relations_repo.hard_delete_many(query, session=session)
             stats["factions_deleted"] = await factions_repo.hard_delete_many(query, session=session)
+            stats["characters_deleted"] = await characters_repo.hard_delete_many(query, session=session)
+            stats["worldbook_deleted"] = await worldbook_repo.hard_delete_many(query, session=session)
 
             novel_deleted = await novel_repo.hard_delete_one({"_id": obj_id}, session=session)
             stats["novel_deleted"] = 1 if novel_deleted else 0

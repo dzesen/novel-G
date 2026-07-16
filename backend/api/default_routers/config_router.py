@@ -1,8 +1,9 @@
+import logging
 from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException
 
-from backend.config.config import get_all_config, update_config
+from backend.config.config import get_all_config, replace_config, update_config
 from backend.db.mongo import connect_to_mongo
 from backend.services.llm.provider_test_service import (
     ProviderTestRequest,
@@ -11,6 +12,7 @@ from backend.services.llm.provider_test_service import (
 )
 
 router = APIRouter(prefix="/api/config", tags=["config"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("")
@@ -22,14 +24,30 @@ async def get_configurations():
 @router.put("")
 async def update_configurations(config_data: Dict[str, Any]):
     """更新项目配置，并在需要时刷新Mongo连接。"""
+    previous_config = get_all_config(force_reload=True)
+    config_written = False
     try:
         updated_config = update_config(config_data)
+        config_written = True
         await connect_to_mongo()
         return {"message": "Config updated", "data": updated_config}
     except ValueError as exc:
+        if config_written:
+            await _rollback_config(previous_config)
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        if config_written:
+            await _rollback_config(previous_config)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+async def _rollback_config(previous_config: Dict[str, Any]) -> None:
+    """配置保存后的连接校验失败时恢复上一份可用配置与连接。"""
+    try:
+        replace_config(previous_config)
+        await connect_to_mongo()
+    except Exception:
+        logger.exception("Failed to restore the previous configuration after validation error.")
 
 
 @router.post("/llm-providers/test", response_model=ProviderTestResponse)

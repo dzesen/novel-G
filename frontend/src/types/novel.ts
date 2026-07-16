@@ -55,6 +55,64 @@ export interface CreateNovelRequest {
   words_per_chapter?: number;
 }
 
+export type ChapterStatus = "draft" | "writing" | "completed";
+
+export interface VolumeSummary {
+  _id: string;
+  novel_id: string;
+  title: string;
+  summary: string;
+  order_index: number;
+  status: string;
+  chapter_count: number;
+  word_count: number;
+  updated_at: string;
+}
+
+export interface ChapterSummary {
+  _id: string;
+  novel_id: string;
+  volume_id: string;
+  title: string;
+  summary: string;
+  status: ChapterStatus;
+  order_index: number;
+  word_count: number;
+  is_deleted: boolean;
+  deleted_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChapterDetail extends ChapterSummary {
+  content: string;
+}
+
+export interface ChapterDraft {
+  title: string;
+  summary: string;
+  content: string;
+  status: ChapterStatus;
+}
+
+export type ReferenceCardType = "character" | "location" | "item" | "rule";
+
+export interface ReferenceCard {
+  _id: string;
+  novel_id: string;
+  card_type: ReferenceCardType;
+  name: string;
+  subtitle: string;
+  description: string;
+  details: Record<string, string>;
+  tags: string[];
+  sort_order: number;
+  is_deleted: boolean;
+  deleted_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface RewriteChatMessage {
   id: string;
   role: "user" | "assistant";

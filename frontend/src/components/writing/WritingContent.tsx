@@ -3,9 +3,11 @@
 import { useState } from "react";
 import type { WritingSidebarItem } from "@/types/novel";
 import WritingSidebar from "./WritingSidebar";
-import WritingPlaceholder from "./WritingPlaceholder";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
 import FactionCardsWorkspace from "./factions/FactionCardsWorkspace";
+import ChapterWorkspace from "./chapters/ChapterWorkspace";
+import ReferenceCardsWorkspace from "./reference-cards/ReferenceCardsWorkspace";
+import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
 
 interface WritingContentProps {
   mode: "create" | "edit";
@@ -22,7 +24,26 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     if (activeItem === "faction-cards") {
       return <FactionCardsWorkspace mode={mode} novelId={novelId} />;
     }
-    return <WritingPlaceholder moduleKey={activeItem} />;
+    if (activeItem === "chapter-editor") {
+      return <ChapterWorkspace mode={mode} novelId={novelId} />;
+    }
+    if (activeItem === "character-cards") {
+      return <ReferenceCardsWorkspace key="character" mode={mode} novelId={novelId} cardType="character" />;
+    }
+    if (activeItem === "location-cards") {
+      return <ReferenceCardsWorkspace key="location" mode={mode} novelId={novelId} cardType="location" />;
+    }
+    if (activeItem === "item-cards") {
+      return <ReferenceCardsWorkspace key="item" mode={mode} novelId={novelId} cardType="item" />;
+    }
+    if (activeItem === "rule-cards") {
+      return <ReferenceCardsWorkspace key="rule" mode={mode} novelId={novelId} cardType="rule" />;
+    }
+    if (activeItem === "relationship-map") {
+      return <RelationshipWorkspace mode={mode} novelId={novelId} />;
+    }
+    const unreachable: never = activeItem;
+    return unreachable;
   };
 
   return (

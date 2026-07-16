@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from bson import ObjectId
 from bson.errors import InvalidId

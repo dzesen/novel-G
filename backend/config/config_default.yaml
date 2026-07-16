@@ -6,6 +6,13 @@
 "mongo_timeout_ms": 5000
 "mongo_transaction_mode": "auto"
 
+# 本地自动备份：启动时若距离上次备份超过 interval_hours，则保存完整数据快照。
+backup:
+  enabled: true
+  interval_hours: 24
+  retention_count: 10
+  directory: "backups"
+
 # LLM 大模型配置
 # 每个 provider 条目的 key 是用户自定义的别名，type 指定客户端类别（openai / gemini / claude）
 # 同一个 type 可以定义多个不同别名的配置，方便在不同场景使用不同模型

@@ -11,6 +11,7 @@ from backend.api.default_routers.config_router import router as config_router
 from backend.api.default_routers.novel_router import router as novel_router
 from backend.api.default_routers.upload_router import router as upload_router
 from backend.api.default_routers.volume_router import router as volume_router
+from backend.api.default_routers.chapter_router import router as chapter_router
 from backend.api.default_routers.faction_router import router as faction_router
 from backend.api.default_routers.faction_relation_router import router as faction_relation_router
 from backend.api.llm_routers.create_novel_router import router as create_novel_router
@@ -21,6 +22,9 @@ from backend.runtime import (
     get_backend_log_level,
     is_backend_debug_enabled,
 )
+from backend.services.backup.backup_service import create_automatic_backup_if_due
+from backend.api.default_routers.backup_router import router as backup_router
+from backend.api.default_routers.reference_card_router import router as reference_card_router
 
 apply_runtime_flags_from_argv()
 
@@ -45,6 +49,7 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     # Initialize DB Indexes
     await init_all_indexes()
+    await create_automatic_backup_if_due()
     logger.info("Backend startup completed.")
     yield
     # Teardown
@@ -70,11 +75,14 @@ app.mount("/static/covers", StaticFiles(directory="static/covers"), name="static
 
 app.include_router(novel_router)
 app.include_router(volume_router)
+app.include_router(chapter_router)
 app.include_router(faction_router)
 app.include_router(faction_relation_router)
 app.include_router(config_router)
 app.include_router(create_novel_router)
 app.include_router(upload_router)
+app.include_router(backup_router)
+app.include_router(reference_card_router)
 
 if __name__ == "__main__":
     import uvicorn

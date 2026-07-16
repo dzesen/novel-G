@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +72,7 @@ class VolumeRepository(BaseRepository):
         prepared.setdefault("summary", "")
         prepared.setdefault("status", "draft")
         prepared.setdefault("arcs_count", 0)
+        prepared.setdefault("chapter_count", 0)
         prepared.setdefault("word_count", 0)
 
         try:
@@ -154,6 +157,7 @@ class VolumeRepository(BaseRepository):
         self, volume_id: str,
         arcs_count_delta: int = 0,
         word_count_delta: int = 0,
+        chapter_count_delta: int = 0,
         session: AsyncClientSession | None = None,
     ) -> bool:
         """原子增减卷的统计字段（arcs_count / word_count）。
@@ -172,6 +176,8 @@ class VolumeRepository(BaseRepository):
             increments["arcs_count"] = arcs_count_delta
         if word_count_delta != 0:
             increments["word_count"] = word_count_delta
+        if chapter_count_delta != 0:
+            increments["chapter_count"] = chapter_count_delta
 
         if not increments:
             return False

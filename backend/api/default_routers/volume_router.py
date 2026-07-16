@@ -24,6 +24,7 @@ class UpdateVolumeRequest(BaseModel):
 
 class UpdateVolumeStatsRequest(BaseModel):
     arcs_count_delta: int = 0
+    chapter_count_delta: int = 0
     word_count_delta: int = 0
 
 
@@ -88,7 +89,10 @@ async def update_volume_stats(volume_id: str, req: UpdateVolumeStatsRequest):
     """更新卷的统计数据（arcs_count / word_count 增减）。"""
     try:
         success = await VolumeService.update_volume_stats(
-            volume_id, req.arcs_count_delta, req.word_count_delta
+            volume_id,
+            req.arcs_count_delta,
+            req.word_count_delta,
+            req.chapter_count_delta,
         )
         return {"success": success}
     except InvalidIdError as e:

@@ -116,6 +116,41 @@ async def init_volume_indexes():
         logger.error(f"初始化volume索引失败：{e}")
 
 
+async def init_chapter_indexes():
+    """初始化 chapters 集合的顺序、列表和更新时间索引。"""
+    try:
+        db = get_database()
+        chapters_collection = db["chapters"]
+
+        await _drop_legacy_unique_index(
+            chapters_collection,
+            {"volume_id": 1, "order_index": 1},
+            "chapters_active_volume_order_unique",
+        )
+
+        indexes = [
+            pymongo.IndexModel([("novel_id", pymongo.ASCENDING)]),
+            pymongo.IndexModel([("volume_id", pymongo.ASCENDING)]),
+            pymongo.IndexModel(
+                [("volume_id", pymongo.ASCENDING), ("order_index", pymongo.ASCENDING)],
+                unique=True,
+                partialFilterExpression={"is_deleted": False},
+                name="chapters_active_volume_order_unique",
+            ),
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("is_deleted", pymongo.ASCENDING),
+                ("volume_id", pymongo.ASCENDING),
+                ("order_index", pymongo.ASCENDING),
+            ]),
+            pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
+        ]
+        await chapters_collection.create_indexes(indexes)
+        logger.info("成功初始化'chapters'集合的索引。")
+    except Exception as exc:
+        logger.error("初始化 chapter 索引失败：%s", exc)
+
+
 async def init_faction_indexes():
     """初始化factions集合的索引。"""
     try:
@@ -171,6 +206,32 @@ async def init_faction_indexes():
         logger.error(f"初始化faction索引失败：{e}")
 
 
+async def init_reference_card_indexes():
+    """Initialize list/search indexes for character and world-building cards."""
+    try:
+        db = get_database()
+        for collection_name in ("characters", "worldbook"):
+            collection = db[collection_name]
+            await collection.create_indexes([
+                pymongo.IndexModel([
+                    ("novel_id", pymongo.ASCENDING),
+                    ("card_type", pymongo.ASCENDING),
+                    ("is_deleted", pymongo.ASCENDING),
+                    ("sort_order", pymongo.ASCENDING),
+                ]),
+                pymongo.IndexModel([
+                    ("novel_id", pymongo.ASCENDING),
+                    ("card_type", pymongo.ASCENDING),
+                    ("name", pymongo.ASCENDING),
+                ]),
+                pymongo.IndexModel([("tags", pymongo.ASCENDING)]),
+                pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
+            ])
+        logger.info("成功初始化人物与世界资料卡索引。")
+    except Exception as exc:
+        logger.error("初始化 reference card 索引失败：%s", exc)
+
+
 async def init_faction_relation_indexes():
     """初始化faction_relations集合的索引。"""
     try:
@@ -220,6 +281,8 @@ async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_novel_indexes()
     await init_volume_indexes()
+    await init_chapter_indexes()
+    await init_reference_card_indexes()
     await init_faction_indexes()
     await init_faction_relation_indexes()
     # 在这里添加其他集合的索引初始化

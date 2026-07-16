@@ -11,3 +11,4 @@ python-multipart
 pymongo>=4.16
 httpx
 pytest
+eval-type-backport; python_version < "3.10"

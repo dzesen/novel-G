@@ -2,6 +2,7 @@
 /static/
 /Developer_Documentation/
 /logs/
+/backups/
 .venv/
 .vscode/
 .pytest_cache/

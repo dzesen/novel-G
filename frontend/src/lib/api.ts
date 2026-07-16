@@ -77,6 +77,34 @@ export async function apiDelete<T = unknown>(path: string): Promise<T> {
   return res.json();
 }
 
+export async function apiDownload(path: string, fallbackFilename = "download"): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, { method: "GET" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Request failed: ${res.status}`);
+  }
+
+  const disposition = res.headers.get("Content-Disposition") || "";
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const simpleName = disposition.match(/filename="([^"]+)"/i)?.[1];
+  let filename = fallbackFilename;
+  try {
+    filename = encodedName ? decodeURIComponent(encodedName) : simpleName || fallbackFilename;
+  } catch {
+    filename = simpleName || fallbackFilename;
+  }
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 /**
  * SSE POST 请求：发送 JSON body 并逐条回调 SSE 事件。
  */

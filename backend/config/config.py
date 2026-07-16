@@ -18,6 +18,12 @@ _FALLBACK_DEFAULT_CONFIG: Dict[str, Any] = {
     "mongo_database_name": "my_database",
     "mongo_timeout_ms": 5000,
     "mongo_transaction_mode": "auto",
+    "backup": {
+        "enabled": True,
+        "interval_hours": 24,
+        "retention_count": 10,
+        "directory": "backups",
+    },
 }
 
 _config_lock = RLock()
@@ -503,3 +509,20 @@ def update_config(updates: Dict[str, Any]) -> Dict[str, Any]:
         _cached_config = next_config
         _cached_mtimes = (_get_mtime(DEFAULT_CONFIG_PATH), _get_mtime(CONFIG_PATH))
         return deepcopy(next_config)
+
+
+def replace_config(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    """用一份完整配置替换运行配置，主要用于保存失败后的精确回滚。"""
+    if not isinstance(config_data, dict):
+        raise ValueError("Replacement config must be a mapping")
+    if not config_data:
+        raise ValueError("Replacement config cannot be empty")
+
+    replacement = _normalize_config_tree(deepcopy(config_data))
+    with _config_lock:
+        _write_yaml(CONFIG_PATH, replacement)
+
+        global _cached_config, _cached_mtimes
+        _cached_config = replacement
+        _cached_mtimes = (_get_mtime(DEFAULT_CONFIG_PATH), _get_mtime(CONFIG_PATH))
+        return deepcopy(replacement)

@@ -1,9 +1,12 @@
 """Novel Generator 启动器。"""
 
+from __future__ import annotations
+
 import atexit
 import codecs
 import locale
 import os
+import shutil
 import shlex
 import signal
 import socket
@@ -15,7 +18,7 @@ import webbrowser
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TextIO
+from typing import Callable, Literal, TextIO
 
 import customtkinter as ctk
 
@@ -37,6 +40,7 @@ RETAIN_PENDING_LOG_CHARS = 90_000
 MAX_LOG_FILES = 100
 
 ServiceState = Literal["stopped", "starting", "running", "stopping"]
+PreflightCheck = Callable[[], tuple[bool, str]]
 
 _LOG_DIR_LOCK = threading.Lock()
 
@@ -200,6 +204,7 @@ class ServicePanel(ctk.CTkFrame):
         url: str,
         accent_color: str,
         env: dict[str, str] | None = None,
+        preflight: PreflightCheck | None = None,
     ):
         super().__init__(
             master,
@@ -215,6 +220,7 @@ class ServicePanel(ctk.CTkFrame):
         self.port = port
         self.url = url
         self.accent_color = accent_color
+        self.preflight = preflight
 
         self._proc: subprocess.Popen | None = None
         self._monitor_thread: threading.Thread | None = None
@@ -601,6 +607,23 @@ class ServicePanel(ctk.CTkFrame):
 
         self._open_log_file()
 
+        if self.preflight is not None:
+            self.write_log("[Launcher] 正在检查本地运行环境...\n")
+            try:
+                is_ready, message = self.preflight()
+            except Exception as exc:
+                is_ready = False
+                message = f"环境检查异常：{exc}"
+
+            self.write_log(f"{message.rstrip()}\n")
+            if not is_ready:
+                self.write_log("[ERROR] 环境未就绪，服务未启动。\n")
+                self._close_log_file()
+                with self._state_lock:
+                    self._state = "stopped"
+                self._queue_event("status", "stopped")
+                return
+
         if is_port_in_use(self.port):
             self.write_log(f"[WARN] 端口 {self.port} 已被占用，正在终止残留进程...\n")
             kill_port(self.port)
@@ -798,6 +821,7 @@ class App(ctk.CTk):
             port=BACKEND_PORT,
             url=f"http://localhost:{BACKEND_PORT}/docs",
             accent_color="#15803d",
+            preflight=self._check_backend_environment,
         )
         self.backend.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
@@ -818,6 +842,7 @@ class App(ctk.CTk):
             port=FRONTEND_PORT,
             url=f"http://localhost:{FRONTEND_PORT}",
             accent_color="#2563eb",
+            preflight=self._check_frontend_environment,
         )
         self.frontend.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
@@ -833,6 +858,66 @@ class App(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._atexit_cleanup)
+
+    @staticmethod
+    def _check_backend_environment() -> tuple[bool, str]:
+        if not VENV_PYTHON.is_file():
+            return False, "[ERROR] 未找到 Python 虚拟环境，请先双击 setup.bat 完成安装。"
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        try:
+            result = subprocess.run(
+                [str(VENV_PYTHON), "-m", "backend.preflight"],
+                cwd=BASE_DIR,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "[ERROR] MongoDB 检查超时，请确认数据库服务已启动且连接地址正确。"
+        except OSError as exc:
+            return False, f"[ERROR] 无法运行后端环境检查：{exc}"
+
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+        if result.returncode != 0:
+            return False, output or "[ERROR] 后端环境检查失败，请重新运行 setup.bat。"
+        return True, output or "[OK] Python 依赖与 MongoDB 均已就绪。"
+
+    def _check_frontend_environment(self) -> tuple[bool, str]:
+        node_path = shutil.which("node")
+        npm_path = shutil.which(self.npm_cmd)
+        if not node_path or not npm_path:
+            return False, "[ERROR] 未找到 Node.js 或 npm，请安装 Node.js 20.9+ 后重新运行 setup.bat。"
+
+        try:
+            result = subprocess.run(
+                [node_path, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            version_text = result.stdout.strip().lstrip("v")
+            version_parts = tuple(int(part) for part in version_text.split(".")[:3])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False, "[ERROR] 无法识别 Node.js 版本，请重新安装 Node.js 20.9+。"
+
+        if version_parts < (20, 9, 0):
+            return False, f"[ERROR] 当前 Node.js 为 {version_text}，前端需要 20.9.0 或更高版本。"
+
+        next_package = FRONTEND_DIR / "node_modules" / "next" / "package.json"
+        if not next_package.is_file():
+            return False, "[ERROR] 前端依赖尚未安装，请先双击 setup.bat。"
+
+        return True, f"[OK] Node.js {version_text} 与前端依赖均已就绪。"
 
     def _on_theme_mode_change(self, mode: str) -> None:
         mapping = {
