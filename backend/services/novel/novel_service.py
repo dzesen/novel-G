@@ -1,5 +1,6 @@
 from typing import Tuple, Dict, Any
 from backend.db.repositories.novel_repository import novel_repo
+from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.transaction import run_mongo_write_unit
@@ -43,16 +44,16 @@ class NovelService:
             obj_id = to_object_id(novel_id)
             query = {"novel_id": obj_id}
 
-            volumes_repo = BaseRepository("volumes")
-            arcs_repo = BaseRepository("arcs")
-            chapters_repo = BaseRepository("chapters")
-            outlines_repo = BaseRepository("outlines")
-            tasks_repo = BaseRepository("generation_tasks")
-            memories_repo = BaseRepository("memory_fragments")
-            factions_repo = BaseRepository("factions")
-            faction_relations_repo = BaseRepository("faction_relations")
-            characters_repo = BaseRepository("characters")
-            worldbook_repo = BaseRepository("worldbook")
+            volumes_repo = BaseRepository(collections.VOLUMES)
+            arcs_repo = BaseRepository(collections.ARCS)
+            chapters_repo = BaseRepository(collections.CHAPTERS)
+            outlines_repo = BaseRepository(collections.OUTLINES)
+            tasks_repo = BaseRepository(collections.GENERATION_TASKS)
+            memories_repo = BaseRepository(collections.MEMORY_FRAGMENTS)
+            factions_repo = BaseRepository(collections.FACTIONS)
+            faction_relations_repo = BaseRepository(collections.FACTION_RELATIONS)
+            characters_repo = BaseRepository(collections.CHARACTERS)
+            worldbook_repo = BaseRepository(collections.WORLDBOOK)
 
             stats = {}
 

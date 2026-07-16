@@ -7,6 +7,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
+from backend.db.collections import NOVELS
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.services.backup.backup_service import (
     MAX_BACKUP_BYTES,
@@ -82,7 +83,7 @@ async def export_novel_text(novel_id: str):
 async def export_novel_json(novel_id: str):
     try:
         snapshot = await build_novel_backup(novel_id)
-        title = snapshot["collections"]["novels"][0].get("title", "novel")
+        title = snapshot["collections"][NOVELS][0].get("title", "novel")
         return Response(
             content=serialize_backup(snapshot),
             media_type="application/json; charset=utf-8",

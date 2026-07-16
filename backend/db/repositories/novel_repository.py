@@ -4,13 +4,14 @@ from typing import Any, Dict, List, Optional
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
+from backend.db.collections import NOVELS
 from backend.db.utils import to_object_id
 from backend.db.errors import NotFoundError, InvalidIdError
 
 class NovelRepository(BaseRepository):
     def __init__(self):
         """初始化小说仓储，指定集合为'novels'"""
-        super().__init__("novels")
+        super().__init__(NOVELS)
 
     async def create_novel(self, data: Dict[str, Any], session: AsyncClientSession | None = None) -> str:
         """创建一本小说，并初始化相关的默认字段和统计数据。

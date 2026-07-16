@@ -1,6 +1,7 @@
 import pymongo
 import logging
 from pymongo.asynchronous.collection import AsyncCollection
+from backend.db import collections
 from backend.db.mongo import get_database
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ async def init_novel_indexes():
     """初始化novels集合的索引。"""
     try:
         db = get_database()
-        novels_collection = db["novels"]
+        novels_collection = db[collections.NOVELS]
         
         logger.info("正在初始化'novels'集合的索引...")
         
@@ -77,7 +78,7 @@ async def init_volume_indexes():
     """初始化volumes集合的索引。"""
     try:
         db = get_database()
-        volumes_collection = db["volumes"]
+        volumes_collection = db[collections.VOLUMES]
 
         logger.info("正在初始化'volumes'集合的索引...")
 
@@ -120,7 +121,7 @@ async def init_chapter_indexes():
     """初始化 chapters 集合的顺序、列表和更新时间索引。"""
     try:
         db = get_database()
-        chapters_collection = db["chapters"]
+        chapters_collection = db[collections.CHAPTERS]
 
         await _drop_legacy_unique_index(
             chapters_collection,
@@ -155,7 +156,7 @@ async def init_faction_indexes():
     """初始化factions集合的索引。"""
     try:
         db = get_database()
-        factions_collection = db["factions"]
+        factions_collection = db[collections.FACTIONS]
 
         logger.info("正在初始化'factions'集合的索引...")
 
@@ -210,7 +211,7 @@ async def init_reference_card_indexes():
     """Initialize list/search indexes for character and world-building cards."""
     try:
         db = get_database()
-        for collection_name in ("characters", "worldbook"):
+        for collection_name in (collections.CHARACTERS, collections.WORLDBOOK):
             collection = db[collection_name]
             await collection.create_indexes([
                 pymongo.IndexModel([
@@ -236,7 +237,7 @@ async def init_faction_relation_indexes():
     """初始化faction_relations集合的索引。"""
     try:
         db = get_database()
-        relations_collection = db["faction_relations"]
+        relations_collection = db[collections.FACTION_RELATIONS]
 
         logger.info("正在初始化'faction_relations'集合的索引...")
 

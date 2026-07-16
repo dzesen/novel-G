@@ -11,6 +11,19 @@ from typing import Any, Dict
 from bson import json_util
 
 from backend.config import get_config_value
+from backend.db.collections import (
+    ARCS,
+    CHAPTERS,
+    CHARACTERS,
+    FACTION_RELATIONS,
+    FACTIONS,
+    GENERATION_TASKS,
+    MEMORY_FRAGMENTS,
+    NOVELS,
+    OUTLINES,
+    VOLUMES,
+    WORLDBOOK,
+)
 from backend.db.mongo import get_database
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -21,18 +34,20 @@ logger = logging.getLogger(__name__)
 BACKUP_FORMAT = "novel-generator-backup"
 BACKUP_VERSION = 1
 MAX_BACKUP_BYTES = 100 * 1024 * 1024
+# 恢复按本元组顺序 delete_many + insert_many，故保持有序且不重复。
+# 新增集合务必同步登记，test_backup_covers_every_registered_collection 会守着这条。
 BACKUP_COLLECTIONS = (
-    "novels",
-    "volumes",
-    "arcs",
-    "chapters",
-    "outlines",
-    "generation_tasks",
-    "memory_fragments",
-    "characters",
-    "worldbook",
-    "factions",
-    "faction_relations",
+    NOVELS,
+    VOLUMES,
+    ARCS,
+    CHAPTERS,
+    OUTLINES,
+    GENERATION_TASKS,
+    MEMORY_FRAGMENTS,
+    CHARACTERS,
+    WORLDBOOK,
+    FACTIONS,
+    FACTION_RELATIONS,
 )
 
 
@@ -216,11 +231,11 @@ async def build_novel_text(novel_id: str) -> tuple[str, str]:
 async def build_novel_backup(novel_id: str) -> Dict[str, Any]:
     novel = await novel_repo.get_novel_by_id(novel_id)
     db = get_database()
-    collections: Dict[str, list[dict]] = {"novels": [novel]}
+    exported: Dict[str, list[dict]] = {NOVELS: [novel]}
     for collection_name in BACKUP_COLLECTIONS:
-        if collection_name == "novels":
+        if collection_name == NOVELS:
             continue
-        collections[collection_name] = await db[collection_name].find(
+        exported[collection_name] = await db[collection_name].find(
             {"novel_id": novel["_id"]}
         ).to_list(length=None)
     return {
@@ -228,5 +243,5 @@ async def build_novel_backup(novel_id: str) -> Dict[str, Any]:
         "version": BACKUP_VERSION,
         "scope": "novel",
         "created_at": _utc_now(),
-        "collections": collections,
+        "collections": exported,
     }

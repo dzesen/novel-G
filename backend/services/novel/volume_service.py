@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
+from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import DuplicateKeyError
 from backend.db.transaction import run_mongo_write_unit
@@ -109,8 +110,8 @@ class VolumeService:
                 return False
 
             obj_id = to_object_id(volume_id)
-            arcs_repo = BaseRepository("arcs")
-            chapters_repo = BaseRepository("chapters")
+            arcs_repo = BaseRepository(collections.ARCS)
+            chapters_repo = BaseRepository(collections.CHAPTERS)
             active_chapter_count = await chapters_repo.count_documents(
                 {"volume_id": obj_id},
                 session=session,
@@ -173,8 +174,8 @@ class VolumeService:
             if not success:
                 return False
 
-            arcs_repo = BaseRepository("arcs")
-            chapters_repo = BaseRepository("chapters")
+            arcs_repo = BaseRepository(collections.ARCS)
+            chapters_repo = BaseRepository(collections.CHAPTERS)
             arcs_restored = await arcs_repo.update_many(
                 {"volume_id": obj_id, "deleted_with_volume_id": obj_id},
                 {
@@ -232,8 +233,8 @@ class VolumeService:
 
             stats = {}
 
-            arcs_repo = BaseRepository("arcs")
-            chapters_repo = BaseRepository("chapters")
+            arcs_repo = BaseRepository(collections.ARCS)
+            chapters_repo = BaseRepository(collections.CHAPTERS)
             stats["arcs_deleted"] = await arcs_repo.hard_delete_many({"volume_id": obj_id}, session=session)
             stats["chapters_deleted"] = await chapters_repo.hard_delete_many(
                 {"volume_id": obj_id},

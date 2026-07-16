@@ -8,6 +8,7 @@ from bson import ObjectId
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
+from backend.db.collections import FACTIONS
 from backend.db.errors import DuplicateKeyError, NotFoundError
 from backend.db.utils import to_object_id
 
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 class FactionRepository(BaseRepository):
     def __init__(self):
         """初始化阵营仓储，指定集合为'factions'。"""
-        super().__init__("factions")
+        super().__init__(FACTIONS)
 
     async def _get_next_faction_id(
         self,

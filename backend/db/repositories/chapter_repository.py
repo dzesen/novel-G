@@ -8,13 +8,14 @@ import pymongo.errors
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
+from backend.db.collections import CHAPTERS
 from backend.db.errors import DuplicateKeyError, NotFoundError
 from backend.db.utils import to_object_id
 
 
 class ChapterRepository(BaseRepository):
     def __init__(self) -> None:
-        super().__init__("chapters")
+        super().__init__(CHAPTERS)
 
     async def _get_next_order_index(
         self,

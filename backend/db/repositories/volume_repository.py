@@ -7,6 +7,7 @@ import pymongo.errors
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
+from backend.db.collections import VOLUMES
 from backend.db.utils import to_object_id
 from backend.db.errors import NotFoundError, DuplicateKeyError
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 class VolumeRepository(BaseRepository):
     def __init__(self):
         """初始化卷仓储，指定集合为'volumes'"""
-        super().__init__("volumes")
+        super().__init__(VOLUMES)
 
     # 辅助方法 
 
