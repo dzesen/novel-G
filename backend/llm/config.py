@@ -55,6 +55,14 @@ class LLMConfig(BaseModel):
     default_provider: str = Field(default="openai_gpt4o_mini", description="默认服务商别名")
     format_review_provider: str = Field(default="", description="格式审校服务商别名，需支持 json_schema")
     providers: dict[str, LLMProviderConfig] = Field(default_factory=dict, description="服务商配置映射（key 为别名）")
+    log_partial_result_on_disconnect: bool = Field(
+        default=False,
+        description=(
+            "客户端断开时，是否把已完成步骤的完整结果打进日志。"
+            "默认关闭：整段剧情文本会让日志迅速膨胀，且前端本就有 cached_steps 续跑机制。"
+            "需要事后挖回中断结果时再开。"
+        ),
+    )
 
 
 def get_llm_config() -> LLMConfig:

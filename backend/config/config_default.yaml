@@ -21,6 +21,10 @@ backup:
 llm:
   default_provider: openai_gpt4o_mini
   format_review_provider: openai_gpt5_4_nano
+  # 客户端断开时，是否把已完成步骤的完整结果打进日志。
+  # 无论开关如何，断开都会立即取消正在跑的 LLM 调用——否则关了页面照样计费。
+  # 默认关闭：整段剧情文本会让日志迅速膨胀，且前端本就带 cached_steps 续跑。
+  log_partial_result_on_disconnect: false
   providers:
     openai_gpt4o_mini:
       type: openai

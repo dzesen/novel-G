@@ -5,17 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 from typing import Any, AsyncGenerator, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
 from backend.llm.config import get_llm_config, get_provider_config
+from backend.services.llm.workflow_runner import (
+    WorkflowDeps,
+    WorkflowStep,
+    run_workflow,
+)
 from backend.services.llm.workflow_service import (
     get_llm_service_for_step,
     resolve_provider_for_step,
@@ -131,22 +135,49 @@ def _check_json_schema_support(step_name: str, workflow_name: str = WORKFLOW_NAM
     return get_provider_config(provider).supports_json_schema
 
 
-def _sse_event(event: str, data: dict) -> str:
-    """格式化一条 SSE 事件。"""
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
+    WorkflowStep(
+        key="expand_idea",
+        # 唯一一个两套词汇不同名的步骤：另外三步恰好同名，这个区别极易被忽略。
+        config_key="expand_idea_to_full_novel_story",
+        schema=ExpandIdeaSchema,
+        prompt_args=lambda ctx: {"user_idea": ctx.params["user_idea"]},
+    ),
+    WorkflowStep(
+        key="extract_idea",
+        schema=ExtractIdeaSchema,
+        prompt_args=lambda ctx: {"plot": ctx.results["expand_idea"].plot},
+    ),
+    WorkflowStep(
+        key="core_seed",
+        schema=CoreSeedSchema,
+        prompt_args=lambda ctx: {
+            "plot": ctx.results["expand_idea"].plot,
+            "genre": ctx.results["extract_idea"].genre,
+            "tone": ctx.results["extract_idea"].tone,
+            "target_audience": ctx.results["extract_idea"].target_audience,
+            "core_idea": ctx.results["extract_idea"].core_idea,
+            "number_of_chapters": ctx.params["number_of_chapters"],
+            "words_per_chapter": ctx.params["words_per_chapter"],
+        },
+    ),
+    WorkflowStep(
+        key="novel_meta",
+        schema=NovelMetaSchema,
+        prompt_args=lambda ctx: {
+            "plot": ctx.results["expand_idea"].plot,
+            "genre": ctx.results["extract_idea"].genre,
+            "tone": ctx.results["extract_idea"].tone,
+            "target_audience": ctx.results["extract_idea"].target_audience,
+            "core_idea": ctx.results["extract_idea"].core_idea,
+            "number_of_chapters": ctx.params["number_of_chapters"],
+            "words_per_chapter": ctx.params["words_per_chapter"],
+            "core_seed": ctx.results["core_seed"].core_seed,
+        },
+    ),
+)
 
-
-def _log_workflow_event(request_id: str, step: str, status: str, **details: object) -> None:
-    logger.info(
-        "[create_novel_by_ai] request_id=%s step=%s status=%s details=%s",
-        request_id,
-        step,
-        status,
-        details or {},
-    )
-
-
-AI_CREATE_STEP_ORDER: tuple[str, ...] = ("expand_idea", "extract_idea", "core_seed", "novel_meta")
+AI_CREATE_STEP_ORDER: tuple[str, ...] = tuple(step.key for step in AI_CREATE_STEPS)
 
 
 class AICreateCachedSteps(BaseModel):
@@ -166,47 +197,6 @@ class AICreateCachedSteps(BaseModel):
     extract_idea: ExtractIdeaSchema | None = None
     core_seed: CoreSeedSchema | None = None
     novel_meta: NovelMetaSchema | None = None
-
-
-def _model_dump_or_none(model: BaseModel | None) -> dict[str, Any] | None:
-    """把 Pydantic 模型转换为可序列化字典。
-
-    Args:
-        model: 可能为空的 Pydantic 模型实例。
-
-    Returns:
-        模型字典；为空时返回 None。
-    """
-    return model.model_dump() if model is not None else None
-
-
-def _build_ai_create_result(
-    expanded: ExpandIdeaSchema | None = None,
-    idea: ExtractIdeaSchema | None = None,
-    seed: CoreSeedSchema | None = None,
-    meta: NovelMetaSchema | None = None,
-) -> dict[str, Any]:
-    """汇总 AI 创建小说流程中已经完成的步骤结果。
-
-    Args:
-        expanded: 扩写完整剧情步骤结果。
-        idea: 提炼创意步骤结果。
-        seed: 生成故事核心步骤结果。
-        meta: 生成小说设定步骤结果。
-
-    Returns:
-        只包含非空步骤的结果字典，可作为 partial_result 或最终 result。
-    """
-    result: dict[str, Any] = {}
-    if dumped := _model_dump_or_none(expanded):
-        result["expand_idea"] = dumped
-    if dumped := _model_dump_or_none(idea):
-        result["extract_idea"] = dumped
-    if dumped := _model_dump_or_none(seed):
-        result["core_seed"] = dumped
-    if dumped := _model_dump_or_none(meta):
-        result["novel_meta"] = dumped
-    return result
 
 
 def _get_contiguous_cached_steps(cached_steps: AICreateCachedSteps | None) -> dict[str, BaseModel]:
@@ -643,277 +633,48 @@ async def rewrite_novel_field(req: NovelFieldRewriteRequest):
 
 
 @router.post("/create-novel-by-ai")
-async def create_novel_by_ai(req: AICreateNovelRequest):
+async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
     """4 步 LLM 管道（SSE 流式）：expand_idea → extract_idea → core_seed → novel_meta。
 
     Args:
         req: AI 创建小说请求，允许携带从第一步开始连续完成的 cached_steps。
+        request: 用于检测客户端断开，断开时会取消正在跑的 LLM 调用。
 
     Returns:
         SSE 响应；每一步通过 step 事件推送，结束时通过 done 事件返回结果或部分结果。
     """
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        request_id = uuid4().hex[:8]
-        workflow_start = time.perf_counter()
-        prompts = _load_prompts().get("create_novel_by_ai", {})
-        gen_kwargs = _build_gen_kwargs(req)
-        cached_prefix = _get_contiguous_cached_steps(req.cached_steps)
-        expanded: ExpandIdeaSchema | None = None
-        idea: ExtractIdeaSchema | None = None
-        seed: CoreSeedSchema | None = None
-        meta: NovelMetaSchema | None = None
-        _log_workflow_event(
-            request_id,
-            "workflow",
-            "started",
-            idea_chars=len(req.user_idea),
-            number_of_chapters=req.number_of_chapters,
-            words_per_chapter=req.words_per_chapter,
-            cached_steps=list(cached_prefix.keys()),
-            overrides=sorted(gen_kwargs.keys()),
+        # 依赖在此处装配而非模块级：这些名字在测试中会被 monkeypatch 到本模块上，
+        # 调用时再取才能拿到替身。
+        deps = WorkflowDeps(
+            resolve_provider=resolve_provider_for_step,
+            resolve_timeout=resolve_timeout_for_step,
+            get_service=get_llm_service_for_step,
+            supports_schema=_check_json_schema_support,
+            fix_format=validate_and_fix_format,
         )
-
-        # Step 1: Expand Idea to Full Novel Story
-        if cached_expanded := cached_prefix.get("expand_idea"):
-            expanded = cached_expanded  # type: ignore[assignment]
-            _log_workflow_event(request_id, "expand_idea", "cached")
-            yield _sse_event("step", {"step": "expand_idea", "status": "done", "cached": True, "data": expanded.model_dump()})
-        else:
-            yield _sse_event("step", {"step": "expand_idea", "status": "running"})
-            step_started_at = time.perf_counter()
-            provider0 = resolve_provider_for_step(WORKFLOW_NAME, "expand_idea_to_full_novel_story") or ""
-            timeout0 = resolve_timeout_for_step(WORKFLOW_NAME, "expand_idea_to_full_novel_story")
-            use_schema0 = _check_json_schema_support("expand_idea_to_full_novel_story")
-            _log_workflow_event(
-                request_id,
-                "expand_idea",
-                "running",
-                provider=provider0 or "unresolved",
-                timeout_seconds=timeout0,
-                json_schema=use_schema0,
-            )
-            try:
-                svc0 = get_llm_service_for_step(WORKFLOW_NAME, "expand_idea_to_full_novel_story")
-                suffix0 = "expand_idea_to_full_novel_story_prompt_with_schema_suffix" if use_schema0 else "expand_idea_to_full_novel_story_prompt_without_schema_suffix"
-                prompt0 = (
-                    prompts["expand_idea_to_full_novel_story_prompt_base"].format(
-                        user_idea=req.user_idea,
-                    )
-                    + "\n"
-                    + prompts[suffix0]
-                )
-                if use_schema0:
-                    expanded = await svc0.generate_structured(prompt0, ExpandIdeaSchema, **gen_kwargs)
-                else:
-                    raw0 = await svc0.generate_text(prompt0, **gen_kwargs)
-                    expanded = await validate_and_fix_format(raw0, ExpandIdeaSchema, "expand_idea_to_full_novel_story")
-                _log_workflow_event(
-                    request_id,
-                    "expand_idea",
-                    "done",
-                    provider=provider0 or "unresolved",
-                    elapsed_ms=int((time.perf_counter() - step_started_at) * 1000),
-                )
-                yield _sse_event("step", {"step": "expand_idea", "status": "done", "data": expanded.model_dump()})
-            except Exception as e:
-                logger.exception(
-                    "[create_novel_by_ai] request_id=%s step=%s failed provider=%s",
-                    request_id,
-                    "expand_idea",
-                    provider0 or "unresolved",
-                )
-                yield _sse_event("step", {"step": "expand_idea", "status": "error", "error": str(e)})
-                yield _sse_event("done", {"success": False, "failed_step": "expand_idea", "partial_result": _build_ai_create_result(expanded, idea, seed, meta)})
-                return
-
-        # Step 2: Extract Idea
-        if cached_idea := cached_prefix.get("extract_idea"):
-            idea = cached_idea  # type: ignore[assignment]
-            _log_workflow_event(request_id, "extract_idea", "cached")
-            yield _sse_event("step", {"step": "extract_idea", "status": "done", "cached": True, "data": idea.model_dump()})
-        else:
-            yield _sse_event("step", {"step": "extract_idea", "status": "running"})
-            step_started_at = time.perf_counter()
-            provider1 = resolve_provider_for_step(WORKFLOW_NAME, "extract_idea") or ""
-            timeout1 = resolve_timeout_for_step(WORKFLOW_NAME, "extract_idea")
-            use_schema1 = _check_json_schema_support("extract_idea")
-            _log_workflow_event(
-                request_id,
-                "extract_idea",
-                "running",
-                provider=provider1 or "unresolved",
-                timeout_seconds=timeout1,
-                json_schema=use_schema1,
-            )
-            try:
-                svc1 = get_llm_service_for_step(WORKFLOW_NAME, "extract_idea")
-                suffix1 = "extract_idea_prompt_with_schema_suffix" if use_schema1 else "extract_idea_prompt_without_schema_suffix"
-                prompt1 = (
-                    prompts["extract_idea_prompt_base"].format(
-                        plot=expanded.plot,
-                    )
-                    + "\n"
-                    + prompts[suffix1]
-                )
-                if use_schema1:
-                    idea = await svc1.generate_structured(prompt1, ExtractIdeaSchema, **gen_kwargs)
-                else:
-                    raw1 = await svc1.generate_text(prompt1, **gen_kwargs)
-                    idea = await validate_and_fix_format(raw1, ExtractIdeaSchema, "extract_idea")
-                _log_workflow_event(
-                    request_id,
-                    "extract_idea",
-                    "done",
-                    provider=provider1 or "unresolved",
-                    elapsed_ms=int((time.perf_counter() - step_started_at) * 1000),
-                )
-                yield _sse_event("step", {"step": "extract_idea", "status": "done", "data": idea.model_dump()})
-            except Exception as e:
-                logger.exception(
-                    "[create_novel_by_ai] request_id=%s step=%s failed provider=%s",
-                    request_id,
-                    "extract_idea",
-                    provider1 or "unresolved",
-                )
-                yield _sse_event("step", {"step": "extract_idea", "status": "error", "error": str(e)})
-                yield _sse_event("done", {"success": False, "failed_step": "extract_idea", "partial_result": _build_ai_create_result(expanded, idea, seed, meta)})
-                return
-
-        # Step 3: Core Seed
-        if cached_seed := cached_prefix.get("core_seed"):
-            seed = cached_seed  # type: ignore[assignment]
-            _log_workflow_event(request_id, "core_seed", "cached")
-            yield _sse_event("step", {"step": "core_seed", "status": "done", "cached": True, "data": seed.model_dump()})
-        else:
-            yield _sse_event("step", {"step": "core_seed", "status": "running"})
-            step_started_at = time.perf_counter()
-            provider2 = resolve_provider_for_step(WORKFLOW_NAME, "core_seed") or ""
-            timeout2 = resolve_timeout_for_step(WORKFLOW_NAME, "core_seed")
-            use_schema2 = _check_json_schema_support("core_seed")
-            _log_workflow_event(
-                request_id,
-                "core_seed",
-                "running",
-                provider=provider2 or "unresolved",
-                timeout_seconds=timeout2,
-                json_schema=use_schema2,
-            )
-            try:
-                svc2 = get_llm_service_for_step(WORKFLOW_NAME, "core_seed")
-                suffix2 = "core_seed_prompt_with_schema_suffix" if use_schema2 else "core_seed_prompt_without_schema_suffix"
-                prompt2 = (
-                    prompts["core_seed_prompt_base"].format(
-                        plot=expanded.plot,
-                        genre=idea.genre,
-                        tone=idea.tone,
-                        target_audience=idea.target_audience,
-                        core_idea=idea.core_idea,
-                        number_of_chapters=req.number_of_chapters,
-                        words_per_chapter=req.words_per_chapter,
-                    )
-                    + "\n"
-                    + prompts[suffix2]
-                )
-                if use_schema2:
-                    seed = await svc2.generate_structured(prompt2, CoreSeedSchema, **gen_kwargs)
-                else:
-                    raw2 = await svc2.generate_text(prompt2, **gen_kwargs)
-                    seed = await validate_and_fix_format(raw2, CoreSeedSchema, "core_seed")
-                _log_workflow_event(
-                    request_id,
-                    "core_seed",
-                    "done",
-                    provider=provider2 or "unresolved",
-                    elapsed_ms=int((time.perf_counter() - step_started_at) * 1000),
-                )
-                yield _sse_event("step", {"step": "core_seed", "status": "done", "data": seed.model_dump()})
-            except Exception as e:
-                logger.exception(
-                    "[create_novel_by_ai] request_id=%s step=%s failed provider=%s",
-                    request_id,
-                    "core_seed",
-                    provider2 or "unresolved",
-                )
-                yield _sse_event("step", {"step": "core_seed", "status": "error", "error": str(e)})
-                yield _sse_event("done", {"success": False, "failed_step": "core_seed", "partial_result": _build_ai_create_result(expanded, idea, seed, meta)})
-                return
-
-        # Step 4: Novel Meta
-        if cached_meta := cached_prefix.get("novel_meta"):
-            meta = cached_meta  # type: ignore[assignment]
-            _log_workflow_event(request_id, "novel_meta", "cached")
-            yield _sse_event("step", {"step": "novel_meta", "status": "done", "cached": True, "data": meta.model_dump()})
-        else:
-            yield _sse_event("step", {"step": "novel_meta", "status": "running"})
-            step_started_at = time.perf_counter()
-            provider3 = resolve_provider_for_step(WORKFLOW_NAME, "novel_meta") or ""
-            timeout3 = resolve_timeout_for_step(WORKFLOW_NAME, "novel_meta")
-            use_schema3 = _check_json_schema_support("novel_meta")
-            _log_workflow_event(
-                request_id,
-                "novel_meta",
-                "running",
-                provider=provider3 or "unresolved",
-                timeout_seconds=timeout3,
-                json_schema=use_schema3,
-            )
-            try:
-                svc3 = get_llm_service_for_step(WORKFLOW_NAME, "novel_meta")
-                suffix3 = "novel_meta_prompt_with_schema_suffix" if use_schema3 else "novel_meta_prompt_without_schema_suffix"
-                prompt3 = (
-                    prompts["novel_meta_prompt_base"].format(
-                        plot=expanded.plot,
-                        genre=idea.genre,
-                        tone=idea.tone,
-                        target_audience=idea.target_audience,
-                        core_idea=idea.core_idea,
-                        number_of_chapters=req.number_of_chapters,
-                        words_per_chapter=req.words_per_chapter,
-                        core_seed=seed.core_seed,
-                    )
-                    + "\n"
-                    + prompts[suffix3]
-                )
-                if use_schema3:
-                    meta = await svc3.generate_structured(prompt3, NovelMetaSchema, **gen_kwargs)
-                else:
-                    raw3 = await svc3.generate_text(prompt3, **gen_kwargs)
-                    meta = await validate_and_fix_format(raw3, NovelMetaSchema, "novel_meta")
-                _log_workflow_event(
-                    request_id,
-                    "novel_meta",
-                    "done",
-                    provider=provider3 or "unresolved",
-                    elapsed_ms=int((time.perf_counter() - step_started_at) * 1000),
-                )
-                yield _sse_event("step", {"step": "novel_meta", "status": "done", "data": meta.model_dump()})
-            except Exception as e:
-                logger.exception(
-                    "[create_novel_by_ai] request_id=%s step=%s failed provider=%s",
-                    request_id,
-                    "novel_meta",
-                    provider3 or "unresolved",
-                )
-                yield _sse_event("step", {"step": "novel_meta", "status": "error", "error": str(e)})
-                yield _sse_event("done", {"success": False, "failed_step": "novel_meta", "partial_result": _build_ai_create_result(expanded, idea, seed, meta)})
-                return
-
-        # All steps completed
-        final_result = _build_ai_create_result(expanded, idea, seed, meta)
-        _log_workflow_event(
-            request_id,
-            "workflow",
-            "done",
-            total_elapsed_ms=int((time.perf_counter() - workflow_start) * 1000),
-        )
-        yield _sse_event("done", {
-            "success": True,
-            "result": final_result,
-        })
+        async for frame in run_workflow(
+            workflow_name=WORKFLOW_NAME,
+            steps=AI_CREATE_STEPS,
+            prompts=_load_prompts().get(WORKFLOW_NAME, {}),
+            params={
+                "user_idea": req.user_idea,
+                "number_of_chapters": req.number_of_chapters,
+                "words_per_chapter": req.words_per_chapter,
+            },
+            gen_kwargs=_build_gen_kwargs(req),
+            cached=_get_contiguous_cached_steps(req.cached_steps),
+            deps=deps,
+            request_id=uuid4().hex[:8],
+            is_disconnected=request.is_disconnected,
+            log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
+        ):
+            yield frame
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
