@@ -96,6 +96,7 @@ function resolveBaseUrlForProviderTypeChange(
 const TEST_STEPS: { capability: ProviderTestCapability; labelKey: string }[] = [
   { capability: "connection", labelKey: "test.connection" },
   { capability: "streaming", labelKey: "test.streaming" },
+  { capability: "stream_usage", labelKey: "test.streamUsage" },
   { capability: "json_schema", labelKey: "test.jsonSchema" },
   { capability: "function_calling", labelKey: "test.functionCalling" },
 ];
@@ -808,6 +809,16 @@ function ProviderDetail({
             selected={provider.supports_function_calling}
             onChange={(value) => onChange({ supports_function_calling: value })}
           />
+          {/* 该开关只对 openai 类型生效：它控制是否发 stream_options 去索取用量。
+              Claude / Gemini 的流式响应本来就带用量，客户端不读这个开关，
+              显示出来只会让人以为关掉就不统计了。 */}
+          {provider.type === "openai" && (
+            <CapabilitySwitch
+              label={t("supportsStreamUsage")}
+              selected={provider.supports_stream_usage}
+              onChange={(value) => onChange({ supports_stream_usage: value })}
+            />
+          )}
         </div>
       </section>
 

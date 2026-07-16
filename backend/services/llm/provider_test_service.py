@@ -14,10 +14,12 @@ from backend.llm.base_client import BaseLLMClient
 from backend.llm.config import LLMProviderConfig
 from backend.llm.factory import create_llm_client_from_config
 from backend.llm.logger import log_provider_test_raw_response
-from backend.llm.models import LLMFunctionCallProbe, LLMRequest
+from backend.llm.models import LLMFunctionCallProbe, LLMRequest, TokenUsage
 from backend.llm.prompts.prompt_selector import load_llm_provider_test_prompts
 
-ProviderTestCapability = Literal["connection", "streaming", "json_schema", "function_calling"]
+ProviderTestCapability = Literal[
+    "connection", "streaming", "stream_usage", "json_schema", "function_calling"
+]
 ProviderTestStatus = Literal["passed", "failed", "skipped"]
 ClientFactory = Callable[[LLMProviderConfig, str], BaseLLMClient]
 
@@ -50,6 +52,7 @@ class ProviderCapabilityRecommendation(BaseModel):
     supports_streaming: bool = Field(default=False, description="是否建议启用流式输出")
     supports_json_schema: bool = Field(default=False, description="是否建议启用 JSON Schema")
     supports_function_calling: bool = Field(default=False, description="是否建议启用 Function Calling")
+    supports_stream_usage: bool = Field(default=False, description="是否建议启用流式 Token 用量统计")
 
 
 class ProviderTestResponse(BaseModel):
@@ -277,6 +280,7 @@ async def test_llm_provider_capabilities(
         )
         skipped = [
             _result("streaming", "流式输出", "skipped", message="连接测试未通过"),
+            _result("stream_usage", "流式用量统计", "skipped", message="连接测试未通过"),
             _result("json_schema", "JSON Schema", "skipped", message="连接测试未通过"),
             _result("function_calling", "Function Calling", "skipped", message="连接测试未通过"),
         ]
@@ -287,6 +291,9 @@ async def test_llm_provider_capabilities(
             summary="连接测试失败，已跳过能力探测",
             results=[connection, *skipped],
         )
+
+    # 由 run_stream_usage 填入，供其结果摘要回报实际 token 数。
+    _usage_summary: list[TokenUsage] = []
 
     async def run_connection() -> None:
         """执行普通文本接口可用性测试。
@@ -360,6 +367,7 @@ async def test_llm_provider_capabilities(
                         "skipped",
                         message=f"连接测试未通过；初次流式失败: {initial_stream_result.message}",
                     ),
+                    _result("stream_usage", "流式用量统计", "skipped", message="连接测试未通过"),
                     _result("json_schema", "JSON Schema", "skipped", message="连接测试未通过"),
                     _result("function_calling", "Function Calling", "skipped", message="连接测试未通过"),
                 ]
@@ -374,6 +382,41 @@ async def test_llm_provider_capabilities(
 
         # 普通接口可用时再复测流式能力，避免把必须 stream=true 的模型误判为不可用。
         results.append(await _run_step("streaming", "流式输出", api_key, run_streaming))
+
+    async def run_stream_usage() -> None:
+        """探测流式响应是否回报 token 用量。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+        """
+        seen: list[TokenUsage] = []
+        # 必须用临时开启开关的配置另建客户端：openai 客户端只在 supports_stream_usage
+        # 为真时才发 stream_options，拿用户当前（默认关闭的）配置去探，就永远不会索取
+        # 用量，于是永远探不到、永远建议关闭——死锁。这里正是要试"开了会怎样"。
+        usage_client = client_factory(
+            provider.model_copy(update={"supports_stream_usage": True}),
+            alias,
+        )
+        stream_request = _build_probe_request(prompts["stream_probe_prompt"]).model_copy(
+            update={"stream": True}
+        )
+        async for _chunk in usage_client.stream_text(stream_request, usage_sink=seen.append):
+            pass
+
+        log_provider_test_raw_response(
+            alias,
+            "stream_usage",
+            {"usage": [item.model_dump() for item in seen]},
+        )
+        if not seen:
+            raise ValueError("流式响应未回报 token 用量")
+        usage = seen[-1]
+        if usage.total_tokens <= 0 and usage.input_tokens <= 0 and usage.output_tokens <= 0:
+            raise ValueError("流式响应回报了用量结构，但数值全为零")
+        _usage_summary.append(usage)
 
     async def run_json_schema() -> None:
         """执行 JSON Schema 结构化输出能力测试。
@@ -416,13 +459,39 @@ async def test_llm_provider_capabilities(
             response.raw_response or {"content": response.content},
         )
 
+    # 流式不通就没必要探流式用量，只会白烧一次调用。
+    if results[1].status == "passed":
+        usage_result = await _run_step("stream_usage", "流式用量统计", api_key, run_stream_usage)
+        if usage_result.status == "passed" and _usage_summary:
+            usage = _usage_summary[-1]
+            # 回报实际 token 数，人可据此判断用量是否合理（而非只看一个"通过"）。
+            usage_result = usage_result.model_copy(
+                update={
+                    "message": (
+                        f"已回报用量：{usage.total_tokens} tokens"
+                        f"（输入 {usage.input_tokens} / 输出 {usage.output_tokens}）"
+                    )
+                }
+            )
+    else:
+        usage_result = _result(
+            "stream_usage",
+            "流式用量统计",
+            "skipped",
+            message="流式输出未通过",
+        )
+    results.append(usage_result)
+
     results.append(await _run_step("json_schema", "JSON Schema", api_key, run_json_schema))
     results.append(await _run_step("function_calling", "Function Calling", api_key, run_function_calling))
 
+    # 按 capability 取，不按下标：插入新能力时下标会静默错位。
+    statuses = {item.capability: item.status for item in results}
     recommendation = ProviderCapabilityRecommendation(
-        supports_streaming=results[1].status == "passed",
-        supports_json_schema=results[2].status == "passed",
-        supports_function_calling=results[3].status == "passed",
+        supports_streaming=statuses.get("streaming") == "passed",
+        supports_json_schema=statuses.get("json_schema") == "passed",
+        supports_function_calling=statuses.get("function_calling") == "passed",
+        supports_stream_usage=statuses.get("stream_usage") == "passed",
     )
     passed_count = sum(1 for item in results if item.status == "passed")
     return ProviderTestResponse(

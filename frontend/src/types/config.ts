@@ -11,6 +11,7 @@ export interface ProviderConfig {
   supports_streaming: boolean;
   supports_json_schema: boolean;
   supports_function_calling: boolean;
+  supports_stream_usage: boolean;
   // 生成参数默认值（可选）
   temperature?: number | null;
   top_p?: number | null;
@@ -23,6 +24,7 @@ export interface ProviderConfig {
 export type ProviderTestCapability =
   | "connection"
   | "streaming"
+  | "stream_usage"
   | "json_schema"
   | "function_calling";
 
@@ -40,6 +42,7 @@ export interface ProviderCapabilityRecommendation {
   supports_streaming: boolean;
   supports_json_schema: boolean;
   supports_function_calling: boolean;
+  supports_stream_usage: boolean;
 }
 
 export interface ProviderTestResponse {
@@ -104,6 +107,7 @@ export function newProviderConfig(): ProviderConfig {
     supports_streaming: true,
     supports_json_schema: false,
     supports_function_calling: false,
+    supports_stream_usage: false,
     temperature: null,
     top_p: null,
     max_tokens: null,
