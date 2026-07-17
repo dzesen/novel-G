@@ -1,9 +1,15 @@
 """人物状态仓储：追踪角色的当下状态与不可逆的既成事实。
 
-刻意不提供删除或改写 permanent_facts 的方法。该集合的写入方是 AI
-（阶段 2 的 extract_chapter_state_by_ai），而"不可逆事实被覆盖"正是本设计
-要防的头号故障：第 40 章"左臂尽废"被第 50 章"已痊愈"覆盖，第 87 章 AI 就会
-写他双手持剑。没有入口，AI 就无从误调；删除必须由人在别处执行。
+current_state 可覆盖，permanent_facts 只增不改：第 40 章"左臂尽废"不能被
+第 50 章"已痊愈"抹掉，否则第 87 章 AI 就会写他双手持剑。
+
+本类自己没有声明任何删除或改写 permanent_facts 的方法——这只是"这个仓储的
+操作词汇里不存在这个动作"，不是运行时沙箱或权限拦截。它和其他仓储一样继承
+自 BaseRepository，update_one / update_many / bulk_write / hard_delete_one
+等通用方法依然可以直接绕过这条规则改写甚至清空 permanent_facts；这是继承
+通用 CRUD 的正常代价，不是本类特有的漏洞，也不该被误读成"AI 无法误调"。
+真正校验、落地 AI 输出的关卡在阶段 2 服务层（extract_chapter_state_by_ai）：
+AI 只产出 JSON，由那一层解释后才会调用到这里的方法。
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
 from backend.db.collections import CHARACTER_STATES
+from backend.db.errors import NotFoundError
 from backend.db.utils import get_utc_now, to_object_id
 
 FACT_KIND_VALUES = {"death", "injury", "identity", "relation", "ability"}
@@ -82,6 +89,23 @@ class CharacterStateRepository(BaseRepository):
         )
         return str(existing["_id"])
 
+    async def _get_state(
+        self,
+        novel_id: str,
+        card_id: str,
+        session: AsyncClientSession | None = None,
+    ) -> Dict[str, Any]:
+        """按 novel_id + card_id 取状态文档，不存在时抛 NotFoundError。"""
+        state = await self.find_one(
+            {"novel_id": to_object_id(novel_id), "card_id": to_object_id(card_id)},
+            session=session,
+        )
+        if not state:
+            raise NotFoundError(
+                f"Character state for card '{card_id}' was not found"
+            )
+        return state
+
     async def append_permanent_fact(
         self,
         novel_id: str,
@@ -99,6 +123,11 @@ class CharacterStateRepository(BaseRepository):
 
         Returns:
             实际追加成功时返回 True。
+
+        Raises:
+            NotFoundError: 该角色尚无状态文档（必须先 upsert_state）。
+                没有 upsert=True 是刻意的：永久事实绝不能被静默丢弃，
+                宁可显式报错也不要凭空插入一条只有事实、没有当下状态的文档。
         """
         kind = str(fact.get("kind", ""))
         if kind not in FACT_KIND_VALUES:
@@ -112,8 +141,9 @@ class CharacterStateRepository(BaseRepository):
         if chapter_order <= 0:
             raise ValueError("chapter_order must be greater than 0")
 
+        current = await self._get_state(novel_id, card_id, session=session)
         result = await self.collection.update_one(
-            {"novel_id": to_object_id(novel_id), "card_id": to_object_id(card_id)},
+            {"_id": current["_id"]},
             {
                 "$push": {
                     "permanent_facts": {
