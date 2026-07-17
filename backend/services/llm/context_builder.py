@@ -345,6 +345,11 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         ]
         pov_id = raw_outline.get("pov_character_card_id")
         outline["pov_character_card_id"] = str(pov_id) if pov_id is not None else None
+        # threads_planted（设计 §4.1，同为 [ObjectId]）故意不在此处 str() 化：
+        # assemble_context 目前不读这个字段，转换了也是死代码。但它和上面三个
+        # 字段是同一种 BSON ObjectId，将来谁把它接进装配逻辑，必须照此处的写法
+        # 先 str() 化，否则就是重新引入这段注释本身要防的那个 bug——
+        # ObjectId != str，匹配不上任何东西，不报错，只是悄悄地永远装不进上下文。
 
     return {
         "novel": {
