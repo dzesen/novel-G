@@ -296,17 +296,23 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     if present_blocks:
         sections.append(_blob("present_cards", "\n\n".join(present_blocks)))
 
-    # permanent_facts 装配范围（设计 §5.2）分三档，本函数只实现前两档：
-    # 1）本章出场人物（上面 present_blocks 已覆盖）；
-    # 2）全书主要角色，无条件装配，不看是否出场。
-    # 第三档"次要人物被本章细纲提及时装配"未实现——不是遗漏：§4.1 的
-    # outline schema 里没有任何"被提及人物"字段（只有 present_character_card_ids），
-    # 这是设计文档自身的矛盾，本函数无权替它生造字段，留给阶段 2（设计并落地
-    # outline schema 时）一并解决。
+    # permanent_facts 装配范围（设计 §5.2）分三档：
+    # 1）本章出场人物（present_ids）；
+    # 2）全书主要角色，无条件装配，不看是否出场；
+    # 3）被本章细纲 mentioned 的次要人物（§4.1 mentioned_character_card_ids）。
     #
-    # importance 是资料卡通用字段，地点/物品/规则卡也能标 importance="main"，
-    # 必须显式限定 card_type == "character"，否则会把非角色卡也拖进这一档。
+    # 第三档是【减灾非屏障】：只在 AI 真的把某人填进 mentioned_character_card_ids
+    # 时才生效，AI 漏填则该人的既定事实静默缺席——正是本档要防的 bug。灾难性
+    # 情形（主要角色死后开口）已由第二档无条件兜住，本档只窄化到"次要死者在后文
+    # 被提及"。人可在预览里补 mentioned 名单。
+    #
+    # importance/card_type 是资料卡通用字段，第二档必须显式限定 card_type=="character"，
+    # 否则会把 importance="main" 的地点/物品卡也拖进来。
+    mentioned_ids = list(outline.get("mentioned_character_card_ids") or [])
     fact_ids = list(present_ids)
+    for card_id in mentioned_ids:
+        if card_id not in fact_ids:
+            fact_ids.append(card_id)
     for card_id, card in cards.items():
         if (
             card.get("card_type") == "character"
@@ -431,6 +437,9 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         outline = dict(raw_outline)
         outline["present_character_card_ids"] = [
             str(cid) for cid in (raw_outline.get("present_character_card_ids") or [])
+        ]
+        outline["mentioned_character_card_ids"] = [
+            str(cid) for cid in (raw_outline.get("mentioned_character_card_ids") or [])
         ]
         outline["threads_resolved"] = [
             str(tid) for tid in (raw_outline.get("threads_resolved") or [])
