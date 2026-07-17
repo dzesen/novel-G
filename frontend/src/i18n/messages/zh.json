@@ -426,6 +426,8 @@
         "item": "追踪关键物品的来源、能力与限制",
         "rule": "维护世界运行规则、代价与例外"
       },
+      "importanceMain": "主要角色",
+      "importanceSub": "次要角色",
       "createModeUnavailable": "请先保存小说，再建立与小说绑定的资料卡。",
       "newCard": "新建资料卡",
       "editing": "编辑资料卡",

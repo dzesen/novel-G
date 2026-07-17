@@ -107,6 +107,7 @@ export interface ReferenceCard {
   details: Record<string, string>;
   tags: string[];
   sort_order: number;
+  importance: "main" | "sub";
   is_deleted: boolean;
   deleted_at?: string | null;
   created_at: string;

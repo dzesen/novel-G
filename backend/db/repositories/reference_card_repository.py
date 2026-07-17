@@ -11,6 +11,10 @@ from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.utils import to_object_id
 
+# 与 §4.3 plot_threads 的 importance 词汇保持一致：主要角色的
+# permanent_facts 无条件装配（见设计 §5.2），次要角色不享受该待遇。
+CARD_IMPORTANCE_VALUES = {"main", "sub"}
+
 
 class ReferenceCardRepository(BaseRepository):
     """Store a single family of novel-scoped reference cards."""
@@ -49,6 +53,10 @@ class ReferenceCardRepository(BaseRepository):
         if not name:
             raise ValueError("Card name cannot be empty")
 
+        importance = str(data.get("importance") or "sub")
+        if importance not in CARD_IMPORTANCE_VALUES:
+            raise ValueError(f"Unsupported card importance: {importance}")
+
         obj_id = to_object_id(novel_id)
         prepared = {
             "novel_id": obj_id,
@@ -58,6 +66,7 @@ class ReferenceCardRepository(BaseRepository):
             "description": str(data.get("description", "")).strip(),
             "details": dict(data.get("details") or {}),
             "tags": list(data.get("tags") or []),
+            "importance": importance,
             "sort_order": int(data.get("sort_order") or await self._next_sort_order(obj_id, card_type, session)),
         }
         return await self.insert_one(prepared, session=session)
@@ -113,7 +122,7 @@ class ReferenceCardRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> bool:
         current = await self.get_card(novel_id, card_type, card_id, session=session)
-        allowed_fields = {"name", "subtitle", "description", "details", "tags", "sort_order"}
+        allowed_fields = {"name", "subtitle", "description", "details", "tags", "sort_order", "importance"}
         prepared = {key: value for key, value in data.items() if key in allowed_fields}
         if "name" in prepared:
             prepared["name"] = str(prepared["name"]).strip()
@@ -123,6 +132,10 @@ class ReferenceCardRepository(BaseRepository):
             prepared["details"] = dict(prepared["details"] or {})
         if "tags" in prepared:
             prepared["tags"] = list(prepared["tags"] or [])
+        if "importance" in prepared:
+            prepared["importance"] = str(prepared["importance"])
+            if prepared["importance"] not in CARD_IMPORTANCE_VALUES:
+                raise ValueError(f"Unsupported card importance: {prepared['importance']}")
         if not prepared:
             return False
         return await self.update_one({"_id": current["_id"]}, prepared, session=session)

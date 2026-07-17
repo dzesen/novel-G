@@ -426,6 +426,8 @@
         "item": "Track the origin, powers, and limits of important objects",
         "rule": "Maintain world rules, their costs, and their exceptions"
       },
+      "importanceMain": "Main Character",
+      "importanceSub": "Supporting Character",
       "createModeUnavailable": "Save the novel before creating reference cards tied to it.",
       "newCard": "New card",
       "editing": "Editing card",

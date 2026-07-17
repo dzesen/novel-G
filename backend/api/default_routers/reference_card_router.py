@@ -21,6 +21,9 @@ class ReferenceCardCreateRequest(BaseModel):
     details: Dict[str, str] = Field(default_factory=dict)
     tags: List[str] = Field(default_factory=list)
     sort_order: Optional[int] = None
+    # 用 Optional[str] 而非 Literal["main","sub"]：非法值要落到仓储层的
+    # ValueError，经 _translate_error 转成 400 + 可读消息，而不是 FastAPI 的 422。
+    importance: Optional[str] = None
 
 
 class ReferenceCardUpdateRequest(BaseModel):
@@ -30,6 +33,7 @@ class ReferenceCardUpdateRequest(BaseModel):
     details: Optional[Dict[str, str]] = None
     tags: Optional[List[str]] = None
     sort_order: Optional[int] = None
+    importance: Optional[str] = None
 
 
 def _serialize_card(card: dict) -> dict:
