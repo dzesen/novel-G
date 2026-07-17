@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import unicodedata
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,9 @@ DEFAULT_CONTEXT_TOKEN_BUDGET = 8000
 
 # 最近 K 章摘要。K=5，硬编码；配置项留到有真实数据之后（设计已确认决策）。
 RECENT_CHAPTER_COUNT = 5
+
+# other_threads 中 due 为空的 drop_rank：无截止期即无紧迫性，视作无限远，最先丢。
+_NO_DUE_DROP_RANK = -(10 ** 9)
 
 
 def _is_cjk(char: str) -> bool:
@@ -111,6 +114,37 @@ def _volume_section(volume: dict) -> "Optional[ContextSection]":
     return _blob("volume", f"本卷摘要：{volume.get('summary', '')}\n本卷弧线：{volume.get('arc', '')}")
 
 
+def _recent_chapters_section(recent: list) -> "Optional[ContextSection]":
+    """装 recent 章摘要段，每章一条可独立丢弃的 item。两模式共用（§4.2 共享 helper）。
+
+    drop_rank = order_index：最旧的 order_index 最小 → 逐项截断时最先丢。
+    """
+    items = [
+        ContextItem(text=f"第 {c['order_index']} 章：{c['summary']}", drop_rank=int(c["order_index"]))
+        for c in recent if c.get("summary")
+    ]
+    if not items:
+        return None
+    return ContextSection(name="recent_chapters", header="最近章节摘要：", items=items)
+
+
+def _thread_items(threads: list) -> "List[ContextItem]":
+    """把活跃伏笔装成 ContextItem 列表。两模式共用。
+
+    呈现顺序：due 升序、None 最后（近的先呈现给 AI）。
+    drop_rank：-(due)，None 取极小值——due 越远越先丢，None 无截止期最先丢，与呈现顺序相反。
+    返回排好序的新列表，不修改入参。
+    """
+    ordered = sorted(threads, key=lambda t: (t.get("due_chapter_order") is None, t.get("due_chapter_order") or 0))
+    return [
+        ContextItem(
+            text=f"- {t['name']}：{t.get('description', '')}",
+            drop_rank=(-(t["due_chapter_order"]) if t.get("due_chapter_order") is not None else _NO_DUE_DROP_RANK),
+        )
+        for t in ordered
+    ]
+
+
 class ChapterContext(BaseModel):
     """喂给 prompt 的上下文包。"""
 
@@ -119,7 +153,7 @@ class ChapterContext(BaseModel):
         default_factory=list,
         description="因超预算被整段丢空的段落标识；截断必须可观测",
     )
-    dropped_item_counts: dict = Field(
+    dropped_item_counts: Dict[str, int] = Field(
         default_factory=dict,
         description="部分被丢（段落未清空）的段落 -> 丢弃条目数；与 truncated_sections 互补",
     )
@@ -154,7 +188,6 @@ SECTION_PRIORITY = {
     "recent_chapters": 30,
     "other_threads": 20,       # 最先丢
 }
-NEVER_TRUNCATE = {name for name, weight in SECTION_PRIORITY.items() if weight >= 100}
 
 
 def _facts_up_to(state: dict, chapter_order: int) -> list:
@@ -171,38 +204,56 @@ def _format_facts(name: str, facts: list) -> str:
     return f"{name} 的既定事实：\n" + "\n".join(lines)
 
 
-def _truncate_to_budget(
-    sections: list, budget: int
-) -> tuple:
-    """超预算时从低优先级往高截断，返回 (保留的段落, 被丢的段落名)。
+def _truncate_to_budget(sections: list, budget: int, priority: dict) -> tuple:
+    """超预算时按 (段落优先级, item.drop_rank) 一次全局排序，逐条丢弃。
 
-    永不截断档（见 SECTION_PRIORITY 中权重 >= 100 的）即使超预算也保留：
-    宁可请求失败，也不能让 AI 在缺失既定事实的情况下写出死人复活。
+    段落优先级为主键、条目 drop_rank 为次键，段落级与条目级由此统一成一次排序。
+    优先级 >= 100 的段落永不截断（其条目不进候选）：宁可请求失败，也不能让 AI
+    在缺失既定事实的情况下写出死人复活。
 
     Args:
         sections: 已装配的段落列表。
         budget: token 预算。
+        priority: {段落名: 权重} 表；权重越小越先丢，>= 100 为永不截断。
 
     Returns:
-        (保留段落列表（保持原顺序）, 被丢弃的段落名列表)。
+        (保留段落（保持原顺序、原 header）, 整段丢空的段名列表, {部分丢弃段名: 丢弃条目数})。
     """
+    never = {name for name, weight in priority.items() if weight >= 100}
     total = sum(estimate_tokens(s.content) for s in sections)
     if total <= budget:
-        return sections, []
+        return sections, [], {}
 
-    droppable = sorted(
-        (s for s in sections if s.name not in NEVER_TRUNCATE),
-        key=lambda s: SECTION_PRIORITY.get(s.name, 0),
-    )
-    dropped: list = []
-    for section in droppable:
+    candidates = [
+        (priority.get(s.name, 0), item.drop_rank, id(item), item)
+        for s in sections
+        if s.name not in never
+        for item in s.items
+    ]
+    candidates.sort(key=lambda c: (c[0], c[1]))
+
+    dropped_ids: set = set()
+    per_section: dict = {}
+    id_to_section = {id(item): s.name for s in sections for item in s.items}
+    for _prio, _rank, item_id, item in candidates:
         if total <= budget:
             break
-        total -= estimate_tokens(section.content)
-        dropped.append(section.name)
+        total -= estimate_tokens(item.text)
+        dropped_ids.add(item_id)
+        sname = id_to_section[item_id]
+        per_section[sname] = per_section.get(sname, 0) + 1
 
-    kept = [s for s in sections if s.name not in dropped]
-    return kept, dropped
+    kept: list = []
+    fully_dropped: list = []
+    for s in sections:
+        survivors = [item for item in s.items if id(item) not in dropped_ids]
+        if s.items and not survivors and s.name not in never:
+            fully_dropped.append(s.name)
+            continue
+        kept.append(ContextSection(name=s.name, header=s.header, items=survivors))
+
+    partial = {name: count for name, count in per_section.items() if name not in fully_dropped}
+    return kept, fully_dropped, partial
 
 
 def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -> ChapterContext:
@@ -280,11 +331,9 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     if volume_section is not None:
         sections.append(volume_section)
 
-    recent = inputs.get("recent_chapters") or []
-    if recent:
-        lines = [f"第 {c['order_index']} 章：{c['summary']}" for c in recent if c.get("summary")]
-        if lines:
-            sections.append(_blob("recent_chapters", "最近章节摘要：\n" + "\n".join(lines)))
+    recent_section = _recent_chapters_section(inputs.get("recent_chapters") or [])
+    if recent_section is not None:
+        sections.append(recent_section)
 
     threads = [t for t in (inputs.get("threads") or []) if t.get("status") in ACTIVE_THREAD_STATUSES]
     # threads_resolved 存的是 ObjectId（设计 §4.1），只能按 _id 匹配。不能退回
@@ -298,19 +347,17 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         lines = [f"- {t['name']}：{t.get('description', '')}" for t in resolving]
         sections.append(_blob("threads_to_resolve", "本章需回收的伏笔：\n" + "\n".join(lines)))
     if others:
-        # 远期伏笔先丢，故按 due 升序排；due 为空的排最后。
-        others.sort(key=lambda t: (t.get("due_chapter_order") is None, t.get("due_chapter_order") or 0))
-        lines = [f"- {t['name']}：{t.get('description', '')}" for t in others]
-        sections.append(_blob("other_threads", "活跃伏笔：\n" + "\n".join(lines)))
+        sections.append(ContextSection(name="other_threads", header="活跃伏笔：", items=_thread_items(others)))
 
-    kept, dropped = _truncate_to_budget(sections, budget)
-    if dropped:
+    kept, dropped, partial = _truncate_to_budget(sections, budget, SECTION_PRIORITY)
+    if dropped or partial:
         logger.warning(
-            "上下文超预算，已截断段落 %s（预算 %s tokens）。本章将在信息不全的情况下生成。",
+            "上下文超预算，整段丢弃 %s，部分丢弃 %s（预算 %s tokens）。本章将在信息不全的情况下生成。",
             dropped,
+            partial,
             budget,
         )
-    return ChapterContext(sections=kept, truncated_sections=dropped)
+    return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
 
 
 async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
