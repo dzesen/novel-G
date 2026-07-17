@@ -92,10 +92,20 @@ class PlotThreadRepository(BaseRepository):
         query: Dict[str, Any] = {"novel_id": to_object_id(novel_id), "is_deleted": False}
         if statuses:
             query["status"] = {"$in": sorted(statuses)}
-        cursor = self.collection.find(query, session=session).sort(
-            [("due_chapter_order", 1), ("created_at", 1)]
+        cursor = self.collection.find(query, session=session).sort("created_at", 1)
+        threads = await cursor.to_list(length=None)
+        # MongoDB 的 BSON 比较序里 Null 排在 Number 之前，若直接对
+        # due_chapter_order 做 $sort: 1，没有截止章节的伏笔反而会排到最前面，
+        # 变成"最紧迫"，与装配器的预期（无 due = 最不紧迫，最先被砍）正好相反。
+        # 结果集很小（单本小说的伏笔，至多几十条），所以改在 Python 端排序，
+        # 用 (due 是否为空, due 值) 作为键，让空值稳定排在最后。
+        threads.sort(
+            key=lambda t: (
+                t.get("due_chapter_order") is None,
+                t.get("due_chapter_order") if t.get("due_chapter_order") is not None else 0,
+            )
         )
-        return await cursor.to_list(length=None)
+        return threads
 
     async def _get_thread(
         self,
