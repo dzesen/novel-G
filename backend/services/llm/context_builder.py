@@ -20,11 +20,19 @@ logger = logging.getLogger(__name__)
 # 不要在本模块重新定义 ACTIVE_THREAD_STATUSES——它已由 plot_thread_repository
 # 定义，两处各写一份必然随时间漂移。导入仓储模块不会连数据库
 # （BaseRepository.collection 是惰性 property），故本模块仍可脱离 MongoDB 测试。
-from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSES
+from backend.db.repositories.character_repository import character_repo
+from backend.db.repositories.character_state_repository import character_state_repo
+from backend.db.repositories.chapter_repository import chapter_repo
+from backend.db.repositories.novel_repository import novel_repo
+from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSES, plot_thread_repo
+from backend.db.repositories.volume_repository import volume_repo
 
 # 默认上下文预算。写到第 87 章时，"最近 K 章 + 所有活跃伏笔 + 相关卡片"
 # 必然撑爆窗口；没有预算控制，系统会在中后期以"莫名其妙的 API 报错"死掉。
 DEFAULT_CONTEXT_TOKEN_BUDGET = 8000
+
+# 最近 K 章摘要。K=5，硬编码；配置项留到有真实数据之后（设计已确认决策）。
+RECENT_CHAPTER_COUNT = 5
 
 
 def _is_cjk(char: str) -> bool:
@@ -258,3 +266,98 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
             budget,
         )
     return ChapterContext(sections=kept, truncated_sections=dropped)
+
+
+async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
+    """取出装配上下文所需的全部数据。唯一碰数据库的一层，不含逻辑。
+
+    Args:
+        novel_id: 小说 ObjectId 字符串。
+        chapter_id: 目标章节 ObjectId 字符串。
+
+    Returns:
+        供 assemble_context 消费的普通 dict，形状见本模块文档。
+    """
+    novel = await novel_repo.get_novel_by_id(novel_id)
+    chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+    volume = await volume_repo.get_volume_by_id(str(chapter["volume_id"]))
+
+    order_index = int(chapter.get("order_index") or 0)
+    all_chapters = await chapter_repo.get_chapters_by_novel(novel_id)
+    recent = [
+        {"order_index": int(c.get("order_index") or 0), "summary": c.get("summary", "")}
+        for c in all_chapters
+        if 0 < int(c.get("order_index") or 0) < order_index
+    ]
+    recent.sort(key=lambda c: c["order_index"])
+    recent = recent[-RECENT_CHAPTER_COUNT:]
+
+    card_docs = await character_repo.list_cards(novel_id, "character")
+    cards = {
+        str(card["_id"]): {
+            "name": card.get("name", ""),
+            "importance": card.get("importance", "sub"),
+            "description": card.get("description", ""),
+            "card_type": card.get("card_type", "character"),
+        }
+        for card in card_docs
+    }
+
+    state_docs = await character_state_repo.list_states(novel_id)
+    states = {
+        str(state["card_id"]): {
+            "current_state": state.get("current_state", ""),
+            "as_of_chapter_order": state.get("as_of_chapter_order", 0),
+            "permanent_facts": state.get("permanent_facts", []),
+        }
+        for state in state_docs
+    }
+
+    thread_docs = await plot_thread_repo.list_threads(
+        novel_id, statuses=ACTIVE_THREAD_STATUSES
+    )
+    threads = [
+        {
+            "_id": str(t["_id"]),
+            "name": t.get("name", ""),
+            "description": t.get("description", ""),
+            "status": t.get("status", ""),
+            "due_chapter_order": t.get("due_chapter_order"),
+        }
+        for t in thread_docs
+    ]
+
+    return {
+        "novel": {
+            "core_seed": novel.get("core_seed", ""),
+            "worldview": novel.get("worldview", ""),
+            "writing_style": novel.get("writing_style", ""),
+            "narrative_pov": novel.get("narrative_pov", ""),
+            "tone": novel.get("tone", ""),
+            "era_background": novel.get("era_background", ""),
+        },
+        "volume": {"summary": volume.get("summary", ""), "arc": volume.get("arc", "")},
+        "chapter": {"order_index": order_index, "outline": chapter.get("outline")},
+        "recent_chapters": recent,
+        "cards": cards,
+        "states": states,
+        "threads": threads,
+    }
+
+
+async def build_context(
+    novel_id: str,
+    chapter_id: str,
+    budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+) -> ChapterContext:
+    """取数 + 装配的组合入口。
+
+    Args:
+        novel_id: 小说 ObjectId 字符串。
+        chapter_id: 目标章节 ObjectId 字符串。
+        budget: token 预算。
+
+    Returns:
+        装配好的 ChapterContext。
+    """
+    return assemble_context(await fetch_context_inputs(novel_id, chapter_id), budget=budget)
