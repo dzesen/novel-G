@@ -131,7 +131,7 @@ class ChapterRepository(BaseRepository):
         update_data: Dict[str, Any],
         session: AsyncClientSession | None = None,
     ) -> bool:
-        allowed = {"title", "summary", "content", "status", "order_index", "word_count"}
+        allowed = {"title", "summary", "content", "status", "order_index", "word_count", "outline"}
         filtered = {key: value for key, value in update_data.items() if key in allowed}
         if not filtered:
             return False
