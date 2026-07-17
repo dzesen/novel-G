@@ -18,6 +18,7 @@ WORLDBOOK = "worldbook"
 FACTIONS = "factions"
 FACTION_RELATIONS = "faction_relations"
 PLOT_THREADS = "plot_threads"
+CHARACTER_STATES = "character_states"
 
 ACTIVE_COLLECTIONS = frozenset({
     NOVELS,
@@ -28,6 +29,7 @@ ACTIVE_COLLECTIONS = frozenset({
     FACTIONS,
     FACTION_RELATIONS,
     PLOT_THREADS,
+    CHARACTER_STATES,
 })
 
 # 遗留集合：仓储模块已删除，当前无任何写入方。

@@ -303,6 +303,27 @@ async def init_plot_thread_indexes():
         logger.error("初始化 plot_threads 索引失败：%s", exc)
 
 
+async def init_character_state_indexes():
+    """初始化 character_states 集合的索引。"""
+    try:
+        db = get_database()
+        states_collection = db[collections.CHARACTER_STATES]
+
+        indexes = [
+            # 每角色一条状态：两条必然互相矛盾，故在库层面就禁掉。
+            pymongo.IndexModel(
+                [("novel_id", pymongo.ASCENDING), ("card_id", pymongo.ASCENDING)],
+                unique=True,
+                name="character_states_novel_card_unique",
+            ),
+            pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
+        ]
+        await states_collection.create_indexes(indexes)
+        logger.info("成功初始化'character_states'集合的索引。")
+    except Exception as exc:
+        logger.error("初始化 character_states 索引失败：%s", exc)
+
+
 async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_novel_indexes()
@@ -312,4 +333,5 @@ async def init_all_indexes():
     await init_faction_indexes()
     await init_faction_relation_indexes()
     await init_plot_thread_indexes()
+    await init_character_state_indexes()
     # 在这里添加其他集合的索引初始化

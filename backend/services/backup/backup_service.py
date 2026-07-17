@@ -13,6 +13,7 @@ from bson import json_util
 from backend.config import get_config_value
 from backend.db.collections import (
     CHAPTERS,
+    CHARACTER_STATES,
     CHARACTERS,
     FACTION_RELATIONS,
     FACTIONS,
@@ -48,6 +49,7 @@ BACKUP_COLLECTIONS = (
     FACTIONS,
     FACTION_RELATIONS,
     PLOT_THREADS,
+    CHARACTER_STATES,
 )
 
 
