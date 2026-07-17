@@ -12,7 +12,6 @@ from bson import json_util
 
 from backend.config import get_config_value
 from backend.db.collections import (
-    ARCS,
     CHAPTERS,
     CHARACTERS,
     FACTION_RELATIONS,
@@ -39,7 +38,6 @@ MAX_BACKUP_BYTES = 100 * 1024 * 1024
 BACKUP_COLLECTIONS = (
     NOVELS,
     VOLUMES,
-    ARCS,
     CHAPTERS,
     OUTLINES,
     GENERATION_TASKS,

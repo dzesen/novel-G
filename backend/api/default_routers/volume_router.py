@@ -23,7 +23,6 @@ class UpdateVolumeRequest(BaseModel):
 
 
 class UpdateVolumeStatsRequest(BaseModel):
-    arcs_count_delta: int = 0
     chapter_count_delta: int = 0
     word_count_delta: int = 0
 
@@ -86,11 +85,10 @@ async def update_volume(volume_id: str, req: UpdateVolumeRequest):
 
 @router.patch("/{volume_id}/stats")
 async def update_volume_stats(volume_id: str, req: UpdateVolumeStatsRequest):
-    """更新卷的统计数据（arcs_count / word_count 增减）。"""
+    """更新卷的统计数据（chapter_count / word_count 增减）。"""
     try:
         success = await VolumeService.update_volume_stats(
             volume_id,
-            req.arcs_count_delta,
             req.word_count_delta,
             req.chapter_count_delta,
         )
@@ -101,7 +99,7 @@ async def update_volume_stats(volume_id: str, req: UpdateVolumeStatsRequest):
 
 @router.delete("/{volume_id}")
 async def soft_delete_volume(volume_id: str):
-    """软删除指定卷（级联软删除下属 arcs，并联动扣减小说统计）。"""
+    """软删除指定卷（级联软删除下属章节，并联动扣减小说统计）。"""
     try:
         success = await VolumeService.soft_delete_volume(volume_id)
         return {"success": success}
@@ -113,7 +111,7 @@ async def soft_delete_volume(volume_id: str):
 
 @router.post("/{volume_id}/restore")
 async def restore_volume(volume_id: str):
-    """恢复已软删除的卷（级联恢复下属 arcs，并联动回补小说统计）。"""
+    """恢复已软删除的卷（级联恢复下属章节，并联动回补小说统计）。"""
     try:
         success = await VolumeService.restore_volume(volume_id)
         return {"success": success}
@@ -127,7 +125,7 @@ async def restore_volume(volume_id: str):
 
 @router.delete("/{volume_id}/hard")
 async def hard_delete_volume(volume_id: str):
-    """彻底物理删除指定卷及其所有关联 arcs，不可恢复。"""
+    """彻底物理删除指定卷及其所有关联章节，不可恢复。"""
     try:
         stats = await VolumeService.hard_delete_volume(volume_id)
         return {"message": "Hard deleted successfully", "stats": stats}

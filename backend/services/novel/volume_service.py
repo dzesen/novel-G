@@ -76,14 +76,12 @@ class VolumeService:
     @staticmethod
     async def update_volume_stats(
         volume_id: str,
-        arcs_count_delta: int = 0,
         word_count_delta: int = 0,
         chapter_count_delta: int = 0,
     ) -> bool:
-        """更新卷统计（由下级 arcs 增删时回调使用）。"""
+        """更新卷统计（由下级章节增删时回调使用）。"""
         return await volume_repo.update_volume_stats(
             volume_id,
-            arcs_count_delta,
             word_count_delta,
             chapter_count_delta,
         )
@@ -96,11 +94,11 @@ class VolumeService:
         软删除卷 + 级联：
         1. 获取卷信息（用于联动统计扣减）
         2. 软删除该卷自身
-        3. 级联软删除该卷下所有 arcs
+        3. 级联软删除该卷下所有章节
         4. 向上联动：novels.current_volume_count - 1，novels.current_word_count 扣减该卷字数
         """
         async def _delete(session):
-            """在同一个写入单元内软删除卷、子 arcs 并扣减小说统计。"""
+            """在同一个写入单元内软删除卷、子章节并扣减小说统计。"""
             volume = await volume_repo.get_volume_by_id(volume_id, session=session)
             novel_id = str(volume["novel_id"])
             volume_word_count = volume.get("word_count", 0)
@@ -110,23 +108,11 @@ class VolumeService:
                 return False
 
             obj_id = to_object_id(volume_id)
-            arcs_repo = BaseRepository(collections.ARCS)
             chapters_repo = BaseRepository(collections.CHAPTERS)
             active_chapter_count = await chapters_repo.count_documents(
                 {"volume_id": obj_id},
                 session=session,
             )
-            arcs_deleted = await arcs_repo.update_many(
-                {"volume_id": obj_id},
-                {
-                    "is_deleted": True,
-                    "deleted_at": get_utc_now(),
-                    "deleted_with_volume_id": obj_id,
-                },
-                include_deleted=False,
-                session=session,
-            )
-            logger.info(f"级联软删除卷 {volume_id} 下 {arcs_deleted} 个 arcs")
             chapters_deleted = await chapters_repo.update_many(
                 {"volume_id": obj_id},
                 {
@@ -157,11 +143,11 @@ class VolumeService:
         """
         恢复已软删除的卷 + 级联：
         1. 恢复卷自身
-        2. 级联恢复该卷下所有 arcs
+        2. 级联恢复该卷下所有章节
         3. 向上联动：novels.current_volume_count + 1，回补字数
         """
         async def _restore(session):
-            """在同一个写入单元内恢复卷、子 arcs 并回补小说统计。"""
+            """在同一个写入单元内恢复卷、子章节并回补小说统计。"""
             obj_id = to_object_id(volume_id)
             volume = await volume_repo.find_one({"_id": obj_id}, include_deleted=True, session=session)
             if not volume or not volume.get("is_deleted", False):
@@ -174,19 +160,7 @@ class VolumeService:
             if not success:
                 return False
 
-            arcs_repo = BaseRepository(collections.ARCS)
             chapters_repo = BaseRepository(collections.CHAPTERS)
-            arcs_restored = await arcs_repo.update_many(
-                {"volume_id": obj_id, "deleted_with_volume_id": obj_id},
-                {
-                    "is_deleted": False,
-                    "deleted_at": None,
-                    "deleted_with_volume_id": None,
-                },
-                include_deleted=True,
-                session=session,
-            )
-            logger.info(f"级联恢复卷 {volume_id} 下 {arcs_restored} 个 arcs")
             chapters_restored = await chapters_repo.update_many(
                 {"volume_id": obj_id, "deleted_with_volume_id": obj_id},
                 {
@@ -217,12 +191,12 @@ class VolumeService:
         """
         物理删除卷 + 级联：
         1. 校验该卷已处于软删除状态
-        2. 级联物理删除所有关联 arcs
+        2. 级联物理删除所有关联章节
         3. 物理删除卷自身
         4. 返回删除统计
         """
         async def _delete(session):
-            """在同一个写入单元内物理删除卷及其子 arcs。"""
+            """在同一个写入单元内物理删除卷及其子章节。"""
             obj_id = to_object_id(volume_id)
 
             volume = await volume_repo.find_one({"_id": obj_id}, include_deleted=True, session=session)
@@ -233,9 +207,7 @@ class VolumeService:
 
             stats = {}
 
-            arcs_repo = BaseRepository(collections.ARCS)
             chapters_repo = BaseRepository(collections.CHAPTERS)
-            stats["arcs_deleted"] = await arcs_repo.hard_delete_many({"volume_id": obj_id}, session=session)
             stats["chapters_deleted"] = await chapters_repo.hard_delete_many(
                 {"volume_id": obj_id},
                 session=session,

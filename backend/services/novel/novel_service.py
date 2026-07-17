@@ -45,7 +45,6 @@ class NovelService:
             query = {"novel_id": obj_id}
 
             volumes_repo = BaseRepository(collections.VOLUMES)
-            arcs_repo = BaseRepository(collections.ARCS)
             chapters_repo = BaseRepository(collections.CHAPTERS)
             outlines_repo = BaseRepository(collections.OUTLINES)
             tasks_repo = BaseRepository(collections.GENERATION_TASKS)
@@ -58,7 +57,6 @@ class NovelService:
             stats = {}
 
             # 这些集合当前有的还是空仓储，统一按 novel_id 清理即可。
-            stats["arcs_deleted"] = await arcs_repo.hard_delete_many(query, session=session)
             stats["volumes_deleted"] = await volumes_repo.hard_delete_many(query, session=session)
             stats["chapters_deleted"] = await chapters_repo.hard_delete_many(query, session=session)
             stats["outlines_deleted"] = await outlines_repo.hard_delete_many(query, session=session)

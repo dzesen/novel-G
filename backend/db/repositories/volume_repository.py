@@ -72,7 +72,6 @@ class VolumeRepository(BaseRepository):
         # 默认字段
         prepared.setdefault("summary", "")
         prepared.setdefault("status", "draft")
-        prepared.setdefault("arcs_count", 0)
         prepared.setdefault("chapter_count", 0)
         prepared.setdefault("word_count", 0)
 
@@ -156,25 +155,22 @@ class VolumeRepository(BaseRepository):
 
     async def update_volume_stats(
         self, volume_id: str,
-        arcs_count_delta: int = 0,
         word_count_delta: int = 0,
         chapter_count_delta: int = 0,
         session: AsyncClientSession | None = None,
     ) -> bool:
-        """原子增减卷的统计字段（arcs_count / word_count）。
+        """原子增减卷的统计字段（chapter_count / word_count）。
 
         Args:
             volume_id: 卷 ObjectId 字符串。
-            arcs_count_delta: arcs_count 增量。
             word_count_delta: word_count 增量。
+            chapter_count_delta: chapter_count 增量。
             session: 可选 MongoDB 会话，用于事务写入。
 
         Returns:
             实际修改成功时返回 True。
         """
         increments = {}
-        if arcs_count_delta != 0:
-            increments["arcs_count"] = arcs_count_delta
         if word_count_delta != 0:
             increments["word_count"] = word_count_delta
         if chapter_count_delta != 0:

@@ -29,16 +29,17 @@ ACTIVE_COLLECTIONS = frozenset({
 })
 
 # 遗留集合：仓储模块已删除，当前无任何写入方。
-# 仍保留的原因有二：novel_service.hard_delete_novel 与 volume_service 仍按 novel_id
-# 做防御性清理；备份仍收录，以免历史库中的残留数据在恢复时被静默丢弃。
-# 去留在阶段 1 决定，见 docs/superpowers/specs/2026-07-16-ai-chapter-generation-design.md §4.2。
-ARCS = "arcs"
+# 仍保留的原因：novel_service.hard_delete_novel 仍按 novel_id 做防御性清理，
+# 备份也仍收录，以免历史库中的残留数据在恢复时被静默丢弃。
+#
+# 曾经的第四个幽灵 arcs 已于 2026-07-17 按 §4.2 方案 A 彻底清除：审计确认它在全部
+# 224 个提交里从无一处 insert，那套级联是为一个从未存在过数据的集合写的防御。
+# 余下三个未同等处置——它们的历史仓储真的写过库，老用户可能存有数据。
 OUTLINES = "outlines"
 GENERATION_TASKS = "generation_tasks"
 MEMORY_FRAGMENTS = "memory_fragments"
 
 LEGACY_COLLECTIONS = frozenset({
-    ARCS,
     OUTLINES,
     GENERATION_TASKS,
     MEMORY_FRAGMENTS,
