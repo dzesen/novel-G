@@ -135,9 +135,9 @@ class VolumeRepository(BaseRepository):
     ) -> bool:
         """
         更新卷基础信息（白名单模式）。
-        允许字段：title, summary, status, order_index
+        允许字段：title, summary, status, order_index, arc, chapter_range
         """
-        allowed_fields = {"title", "summary", "status", "order_index"}
+        allowed_fields = {"title", "summary", "status", "order_index", "arc", "chapter_range"}
         filtered = {k: v for k, v in update_data.items() if k in allowed_fields}
 
         if not filtered:
