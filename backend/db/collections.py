@@ -50,3 +50,10 @@ LEGACY_COLLECTIONS = frozenset({
 })
 
 ALL_COLLECTIONS = ACTIVE_COLLECTIONS | LEGACY_COLLECTIONS
+
+# 小说作用域集合：除 NOVELS（被删除的根记录，按 _id 删）外，其余每个集合
+# 的每条记录都挂着 novel_id，novel_service.hard_delete_novel 的级联清理
+# 必须覆盖到这里的每一个，一个不落——包括上面三个遗留幽灵集合。
+# tests/test_novel_service.py 拿它核对级联的完整性，用法与
+# BACKUP_COLLECTIONS 的覆盖测试同源。
+NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS}

@@ -290,7 +290,10 @@ async def init_plot_thread_indexes():
                 ("novel_id", pymongo.ASCENDING),
                 ("status", pymongo.ASCENDING),
             ]),
-            # 按期望回收章序排序，驱动截断优先级与欠账提醒。
+            # 按期望回收章序范围查询。截断优先级已改在 Python 端排序
+            # （见 plot_thread_repository.list_threads 的说明），此索引不再
+            # 驱动截断；保留是为阶段 2 的欠账提醒（按 due_chapter_order 找
+            # 逾期未回收的伏笔）服务。
             pymongo.IndexModel([
                 ("novel_id", pymongo.ASCENDING),
                 ("due_chapter_order", pymongo.ASCENDING),

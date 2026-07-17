@@ -86,8 +86,16 @@ class ChapterContext(BaseModel):
         return "\n\n".join(section.content for section in self.sections if section.content)
 
 
-# 截断优先级：数字越小越先被丢。与设计 §5.1 的优先级表一一对应，
-# 该表自称"本设计中最关键的一条"。
+# 截断优先级：数字越小越先被丢。与设计 §5.1 的优先级表并非一一对应——
+# 那张表共 9 档，这里只实现了 1-8 档（对应 core_settings / chapter_outline /
+# threads_to_resolve / permanent_facts / present_cards / volume /
+# recent_chapters / other_threads）。第 9 档"次要卡片（地点/物品/规则）"
+# 未实现，故意没有 "minor_cards" 这一项：fetch_context_inputs 从未查询过
+# worldbook_repo，这些卡片本就不曾进入过上下文，装了这一档只会制造"优先级表
+# 完整"的假象。原因见 fetch_context_inputs 与设计文档阶段 1 状态记录——
+# 装配"仅本章细纲引用的卡片"（设计 §5）需要 outline schema 有一个"引用了
+# 哪些非人物卡"的字段，§4.1 至今没有定义它；装配"全部卡片"又违反 §5
+# 本身的要求。留给阶段 2 补 outline schema 时一并解决。
 SECTION_PRIORITY = {
     "core_settings": 100,      # 永不截断
     "chapter_outline": 100,    # 永不截断
@@ -96,8 +104,7 @@ SECTION_PRIORITY = {
     "present_cards": 50,
     "volume": 40,
     "recent_chapters": 30,
-    "other_threads": 20,
-    "minor_cards": 10,         # 最先丢
+    "other_threads": 20,       # 最先丢
 }
 NEVER_TRUNCATE = {name for name, weight in SECTION_PRIORITY.items() if weight >= 100}
 
