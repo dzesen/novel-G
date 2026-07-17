@@ -26,6 +26,7 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSES, plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
+from backend.db.repositories.worldbook_repository import worldbook_repo
 
 # 默认上下文预算。写到第 87 章时，"最近 K 章 + 所有活跃伏笔 + 相关卡片"
 # 必然撑爆窗口；没有预算控制，系统会在中后期以"莫名其妙的 API 报错"死掉。
@@ -168,16 +169,10 @@ class ChapterContext(BaseModel):
         return "\n\n".join(section.content for section in self.sections if section.content)
 
 
-# 截断优先级：数字越小越先被丢。与设计 §5.1 的优先级表并非一一对应——
-# 那张表共 9 档，这里只实现了 1-8 档（对应 core_settings / chapter_outline /
-# threads_to_resolve / permanent_facts / present_cards / volume /
-# recent_chapters / other_threads）。第 9 档"次要卡片（地点/物品/规则）"
-# 未实现，故意没有 "minor_cards" 这一项：fetch_context_inputs 从未查询过
-# worldbook_repo，这些卡片本就不曾进入过上下文，装了这一档只会制造"优先级表
-# 完整"的假象。原因见 fetch_context_inputs 与设计文档阶段 1 状态记录——
-# 装配"仅本章细纲引用的卡片"（设计 §5）需要 outline schema 有一个"引用了
-# 哪些非人物卡"的字段，§4.1 至今没有定义它；装配"全部卡片"又违反 §5
-# 本身的要求。留给阶段 2 补 outline schema 时一并解决。
+# 截断优先级：数字越小越先被丢。九档对应设计 §5.1：core_settings /
+# chapter_outline / threads_to_resolve / permanent_facts / present_cards /
+# volume / recent_chapters / other_threads / minor_cards。第 9 档
+# minor_cards 见 §5.1 第 9 档，已实现。
 SECTION_PRIORITY = {
     "core_settings": 100,      # 永不截断
     "chapter_outline": 100,    # 永不截断
@@ -186,7 +181,8 @@ SECTION_PRIORITY = {
     "present_cards": 50,
     "volume": 40,
     "recent_chapters": 30,
-    "other_threads": 20,       # 最先丢
+    "other_threads": 20,
+    "minor_cards": 10,         # 最先丢：地点/物品/规则卡
 }
 
 
@@ -355,6 +351,17 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     if others:
         sections.append(ContextSection(name="other_threads", header="活跃伏笔：", items=_thread_items(others)))
 
+    worldbook_cards = inputs.get("worldbook_cards") or {}
+    referenced_ids = list(outline.get("referenced_worldbook_card_ids") or [])
+    minor_blocks = []
+    for card_id in referenced_ids:
+        card = worldbook_cards.get(card_id)
+        if not card:
+            continue
+        minor_blocks.append(f"{card['name']}：{card.get('description', '')}")
+    if minor_blocks:
+        sections.append(_blob("minor_cards", "相关设定：\n" + "\n".join(minor_blocks)))
+
     kept, dropped, partial = _truncate_to_budget(sections, budget, SECTION_PRIORITY)
     if dropped or partial:
         logger.warning(
@@ -401,6 +408,15 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         for card in card_docs
     }
 
+    worldbook_cards: dict = {}
+    for card_type in worldbook_repo.supported_types:
+        for card in await worldbook_repo.list_cards(novel_id, card_type):
+            worldbook_cards[str(card["_id"])] = {
+                "name": card.get("name", ""),
+                "description": card.get("description", ""),
+                "card_type": card.get("card_type", card_type),
+            }
+
     state_docs = await character_state_repo.list_states(novel_id)
     states = {
         str(state["card_id"]): {
@@ -444,6 +460,9 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         outline["threads_resolved"] = [
             str(tid) for tid in (raw_outline.get("threads_resolved") or [])
         ]
+        outline["referenced_worldbook_card_ids"] = [
+            str(cid) for cid in (raw_outline.get("referenced_worldbook_card_ids") or [])
+        ]
         pov_id = raw_outline.get("pov_character_card_id")
         outline["pov_character_card_id"] = str(pov_id) if pov_id is not None else None
         # threads_planted（设计 §4.1，同为 [ObjectId]）故意不在此处 str() 化：
@@ -465,6 +484,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         "chapter": {"order_index": order_index, "outline": outline},
         "recent_chapters": recent,
         "cards": cards,
+        "worldbook_cards": worldbook_cards,
         "states": states,
         "threads": threads,
     }
