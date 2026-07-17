@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import unicodedata
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -60,11 +60,55 @@ def estimate_tokens(text: str) -> int:
     return cjk + (rest + 3) // 4
 
 
+class ContextItem(BaseModel):
+    """段落内的一个可独立丢弃的条目。"""
+
+    text: str = Field(description="条目正文")
+    drop_rank: int = Field(default=0, description="截断排序键：同段落内越小越先丢")
+
+
 class ContextSection(BaseModel):
-    """上下文中的一段，按装配优先级排列。"""
+    """上下文中的一段，按装配优先级排列。
+
+    内容由 header + items 派生：header 是段落固定前缀（如"最近章节摘要："），
+    items 是可逐条丢弃的条目。单块段落用一个 item 承载、header 留空。
+    """
 
     name: str = Field(description="段落标识，与截断优先级表对应")
-    content: str = Field(description="段落正文")
+    header: str = Field(default="", description="段落固定前缀，随存活条目一起呈现")
+    items: List[ContextItem] = Field(default_factory=list, description="段落条目，按呈现顺序排列")
+
+    @property
+    def content(self) -> str:
+        """由 header 与存活 items 派生的段落正文。"""
+        parts = [self.header] if self.header else []
+        parts.extend(item.text for item in self.items)
+        return "\n".join(parts)
+
+
+def _blob(name: str, text: str) -> "ContextSection":
+    """造一个单条 item、无 header 的段落。"""
+    return ContextSection(name=name, items=[ContextItem(text=text)])
+
+
+def _core_settings_section(novel: dict) -> "ContextSection":
+    """装 core_settings 段。正文模式与细纲模式共用（§4.2 共享 helper），避免两处漂移。"""
+    core_lines = [
+        f"核心种子：{novel.get('core_seed', '')}",
+        f"世界观：{novel.get('worldview', '')}",
+        f"写作风格：{novel.get('writing_style', '')}",
+        f"叙事视角：{novel.get('narrative_pov', '')}",
+        f"基调：{novel.get('tone', '')}",
+        f"时代背景：{novel.get('era_background', '')}",
+    ]
+    return _blob("core_settings", "\n".join(core_lines))
+
+
+def _volume_section(volume: dict) -> "Optional[ContextSection]":
+    """装 volume 段（本卷摘要 + 弧线）；两者皆空时返回 None。两模式共用。"""
+    if not (volume.get("summary") or volume.get("arc")):
+        return None
+    return _blob("volume", f"本卷摘要：{volume.get('summary', '')}\n本卷弧线：{volume.get('arc', '')}")
 
 
 class ChapterContext(BaseModel):
@@ -73,7 +117,11 @@ class ChapterContext(BaseModel):
     sections: List[ContextSection] = Field(default_factory=list, description="按顺序排列的上下文段落")
     truncated_sections: List[str] = Field(
         default_factory=list,
-        description="因超预算被丢弃的段落标识；截断必须可观测",
+        description="因超预算被整段丢空的段落标识；截断必须可观测",
+    )
+    dropped_item_counts: dict = Field(
+        default_factory=dict,
+        description="部分被丢（段落未清空）的段落 -> 丢弃条目数；与 truncated_sections 互补",
     )
 
     @property
@@ -178,18 +226,10 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     present_ids = list(outline.get("present_character_card_ids") or [])
     sections: List[ContextSection] = []
 
-    core_lines = [
-        f"核心种子：{novel.get('core_seed', '')}",
-        f"世界观：{novel.get('worldview', '')}",
-        f"写作风格：{novel.get('writing_style', '')}",
-        f"叙事视角：{novel.get('narrative_pov', '')}",
-        f"基调：{novel.get('tone', '')}",
-        f"时代背景：{novel.get('era_background', '')}",
-    ]
-    sections.append(ContextSection(name="core_settings", content="\n".join(core_lines)))
+    sections.append(_core_settings_section(novel))
 
     if outline:
-        sections.append(ContextSection(name="chapter_outline", content=f"本章细纲：{outline}"))
+        sections.append(_blob("chapter_outline", f"本章细纲：{outline}"))
 
     # 出场人物：完整卡片 + current_state
     present_blocks = []
@@ -203,7 +243,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
             block += f"\n当下状态（截至第 {state.get('as_of_chapter_order', chapter_order)} 章）：{state['current_state']}"
         present_blocks.append(block)
     if present_blocks:
-        sections.append(ContextSection(name="present_cards", content="\n\n".join(present_blocks)))
+        sections.append(_blob("present_cards", "\n\n".join(present_blocks)))
 
     # permanent_facts 装配范围（设计 §5.2）分三档，本函数只实现前两档：
     # 1）本章出场人物（上面 present_blocks 已覆盖）；
@@ -234,19 +274,17 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         if facts:
             fact_blocks.append(_format_facts(card["name"], facts))
     if fact_blocks:
-        sections.append(ContextSection(name="permanent_facts", content="\n\n".join(fact_blocks)))
+        sections.append(_blob("permanent_facts", "\n\n".join(fact_blocks)))
 
-    if volume.get("summary") or volume.get("arc"):
-        sections.append(ContextSection(
-            name="volume",
-            content=f"本卷摘要：{volume.get('summary', '')}\n本卷弧线：{volume.get('arc', '')}",
-        ))
+    volume_section = _volume_section(volume)
+    if volume_section is not None:
+        sections.append(volume_section)
 
     recent = inputs.get("recent_chapters") or []
     if recent:
         lines = [f"第 {c['order_index']} 章：{c['summary']}" for c in recent if c.get("summary")]
         if lines:
-            sections.append(ContextSection(name="recent_chapters", content="最近章节摘要：\n" + "\n".join(lines)))
+            sections.append(_blob("recent_chapters", "最近章节摘要：\n" + "\n".join(lines)))
 
     threads = [t for t in (inputs.get("threads") or []) if t.get("status") in ACTIVE_THREAD_STATUSES]
     # threads_resolved 存的是 ObjectId（设计 §4.1），只能按 _id 匹配。不能退回
@@ -258,12 +296,12 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
 
     if resolving:
         lines = [f"- {t['name']}：{t.get('description', '')}" for t in resolving]
-        sections.append(ContextSection(name="threads_to_resolve", content="本章需回收的伏笔：\n" + "\n".join(lines)))
+        sections.append(_blob("threads_to_resolve", "本章需回收的伏笔：\n" + "\n".join(lines)))
     if others:
         # 远期伏笔先丢，故按 due 升序排；due 为空的排最后。
         others.sort(key=lambda t: (t.get("due_chapter_order") is None, t.get("due_chapter_order") or 0))
         lines = [f"- {t['name']}：{t.get('description', '')}" for t in others]
-        sections.append(ContextSection(name="other_threads", content="活跃伏笔：\n" + "\n".join(lines)))
+        sections.append(_blob("other_threads", "活跃伏笔：\n" + "\n".join(lines)))
 
     kept, dropped = _truncate_to_budget(sections, budget)
     if dropped:
