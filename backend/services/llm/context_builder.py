@@ -186,6 +186,24 @@ SECTION_PRIORITY = {
 }
 
 
+class ContextBudgetError(Exception):
+    """永不截断档自身已超预算，无法在不牺牲安全信息的前提下装配上下文。"""
+
+
+# 细纲模式的截断优先级：与正文模式不同。roster 永不截断——截了它 AI 就吐不出
+# 合法 id，是失败而非降级。没有 chapter_outline/present_cards/threads_to_resolve
+# 三段（它们是本工作流的输出）。
+OUTLINE_SECTION_PRIORITY = {
+    "core_settings": 100,     # 永不截断
+    "permanent_facts": 100,   # 永不截断——死人复活屏障
+    "roster": 100,            # 永不截断——AI 选人/选物/选伏笔的唯一来源
+    "volume": 40,
+    "recent_chapters": 30,
+    "other_threads": 20,
+}
+OUTLINE_NEVER_TRUNCATE = {name for name, weight in OUTLINE_SECTION_PRIORITY.items() if weight >= 100}
+
+
 def _facts_up_to(state: dict, chapter_order: int) -> list:
     """取 chapter_order 及之前确立的永久事实。
 
@@ -373,6 +391,94 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
 
 
+def _roster_section(roster: dict) -> ContextSection:
+    """把 roster 装成一个永不截断的段落，条目携带 id 供 AI 选中。"""
+    lines: list = []
+    for label, key in (("人物", "characters"), ("世界设定", "worldbook"), ("伏笔", "threads")):
+        entries = roster.get(key) or []
+        if not entries:
+            continue
+        lines.append(f"【{label}】可用 id 名单：")
+        for e in entries:
+            lines.append(f"- id={e['id']} {e['name']}：{e.get('brief', '')}")
+    return _blob("roster", "\n".join(lines))
+
+
+def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -> ChapterContext:
+    """细纲模式装配。纯函数，不碰数据库。
+
+    与 assemble_context（正文模式）的差异（设计 §4.2）：
+    - 加 roster（AI 选人/选物/选伏笔的名单，带 id），进永不截断档；
+    - 去掉 chapter_outline / present_cards / threads_to_resolve 三段——它们是本
+      工作流的输出，生成细纲时尚不存在。
+
+    Raises:
+        ContextBudgetError: 永不截断档（尤其 roster）自身已超预算。roster 有界
+            （见 §4.4），此为安全阀而非常态。
+    """
+    novel = inputs.get("novel") or {}
+    volume = inputs.get("volume") or {}
+    chapter = inputs.get("chapter") or {}
+    cards = inputs.get("cards") or {}
+    states = inputs.get("states") or {}
+    roster = inputs.get("roster") or {}
+    chapter_order = int(chapter.get("order_index") or 0)
+
+    sections: List[ContextSection] = []
+
+    # core_settings / recent / threads 段用与正文模式同一套共享 helper（§4.2），
+    # 只有 roster 与"去掉三段输出"是细纲模式独有。
+    sections.append(_core_settings_section(novel))
+
+    sections.append(_roster_section(roster))
+
+    # 主要角色的 permanent_facts 无条件装配（死人复活屏障，细纲阶段同样需要）。
+    # 这一段与正文模式的三档装配逻辑不同（这里只取主要角色），故不共用 helper。
+    fact_blocks = []
+    for card_id, card in cards.items():
+        if card.get("card_type") == "character" and card.get("importance") == "main":
+            state = states.get(card_id)
+            if not state:
+                continue
+            facts = _facts_up_to(state, chapter_order)
+            if facts:
+                fact_blocks.append(_format_facts(card["name"], facts))
+    if fact_blocks:
+        sections.append(_blob("permanent_facts", "\n\n".join(fact_blocks)))
+
+    volume_section = _volume_section(volume)
+    if volume_section is not None:
+        sections.append(volume_section)
+
+    recent_section = _recent_chapters_section(inputs.get("recent_chapters") or [])
+    if recent_section is not None:
+        sections.append(recent_section)
+
+    threads = [t for t in (inputs.get("threads") or []) if t.get("status") in ACTIVE_THREAD_STATUSES]
+    if threads:
+        sections.append(ContextSection(name="other_threads", header="活跃伏笔：", items=_thread_items(threads)))
+
+    # roster 有界（§4.4）：永不截断档自身超预算时报错，不静默截断。
+    never_tokens = sum(
+        estimate_tokens(s.content) for s in sections if s.name in OUTLINE_NEVER_TRUNCATE
+    )
+    if never_tokens > budget:
+        raise ContextBudgetError(
+            f"细纲上下文的永不截断档已达 {never_tokens} tokens，超出预算 {budget}；"
+            f"很可能是 roster 过大（卡片/伏笔过多）。请精简后重试。"
+        )
+
+    kept, dropped, partial = _truncate_to_budget(sections, budget, OUTLINE_SECTION_PRIORITY)
+    if dropped or partial:
+        logger.warning(
+            "细纲上下文超预算，整段丢弃 %s，部分丢弃 %s（预算 %s tokens）。",
+            dropped,
+            partial,
+            budget,
+        )
+    return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
+
+
 async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     """取出装配上下文所需的全部数据。唯一碰数据库的一层，不含逻辑。
 
@@ -471,6 +577,23 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         # 先 str() 化，否则就是重新引入这段注释本身要防的那个 bug——
         # ObjectId != str，匹配不上任何东西，不报错，只是悄悄地永远装不进上下文。
 
+    # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
+    # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。
+    roster = {
+        "characters": [
+            {"id": cid, "name": c["name"], "brief": c.get("description", "")}
+            for cid, c in cards.items()
+        ],
+        "worldbook": [
+            {"id": wid, "name": w["name"], "brief": w.get("description", "")}
+            for wid, w in worldbook_cards.items()
+        ],
+        "threads": [
+            {"id": t["_id"], "name": t["name"], "brief": t.get("description", "")}
+            for t in threads
+        ],
+    }
+
     return {
         "novel": {
             "core_seed": novel.get("core_seed", ""),
@@ -487,6 +610,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         "worldbook_cards": worldbook_cards,
         "states": states,
         "threads": threads,
+        "roster": roster,
     }
 
 
@@ -506,3 +630,12 @@ async def build_context(
         装配好的 ChapterContext。
     """
     return assemble_context(await fetch_context_inputs(novel_id, chapter_id), budget=budget)
+
+
+async def build_outline_context(
+    novel_id: str,
+    chapter_id: str,
+    budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+) -> ChapterContext:
+    """细纲模式的取数 + 装配组合入口。"""
+    return assemble_outline_context(await fetch_context_inputs(novel_id, chapter_id), budget=budget)
