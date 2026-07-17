@@ -9,10 +9,13 @@
 
 from __future__ import annotations
 
+import logging
 import unicodedata
 from typing import List
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 # 不要在本模块重新定义 ACTIVE_THREAD_STATUSES——它已由 plot_thread_repository
 # 定义，两处各写一份必然随时间漂移。导入仓储模块不会连数据库
@@ -103,6 +106,40 @@ def _facts_up_to(state: dict, chapter_order: int) -> list:
 def _format_facts(name: str, facts: list) -> str:
     lines = [f"- {f['fact']}（第 {f['chapter_order']} 章确立，{f['kind']}）" for f in facts]
     return f"{name} 的既定事实：\n" + "\n".join(lines)
+
+
+def _truncate_to_budget(
+    sections: list, budget: int
+) -> tuple:
+    """超预算时从低优先级往高截断，返回 (保留的段落, 被丢的段落名)。
+
+    永不截断档（见 SECTION_PRIORITY 中权重 >= 100 的）即使超预算也保留：
+    宁可请求失败，也不能让 AI 在缺失既定事实的情况下写出死人复活。
+
+    Args:
+        sections: 已装配的段落列表。
+        budget: token 预算。
+
+    Returns:
+        (保留段落列表（保持原顺序）, 被丢弃的段落名列表)。
+    """
+    total = sum(estimate_tokens(s.content) for s in sections)
+    if total <= budget:
+        return sections, []
+
+    droppable = sorted(
+        (s for s in sections if s.name not in NEVER_TRUNCATE),
+        key=lambda s: SECTION_PRIORITY.get(s.name, 0),
+    )
+    dropped: list = []
+    for section in droppable:
+        if total <= budget:
+            break
+        total -= estimate_tokens(section.content)
+        dropped.append(section.name)
+
+    kept = [s for s in sections if s.name not in dropped]
+    return kept, dropped
 
 
 def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -> ChapterContext:
@@ -213,4 +250,11 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         lines = [f"- {t['name']}：{t.get('description', '')}" for t in others]
         sections.append(ContextSection(name="other_threads", content="活跃伏笔：\n" + "\n".join(lines)))
 
-    return ChapterContext(sections=sections)
+    kept, dropped = _truncate_to_budget(sections, budget)
+    if dropped:
+        logger.warning(
+            "上下文超预算，已截断段落 %s（预算 %s tokens）。本章将在信息不全的情况下生成。",
+            dropped,
+            budget,
+        )
+    return ChapterContext(sections=kept, truncated_sections=dropped)
