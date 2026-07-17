@@ -278,6 +278,31 @@ async def init_faction_relation_indexes():
         logger.error(f"初始化faction_relations索引失败：{e}")
 
 
+async def init_plot_thread_indexes():
+    """初始化 plot_threads 集合的索引。"""
+    try:
+        db = get_database()
+        threads_collection = db[collections.PLOT_THREADS]
+
+        indexes = [
+            # 按状态召回活跃伏笔，装配器每章都要查。
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+            ]),
+            # 按期望回收章序排序，驱动截断优先级与欠账提醒。
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("due_chapter_order", pymongo.ASCENDING),
+            ]),
+            pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
+        ]
+        await threads_collection.create_indexes(indexes)
+        logger.info("成功初始化'plot_threads'集合的索引。")
+    except Exception as exc:
+        logger.error("初始化 plot_threads 索引失败：%s", exc)
+
+
 async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_novel_indexes()
@@ -286,4 +311,5 @@ async def init_all_indexes():
     await init_reference_card_indexes()
     await init_faction_indexes()
     await init_faction_relation_indexes()
+    await init_plot_thread_indexes()
     # 在这里添加其他集合的索引初始化

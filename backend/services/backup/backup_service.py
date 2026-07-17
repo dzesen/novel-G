@@ -20,6 +20,7 @@ from backend.db.collections import (
     MEMORY_FRAGMENTS,
     NOVELS,
     OUTLINES,
+    PLOT_THREADS,
     VOLUMES,
     WORLDBOOK,
 )
@@ -46,6 +47,7 @@ BACKUP_COLLECTIONS = (
     WORLDBOOK,
     FACTIONS,
     FACTION_RELATIONS,
+    PLOT_THREADS,
 )
 
 
