@@ -153,10 +153,23 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     if present_blocks:
         sections.append(ContextSection(name="present_cards", content="\n\n".join(present_blocks)))
 
-    # permanent_facts：出场人物 + 全部主要角色（无条件）
+    # permanent_facts 装配范围（设计 §5.2）分三档，本函数只实现前两档：
+    # 1）本章出场人物（上面 present_blocks 已覆盖）；
+    # 2）全书主要角色，无条件装配，不看是否出场。
+    # 第三档"次要人物被本章细纲提及时装配"未实现——不是遗漏：§4.1 的
+    # outline schema 里没有任何"被提及人物"字段（只有 present_character_card_ids），
+    # 这是设计文档自身的矛盾，本函数无权替它生造字段，留给阶段 2（设计并落地
+    # outline schema 时）一并解决。
+    #
+    # importance 是资料卡通用字段，地点/物品/规则卡也能标 importance="main"，
+    # 必须显式限定 card_type == "character"，否则会把非角色卡也拖进这一档。
     fact_ids = list(present_ids)
     for card_id, card in cards.items():
-        if card.get("importance") == "main" and card_id not in fact_ids:
+        if (
+            card.get("card_type") == "character"
+            and card.get("importance") == "main"
+            and card_id not in fact_ids
+        ):
             fact_ids.append(card_id)
 
     fact_blocks = []
@@ -184,8 +197,11 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
             sections.append(ContextSection(name="recent_chapters", content="最近章节摘要：\n" + "\n".join(lines)))
 
     threads = [t for t in (inputs.get("threads") or []) if t.get("status") in ACTIVE_THREAD_STATUSES]
+    # threads_resolved 存的是 ObjectId（设计 §4.1），只能按 _id 匹配。不能退回
+    # 按 name 匹配：plot_threads 的 name 没有唯一索引（见 db/indexes.py），
+    # 两条同名伏笔会被一起错误地拖进 threads_to_resolve 这一"永不截断"档。
     to_resolve = set(outline.get("threads_resolved") or [])
-    resolving = [t for t in threads if t.get("name") in to_resolve or t.get("_id") in to_resolve]
+    resolving = [t for t in threads if t.get("_id") in to_resolve]
     others = [t for t in threads if t not in resolving]
 
     if resolving:
