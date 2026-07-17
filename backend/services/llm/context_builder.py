@@ -327,6 +327,25 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         for t in thread_docs
     ]
 
+    # outline 子文档里的 id 字段是真实 BSON ObjectId（设计 §4.1），而
+    # assemble_context 拿它们去匹配上面已 str() 化的 cards/threads 主键——
+    # ObjectId 与 str 用 == 恒不相等，不转换的话 present_cards、
+    # threads_to_resolve（后者还是永不截断档）会静默地永远装不进内容。
+    # 阶段 2 之前没有代码会写 chapter.outline，所以这里必须兜住 None；
+    # 复制成新 dict 再改，不动 chapter 里读出来的原始子文档。
+    raw_outline = chapter.get("outline")
+    outline = None
+    if raw_outline:
+        outline = dict(raw_outline)
+        outline["present_character_card_ids"] = [
+            str(cid) for cid in (raw_outline.get("present_character_card_ids") or [])
+        ]
+        outline["threads_resolved"] = [
+            str(tid) for tid in (raw_outline.get("threads_resolved") or [])
+        ]
+        pov_id = raw_outline.get("pov_character_card_id")
+        outline["pov_character_card_id"] = str(pov_id) if pov_id is not None else None
+
     return {
         "novel": {
             "core_seed": novel.get("core_seed", ""),
@@ -337,7 +356,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             "era_background": novel.get("era_background", ""),
         },
         "volume": {"summary": volume.get("summary", ""), "arc": volume.get("arc", "")},
-        "chapter": {"order_index": order_index, "outline": chapter.get("outline")},
+        "chapter": {"order_index": order_index, "outline": outline},
         "recent_chapters": recent,
         "cards": cards,
         "states": states,
