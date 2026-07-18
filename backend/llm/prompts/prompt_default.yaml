@@ -355,3 +355,31 @@ create_factions_by_ai:
         }}
       ]
     }}
+
+# 分卷大纲 Prompt 配置
+create_volume_outline_by_ai:
+  volume_outline_prompt_base: |
+    你是一位资深长篇小说结构编辑。请依据下面的小说设定，把全书 {number_of_chapters} 章
+    划分为若干卷，产出分卷大纲。
+
+    【小说设定】
+    标题：{title}
+    类型：{genre}
+    基调：{tone}
+    核心创意：{core_idea}
+    故事核心：{core_seed}
+    简介：{summary}
+    世界观：{worldview}
+    主线剧情：{plot}
+
+    要求：
+    - 卷数依据剧情节奏自定（通常 3-8 卷），每卷有清晰的起承转合。
+    - 每卷给出：卷标题、本卷剧情摘要、本卷弧线（arc）、覆盖的章节区间 chapter_range{{start,end}}。
+    - **章节区间必须以全书章号连续覆盖 1..{number_of_chapters}，互不重叠、无缝隙**：
+      首卷从第 1 章起，每卷 start = 上一卷 end + 1，末卷 end = {number_of_chapters}。
+  volume_outline_prompt_with_schema_suffix: |
+    请严格按提供的 JSON Schema 输出，volumes 数组按章序递增排列。
+  volume_outline_prompt_without_schema_suffix: |
+    请只输出 JSON，形如：
+    {"volumes":[{"title":"第一卷 ...","summary":"...","arc":"...","chapter_range":{"start":1,"end":20}}]}
+    不要输出 JSON 以外的任何内容。

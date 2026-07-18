@@ -115,3 +115,9 @@ llm:
         create_core_factions:
           provider: openai_gpt4o_mini
           timeout_seconds: null
+    create_volume_outline_by_ai:
+      default_provider: openai_gpt4o_mini
+      steps:
+        volume_outline:
+          provider: openai_gpt4o_mini
+          timeout_seconds: null

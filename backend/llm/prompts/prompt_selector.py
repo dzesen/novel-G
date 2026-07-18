@@ -23,6 +23,7 @@ DEFAULT_PROMPT_FILENAME = "prompt_default.yaml"
 WORKFLOW_NAME = "create_novel_by_ai"
 REWRITE_NOVEL_FIELD_PROMPT_NAME = "rewrite_novel_field"
 CORE_FACTIONS_PROMPT_NAME = "create_factions_by_ai"
+VOLUME_OUTLINE_PROMPT_NAME = "create_volume_outline_by_ai"
 LLM_PROVIDER_TEST_PROMPT_NAME = "llm_provider_test"
 
 DEFAULT_PROMPT_PATH = PROMPT_DIR / DEFAULT_PROMPT_FILENAME
@@ -55,6 +56,12 @@ REQUIRED_CORE_FACTIONS_PROMPT_KEYS: tuple[str, ...] = (
     "create_core_factions_prompt_without_schema_suffix",
 )
 
+REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS: tuple[str, ...] = (
+    "volume_outline_prompt_base",
+    "volume_outline_prompt_with_schema_suffix",
+    "volume_outline_prompt_without_schema_suffix",
+)
+
 REQUIRED_LLM_PROVIDER_TEST_PROMPT_KEYS: tuple[str, ...] = (
     "text_probe_prompt",
     "stream_probe_prompt",
@@ -67,6 +74,7 @@ REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
     WORKFLOW_NAME: REQUIRED_CREATE_NOVEL_PROMPT_KEYS,
     REWRITE_NOVEL_FIELD_PROMPT_NAME: REQUIRED_REWRITE_NOVEL_FIELD_PROMPT_KEYS,
     CORE_FACTIONS_PROMPT_NAME: REQUIRED_CORE_FACTIONS_PROMPT_KEYS,
+    VOLUME_OUTLINE_PROMPT_NAME: REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS,
 }
 
 PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
@@ -118,6 +126,17 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "tags_json",
     },
     "function_result_probe_prompt": {"probe_token", "tool_result"},
+    "volume_outline_prompt_base": {
+        "number_of_chapters",
+        "title",
+        "genre",
+        "tone",
+        "core_idea",
+        "core_seed",
+        "summary",
+        "worldview",
+        "plot",
+    },
 }
 
 logger = logging.getLogger(__name__)
