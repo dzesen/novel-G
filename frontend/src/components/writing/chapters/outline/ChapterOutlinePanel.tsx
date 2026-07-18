@@ -80,8 +80,16 @@ export default function ChapterOutlinePanel({
 
   const discardPreview = () => {
     setDirty(false);
+    setRegenerateArmed(false);
     stream.reset();
   };
+
+  // 二次确认必须"一次只放行一次生成"。丢弃预览或生成失败都会让面板退回到
+  // "只显示已接受的细纲"那个状态，此时若 armed 还留着 true，下一次就变成一键
+  // 直接重新生成——保险栓等于白装。故凡是退回只读态，都重新上栓。
+  useEffect(() => {
+    if (stream.status === "error") setRegenerateArmed(false);
+  }, [stream.status]);
 
   const accept = async () => {
     if (!outline) return;
@@ -124,7 +132,12 @@ export default function ChapterOutlinePanel({
                 {t("cancel")}
               </Button>
             ) : existingOutline && !outline && !regenerateArmed ? (
-              <Button variant="outline" size="sm" onPress={() => setRegenerateArmed(true)}>
+              <Button
+                variant="outline"
+                size="sm"
+                onPress={() => setRegenerateArmed(true)}
+                isDisabled={busy}
+              >
                 {t("regenerate")}
               </Button>
             ) : (
