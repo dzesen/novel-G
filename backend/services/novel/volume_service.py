@@ -115,6 +115,9 @@ class VolumeService:
                     for n in range(start, end + 1)
                 ]
                 await chapters_repo.insert_many(stub_docs, session=session)
+                await volume_repo.update_volume_stats(
+                    volume_id, chapter_count_delta=len(stub_docs), session=session
+                )
                 total_chapters += len(stub_docs)
 
             await novel_repo.increment_novel_stats(
