@@ -20,6 +20,7 @@ interface ChapterEditorPaneProps {
   onDelete: () => Promise<void>;
   onExport: () => void;
   onExportNovel: () => void;
+  onOpenChapterOutline: () => void;
 }
 
 function SaveStateLabel({ state }: { state: ChapterSaveState }) {
@@ -47,8 +48,10 @@ export default function ChapterEditorPane({
   onDelete,
   onExport,
   onExportNovel,
+  onOpenChapterOutline,
 }: ChapterEditorPaneProps) {
   const t = useTranslations("writing.chapterEditor");
+  const tOutline = useTranslations("writing.outline");
   const [showSummary, setShowSummary] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -121,6 +124,13 @@ export default function ChapterEditorPane({
             aria-label={t("chapterTitle")}
           />
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onOpenChapterOutline}
+              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              {tOutline("chapterTitle")}
+            </button>
             <button
               type="button"
               onClick={onExportNovel}

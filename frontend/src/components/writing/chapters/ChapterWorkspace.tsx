@@ -20,6 +20,7 @@ import {
   saveLocalChapterDraft,
 } from "./chapterUtils";
 import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
+import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -45,6 +46,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [chapterLoadError, setChapterLoadError] = useState(false);
   const [saveState, setSaveState] = useState<ChapterSaveState>("idle");
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
+  const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(null);
@@ -356,6 +358,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         onDelete={deleteChapter}
         onExport={exportChapter}
         onExportNovel={() => void exportNovel()}
+        onOpenChapterOutline={() => setChapterOutlineOpen(true)}
       />
 
       {volumeOutlineOpen && novelId && (
@@ -363,6 +366,15 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
           novelId={novelId}
           onClose={() => setVolumeOutlineOpen(false)}
           onAccepted={() => void loadStructure()}
+        />
+      )}
+
+      {chapterOutlineOpen && novelId && selectedChapterId && (
+        <ChapterOutlinePanel
+          novelId={novelId}
+          chapterId={selectedChapterId}
+          onClose={() => setChapterOutlineOpen(false)}
+          onAccepted={() => selectedChapterId && void loadChapter(selectedChapterId)}
         />
       )}
 
