@@ -391,6 +391,72 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
 
 
+def build_roster(cards: dict, worldbook_cards: dict, threads: list) -> dict:
+    """由已取到的卡片/伏笔构造 roster（AI 可选中的 id 名单）。纯函数，无 IO。
+
+    抽成共享函数是因为它有**两个**调用方：预览侧的 fetch_context_inputs（用它
+    已经查到的数据，不额外查库）与 accept 侧的 fetch_roster（自己查库）。
+    两处各写一份必然漂移，而漂移的表现是"预览通过的 payload 在 accept 被拒"——
+    一个用户完全无法自救的失败。
+
+    Args:
+        cards: {id 字符串: {"name", "description", ...}} 人物卡。
+        worldbook_cards: 同上，世界卡（地点/物品/规则）。
+        threads: [{"_id" 字符串, "name", "description", ...}] 活跃伏笔。
+
+    Returns:
+        {"characters": [...], "worldbook": [...], "threads": [...]}，每项 {id, name, brief}。
+    """
+    return {
+        "characters": [
+            {"id": cid, "name": card["name"], "brief": card.get("description", "")}
+            for cid, card in cards.items()
+        ],
+        "worldbook": [
+            {"id": wid, "name": card["name"], "brief": card.get("description", "")}
+            for wid, card in worldbook_cards.items()
+        ],
+        "threads": [
+            {"id": thread["_id"], "name": thread["name"], "brief": thread.get("description", "")}
+            for thread in threads
+        ],
+    }
+
+
+async def fetch_roster(novel_id: str) -> dict:
+    """只取 roster 所需的数据并构造 roster（accept 侧的 id 存在性校验用）。
+
+    伏笔只取 ACTIVE_THREAD_STATUSES，与 fetch_context_inputs 一致——accept 侧
+    看到的名单必须与预览侧**完全相同**。若一条伏笔在预览之后被回收，accept
+    会因此报错：那是正确行为（可见的失败），不是应该放宽的地方。
+    """
+    card_docs = await character_repo.list_cards(novel_id, "character")
+    cards = {
+        str(card["_id"]): {"name": card.get("name", ""), "description": card.get("description", "")}
+        for card in card_docs
+    }
+
+    worldbook_cards: dict = {}
+    for card_type in worldbook_repo.supported_types:
+        for card in await worldbook_repo.list_cards(novel_id, card_type):
+            worldbook_cards[str(card["_id"])] = {
+                "name": card.get("name", ""),
+                "description": card.get("description", ""),
+            }
+
+    thread_docs = await plot_thread_repo.list_threads(novel_id, statuses=ACTIVE_THREAD_STATUSES)
+    threads = [
+        {
+            "_id": str(thread["_id"]),
+            "name": thread.get("name", ""),
+            "description": thread.get("description", ""),
+        }
+        for thread in thread_docs
+    ]
+
+    return build_roster(cards, worldbook_cards, threads)
+
+
 def _roster_section(roster: dict) -> ContextSection:
     """把 roster 装成一个永不截断的段落，条目携带 id 供 AI 选中。"""
     lines: list = []
@@ -579,20 +645,8 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
 
     # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
     # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。
-    roster = {
-        "characters": [
-            {"id": cid, "name": c["name"], "brief": c.get("description", "")}
-            for cid, c in cards.items()
-        ],
-        "worldbook": [
-            {"id": wid, "name": w["name"], "brief": w.get("description", "")}
-            for wid, w in worldbook_cards.items()
-        ],
-        "threads": [
-            {"id": t["_id"], "name": t["name"], "brief": t.get("description", "")}
-            for t in threads
-        ],
-    }
+    # 形状由 build_roster 统一定义，accept 侧的 fetch_roster 用同一个函数。
+    roster = build_roster(cards, worldbook_cards, threads)
 
     return {
         "novel": {

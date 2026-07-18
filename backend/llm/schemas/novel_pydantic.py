@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
@@ -262,4 +262,54 @@ class VolumeOutlineResultSchema(BaseModel):
 
     volumes: list[VolumeOutlineItemSchema] = Field(
         ..., min_length=1, max_length=50, description="分卷列表，按章序递增"
+    )
+
+
+class SceneSchema(BaseModel):
+    """章内一场戏。"""
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(..., min_length=1, max_length=500, description="这一场发生了什么")
+    purpose: str = Field(..., min_length=1, max_length=200, description="这一场在全局的作用")
+
+
+class NewThreadSchema(BaseModel):
+    """细纲提议的新伏笔。**无 id**——伏笔尚不存在，accept 时创建并把 id 回填进
+    chapter.outline.threads_planted（设计 §3.2）。伏笔表在此之前没有任何创建入口。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=100, description="伏笔名")
+    description: str = Field(default="", max_length=1000, description="伏笔说明")
+    due_chapter_order: Optional[int] = Field(
+        default=None, ge=1, description="预计回收章序（全书章号）；null 表示尚未确定"
+    )
+    importance: Literal["main", "sub"] = Field(default="sub", description="伏笔重要度")
+
+
+class ChapterOutlineResultSchema(BaseModel):
+    """AI 章节细纲生成结果（**LLM 输出 schema，非存储 schema**，见设计 §3.2）。
+
+    与库里 chapter.outline 的三处系统性差异：
+    - id 字段在这里是**字符串**，落库时转 ObjectId；
+    - **没有** threads_planted——它由 accept 创建 new_threads 后回填；
+    - **没有** generated_at / edited_by_human——服务端赋值。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    pov_character_card_id: Optional[str] = Field(default=None, description="视角人物卡 id")
+    present_character_card_ids: List[str] = Field(default_factory=list, description="本章出场人物卡 id")
+    mentioned_character_card_ids: List[str] = Field(
+        default_factory=list, description="本章被提及但不出场的人物卡 id"
+    )
+    referenced_worldbook_card_ids: List[str] = Field(
+        default_factory=list, description="本章引用的地点/物品/规则卡 id（worldbook 集合，非 characters）"
+    )
+    scenes: List[SceneSchema] = Field(..., min_length=1, max_length=20, description="本章场景序列")
+    core_conflict: str = Field(..., min_length=1, max_length=500, description="本章核心冲突")
+    ending_hook: str = Field(..., min_length=1, max_length=500, description="章末钩子")
+    target_word_count: int = Field(..., ge=100, le=50000, description="本章目标字数")
+    threads_resolved: List[str] = Field(default_factory=list, description="本章回收的伏笔 id")
+    new_threads: List[NewThreadSchema] = Field(
+        default_factory=list, max_length=10, description="本章新埋下的伏笔（尚无 id）"
     )
