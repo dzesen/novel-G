@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, List
 
+from pydantic import ValidationError
+
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db import collections
@@ -8,6 +10,7 @@ from backend.db.base import BaseRepository
 from backend.db.errors import DuplicateKeyError
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import to_object_id, get_utc_now
+from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
 from backend.services.novel.outline_validation import validate_chapter_ranges
 
 logger = logging.getLogger(__name__)
@@ -74,7 +77,15 @@ class VolumeService:
         novel = await novel_repo.get_novel_by_id(novel_id)
         number_of_chapters = int(novel.get("number_of_chapters") or 0)
 
-        # 层 1：前置全校验，必须在第一次写之前。
+        # 层 1：前置全校验，必须在第一次写之前。先用严格 schema 校验整份 payload
+        # （title/summary/arc/chapter_range 形状，extra="forbid"），
+        # 再用 validate_chapter_ranges 做 schema 做不到的跨卷覆盖 1..N 检查。
+        # 顺序不能反：schema 校验通过后，_build 里的 vol["title"] 等字段访问才安全。
+        try:
+            VolumeOutlineResultSchema.model_validate({"volumes": volumes})
+        except ValidationError as exc:
+            raise ValueError(f"分卷数据非法，未做任何写入：{exc}") from exc
+
         problems = validate_chapter_ranges(volumes, number_of_chapters)
         if problems:
             raise ValueError("分卷区间非法，未做任何写入：" + "；".join(problems))
@@ -85,51 +96,59 @@ class VolumeService:
             created_volume_ids: List[str] = []
             total_chapters = 0
             chapters_repo = BaseRepository(collections.CHAPTERS)
-            for order_index, vol in enumerate(volumes, start=1):
-                rng = vol["chapter_range"]
-                start, end = int(rng["start"]), int(rng["end"])
-                volume_id = await volume_repo.create_volume(
-                    {
-                        "novel_id": novel_id,
-                        "title": vol["title"],
-                        "summary": vol.get("summary", ""),
-                        "arc": vol.get("arc", ""),
-                        "chapter_range": {"start": start, "end": end},
-                        "order_index": order_index,
-                    },
+            try:
+                for order_index, vol in enumerate(volumes, start=1):
+                    rng = vol["chapter_range"]
+                    start, end = int(rng["start"]), int(rng["end"])
+                    volume_id = await volume_repo.create_volume(
+                        {
+                            "novel_id": novel_id,
+                            "title": vol["title"],
+                            "summary": vol.get("summary", ""),
+                            "arc": vol.get("arc", ""),
+                            "chapter_range": {"start": start, "end": end},
+                            "order_index": order_index,
+                        },
+                        session=session,
+                    )
+                    created_volume_ids.append(volume_id)
+                    # 层 3：批量建存根，一次 insert_many 而非逐章 insert_one。
+                    stub_docs = [
+                        {
+                            "novel_id": novel_obj_id,
+                            "volume_id": to_object_id(volume_id),
+                            "title": f"第{n}章",
+                            "order_index": n,  # 全书章号（见计划建模决策）
+                            "status": "draft",
+                            "summary": "",
+                            "content": "",
+                            "word_count": 0,
+                        }
+                        for n in range(start, end + 1)
+                    ]
+                    await chapters_repo.insert_many(stub_docs, session=session)
+                    await volume_repo.update_volume_stats(
+                        volume_id, chapter_count_delta=len(stub_docs), session=session
+                    )
+                    total_chapters += len(stub_docs)
+
+                await novel_repo.increment_novel_stats(
+                    novel_id,
+                    {"current_volume_count": len(created_volume_ids), "current_chapter_count": total_chapters},
                     session=session,
                 )
-                created_volume_ids.append(volume_id)
-                # 层 3：批量建存根，一次 insert_many 而非逐章 insert_one。
-                stub_docs = [
-                    {
-                        "novel_id": novel_obj_id,
-                        "volume_id": to_object_id(volume_id),
-                        "title": f"第{n}章",
-                        "order_index": n,  # 全书章号（见计划建模决策）
-                        "status": "draft",
-                        "summary": "",
-                        "content": "",
-                        "word_count": 0,
-                    }
-                    for n in range(start, end + 1)
-                ]
-                await chapters_repo.insert_many(stub_docs, session=session)
-                await volume_repo.update_volume_stats(
-                    volume_id, chapter_count_delta=len(stub_docs), session=session
+                return {
+                    "volume_count": len(created_volume_ids),
+                    "chapter_count": total_chapters,
+                    "volume_ids": created_volume_ids,
+                }
+            except Exception:
+                # 层 4：中途失败精确上报已建内容，不谎报回滚（设计 §7.2/§7.6）。
+                logger.error(
+                    "accept_volume_outline 中途失败：novel_id=%s 已建 %s 卷 / %s 章（非原子，未回滚）",
+                    novel_id, len(created_volume_ids), total_chapters,
                 )
-                total_chapters += len(stub_docs)
-
-            await novel_repo.increment_novel_stats(
-                novel_id,
-                {"current_volume_count": len(created_volume_ids), "current_chapter_count": total_chapters},
-                session=session,
-            )
-            return {
-                "volume_count": len(created_volume_ids),
-                "chapter_count": total_chapters,
-                "volume_ids": created_volume_ids,
-            }
+                raise
 
         # 层 2：run_mongo_write_unit(auto)——单机降级顺序写、副本集白捡原子性。
         return await run_mongo_write_unit(_build, "accept_volume_outline")

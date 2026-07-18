@@ -51,6 +51,7 @@ async def accept_volume_outline(novel_id: str, req: AcceptVolumeOutlineRequest):
     """接受分卷大纲预览：建卷 + 按 chapter_range 建章存根。小说已有卷时 409（设计 §7.3）。"""
     try:
         # 409 前置守卫：文案必须指路（设计 §7.3）。
+        # 用未删卷计数（非 has_volumes 的含软删计数）：垃圾桶里的软删卷不应挡住重建（设计 §7.3）。
         existing = await VolumeService.get_volumes_by_novel(novel_id)
         if existing:
             raise HTTPException(
@@ -63,6 +64,8 @@ async def accept_volume_outline(novel_id: str, req: AcceptVolumeOutlineRequest):
         raise
     except NotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except DuplicateKeyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except (ValueError, InvalidIdError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
