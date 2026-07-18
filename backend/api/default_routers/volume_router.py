@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, List, Optional
 
 from backend.services.novel.volume_service import VolumeService
 from backend.db.errors import NotFoundError, InvalidIdError, DuplicateKeyError
@@ -27,6 +27,10 @@ class UpdateVolumeStatsRequest(BaseModel):
     word_count_delta: int = 0
 
 
+class AcceptVolumeOutlineRequest(BaseModel):
+    volumes: List[dict]
+
+
 @router.post("/create")
 async def create_volume(req: CreateVolumeRequest):
     """创建一个新卷，挂载到指定小说下。"""
@@ -38,6 +42,27 @@ async def create_volume(req: CreateVolumeRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except DuplicateKeyError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except (ValueError, InvalidIdError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/novel/{novel_id}/accept-outline")
+async def accept_volume_outline(novel_id: str, req: AcceptVolumeOutlineRequest):
+    """接受分卷大纲预览：建卷 + 按 chapter_range 建章存根。小说已有卷时 409（设计 §7.3）。"""
+    try:
+        # 409 前置守卫：文案必须指路（设计 §7.3）。
+        existing = await VolumeService.get_volumes_by_novel(novel_id)
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"该小说已有 {len(existing)} 卷，请先清空卷（可在垃圾桶恢复）后重试",
+            )
+        result = await VolumeService.accept_volume_outline(novel_id, req.volumes)
+        return result
+    except HTTPException:
+        raise
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except (ValueError, InvalidIdError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
