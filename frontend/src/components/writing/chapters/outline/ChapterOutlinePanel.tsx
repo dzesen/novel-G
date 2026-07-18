@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiPost } from "@/lib/api";
@@ -53,11 +53,18 @@ export default function ChapterOutlinePanel({
     stream.setResult((current) => (current ? { ...current, ...next } : current));
   };
 
-  // dirty 描述的是"**当前这份**细纲有没有被人动过"，所以任何一份新细纲顶替旧的时候
-  // 都必须清掉它。漏了这一步，"改一处 → 重新生成 → 直接接受"会把一份人类从未看过的
-  // AI 产物标成 edited_by_human=true，而这个字段的唯一用途就是回答"这份细纲经没经过人手"。
-  const startGeneration = () => {
+  // dirty 描述的是"**当前这份**细纲有没有被人动过"，所以只在真有新细纲顶替旧的那一刻
+  // 清掉它——即 resultVersion 前进的那一刻，而不是"点了生成"的那一刻。
+  //
+  // 两个方向都会错，两个都踩过：
+  // - 永不清零 → "改一处 → 重新生成 → 直接接受"把人类从未看过的 AI 产物标成已人工编辑；
+  // - 点击时就清零 → 生成被取消或失败时屏幕上留着的仍是那份改过的旧细纲（start 刻意
+  //   不清 result），却已被标成未编辑，接受时反过来漏报。
+  useEffect(() => {
     setDirty(false);
+  }, [stream.resultVersion]);
+
+  const startGeneration = () => {
     void stream.start({
       novel_id: novelId,
       chapter_id: chapterId,

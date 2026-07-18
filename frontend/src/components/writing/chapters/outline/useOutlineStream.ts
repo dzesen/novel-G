@@ -25,6 +25,16 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
   const [droppedIds, setDroppedIds] = useState<DroppedIds | null>(null);
   const [error, setError] = useState("");
+  // 每当**流**送来一份新结果就 +1；调用方经 setResult 自己改内容时不动。
+  // 消费方用它判断"手上这份是不是刚换的新货"——不能用"点了生成"来判断，
+  // 因为生成可能被取消或失败，那时屏幕上留着的仍是旧的那一份（见 start 里
+  // 刻意不清 result 的注释）。
+  const [resultVersion, setResultVersion] = useState(0);
+
+  const acceptStreamResult = useCallback((next: T) => {
+    setResult(next);
+    setResultVersion((current) => current + 1);
+  }, []);
 
   const abortRef = useRef<AbortController | null>(null);
   // 单调递增的"第几轮"标记：只被 start() 推进，cancel() 不动它。
@@ -97,7 +107,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
                 setError(typeof data.error === "string" ? data.error : "生成失败");
                 setStatus("error");
               } else if (data.status === "done" && data.data) {
-                setResult(data.data as T);
+                acceptStreamResult(data.data as T);
               }
               return;
             }
@@ -106,7 +116,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
               if (data.success) {
                 const bag = data.result as Record<string, unknown> | undefined;
                 const produced = bag?.[stepKey];
-                if (produced) setResult(produced as T);
+                if (produced) acceptStreamResult(produced as T);
                 setStatus("done");
               } else {
                 const failed = typeof data.failed_step === "string" ? data.failed_step : stepKey;
@@ -142,8 +152,19 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [cancel, path, stepKey]
+    [acceptStreamResult, cancel, path, stepKey]
   );
 
-  return { status, result, contextReport, droppedIds, error, start, cancel, reset, setResult };
+  return {
+    status,
+    result,
+    resultVersion,
+    contextReport,
+    droppedIds,
+    error,
+    start,
+    cancel,
+    reset,
+    setResult,
+  };
 }
