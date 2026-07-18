@@ -27,6 +27,12 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
   const [error, setError] = useState("");
 
   const abortRef = useRef<AbortController | null>(null);
+  // 单调递增的"第几轮"标记：只被 start() 推进，cancel() 不动它。
+  // 用它而不是直接比 abortRef.current，是因为 cancel() 会把 abortRef.current
+  // 置 null——单纯取消而不重启的这一轮，此时 abortRef.current 和"被下一轮取代"
+  // 长得一模一样（都是与 controller 不相等），但前者仍要正常收到 idle，
+  // 后者才必须被挡住。runIdRef 只在真正开新一轮时前进，能把两者分开。
+  const runIdRef = useRef(0);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();
@@ -50,6 +56,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
       cancel();
       const controller = new AbortController();
       abortRef.current = controller;
+      const runId = ++runIdRef.current;
 
       setStatus("running");
       setError("");
@@ -63,6 +70,11 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
           path,
           payload,
           (event, data) => {
+            // abort() 是异步的：调用时已经排队的 chunk 仍会触发这个回调。
+            // 若 runIdRef 已经前进到更新的一轮，说明本轮已被取代，不能再写
+            // result/contextReport/droppedIds 等状态覆盖新一轮的结果。
+            if (runIdRef.current !== runId) return;
+
             if (event === "context") {
               // 设计 §7.1：截断在 LLM 调用之前就已知，必须**立刻**渲染。
               // 攒到结束才显示，等于把后端专门前置这一帧的设计抵消掉。
@@ -106,6 +118,19 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
           controller.signal
         );
       } catch (err) {
+        // abort() 不会同步中断挂起的 await：旧一轮的 reader.read() 会在
+        // 稍后的微任务里才 reject。若 runIdRef 已经前进到更新的一轮，说明本轮
+        // 已被取代，任何状态写入（包括下面的 idle/error）都必须跳过，否则会把
+        // 已经 done 的新一轮结果又拨回 idle/error。
+        //
+        // 这里特意不用 `abortRef.current !== controller` 来判断：cancel() 会把
+        // abortRef.current 置 null，单纯取消不重启的这一轮和"被下一轮取代"在
+        // abortRef.current 上长得一样，会把前者也错误地挡住，导致面板上直接绑
+        // stream.cancel 的取消按钮永远卡在 running（见 Task 4 VolumeOutlinePanel
+        // 的取消按钮）。runIdRef 只在 start() 里前进，cancel() 不动它，才能把
+        // "单纯取消" 和 "被取代" 分开。
+        if (runIdRef.current !== runId) return;
+
         // 主动取消不是错误：AbortError 只把状态收回 idle。
         if (err instanceof DOMException && err.name === "AbortError") {
           setStatus("idle");
