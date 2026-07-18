@@ -32,12 +32,19 @@ from backend.services.llm.context_builder import (
     fetch_context_inputs,
 )
 from backend.services.llm.format_review_service import validate_and_fix_format
-from backend.services.llm.workflow_runner import WorkflowDeps, WorkflowStep, run_workflow
+from backend.services.llm.workflow_runner import (
+    WorkflowDeps,
+    WorkflowStep,
+    parse_sse_event,
+    run_workflow,
+    sse_event,
+)
 from backend.services.llm.workflow_service import (
     get_llm_service_for_step,
     resolve_provider_for_step,
     resolve_timeout_for_step,
 )
+from backend.services.novel.outline_validation import validate_outline_ids
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
 logger = logging.getLogger(__name__)
@@ -135,6 +142,38 @@ def _safe(novel: dict, field: str, fallback: str = "未提供") -> str:
     return str(value or "").strip() or fallback
 
 
+def _extract_chapter_outline(parsed) -> Optional[dict]:
+    """从一帧解析结果里取出细纲数据；该帧不携带细纲则返回 None。
+
+    **两类**帧携带它：单步的 step done（data 直接是细纲）与工作流 done
+    （result.chapter_outline）。两处都要清洗——只清 done 的话，前端按 step 帧
+    缓存/续跑时用的仍是未校验的原始 id。
+    """
+    if parsed is None:
+        return None
+    event, data = parsed
+    if event == "step" and data.get("step") == "chapter_outline" and data.get("status") == "done":
+        outline = data.get("data")
+        return outline if isinstance(outline, dict) else None
+    if event == "done" and data.get("success") and isinstance(data.get("result"), dict):
+        outline = data["result"].get("chapter_outline")
+        return outline if isinstance(outline, dict) else None
+    return None
+
+
+def _replace_chapter_outline(parsed, cleaned: dict) -> str:
+    """把清洗后的细纲写回帧并重新序列化。只在 _extract_chapter_outline 命中时调用。"""
+    event, data = parsed
+    data = dict(data)
+    if event == "step":
+        data["data"] = cleaned
+    else:
+        result = dict(data["result"])
+        result["chapter_outline"] = cleaned
+        data["result"] = result
+    return sse_event(event, data)
+
+
 @router.post("/create-volume-outline-by-ai")
 async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Request):
     """基于已保存小说设定生成分卷大纲预览（SSE）。不写数据库。"""
@@ -221,7 +260,22 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
 
+    roster = inputs["roster"]
+
     async def event_stream() -> AsyncGenerator[str, None]:
+        if context.truncated_sections or context.dropped_item_counts:
+            # 欠账 #1 / 设计 §6：截断在 LLM 调用之前就已知，故在这里立刻告知前端，
+            # 而不是挂到 step done 事件上（那是 usage 的路——用量只有调用完才知道）。
+            # 挂到 done 上等于让用户白等 90 秒才被告知"这一章是在信息不全的情况下
+            # 写的"，而那正是该提前中止的时刻。执行器因此不必学会"上下文包"这个概念。
+            yield sse_event(
+                "context",
+                {
+                    "truncated_sections": context.truncated_sections,
+                    "dropped_item_counts": context.dropped_item_counts,
+                },
+            )
+
         deps = WorkflowDeps(
             resolve_provider=resolve_provider_for_step,
             resolve_timeout=resolve_timeout_for_step,
@@ -229,6 +283,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             supports_schema=_check_chapter_json_schema_support,
             fix_format=validate_and_fix_format,
         )
+        reported = False
         async for frame in run_workflow(
             workflow_name=CHAPTER_OUTLINE_WORKFLOW,
             steps=CHAPTER_OUTLINE_STEPS,
@@ -241,7 +296,19 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             is_disconnected=request.is_disconnected,
             log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
         ):
-            yield frame
+            parsed = parse_sse_event(frame)
+            outline = _extract_chapter_outline(parsed)
+            if outline is None:
+                yield frame
+                continue
+            # 设计 §5.3：AI 返回的每个 id 必须在 roster 内，不在则剔除并**明确上报**。
+            # 不上报的话，"AI 漏了个人物"会以"预览里少一行"的形式无声通过，而
+            # preview-then-accept 的全部意义就是让人拿最后一道关。
+            cleaned, dropped = validate_outline_ids(outline, roster)
+            if dropped and not reported:
+                yield sse_event("id_validation", {"dropped": dropped})
+                reported = True
+            yield _replace_chapter_outline(parsed, cleaned)
 
     return StreamingResponse(
         event_stream(),

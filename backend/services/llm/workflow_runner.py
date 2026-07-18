@@ -97,6 +97,33 @@ def sse_comment(text: str) -> str:
     return f": {text}\n\n"
 
 
+def parse_sse_event(frame: str) -> "tuple[str, dict] | None":
+    """把一帧 SSE 解析回 (事件名, 数据)——`sse_event` 的逆函数。
+
+    与 sse_event 放在同一模块，是为了让"帧长什么样"只有一个模块知道。路由需要
+    在 run_workflow 的输出上做后处理（如设计 §5.3 的 id 剔除要写回 done 帧）；
+    若每个路由自己 split 字符串，帧格式一改就要满仓库找。执行器**没有**因此
+    学到任何业务概念，它只是多了一个自己已有函数的逆。
+
+    Args:
+        frame: 一帧 SSE 文本。
+
+    Returns:
+        (事件名, 数据字典)；非事件帧（keepalive 注释、格式不符、data 非 JSON）返回 None。
+    """
+    if not frame.startswith("event: "):
+        return None
+    lines = frame.split("\n")
+    event = lines[0][len("event: "):]
+    for line in lines[1:]:
+        if line.startswith("data: "):
+            try:
+                return event, json.loads(line[len("data: "):])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
 def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
     """累加两份用量。"""
     return TokenUsage(
