@@ -230,3 +230,36 @@ class CoreFactionsResultSchema(BaseModel):
             raise ValueError("核心阵营关系至少需要一组复杂关系")
 
         return self
+
+
+class ChapterRangeSchema(BaseModel):
+    """一卷覆盖的章序区间（全书章号）。"""
+    model_config = ConfigDict(extra="forbid")
+
+    start: int = Field(..., ge=1, description="本卷起始章序（全书编号，从 1 起）")
+    end: int = Field(..., ge=1, description="本卷结束章序（全书编号）")
+
+    @model_validator(mode="after")
+    def _end_not_before_start(self) -> "ChapterRangeSchema":
+        if self.end < self.start:
+            raise ValueError(f"chapter_range.end({self.end}) 不能小于 start({self.start})")
+        return self
+
+
+class VolumeOutlineItemSchema(BaseModel):
+    """单卷大纲。跨卷区间连续性由 validate_chapter_ranges 校验（需 number_of_chapters）。"""
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1, max_length=50, description="卷标题")
+    summary: str = Field(..., min_length=10, max_length=1000, description="本卷剧情摘要")
+    arc: str = Field(..., min_length=5, max_length=500, description="本卷弧线（起承转合）")
+    chapter_range: ChapterRangeSchema = Field(..., description="本卷覆盖的章序区间")
+
+
+class VolumeOutlineResultSchema(BaseModel):
+    """AI 分卷大纲生成结果（LLM 输出 schema，非存储 schema）。"""
+    model_config = ConfigDict(extra="forbid")
+
+    volumes: list[VolumeOutlineItemSchema] = Field(
+        ..., min_length=1, max_length=50, description="分卷列表，按章序递增"
+    )
