@@ -1,4 +1,5 @@
 import type { NovelRewriteFieldKey } from "@/lib/novelFields";
+import type { StoredChapterOutline } from "@/components/writing/chapters/outline/outlineTypes";
 
 export type { NovelRewriteFieldKey } from "@/lib/novelFields";
 
@@ -86,6 +87,9 @@ export interface ChapterSummary {
 
 export interface ChapterDetail extends ChapterSummary {
   content: string;
+  /** 已接受的细纲；未接受过的章没有这个字段。后端 chapter_router._serialize_outline
+   *  已把其中 6 个 id 字段转成字符串。 */
+  outline?: StoredChapterOutline;
 }
 
 export interface ChapterDraft {

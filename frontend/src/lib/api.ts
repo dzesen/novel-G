@@ -111,12 +111,14 @@ export async function apiDownload(path: string, fallbackFilename = "download"): 
 export async function apiPostSSE(
   path: string,
   data: unknown,
-  onEvent: (event: string, data: Record<string, unknown>) => void
+  onEvent: (event: string, data: Record<string, unknown>) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
+    signal,
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
