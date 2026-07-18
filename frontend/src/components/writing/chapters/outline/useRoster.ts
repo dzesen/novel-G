@@ -32,13 +32,15 @@ export function useRoster(novelId: string | null) {
     setLoading(true);
     setError("");
     try {
-      const [characterRes, ...worldbookRes] = await Promise.all([
+      // 五个请求彼此独立，必须一并发出：把伏笔那条单独 await 会白白多一个往返，
+      // 面板每次打开都慢一拍。
+      const [characterRes, threadRes, ...worldbookRes] = await Promise.all([
         apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/character`),
+        apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}`),
         ...WORLDBOOK_TYPES.map((type) =>
           apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/${type}`)
         ),
       ]);
-      const threadRes = await apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}`);
 
       setCharacters(
         characterRes.data.map((card) => ({
