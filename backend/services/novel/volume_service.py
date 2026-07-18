@@ -8,6 +8,7 @@ from backend.db.base import BaseRepository
 from backend.db.errors import DuplicateKeyError
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import to_object_id, get_utc_now
+from backend.services.novel.outline_validation import validate_chapter_ranges
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,84 @@ class VolumeService:
             # 自动序号在并发创建时可能撞唯一索引，重新读取最大序号后再尝试一次。
             return await run_mongo_write_unit(_create, "create_volume_retry")
 
-    # 查询（透传） 
+    @staticmethod
+    async def has_volumes(novel_id: str, *, session=None) -> bool:
+        """小说下是否已存在卷（含软删，仿 has_core_factions_initialized）。"""
+        obj_id = to_object_id(novel_id)
+        count = await volume_repo.count_documents(
+            {"novel_id": obj_id}, include_deleted=True, session=session
+        )
+        return count > 0
+
+    @staticmethod
+    async def accept_volume_outline(novel_id: str, volumes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """接受分卷大纲预览：建卷 + 按 chapter_range 建章存根（设计 §7）。
+
+        非原子（单机 mongod 无事务，run_mongo_write_unit 降级为顺序写）。四层防御见设计 §7.2：
+        ①前置全校验（本方法开头，第一次写之前）②run_mongo_write_unit(auto) ③insert_many ④失败精确上报。
+        不做幂等续跑（§7.4）；409 前置守卫由端点负责。
+        """
+        novel = await novel_repo.get_novel_by_id(novel_id)
+        number_of_chapters = int(novel.get("number_of_chapters") or 0)
+
+        # 层 1：前置全校验，必须在第一次写之前。
+        problems = validate_chapter_ranges(volumes, number_of_chapters)
+        if problems:
+            raise ValueError("分卷区间非法，未做任何写入：" + "；".join(problems))
+
+        novel_obj_id = to_object_id(novel_id)
+
+        async def _build(session):
+            created_volume_ids: List[str] = []
+            total_chapters = 0
+            chapters_repo = BaseRepository(collections.CHAPTERS)
+            for order_index, vol in enumerate(volumes, start=1):
+                rng = vol["chapter_range"]
+                start, end = int(rng["start"]), int(rng["end"])
+                volume_id = await volume_repo.create_volume(
+                    {
+                        "novel_id": novel_id,
+                        "title": vol["title"],
+                        "summary": vol.get("summary", ""),
+                        "arc": vol.get("arc", ""),
+                        "chapter_range": {"start": start, "end": end},
+                        "order_index": order_index,
+                    },
+                    session=session,
+                )
+                created_volume_ids.append(volume_id)
+                # 层 3：批量建存根，一次 insert_many 而非逐章 insert_one。
+                stub_docs = [
+                    {
+                        "novel_id": novel_obj_id,
+                        "volume_id": to_object_id(volume_id),
+                        "title": f"第{n}章",
+                        "order_index": n,  # 全书章号（见计划建模决策）
+                        "status": "draft",
+                        "summary": "",
+                        "content": "",
+                        "word_count": 0,
+                    }
+                    for n in range(start, end + 1)
+                ]
+                await chapters_repo.insert_many(stub_docs, session=session)
+                total_chapters += len(stub_docs)
+
+            await novel_repo.increment_novel_stats(
+                novel_id,
+                {"current_volume_count": len(created_volume_ids), "current_chapter_count": total_chapters},
+                session=session,
+            )
+            return {
+                "volume_count": len(created_volume_ids),
+                "chapter_count": total_chapters,
+                "volume_ids": created_volume_ids,
+            }
+
+        # 层 2：run_mongo_write_unit(auto)——单机降级顺序写、副本集白捡原子性。
+        return await run_mongo_write_unit(_build, "accept_volume_outline")
+
+    # 查询（透传）
 
     @staticmethod
     async def get_volumes_by_novel(novel_id: str) -> List[Dict[str, Any]]:
