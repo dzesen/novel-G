@@ -18,6 +18,7 @@ import type {
   ChapterOutlineResult,
   NewThread,
   Scene,
+  StoredChapterOutline,
 } from "./outlineTypes";
 
 interface ChapterOutlinePanelProps {
@@ -25,6 +26,7 @@ interface ChapterOutlinePanelProps {
   chapterId: string;
   onClose: () => void;
   onAccepted: () => void;
+  existingOutline?: StoredChapterOutline;
 }
 
 export default function ChapterOutlinePanel({
@@ -32,6 +34,7 @@ export default function ChapterOutlinePanel({
   chapterId,
   onClose,
   onAccepted,
+  existingOutline,
 }: ChapterOutlinePanelProps) {
   const t = useTranslations("writing.outline");
   const roster = useRoster(novelId);
@@ -45,6 +48,9 @@ export default function ChapterOutlinePanel({
   const [orphanThreadIds, setOrphanThreadIds] = useState<string[]>([]);
   // 设计 §5.1：用户动过任何字段即置 true，不做深比较。
   const [dirty, setDirty] = useState(false);
+  // 已接受的细纲不可编辑后直接回贴（见文件顶部 accept 的 schema 约束），重新生成
+  // 会整份覆盖它并让上次创建的伏笔成为孤儿，所以用二次确认挡一下误点。
+  const [regenerateArmed, setRegenerateArmed] = useState(false);
 
   const outline = stream.result;
 
@@ -117,6 +123,10 @@ export default function ChapterOutlinePanel({
               <Button variant="outline" size="sm" onPress={stream.cancel}>
                 {t("cancel")}
               </Button>
+            ) : existingOutline && !outline && !regenerateArmed ? (
+              <Button variant="outline" size="sm" onPress={() => setRegenerateArmed(true)}>
+                {t("regenerate")}
+              </Button>
             ) : (
               <Button
                 variant="primary"
@@ -125,7 +135,7 @@ export default function ChapterOutlinePanel({
                 onPress={startGeneration}
                 isDisabled={busy}
               >
-                {outline ? t("regenerate") : t("generate")}
+                {existingOutline && !outline ? t("confirmRegenerate") : outline ? t("regenerate") : t("generate")}
               </Button>
             )}
             <Button variant="ghost" size="sm" onPress={onClose} isDisabled={accepting}>
@@ -140,6 +150,51 @@ export default function ChapterOutlinePanel({
           </div>
 
           {roster.error && <Notice tone="warning">{t("rosterLoadFailed", { error: roster.error })}</Notice>}
+
+          {existingOutline && !outline && (
+            <section className="mb-4 rounded-md border border-border bg-background p-4">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <h4 className="text-sm font-semibold text-foreground">{t("existingTitle")}</h4>
+                <div className="flex gap-2 text-xs text-muted">
+                  {existingOutline.generated_at && (
+                    <span className="rounded-md border border-border px-2 py-0.5">
+                      {t("existingGeneratedAt", { time: new Date(existingOutline.generated_at).toLocaleString() })}
+                    </span>
+                  )}
+                  <span className="rounded-md border border-border px-2 py-0.5">
+                    {existingOutline.edited_by_human ? t("existingEditedByHuman") : t("existingAiOnly")}
+                  </span>
+                </div>
+              </div>
+              <p className="mb-3 text-xs leading-5 text-amber-700 dark:text-amber-300">{t("existingHint")}</p>
+              {regenerateArmed && (
+                <p className="mb-3 text-xs leading-5 text-amber-700 dark:text-amber-300">{t("regenerateWarning")}</p>
+              )}
+              <dl className="grid gap-2 text-sm">
+                <ReadOnlyIds label={t("fieldPov")} ids={existingOutline.pov_character_card_id ? [existingOutline.pov_character_card_id] : []} nameById={roster.nameById} />
+                <ReadOnlyIds label={t("fieldPresent")} ids={existingOutline.present_character_card_ids} nameById={roster.nameById} />
+                <ReadOnlyIds label={t("fieldMentioned")} ids={existingOutline.mentioned_character_card_ids} nameById={roster.nameById} />
+                <ReadOnlyIds label={t("fieldWorldbook")} ids={existingOutline.referenced_worldbook_card_ids} nameById={roster.nameById} />
+                <ReadOnlyIds label={t("threadsPlanted")} ids={existingOutline.threads_planted} nameById={roster.nameById} />
+                <ReadOnlyIds label={t("fieldThreadsResolved")} ids={existingOutline.threads_resolved} nameById={roster.nameById} />
+                <ReadOnlyText label={t("fieldCoreConflict")} value={existingOutline.core_conflict} />
+                <ReadOnlyText label={t("fieldEndingHook")} value={existingOutline.ending_hook} />
+                <ReadOnlyText label={t("fieldTargetWords")} value={String(existingOutline.target_word_count)} />
+              </dl>
+              <div className="mt-3 grid gap-2">
+                <span className="text-xs font-medium text-muted">{t("fieldScenes")}</span>
+                {existingOutline.scenes.map((scene, index) => (
+                  <div key={index} className="rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-foreground">
+                    <p>{scene.summary}</p>
+                    <p className="mt-1 text-muted">{scene.purpose}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-muted">
+                {t("threadsResolvedNotice")}
+              </p>
+            </section>
+          )}
 
           <ContextNotices report={stream.contextReport} />
           {stream.droppedIds && Object.keys(stream.droppedIds).length > 0 && (
@@ -395,5 +450,39 @@ function RowEditor<T>({
         ))}
       </div>
     </section>
+  );
+}
+
+function ReadOnlyIds({
+  label,
+  ids,
+  nameById,
+}: {
+  label: string;
+  ids: string[];
+  nameById: Record<string, string>;
+}) {
+  if (ids.length === 0) return null;
+  return (
+    <div className="grid gap-1">
+      <dt className="text-xs font-medium text-muted">{label}</dt>
+      <dd className="flex flex-wrap gap-1.5">
+        {ids.map((id) => (
+          <span key={id} className="rounded-md border border-border px-2 py-0.5 text-xs text-foreground">
+            {nameById[id] ?? id}
+          </span>
+        ))}
+      </dd>
+    </div>
+  );
+}
+
+function ReadOnlyText({ label, value }: { label: string; value: string }) {
+  if (!value) return null;
+  return (
+    <div className="grid gap-1">
+      <dt className="text-xs font-medium text-muted">{label}</dt>
+      <dd className="text-sm leading-5 text-foreground">{value}</dd>
+    </div>
   );
 }

@@ -21,6 +21,7 @@ import {
 } from "./chapterUtils";
 import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
 import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
+import type { StoredChapterOutline } from "./outline/outlineTypes";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -39,6 +40,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [selectedVolumeId, setSelectedVolumeId] = useState<string | null>(null);
   const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
   const [draft, setDraft] = useState<ChapterDraft | null>(null);
+  const [chapterOutline, setChapterOutline] = useState<StoredChapterOutline | undefined>();
   const [updatedAt, setUpdatedAt] = useState<string | undefined>();
   const [structureLoading, setStructureLoading] = useState(mode === "edit");
   const [structureError, setStructureError] = useState("");
@@ -103,6 +105,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
       const localDraft = loadNewerLocalChapterDraft(chapter);
       revisionRef.current = localDraft ? 1 : 0;
       setDraft(localDraft ?? chapterToDraft(chapter));
+      setChapterOutline(chapter.outline);
       setUpdatedAt(chapter.updated_at);
       setSaveState(localDraft ? "dirty" : "idle");
       setSelectedVolumeId(chapter.volume_id);
@@ -110,6 +113,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
       if (sequence === loadSequenceRef.current) {
         setChapterLoadError(true);
         setDraft(null);
+        setChapterOutline(undefined);
       }
     } finally {
       if (sequence === loadSequenceRef.current) {
@@ -234,6 +238,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     const chapter = chapters.find((item) => item._id === chapterId);
     if (chapter) setSelectedVolumeId(chapter.volume_id);
     setDraft(null);
+    setChapterOutline(undefined);
     setUpdatedAt(undefined);
     setSaveState("idle");
     selectedChapterIdRef.current = chapterId;
@@ -375,6 +380,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
           chapterId={selectedChapterId}
           onClose={() => setChapterOutlineOpen(false)}
           onAccepted={() => selectedChapterId && void loadChapter(selectedChapterId)}
+          existingOutline={chapterOutline}
         />
       )}
 
