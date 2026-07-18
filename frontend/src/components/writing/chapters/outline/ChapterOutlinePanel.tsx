@@ -84,11 +84,15 @@ export default function ChapterOutlinePanel({
     stream.reset();
   };
 
-  // 二次确认必须"一次只放行一次生成"。丢弃预览或生成失败都会让面板退回到
-  // "只显示已接受的细纲"那个状态，此时若 armed 还留着 true，下一次就变成一键
-  // 直接重新生成——保险栓等于白装。故凡是退回只读态，都重新上栓。
+  // 二次确认必须"一次只放行一次生成"。丢弃预览、生成失败、生成中途取消——三条路
+  // 都会让面板退回到"只显示已接受的细纲"那个状态，此时若 armed 还留着 true，
+  // 下一次就变成一键直接重新生成，保险栓等于白装。故凡是退回只读态都重新上栓。
+  //
+  // 取消走的是 idle 不是 error（见 useOutlineStream 的 AbortError 分支：主动取消
+  // 不算失败），只判 error 会漏掉它——而取消按钮就摆在生成过程中的表头上，是最容易走到的一条。
+  // 上栓本身不改 stream.status，所以本effect不会把刚点下的 armed 又抹掉。
   useEffect(() => {
-    if (stream.status === "error") setRegenerateArmed(false);
+    if (stream.status === "error" || stream.status === "idle") setRegenerateArmed(false);
   }, [stream.status]);
 
   const accept = async () => {
