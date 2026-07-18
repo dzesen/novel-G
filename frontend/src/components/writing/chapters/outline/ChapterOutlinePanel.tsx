@@ -53,6 +53,23 @@ export default function ChapterOutlinePanel({
     stream.setResult((current) => (current ? { ...current, ...next } : current));
   };
 
+  // dirty 描述的是"**当前这份**细纲有没有被人动过"，所以任何一份新细纲顶替旧的时候
+  // 都必须清掉它。漏了这一步，"改一处 → 重新生成 → 直接接受"会把一份人类从未看过的
+  // AI 产物标成 edited_by_human=true，而这个字段的唯一用途就是回答"这份细纲经没经过人手"。
+  const startGeneration = () => {
+    setDirty(false);
+    void stream.start({
+      novel_id: novelId,
+      chapter_id: chapterId,
+      ...toRequestParams(params),
+    });
+  };
+
+  const discardPreview = () => {
+    setDirty(false);
+    stream.reset();
+  };
+
   const accept = async () => {
     if (!outline) return;
     setAccepting(true);
@@ -98,13 +115,7 @@ export default function ChapterOutlinePanel({
                 variant="primary"
                 size="sm"
                 className="bg-accent text-white hover:bg-accent-hover"
-                onPress={() =>
-                  void stream.start({
-                    novel_id: novelId,
-                    chapter_id: chapterId,
-                    ...toRequestParams(params),
-                  })
-                }
+                onPress={startGeneration}
                 isDisabled={busy}
               >
                 {outline ? t("regenerate") : t("generate")}
@@ -309,7 +320,7 @@ export default function ChapterOutlinePanel({
         </div>
 
         <footer className="flex justify-end gap-2 border-t border-border px-5 py-3">
-          <Button variant="ghost" size="sm" onPress={stream.reset} isDisabled={!outline || busy}>
+          <Button variant="ghost" size="sm" onPress={discardPreview} isDisabled={!outline || busy}>
             {t("discard")}
           </Button>
           <Button
