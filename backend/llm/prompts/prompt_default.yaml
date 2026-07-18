@@ -383,3 +383,34 @@ create_volume_outline_by_ai:
     请只输出 JSON，形如：
     {"volumes":[{"title":"第一卷 ...","summary":"...","arc":"...","chapter_range":{"start":1,"end":20}}]}
     不要输出 JSON 以外的任何内容。
+
+# 章节细纲 Prompt 配置
+create_chapter_outline_by_ai:
+  chapter_outline_prompt_base: |
+    你是一位资深长篇小说编辑。请为第 {chapter_order} 章《{chapter_title}》撰写章节细纲。
+    本章目标字数约 {words_per_chapter} 字。
+
+    【已知上下文】
+    {context}
+
+    要求：
+    - scenes：拆成 2-6 个场景，每场给出 summary（这一场发生了什么）与 purpose（这一场在全局的作用）。
+    - core_conflict：本章的核心冲突，一句话。
+    - ending_hook：章末钩子，让读者想读下一章。
+    - target_word_count：本章目标字数，接近 {words_per_chapter}。
+    - 凡指向人物、世界设定、伏笔的字段，**只能填上文【可用 id 名单】里出现过的 id 原文**：
+      pov_character_card_id（视角人物，可为 null）、
+      present_character_card_ids（本章出场人物）、
+      mentioned_character_card_ids（本章被提及但不出场的人物）、
+      referenced_worldbook_card_ids（本章涉及的地点/物品/规则）、
+      threads_resolved（本章回收的伏笔）。
+      **不要自己编造 id**：名单之外的 id 会被系统剔除并报告给用户。
+    - new_threads：本章新埋下的伏笔，每条给 name、description、
+      due_chapter_order（预计回收章序，可为 null）、importance（main 或 sub）。
+      这些伏笔尚不存在于名单中，**不要为它们编 id**。
+  chapter_outline_prompt_with_schema_suffix: |
+    请严格按提供的 JSON Schema 输出。
+  chapter_outline_prompt_without_schema_suffix: |
+    请只输出 JSON，形如：
+    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_chapter_order":null,"importance":"sub"}]}
+    不要输出 JSON 以外的任何内容。

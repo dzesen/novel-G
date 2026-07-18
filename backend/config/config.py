@@ -45,6 +45,9 @@ _KNOWN_WORKFLOW_STEPS: dict[str, tuple[str, ...]] = {
     "create_volume_outline_by_ai": (
         "volume_outline",
     ),
+    "create_chapter_outline_by_ai": (
+        "chapter_outline",
+    ),
 }
 _PROVIDER_RENAMES_KEY = "_provider_renames"
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)
