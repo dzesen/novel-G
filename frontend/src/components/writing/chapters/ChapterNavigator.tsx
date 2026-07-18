@@ -16,6 +16,7 @@ interface ChapterNavigatorProps {
   onCreateVolume: (title: string) => Promise<void>;
   onCreateChapter: (volumeId: string) => Promise<void>;
   onRestoreChapter: (chapterId: string) => Promise<void>;
+  onOpenVolumeOutline: () => void;
 }
 
 function PlusIcon() {
@@ -38,8 +39,10 @@ export default function ChapterNavigator({
   onCreateVolume,
   onCreateChapter,
   onRestoreChapter,
+  onOpenVolumeOutline,
 }: ChapterNavigatorProps) {
   const t = useTranslations("writing.chapterEditor");
+  const tOutline = useTranslations("writing.outline");
   const [showVolumeForm, setShowVolumeForm] = useState(false);
   const [volumeTitle, setVolumeTitle] = useState("");
   const [creatingVolume, setCreatingVolume] = useState(false);
@@ -87,14 +90,23 @@ export default function ChapterNavigator({
             {t("structureMeta", { volumes: volumes.length, chapters: chapters.length })}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setShowVolumeForm((value) => !value)}
-          className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-accent transition-colors hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
-          aria-label={t("newVolume")}
-        >
-          <PlusIcon />
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={onOpenVolumeOutline}
+            className="rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary"
+          >
+            {tOutline("volumeTitle")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowVolumeForm((value) => !value)}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-accent transition-colors hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+            aria-label={t("newVolume")}
+          >
+            <PlusIcon />
+          </button>
+        </div>
       </div>
 
       {showVolumeForm && (

@@ -19,6 +19,7 @@ import {
   loadNewerLocalChapterDraft,
   saveLocalChapterDraft,
 } from "./chapterUtils";
+import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -43,6 +44,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [chapterLoading, setChapterLoading] = useState(false);
   const [chapterLoadError, setChapterLoadError] = useState(false);
   const [saveState, setSaveState] = useState<ChapterSaveState>("idle");
+  const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(null);
@@ -338,6 +340,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         onCreateVolume={createVolume}
         onCreateChapter={createChapter}
         onRestoreChapter={restoreChapter}
+        onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
       />
       <ChapterEditorPane
         chapterId={selectedChapterId}
@@ -354,6 +357,14 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         onExport={exportChapter}
         onExportNovel={() => void exportNovel()}
       />
+
+      {volumeOutlineOpen && novelId && (
+        <VolumeOutlinePanel
+          novelId={novelId}
+          onClose={() => setVolumeOutlineOpen(false)}
+          onAccepted={() => void loadStructure()}
+        />
+      )}
 
       {structureError && (
         <div role="alert" className="absolute bottom-4 left-1/2 z-30 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-3 rounded-lg border border-red-300 bg-red-50 px-4 py-2.5 text-sm text-red-800 shadow-lg dark:border-red-900 dark:bg-red-950 dark:text-red-200">
