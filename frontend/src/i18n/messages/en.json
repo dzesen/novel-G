@@ -501,7 +501,7 @@
       "emptyPreview": "Click \"Generate prose\" to start.",
       "charCount": "{count} characters",
       "incomplete": "Incomplete: generation was interrupted. Below is what was written so far. You can accept it as is or regenerate.",
-      "needOutline": "This chapter has no accepted outline yet. Generate and accept one under \"Chapter outline\" first.",
+      "needOutline": "This chapter has no accepted outline yet. Generate and accept one under \"AI chapter outline\" first.",
       "overwriteArm": "This chapter already has content. Accepting replaces all of it.",
       "overwriteConfirm": "Confirm overwrite",
       "acceptedNotice": "Prose written to the editor. Review it, then save.",

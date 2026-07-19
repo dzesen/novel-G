@@ -60,6 +60,13 @@ export default function ProsePanel({
     });
   };
 
+  const discard = () => {
+    // 保险栓是面板本地状态，不属于 stream，stream.reset() 清不到它——
+    // 两边要一起复位，否则会同屏出现"空状态提示"与"覆盖警告"互相矛盾的界面。
+    stream.reset();
+    setOverwriteArmed(false);
+  };
+
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/25 px-4 py-6">
       <div className="flex max-h-full w-full max-w-5xl flex-col rounded-md border border-border bg-surface shadow-lg">
@@ -139,7 +146,7 @@ export default function ProsePanel({
         </div>
 
         <footer className="flex justify-end gap-2 border-t border-border px-5 py-3">
-          <Button variant="ghost" size="sm" onPress={stream.reset} isDisabled={!hasText || running}>
+          <Button variant="ghost" size="sm" onPress={discard} isDisabled={!hasText || running}>
             {t("discard")}
           </Button>
           <Button

@@ -332,6 +332,10 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
       clearLocalChapterDraft(deletedId);
       selectedChapterIdRef.current = null;
       setSelectedChapterId(null);
+      // 这里绕开了 selectChapter，所以要手动补上它顺带做的面板复位：
+      // 两个面板都以整容器覆盖的方式渲染，持有的 chapterId 会指向刚被删掉的章。
+      setProseOpen(false);
+      setChapterOutlineOpen(false);
       await loadStructure();
     } catch (error) {
       setStructureError(error instanceof Error ? error.message : t("deleteFailed"));
