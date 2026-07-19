@@ -109,6 +109,13 @@ export default function ChapterOutlinePanel({
       if (response.previous_thread_ids.length > 0) {
         setOrphanThreadIds(response.previous_thread_ids);
         void roster.reload();
+        // 已接受的这份预览必须立刻退场，否则面板停在"可再次接受"的状态：
+        // 再点一次接受会把 new_threads 原样再建一批，并让刚创建的那批也成孤儿；
+        // 而"重新生成"的二次确认要求 !outline，此时 outline 仍为真值，那道确认
+        // 恰好在唯一会走到它的路径上被绕开。产品里**没有伏笔管理界面**（设计 §13），
+        // 重复与孤儿都清理不掉，所以这里必须主动收口。
+        // reset 只清 stream 自己的状态，orphanThreadIds 是本组件的 state，警告不受影响。
+        stream.reset();
       } else {
         onClose();
       }

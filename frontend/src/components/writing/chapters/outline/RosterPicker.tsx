@@ -1,5 +1,6 @@
 "use client";
 
+import { useTranslations } from "next-intl";
 import type { RosterEntry } from "./useRoster";
 
 interface RosterPickerProps {
@@ -19,6 +20,7 @@ interface RosterPickerProps {
  * 同名歧义），所以人工修正也必须落到 id 上，不能让人输名字。
  */
 export default function RosterPicker({ label, options, value, onChange, mode, emptyText }: RosterPickerProps) {
+  const t = useTranslations("writing.outline");
   const selected = mode === "multi" ? (value as string[]) : value ? [value as string] : [];
 
   const toggle = (id: string) => {
@@ -60,7 +62,7 @@ export default function RosterPicker({ label, options, value, onChange, mode, em
         <p className="text-xs text-amber-700 dark:text-amber-300">
           {selected
             .filter((id) => !options.some((option) => option.id === id))
-            .map((id) => `未知 id：${id}`)
+            .map((id) => t("unknownId", { id }))
             .join("；")}
         </p>
       )}

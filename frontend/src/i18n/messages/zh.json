@@ -467,6 +467,14 @@
       "addThread": "添加伏笔",
       "removeRow": "删除",
       "rosterEmpty": "本书还没有可选项。",
+      "unknownId": "未知 id：{id}",
+      "threadHintWithDue": "{status} · 预计第 {chapter} 章回收",
+      "threadStatus": {
+        "planted": "已埋",
+        "developing": "发展中",
+        "resolved": "已回收",
+        "abandoned": "已废弃"
+      },
       "rosterLoadFailed": "选项加载失败，id 将以原始字符串显示：{error}",
       "droppedIdsWarning": "AI 引用了 {count} 个不存在的 id，已自动剔除：{detail}",
       "threadsResolvedNotice": "接受细纲不会让伏笔从后续章节的活跃列表中消失。伏笔状态的真正转移属于后续阶段的状态回填——写完正文才能确认那条伏笔是否真的收了。",

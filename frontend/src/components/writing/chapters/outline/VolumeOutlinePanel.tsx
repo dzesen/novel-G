@@ -20,7 +20,8 @@ import type {
 interface VolumeOutlinePanelProps {
   novelId: string;
   onClose: () => void;
-  onAccepted: () => void;
+  /** 带上后端返回的建卷/建章数：面板接受后即关闭，成功反馈只能由调用方呈现。 */
+  onAccepted: (result: AcceptVolumeOutlineResponse) => void;
 }
 
 export default function VolumeOutlinePanel({ novelId, onClose, onAccepted }: VolumeOutlinePanelProps) {
@@ -49,11 +50,11 @@ export default function VolumeOutlinePanel({ novelId, onClose, onAccepted }: Vol
     setAccepting(true);
     setAcceptError("");
     try {
-      await apiPost<AcceptVolumeOutlineResponse>(
+      const result = await apiPost<AcceptVolumeOutlineResponse>(
         `/api/volumes/novel/${novelId}/accept-outline`,
         { volumes }
       );
-      onAccepted();
+      onAccepted(result);
       onClose();
     } catch (err) {
       // 409 的文案里含恢复路径（"请先清空卷（可在垃圾桶恢复）后重试"），

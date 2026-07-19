@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslations } from "next-intl";
 import { apiGet } from "@/lib/api";
 import type { ReferenceCard } from "@/types/novel";
 import type { PlotThread } from "./outlineTypes";
@@ -21,6 +22,7 @@ const WORLDBOOK_TYPES = ["location", "item", "rule"] as const;
  * 本 hook 的产物只用于显示与人工挑选，判据仍在后端。
  */
 export function useRoster(novelId: string | null) {
+  const t = useTranslations("writing.outline");
   const [characters, setCharacters] = useState<RosterEntry[]>([]);
   const [worldbook, setWorldbook] = useState<RosterEntry[]>([]);
   const [threads, setThreads] = useState<RosterEntry[]>([]);
@@ -59,20 +61,25 @@ export function useRoster(novelId: string | null) {
         )
       );
       setThreads(
-        threadRes.data.map((thread) => ({
-          id: thread._id,
-          name: thread.name,
-          hint: thread.due_chapter_order
-            ? `${thread.status} · 预计第 ${thread.due_chapter_order} 章回收`
-            : thread.status,
-        }))
+        threadRes.data.map((thread) => {
+          // 状态是后端枚举（planted/developing/resolved/abandoned），直接显示等于
+          // 把内部标识符漏给用户，且英文界面下也不会翻译，故一律过 i18n 映射。
+          const status = t(`threadStatus.${thread.status}`);
+          return {
+            id: thread._id,
+            name: thread.name,
+            hint: thread.due_chapter_order
+              ? t("threadHintWithDue", { status, chapter: thread.due_chapter_order })
+              : status,
+          };
+        })
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [novelId]);
+  }, [novelId, t]);
 
   useEffect(() => {
     void load();

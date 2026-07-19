@@ -34,6 +34,7 @@ interface ListResponse<T> {
 
 export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProps) {
   const t = useTranslations("writing.chapterEditor");
+  const tOutline = useTranslations("writing.outline");
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [trash, setTrash] = useState<ChapterSummary[]>([]);
@@ -44,6 +45,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [updatedAt, setUpdatedAt] = useState<string | undefined>();
   const [structureLoading, setStructureLoading] = useState(mode === "edit");
   const [structureError, setStructureError] = useState("");
+  const [structureNotice, setStructureNotice] = useState("");
   const [chapterLoading, setChapterLoading] = useState(false);
   const [chapterLoadError, setChapterLoadError] = useState(false);
   const [saveState, setSaveState] = useState<ChapterSaveState>("idle");
@@ -119,6 +121,31 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
       if (sequence === loadSequenceRef.current) {
         setChapterLoading(false);
       }
+    }
+  }, []);
+
+  /**
+   * 接受细纲后只刷新 outline，**绝不能改走 loadChapter**。
+   *
+   * accept 会经 update_chapter 把 chapter.updated_at 顶到当前时刻；loadChapter 随后
+   * 调 loadNewerLocalChapterDraft，它按 savedAt <= updated_at 判定本地草稿已过期，
+   * 于是**删掉 localStorage 里的备份**并返回 null，正文随即被服务端副本覆盖、
+   * saveState 归 idle——用户没保存的正文就这么没了，无提示无从恢复。
+   *
+   * 这条路径在两种能长期存在的状态下很容易走到：saveState 为 error（自动保存失败后
+   * 不会重试）、以及标题为空（此时自动保存被整个跳过）。selectChapter 切章前会先
+   * persistDraft 冲一次草稿，可见这个风险本就被代码承认；accept 是唯一漏掉那道保护的调用方。
+   *
+   * 这里不需要 loadSequenceRef 那道竞态守卫：本函数只写 chapterOutline 一个状态，
+   * 与 loadChapter 争抢的 draft/saveState 都不碰；且它由用户点击"接受"触发，
+   * 不像 loadChapter 那样会被选章切换连续打断。
+   */
+  const refreshChapterOutline = useCallback(async (chapterId: string) => {
+    try {
+      const chapter = await apiGet<ChapterDetail>(`/api/chapters/${chapterId}`);
+      setChapterOutline(chapter.outline);
+    } catch {
+      // 细纲已在服务端落库，这里只是回读失败；不动正文状态，重开面板即可再读。
     }
   }, []);
 
@@ -370,7 +397,17 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         <VolumeOutlinePanel
           novelId={novelId}
           onClose={() => setVolumeOutlineOpen(false)}
-          onAccepted={() => void loadStructure()}
+          onAccepted={(result) => {
+            // 面板接受后即关闭，成功反馈只能落在工作区里；否则用户只看到面板消失，
+            // 无从确认到底建了几卷几章。
+            setStructureNotice(
+              tOutline("acceptSuccess", {
+                volumes: result.volume_count,
+                chapters: result.chapter_count,
+              })
+            );
+            void loadStructure();
+          }}
         />
       )}
 
@@ -379,9 +416,18 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
           novelId={novelId}
           chapterId={selectedChapterId}
           onClose={() => setChapterOutlineOpen(false)}
-          onAccepted={() => selectedChapterId && void loadChapter(selectedChapterId)}
+          onAccepted={() => selectedChapterId && void refreshChapterOutline(selectedChapterId)}
           existingOutline={chapterOutline}
         />
+      )}
+
+      {structureNotice && (
+        <div role="status" className="absolute bottom-4 left-1/2 z-30 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-3 rounded-lg border border-green-300 bg-green-50 px-4 py-2.5 text-sm text-green-800 shadow-lg dark:border-green-900 dark:bg-green-950 dark:text-green-200">
+          <span className="min-w-0">{structureNotice}</span>
+          <button type="button" onClick={() => setStructureNotice("")} className="shrink-0 text-xs font-medium underline">
+            {t("dismiss")}
+          </button>
+        </div>
       )}
 
       {structureError && (

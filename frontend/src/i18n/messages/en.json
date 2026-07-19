@@ -467,6 +467,14 @@
       "addThread": "Add thread",
       "removeRow": "Remove",
       "rosterEmpty": "Nothing to choose from yet.",
+      "unknownId": "Unknown id: {id}",
+      "threadHintWithDue": "{status} · expected to resolve in chapter {chapter}",
+      "threadStatus": {
+        "planted": "Planted",
+        "developing": "Developing",
+        "resolved": "Resolved",
+        "abandoned": "Abandoned"
+      },
       "rosterLoadFailed": "Failed to load options; ids will be shown raw: {error}",
       "droppedIdsWarning": "AI referenced {count} ids that do not exist; they were removed: {detail}",
       "threadsResolvedNotice": "Accepting an outline does not remove a plot thread from later chapters' active list. The actual status transition happens during state backfill in a later phase, once the prose confirms the thread was really resolved.",
