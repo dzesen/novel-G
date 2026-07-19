@@ -271,7 +271,10 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     setChapterOutline(undefined);
     setUpdatedAt(undefined);
     setSaveState("idle");
+    // 两个面板都持有 chapterId、以整容器覆盖的方式渲染：换章后若不关，
+    // 面板会挂着上一章的 id 继续渲染（deleteChapter 已修过同一个坑）。
     setProseOpen(false);
+    setChapterOutlineOpen(false);
     selectedChapterIdRef.current = chapterId;
     setSelectedChapterId(chapterId);
   };
