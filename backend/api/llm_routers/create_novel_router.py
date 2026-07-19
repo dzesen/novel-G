@@ -258,16 +258,10 @@ class NovelFieldRewriteResult(BaseModel):
     value: str | list[str]
 
 
-class GenerateCoreFactionsRequest(BaseModel):
+class GenerateCoreFactionsRequest(GenerationParamsMixin):
     """基于已保存小说生成核心阵营预览的请求。"""
 
     novel_id: str = Field(..., min_length=1)
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-    max_tokens: int | None = Field(default=None, gt=0)
-    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
-    system_prompt: str | None = Field(default=None)
 
 
 def _validate_rewrite_provider(provider: str):
