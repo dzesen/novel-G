@@ -63,6 +63,10 @@ async def stream_prose(
             if is_disconnected is not None and await is_disconnected():
                 # 用户关了页面：立刻关掉生成器，底层 HTTP 请求随之断开，不再计费。
                 # 粒度是 chunk 而非 run_workflow 的 15 秒轮询（设计 §7.2）。
+                # 实测（设计 §10.3）：本部署下真正生效的是 ASGI 任务取消
+                # （CancelledError 更早、绕过 except Exception），这条循环内
+                # 检查在生产路径上从未被走到——留着是刻意的兜底（is_disconnected
+                # 做成可选参数正是为此），不是应删除的死代码。
                 try:
                     await stream.aclose()
                 except Exception:
