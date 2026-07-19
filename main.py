@@ -17,6 +17,7 @@ from backend.api.default_routers.faction_relation_router import router as factio
 from backend.api.llm_routers.create_novel_router import router as create_novel_router
 from backend.api.llm_routers.outline_router import router as outline_router
 from backend.api.llm_routers.prose_router import router as prose_router
+from backend.api.llm_routers.state_router import router as state_router
 from backend.llm.prompts.prompt_selector import load_prompt_config
 from backend.runtime import (
     apply_runtime_flags_from_argv,
@@ -85,6 +86,7 @@ app.include_router(config_router)
 app.include_router(create_novel_router)
 app.include_router(outline_router)
 app.include_router(prose_router)
+app.include_router(state_router)
 app.include_router(upload_router)
 app.include_router(backup_router)
 app.include_router(reference_card_router)
