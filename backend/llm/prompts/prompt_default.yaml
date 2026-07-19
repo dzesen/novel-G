@@ -432,6 +432,12 @@ write_chapter_by_ai:
     - 以场景和对话推进，避免大段旁白式总结。
     - 章末收在细纲给出的钩子上。
     - 直接输出正文本身。不要写标题、不要写"第几章"、不要加任何解释或小标题。
+  # 下面这段**永远不会被使用**：正文是纯文本，prose_router 固定取
+  # _without_schema_suffix，从不请求 JSON Schema。它存在的唯一原因是
+  # prompt_selector 的 REQUIRED_PROSE_PROMPT_KEYS 要求三段齐全，缺了会启动报错。
+  # 因此它也没有任何测试覆盖——改坏了不会有人发现，不要往里加真实约束。
+  # 要根治得放宽那个三键校验，允许纯文本工作流只声明两段；那会动到 2a 已验证的
+  # 共用校验器、影响四条既有工作流，故留给日后专门的 prompt 基建清理波。
   chapter_content_prompt_with_schema_suffix: |
     直接输出正文纯文本。
   chapter_content_prompt_without_schema_suffix: |
