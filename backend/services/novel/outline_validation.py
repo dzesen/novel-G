@@ -72,6 +72,19 @@ _OUTLINE_ID_FIELDS: Tuple[Tuple[str, str, bool], ...] = (
 )
 
 
+def known_id_sets(roster: Dict[str, Any]) -> Dict[str, set]:
+    """把 roster 折成三个 id 集合，供各 payload 校验器共用。
+
+    抽出来是因为状态回填的校验器（state_validation.validate_state_ids）需要
+    同一份提取逻辑。两个校验器各自处理不同形状的 payload（细纲是平铺字段、
+    回填是列表项里的嵌套 id），但"roster 里有哪些合法 id"这件事只该有一份实现。
+    """
+    return {
+        key: {str(entry["id"]) for entry in (roster.get(key) or [])}
+        for key in ("characters", "worldbook", "threads")
+    }
+
+
 def validate_outline_ids(
     outline: Dict[str, Any],
     roster: Dict[str, Any],
@@ -92,10 +105,7 @@ def validate_outline_ids(
     （那里没有预览可上报，静默剔除会变成无声降级）。两端共用本函数，
     保证"预览通过的 payload 在 accept 也通过"——两处各写一份规则必然漂移。
     """
-    known = {
-        key: {str(entry["id"]) for entry in (roster.get(key) or [])}
-        for key in ("characters", "worldbook", "threads")
-    }
+    known = known_id_sets(roster)
 
     cleaned = dict(outline)
     dropped: Dict[str, List[str]] = {}
