@@ -77,13 +77,22 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
     prompts = _load_prompts().get(PROSE_PROMPT_NAME, {})
+    # 字数目标优先取本章细纲的 target_word_count：那是 2a 细纲链写入、人可能在
+    # 细纲面板里手动改过的**本章**决定，比小说级的 words_per_chapter 更具体。
+    # 若只信小说级默认值，一章被人为改成 5000 字的细纲会和"约 3000 字"的指令
+    # 同时喂给模型——同一次调用里两个矛盾的字数目标，且人的显式选择被静默吞掉。
+    words_per_chapter = (
+        (chapter.get("outline") or {}).get("target_word_count")
+        or novel.get("words_per_chapter")
+        or 3000
+    )
     # 正文是纯文本，固定走 without_schema 后缀；本工作流从不请求 JSON Schema。
     prompt = (
         prompts[f"{PROSE_STEP}_prompt_base"].format(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),
             chapter_title=str(chapter.get("title") or ""),
-            words_per_chapter=novel.get("words_per_chapter") or 3000,
+            words_per_chapter=words_per_chapter,
         )
         + "\n"
         + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"]
