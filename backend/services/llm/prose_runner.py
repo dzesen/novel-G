@@ -63,7 +63,18 @@ async def stream_prose(
             if is_disconnected is not None and await is_disconnected():
                 # 用户关了页面：立刻关掉生成器，底层 HTTP 请求随之断开，不再计费。
                 # 粒度是 chunk 而非 run_workflow 的 15 秒轮询（设计 §7.2）。
-                await stream.aclose()
+                try:
+                    await stream.aclose()
+                except Exception:
+                    # 关闭本身失败（例如收尾时网络层出错）不能落到下面的
+                    # except Exception 里补发一条 done 帧——断连路径的契约是
+                    # 不发任何终局帧，没人在听了。这里只记日志，不再抛出。
+                    logger.exception(
+                        "[%s] request_id=%s step=%s aclose failed after disconnect",
+                        workflow_name,
+                        request_id,
+                        step_key,
+                    )
                 logger.info(
                     "[%s] request_id=%s step=%s status=disconnected chunks=%d",
                     workflow_name,
