@@ -8,13 +8,18 @@ monkeypatch 本模块的全局名。本路由从不写数据库——落库在�
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import Field
 
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    safe_novel_text,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -105,41 +110,13 @@ CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
 )
 
 
-class VolumeOutlineRequest(BaseModel):
+class VolumeOutlineRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
-    temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    top_p: Optional[float] = Field(default=None, ge=0, le=1)
-    max_tokens: Optional[int] = Field(default=None, gt=0)
-    presence_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
-    frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
-    system_prompt: Optional[str] = Field(default=None)
 
 
-class ChapterOutlineRequest(BaseModel):
+class ChapterOutlineRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
     chapter_id: str = Field(..., min_length=1)
-    temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    top_p: Optional[float] = Field(default=None, ge=0, le=1)
-    max_tokens: Optional[int] = Field(default=None, gt=0)
-    presence_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
-    frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
-    system_prompt: Optional[str] = Field(default=None)
-
-
-def _build_gen_kwargs(req: Any) -> dict:
-    kwargs: dict = {}
-    for key in ("temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty", "system_prompt"):
-        val = getattr(req, key)
-        if val is not None:
-            kwargs[key] = val
-    return kwargs
-
-
-def _safe(novel: dict, field: str, fallback: str = "未提供") -> str:
-    value = novel.get(field)
-    if isinstance(value, list):
-        return "、".join(str(v).strip() for v in value if str(v).strip()) or fallback
-    return str(value or "").strip() or fallback
 
 
 def _extract_chapter_outline(parsed) -> Optional[dict]:
@@ -186,14 +163,14 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
 
     params = {
         "number_of_chapters": novel.get("number_of_chapters") or 100,
-        "title": _safe(novel, "title"),
-        "genre": _safe(novel, "genre", "未分类"),
-        "tone": _safe(novel, "tone"),
-        "core_idea": _safe(novel, "core_idea"),
-        "core_seed": _safe(novel, "core_seed"),
-        "summary": _safe(novel, "summary"),
-        "worldview": _safe(novel, "worldview"),
-        "plot": _safe(novel, "plot"),
+        "title": safe_novel_text(novel, "title"),
+        "genre": safe_novel_text(novel, "genre", "未分类"),
+        "tone": safe_novel_text(novel, "tone"),
+        "core_idea": safe_novel_text(novel, "core_idea"),
+        "core_seed": safe_novel_text(novel, "core_seed"),
+        "summary": safe_novel_text(novel, "summary"),
+        "worldview": safe_novel_text(novel, "worldview"),
+        "plot": safe_novel_text(novel, "plot"),
     }
 
     async def event_stream() -> AsyncGenerator[str, None]:
@@ -209,7 +186,7 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
             steps=VOLUME_OUTLINE_STEPS,
             prompts=_load_prompts().get(VOLUME_OUTLINE_PROMPT_NAME, {}),
             params=params,
-            gen_kwargs=_build_gen_kwargs(req),
+            gen_kwargs=build_gen_kwargs(req),
             cached={},
             deps=deps,
             request_id=uuid4().hex[:8],
@@ -289,7 +266,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             steps=CHAPTER_OUTLINE_STEPS,
             prompts=_load_prompts().get(CHAPTER_OUTLINE_PROMPT_NAME, {}),
             params=params,
-            gen_kwargs=_build_gen_kwargs(req),
+            gen_kwargs=build_gen_kwargs(req),
             cached={},
             deps=deps,
             request_id=uuid4().hex[:8],

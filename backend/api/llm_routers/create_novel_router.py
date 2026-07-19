@@ -12,6 +12,11 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    safe_novel_text,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
 from backend.llm.config import get_llm_config, get_provider_config
@@ -221,28 +226,11 @@ def _get_contiguous_cached_steps(cached_steps: AICreateCachedSteps | None) -> di
     return prefix
 
 
-class AICreateNovelRequest(BaseModel):
+class AICreateNovelRequest(GenerationParamsMixin):
     user_idea: str
     number_of_chapters: int = 100
     words_per_chapter: int = 3000
     cached_steps: AICreateCachedSteps | None = None
-    # 可选生成参数，前端传入时覆盖 provider 级别默认值
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-    max_tokens: int | None = Field(default=None, gt=0)
-    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
-    system_prompt: str | None = Field(default=None)
-
-
-def _build_gen_kwargs(req: Any) -> dict:
-    """从请求中提取非空的生成参数，用于传入 LLMService。"""
-    kwargs: dict = {}
-    for key in ("temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty", "system_prompt"):
-        val = getattr(req, key)
-        if val is not None:
-            kwargs[key] = val
-    return kwargs
 
 
 class NovelRewriteChatMessage(BaseModel):
@@ -461,24 +449,6 @@ def _normalize_rewrite_result(
     )
 
 
-def _safe_novel_text(novel: dict[str, Any], field: str, fallback: str = "未提供") -> str:
-    """读取小说字段并转换为适合提示词的文本。
-
-    Args:
-        novel: 已落库小说文档。
-        field: 字段名。
-        fallback: 字段为空时使用的占位文本。
-
-    Returns:
-        可放入提示词的字符串。
-    """
-    value = novel.get(field)
-    if isinstance(value, list):
-        return "、".join(str(item).strip() for item in value if str(item).strip()) or fallback
-    text = str(value or "").strip()
-    return text or fallback
-
-
 def _build_core_factions_prompt(novel: dict[str, Any], *, use_json_schema: bool) -> str:
     """构造全书核心阵营生成提示词。
 
@@ -497,20 +467,20 @@ def _build_core_factions_prompt(novel: dict[str, Any], *, use_json_schema: bool)
     )
     tags = novel.get("tags") if isinstance(novel.get("tags"), list) else []
     prompt_base = prompts["create_core_factions_prompt_base"].format(
-        plot=_safe_novel_text(novel, "plot"),
-        genre=_safe_novel_text(novel, "genre", "未分类"),
-        tone=_safe_novel_text(novel, "tone"),
-        target_audience=_safe_novel_text(novel, "target_audience"),
-        core_idea=_safe_novel_text(novel, "core_idea"),
+        plot=safe_novel_text(novel, "plot"),
+        genre=safe_novel_text(novel, "genre", "未分类"),
+        tone=safe_novel_text(novel, "tone"),
+        target_audience=safe_novel_text(novel, "target_audience"),
+        core_idea=safe_novel_text(novel, "core_idea"),
         number_of_chapters=novel.get("number_of_chapters") or 100,
         words_per_chapter=novel.get("words_per_chapter") or 3000,
-        core_seed=_safe_novel_text(novel, "core_seed"),
-        title=_safe_novel_text(novel, "title"),
-        summary=_safe_novel_text(novel, "summary"),
-        worldview=_safe_novel_text(novel, "worldview"),
-        writing_style=_safe_novel_text(novel, "writing_style"),
-        narrative_pov=_safe_novel_text(novel, "narrative_pov"),
-        era_background=_safe_novel_text(novel, "era_background"),
+        core_seed=safe_novel_text(novel, "core_seed"),
+        title=safe_novel_text(novel, "title"),
+        summary=safe_novel_text(novel, "summary"),
+        worldview=safe_novel_text(novel, "worldview"),
+        writing_style=safe_novel_text(novel, "writing_style"),
+        narrative_pov=safe_novel_text(novel, "narrative_pov"),
+        era_background=safe_novel_text(novel, "era_background"),
         tags_json=json.dumps(tags, ensure_ascii=False),
     )
     return f"{prompt_base}\n{prompts[suffix_key]}".strip()
@@ -540,7 +510,7 @@ async def generate_core_factions(req: GenerateCoreFactionsRequest):
     provider = resolve_provider_for_step(FACTIONS_WORKFLOW_NAME, step_name) or ""
     timeout_seconds = resolve_timeout_for_step(FACTIONS_WORKFLOW_NAME, step_name)
     use_json_schema = _check_json_schema_support(step_name, FACTIONS_WORKFLOW_NAME)
-    gen_kwargs = _build_gen_kwargs(req)
+    gen_kwargs = build_gen_kwargs(req)
     prompt = _build_core_factions_prompt(novel, use_json_schema=use_json_schema)
 
     logger.info(
@@ -663,7 +633,7 @@ async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
                 "number_of_chapters": req.number_of_chapters,
                 "words_per_chapter": req.words_per_chapter,
             },
-            gen_kwargs=_build_gen_kwargs(req),
+            gen_kwargs=build_gen_kwargs(req),
             cached=_get_contiguous_cached_steps(req.cached_steps),
             deps=deps,
             request_id=uuid4().hex[:8],
