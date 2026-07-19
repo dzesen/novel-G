@@ -21,6 +21,9 @@ interface ChapterEditorPaneProps {
   onExport: () => void;
   onExportNovel: () => void;
   onOpenChapterOutline: () => void;
+  onOpenProse: () => void;
+  /** 无已接受细纲时禁用 AI 写正文：没有 outline 上下文包会退化（设计 §6）。 */
+  canGenerateProse: boolean;
 }
 
 function SaveStateLabel({ state }: { state: ChapterSaveState }) {
@@ -49,9 +52,12 @@ export default function ChapterEditorPane({
   onExport,
   onExportNovel,
   onOpenChapterOutline,
+  onOpenProse,
+  canGenerateProse,
 }: ChapterEditorPaneProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
+  const tProse = useTranslations("writing.prose");
   const [showSummary, setShowSummary] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -130,6 +136,15 @@ export default function ChapterEditorPane({
               className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
               {tOutline("chapterTitle")}
+            </button>
+            <button
+              type="button"
+              onClick={onOpenProse}
+              disabled={!canGenerateProse}
+              title={canGenerateProse ? undefined : tProse("needOutline")}
+              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+            >
+              {tProse("title")}
             </button>
             <button
               type="button"

@@ -22,6 +22,7 @@ import {
 import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
 import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
 import type { StoredChapterOutline } from "./outline/outlineTypes";
+import ProsePanel from "./prose/ProsePanel";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -35,6 +36,7 @@ interface ListResponse<T> {
 export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
+  const tProse = useTranslations("writing.prose");
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [trash, setTrash] = useState<ChapterSummary[]>([]);
@@ -51,6 +53,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [saveState, setSaveState] = useState<ChapterSaveState>("idle");
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
+  const [proseOpen, setProseOpen] = useState(false);
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(null);
@@ -268,6 +271,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     setChapterOutline(undefined);
     setUpdatedAt(undefined);
     setSaveState("idle");
+    setProseOpen(false);
     selectedChapterIdRef.current = chapterId;
     setSelectedChapterId(chapterId);
   };
@@ -391,6 +395,8 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         onExport={exportChapter}
         onExportNovel={() => void exportNovel()}
         onOpenChapterOutline={() => setChapterOutlineOpen(true)}
+        onOpenProse={() => setProseOpen(true)}
+        canGenerateProse={Boolean(chapterOutline)}
       />
 
       {volumeOutlineOpen && novelId && (
@@ -418,6 +424,23 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
           onClose={() => setChapterOutlineOpen(false)}
           onAccepted={() => selectedChapterId && void refreshChapterOutline(selectedChapterId)}
           existingOutline={chapterOutline}
+        />
+      )}
+
+      {proseOpen && novelId && selectedChapterId && (
+        <ProsePanel
+          novelId={novelId}
+          chapterId={selectedChapterId}
+          hasExistingContent={Boolean(draft?.content?.trim())}
+          onClose={() => setProseOpen(false)}
+          onAccepted={(text) => {
+            // **只写草稿**，落库交给既有自动保存（设计 §2）。
+            // 这里绝不能像 accept 细纲那样回读服务端：那条路会把 updated_at 顶新、
+            // 让 loadNewerLocalChapterDraft 判定本地草稿过期并删掉备份——
+            // 整分支评审 Important #1 的原样重演。
+            changeDraft({ content: text });
+            setStructureNotice(tProse("acceptedNotice"));
+          }}
         />
       )}
 

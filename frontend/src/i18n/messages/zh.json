@@ -488,6 +488,25 @@
       "confirmRegenerate": "确定重新生成",
       "threadsPlanted": "本章埋下的伏笔"
     },
+    "prose": {
+      "title": "AI 写正文",
+      "description": "基于本章细纲与上下文包生成正文。接受后写入编辑器，由自动保存落库。",
+      "generate": "生成正文",
+      "regenerate": "重新生成",
+      "cancel": "取消",
+      "close": "关闭",
+      "accept": "接受并写入编辑器",
+      "discard": "丢弃",
+      "generating": "正在生成正文…",
+      "emptyPreview": "点击「生成正文」开始。",
+      "charCount": "{count} 字",
+      "incomplete": "未完成：生成被中断，下面是已经写出来的部分。可以直接接受，也可以重新生成。",
+      "needOutline": "本章还没有已接受的细纲。请先在「章节细纲」里生成并接受细纲。",
+      "overwriteArm": "正文已有内容，接受会整章覆盖。",
+      "overwriteConfirm": "确认覆盖并写入",
+      "acceptedNotice": "正文已写入编辑器，请检查后保存。",
+      "tokenUsage": "本次用量 {total} tokens（输入 {input} / 输出 {output}）"
+    },
     "referenceCards": {
       "types": {
         "character": "角色卡",

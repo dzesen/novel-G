@@ -12,6 +12,12 @@ import type { ContextReport } from "../outline/outlineTypes";
  */
 export type ProseStreamStatus = "idle" | "running" | "done" | "error" | "cancelled";
 
+export interface ProseUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
 /**
  * 正文流的 SSE 事件机。
  *
@@ -25,6 +31,7 @@ export function useProseStream() {
   const [text, setText] = useState("");
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
   const [error, setError] = useState("");
+  const [usage, setUsage] = useState<ProseUsage | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   // 单调递增的"第几轮"：只被 start() 推进，cancel() 不动它。
@@ -62,6 +69,7 @@ export function useProseStream() {
     setText("");
     setContextReport(null);
     setError("");
+    setUsage(null);
     bufferRef.current = "";
   }, [cancel]);
 
@@ -75,6 +83,7 @@ export function useProseStream() {
       setStatus("running");
       setError("");
       setContextReport(null);
+      setUsage(null);
       // 新一轮从空白开始：正文与细纲不同，把新章的 token 追加在旧章后面
       // 会拼出一段没人想要的东西。
       setText("");
@@ -116,6 +125,9 @@ export function useProseStream() {
                   bufferRef.current = data.text;
                   setText(data.text);
                 }
+                if (data.usage && typeof data.usage === "object") {
+                  setUsage(data.usage as ProseUsage);
+                }
                 setStatus("done");
                 return;
               } else {
@@ -143,5 +155,5 @@ export function useProseStream() {
     [cancel]
   );
 
-  return { status, text, contextReport, error, start, cancel, reset };
+  return { status, text, contextReport, error, usage, start, cancel, reset };
 }
