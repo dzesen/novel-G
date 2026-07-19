@@ -1,0 +1,104 @@
+"""正文流式驱动器：单步、流式、逐 token 产出 SSE 帧。
+
+**为什么不复用 `run_workflow`**（设计 §3.1）：它的 `_drive_with_keepalive` 是
+"起一个 asyncio.Task、等它完成、其间发心跳"的形状，而流式是
+`async for chunk in service.stream_text(...)`——无法通过一个"等 task 结束"的
+函数逐 chunk 往外 yield。扩展它必然是一个从头写到尾、与现有路径几乎不重叠的分支，
+而 2a 的全部工作流都跑在那个函数里。
+
+本模块只从 workflow_runner 借 `sse_event` 一个纯格式化函数（"帧长什么样只有一个
+模块知道"是那边立下的原则），不借用任何执行逻辑。
+
+**没有 keepalive**：token 本身就是流量，流式不需要心跳。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, AsyncGenerator
+
+from backend.llm.models import TokenUsage
+from backend.services.llm.workflow_runner import sse_event
+
+logger = logging.getLogger(__name__)
+
+
+async def stream_prose(
+    *,
+    workflow_name: str,
+    step_key: str,
+    prompt: str,
+    service: Any,
+    gen_kwargs: Mapping[str, Any],
+    request_id: str,
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+) -> AsyncGenerator[str, None]:
+    """流式生成正文，产出 delta 帧与终局 done 帧。
+
+    Args:
+        workflow_name: 工作流名，仅用于日志。
+        step_key: 步骤名，仅用于日志。
+        prompt: 拼装完成的完整提示词。
+        service: LLMService（或具备 stream_text / last_usage 的替身）。
+        gen_kwargs: 透传给 LLMService 的生成参数覆盖。
+        request_id: 便于串联日志的请求标识。
+        is_disconnected: 查询客户端是否断开的回调；None 表示不检查。
+
+    Yields:
+        SSE 帧字符串：每个非空 chunk 一条 `delta`，末尾一条 `done`。
+        客户端断开时**不发任何终局帧**——没人在听了。
+    """
+    started_at = time.perf_counter()
+    chunks: list[str] = []
+
+    logger.info(
+        "[%s] request_id=%s step=%s status=running", workflow_name, request_id, step_key
+    )
+
+    stream = service.stream_text(prompt, **gen_kwargs)
+    try:
+        async for chunk in stream:
+            if is_disconnected is not None and await is_disconnected():
+                # 用户关了页面：立刻关掉生成器，底层 HTTP 请求随之断开，不再计费。
+                # 粒度是 chunk 而非 run_workflow 的 15 秒轮询（设计 §7.2）。
+                await stream.aclose()
+                logger.info(
+                    "[%s] request_id=%s step=%s status=disconnected chunks=%d",
+                    workflow_name,
+                    request_id,
+                    step_key,
+                    len(chunks),
+                )
+                return
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            yield sse_event("delta", {"text": chunk})
+    except Exception as exc:
+        logger.exception(
+            "[%s] request_id=%s step=%s failed after %d chunks",
+            workflow_name,
+            request_id,
+            step_key,
+            len(chunks),
+        )
+        # 已发出的 delta 留在前端手上（设计 §7.3 已说明这半章无从对账）。
+        yield sse_event("done", {"success": False, "error": str(exc)})
+        return
+
+    text = "".join(chunks)
+    # last_usage 只在生成器耗尽后才有效；中途取消或 provider 不报用量时为零值
+    # （设计 §7.1）。这里不编造估算值。
+    usage = getattr(service, "last_usage", None) or TokenUsage()
+    logger.info(
+        "[%s] request_id=%s step=%s status=done elapsed_ms=%d chars=%d total_tokens=%s",
+        workflow_name,
+        request_id,
+        step_key,
+        int((time.perf_counter() - started_at) * 1000),
+        len(text),
+        usage.model_dump().get("total_tokens"),
+    )
+    yield sse_event("done", {"success": True, "text": text, "usage": usage.model_dump()})
