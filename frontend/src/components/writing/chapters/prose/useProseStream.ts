@@ -45,6 +45,19 @@ export function useProseStream() {
 
   const reset = useCallback(() => {
     cancel();
+    // reset() 和 cancel() 都会 abort，但 reset() 还要同步把 status 定成
+    // "idle"——这一步 cancel() 自己不做。问题在于 abort() 不同步：旧一轮的
+    // reader.read() 会在稍后的微任务里 reject，跑进 start() 的 catch，
+    // 那里的守卫只挡"被新一轮取代"（runIdRef 前进），不挡"被 reset() 收场"。
+    // 于是 catch 会在 reset() 刚设完 idle 之后，把 status 又覆盖成
+    // cancelled/error，且 text 已经被这里清空——面板就会显示一个"可接受的
+    // 未完成章节"，但其实内容是空的。
+    // 因此 reset() 也要推进 runIdRef，让那个迟到的 catch 认出自己已经作废。
+    // 注意 cancel() 本身依然不能推进它：面板上单纯点"取消"要正常收到
+    // cancelled 终态（保留半章可接受），只有 reset() 这种"连状态一起清空
+    // 重来"的收场才需要拦住迟到的回调。把这两者的 runIdRef 行为合并，
+    // 会让单纯取消也收不到终态，面板的取消按钮会卡死在 running。
+    runIdRef.current += 1;
     setStatus("idle");
     setText("");
     setContextReport(null);
@@ -104,6 +117,7 @@ export function useProseStream() {
                   setText(data.text);
                 }
                 setStatus("done");
+                return;
               } else {
                 setError(typeof data.error === "string" ? data.error : "生成失败");
                 setStatus("error");
