@@ -184,6 +184,7 @@ SECTION_PRIORITY = {
     "other_threads": 20,
     "minor_cards": 10,         # 最先丢：地点/物品/规则卡
 }
+PROSE_NEVER_TRUNCATE = {name for name, weight in SECTION_PRIORITY.items() if weight >= 100}
 
 
 class ContextBudgetError(Exception):
@@ -279,6 +280,12 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
 
     Returns:
         装配好的 ChapterContext，含被截断段落的标识。
+
+    Raises:
+        ContextBudgetError: 永不截断档（core_settings / chapter_outline /
+            threads_to_resolve / permanent_facts）自身已超预算。permanent_facts
+            随全书主要角色数量线性增长、无上界（§4.4 的 roster 有界假设在这里不
+            成立），此为安全阀而非常态——写到中后期这一档迟早会撑爆窗口。
     """
     novel = inputs.get("novel") or {}
     volume = inputs.get("volume") or {}
@@ -379,6 +386,21 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         minor_blocks.append(f"{card['name']}：{card.get('description', '')}")
     if minor_blocks:
         sections.append(_blob("minor_cards", "相关设定：\n" + "\n".join(minor_blocks)))
+
+    # permanent_facts 无上界（随主要角色数量线性增长，§4.4 的"roster 有界"假设
+    # 在正文模式不成立），本档也可能像细纲模式的 roster 一样单独超预算：宁可
+    # 报错也不能悄悄丢弃"死人复活"屏障——没有这道守卫，_truncate_to_budget
+    # 只从可丢弃段落里丢，永不截断档超预算时会静默地丢无可丢、返回一个仍然
+    # 超预算的包，且因为 truncated_sections/dropped_item_counts 皆空，
+    # prose_router 也不会发 context 帧告知前端（见该模块 §6 契约）。
+    never_tokens = sum(
+        estimate_tokens(s.content) for s in sections if s.name in PROSE_NEVER_TRUNCATE
+    )
+    if never_tokens > budget:
+        raise ContextBudgetError(
+            f"正文上下文的永不截断档已达 {never_tokens} tokens，超出预算 {budget}；"
+            f"很可能是 permanent_facts 过多（主要角色事实随全书线性增长）。请精简后重试。"
+        )
 
     kept, dropped, partial = _truncate_to_budget(sections, budget, SECTION_PRIORITY)
     if dropped or partial:
