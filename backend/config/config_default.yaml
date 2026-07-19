@@ -133,3 +133,9 @@ llm:
         chapter_content:
           provider: openai_gpt4o_mini
           timeout_seconds: null
+    extract_chapter_state_by_ai:
+      default_provider: openai_gpt4o_mini
+      steps:
+        chapter_state:
+          provider: openai_gpt4o_mini
+          timeout_seconds: null

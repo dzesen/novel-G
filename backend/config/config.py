@@ -51,6 +51,9 @@ _KNOWN_WORKFLOW_STEPS: dict[str, tuple[str, ...]] = {
     "write_chapter_by_ai": (
         "chapter_content",
     ),
+    "extract_chapter_state_by_ai": (
+        "chapter_state",
+    ),
 }
 _PROVIDER_RENAMES_KEY = "_provider_renames"
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)

@@ -26,6 +26,7 @@ CORE_FACTIONS_PROMPT_NAME = "create_factions_by_ai"
 VOLUME_OUTLINE_PROMPT_NAME = "create_volume_outline_by_ai"
 CHAPTER_OUTLINE_PROMPT_NAME = "create_chapter_outline_by_ai"
 PROSE_PROMPT_NAME = "write_chapter_by_ai"
+CHAPTER_STATE_PROMPT_NAME = "extract_chapter_state_by_ai"
 LLM_PROVIDER_TEST_PROMPT_NAME = "llm_provider_test"
 
 DEFAULT_PROMPT_PATH = PROMPT_DIR / DEFAULT_PROMPT_FILENAME
@@ -76,6 +77,12 @@ REQUIRED_PROSE_PROMPT_KEYS: tuple[str, ...] = (
     "chapter_content_prompt_without_schema_suffix",
 )
 
+REQUIRED_CHAPTER_STATE_PROMPT_KEYS: tuple[str, ...] = (
+    "chapter_state_prompt_base",
+    "chapter_state_prompt_with_schema_suffix",
+    "chapter_state_prompt_without_schema_suffix",
+)
+
 REQUIRED_LLM_PROVIDER_TEST_PROMPT_KEYS: tuple[str, ...] = (
     "text_probe_prompt",
     "stream_probe_prompt",
@@ -91,6 +98,7 @@ REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
     VOLUME_OUTLINE_PROMPT_NAME: REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS,
     CHAPTER_OUTLINE_PROMPT_NAME: REQUIRED_CHAPTER_OUTLINE_PROMPT_KEYS,
     PROSE_PROMPT_NAME: REQUIRED_PROSE_PROMPT_KEYS,
+    CHAPTER_STATE_PROMPT_NAME: REQUIRED_CHAPTER_STATE_PROMPT_KEYS,
 }
 
 PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
@@ -164,6 +172,12 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "chapter_order",
         "chapter_title",
         "words_per_chapter",
+    },
+    "chapter_state_prompt_base": {
+        "context",
+        "chapter_order",
+        "chapter_title",
+        "chapter_content",
     },
 }
 

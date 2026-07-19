@@ -442,3 +442,40 @@ write_chapter_by_ai:
     直接输出正文纯文本。
   chapter_content_prompt_without_schema_suffix: |
     直接输出正文纯文本，不要输出 JSON，不要用代码块包裹。
+
+extract_chapter_state_by_ai:
+  chapter_state_prompt_base: |
+    你是一位严谨的长篇小说编辑，负责在作者写完一章后回填记忆档案。
+
+    请阅读第 {chapter_order} 章《{chapter_title}》的正文，产出四件事：
+    1. 本章摘要；
+    2. 出场角色的当下状态更新与新确立的永久事实；
+    3. 既有伏笔的状态推进；
+    4. 正文与既有永久事实的冲突报告。
+
+    【已知上下文】
+    {context}
+
+    【本章正文】
+    {chapter_content}
+
+    要求：
+    - 摘要控制在 200 字以内，写清本章实际发生的事，不要评论、不要剧透后文。
+    - 当下状态（current_state）写角色在本章**结束时**的位置、处境、情绪、伤势，
+      这是会被后续章节覆盖的信息。
+    - 永久事实（permanent_facts）只写**不可逆**的既成事实：死亡、残疾、身份揭露、
+      关系决裂、能力获得或永久丧失。可以痊愈的伤、会改变的情绪**不是**永久事实。
+      拿不准就不写——写错了没有删除入口。
+    - 只为**上文出现过**的角色和伏笔提交更新，不要凭空创造 id。
+    - 伏笔只能推进为 developing（有推进但未收）或 resolved（本章确实收了）。
+      不要新建伏笔，不要判定废弃。以**正文实际写了什么**为准：
+      细纲计划要收的伏笔，正文可能根本没写到。
+    - 一致性冲突：逐条比对本章正文与上文列出的既有永久事实。
+      **回忆、幻觉、诈死、托梦、他人假扮都是合法叙事**，不要把它们报成冲突；
+      只报那些看起来像是作者忘了设定的地方，并在 conflict 里写明正文依据。
+      没有冲突就返回空列表，不要为了凑数而编造。
+  chapter_state_prompt_with_schema_suffix: |
+    按给定的 JSON Schema 输出。
+  chapter_state_prompt_without_schema_suffix: |
+    只输出一个 JSON 对象，不要用代码块包裹，不要加任何解释。格式：
+    {{"summary": "本章摘要", "character_updates": [{{"card_id": "卡片id", "current_state": "当下状态", "new_permanent_facts": [{{"fact": "事实描述", "kind": "death|injury|identity|relation|ability"}}]}}], "thread_updates": [{{"thread_id": "伏笔id", "status": "developing|resolved", "evidence": "正文依据"}}], "consistency_issues": [{{"card_id": "卡片id或null", "fact": "被违反的既有事实", "conflict": "正文中冲突的内容"}}]}}
