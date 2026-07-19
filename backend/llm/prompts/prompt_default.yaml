@@ -414,3 +414,25 @@ create_chapter_outline_by_ai:
     请只输出 JSON，形如：
     {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_chapter_order":null,"importance":"sub"}]}
     不要输出 JSON 以外的任何内容。
+
+# 章节正文 Prompt 配置
+write_chapter_by_ai:
+  chapter_content_prompt_base: |
+    你是一位资深长篇小说作者。请为第 {chapter_order} 章《{chapter_title}》撰写正文。
+    本章目标字数约 {words_per_chapter} 字。
+
+    【已知上下文】
+    {context}
+
+    要求：
+    - 严格按上文【本章细纲】的场景顺序推进，不要新增细纲之外的重大情节。
+    - 人物的言行必须与其卡片设定、当前状态、既有永久事实一致；
+      与永久事实冲突的写法（例如让已死之人正常出场）除非细纲明确要求，否则不要写。
+    - 采用上文指定的叙事视角与写作风格；没有指定时用第三人称有限视角。
+    - 以场景和对话推进，避免大段旁白式总结。
+    - 章末收在细纲给出的钩子上。
+    - 直接输出正文本身。不要写标题、不要写"第几章"、不要加任何解释或小标题。
+  chapter_content_prompt_with_schema_suffix: |
+    直接输出正文纯文本。
+  chapter_content_prompt_without_schema_suffix: |
+    直接输出正文纯文本，不要输出 JSON，不要用代码块包裹。

@@ -127,3 +127,9 @@ llm:
         chapter_outline:
           provider: openai_gpt4o_mini
           timeout_seconds: null
+    write_chapter_by_ai:
+      default_provider: openai_gpt4o_mini
+      steps:
+        chapter_content:
+          provider: openai_gpt4o_mini
+          timeout_seconds: null
