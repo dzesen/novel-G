@@ -43,6 +43,8 @@ export function useProseStream() {
   const bufferRef = useRef("");
 
   const cancel = useCallback(() => {
+    // 这里刻意不推进 runIdRef——原因见下方 reset() 里那段长注释；
+    // 两者的行为差异不是遗漏，合并会让单纯取消收不到终态、取消按钮卡在 running。
     abortRef.current?.abort();
     abortRef.current = null;
   }, []);
