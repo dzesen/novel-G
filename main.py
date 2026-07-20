@@ -29,6 +29,7 @@ from backend.services.backup.backup_service import create_automatic_backup_if_du
 from backend.api.default_routers.backup_router import router as backup_router
 from backend.api.default_routers.reference_card_router import router as reference_card_router
 from backend.api.default_routers.plot_thread_router import router as plot_thread_router
+from backend.api.default_routers.character_state_router import router as character_state_router
 
 apply_runtime_flags_from_argv()
 
@@ -91,6 +92,7 @@ app.include_router(upload_router)
 app.include_router(backup_router)
 app.include_router(reference_card_router)
 app.include_router(plot_thread_router)
+app.include_router(character_state_router)
 
 if __name__ == "__main__":
     import uvicorn
