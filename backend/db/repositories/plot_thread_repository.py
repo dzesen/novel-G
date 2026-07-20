@@ -13,6 +13,7 @@ from backend.db.utils import to_object_id
 
 THREAD_STATUS_VALUES = {"planted", "developing", "resolved", "abandoned"}
 THREAD_IMPORTANCE_VALUES = {"main", "sub"}
+THREAD_SOURCE_VALUES = {"outline", "manual"}
 # 装配器只喂这两种：已收和废弃的伏笔不该再占上下文预算。
 ACTIVE_THREAD_STATUSES = {"planted", "developing"}
 
@@ -60,6 +61,10 @@ class PlotThreadRepository(BaseRepository):
         if importance not in THREAD_IMPORTANCE_VALUES:
             raise ValueError(f"Unsupported plot thread importance: {importance}")
 
+        source = str(data.get("source") or "outline")
+        if source not in THREAD_SOURCE_VALUES:
+            raise ValueError(f"Unsupported plot thread source: {source}")
+
         prepared = {
             "novel_id": to_object_id(novel_id),
             "name": name,
@@ -70,6 +75,7 @@ class PlotThreadRepository(BaseRepository):
             "due_chapter_order": _coerce_chapter_order(data.get("due_chapter_order")),
             "resolved_chapter_order": _coerce_chapter_order(data.get("resolved_chapter_order")),
             "notes": str(data.get("notes", "")).strip(),
+            "source": source,
         }
         return await self.insert_one(prepared, session=session)
 

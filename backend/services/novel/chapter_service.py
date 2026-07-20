@@ -218,6 +218,7 @@ class ChapterService:
                                 "description": thread.get("description", ""),
                                 "status": "planted",
                                 "importance": thread.get("importance", "sub"),
+                                "source": "outline",
                                 "planted_chapter_order": chapter_order,
                                 "due_chapter_order": thread.get("due_chapter_order"),
                             },
