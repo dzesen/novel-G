@@ -254,6 +254,11 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     if (saveState === "dirty" || saveState === "error") {
       await persistDraft(selectedChapterId, draft, revisionRef.current);
     }
+    // saveState === "saving" 时自动保存已在途、上面的分支不会触发，但那份 PUT 仍可能
+    // 未落库；无条件等一次保存队列排空，确保后端读到的正文是最新的（设计 §4.1）。
+    // dirty/error 分支已 await 的 persistDraft 会把 saveQueueRef.current 指向自身任务，
+    // 故这一行此时是已决议的 no-op；idle/saved 时队列本就空，同样是 no-op。
+    await saveQueueRef.current;
     return true;
   }, [draft, persistDraft, saveState, selectedChapterId]);
 
