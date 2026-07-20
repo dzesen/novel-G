@@ -15,7 +15,10 @@ from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import get_utc_now, to_object_id
-from backend.llm.schemas.novel_pydantic import ChapterOutlineResultSchema
+from backend.llm.schemas.novel_pydantic import (
+    ChapterOutlineEditSchema,
+    ChapterOutlineResultSchema,
+)
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.outline_validation import validate_outline_ids
 
@@ -269,6 +272,75 @@ class ChapterService:
                 raise
 
         return await run_mongo_write_unit(_write, "accept_chapter_outline")
+
+    @staticmethod
+    async def update_chapter_outline(
+        chapter_id: str,
+        edit_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """编辑已存 chapter.outline 的作者字段（设计 §4）。
+
+        与 accept 的分工：accept 把 AI 预览物化（建 new_threads → 回填 threads_planted）；
+        本方法只改作者字段，threads_planted 与 generated_at 从现有 outline **原样保留**，
+        edited_by_human 强制 true。零 plot_thread 写、零字数/卷书统计联动。
+
+        Raises:
+            ValueError: payload 形状非法 / 引用了不存在的 id / 章节尚无 outline。三者均在写前。
+            NotFoundError: 章节不存在。
+        """
+        # 层 1a：形状校验。extra="forbid" 在此挡下 new_threads / threads_planted /
+        # generated_at / edited_by_human 等越界键——编辑不能建伏笔、不能篡改保留字段。
+        try:
+            parsed = ChapterOutlineEditSchema.model_validate(edit_payload)
+        except ValidationError as exc:
+            raise ValueError(f"细纲编辑数据非法，未做任何写入：{exc}") from exc
+        payload = parsed.model_dump()
+
+        chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+        existing = chapter.get("outline")
+        if not existing:
+            raise ValueError("本章尚无细纲，请先生成细纲后再编辑，未做任何写入")
+
+        novel_id = str(chapter["novel_id"])
+
+        # 层 1b：id 存在性校验（raise 模式，与 accept 同一函数、同一 roster）。
+        roster = await fetch_roster(novel_id)
+        _cleaned, dropped = validate_outline_ids(payload, roster)
+        if dropped:
+            details = "；".join(
+                f"{field}: {', '.join(ids)}" for field, ids in sorted(dropped.items())
+            )
+            raise ValueError(f"细纲引用了该小说中不存在的 id，未做任何写入：{details}")
+
+        stored = {
+            "pov_character_card_id": _optional_object_id(payload["pov_character_card_id"]),
+            "present_character_card_ids": [
+                to_object_id(cid) for cid in payload["present_character_card_ids"]
+            ],
+            "mentioned_character_card_ids": [
+                to_object_id(cid) for cid in payload["mentioned_character_card_ids"]
+            ],
+            "referenced_worldbook_card_ids": [
+                to_object_id(cid) for cid in payload["referenced_worldbook_card_ids"]
+            ],
+            "scenes": payload["scenes"],
+            "core_conflict": payload["core_conflict"],
+            "ending_hook": payload["ending_hook"],
+            "target_word_count": payload["target_word_count"],
+            "threads_resolved": [to_object_id(tid) for tid in payload["threads_resolved"]],
+            # 保留：threads_planted 与 generated_at 原样从现有 outline 并回（设计 §2.1/§2.3）。
+            # 编辑 schema 不含这两个字段，故客户端无从篡改；这里是它们唯一的来源。
+            # 库里它们本就是 ObjectId / datetime，不需要转换。
+            "threads_planted": list(existing.get("threads_planted") or []),
+            "generated_at": existing.get("generated_at"),
+            "edited_by_human": True,
+        }
+
+        async def _write(session):
+            await chapter_repo.update_chapter(chapter_id, {"outline": stored}, session=session)
+            return await chapter_repo.get_chapter_by_id(chapter_id, session=session)
+
+        return await run_mongo_write_unit(_write, "update_chapter_outline")
 
     @staticmethod
     async def soft_delete_chapter(chapter_id: str) -> bool:
