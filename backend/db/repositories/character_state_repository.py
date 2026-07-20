@@ -291,6 +291,7 @@ class CharacterStateRepository(BaseRepository):
             {
                 "novel_id": to_object_id(novel_id),
                 "card_id": to_object_id(card_id),
+                "permanent_facts.id": to_object_id(fact_id),
                 "is_deleted": False,
             },
             {
@@ -299,9 +300,9 @@ class CharacterStateRepository(BaseRepository):
             },
             session=session,
         )
-        if result.modified_count == 0:
+        if result.matched_count == 0:
             raise NotFoundError(f"Permanent fact '{fact_id}' was not found")
-        return True
+        return result.modified_count > 0
 
     async def ensure_fact_ids(
         self,
