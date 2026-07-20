@@ -38,11 +38,15 @@ export default function CharacterMemoryWorkspace({ novelId }: Props) {
       ]);
       setStates(stateRes.data);
       setNames(Object.fromEntries(cardRes.data.map((c) => [c._id, c.name])));
-      setStateDraft(
-        Object.fromEntries(
-          stateRes.data.map((s) => [s.card_id, { current_state: s.current_state, as_of: String(s.as_of_chapter_order) }]),
-        ),
-      );
+      setStateDraft((prev) => {
+        const next = { ...prev };
+        for (const s of stateRes.data) {
+          if (!(s.card_id in next)) {
+            next[s.card_id] = { current_state: s.current_state, as_of: String(s.as_of_chapter_order) };
+          }
+        }
+        return next;
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : t("loadError"));
     }
