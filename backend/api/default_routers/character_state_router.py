@@ -73,6 +73,8 @@ async def edit_current_state(novel_id: str, card_id: str, req: CurrentStateUpdat
             novel_id, card_id, req.current_state, req.as_of_chapter_order
         )
         state = await character_state_repo.get_state(novel_id, card_id)
+        if state is None:
+            raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
     except Exception as exc:
         raise _translate_error(exc) from exc
@@ -85,6 +87,8 @@ async def edit_fact(novel_id: str, card_id: str, fact_id: str, req: PermanentFac
             novel_id, card_id, fact_id, req.model_dump(exclude_unset=True)
         )
         state = await character_state_repo.get_state(novel_id, card_id)
+        if state is None:
+            raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
     except Exception as exc:
         raise _translate_error(exc) from exc
@@ -95,6 +99,8 @@ async def delete_fact(novel_id: str, card_id: str, fact_id: str):
     try:
         await character_state_repo.delete_permanent_fact(novel_id, card_id, fact_id)
         state = await character_state_repo.get_state(novel_id, card_id)
+        if state is None:
+            raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
     except Exception as exc:
         raise _translate_error(exc) from exc
