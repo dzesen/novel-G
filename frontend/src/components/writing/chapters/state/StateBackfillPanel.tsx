@@ -68,7 +68,11 @@ export function StateBackfillPanel({
     setCheckedThreads(new Set(stream.result.thread_updates.map((item) => item.thread_id)));
     setAcceptResult(null);
     setAcceptError("");
-  }, [stream.resultVersion, stream.result]);
+    // 只在**流**送来新结果时重置勾选（由 resultVersion 追踪）；刻意不把 stream.result
+    // 放进依赖——本地编辑（摘要/current_state 文本框）会经 setResult 换新对象引用但**不**
+    // 推进 resultVersion，若把 result 列入依赖，每次击键都会清空用户的勾选与跳过横幅。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream.resultVersion]);
 
   // 六条约束之二：busy 只由生成状态与接受状态派生，consistency_issues 从不参与——
   // 一致性冲突只是标红提示，不得阻断接受（设计 §6.3）。
@@ -212,11 +216,12 @@ export function StateBackfillPanel({
           <ContextNotices report={stream.contextReport} />
           {stream.droppedIds && Object.keys(stream.droppedIds).length > 0 && (
             <Notice tone="warning">
-              {Object.entries(stream.droppedIds).map(([field, ids]) => (
-                <div key={field}>
-                  {field}: {ids.join(", ")}
-                </div>
-              ))}
+              {t("droppedIdsWarning", {
+                count: Object.values(stream.droppedIds).reduce((sum, ids) => sum + ids.length, 0),
+                detail: Object.entries(stream.droppedIds)
+                  .map(([field, ids]) => `${field}: ${ids.join(", ")}`)
+                  .join("、"),
+              })}
             </Notice>
           )}
 

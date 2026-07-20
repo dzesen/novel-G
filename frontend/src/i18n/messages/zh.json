@@ -763,6 +763,7 @@
     "skippedDuplicates": "{count} 条永久事实与本章已有事实重复，已跳过：{facts}",
     "emptyResult": "AI 未提出任何状态变更。",
     "unknownCharacter": "未知角色",
-    "unknownThread": "未知伏笔"
+    "unknownThread": "未知伏笔",
+    "droppedIdsWarning": "AI 引用了 {count} 个不在名单内的对象，已自动剔除：{detail}"
   }
 }
