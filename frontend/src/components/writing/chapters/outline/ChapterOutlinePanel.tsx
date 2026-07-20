@@ -173,7 +173,7 @@ export default function ChapterOutlinePanel({
               <Button variant="outline" size="sm" onPress={stream.cancel}>
                 {t("cancel")}
               </Button>
-            ) : existingOutline && !outline && !regenerateArmed ? (
+            ) : editBuffer ? null : existingOutline && !outline && !regenerateArmed ? (
               <Button
                 variant="outline"
                 size="sm"
