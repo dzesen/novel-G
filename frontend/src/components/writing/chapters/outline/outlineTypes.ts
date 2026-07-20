@@ -97,6 +97,12 @@ export interface PlotThread {
   referenced_by_chapter_orders?: number[];
 }
 
+/** 细纲的作者字段（生成与编辑共用；= ChapterOutlineResult 去掉 new_threads）。 */
+export type ChapterOutlineAuthoredFields = Omit<ChapterOutlineResult, "new_threads">;
+
+/** PUT /api/chapters/{id}/outline 的请求体 outline 字段形状（仅作者字段）。 */
+export type ChapterOutlineEditPayload = ChapterOutlineAuthoredFields;
+
 export interface AcceptVolumeOutlineResponse {
   volume_count: number;
   chapter_count: number;

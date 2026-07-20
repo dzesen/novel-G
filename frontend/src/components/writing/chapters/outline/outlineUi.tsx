@@ -50,3 +50,80 @@ export function ContextNotices({ report }: { report: ContextReport | null }) {
     </>
   );
 }
+
+export function RowEditor<T>({
+  title,
+  rows,
+  addLabel,
+  removeLabel,
+  blank,
+  onChange,
+  render,
+}: {
+  title: string;
+  rows: T[];
+  addLabel: string;
+  removeLabel: string;
+  blank: T;
+  onChange: (rows: T[]) => void;
+  render: (row: T, update: (patch: Partial<T>) => void) => ReactNode;
+}) {
+  return (
+    <section className="rounded-md border border-border bg-background p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <h4 className="text-sm font-semibold text-foreground">{title}</h4>
+        <button
+          type="button"
+          onClick={() => onChange([...rows, blank])}
+          className="rounded-md border border-border px-2 py-1 text-xs text-muted hover:bg-surface-secondary hover:text-foreground"
+        >
+          {addLabel}
+        </button>
+      </div>
+      <div className="grid gap-3">
+        {rows.map((row, index) => (
+          <div key={index} className="rounded-md border border-border bg-surface p-3">
+            {render(row, (rowPatch) => {
+              const next = [...rows];
+              next[index] = { ...next[index], ...rowPatch };
+              onChange(next);
+            })}
+            <div className="mt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => onChange(rows.filter((_, i) => i !== index))}
+                className="text-xs text-red-600 hover:underline dark:text-red-400"
+              >
+                {removeLabel}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+export function ReadOnlyIds({
+  label,
+  ids,
+  nameById,
+}: {
+  label: string;
+  ids: string[];
+  nameById: Record<string, string>;
+}) {
+  if (ids.length === 0) return null;
+  return (
+    <div className="grid gap-1">
+      <dt className="text-xs font-medium text-muted">{label}</dt>
+      <dd className="flex flex-wrap gap-1.5">
+        {ids.map((id) => (
+          <span key={id} className="rounded-md border border-border px-2 py-0.5 text-xs text-foreground">
+            {nameById[id] ?? id}
+          </span>
+        ))}
+      </dd>
+    </div>
+  );
+}
