@@ -1,21 +1,27 @@
 """人物状态仓储：追踪角色的当下状态与不可逆的既成事实。
 
-current_state 可覆盖，permanent_facts 只增不改：第 40 章"左臂尽废"不能被
-第 50 章"已痊愈"抹掉，否则第 87 章 AI 就会写他双手持剑。
+current_state 可覆盖，permanent_facts 对 AI 的写入路径只增不改：第 40 章
+"左臂尽废"不能被第 50 章"已痊愈"抹掉，否则第 87 章 AI 就会写他双手持剑。
+append_permanent_fact 仍然是 AI（阶段 2 服务层 extract_chapter_state_by_ai /
+accept_chapter_state）唯一的写入入口，且只增不改——这条不变量对 AI 没有变。
 
-本类自己没有声明任何删除或改写 permanent_facts 的方法——这只是"这个仓储的
-操作词汇里不存在这个动作"，不是运行时沙箱或权限拦截。它和其他仓储一样继承
-自 BaseRepository，update_one / update_many / bulk_write / hard_delete_one
-等通用方法依然可以直接绕过这条规则改写甚至清空 permanent_facts；这是继承
-通用 CRUD 的正常代价，不是本类特有的漏洞，也不该被误读成"AI 无法误调"。
-真正校验、落地 AI 输出的关卡在阶段 2 服务层（extract_chapter_state_by_ai）：
-AI 只产出 JSON，由那一层解释后才会调用到这里的方法。
+人工纠错是刻意打破上面这条边界的第二写入面（设计 §2.2/§2.3/§5.3，关闭已知
+局限 B1）：set_current_state / update_permanent_fact / delete_permanent_fact
+让人类可以订正 current_state、改写或删除单条 permanent_fact，但止步于"纠正"
+——不提供"凭空新增一条 fact"的人工入口，新增永远只能走 AI 的
+append_permanent_fact。这三个人工方法都要求目标文档/fact 已存在，绝不
+upsert、找不到就显式抛 NotFoundError，不会静默失败或凭空造文档。
+
+它和其他仓储一样继承自 BaseRepository，update_one / update_many / bulk_write /
+hard_delete_one 等通用方法依然可以直接绕过上面所有校验改写甚至清空
+permanent_facts；这是继承通用 CRUD 的正常代价，不是本类特有的漏洞。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
@@ -147,6 +153,7 @@ class CharacterStateRepository(BaseRepository):
             {
                 "$push": {
                     "permanent_facts": {
+                        "id": ObjectId(),
                         "chapter_order": chapter_order,
                         "fact": text,
                         "kind": kind,
@@ -192,6 +199,139 @@ class CharacterStateRepository(BaseRepository):
             query["card_id"] = {"$in": [to_object_id(cid) for cid in card_ids]}
         cursor = self.collection.find(query, session=session)
         return await cursor.to_list(length=None)
+
+    async def set_current_state(
+        self,
+        novel_id: str,
+        card_id: str,
+        current_state: str,
+        as_of_chapter_order: int,
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        """人工订正 current_state。要求文档已存在，否则抛 NotFoundError。
+
+        与 AI 的 upsert_state 刻意区分：人工编辑绝不凭空造一份新状态文档。
+        """
+        if as_of_chapter_order <= 0:
+            raise ValueError("as_of_chapter_order must be greater than 0")
+        now = get_utc_now()
+        result = await self.collection.update_one(
+            {
+                "novel_id": to_object_id(novel_id),
+                "card_id": to_object_id(card_id),
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "current_state": str(current_state).strip(),
+                    "as_of_chapter_order": int(as_of_chapter_order),
+                    "updated_at": now,
+                }
+            },
+            session=session,
+        )
+        if result.matched_count == 0:
+            raise NotFoundError(f"Character state for card '{card_id}' was not found")
+        return result.modified_count > 0
+
+    async def update_permanent_fact(
+        self,
+        novel_id: str,
+        card_id: str,
+        fact_id: str,
+        fields: Dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        """按 fact id 改单条永久事实的 fact/kind/chapter_order。
+
+        状态文档或该 fact id 不存在时抛 NotFoundError。
+        """
+        set_ops: Dict[str, Any] = {}
+        if fields.get("fact") is not None:
+            text = str(fields["fact"]).strip()
+            if not text:
+                raise ValueError("Permanent fact text cannot be empty")
+            set_ops["permanent_facts.$.fact"] = text
+        if fields.get("kind") is not None:
+            kind = str(fields["kind"])
+            if kind not in FACT_KIND_VALUES:
+                raise ValueError(f"Unsupported permanent fact kind: {kind}")
+            set_ops["permanent_facts.$.kind"] = kind
+        if fields.get("chapter_order") is not None:
+            chapter_order = int(fields["chapter_order"])
+            if chapter_order <= 0:
+                raise ValueError("chapter_order must be greater than 0")
+            set_ops["permanent_facts.$.chapter_order"] = chapter_order
+        if not set_ops:
+            return False
+        set_ops["updated_at"] = get_utc_now()
+        result = await self.collection.update_one(
+            {
+                "novel_id": to_object_id(novel_id),
+                "card_id": to_object_id(card_id),
+                "permanent_facts.id": to_object_id(fact_id),
+                "is_deleted": False,
+            },
+            {"$set": set_ops},
+            session=session,
+        )
+        if result.matched_count == 0:
+            raise NotFoundError(f"Permanent fact '{fact_id}' was not found")
+        return result.modified_count > 0
+
+    async def delete_permanent_fact(
+        self,
+        novel_id: str,
+        card_id: str,
+        fact_id: str,
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        """按 fact id 删单条永久事实。未删到（状态或 fact 不存在）抛 NotFoundError。"""
+        result = await self.collection.update_one(
+            {
+                "novel_id": to_object_id(novel_id),
+                "card_id": to_object_id(card_id),
+                "is_deleted": False,
+            },
+            {
+                "$pull": {"permanent_facts": {"id": to_object_id(fact_id)}},
+                "$set": {"updated_at": get_utc_now()},
+            },
+            session=session,
+        )
+        if result.modified_count == 0:
+            raise NotFoundError(f"Permanent fact '{fact_id}' was not found")
+        return True
+
+    async def ensure_fact_ids(
+        self,
+        novel_id: str,
+        session: AsyncClientSession | None = None,
+    ) -> int:
+        """给历史上缺 id 的 permanent_facts 幂等补 id，返回修复条数。
+
+        管理列表端点在返回前调用（唯一一处"读时写"，见设计 §5.4）。
+        逐条 Python 判断而非 dot-notation 查询，稳妥覆盖"同文档部分有部分无 id"。
+        """
+        cursor = self.collection.find(
+            {"novel_id": to_object_id(novel_id), "is_deleted": False}, session=session
+        )
+        docs = await cursor.to_list(length=None)
+        fixed = 0
+        for doc in docs:
+            facts = doc.get("permanent_facts") or []
+            missing = [f for f in facts if "id" not in f]
+            if not missing:
+                continue
+            for fact in missing:
+                fact["id"] = ObjectId()
+            fixed += len(missing)
+            await self.collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"permanent_facts": facts, "updated_at": get_utc_now()}},
+                session=session,
+            )
+        return fixed
 
 
 character_state_repo = CharacterStateRepository()
