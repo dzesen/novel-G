@@ -80,6 +80,8 @@ export type DroppedIds = Record<string, string[]>;
 
 export type ThreadStatus = "planted" | "developing" | "resolved" | "abandoned";
 
+export type ThreadSource = "outline" | "manual";
+
 export interface PlotThread {
   _id: string;
   novel_id: string;
@@ -88,6 +90,11 @@ export interface PlotThread {
   status: ThreadStatus;
   importance: ThreadImportance;
   due_chapter_order: number | null;
+  planted_chapter_order?: number | null;
+  resolved_chapter_order?: number | null;
+  notes?: string;
+  source?: ThreadSource;
+  referenced_by_chapter_orders?: number[];
 }
 
 export interface AcceptVolumeOutlineResponse {

@@ -8,6 +8,8 @@ import FactionCardsWorkspace from "./factions/FactionCardsWorkspace";
 import ChapterWorkspace from "./chapters/ChapterWorkspace";
 import ReferenceCardsWorkspace from "./reference-cards/ReferenceCardsWorkspace";
 import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
+import PlotThreadWorkspace from "./plot-threads/PlotThreadWorkspace";
+import CharacterMemoryWorkspace from "./character-memory/CharacterMemoryWorkspace";
 
 interface WritingContentProps {
   mode: "create" | "edit";
@@ -41,6 +43,12 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     }
     if (activeItem === "relationship-map") {
       return <RelationshipWorkspace mode={mode} novelId={novelId} />;
+    }
+    if (activeItem === "plot-threads") {
+      return <PlotThreadWorkspace mode={mode} novelId={novelId} />;
+    }
+    if (activeItem === "character-memory") {
+      return <CharacterMemoryWorkspace mode={mode} novelId={novelId} />;
     }
     const unreachable: never = activeItem;
     return unreachable;

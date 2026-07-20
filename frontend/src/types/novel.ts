@@ -306,4 +306,6 @@ export type WritingSidebarItem =
   | "faction-cards"
   | "item-cards"
   | "rule-cards"
-  | "relationship-map";
+  | "relationship-map"
+  | "plot-threads"
+  | "character-memory";

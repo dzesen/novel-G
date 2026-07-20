@@ -91,6 +91,24 @@ const ENTITY_ITEMS: NavItem[] = [
       </svg>
     ),
   },
+  {
+    key: "plot-threads",
+    labelKey: "sidebar.plotThreads",
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M4 7h16" /><path d="M4 12h16" /><path d="M4 17h10" /><circle cx="19" cy="17" r="2" />
+      </svg>
+    ),
+  },
+  {
+    key: "character-memory",
+    labelKey: "sidebar.characterMemory",
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 8V4H8" /><rect width="16" height="12" x="4" y="8" rx="2" /><path d="M2 14h2" /><path d="M20 14h2" /><path d="M15 13v2" /><path d="M9 13v2" />
+      </svg>
+    ),
+  },
 ];
 
 export default function WritingSidebar({ activeItem, onSelect }: WritingSidebarProps) {
