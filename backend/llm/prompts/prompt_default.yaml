@@ -98,7 +98,7 @@ create_novel_by_ai:
     现在请直接开始创作正文。
   expand_idea_to_full_novel_story_prompt_without_schema_suffix: |
     请按照以下 JSON 结构返回，不要输出额外内容，字数不得超过4000字：
-    {{"plot": "完整的3000字长篇压缩故事正文"}}
+    {"plot": "完整的3000字长篇压缩故事正文"}
   
   #提炼小说构思要素
   extract_idea_prompt_base: |
@@ -117,12 +117,12 @@ create_novel_by_ai:
     请只提炼出故事构思要素, 不要输出任何额外内容。
   extract_idea_prompt_without_schema_suffix: |
     请严格输出 JSON, 不要输出任何额外内容: 
-    {{
+    {
       "genre": "小说类型，如玄幻、科幻、都市、悬疑、历史、仙侠等，字数限制不超过20字",
       "tone": "整体基调，如热血、黑暗、轻松、搞笑、治愈、压抑等，字数限制不超过20字",
       "target_audience": "目标读者，如男频、女频、青少年等，字数限制不超过20字",
       "core_idea": "核心设想，字数限制不超过250字"
-    }}
+    }
 
   #故事核心
   core_seed_prompt_base: |
@@ -147,7 +147,7 @@ create_novel_by_ai:
     请只生成故事核心内容。
   core_seed_prompt_without_schema_suffix: |
     请严格输出一个 JSON 对象, 不要输出任何额外内容: 
-    {{"core_seed": "故事核心公式，需包含显性冲突、潜在危机、人物核心驱动力与世界观关键矛盾暗示，长度30-100字，不得超过100字"}}
+    {"core_seed": "故事核心公式，需包含显性冲突、潜在危机、人物核心驱动力与世界观关键矛盾暗示，长度30-100字，不得超过100字"}
 
   #小说整体设定
   novel_meta_prompt_base: |
@@ -208,7 +208,7 @@ create_novel_by_ai:
     请只生成小说整体设定内容。
   novel_meta_prompt_without_schema_suffix: |
     请严格输出 JSON, 不要输出任何额外内容: 
-    {{
+    {
       "title": "小说主标题，具有吸引力和传播性，符合类型读者审美，字数限制不超过20字",
       "subtitle": "副标题，补充核心冲突或主题，具有一定文学感或商业感，字数限制不超过20字",
       "introduction": "引言，100-300字，引入故事，吸引读者阅读兴趣",
@@ -218,7 +218,7 @@ create_novel_by_ai:
       "narrative_pov": "叙事视角，只能为第一人称、第三人称有限视角、全知视角之一",
       "era_background": "时代背景，如“架空古代 / 未来星际 / 现代都市 / 末世废土”等，字数限制不超过40字",
       "tags": ["标签1", "标签2", "标签3"]
-    }}
+    }
 
 # 创建态单字段改写 Prompt 配置
 rewrite_novel_field:
@@ -322,9 +322,9 @@ create_factions_by_ai:
     请只生成全书核心阵营与阵营关系，不要输出解释、Markdown 或角色信息。
   create_core_factions_prompt_without_schema_suffix: |
     请严格输出 JSON，不要输出额外内容:
-    {{
+    {
       "core_factions": [
-        {{
+        {
           "name": "阵营名称",
           "faction_type": "国家政权/宗门组织/地下势力/商业联盟/宗教组织/异族势力/研究组织/中立组织/秘密结社等",
           "positioning": "阵营在世界结构中的位置",
@@ -339,10 +339,10 @@ create_factions_by_ai:
           "influence_scope": "全域级/多区域级/区域级",
           "expandability": "后续可扩展方向",
           "tags": ["标签1", "标签2"]
-        }}
+        }
       ],
       "faction_relations": [
-        {{
+        {
           "source_faction_name": "阵营A",
           "target_faction_name": "阵营B",
           "relation_type": "hostile",
@@ -352,9 +352,9 @@ create_factions_by_ai:
           "possible_change": "可能变化",
           "intensity": 5,
           "is_active": true
-        }}
+        }
       ]
-    }}
+    }
 
 # 分卷大纲 Prompt 配置
 create_volume_outline_by_ai:
