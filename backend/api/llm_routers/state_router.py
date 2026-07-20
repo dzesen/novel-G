@@ -22,7 +22,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import to_object_id
 from backend.llm.config import get_llm_config, get_provider_config
 from backend.llm.prompts.prompt_selector import CHAPTER_STATE_PROMPT_NAME, load_prompt_config
-from backend.llm.schemas.novel_pydantic import ChapterStateResultSchema
+from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema, ChapterStateResultSchema
 from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_context,
@@ -41,6 +41,7 @@ from backend.services.llm.workflow_service import (
     resolve_provider_for_step,
     resolve_timeout_for_step,
 )
+from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.state_validation import validate_state_ids
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -206,3 +207,27 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class AcceptChapterStateRequest(ChapterStateAcceptSchema):
+    """accept 端点入参：在 payload 之外多带一个 chapter_id。
+
+    继承 ChapterStateAcceptSchema 而非重复其字段，故 extra="forbid" 一并继承——
+    多余字段仍会被拒。传给服务层时要**去掉 chapter_id**，那是定位参数不是数据。
+    """
+
+    chapter_id: str = Field(..., min_length=1)
+
+
+@router.post("/accept-chapter-state")
+async def accept_chapter_state(req: AcceptChapterStateRequest):
+    """接受状态回填：写章摘要、回填人物状态、推进伏笔状态。"""
+    payload = req.model_dump(exclude={"chapter_id"})
+    try:
+        return await ChapterStateService.accept_chapter_state(req.chapter_id, payload)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
