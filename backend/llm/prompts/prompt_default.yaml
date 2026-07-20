@@ -478,4 +478,4 @@ extract_chapter_state_by_ai:
     按给定的 JSON Schema 输出。
   chapter_state_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要用代码块包裹，不要加任何解释。格式：
-    {{"summary": "本章摘要", "character_updates": [{{"card_id": "卡片id", "current_state": "当下状态", "new_permanent_facts": [{{"fact": "事实描述", "kind": "death|injury|identity|relation|ability"}}]}}], "thread_updates": [{{"thread_id": "伏笔id", "status": "developing|resolved", "evidence": "正文依据"}}], "consistency_issues": [{{"card_id": "卡片id或null", "fact": "被违反的既有事实", "conflict": "正文中冲突的内容"}}]}}
+    {"summary": "本章摘要", "character_updates": [{"card_id": "卡片id", "current_state": "当下状态", "new_permanent_facts": [{"fact": "事实描述", "kind": "death|injury|identity|relation|ability"}]}], "thread_updates": [{"thread_id": "伏笔id", "status": "developing|resolved", "evidence": "正文依据"}], "consistency_issues": [{"card_id": "卡片id或null", "fact": "被违反的既有事实", "conflict": "正文中冲突的内容"}]}
