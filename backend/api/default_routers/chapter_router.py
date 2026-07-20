@@ -37,6 +37,10 @@ class AcceptChapterOutlineRequest(BaseModel):
     edited_by_human: bool = False
 
 
+class UpdateChapterOutlineRequest(BaseModel):
+    outline: dict
+
+
 _OUTLINE_ID_FIELDS = (
     "pov_character_card_id",
     "present_character_card_ids",
@@ -103,6 +107,20 @@ async def accept_chapter_outline(chapter_id: str, req: AcceptChapterOutlineReque
             edited_by_human=req.edited_by_human,
         )
     except (NotFoundError, DuplicateKeyError, InvalidIdError, ValueError) as exc:
+        raise _handle_client_error(exc) from exc
+
+
+@router.put("/{chapter_id}/outline")
+async def update_chapter_outline(chapter_id: str, req: UpdateChapterOutlineRequest):
+    """编辑已存章节细纲的作者字段（设计 §5）。
+
+    threads_planted 与 generated_at 由服务端从现有 outline 保留，edited_by_human
+    强制 true。不创建/删除任何伏笔。请求体不含 edited_by_human（服务端固定 true）。
+    """
+    try:
+        chapter = await ChapterService.update_chapter_outline(chapter_id, req.outline)
+        return _serialize(chapter)
+    except (NotFoundError, InvalidIdError, ValueError) as exc:
         raise _handle_client_error(exc) from exc
 
 
