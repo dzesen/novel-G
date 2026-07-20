@@ -287,13 +287,13 @@ class NewThreadSchema(BaseModel):
     importance: Literal["main", "sub"] = Field(default="sub", description="伏笔重要度")
 
 
-class ChapterOutlineResultSchema(BaseModel):
-    """AI 章节细纲生成结果（**LLM 输出 schema，非存储 schema**，见设计 §3.2）。
+class ChapterOutlineAuthoredSchema(BaseModel):
+    """章节细纲的**作者字段**——生成与编辑共用的公共基（设计 §2.5）。
 
-    与库里 chapter.outline 的三处系统性差异：
-    - id 字段在这里是**字符串**，落库时转 ObjectId；
-    - **没有** threads_planted——它由 accept 创建 new_threads 后回填；
-    - **没有** generated_at / edited_by_human——服务端赋值。
+    抽出来是为了让"AI 能生成的作者字段"与"人能编辑的作者字段"结构性恒等、
+    约束不可能漂移。id 字段在这里是**字符串**，落库时转 ObjectId。
+    不含 new_threads（仅生成有）、也不含 threads_planted / generated_at /
+    edited_by_human（存储 schema 才有、服务端赋值）。
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -310,9 +310,29 @@ class ChapterOutlineResultSchema(BaseModel):
     ending_hook: str = Field(..., min_length=1, max_length=500, description="章末钩子")
     target_word_count: int = Field(..., ge=100, le=50000, description="本章目标字数")
     threads_resolved: List[str] = Field(default_factory=list, description="本章回收的伏笔 id")
+
+
+class ChapterOutlineResultSchema(ChapterOutlineAuthoredSchema):
+    """AI 章节细纲生成结果（**LLM 输出 schema，非存储 schema**，见设计 §3.2）。
+
+    在作者字段基上多一个 new_threads。与库里 chapter.outline 的三处系统性差异：
+    - id 字段在这里是**字符串**，落库时转 ObjectId；
+    - **没有** threads_planted——它由 accept 创建 new_threads 后回填；
+    - **没有** generated_at / edited_by_human——服务端赋值。
+    """
+
     new_threads: List[NewThreadSchema] = Field(
         default_factory=list, max_length=10, description="本章新埋下的伏笔（尚无 id）"
     )
+
+
+class ChapterOutlineEditSchema(ChapterOutlineAuthoredSchema):
+    """人工编辑已存细纲的**编辑输入 schema**（设计 §3/§4）。
+
+    = 作者字段基本身。**不含** new_threads（编辑不能建伏笔）、threads_planted
+    （保留不动，服务端从现有 outline 并回）、generated_at（保留原值）、
+    edited_by_human（服务端强制 true）。
+    """
 
 
 class PermanentFactProposalSchema(BaseModel):
