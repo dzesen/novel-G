@@ -736,6 +736,7 @@
     "title": "AI State Backfill",
     "openButton": "AI State Backfill",
     "needContent": "This chapter has no saved prose yet. Write and save the prose first.",
+    "needTitleToSave": "Prose cannot be saved while the chapter title is empty. Add a title first.",
     "generate": "Start backfill",
     "regenerate": "Regenerate",
     "cancel": "Cancel",

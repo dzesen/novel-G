@@ -23,6 +23,7 @@ import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
 import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
 import type { StoredChapterOutline } from "./outline/outlineTypes";
 import ProsePanel from "./prose/ProsePanel";
+import { StateBackfillPanel } from "./state/StateBackfillPanel";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -37,6 +38,9 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tProse = useTranslations("writing.prose");
+  // stateBackfill 是顶层命名空间（不在 writing 之下，见 T6 报告的偏离说明），
+  // 必须单独取一份 translator，不能借用上面几个 writing.* 的 t()。
+  const tStateBackfill = useTranslations("stateBackfill");
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [trash, setTrash] = useState<ChapterSummary[]>([]);
@@ -54,6 +58,8 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
   const [proseOpen, setProseOpen] = useState(false);
+  const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
+  const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(null);
@@ -231,6 +237,37 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     void persistDraft(selectedChapterId, draft, revisionRef.current);
   }, [draft, persistDraft, selectedChapterId]);
 
+  /**
+   * 显式冲一次草稿并**等待落库**，供状态回填面板在打开前调用。
+   *
+   * 状态回填在后端读 chapter.content（设计 §4.1），而正文可能还躺在
+   * 900ms 防抖的自动保存队列里。不等这一下，AI 就会为**上一版正文**
+   * 生成摘要与永久事实，且静默无感。
+   *
+   * 与 saveNow 的区别只在于**返回 Promise**：saveNow 是快捷键用的即发即忘。
+   * 标题为空时 persistDraft 会被跳过（自动保存的既有约定），此时本函数
+   * 返回 false，调用方必须据此拒绝打开面板——静默的空保存比不保存更危险。
+   */
+  const flushDraft = useCallback(async (): Promise<boolean> => {
+    if (!selectedChapterId || !draft) return false;
+    if (!draft.title.trim()) return false;
+    if (saveState === "dirty" || saveState === "error") {
+      await persistDraft(selectedChapterId, draft, revisionRef.current);
+    }
+    return true;
+  }, [draft, persistDraft, saveState, selectedChapterId]);
+
+  const openStateBackfill = useCallback(async () => {
+    setStateBackfillBlocked("");
+    const flushed = await flushDraft();
+    if (!flushed) {
+      // 标题为空 → 自动保存被跳过 → 库里的正文是旧的。如实拦住，不静默放行。
+      setStateBackfillBlocked(tStateBackfill("needTitleToSave"));
+      return;
+    }
+    setStateBackfillOpen(true);
+  }, [flushDraft, tStateBackfill]);
+
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
@@ -271,10 +308,12 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     setChapterOutline(undefined);
     setUpdatedAt(undefined);
     setSaveState("idle");
-    // 两个面板都持有 chapterId、以整容器覆盖的方式渲染：换章后若不关，
+    // 三个面板都持有 chapterId、以整容器覆盖的方式渲染：换章后若不关，
     // 面板会挂着上一章的 id 继续渲染（deleteChapter 已修过同一个坑）。
     setProseOpen(false);
     setChapterOutlineOpen(false);
+    setStateBackfillOpen(false);
+    setStateBackfillBlocked("");
     selectedChapterIdRef.current = chapterId;
     setSelectedChapterId(chapterId);
   };
@@ -336,9 +375,11 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
       selectedChapterIdRef.current = null;
       setSelectedChapterId(null);
       // 这里绕开了 selectChapter，所以要手动补上它顺带做的面板复位：
-      // 两个面板都以整容器覆盖的方式渲染，持有的 chapterId 会指向刚被删掉的章。
+      // 三个面板都以整容器覆盖的方式渲染，持有的 chapterId 会指向刚被删掉的章。
       setProseOpen(false);
       setChapterOutlineOpen(false);
+      setStateBackfillOpen(false);
+      setStateBackfillBlocked("");
       await loadStructure();
     } catch (error) {
       setStructureError(error instanceof Error ? error.message : t("deleteFailed"));
@@ -404,6 +445,9 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         onOpenChapterOutline={() => setChapterOutlineOpen(true)}
         onOpenProse={() => setProseOpen(true)}
         canGenerateProse={Boolean(chapterOutline)}
+        onOpenStateBackfill={() => void openStateBackfill()}
+        hasContent={Boolean(draft?.content?.trim())}
+        stateBackfillBlocked={stateBackfillBlocked}
       />
 
       {volumeOutlineOpen && novelId && (
@@ -447,6 +491,18 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
             // 整分支评审 Important #1 的原样重演。
             changeDraft({ content: text });
             setStructureNotice(tProse("acceptedNotice"));
+          }}
+        />
+      )}
+
+      {stateBackfillOpen && novelId && selectedChapterId && (
+        <StateBackfillPanel
+          novelId={novelId}
+          chapterId={selectedChapterId}
+          onClose={() => setStateBackfillOpen(false)}
+          onAccepted={() => {
+            // 摘要已由后端写库；回读章节列表让摘要与字数显示跟上。
+            void loadStructure();
           }}
         />
       )}

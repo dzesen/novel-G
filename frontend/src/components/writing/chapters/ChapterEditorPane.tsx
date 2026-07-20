@@ -24,6 +24,11 @@ interface ChapterEditorPaneProps {
   onOpenProse: () => void;
   /** 无已接受细纲时禁用 AI 写正文：没有 outline 上下文包会退化（设计 §6）。 */
   canGenerateProse: boolean;
+  onOpenStateBackfill: () => void;
+  /** chapter.content 为空时禁用 AI 状态回填：后端读库里的正文，没正文就没得回填（2b-2 设计 §4.1）。 */
+  hasContent: boolean;
+  /** flushDraft 因标题为空被拒绝、面板未能打开时的提示文案；非空时渲染在按钮下方。 */
+  stateBackfillBlocked: string;
 }
 
 function SaveStateLabel({ state }: { state: ChapterSaveState }) {
@@ -54,10 +59,15 @@ export default function ChapterEditorPane({
   onOpenChapterOutline,
   onOpenProse,
   canGenerateProse,
+  onOpenStateBackfill,
+  hasContent,
+  stateBackfillBlocked,
 }: ChapterEditorPaneProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tProse = useTranslations("writing.prose");
+  // stateBackfill 是顶层命名空间，与上面几个 writing.* 的 t() 不同源，需单独取。
+  const tStateBackfill = useTranslations("stateBackfill");
   const [showSummary, setShowSummary] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -148,6 +158,15 @@ export default function ChapterEditorPane({
             </button>
             <button
               type="button"
+              onClick={onOpenStateBackfill}
+              disabled={!hasContent}
+              title={hasContent ? undefined : tStateBackfill("needContent")}
+              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+            >
+              {tStateBackfill("openButton")}
+            </button>
+            <button
+              type="button"
               onClick={onExportNovel}
               className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted transition-colors hover:bg-surface-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
@@ -170,6 +189,12 @@ export default function ChapterEditorPane({
             </button>
           </div>
         </div>
+
+        {stateBackfillBlocked && (
+          <p role="alert" className="mt-1.5 text-xs text-red-600 dark:text-red-400">
+            {stateBackfillBlocked}
+          </p>
+        )}
 
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
           <label className="flex items-center gap-2 text-xs text-muted">

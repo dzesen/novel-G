@@ -736,6 +736,7 @@
     "title": "AI 状态回填",
     "openButton": "AI 状态回填",
     "needContent": "本章还没有已保存的正文，请先写好并保存正文",
+    "needTitleToSave": "章节标题为空时无法保存正文，请先填写标题",
     "generate": "开始回填",
     "regenerate": "重新回填",
     "cancel": "取消",
