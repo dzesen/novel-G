@@ -482,13 +482,18 @@
       "threadsResolvedNotice": "接受细纲不会让伏笔从后续章节的活跃列表中消失。伏笔状态的真正转移属于后续阶段的状态回填——写完正文才能确认那条伏笔是否真的收了。",
       "orphanThreadsNotice": "本次覆盖了旧细纲，上次创建的 {count} 条伏笔已成为孤儿，不会被自动清理（无法区分其中哪些已被人工编辑过）：{names}",
       "existingTitle": "本章已有细纲",
-      "existingHint": "已接受的细纲不可直接编辑——重新生成会整份覆盖它，且上次创建的伏笔会成为孤儿、需手工清理。",
+      "existingHint": "已接受的细纲可以直接编辑（保存只改字段、不影响已埋的伏笔）；「重新生成」则会整份覆盖它，且上次创建的伏笔会成为孤儿、需手工清理。",
       "existingGeneratedAt": "生成于 {time}",
       "existingEditedByHuman": "已经人工编辑",
       "existingAiOnly": "未经人工编辑",
       "regenerateWarning": "确定要重新生成吗？现有细纲将被覆盖。",
       "confirmRegenerate": "确定重新生成",
-      "threadsPlanted": "本章埋下的伏笔"
+      "threadsPlanted": "本章埋下的伏笔",
+      "editOutline": "编辑细纲",
+      "saveEdit": "保存",
+      "savingEdit": "保存中...",
+      "cancelEdit": "取消编辑",
+      "threadsPlantedReadonlyHint": "本章埋下的伏笔在此只读。要新增或删除伏笔，请到「伏笔管理」工作台，或整份重新生成细纲。"
     },
     "prose": {
       "title": "AI 写正文",

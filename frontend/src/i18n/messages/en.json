@@ -482,13 +482,18 @@
       "threadsResolvedNotice": "Accepting an outline does not remove a plot thread from later chapters' active list. The actual status transition happens during state backfill in a later phase, once the prose confirms the thread was really resolved.",
       "orphanThreadsNotice": "This replaced an earlier outline. The {count} threads created last time are now orphaned and are not cleaned up automatically (there is no way to tell which were hand-edited): {names}",
       "existingTitle": "This chapter already has an outline",
-      "existingHint": "An accepted outline cannot be edited directly. Regenerating replaces it wholesale, and the threads created last time become orphans that need manual cleanup.",
+      "existingHint": "An accepted outline can be edited directly (saving only changes fields and keeps the planted threads). Regenerating instead replaces it wholesale, and the threads created last time become orphans that need manual cleanup.",
       "existingGeneratedAt": "Generated at {time}",
       "existingEditedByHuman": "Hand-edited",
       "existingAiOnly": "Not hand-edited",
       "regenerateWarning": "Regenerate? The current outline will be replaced.",
       "confirmRegenerate": "Yes, regenerate",
-      "threadsPlanted": "Plot threads planted here"
+      "threadsPlanted": "Plot threads planted here",
+      "editOutline": "Edit outline",
+      "saveEdit": "Save",
+      "savingEdit": "Saving...",
+      "cancelEdit": "Cancel",
+      "threadsPlantedReadonlyHint": "Threads planted in this chapter are read-only here. To add or remove threads, use the Plot Threads workspace, or regenerate the whole outline."
     },
     "prose": {
       "title": "AI Write Chapter",

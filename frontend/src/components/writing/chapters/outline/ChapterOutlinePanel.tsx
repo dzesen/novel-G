@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
-import { apiPost } from "@/lib/api";
+import { apiPost, apiPut } from "@/lib/api";
 import { useOutlineStream } from "./useOutlineStream";
 import { useRoster } from "./useRoster";
 import OutlineGenerationParams, {
@@ -15,6 +15,7 @@ import OutlineFieldsEditor from "./OutlineFieldsEditor";
 import { ContextNotices, Field, Notice, ReadOnlyIds, RowEditor } from "./outlineUi";
 import type {
   AcceptChapterOutlineResponse,
+  ChapterOutlineEditPayload,
   ChapterOutlineResult,
   NewThread,
   StoredChapterOutline,
@@ -50,6 +51,10 @@ export default function ChapterOutlinePanel({
   // 已接受的细纲不可编辑后直接回贴（见文件顶部 accept 的 schema 约束），重新生成
   // 会整份覆盖它并让上次创建的伏笔成为孤儿，所以用二次确认挡一下误点。
   const [regenerateArmed, setRegenerateArmed] = useState(false);
+  // 编辑态：editBuffer 非 null 即处于"改已存细纲"模式，与 AI 预览（stream.result）互斥。
+  const [editBuffer, setEditBuffer] = useState<StoredChapterOutline | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
 
   const outline = stream.result;
 
@@ -126,6 +131,33 @@ export default function ChapterOutlinePanel({
     }
   };
 
+  const saveEdit = async () => {
+    if (!editBuffer) return;
+    setSavingEdit(true);
+    setEditError("");
+    try {
+      const payload: ChapterOutlineEditPayload = {
+        pov_character_card_id: editBuffer.pov_character_card_id,
+        present_character_card_ids: editBuffer.present_character_card_ids,
+        mentioned_character_card_ids: editBuffer.mentioned_character_card_ids,
+        referenced_worldbook_card_ids: editBuffer.referenced_worldbook_card_ids,
+        scenes: editBuffer.scenes,
+        core_conflict: editBuffer.core_conflict,
+        ending_hook: editBuffer.ending_hook,
+        target_word_count: editBuffer.target_word_count,
+        threads_resolved: editBuffer.threads_resolved,
+      };
+      await apiPut(`/api/chapters/${chapterId}/outline`, { outline: payload });
+      setEditBuffer(null);
+      onAccepted(); // 触发父层刷新，existingOutline 反映本次编辑
+      onClose();
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
   const busy = stream.status === "running" || accepting;
 
   return (
@@ -174,19 +206,29 @@ export default function ChapterOutlinePanel({
 
           {roster.error && <Notice tone="warning">{t("rosterLoadFailed", { error: roster.error })}</Notice>}
 
-          {existingOutline && !outline && (
+          {existingOutline && !outline && !editBuffer && (
             <section className="mb-4 rounded-md border border-border bg-background p-4">
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <h4 className="text-sm font-semibold text-foreground">{t("existingTitle")}</h4>
-                <div className="flex gap-2 text-xs text-muted">
-                  {existingOutline.generated_at && (
+                <div className="flex items-center gap-2">
+                  <div className="flex gap-2 text-xs text-muted">
+                    {existingOutline.generated_at && (
+                      <span className="rounded-md border border-border px-2 py-0.5">
+                        {t("existingGeneratedAt", { time: new Date(existingOutline.generated_at).toLocaleString() })}
+                      </span>
+                    )}
                     <span className="rounded-md border border-border px-2 py-0.5">
-                      {t("existingGeneratedAt", { time: new Date(existingOutline.generated_at).toLocaleString() })}
+                      {existingOutline.edited_by_human ? t("existingEditedByHuman") : t("existingAiOnly")}
                     </span>
-                  )}
-                  <span className="rounded-md border border-border px-2 py-0.5">
-                    {existingOutline.edited_by_human ? t("existingEditedByHuman") : t("existingAiOnly")}
-                  </span>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onPress={() => setEditBuffer(structuredClone(existingOutline))}
+                    isDisabled={busy}
+                  >
+                    {t("editOutline")}
+                  </Button>
                 </div>
               </div>
               <p className="mb-3 text-xs leading-5 text-amber-700 dark:text-amber-300">{t("existingHint")}</p>
@@ -216,6 +258,46 @@ export default function ChapterOutlinePanel({
               <p className="mt-3 rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-muted">
                 {t("threadsResolvedNotice")}
               </p>
+            </section>
+          )}
+
+          {editBuffer && !outline && (
+            <section className="mb-4 grid gap-4">
+              <h4 className="text-sm font-semibold text-foreground">{t("editOutline")}</h4>
+              <OutlineFieldsEditor
+                value={editBuffer}
+                onChange={(patch) => setEditBuffer((cur) => (cur ? { ...cur, ...patch } : cur))}
+                roster={roster}
+              />
+              <div className="grid gap-2 rounded-md border border-border bg-background p-4">
+                <ReadOnlyIds label={t("threadsPlanted")} ids={editBuffer.threads_planted} nameById={roster.nameById} />
+                <p className="rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-muted">
+                  {t("threadsPlantedReadonlyHint")}
+                </p>
+              </div>
+              {editError && <Notice tone="error">{editError}</Notice>}
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onPress={() => {
+                    setEditBuffer(null);
+                    setEditError("");
+                  }}
+                  isDisabled={savingEdit}
+                >
+                  {t("cancelEdit")}
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="bg-accent text-white hover:bg-accent-hover"
+                  onPress={() => void saveEdit()}
+                  isDisabled={savingEdit}
+                >
+                  {savingEdit ? t("savingEdit") : t("saveEdit")}
+                </Button>
+              </div>
             </section>
           )}
 
