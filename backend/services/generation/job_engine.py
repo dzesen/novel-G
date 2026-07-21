@@ -29,7 +29,7 @@ class JobControl:
 
 @dataclass(frozen=True)
 class JobEngineDeps:
-    list_volume_chapters: Callable[[str], Awaitable[List[Dict[str, Any]]]]
+    list_worklist_chapters: Callable[[], Awaitable[List[Dict[str, Any]]]]
     run_chapter: Callable[[str, Dict[str, Any]], Awaitable[ChapterOutcome]]
 
 
@@ -64,8 +64,8 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 await _pause(repo, job_id, "cost_cap")
                 return
 
-            chapters = await deps.list_volume_chapters(str(job["volume_id"]))
-            chapter = job_planner.next_chapter_needing_work(chapters)
+            chapters = await deps.list_worklist_chapters()
+            chapter = job_planner.first_needing_work(chapters)
             if chapter is None:
                 await repo.update_job_fields(job_id, {"status": "completed", "current_chapter_id": None})
                 return
