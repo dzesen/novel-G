@@ -55,6 +55,7 @@ class NovelService:
             worldbook_repo = BaseRepository(collections.WORLDBOOK)
             plot_threads_repo = BaseRepository(collections.PLOT_THREADS)
             character_states_repo = BaseRepository(collections.CHARACTER_STATES)
+            generation_jobs_repo = BaseRepository(collections.GENERATION_JOBS)
 
             stats = {}
 
@@ -70,6 +71,7 @@ class NovelService:
             stats["worldbook_deleted"] = await worldbook_repo.hard_delete_many(query, session=session)
             stats["plot_threads_deleted"] = await plot_threads_repo.hard_delete_many(query, session=session)
             stats["character_states_deleted"] = await character_states_repo.hard_delete_many(query, session=session)
+            stats["generation_jobs_deleted"] = await generation_jobs_repo.hard_delete_many(query, session=session)
 
             novel_deleted = await novel_repo.hard_delete_one({"_id": obj_id}, session=session)
             stats["novel_deleted"] = 1 if novel_deleted else 0

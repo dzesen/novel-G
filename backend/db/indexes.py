@@ -327,6 +327,30 @@ async def init_character_state_indexes():
         logger.error("初始化 character_states 索引失败：%s", exc)
 
 
+async def init_generation_job_indexes():
+    """初始化 generation_jobs 集合的索引。"""
+    try:
+        db = get_database()
+        jobs_collection = db[collections.GENERATION_JOBS]
+        indexes = [
+            # 活跃作业查找 + 列表（全局单作业守卫按 status 查在跑作业）
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+            ]),
+            # 历史列表按创建时间
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("created_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
+        ]
+        await jobs_collection.create_indexes(indexes)
+        logger.info("成功初始化'generation_jobs'集合的索引。")
+    except Exception as exc:
+        logger.error("初始化 generation_jobs 索引失败：%s", exc)
+
+
 async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_novel_indexes()
@@ -337,4 +361,5 @@ async def init_all_indexes():
     await init_faction_relation_indexes()
     await init_plot_thread_indexes()
     await init_character_state_indexes()
+    await init_generation_job_indexes()
     # 在这里添加其他集合的索引初始化

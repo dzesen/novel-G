@@ -20,6 +20,11 @@ FACTION_RELATIONS = "faction_relations"
 PLOT_THREADS = "plot_threads"
 CHARACTER_STATES = "character_states"
 
+# 批量生成作业（阶段 3）。注意与遗留幽灵 GENERATION_TASKS 撞名但**不同集合**：
+# 本集合有写入方（作业引擎），generation_tasks 无。级联 stats key 用规则名
+# generation_jobs_deleted，勿沿用 generation_tasks 那条不规则的 tasks_deleted。
+GENERATION_JOBS = "generation_jobs"
+
 ACTIVE_COLLECTIONS = frozenset({
     NOVELS,
     VOLUMES,
@@ -30,6 +35,7 @@ ACTIVE_COLLECTIONS = frozenset({
     FACTION_RELATIONS,
     PLOT_THREADS,
     CHARACTER_STATES,
+    GENERATION_JOBS,
 })
 
 # 遗留集合：仓储模块已删除，当前无任何写入方。
