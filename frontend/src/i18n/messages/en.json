@@ -546,6 +546,7 @@
       "truncationTitle": "Generated with incomplete context",
       "truncationSections": "Truncated sections ({step}): {sections}",
       "truncationDropped": "Dropped items ({step}): {detail}",
+      "droppedIdsWarning": "Cleaned referenced ids: {detail}",
       "resultCompleted": "Volume complete: {count} chapters this run, ~{tokens} tokens total.",
       "resultAborted": "Job aborted.",
       "resultDismiss": "Dismiss",

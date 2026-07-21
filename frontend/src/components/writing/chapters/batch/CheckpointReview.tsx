@@ -108,7 +108,7 @@ function ChapterCard({
         </div>
       )}
 
-      {progress.truncations.length > 0 && (
+      {(progress.truncations.length > 0 || Object.keys(progress.dropped_ids).length > 0) && (
         <div className="mt-2 grid gap-1 rounded-md border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
           <span className="font-semibold">{t("truncationTitle")}</span>
           {progress.truncations.map((tr, i) => (
@@ -126,6 +126,9 @@ function ChapterCard({
               )}
             </div>
           ))}
+          {Object.keys(progress.dropped_ids).length > 0 && (
+            <div>{t("droppedIdsWarning", { detail: Object.keys(progress.dropped_ids).join("、") })}</div>
+          )}
         </div>
       )}
     </div>

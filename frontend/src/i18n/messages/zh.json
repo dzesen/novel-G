@@ -546,6 +546,7 @@
       "truncationTitle": "信息不全下生成",
       "truncationSections": "截断段落（{step}）：{sections}",
       "truncationDropped": "丢弃条目（{step}）：{detail}",
+      "droppedIdsWarning": "清理的引用 id：{detail}",
       "resultCompleted": "整卷完成：本次处理 {count} 章，合计 ~{tokens} token。",
       "resultAborted": "作业已中止。",
       "resultDismiss": "知道了",
