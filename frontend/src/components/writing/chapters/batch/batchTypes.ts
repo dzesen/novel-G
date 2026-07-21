@@ -1,3 +1,5 @@
+import type { ChapterSummary } from "@/types/novel";
+
 // 镜像后端 generation_job_router._serialize_job 后的 JSON 形状（设计 §8）。
 export type JobStatus =
   | "pending" | "running" | "paused"
@@ -41,8 +43,8 @@ export interface JobError {
 export interface GenerationJob {
   _id: string;
   novel_id: string;
-  scope: "volume";
-  volume_id: string;
+  scope: "volume" | "book";
+  volume_id: string | null;
   status: JobStatus;
   pause_reason: PauseReason;
   checkpoint_interval: number;
@@ -74,4 +76,9 @@ export function isActive(status: JobStatus): boolean {
 /** 本检查点窗口 = last_checkpoint_index 之后的 progress（设计 §7.2）。 */
 export function checkpointWindow(job: GenerationJob): ChapterProgress[] {
   return job.progress.slice(job.last_checkpoint_index);
+}
+
+/** 作业覆盖的章集合：整本=全书章；整卷=按 volume_id 过滤（设计 §5.1）。进度分母统一走它。 */
+export function jobChapters(job: GenerationJob, chapters: ChapterSummary[]): ChapterSummary[] {
+  return job.scope === "book" ? chapters : chapters.filter((c) => c.volume_id === job.volume_id);
 }
