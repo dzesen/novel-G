@@ -514,7 +514,7 @@
       "dialogStart": "Start",
       "dialogStarting": "Starting…",
       "dialogCancel": "Cancel",
-      "progressTitle": "Volume generation",
+      "progressTitle": "Generation progress",
       "progressBook": "Whole-book generation",
       "progressVolume": "Volume: {title}",
       "progressChapters": "{done} / {total} chapters done",

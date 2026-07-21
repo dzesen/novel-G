@@ -514,7 +514,7 @@
       "dialogStart": "启动",
       "dialogStarting": "启动中…",
       "dialogCancel": "取消",
-      "progressTitle": "整卷生成",
+      "progressTitle": "生成进度",
       "progressBook": "整本生成",
       "progressVolume": "卷：{title}",
       "progressChapters": "完成 {done} / {total} 章",
