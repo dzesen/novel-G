@@ -88,9 +88,13 @@ class ChapterService:
         return await chapter_repo.get_chapter_by_id(chapter_id)
 
     @staticmethod
-    async def get_chapters_by_novel(novel_id: str) -> List[Dict[str, Any]]:
+    async def get_chapters_by_novel(
+        novel_id: str,
+        *,
+        include_content: bool = False,
+    ) -> List[Dict[str, Any]]:
         await novel_repo.get_novel_by_id(novel_id)
-        return await chapter_repo.get_chapters_by_novel(novel_id)
+        return await chapter_repo.get_chapters_by_novel(novel_id, include_content=include_content)
 
     @staticmethod
     async def get_deleted_chapters(novel_id: str) -> List[Dict[str, Any]]:
