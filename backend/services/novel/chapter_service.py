@@ -102,9 +102,16 @@ class ChapterService:
         return [chapter for chapter in chapters if chapter.get("is_deleted")]
 
     @staticmethod
-    async def get_chapters_by_volume(volume_id: str) -> List[Dict[str, Any]]:
+    async def get_chapters_by_volume(
+        volume_id: str,
+        *,
+        include_content: bool = False,
+    ) -> List[Dict[str, Any]]:
         await volume_repo.get_volume_by_id(volume_id)
-        return await chapter_repo.get_chapters_by_volume(volume_id)
+        return await chapter_repo.get_chapters_by_volume(
+            volume_id,
+            include_content=include_content,
+        )
 
     @staticmethod
     async def update_chapter(chapter_id: str, update_data: Dict[str, Any]) -> bool:

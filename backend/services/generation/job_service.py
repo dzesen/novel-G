@@ -40,8 +40,11 @@ class GenerationJobService:
     @staticmethod
     def _spawn(job_id: str, control: JobControl) -> None:
         """在当前事件循环拉起后台任务并记入注册表。测试用 monkeypatch 换成 no-op。"""
+        async def _list_with_content(volume_id):
+            return await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
+
         deps = JobEngineDeps(
-            list_volume_chapters=ChapterService.get_chapters_by_volume,
+            list_volume_chapters=_list_with_content,
             run_chapter=lambda nid, ch: run_chapter(nid, ch, build_chapter_pipeline_deps()),
         )
         task = asyncio.create_task(run_job(job_id, deps, control))
@@ -52,7 +55,7 @@ class GenerationJobService:
                                token_budget: Optional[int]) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
-        chapters = await ChapterService.get_chapters_by_volume(volume_id)
+        chapters = await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
         if job_planner.next_chapter_needing_work(chapters) is None:
             raise ValueError("本卷没有需要生成的章节（都已有正文与状态回填，或还没有章节存根）")
         await GenerationJobService._guard_no_running()

@@ -118,10 +118,12 @@ class ChapterRepository(BaseRepository):
         self,
         volume_id: str,
         *,
+        include_content: bool = False,
         session: AsyncClientSession | None = None,
     ) -> List[Dict[str, Any]]:
         return await self._list_chapters(
             {"volume_id": to_object_id(volume_id)},
+            include_content=include_content,
             session=session,
         )
 
