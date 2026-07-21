@@ -24,6 +24,31 @@ def next_chapter_needing_work(chapters: List[Dict[str, Any]]) -> Optional[Dict[s
     return None
 
 
+def first_needing_work(chapters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """按入参顺序返回第一个仍需处理的章；全完成返回 None。
+
+    **不重排**——排序职责在工作清单提供者（整卷 get_chapters_by_volume 天然按
+    order_index 升序；整本 order_book_chapters 复合排序）。设计 §2.1。
+    """
+    for chapter in chapters:
+        if chapter_needs_work(chapter):
+            return chapter
+    return None
+
+
+def order_book_chapters(chapters: List[Dict[str, Any]],
+                        volume_order_map: Dict[str, int]) -> List[Dict[str, Any]]:
+    """整本工作清单排序：按 (卷叙事序 volume.order_index, 卷内 chapter.order_index) 升序。
+
+    volume_order_map: {volume_id(str): volume.order_index}。章的 volume_id 可能是
+    ObjectId，故按 str() 查表。未知卷排末尾（+∞），不崩。稳定排序。设计 §2.2。
+    """
+    def _key(chapter: Dict[str, Any]):
+        vol_order = volume_order_map.get(str(chapter.get("volume_id")), float("inf"))
+        return (vol_order, int(chapter.get("order_index") or 0))
+    return sorted(chapters, key=_key)
+
+
 def result_to_accept_state(result: Dict[str, Any]) -> Dict[str, Any]:
     """ChapterStateResultSchema dump → ChapterStateAcceptSchema dump（自动接受全部）。
 
