@@ -16,14 +16,6 @@ def chapter_needs_work(chapter: Dict[str, Any]) -> bool:
     return not (has_content and has_summary)
 
 
-def next_chapter_needing_work(chapters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """按 order_index 升序，返回第一个仍需处理的章；全完成返回 None。"""
-    for chapter in sorted(chapters, key=lambda c: int(c.get("order_index") or 0)):
-        if chapter_needs_work(chapter):
-            return chapter
-    return None
-
-
 def first_needing_work(chapters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """按入参顺序返回第一个仍需处理的章；全完成返回 None。
 

@@ -14,15 +14,18 @@ from backend.services.generation.job_engine import (
 )
 from backend.services.novel.chapter_service import ChapterService
 from backend.db.repositories.volume_repository import volume_repo
+from backend.db.repositories.novel_repository import novel_repo
+from backend.services.generation.book_worklist import get_book_worklist
 
 
 class ConflictError(Exception):
     """已有在跑作业（全局单作业约束）。路由映射为 409。"""
 
 
-def _new_job_doc(novel_id, volume_id, checkpoint_interval, token_budget) -> Dict[str, Any]:
+def _new_job_doc(novel_id, scope, volume_id, checkpoint_interval, token_budget) -> Dict[str, Any]:
     return {
-        "novel_id": to_object_id(novel_id), "scope": "volume", "volume_id": to_object_id(volume_id),
+        "novel_id": to_object_id(novel_id), "scope": scope,
+        "volume_id": to_object_id(volume_id) if volume_id else None,
         "status": "running", "pause_reason": None,
         "checkpoint_interval": int(checkpoint_interval), "token_budget": token_budget,
         "tokens_used": 0, "current_chapter_id": None, "progress": [],
@@ -39,12 +42,19 @@ class GenerationJobService:
 
     @staticmethod
     def _spawn(job_id: str, control: JobControl) -> None:
-        """在当前事件循环拉起后台任务并记入注册表。测试用 monkeypatch 换成 no-op。"""
-        async def _list_with_content(volume_id):
-            return await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
+        """在当前事件循环拉起后台任务并记入注册表。测试用 monkeypatch 换成 no-op。
+
+        工作清单提供者按作业 scope 装配：闭包每次读作业文档决定取整卷还是整本清单，
+        引擎对 scope 无知（设计 §3.1/§3.2）。作业的 scope/目标从不变，重读代价可忽略。
+        """
+        async def _list_worklist():
+            job = await generation_job_repo.get_job(job_id)
+            if job.get("scope") == "book":
+                return await get_book_worklist(str(job["novel_id"]), include_content=True)
+            return await ChapterService.get_chapters_by_volume(str(job["volume_id"]), include_content=True)
 
         deps = JobEngineDeps(
-            list_volume_chapters=_list_with_content,
+            list_worklist_chapters=_list_worklist,
             run_chapter=lambda nid, ch: run_chapter(nid, ch, build_chapter_pipeline_deps()),
         )
         task = asyncio.create_task(run_job(job_id, deps, control))
@@ -56,11 +66,26 @@ class GenerationJobService:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
         chapters = await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
-        if job_planner.next_chapter_needing_work(chapters) is None:
+        if job_planner.first_needing_work(chapters) is None:
             raise ValueError("本卷没有需要生成的章节（都已有正文与状态回填，或还没有章节存根）")
         await GenerationJobService._guard_no_running()
 
-        job_id = await generation_job_repo.create_job(_new_job_doc(novel_id, volume_id, checkpoint_interval, token_budget))
+        job_id = await generation_job_repo.create_job(
+            _new_job_doc(novel_id, "volume", volume_id, checkpoint_interval, token_budget))
+        control = JobControl()
+        GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def start_book_job(novel_id: str, checkpoint_interval: int,
+                             token_budget: Optional[int]) -> Dict[str, Any]:
+        await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
+        chapters = await get_book_worklist(novel_id, include_content=True)
+        if job_planner.first_needing_work(chapters) is None:
+            raise ValueError("本书没有需要生成的章节（所有卷的章节都已有正文与状态回填，或还没有章节存根）")
+        await GenerationJobService._guard_no_running()
+        job_id = await generation_job_repo.create_job(
+            _new_job_doc(novel_id, "book", None, checkpoint_interval, token_budget))
         control = JobControl()
         GenerationJobService._spawn(job_id, control)
         return await generation_job_repo.get_job(job_id)
