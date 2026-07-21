@@ -94,9 +94,12 @@ class GenerationJobService:
             task = entry[0]
             if task is not None:
                 task.cancel()
-        # 若无在跑任务（如已 interrupted），直接落终态。
-        else:
-            await generation_job_repo.update_job_fields(job_id, {"status": "aborted", "current_chapter_id": None})
+        # 无条件落终态：run_job 被 cancel 后其 finally 只弹注册表、不写状态，且
+        # CancelledError（BaseException）绕过 except Exception，循环顶端的 abort 标记
+        # 可能永不执行——若不在此处写 aborted，作业会永远卡在 running，全局单作业槽被
+        # 死锁（list_running_jobs 计入它，挡住之后所有 start/resume）。cancel 后 run_job
+        # 不会再写状态，故此处写入不会被覆盖。
+        await generation_job_repo.update_job_fields(job_id, {"status": "aborted", "current_chapter_id": None})
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
