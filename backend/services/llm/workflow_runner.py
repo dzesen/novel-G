@@ -343,3 +343,27 @@ async def _generate_and_fix(
     """Provider 不支持 JSON Schema 时，走纯文本生成 + 格式校正。"""
     raw = await service.generate_text(prompt, **gen_kwargs)
     return await deps.fix_format(raw, step.schema, config_key)
+
+
+class WorkflowFailed(Exception):
+    """无头运行时工作流以 done{success:false} 结束。"""
+
+
+async def run_workflow_to_result(step_key: str, frames: AsyncGenerator[str, None]) -> "tuple[dict, int]":
+    """无头消费 run_workflow 的 SSE 帧，返回 (最终 result[step_key], total_tokens)。
+
+    浏览器路径靠 SSE 逐帧渲染；批量引擎不需要帧，只要最终结构化结果。帧格式的知识
+    仍只留在本模块（parse_sse_event 的逆用），执行器未学到任何业务概念。
+    """
+    async for frame in frames:
+        parsed = parse_sse_event(frame)
+        if parsed is None:
+            continue
+        event, data = parsed
+        if event == "done":
+            if not data.get("success"):
+                raise WorkflowFailed(data.get("error") or f"workflow failed at {data.get('failed_step')}")
+            result = data.get("result") or {}
+            usage = data.get("usage") or {}
+            return result.get(step_key, {}), int(usage.get("total_tokens") or 0)
+    raise WorkflowFailed("workflow ended without a done event")
