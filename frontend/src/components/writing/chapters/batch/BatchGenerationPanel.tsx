@@ -7,7 +7,7 @@ import { apiGet, apiPost } from "@/lib/api";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import { type GenerationJob, isActive, isResumable, isTerminal } from "./batchTypes";
 import { useGenerationJob } from "./useGenerationJob";
-import StartVolumeJobDialog from "./StartVolumeJobDialog";
+import StartJobDialog from "./StartJobDialog";
 import CheckpointReview from "./CheckpointReview";
 
 interface BatchGenerationPanelProps {
@@ -82,9 +82,12 @@ export default function BatchGenerationPanel({
   const fillableCount = selectedVolumeChapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
 
   const dialog = startOpen && selectedVolumeId ? (
-    <StartVolumeJobDialog
-      volumeId={selectedVolumeId}
-      volumeTitle={selectedVolume?.title ?? ""}
+    <StartJobDialog
+      scope="volume"
+      targetId={selectedVolumeId}
+      title={t("dialogTitle")}
+      targetHeading={t("dialogVolumeLabel")}
+      targetLabel={selectedVolume?.title ?? ""}
       fillableCount={fillableCount}
       onClose={onStartClose}
       onSubmitted={(started) => {

@@ -6,21 +6,27 @@ import { Button } from "@heroui/react";
 import { apiPost } from "@/lib/api";
 import type { GenerationJob } from "./batchTypes";
 
-interface StartVolumeJobDialogProps {
-  volumeId: string;
-  volumeTitle: string;
+interface StartJobDialogProps {
+  scope: "volume" | "book";
+  targetId: string;         // volume: volume_id；book: novel_id
+  title: string;            // 对话框标题（调用方按 scope 解析好的 i18n 文案）
+  targetHeading: string;    // 目标区小标题（"目标卷" / "目标"）
+  targetLabel: string;      // 目标展示名（卷名 / "全书"）
   fillableCount: number;
   onSubmitted: (job: GenerationJob) => void;
   onClose: () => void;
 }
 
-export default function StartVolumeJobDialog({
-  volumeId,
-  volumeTitle,
+export default function StartJobDialog({
+  scope,
+  targetId,
+  title,
+  targetHeading,
+  targetLabel,
   fillableCount,
   onSubmitted,
   onClose,
-}: StartVolumeJobDialogProps) {
+}: StartJobDialogProps) {
   const t = useTranslations("writing.batch");
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [tokenBudget, setTokenBudget] = useState("");
@@ -38,7 +44,7 @@ export default function StartVolumeJobDialog({
         tokenBudget.trim() && Number.isFinite(parsedBudget) && parsedBudget >= 1
           ? Math.floor(parsedBudget)
           : null;
-      const job = await apiPost<GenerationJob>(`/api/generation-jobs/volume/${volumeId}`, {
+      const job = await apiPost<GenerationJob>(`/api/generation-jobs/${scope}/${targetId}`, {
         checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
         token_budget: budget,
       });
@@ -55,14 +61,14 @@ export default function StartVolumeJobDialog({
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/25 px-4 py-6">
       <div className="flex w-full max-w-md flex-col rounded-md border border-border bg-surface shadow-lg">
         <header className="border-b border-border px-5 py-4">
-          <h3 className="text-base font-semibold text-foreground">{t("dialogTitle")}</h3>
+          <h3 className="text-base font-semibold text-foreground">{title}</h3>
         </header>
 
         <div className="grid gap-4 px-5 py-4">
           <div className="grid gap-1 text-sm">
-            <span className="text-xs font-medium text-muted">{t("dialogVolumeLabel")}</span>
+            <span className="text-xs font-medium text-muted">{targetHeading}</span>
             <div className="rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
-              <span className="font-medium">{volumeTitle}</span>
+              <span className="font-medium">{targetLabel}</span>
               <span className="ml-2 text-xs text-muted">{t("dialogFillable", { count: fillableCount })}</span>
             </div>
           </div>
