@@ -56,6 +56,19 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
     return _serialize_job(job)
 
 
+@router.post("/book/{novel_id}")
+async def start_book_job(novel_id: str, req: StartJobRequest):
+    try:
+        job = await GenerationJobService.start_book_job(
+            novel_id=novel_id,
+            checkpoint_interval=req.checkpoint_interval,
+            token_budget=req.token_budget,
+        )
+    except Exception as exc:
+        raise _handle(exc) from exc
+    return _serialize_job(job)
+
+
 @router.get("/{job_id}")
 async def get_job(job_id: str):
     try:
