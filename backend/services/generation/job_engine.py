@@ -40,6 +40,7 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "tokens": outcome.tokens, "consistency_issues": outcome.consistency_issues,
         "facts_added": outcome.facts_added, "threads_advanced": outcome.threads_advanced,
         "summary_written": outcome.summary_written, "dropped_ids": outcome.dropped_ids,
+        "truncations": outcome.truncations,
         "completed_at": get_utc_now(),
     }
 

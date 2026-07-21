@@ -77,7 +77,7 @@ async def _consume_prose_frames(frames: AsyncGenerator[str, None]) -> Tuple[str,
     raise WorkflowFailed("prose stream ended without a done event")
 
 
-async def generate_outline(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, dict, int]:
+async def generate_outline(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, dict, int, dict]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_outline_context(inputs)
     roster = inputs["roster"]
@@ -101,10 +101,14 @@ async def generate_outline(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict
     )
     result, tokens = await run_workflow_to_result(CHAPTER_OUTLINE_STEP, frames)
     cleaned, dropped = validate_outline_ids(result, roster)
-    return cleaned, dropped, tokens
+    truncation = {
+        "truncated_sections": list(context.truncated_sections),
+        "dropped_item_counts": dict(context.dropped_item_counts),
+    }
+    return cleaned, dropped, tokens, truncation
 
 
-async def generate_prose(novel_id: str, chapter: Dict[str, Any]) -> Tuple[str, int]:
+async def generate_prose(novel_id: str, chapter: Dict[str, Any]) -> Tuple[str, int, dict]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_context(inputs)
     # outline 取 fetch_context_inputs 内部刚刚重新查库得到的版本，不用调用方传入
@@ -135,10 +139,15 @@ async def generate_prose(novel_id: str, chapter: Dict[str, Any]) -> Tuple[str, i
         workflow_name=PROSE_WORKFLOW, step_key=PROSE_STEP, prompt=prompt,
         service=service, gen_kwargs={}, request_id=uuid4().hex[:8],
     )
-    return await _consume_prose_frames(frames)
+    text, tokens = await _consume_prose_frames(frames)
+    truncation = {
+        "truncated_sections": list(context.truncated_sections),
+        "dropped_item_counts": dict(context.dropped_item_counts),
+    }
+    return text, tokens, truncation
 
 
-async def generate_state(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, dict, int]:
+async def generate_state(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, dict, int, dict]:
     chapter_id = str(chapter["_id"])
     inputs = await fetch_context_inputs(novel_id, chapter_id)
     context = assemble_context(inputs)
@@ -165,7 +174,11 @@ async def generate_state(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, 
     )
     result, tokens = await run_workflow_to_result(STATE_STEP, frames)
     cleaned, dropped = validate_state_ids(result, roster)
-    return cleaned, dropped, tokens
+    truncation = {
+        "truncated_sections": list(context.truncated_sections),
+        "dropped_item_counts": dict(context.dropped_item_counts),
+    }
+    return cleaned, dropped, tokens, truncation
 
 
 async def _accept_outline(chapter_id: str, result: dict) -> None:
