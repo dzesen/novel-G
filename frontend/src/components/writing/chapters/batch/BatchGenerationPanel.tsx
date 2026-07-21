@@ -5,7 +5,7 @@ import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
-import { type GenerationJob, isActive, isResumable, isTerminal } from "./batchTypes";
+import { type GenerationJob, isActive, isResumable, isTerminal, jobChapters } from "./batchTypes";
 import { useGenerationJob } from "./useGenerationJob";
 import StartJobDialog from "./StartJobDialog";
 import CheckpointReview from "./CheckpointReview";
@@ -15,7 +15,7 @@ interface BatchGenerationPanelProps {
   selectedVolumeId: string | null;
   volumes: VolumeSummary[];
   chapters: ChapterSummary[];
-  startOpen: boolean;
+  startScope: "volume" | "book" | null;
   onStartClose: () => void;
   onJumpToChapter: (chapterId: string) => void;
   onQuietRefresh: () => void;
@@ -27,7 +27,7 @@ export default function BatchGenerationPanel({
   selectedVolumeId,
   volumes,
   chapters,
-  startOpen,
+  startScope,
   onStartClose,
   onJumpToChapter,
   onQuietRefresh,
@@ -80,33 +80,44 @@ export default function BatchGenerationPanel({
   const selectedVolume = volumes.find((v) => v._id === selectedVolumeId) ?? null;
   const selectedVolumeChapters = chapters.filter((c) => c.volume_id === selectedVolumeId);
   const fillableCount = selectedVolumeChapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
+  const bookFillableCount = chapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
 
-  const dialog = startOpen && selectedVolumeId ? (
-    <StartJobDialog
-      scope="volume"
-      targetId={selectedVolumeId}
-      title={t("dialogTitle")}
-      targetHeading={t("dialogVolumeLabel")}
-      targetLabel={selectedVolume?.title ?? ""}
-      fillableCount={fillableCount}
-      onClose={onStartClose}
-      onSubmitted={(started) => {
-        setDismissed(null);
-        setJob(started);
-        onStartClose();
-      }}
-    />
-  ) : null;
+  const dialog =
+    startScope === "volume" && selectedVolumeId ? (
+      <StartJobDialog
+        scope="volume"
+        targetId={selectedVolumeId}
+        title={t("dialogTitle")}
+        targetHeading={t("dialogVolumeLabel")}
+        targetLabel={selectedVolume?.title ?? ""}
+        fillableCount={fillableCount}
+        onClose={onStartClose}
+        onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
+      />
+    ) : startScope === "book" ? (
+      <StartJobDialog
+        scope="book"
+        targetId={novelId}
+        title={t("dialogTitleBook")}
+        targetHeading={t("dialogBookLabel")}
+        targetLabel={t("dialogBookTarget")}
+        fillableCount={bookFillableCount}
+        onClose={onStartClose}
+        onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
+      />
+    ) : null;
 
   // 无作业，或终态已关闭：只渲染可能的启动对话框，不留常驻条。
   if (!job || (isTerminal(job.status) && dismissed === job._id)) {
     return dialog;
   }
 
-  const volumeChapters = chapters.filter((c) => c.volume_id === job.volume_id);
+  const volumeChapters = jobChapters(job, chapters);
   const total = volumeChapters.length;
   const complete = volumeChapters.filter((c) => c.word_count > 0 && c.summary.trim()).length;
-  const jobVolumeTitle = volumes.find((v) => v._id === job.volume_id)?.title ?? "";
+  const jobScopeLabel = job.scope === "book"
+    ? t("progressBook")
+    : t("progressVolume", { title: volumes.find((v) => v._id === job.volume_id)?.title ?? "" });
   const currentChapter = job.current_chapter_id ? chapterById.get(job.current_chapter_id) : undefined;
 
   return (
@@ -118,7 +129,7 @@ export default function BatchGenerationPanel({
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <h3 className="truncate text-sm font-semibold text-foreground">
-                {t("progressTitle")} · {t("progressVolume", { title: jobVolumeTitle })}
+                {t("progressTitle")} · {jobScopeLabel}
               </h3>
               <p className="mt-0.5 text-xs text-muted">
                 {t("progressChapters", { done: complete, total })}
@@ -172,7 +183,9 @@ export default function BatchGenerationPanel({
         <div className="flex items-center justify-between gap-3 bg-surface px-4 py-3">
           <p className="text-sm text-foreground">
             {job.status === "completed"
-              ? t("resultCompleted", { count: job.progress.length, tokens: job.tokens_used })
+              ? (job.scope === "book"
+                  ? t("resultCompletedBook", { count: job.progress.length, tokens: job.tokens_used })
+                  : t("resultCompleted", { count: job.progress.length, tokens: job.tokens_used }))
               : t("resultAborted")}
           </p>
           <button type="button" onClick={() => setDismissed(job._id)} className="shrink-0 text-xs font-medium text-accent hover:underline">

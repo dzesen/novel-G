@@ -62,7 +62,7 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
   const [proseOpen, setProseOpen] = useState(false);
   const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
-  const [batchStartOpen, setBatchStartOpen] = useState(false);
+  const [batchStartScope, setBatchStartScope] = useState<"volume" | "book" | null>(null);
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(null);
@@ -437,7 +437,8 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
         onCreateChapter={createChapter}
         onRestoreChapter={restoreChapter}
         onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
-        onStartVolumeJob={() => setBatchStartOpen(true)}
+        onStartVolumeJob={() => setBatchStartScope("volume")}
+        onStartBookJob={() => setBatchStartScope("book")}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <BatchGenerationPanel
@@ -445,8 +446,8 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
           selectedVolumeId={selectedVolumeId}
           volumes={volumes}
           chapters={chapters}
-          startOpen={batchStartOpen}
-          onStartClose={() => setBatchStartOpen(false)}
+          startScope={batchStartScope}
+          onStartClose={() => setBatchStartScope(null)}
           onJumpToChapter={selectChapter}
           onQuietRefresh={() => void loadStructure({ silent: true })}
           onNavigateToMemory={onNavigateToMemory}

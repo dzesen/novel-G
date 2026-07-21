@@ -18,6 +18,7 @@ interface ChapterNavigatorProps {
   onRestoreChapter: (chapterId: string) => Promise<void>;
   onOpenVolumeOutline: () => void;
   onStartVolumeJob: () => void;
+  onStartBookJob: () => void;
 }
 
 function PlusIcon() {
@@ -42,11 +43,13 @@ export default function ChapterNavigator({
   onRestoreChapter,
   onOpenVolumeOutline,
   onStartVolumeJob,
+  onStartBookJob,
 }: ChapterNavigatorProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tBatch = useTranslations("writing.batch");
   const selectedVolumeChapterCount = chapters.filter((c) => c.volume_id === selectedVolumeId).length;
+  const bookFillableCount = chapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
   const [showVolumeForm, setShowVolumeForm] = useState(false);
   const [volumeTitle, setVolumeTitle] = useState("");
   const [creatingVolume, setCreatingVolume] = useState(false);
@@ -110,6 +113,15 @@ export default function ChapterNavigator({
             className="rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary disabled:opacity-50"
           >
             {tBatch("startButton")}
+          </button>
+          <button
+            type="button"
+            onClick={onStartBookJob}
+            disabled={bookFillableCount === 0}
+            title={tBatch("startBookButtonTitle")}
+            className="rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary disabled:opacity-50"
+          >
+            {tBatch("startBookButton")}
           </button>
           <button
             type="button"
