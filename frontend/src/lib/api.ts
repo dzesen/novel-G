@@ -10,6 +10,9 @@ export async function apiGet<T = unknown>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
+    // 批量生成会在服务端改写章节内容，客户端若命中浏览器缓存会读到旧副本
+    // （检查点复核里"点击跳转查看"会显示空章）——API 数据始终要最新。
+    cache: "no-store",
   });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
