@@ -31,9 +31,15 @@ export default function StartVolumeJobDialog({
     setSubmitting(true);
     setError("");
     try {
-      const budget = tokenBudget.trim() ? Number(tokenBudget) : null;
+      // 客户端夹到后端约束区间，避免越界值触发 422（其 detail 是数组、原样展示会成 [object Object]）。
+      // 后端：checkpoint_interval ge=1 le=1000；token_budget ge=1（空=不限）。
+      const parsedBudget = Number(tokenBudget);
+      const budget =
+        tokenBudget.trim() && Number.isFinite(parsedBudget) && parsedBudget >= 1
+          ? Math.floor(parsedBudget)
+          : null;
       const job = await apiPost<GenerationJob>(`/api/generation-jobs/volume/${volumeId}`, {
-        checkpoint_interval: Math.max(1, Math.floor(checkpointInterval) || 1),
+        checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
         token_budget: budget,
       });
       onSubmitted(job);
@@ -66,6 +72,7 @@ export default function StartVolumeJobDialog({
             <input
               type="number"
               min={1}
+              max={1000}
               value={checkpointInterval}
               onChange={(e) => setCheckpointInterval(Number(e.target.value))}
               className="min-h-9 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-accent"
