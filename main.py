@@ -30,6 +30,10 @@ from backend.api.default_routers.backup_router import router as backup_router
 from backend.api.default_routers.reference_card_router import router as reference_card_router
 from backend.api.default_routers.plot_thread_router import router as plot_thread_router
 from backend.api.default_routers.character_state_router import router as character_state_router
+from backend.api.default_routers.generation_job_router import (
+    router as generation_job_router,
+    mark_running_jobs_interrupted,
+)
 
 apply_runtime_flags_from_argv()
 
@@ -55,6 +59,9 @@ async def lifespan(app: FastAPI):
     # Initialize DB Indexes
     await init_all_indexes()
     await create_automatic_backup_if_due()
+    interrupted = await mark_running_jobs_interrupted()
+    if interrupted:
+        logger.info("Marked %d running generation job(s) as interrupted after restart.", interrupted)
     logger.info("Backend startup completed.")
     yield
     # Teardown
@@ -93,6 +100,7 @@ app.include_router(backup_router)
 app.include_router(reference_card_router)
 app.include_router(plot_thread_router)
 app.include_router(character_state_router)
+app.include_router(generation_job_router)
 
 if __name__ == "__main__":
     import uvicorn
