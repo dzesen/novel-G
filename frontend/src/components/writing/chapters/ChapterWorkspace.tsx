@@ -11,6 +11,7 @@ import type {
 } from "@/types/novel";
 import ChapterEditorPane, { type ChapterSaveState } from "./ChapterEditorPane";
 import ChapterNavigator from "./ChapterNavigator";
+import BatchGenerationPanel from "./batch/BatchGenerationPanel";
 import {
   chapterToDraft,
   clearLocalChapterDraft,
@@ -28,13 +29,14 @@ import { StateBackfillPanel } from "./state/StateBackfillPanel";
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
+  onNavigateToMemory: () => void;
 }
 
 interface ListResponse<T> {
   data: T[];
 }
 
-export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProps) {
+export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: ChapterWorkspaceProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tProse = useTranslations("writing.prose");
@@ -60,6 +62,7 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
   const [proseOpen, setProseOpen] = useState(false);
   const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
+  const [batchStartOpen, setBatchStartOpen] = useState(false);
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(null);
@@ -71,10 +74,12 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
     [draft?.content],
   );
 
-  const loadStructure = useCallback(async () => {
+  const loadStructure = useCallback(async (opts?: { silent?: boolean }) => {
     if (!novelId) return;
-    setStructureLoading(true);
-    setStructureError("");
+    if (!opts?.silent) {
+      setStructureLoading(true);
+      setStructureError("");
+    }
     try {
       const [volumeResponse, chapterResponse, trashResponse] = await Promise.all([
         apiGet<ListResponse<VolumeSummary>>(`/api/volumes/novel/${novelId}`),
@@ -100,9 +105,9 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         return firstChapter;
       });
     } catch (error) {
-      setStructureError(error instanceof Error ? error.message : t("loadFailed"));
+      if (!opts?.silent) setStructureError(error instanceof Error ? error.message : t("loadFailed"));
     } finally {
-      setStructureLoading(false);
+      if (!opts?.silent) setStructureLoading(false);
     }
   }, [novelId, t]);
 
@@ -432,28 +437,42 @@ export default function ChapterWorkspace({ mode, novelId }: ChapterWorkspaceProp
         onCreateChapter={createChapter}
         onRestoreChapter={restoreChapter}
         onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
+        onStartVolumeJob={() => setBatchStartOpen(true)}
       />
-      <ChapterEditorPane
-        chapterId={selectedChapterId}
-        draft={draft}
-        wordCount={wordCount}
-        updatedAt={updatedAt}
-        loading={chapterLoading}
-        loadError={chapterLoadError}
-        saveState={saveState}
-        onChange={changeDraft}
-        onSave={saveNow}
-        onRetryLoad={() => selectedChapterId && void loadChapter(selectedChapterId)}
-        onDelete={deleteChapter}
-        onExport={exportChapter}
-        onExportNovel={() => void exportNovel()}
-        onOpenChapterOutline={() => setChapterOutlineOpen(true)}
-        onOpenProse={() => setProseOpen(true)}
-        canGenerateProse={Boolean(chapterOutline)}
-        onOpenStateBackfill={() => void openStateBackfill()}
-        hasContent={Boolean(draft?.content?.trim())}
-        stateBackfillBlocked={stateBackfillBlocked}
-      />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <BatchGenerationPanel
+          novelId={novelId}
+          selectedVolumeId={selectedVolumeId}
+          volumes={volumes}
+          chapters={chapters}
+          startOpen={batchStartOpen}
+          onStartClose={() => setBatchStartOpen(false)}
+          onJumpToChapter={selectChapter}
+          onQuietRefresh={() => void loadStructure({ silent: true })}
+          onNavigateToMemory={onNavigateToMemory}
+        />
+        <ChapterEditorPane
+          chapterId={selectedChapterId}
+          draft={draft}
+          wordCount={wordCount}
+          updatedAt={updatedAt}
+          loading={chapterLoading}
+          loadError={chapterLoadError}
+          saveState={saveState}
+          onChange={changeDraft}
+          onSave={saveNow}
+          onRetryLoad={() => selectedChapterId && void loadChapter(selectedChapterId)}
+          onDelete={deleteChapter}
+          onExport={exportChapter}
+          onExportNovel={() => void exportNovel()}
+          onOpenChapterOutline={() => setChapterOutlineOpen(true)}
+          onOpenProse={() => setProseOpen(true)}
+          canGenerateProse={Boolean(chapterOutline)}
+          onOpenStateBackfill={() => void openStateBackfill()}
+          hasContent={Boolean(draft?.content?.trim())}
+          stateBackfillBlocked={stateBackfillBlocked}
+        />
+      </div>
 
       {volumeOutlineOpen && novelId && (
         <VolumeOutlinePanel

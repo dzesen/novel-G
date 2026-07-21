@@ -27,7 +27,13 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       return <FactionCardsWorkspace mode={mode} novelId={novelId} />;
     }
     if (activeItem === "chapter-editor") {
-      return <ChapterWorkspace mode={mode} novelId={novelId} />;
+      return (
+        <ChapterWorkspace
+          mode={mode}
+          novelId={novelId}
+          onNavigateToMemory={() => setActiveItem("character-memory")}
+        />
+      );
     }
     if (activeItem === "character-cards") {
       return <ReferenceCardsWorkspace key="character" mode={mode} novelId={novelId} cardType="character" />;

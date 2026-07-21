@@ -17,6 +17,7 @@ interface ChapterNavigatorProps {
   onCreateChapter: (volumeId: string) => Promise<void>;
   onRestoreChapter: (chapterId: string) => Promise<void>;
   onOpenVolumeOutline: () => void;
+  onStartVolumeJob: () => void;
 }
 
 function PlusIcon() {
@@ -40,9 +41,12 @@ export default function ChapterNavigator({
   onCreateChapter,
   onRestoreChapter,
   onOpenVolumeOutline,
+  onStartVolumeJob,
 }: ChapterNavigatorProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
+  const tBatch = useTranslations("writing.batch");
+  const selectedVolumeChapterCount = chapters.filter((c) => c.volume_id === selectedVolumeId).length;
   const [showVolumeForm, setShowVolumeForm] = useState(false);
   const [volumeTitle, setVolumeTitle] = useState("");
   const [creatingVolume, setCreatingVolume] = useState(false);
@@ -97,6 +101,15 @@ export default function ChapterNavigator({
             className="rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary"
           >
             {tOutline("volumeTitle")}
+          </button>
+          <button
+            type="button"
+            onClick={onStartVolumeJob}
+            disabled={!selectedVolumeId || selectedVolumeChapterCount === 0}
+            title={tBatch("startButtonTitle")}
+            className="rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary disabled:opacity-50"
+          >
+            {tBatch("startButton")}
           </button>
           <button
             type="button"
