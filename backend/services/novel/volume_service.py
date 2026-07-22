@@ -16,6 +16,7 @@ from backend.db.utils import to_object_id, get_utc_now
 from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
 from backend.services.novel.outline_validation import validate_chapter_ranges
 from backend.services.novel.chapter_timeline import ChapterTimeline
+from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.state_timeline import (
     mark_from_chapter_stale,
     mark_downstream_stale,
@@ -34,6 +35,16 @@ class VolumeService:
     # 创建 
 
     @staticmethod
+    async def _refresh_v2_stats(session, mutation) -> bool:
+        version = int(mutation.journal.get("command", {}).get("version") or 1)
+        if version < 2:
+            return False
+        novel_id = str(mutation.journal["novel_id"])
+        report = await derived_stats.refresh(novel_id, session=session)
+        await mutation.receipt("derived_stats", report)
+        return True
+
+    @staticmethod
     async def _execute_create_volume(session, mutation):
         command = mutation.journal["command"]["payload"]
         novel_id = str(mutation.journal["novel_id"])
@@ -48,18 +59,19 @@ class VolumeService:
             prepared["_id"] = to_object_id(volume_id)
             await volume_repo.create_volume(prepared, session=session)
         await mutation.receipt("volume", {"volume_id": volume_id})
-        current = await novel_repo.get_novel_by_id(novel_id, session=session)
-        target = command["novel_stats_after"]
-        deltas = {
-            key: int(value) - int(current.get(key, 0))
-            for key, value in target.items()
-            if int(value) != int(current.get(key, 0))
-        }
-        if deltas:
-            await novel_repo.increment_novel_stats(
-                novel_id, deltas, session=session
-            )
-        await mutation.receipt("novel_stats", target)
+        if not await VolumeService._refresh_v2_stats(session, mutation):
+            current = await novel_repo.get_novel_by_id(novel_id, session=session)
+            target = command["novel_stats_after"]
+            deltas = {
+                key: int(value) - int(current.get(key, 0))
+                for key, value in target.items()
+                if int(value) != int(current.get(key, 0))
+            }
+            if deltas:
+                await novel_repo.increment_novel_stats(
+                    novel_id, deltas, session=session
+                )
+            await mutation.receipt("novel_stats", target)
         return volume_id
 
     @staticmethod
@@ -92,20 +104,8 @@ class VolumeService:
             novel_id=str(novel_id),
             idempotency_key=f"create-volume:{volume_id}",
             operation="create_volume",
-            payload={
-                "volume": dict(data),
-                "novel_stats_after": {
-                    "current_volume_count": int(
-                        novel.get("current_volume_count", 0)
-                    ) + 1,
-                    "current_chapter_count": int(
-                        novel.get("current_chapter_count", 0)
-                    ),
-                    "current_word_count": int(
-                        novel.get("current_word_count", 0)
-                    ),
-                },
-            },
+            version=2,
+            payload={"volume": dict(data)},
             before_image={"novel": novel},
             child_ids={"volume": volume_id},
         )
@@ -175,22 +175,31 @@ class VolumeService:
                     {"chapter_range": item["volume"]["chapter_range"]},
                     session=session,
                 )
-                await BaseRepository(collections.VOLUMES).update_one(
-                    {"_id": volume_obj_id},
-                    {"chapter_count": len(chapter_docs)},
-                    include_deleted=True,
-                    session=session,
-                )
-                await mutation.receipt(
-                    f"volume_stats_{index}", {"chapter_count": len(chapter_docs)}
-                )
+                if int(mutation.journal["command"].get("version") or 1) < 2:
+                    await BaseRepository(collections.VOLUMES).update_one(
+                        {"_id": volume_obj_id},
+                        {"chapter_count": len(chapter_docs)},
+                        include_deleted=True,
+                        session=session,
+                    )
+                    await mutation.receipt(
+                        f"volume_stats_{index}", {"chapter_count": len(chapter_docs)}
+                    )
                 completed_volumes += 1
                 completed_chapters += len(chapter_docs)
+                if int(mutation.journal["command"].get("version") or 1) >= 2:
+                    partial_stats = await derived_stats.refresh(
+                        novel_id, session=session
+                    )
+                    await mutation.receipt(
+                        f"derived_stats_{index}", partial_stats
+                    )
 
-            await novel_repo.update_novel_stats(
-                novel_id, command["novel_stats_after"], session=session
-            )
-            await mutation.receipt("novel_stats", command["novel_stats_after"])
+            if not await VolumeService._refresh_v2_stats(session, mutation):
+                await novel_repo.update_novel_stats(
+                    novel_id, command["novel_stats_after"], session=session
+                )
+                await mutation.receipt("novel_stats", command["novel_stats_after"])
             return dict(command["result"])
         except Exception:
             logger.error(
@@ -260,13 +269,6 @@ class VolumeService:
             normalized_volumes, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
-        target_stats = {
-            "current_volume_count": int(novel.get("current_volume_count", 0))
-            + len(prepared_volumes),
-            "current_chapter_count": int(novel.get("current_chapter_count", 0))
-            + total_chapters,
-            "current_word_count": int(novel.get("current_word_count", 0)),
-        }
         result = {
             "volume_count": len(prepared_volumes),
             "chapter_count": total_chapters,
@@ -277,9 +279,9 @@ class VolumeService:
                 novel_id=novel_id,
                 idempotency_key=f"accept-volume-outline:{novel_id}:{digest}",
                 operation="accept_volume_outline",
+                version=2,
                 payload={
                     "volumes": prepared_volumes,
-                    "novel_stats_after": target_stats,
                     "result": result,
                 },
                 before_image={"novel": novel},
@@ -384,19 +386,6 @@ class VolumeService:
             await mutation.receipt("stale", {"chapter_id": str(stale_from)})
         return {"volume_id": volume_id, "updated": True}
 
-    @staticmethod
-    async def update_volume_stats(
-        volume_id: str,
-        word_count_delta: int = 0,
-        chapter_count_delta: int = 0,
-    ) -> bool:
-        """更新卷统计（由下级章节增删时回调使用）。"""
-        return await volume_repo.update_volume_stats(
-            volume_id,
-            word_count_delta,
-            chapter_count_delta,
-        )
-
     # 软删除（级联） 
 
     @staticmethod
@@ -432,16 +421,19 @@ class VolumeService:
         )
         await mutation.receipt("chapters", {"chapter_ids": chapter_ids})
 
-        current_novel = await novel_repo.get_novel_by_id(novel_id, session=session)
-        target = command["novel_stats_after"]
-        deltas = {
-            key: int(value) - int(current_novel.get(key, 0))
-            for key, value in target.items()
-            if int(value) != int(current_novel.get(key, 0))
-        }
-        if deltas:
-            await novel_repo.increment_novel_stats(novel_id, deltas, session=session)
-        await mutation.receipt("novel_stats", target)
+        if not await VolumeService._refresh_v2_stats(session, mutation):
+            current_novel = await novel_repo.get_novel_by_id(novel_id, session=session)
+            target = command["novel_stats_after"]
+            deltas = {
+                key: int(value) - int(current_novel.get(key, 0))
+                for key, value in target.items()
+                if int(value) != int(current_novel.get(key, 0))
+            }
+            if deltas:
+                await novel_repo.increment_novel_stats(
+                    novel_id, deltas, session=session
+                )
+            await mutation.receipt("novel_stats", target)
         return {"volume_id": volume_id, "deleted": True}
 
     @staticmethod
@@ -458,31 +450,18 @@ class VolumeService:
         chapters = await BaseRepository(collections.CHAPTERS).find_many(
             {"volume_id": to_object_id(volume_id)}, sort=[("order_index", 1)]
         )
-        novel = await novel_repo.get_novel_by_id(novel_id)
-        volume_word_count = int(volume.get("word_count", 0))
-        target = {
-            "current_volume_count": max(
-                0, int(novel.get("current_volume_count", 0)) - 1
-            ),
-            "current_chapter_count": max(
-                0, int(novel.get("current_chapter_count", 0)) - len(chapters)
-            ),
-            "current_word_count": max(
-                0, int(novel.get("current_word_count", 0)) - volume_word_count
-            ),
-        }
         result = await commit_mutation(
             MutationCommand(
                 novel_id=novel_id,
                 idempotency_key=f"soft-delete-volume:{volume_id}:{volume.get('updated_at')}",
                 operation="soft_delete_volume",
+                version=2,
                 payload={
                     "volume_id": volume_id,
                     "chapter_ids": [str(chapter["_id"]) for chapter in chapters],
                     "deleted_at": get_utc_now(),
-                    "novel_stats_after": target,
                 },
-                before_image={"volume": volume, "chapters": chapters, "novel": novel},
+                before_image={"volume": volume, "chapters": chapters},
             ),
             VolumeService._execute_soft_delete_volume,
         )
@@ -514,16 +493,19 @@ class VolumeService:
         )
         await mutation.receipt("chapters", {"chapter_ids": command["chapter_ids"]})
 
-        current_novel = await novel_repo.get_novel_by_id(novel_id, session=session)
-        target = command["novel_stats_after"]
-        deltas = {
-            key: int(value) - int(current_novel.get(key, 0))
-            for key, value in target.items()
-            if int(value) != int(current_novel.get(key, 0))
-        }
-        if deltas:
-            await novel_repo.increment_novel_stats(novel_id, deltas, session=session)
-        await mutation.receipt("novel_stats", target)
+        if not await VolumeService._refresh_v2_stats(session, mutation):
+            current_novel = await novel_repo.get_novel_by_id(novel_id, session=session)
+            target = command["novel_stats_after"]
+            deltas = {
+                key: int(value) - int(current_novel.get(key, 0))
+                for key, value in target.items()
+                if int(value) != int(current_novel.get(key, 0))
+            }
+            if deltas:
+                await novel_repo.increment_novel_stats(
+                    novel_id, deltas, session=session
+                )
+            await mutation.receipt("novel_stats", target)
         if command["chapter_ids"]:
             await mark_downstream_stale(
                 novel_id, str(command["chapter_ids"][0]), session=session
@@ -551,25 +533,17 @@ class VolumeService:
             include_deleted=True,
             sort=[("order_index", 1)],
         )
-        novel = await novel_repo.get_novel_by_id(novel_id)
-        target = {
-            "current_volume_count": int(novel.get("current_volume_count", 0)) + 1,
-            "current_chapter_count": int(novel.get("current_chapter_count", 0))
-            + len(chapters),
-            "current_word_count": int(novel.get("current_word_count", 0))
-            + int(volume.get("word_count", 0)),
-        }
         result = await commit_mutation(
             MutationCommand(
                 novel_id=novel_id,
                 idempotency_key=f"restore-volume:{volume_id}:{volume.get('updated_at')}",
                 operation="restore_volume",
+                version=2,
                 payload={
                     "volume_id": volume_id,
                     "chapter_ids": [str(chapter["_id"]) for chapter in chapters],
-                    "novel_stats_after": target,
                 },
-                before_image={"volume": volume, "chapters": chapters, "novel": novel},
+                before_image={"volume": volume, "chapters": chapters},
             ),
             VolumeService._execute_restore_volume,
         )

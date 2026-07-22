@@ -22,11 +22,6 @@ class UpdateVolumeRequest(BaseModel):
     order_index: Optional[int] = None
 
 
-class UpdateVolumeStatsRequest(BaseModel):
-    chapter_count_delta: int = 0
-    word_count_delta: int = 0
-
-
 class AcceptVolumeOutlineRequest(BaseModel):
     volumes: List[dict]
 
@@ -108,20 +103,6 @@ async def update_volume(volume_id: str, req: UpdateVolumeRequest):
     except DuplicateKeyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except (ValueError, InvalidIdError) as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.patch("/{volume_id}/stats")
-async def update_volume_stats(volume_id: str, req: UpdateVolumeStatsRequest):
-    """更新卷的统计数据（chapter_count / word_count 增减）。"""
-    try:
-        success = await VolumeService.update_volume_stats(
-            volume_id,
-            req.word_count_delta,
-            req.chapter_count_delta,
-        )
-        return {"success": success}
-    except InvalidIdError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 

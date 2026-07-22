@@ -153,36 +153,7 @@ class VolumeRepository(BaseRepository):
                 f"order_index={filtered.get('order_index')} 与同一小说下已有卷冲突"
             )
 
-    async def update_volume_stats(
-        self, volume_id: str,
-        word_count_delta: int = 0,
-        chapter_count_delta: int = 0,
-        session: AsyncClientSession | None = None,
-    ) -> bool:
-        """原子增减卷的统计字段（chapter_count / word_count）。
-
-        Args:
-            volume_id: 卷 ObjectId 字符串。
-            word_count_delta: word_count 增量。
-            chapter_count_delta: chapter_count 增量。
-            session: 可选 MongoDB 会话，用于事务写入。
-
-        Returns:
-            实际修改成功时返回 True。
-        """
-        increments = {}
-        if word_count_delta != 0:
-            increments["word_count"] = word_count_delta
-        if chapter_count_delta != 0:
-            increments["chapter_count"] = chapter_count_delta
-
-        if not increments:
-            return False
-
-        obj_id = to_object_id(volume_id)
-        return await self.increment_one({"_id": obj_id}, increments, session=session)
-
-    # 删除与恢复 
+    # 删除与恢复
 
     async def soft_delete_volume(self, volume_id: str, session: AsyncClientSession | None = None) -> bool:
         """软删除指定卷。

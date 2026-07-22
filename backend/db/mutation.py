@@ -20,6 +20,7 @@ from backend.db.utils import get_utc_now, to_object_id
 T = TypeVar("T")
 MutationCallback = Callable[[Any, "MutationRecorder"], Awaitable[T]]
 _LOCKS: dict[str, asyncio.Lock] = {}
+_NOVEL_LOCKS: dict[str, asyncio.Lock] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -161,7 +162,9 @@ class MutationEngine:
             raise UnsupportedMutationError(
                 f"Unsupported mutation command: {command.operation}@{command.version}"
             )
-        return await _commit_mutation(command, callback)
+        novel_lock = _NOVEL_LOCKS.setdefault(command.novel_id, asyncio.Lock())
+        async with novel_lock:
+            return await _commit_mutation(command, callback)
 
     async def recover(
         self, scope: RecoveryScope | None = None
