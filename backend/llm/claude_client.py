@@ -19,7 +19,9 @@ from backend.llm.exceptions import (
     LLMRateLimitError,
     LLMResponseError,
     LLMSchemaError,
+    LLMSchemaUnsupportedError,
     LLMTimeoutError,
+    is_schema_protocol_unsupported,
 )
 from backend.llm.logger import log_llm_error, log_llm_request, log_llm_response
 from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
@@ -181,6 +183,12 @@ class ClaudeClient(BaseLLMClient):
             params["tool_choice"] = {"type": "tool", "name": "structured_output"}
             resp = await self._client.messages.create(**params)
         except Exception as exc:
+            if is_schema_protocol_unsupported(exc):
+                mapped = LLMSchemaUnsupportedError(
+                    str(exc), provider=self.provider_name, model=model
+                )
+                log_llm_error(mapped, provider=self.provider_name, model=model)
+                raise mapped from exc
             mapped = self._map_error(exc, model)
             log_llm_error(mapped, provider=self.provider_name, model=model)
             raise mapped from exc

@@ -24,7 +24,7 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import to_object_id
-from backend.llm.config import get_llm_config, get_provider_config
+from backend.llm.config import get_llm_config
 from backend.llm.prompts.prompt_selector import (
     CHAPTER_OUTLINE_PROMPT_NAME,
     VOLUME_OUTLINE_PROMPT_NAME,
@@ -36,7 +36,6 @@ from backend.services.llm.context_builder import (
     assemble_outline_context,
     fetch_context_inputs,
 )
-from backend.services.llm.format_review_service import validate_and_fix_format
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
     WorkflowStep,
@@ -44,11 +43,7 @@ from backend.services.llm.workflow_runner import (
     run_workflow,
     sse_event,
 )
-from backend.services.llm.workflow_service import (
-    get_llm_service_for_step,
-    resolve_provider_for_step,
-    resolve_timeout_for_step,
-)
+from backend.services.llm.generation_runtime import create_workflow_runtime
 from backend.services.novel.outline_validation import validate_outline_ids
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -60,22 +55,6 @@ CHAPTER_OUTLINE_WORKFLOW = "create_chapter_outline_by_ai"
 
 def _load_prompts() -> dict:
     return load_prompt_config()
-
-
-def _check_json_schema_support(step_name: str, workflow_name: str = VOLUME_OUTLINE_WORKFLOW) -> bool:
-    provider = resolve_provider_for_step(workflow_name, step_name)
-    if not provider:
-        return False
-    return get_provider_config(provider).supports_json_schema
-
-
-def _check_chapter_json_schema_support(
-    step_name: str, workflow_name: str = CHAPTER_OUTLINE_WORKFLOW
-) -> bool:
-    provider = resolve_provider_for_step(workflow_name, step_name)
-    if not provider:
-        return False
-    return get_provider_config(provider).supports_json_schema
 
 
 VOLUME_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
@@ -175,11 +154,7 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
 
     async def event_stream() -> AsyncGenerator[str, None]:
         deps = WorkflowDeps(
-            resolve_provider=resolve_provider_for_step,
-            resolve_timeout=resolve_timeout_for_step,
-            get_service=get_llm_service_for_step,
-            supports_schema=_check_json_schema_support,
-            fix_format=validate_and_fix_format,
+            runtime=create_workflow_runtime(),
         )
         async for frame in run_workflow(
             workflow_name=VOLUME_OUTLINE_WORKFLOW,
@@ -254,11 +229,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             )
 
         deps = WorkflowDeps(
-            resolve_provider=resolve_provider_for_step,
-            resolve_timeout=resolve_timeout_for_step,
-            get_service=get_llm_service_for_step,
-            supports_schema=_check_chapter_json_schema_support,
-            fix_format=validate_and_fix_format,
+            runtime=create_workflow_runtime(),
         )
         reported = False
         async for frame in run_workflow(

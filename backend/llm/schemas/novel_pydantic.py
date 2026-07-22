@@ -273,6 +273,27 @@ class SceneSchema(BaseModel):
     purpose: str = Field(..., min_length=1, max_length=200, description="这一场在全局的作用")
 
 
+class DueTargetSchema(BaseModel):
+    """伏笔截止目标：优先绑定稳定章节 ID，尚未建章时使用全书计划序号。"""
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["chapter", "planned_ordinal"]
+    chapter_id: Optional[str] = None
+    ordinal: Optional[int] = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_target(self):
+        if self.kind == "chapter" and not self.chapter_id:
+            raise ValueError("chapter due target requires chapter_id")
+        if self.kind == "planned_ordinal" and self.ordinal is None:
+            raise ValueError("planned_ordinal due target requires ordinal")
+        if self.kind == "chapter" and self.ordinal is not None:
+            raise ValueError("chapter due target must not include ordinal")
+        if self.kind == "planned_ordinal" and self.chapter_id is not None:
+            raise ValueError("planned_ordinal due target must not include chapter_id")
+        return self
+
+
 class NewThreadSchema(BaseModel):
     """细纲提议的新伏笔。**无 id**——伏笔尚不存在，accept 时创建并把 id 回填进
     chapter.outline.threads_planted（设计 §3.2）。伏笔表在此之前没有任何创建入口。
@@ -281,10 +302,24 @@ class NewThreadSchema(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=100, description="伏笔名")
     description: str = Field(default="", max_length=1000, description="伏笔说明")
+    due_target: Optional[DueTargetSchema] = Field(
+        default=None,
+        description="预计回收位置；已有章节用 chapter_id，未建章用全书计划序号",
+        exclude_if=lambda value: value is None,
+    )
     due_chapter_order: Optional[int] = Field(
-        default=None, ge=1, description="预计回收章序（全书章号）；null 表示尚未确定"
+        default=None,
+        ge=1,
+        description="旧预览兼容输入；接受时转换为 planned_ordinal，不再直接落库",
+        deprecated=True,
     )
     importance: Literal["main", "sub"] = Field(default="sub", description="伏笔重要度")
+
+    @model_validator(mode="after")
+    def validate_due_compatibility(self):
+        if self.due_target is not None and self.due_chapter_order is not None:
+            raise ValueError("due_target and due_chapter_order cannot both be set")
+        return self
 
 
 class ChapterOutlineAuthoredSchema(BaseModel):

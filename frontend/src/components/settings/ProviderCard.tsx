@@ -41,6 +41,7 @@ interface Props {
   config: AppConfig;
   onChange: (config: AppConfig) => void;
   onProviderRename: (from: string, to: string) => void;
+  onProviderDelete: (alias: string, replacementDefaultAlias?: string) => void;
 }
 
 type ProviderFilter = "all" | "enabled" | "needsTest";
@@ -97,13 +98,14 @@ const TEST_STEPS: { capability: ProviderTestCapability; labelKey: string }[] = [
   { capability: "connection", labelKey: "test.connection" },
   { capability: "streaming", labelKey: "test.streaming" },
   { capability: "stream_usage", labelKey: "test.streamUsage" },
+  { capability: "json_object", labelKey: "test.jsonObject" },
   { capability: "json_schema", labelKey: "test.jsonSchema" },
   { capability: "function_calling", labelKey: "test.functionCalling" },
 ];
 
 const ALIAS_REGEX = /^[a-zA-Z0-9_]+$/;
 
-export function ProviderCard({ config, onChange, onProviderRename }: Props) {
+export function ProviderCard({ config, onChange, onProviderRename, onProviderDelete }: Props) {
   const t = useTranslations("settings.provider");
   const [newAlias, setNewAlias] = useState("");
   const [aliasError, setAliasError] = useState("");
@@ -230,6 +232,11 @@ export function ProviderCard({ config, onChange, onProviderRename }: Props) {
 
   const deleteProvider = (alias: string) => {
     const nextAliases = providerAliases.filter((item) => item !== alias);
+    const replacementDefaultAlias = defaultProvider === alias ? nextAliases[0] : undefined;
+    if (defaultProvider === alias && !replacementDefaultAlias) {
+      window.alert(t("danger.defaultReplacementRequired"));
+      return;
+    }
     if (renamingAlias === alias) {
       cancelRename();
     }
@@ -240,6 +247,7 @@ export function ProviderCard({ config, onChange, onProviderRename }: Props) {
       delete next[alias];
       return next;
     });
+    onProviderDelete(alias, replacementDefaultAlias);
     onChange(removeProviderAlias(config, alias));
   };
 
@@ -254,9 +262,18 @@ export function ProviderCard({ config, onChange, onProviderRename }: Props) {
     }));
 
     try {
+      const draftKey = provider.api_key;
+      const keyMode = provider.api_key_mode;
+      const providerDraft: Record<string, unknown> = { ...provider };
+      delete providerDraft.api_key;
+      delete providerDraft.api_key_mode;
+      delete providerDraft.has_api_key;
+      const usesRequestKey = keyMode === "replace";
       const response = await apiPost<ProviderTestResponse>("/api/config/llm-providers/test", {
         alias,
-        provider,
+        provider: providerDraft,
+        secret_mode: usesRequestKey ? "request" : "saved",
+        request_api_key: usesRequestKey ? draftKey : undefined,
       });
 
       // 测试只回填当前表单，是否写入磁盘仍交给顶部保存按钮。
@@ -683,17 +700,35 @@ function ProviderDetail({
             </div>
 
             <div className="md:col-span-2">
-              <TextField value={provider.api_key} onChange={(value) => onChange({ api_key: value })}>
-                <Label className="text-sm text-muted">{t("apiKey")}</Label>
-                <Input type={showKey ? "text" : "password"} className="border-border" />
-              </TextField>
-              <button
-                type="button"
-                className="mt-1 text-xs text-muted transition-colors hover:text-foreground"
-                onClick={() => onShowKeyChange(!showKey)}
+              <TextField
+                value={provider.api_key || ""}
+                onChange={(value) => onChange({ api_key: value, api_key_mode: "replace" })}
               >
-                {showKey ? t("hideApiKey") : t("showApiKey")}
-              </button>
+                <Label className="text-sm text-muted">{t("apiKey")}</Label>
+                <Input
+                  type={showKey ? "text" : "password"}
+                  placeholder={provider.has_api_key && provider.api_key_mode !== "clear" ? t("apiKeySaved") : ""}
+                  className="border-border"
+                />
+              </TextField>
+              <div className="mt-1 flex gap-3 text-xs">
+                <button
+                  type="button"
+                  className="text-muted transition-colors hover:text-foreground"
+                  onClick={() => onShowKeyChange(!showKey)}
+                >
+                  {showKey ? t("hideApiKey") : t("showApiKey")}
+                </button>
+                {(provider.has_api_key || provider.api_key) && (
+                  <button
+                    type="button"
+                    className="text-red-600 transition-colors hover:text-red-700"
+                    onClick={() => onChange({ api_key: "", api_key_mode: "clear", has_api_key: false })}
+                  >
+                    {t("clearApiKey")}
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* 数字配置改为单列，避免步进按钮挤压标签和输入内容。 */}
@@ -799,11 +834,20 @@ function ProviderDetail({
             selected={provider.supports_streaming}
             onChange={(value) => onChange({ supports_streaming: value })}
           />
-          <CapabilitySwitch
-            label={t("supportsJsonSchema")}
-            selected={provider.supports_json_schema}
-            onChange={(value) => onChange({ supports_json_schema: value })}
-          />
+          <label className="flex items-center justify-between gap-3 rounded-lg border border-border bg-background/50 px-3 py-2 text-sm text-foreground">
+            <span>{t("structuredOutput")}</span>
+            <select
+              value={provider.structured_output}
+              onChange={(event) => onChange({
+                structured_output: event.target.value as ProviderConfig["structured_output"],
+              })}
+              className="rounded-md border border-border bg-surface px-2 py-1 text-sm"
+            >
+              <option value="prompt_json">Prompt JSON</option>
+              <option value="json_object">JSON Object</option>
+              <option value="schema_enforced">Schema Enforced</option>
+            </select>
+          </label>
           <CapabilitySwitch
             label={t("supportsFunctionCalling")}
             selected={provider.supports_function_calling}

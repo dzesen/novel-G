@@ -21,6 +21,7 @@ from typing import Any, AsyncGenerator
 
 from backend.llm.models import TokenUsage
 from backend.services.llm.workflow_runner import sse_event
+from backend.services.llm.generation_runtime import GenerationPlan, GenerationRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,12 @@ async def stream_prose(
     workflow_name: str,
     step_key: str,
     prompt: str,
-    service: Any,
+    service: Any | None,
     gen_kwargs: Mapping[str, Any],
     request_id: str,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    runtime: GenerationRuntime | None = None,
+    generation_plan: GenerationPlan | None = None,
 ) -> AsyncGenerator[str, None]:
     """流式生成正文，产出 delta 帧与终局 done 帧。
 
@@ -57,7 +60,15 @@ async def stream_prose(
         "[%s] request_id=%s step=%s status=running", workflow_name, request_id, step_key
     )
 
-    stream = service.stream_text(prompt, **gen_kwargs)
+    attempt_offset = len(runtime.attempts) if runtime is not None else 0
+    if runtime is not None:
+        if generation_plan is None:
+            raise ValueError("generation_plan is required when runtime is provided")
+        stream = runtime.stream_text(generation_plan, prompt, **gen_kwargs)
+    elif service is not None:
+        stream = service.stream_text(prompt, **gen_kwargs)
+    else:
+        raise ValueError("service or runtime is required")
     try:
         async for chunk in stream:
             if is_disconnected is not None and await is_disconnected():
@@ -92,6 +103,22 @@ async def stream_prose(
             chunks.append(chunk)
             yield sse_event("delta", {"text": chunk})
     except Exception as exc:
+        runtime_attempts = runtime.attempts[attempt_offset:] if runtime is not None else ()
+        usage_so_far = TokenUsage(
+            input_tokens=sum(item.usage.input_tokens for item in runtime_attempts),
+            output_tokens=sum(item.usage.output_tokens for item in runtime_attempts),
+            total_tokens=sum(item.usage.total_tokens for item in runtime_attempts),
+        )
+        attempt_payload = [
+            {
+                "attempt_id": item.attempt_id,
+                "provider_alias": item.provider_alias,
+                "phase": item.phase,
+                "state": item.state,
+                "usage": item.usage.model_dump(),
+            }
+            for item in runtime_attempts
+        ]
         logger.exception(
             "[%s] request_id=%s step=%s failed after %d chunks",
             workflow_name,
@@ -100,13 +127,26 @@ async def stream_prose(
             len(chunks),
         )
         # 已发出的 delta 留在前端手上（设计 §7.3 已说明这半章无从对账）。
-        yield sse_event("done", {"success": False, "error": str(exc)})
+        yield sse_event("done", {
+            "success": False,
+            "error": str(exc),
+            "usage_so_far": usage_so_far.model_dump(),
+            "attempts": attempt_payload,
+        })
         return
 
     text = "".join(chunks)
     # last_usage 只在生成器耗尽后才有效；中途取消或 provider 不报用量时为零值
     # （设计 §7.1）。这里不编造估算值。
-    usage = getattr(service, "last_usage", None) or TokenUsage()
+    if runtime is not None:
+        runtime_attempts = runtime.attempts[attempt_offset:]
+        usage = TokenUsage(
+            input_tokens=sum(item.usage.input_tokens for item in runtime_attempts),
+            output_tokens=sum(item.usage.output_tokens for item in runtime_attempts),
+            total_tokens=sum(item.usage.total_tokens for item in runtime_attempts),
+        )
+    else:
+        usage = getattr(service, "last_usage", None) or TokenUsage()
     logger.info(
         "[%s] request_id=%s step=%s status=done elapsed_ms=%d chars=%d total_tokens=%s",
         workflow_name,

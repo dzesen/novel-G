@@ -22,11 +22,11 @@ export function validateConfig(config: AppConfig, t: TFunc): string | null {
   if (config.llm?.default_provider && !providerAliases.includes(config.llm.default_provider)) {
     return t("provider.mustExist");
   }
-  if (
-    config.llm?.format_review_provider &&
-    !providerAliases.includes(config.llm.format_review_provider)
-  ) {
-    return t("validation.providerNotExist") + `: ${config.llm.format_review_provider}`;
+  const reviewerAlias = config.llm?.format_review?.mode === "provider"
+    ? config.llm.format_review.provider_alias || ""
+    : "";
+  if (reviewerAlias && !providerAliases.includes(reviewerAlias)) {
+    return t("validation.providerNotExist") + `: ${reviewerAlias}`;
   }
 
   // Provider alias validation

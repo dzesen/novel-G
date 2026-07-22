@@ -5,6 +5,8 @@ llm_provider_test:
     请用尽量短的内容回复：PROVIDER_STREAM_OK
   json_schema_probe_prompt: |
     请按结构化输出返回 code 等于 ok，message 等于 ready。不要添加额外解释。
+  json_object_probe_prompt: |
+    请只返回 JSON 对象：{"code":"ok","message":"PROVIDER_JSON_OBJECT_OK"}。不要添加代码围栏或解释。
   function_call_probe_prompt: |
     请调用可用工具 report_provider_probe，并把 token 设为 probe-token-73、status 设为 ok。不要直接回答。
   function_result_probe_prompt: |
@@ -405,14 +407,16 @@ create_chapter_outline_by_ai:
       referenced_worldbook_card_ids（本章涉及的地点/物品/规则）、
       threads_resolved（本章回收的伏笔）。
       **不要自己编造 id**：名单之外的 id 会被系统剔除并报告给用户。
-    - new_threads：本章新埋下的伏笔，每条给 name、description、
-      due_chapter_order（预计回收章序，可为 null）、importance（main 或 sub）。
+    - new_threads：本章新埋下的伏笔，每条给 name、description、due_target、
+      importance（main 或 sub）。due_target 已有目标章节时用
+      {{"kind":"chapter","chapter_id":"<名单中的章节 id>"}}；目标章尚未建立时用
+      {{"kind":"planned_ordinal","ordinal":120}}；不确定时为 null。
       这些伏笔尚不存在于名单中，**不要为它们编 id**。
   chapter_outline_prompt_with_schema_suffix: |
     请严格按提供的 JSON Schema 输出。
   chapter_outline_prompt_without_schema_suffix: |
     请只输出 JSON，形如：
-    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_chapter_order":null,"importance":"sub"}]}
+    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_target":{"kind":"planned_ordinal","ordinal":120},"importance":"sub"}]}
     不要输出 JSON 以外的任何内容。
 
 # 章节正文 Prompt 配置
@@ -432,14 +436,6 @@ write_chapter_by_ai:
     - 以场景和对话推进，避免大段旁白式总结。
     - 章末收在细纲给出的钩子上。
     - 直接输出正文本身。不要写标题、不要写"第几章"、不要加任何解释或小标题。
-  # 下面这段**永远不会被使用**：正文是纯文本，prose_router 固定取
-  # _without_schema_suffix，从不请求 JSON Schema。它存在的唯一原因是
-  # prompt_selector 的 REQUIRED_PROSE_PROMPT_KEYS 要求三段齐全，缺了会启动报错。
-  # 因此它也没有任何测试覆盖——改坏了不会有人发现，不要往里加真实约束。
-  # 要根治得放宽那个三键校验，允许纯文本工作流只声明两段；那会动到 2a 已验证的
-  # 共用校验器、影响四条既有工作流，故留给日后专门的 prompt 基建清理波。
-  chapter_content_prompt_with_schema_suffix: |
-    直接输出正文纯文本。
   chapter_content_prompt_without_schema_suffix: |
     直接输出正文纯文本，不要输出 JSON，不要用代码块包裹。
 

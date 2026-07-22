@@ -29,7 +29,10 @@ class LLMProviderConfig(BaseModel):
     max_concurrency: int = Field(default=5, description="最大并发数")
     use_system_proxy: bool = Field(default=False, description="是否允许 SDK 读取系统代理配置")
     supports_streaming: bool = Field(default=True, description="是否支持流式输出")
-    supports_json_schema: bool = Field(default=False, description="是否支持 JSON Schema 输出")
+    structured_output: Literal["prompt_json", "json_object", "schema_enforced"] = Field(
+        default="prompt_json",
+        description="结构化输出协议",
+    )
     supports_stream_usage: bool = Field(
         default=False,
         description=(
@@ -44,16 +47,31 @@ class LLMProviderConfig(BaseModel):
     temperature: float | None = Field(default=None, ge=0, le=2, description="默认采样温度")
     top_p: float | None = Field(default=None, ge=0, le=1, description="默认核采样概率")
     max_tokens: int | None = Field(default=None, gt=0, description="默认最大生成 token 数")
+    max_context_tokens: int = Field(
+        default=128000,
+        ge=4096,
+        description="模型上下文窗口；用于付费调用前的本地预算诊断",
+    )
     system_prompt: str | None = Field(default=None, description="默认系统提示词")
     presence_penalty: float | None = Field(default=None, ge=-2, le=2, description="默认存在惩罚")
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2, description="默认频率惩罚")
+
+
+class FormatReviewPolicy(BaseModel):
+    """格式审校策略；Stage 2 仅支持关闭或固定 Provider。"""
+
+    mode: Literal["disabled", "provider", "auto"] = "disabled"
+    provider_alias: str | None = None
 
 
 class LLMConfig(BaseModel):
     """LLM 总体配置，包含默认服务商与所有服务商列表。"""
 
     default_provider: str = Field(default="openai_gpt4o_mini", description="默认服务商别名")
-    format_review_provider: str = Field(default="", description="格式审校服务商别名，需支持 json_schema")
+    format_review: FormatReviewPolicy = Field(
+        default_factory=FormatReviewPolicy,
+        description="格式审校 tagged policy",
+    )
     providers: dict[str, LLMProviderConfig] = Field(default_factory=dict, description="服务商配置映射（key 为别名）")
     log_partial_result_on_disconnect: bool = Field(
         default=False,

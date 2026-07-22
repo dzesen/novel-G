@@ -12,6 +12,7 @@ from weakref import WeakKeyDictionary
 from pydantic import BaseModel
 
 from backend.llm.factory import create_llm_client
+from backend.llm.exceptions import LLMStructuredValidationError
 from backend.llm.models import LLMRequest, LLMResponse, TokenUsage
 
 
@@ -129,7 +130,33 @@ class LLMService:
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.schema_generate(request, schema)
         self._record_usage(response.usage)
-        return schema.model_validate(json.loads(response.content))
+        try:
+            return schema.model_validate(json.loads(response.content))
+        except Exception as exc:
+            raise LLMStructuredValidationError(
+                f"Provider 返回内容未通过 {schema.__name__} 校验: {exc}",
+                raw_output=response.content,
+                provider=self._provider_name,
+                model=response.model,
+            ) from exc
+
+    async def generate_json_object(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        **kwargs: Any,
+    ) -> str:
+        """请求 Provider 的 JSON Object 模式并返回原始 JSON 文本。"""
+        request = self._make_request(
+            prompt,
+            system_prompt,
+            metadata={"structured_output": "json_object"},
+            **kwargs,
+        )
+        async with _provider_request_slot(self._provider_name, self._max_concurrency):
+            response: LLMResponse = await self._client.text_generate(request)
+        self._record_usage(response.usage)
+        return response.content
 
     async def stream_text(
         self,

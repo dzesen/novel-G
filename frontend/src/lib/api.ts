@@ -37,6 +37,22 @@ export async function apiPut<T = unknown>(
   return res.json();
 }
 
+export async function apiPatch<T = unknown>(
+  path: string,
+  data: unknown
+): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Request failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function apiPost<T = unknown>(
   path: string,
   data: unknown

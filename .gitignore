@@ -9,5 +9,8 @@
 *.py[cod]
 *$py.class
 config.yaml
+.config-secret-versions.json
+.provider-capabilities.json
+config.yaml.bak
 publish-public.ps1
 PUBLIC_RELEASE.md

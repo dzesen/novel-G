@@ -73,7 +73,6 @@ REQUIRED_CHAPTER_OUTLINE_PROMPT_KEYS: tuple[str, ...] = (
 
 REQUIRED_PROSE_PROMPT_KEYS: tuple[str, ...] = (
     "chapter_content_prompt_base",
-    "chapter_content_prompt_with_schema_suffix",
     "chapter_content_prompt_without_schema_suffix",
 )
 
@@ -87,6 +86,7 @@ REQUIRED_LLM_PROVIDER_TEST_PROMPT_KEYS: tuple[str, ...] = (
     "text_probe_prompt",
     "stream_probe_prompt",
     "json_schema_probe_prompt",
+    "json_object_probe_prompt",
     "function_call_probe_prompt",
     "function_result_probe_prompt",
 )

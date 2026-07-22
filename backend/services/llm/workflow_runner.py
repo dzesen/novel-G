@@ -18,6 +18,12 @@ from typing import Any, AsyncGenerator
 from pydantic import BaseModel
 
 from backend.llm.models import TokenUsage
+from backend.services.llm.generation_runtime import (
+    GenerationRuntime,
+    PromptPlan,
+    StructuredOutputMode,
+    WorkflowStepTarget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +79,7 @@ class WorkflowDeps:
     以注入方式提供，使执行器可脱离配置文件、HTTP 与真实 LLM 测试。
     """
 
-    resolve_provider: Callable[[str, str], str | None]
-    resolve_timeout: Callable[[str, str], int | None]
-    get_service: Callable[[str, str], Any]
-    supports_schema: Callable[[str], bool]
-    fix_format: Callable[..., Awaitable[BaseModel]]
+    runtime: GenerationRuntime
 
 
 class ClientDisconnected(Exception):
@@ -236,12 +238,41 @@ async def run_workflow(
             )
             continue
 
-        yield sse_event("step", {"step": step.key, "status": "running"})
         step_started_at = time.perf_counter()
         config_key = step.resolved_config_key
-        provider = deps.resolve_provider(workflow_name, config_key) or ""
-        timeout_seconds = deps.resolve_timeout(workflow_name, config_key)
-        use_schema = deps.supports_schema(config_key)
+        runtime_attempt_offset = len(deps.runtime.attempts)
+        try:
+            generation_plan = deps.runtime.plan_structured(
+                WorkflowStepTarget(workflow_name, config_key)
+            )
+            provider = generation_plan.provider_alias
+            timeout_seconds = generation_plan.timeout_seconds
+            use_schema = generation_plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
+        except Exception as exc:
+            yield sse_event(
+                "step",
+                {"step": step.key, "status": "error", "error": str(exc)},
+            )
+            yield sse_event(
+                "done",
+                {
+                    "success": False,
+                    "failed_step": step.key,
+                    "partial_result": _partial(),
+                    "usage": total_usage.model_dump(),
+                },
+            )
+            return
+        yield sse_event(
+            "step",
+            {
+                "step": step.key,
+                "status": "running",
+                "provider": provider,
+                "structured_output": generation_plan.mode.value,
+                "reviewer": generation_plan.reviewer_alias,
+            },
+        )
         _log(
             step.key,
             "running",
@@ -251,29 +282,28 @@ async def run_workflow(
         )
 
         try:
-            service = deps.get_service(workflow_name, config_key)
-            suffix_key = (
-                f"{config_key}_prompt_with_schema_suffix"
-                if use_schema
-                else f"{config_key}_prompt_without_schema_suffix"
+            prompt_base = prompts[f"{config_key}_prompt_base"].format(
+                **step.prompt_args(StepContext(results=results, params=params))
             )
-            prompt = (
-                prompts[f"{config_key}_prompt_base"].format(
-                    **step.prompt_args(StepContext(results=results, params=params))
-                )
-                + "\n"
-                + prompts[suffix_key]
-            )
+            native_prompt = prompt_base + "\n" + prompts[f"{config_key}_prompt_with_schema_suffix"]
+            prompt_json = prompt_base + "\n" + prompts[f"{config_key}_prompt_without_schema_suffix"]
 
-            if use_schema:
-                coro = service.generate_structured(prompt, step.schema, **gen_kwargs)
-            else:
-                coro = _generate_and_fix(deps, service, prompt, step, config_key, gen_kwargs)
+            coro = deps.runtime.generate_structured(
+                generation_plan,
+                step.schema,
+                PromptPlan(
+                    native_schema_prompt=native_prompt,
+                    prompt_json_prompt=prompt_json,
+                ),
+                **gen_kwargs,
+            )
 
             task = asyncio.ensure_future(coro)
             async for frame in _drive_with_keepalive(task, is_disconnected, interval):
                 yield frame
-            produced = await task
+            generated = await task
+            produced = generated.value
+            step_usage = generated.usage
 
         except ClientDisconnected:
             _log(
@@ -293,15 +323,45 @@ async def run_workflow(
                 step.key,
                 provider or "unresolved",
             )
-            yield sse_event("step", {"step": step.key, "status": "error", "error": str(exc)})
+            failed_attempts = deps.runtime.attempts[runtime_attempt_offset:]
+            failed_usage = TokenUsage(
+                input_tokens=sum(item.usage.input_tokens for item in failed_attempts),
+                output_tokens=sum(item.usage.output_tokens for item in failed_attempts),
+                total_tokens=sum(item.usage.total_tokens for item in failed_attempts),
+            )
+            total_usage = _add_usage(total_usage, failed_usage)
+            attempt_payload = [
+                {
+                    "attempt_id": attempt.attempt_id,
+                    "provider": attempt.provider_alias,
+                    "phase": attempt.phase,
+                    "usage": attempt.usage.model_dump(),
+                }
+                for attempt in failed_attempts
+            ]
+            yield sse_event(
+                "step",
+                {
+                    "step": step.key,
+                    "status": "error",
+                    "error": str(exc),
+                    "usage": failed_usage.model_dump(),
+                    "attempts": attempt_payload,
+                },
+            )
             yield sse_event(
                 "done",
-                {"success": False, "failed_step": step.key, "partial_result": _partial()},
+                {
+                    "success": False,
+                    "failed_step": step.key,
+                    "partial_result": _partial(),
+                    "usage": total_usage.model_dump(),
+                    "attempts": attempt_payload,
+                },
             )
             return
 
         results[step.key] = produced
-        step_usage = getattr(service, "last_usage", None) or TokenUsage()
         total_usage = _add_usage(total_usage, step_usage)
         _log(
             step.key,
@@ -331,22 +391,19 @@ async def run_workflow(
         {"success": True, "result": _partial(), "usage": total_usage.model_dump()},
     )
 
-
-async def _generate_and_fix(
-    deps: WorkflowDeps,
-    service: Any,
-    prompt: str,
-    step: WorkflowStep,
-    config_key: str,
-    gen_kwargs: Mapping[str, Any],
-) -> BaseModel:
-    """Provider 不支持 JSON Schema 时，走纯文本生成 + 格式校正。"""
-    raw = await service.generate_text(prompt, **gen_kwargs)
-    return await deps.fix_format(raw, step.schema, config_key)
-
-
 class WorkflowFailed(Exception):
     """无头运行时工作流以 done{success:false} 结束。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: dict[str, Any] | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.usage = usage or {}
+        self.attempts = attempts or []
 
 
 async def run_workflow_to_result(step_key: str, frames: AsyncGenerator[str, None]) -> "tuple[dict, int]":
@@ -362,7 +419,11 @@ async def run_workflow_to_result(step_key: str, frames: AsyncGenerator[str, None
         event, data = parsed
         if event == "done":
             if not data.get("success"):
-                raise WorkflowFailed(data.get("error") or f"workflow failed at {data.get('failed_step')}")
+                raise WorkflowFailed(
+                    data.get("error") or f"workflow failed at {data.get('failed_step')}",
+                    usage=data.get("usage"),
+                    attempts=data.get("attempts"),
+                )
             result = data.get("result") or {}
             usage = data.get("usage") or {}
             return result.get(step_key, {}), int(usage.get("total_tokens") or 0)

@@ -9,6 +9,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
+from backend.config.workflow_catalog import WORKFLOW_STEPS
+
 CONFIG_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = CONFIG_DIR / "config_default.yaml"
 CONFIG_PATH = CONFIG_DIR / "config.yaml"
@@ -32,30 +34,10 @@ _cached_mtimes: tuple[float | None, float | None] | None = None
 _REPLACE_DICT_PATHS: set[tuple[str, ...]] = {
     ("llm", "providers"),
 }
-_KNOWN_WORKFLOW_STEPS: dict[str, tuple[str, ...]] = {
-    "create_novel_by_ai": (
-        "expand_idea_to_full_novel_story",
-        "extract_idea",
-        "core_seed",
-        "novel_meta",
-    ),
-    "create_factions_by_ai": (
-        "create_core_factions",
-    ),
-    "create_volume_outline_by_ai": (
-        "volume_outline",
-    ),
-    "create_chapter_outline_by_ai": (
-        "chapter_outline",
-    ),
-    "write_chapter_by_ai": (
-        "chapter_content",
-    ),
-    "extract_chapter_state_by_ai": (
-        "chapter_state",
-    ),
-}
+_KNOWN_WORKFLOW_STEPS = WORKFLOW_STEPS
 _PROVIDER_RENAMES_KEY = "_provider_renames"
+_DEPRECATED_DEFAULT_REVIEWERS = {"openai_gpt5_4_nano"}
+CURRENT_CONFIG_VERSION = 4
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)
 _OPENAI_ENDPOINT_SUFFIXES: tuple[tuple[str, ...], ...] = (
     ("chat", "completions"),
@@ -269,7 +251,8 @@ def _normalize_workflow_config(
     # 已实现模块的流程由程序固定定义，旧配置里的手动步骤不再进入运行时配置。
     step_names = list(_KNOWN_WORKFLOW_STEPS.get(workflow_name, raw_steps.keys()))
     return {
-        "default_provider": str(workflow_config.get("default_provider") or global_default_provider or "").strip(),
+        # 空字符串是有意义的原始配置：运行时动态继承全局默认，不在加载/保存时实体化。
+        "default_provider": str(workflow_config.get("default_provider") or "").strip(),
         "steps": {
             step_name: _normalize_workflow_step_config(raw_steps.get(step_name))
             for step_name in step_names
@@ -306,8 +289,9 @@ def _rename_llm_references(llm_config: Dict[str, Any], old_alias: str, new_alias
     """同步更新默认 Provider、格式审校 Provider 与工作流中的引用。"""
     if llm_config.get("default_provider") == old_alias:
         llm_config["default_provider"] = new_alias
-    if llm_config.get("format_review_provider") == old_alias:
-        llm_config["format_review_provider"] = new_alias
+    review = llm_config.get("format_review")
+    if isinstance(review, dict) and review.get("provider_alias") == old_alias:
+        review["provider_alias"] = new_alias
 
     workflows = llm_config.get("workflows")
     if not isinstance(workflows, dict):
@@ -408,8 +392,139 @@ def _normalize_config_tree(config_data: Dict[str, Any]) -> Dict[str, Any]:
         normalized_providers[alias] = normalized_provider
 
     llm_config["providers"] = normalized_providers
+    review = llm_config.get("format_review")
+    if isinstance(review, dict):
+        mode = str(review.get("mode") or "disabled").strip().lower()
+        alias = str(review.get("provider_alias") or "").strip()
+        if mode not in {"disabled", "provider", "auto"}:
+            mode = "disabled"
+        if mode == "provider" and alias:
+            llm_config["format_review"] = {"mode": "provider", "provider_alias": alias}
+        elif mode == "auto":
+            llm_config["format_review"] = {"mode": "auto", "provider_alias": None}
+        else:
+            llm_config["format_review"] = {"mode": "disabled", "provider_alias": None}
+    else:
+        llm_config["format_review"] = {"mode": "disabled", "provider_alias": None}
     _normalize_workflows(llm_config)
     return normalized
+
+
+def _migrate_config_tree(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    """把原始用户配置逐版本迁移到当前结构；函数幂等且不写磁盘。"""
+    if not isinstance(config_data, dict):
+        raise ValueError("Config must be a mapping")
+    migrated = deepcopy(config_data)
+    raw_version = migrated.get("config_version", 1)
+    if isinstance(raw_version, bool):
+        raise ValueError("config_version must be an integer")
+    try:
+        version = int(raw_version)
+    except (TypeError, ValueError) as error:
+        raise ValueError("config_version must be an integer") from error
+    if version > CURRENT_CONFIG_VERSION:
+        raise ValueError(
+            f"Configuration version {version} is newer than supported version "
+            f"{CURRENT_CONFIG_VERSION}; refusing to overwrite it"
+        )
+    if version < 1:
+        raise ValueError("config_version must be at least 1")
+
+    if version == 1:
+        llm_config = migrated.get("llm")
+        if isinstance(llm_config, dict):
+            providers = llm_config.get("providers")
+            provider_aliases = set(providers) if isinstance(providers, dict) else set()
+            reviewer_alias = str(llm_config.pop("format_review_provider", "") or "").strip()
+            if reviewer_alias in _DEPRECATED_DEFAULT_REVIEWERS and reviewer_alias not in provider_aliases:
+                reviewer_alias = ""
+            llm_config["format_review"] = (
+                {"mode": "provider", "provider_alias": reviewer_alias}
+                if reviewer_alias
+                else {"mode": "disabled", "provider_alias": None}
+            )
+        version = 2
+        migrated["config_version"] = version
+
+    if version == 2:
+        llm_config = migrated.get("llm")
+        if isinstance(llm_config, dict):
+            providers = llm_config.get("providers")
+            if isinstance(providers, dict):
+                for provider in providers.values():
+                    if not isinstance(provider, dict) or provider.get("structured_output"):
+                        continue
+                    provider["structured_output"] = (
+                        "schema_enforced"
+                        if provider.get("supports_json_schema") is True
+                        else "prompt_json"
+                    )
+        version = 3
+        migrated["config_version"] = version
+
+    if version == 3:
+        llm_config = migrated.get("llm")
+        if isinstance(llm_config, dict):
+            providers = llm_config.get("providers")
+            if isinstance(providers, dict):
+                for provider in providers.values():
+                    if isinstance(provider, dict):
+                        provider.pop("supports_json_schema", None)
+        version = 4
+        migrated["config_version"] = version
+
+    return migrated
+
+
+def _provider_references(config: Dict[str, Any]) -> Dict[str, str]:
+    """收集所有可由用户配置的 Provider 引用路径。"""
+    llm_config = config.get("llm")
+    if not isinstance(llm_config, dict):
+        return {}
+
+    references: Dict[str, str] = {}
+
+    def add(path: str, value: Any) -> None:
+        alias = str(value or "").strip()
+        if alias:
+            references[path] = alias
+
+    add("llm.default_provider", llm_config.get("default_provider"))
+    review = llm_config.get("format_review")
+    if isinstance(review, dict) and review.get("mode") == "provider":
+        add("llm.format_review.provider_alias", review.get("provider_alias"))
+
+    workflows = llm_config.get("workflows")
+    if not isinstance(workflows, dict):
+        return references
+    for workflow_name, workflow in workflows.items():
+        if not isinstance(workflow, dict):
+            continue
+        add(f"llm.workflows.{workflow_name}.default_provider", workflow.get("default_provider"))
+        steps = workflow.get("steps")
+        if not isinstance(steps, dict):
+            continue
+        for step_name, step in steps.items():
+            if isinstance(step, dict):
+                add(f"llm.workflows.{workflow_name}.steps.{step_name}.provider", step.get("provider"))
+    return references
+
+
+def _validate_provider_reference_changes(current: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    """允许保留历史坏引用，但拒绝本次新增或由删除 Provider 造成的坏引用。"""
+    current_llm = current.get("llm") if isinstance(current.get("llm"), dict) else {}
+    candidate_llm = candidate.get("llm") if isinstance(candidate.get("llm"), dict) else {}
+    current_providers = set((current_llm.get("providers") or {}).keys())
+    candidate_providers = set((candidate_llm.get("providers") or {}).keys())
+    current_references = _provider_references(current)
+
+    for path, alias in _provider_references(candidate).items():
+        if alias in candidate_providers:
+            continue
+        old_alias = current_references.get(path)
+        was_historically_invalid = old_alias == alias and alias not in current_providers
+        if not was_historically_invalid:
+            raise ValueError(f"Invalid Provider reference at {path}: {alias}")
 
 
 def _get_mtime(path: Path) -> float | None:
@@ -482,8 +597,10 @@ def load_config(force_reload: bool = False) -> Dict[str, Any]:
         if not force_reload and _cached_config is not None and _cached_mtimes == current_mtimes:
             return deepcopy(_cached_config)
 
-        default_config = _read_yaml(DEFAULT_CONFIG_PATH)
-        runtime_config = _normalize_config_tree(_merge_dicts(default_config, _read_yaml(CONFIG_PATH)))
+        default_config = _migrate_config_tree(_read_yaml(DEFAULT_CONFIG_PATH))
+        # 必须先迁移原始用户配置，再与当前默认值合并；否则默认版本号会让旧配置跳过迁移。
+        user_config = _migrate_config_tree(_read_yaml(CONFIG_PATH))
+        runtime_config = _normalize_config_tree(_merge_dicts(default_config, user_config))
 
         _cached_config = runtime_config
         _cached_mtimes = current_mtimes
@@ -515,6 +632,7 @@ def update_config(updates: Dict[str, Any]) -> Dict[str, Any]:
         current_config = _apply_provider_rename_operations(current_config, rename_operations)
         sanitized_updates = _apply_provider_rename_operations(sanitized_updates, rename_operations)
         next_config = _normalize_config_tree(_merge_dicts(current_config, sanitized_updates))
+        _validate_provider_reference_changes(current_config, next_config)
         _write_yaml(CONFIG_PATH, next_config)
 
         global _cached_config, _cached_mtimes

@@ -25,13 +25,14 @@ from backend.services.llm.workflow_runner import (
     WorkflowStep,
     run_workflow,
 )
-from backend.services.llm.workflow_service import (
-    get_llm_service_for_step,
-    resolve_provider_for_step,
-    resolve_timeout_for_step,
+from backend.services.llm.generation_runtime import (
+    ExplicitProviderTarget,
+    PromptPlan,
+    WorkflowStepTarget,
+    create_generation_runtime,
+    create_workflow_runtime,
 )
 from backend.services.llm.llm_service import LLMService
-from backend.services.llm.format_review_service import validate_and_fix_format
 from backend.services.novel.faction_service import FactionService
 from backend.llm.prompts.prompt_selector import (
     CORE_FACTIONS_PROMPT_NAME,
@@ -130,14 +131,6 @@ TAG_SPLIT_RE = re.compile(r"[\n,，、;；]+")
 def _load_prompts() -> dict:
     """读取当前生效的 prompt 定义文件。"""
     return load_prompt_config()
-
-
-def _check_json_schema_support(step_name: str, workflow_name: str = WORKFLOW_NAME) -> bool:
-    """检查指定步骤对应的 Provider 是否支持 JSON Schema 输出。"""
-    provider = resolve_provider_for_step(workflow_name, step_name)
-    if not provider:
-        return False
-    return get_provider_config(provider).supports_json_schema
 
 
 AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
@@ -501,28 +494,29 @@ async def generate_core_factions(req: GenerateCoreFactionsRequest):
         raise HTTPException(status_code=409, detail="核心阵营已初始化，请改用手动新增或先清空核心势力与垃圾桶")
 
     step_name = CREATE_CORE_FACTIONS_STEP_NAME
-    provider = resolve_provider_for_step(FACTIONS_WORKFLOW_NAME, step_name) or ""
-    timeout_seconds = resolve_timeout_for_step(FACTIONS_WORKFLOW_NAME, step_name)
-    use_json_schema = _check_json_schema_support(step_name, FACTIONS_WORKFLOW_NAME)
     gen_kwargs = build_gen_kwargs(req)
-    prompt = _build_core_factions_prompt(novel, use_json_schema=use_json_schema)
+    runtime = create_generation_runtime()
+    plan = runtime.plan_structured(WorkflowStepTarget(FACTIONS_WORKFLOW_NAME, step_name))
 
     logger.info(
         "[generate_core_factions] request_id=%s novel_id=%s provider=%s json_schema=%s",
         request_id,
         req.novel_id,
-        provider or "unresolved",
-        use_json_schema,
+        plan.provider_alias,
+        plan.mode.value,
     )
 
     try:
-        service = get_llm_service_for_step(FACTIONS_WORKFLOW_NAME, step_name)
-        if use_json_schema:
-            raw_result = await service.generate_structured(prompt, CoreFactionsResultSchema, **gen_kwargs)
-        else:
-            raw_text = await service.generate_text(prompt, **gen_kwargs)
-            raw_result = await validate_and_fix_format(raw_text, CoreFactionsResultSchema, step_name)
-        parsed_result = CoreFactionsResultSchema.model_validate(raw_result.model_dump())
+        generated = await runtime.generate_structured(
+            plan,
+            CoreFactionsResultSchema,
+            PromptPlan(
+                native_schema_prompt=_build_core_factions_prompt(novel, use_json_schema=True),
+                prompt_json_prompt=_build_core_factions_prompt(novel, use_json_schema=False),
+            ),
+            **gen_kwargs,
+        )
+        parsed_result = CoreFactionsResultSchema.model_validate(generated.value.model_dump())
         return parsed_result.model_dump()
     except ValueError as exc:
         logger.warning(
@@ -535,8 +529,8 @@ async def generate_core_factions(req: GenerateCoreFactionsRequest):
         logger.exception(
             "[generate_core_factions] request_id=%s failed provider=%s timeout=%s",
             request_id,
-            provider or "unresolved",
-            timeout_seconds,
+            plan.provider_alias,
+            plan.timeout_seconds,
         )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -551,30 +545,28 @@ async def rewrite_novel_field(req: NovelFieldRewriteRequest):
     Returns:
         包含目标字段和改写后字段值的响应字典。
     """
-    provider_config = _validate_rewrite_provider(req.provider)
-    prompt = _build_rewrite_prompt(req, use_json_schema=provider_config.supports_json_schema)
+    _validate_rewrite_provider(req.provider)
+    runtime = create_generation_runtime()
+    plan = runtime.plan_structured(ExplicitProviderTarget(req.provider))
     request_id = uuid4().hex[:8]
     logger.info(
         "[rewrite_novel_field] request_id=%s provider=%s field=%s json_schema=%s",
         request_id,
         req.provider,
         req.target_field,
-        provider_config.supports_json_schema,
+        plan.mode.value,
     )
 
     try:
-        service = LLMService(provider_name=req.provider)
-        if provider_config.supports_json_schema:
-            raw_result = await service.generate_structured(prompt, NovelFieldRewriteResult)
-        else:
-            raw_text = await service.generate_text(prompt)
-            raw_result = await validate_and_fix_format(
-                raw_text,
-                NovelFieldRewriteResult,
-                "rewrite_novel_field",
-            )
-
-        parsed_result = NovelFieldRewriteResult.model_validate(raw_result.model_dump())
+        generated = await runtime.generate_structured(
+            plan,
+            NovelFieldRewriteResult,
+            PromptPlan(
+                native_schema_prompt=_build_rewrite_prompt(req, use_json_schema=True),
+                prompt_json_prompt=_build_rewrite_prompt(req, use_json_schema=False),
+            ),
+        )
+        parsed_result = NovelFieldRewriteResult.model_validate(generated.value.model_dump())
         normalized_result = _normalize_rewrite_result(req.target_field, parsed_result)
         return normalized_result.model_dump()
     except HTTPException:
@@ -612,11 +604,7 @@ async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
         # 依赖在此处装配而非模块级：这些名字在测试中会被 monkeypatch 到本模块上，
         # 调用时再取才能拿到替身。
         deps = WorkflowDeps(
-            resolve_provider=resolve_provider_for_step,
-            resolve_timeout=resolve_timeout_for_step,
-            get_service=get_llm_service_for_step,
-            supports_schema=_check_json_schema_support,
-            fix_format=validate_and_fix_format,
+            runtime=create_workflow_runtime(),
         )
         async for frame in run_workflow(
             workflow_name=WORKFLOW_NAME,

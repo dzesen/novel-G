@@ -1,12 +1,6 @@
-"""三个 LLM 路由（create_novel / outline / prose）共用的请求件。
+"""LLM 路由共用的请求模型、生成参数和安全文本读取工具。
 
-这些字段与函数此前在 create_novel_router 与 outline_router 各有一份逐字相同的拷贝。
-本模块是它们唯一的来源。
-
-**刻意不收纳 `_check_json_schema_support`**：它的模块级身份是测试
-monkeypatch 策略的一部分（tests/test_outline_router.py 直接打路由模块上的
-那个名字），挪进本模块会让 monkeypatch 静默失效；且正文工作流是纯文本、
-从不走 JSON Schema，并不需要它。
+结构化输出协议由 GenerationRuntime 统一规划；路由层不再维护 Provider 能力分支。
 """
 
 from __future__ import annotations

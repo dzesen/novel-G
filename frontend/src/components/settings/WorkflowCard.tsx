@@ -4,16 +4,16 @@ import { useState } from "react";
 import { useTranslations } from "next-intl";
 import {
   Card,
+  Button,
   Select,
   ListBox,
   ListBoxItem,
   Label,
   Chip,
 } from "@heroui/react";
-import type { AppConfig, WorkflowConfig, WorkflowStep } from "@/types/config";
+import type { AppConfig, WorkflowConfig, WorkflowDefinition, WorkflowStep } from "@/types/config";
 import {
-  CREATE_NOVEL_WORKFLOW_NAME,
-  WORKFLOW_DEFINITIONS,
+  applyProviderToAllWorkflows,
   getProviderAliasesForSelection,
   getWorkflowStepNames,
   isProviderSelectable,
@@ -23,11 +23,13 @@ import {
 
 interface Props {
   config: AppConfig;
+  catalog: WorkflowDefinition[];
   onChange: (config: AppConfig) => void;
 }
 
 const GLOBAL_DEFAULT_KEY = "__global_default__";
 const INHERIT_WORKFLOW_KEY = "__inherit_workflow__";
+const AUTO_REVIEW_KEY = "__auto_review__";
 
 /**
  * 渲染小说生成流程配置界面，支持按流程名称独立指定步骤 Provider。
@@ -39,31 +41,37 @@ const INHERIT_WORKFLOW_KEY = "__inherit_workflow__";
  * Returns:
  *   流程 Provider 管理卡片。
  */
-export function WorkflowCard({ config, onChange }: Props) {
+export function WorkflowCard({ config, catalog, onChange }: Props) {
   const t = useTranslations("settings.workflow");
   const tSteps = useTranslations("settings.workflow.steps");
 
   const providers = config.llm?.providers || {};
   const providerAliases = Object.keys(providers);
   const workflows = config.llm?.workflows || {};
-  const workflowNames = WORKFLOW_DEFINITIONS.map((workflow) => workflow.name);
-  const [selectedWorkflowName, setSelectedWorkflowName] = useState(
-    CREATE_NOVEL_WORKFLOW_NAME
-  );
+  const definitions = new Map(catalog.map((definition) => [definition.name, definition]));
+  const workflowNames = Object.keys(workflows);
+  const [selectedWorkflowName, setSelectedWorkflowName] = useState("");
 
   const effectiveSelectedWorkflowName = workflowNames.includes(selectedWorkflowName)
     ? selectedWorkflowName
-    : CREATE_NOVEL_WORKFLOW_NAME;
+    : workflowNames[0] || "";
+  const selectedDefinition = definitions.get(effectiveSelectedWorkflowName);
 
   const selectedWorkflow: WorkflowConfig = workflows[effectiveSelectedWorkflowName] || newWorkflowConfig(
     effectiveSelectedWorkflowName,
-    config.llm?.default_provider || ""
+    "",
+    undefined,
+    selectedDefinition,
   );
-  const stepNames = getWorkflowStepNames(effectiveSelectedWorkflowName, selectedWorkflow);
+  const stepNames = getWorkflowStepNames(selectedWorkflow, selectedDefinition);
   const overriddenSteps = stepNames.filter((stepName) =>
     Boolean(selectedWorkflow.steps?.[stepName]?.provider)
   );
-  const formatReviewProvider = config.llm?.format_review_provider || "";
+  const formatReviewProvider = config.llm?.format_review.mode === "auto"
+    ? AUTO_REVIEW_KEY
+    : config.llm?.format_review.mode === "provider"
+      ? config.llm.format_review.provider_alias || ""
+      : "";
   const workflowDefaultOptions = getProviderAliasesForSelection(
     providers,
     selectedWorkflow.default_provider
@@ -109,7 +117,11 @@ export function WorkflowCard({ config, onChange }: Props) {
       ...config,
       llm: {
         ...config.llm,
-        format_review_provider: provider,
+        format_review: provider === AUTO_REVIEW_KEY
+          ? { mode: "auto", provider_alias: null }
+          : provider
+          ? { mode: "provider", provider_alias: provider }
+          : { mode: "disabled", provider_alias: null },
       },
     });
   };
@@ -131,10 +143,18 @@ export function WorkflowCard({ config, onChange }: Props) {
     if (!providerAliases.includes(providerAlias)) return t("providerNotExist");
     return providers[providerAlias]?.enabled ? t("providerEnabled") : t("providerDisabledShort");
   };
-  const workflowModuleLabel =
-    effectiveSelectedWorkflowName === CREATE_NOVEL_WORKFLOW_NAME
-      ? t("novelWorkflowReady")
-      : t("factionsWorkflowReady");
+  const workflowModuleLabel = selectedDefinition ? t("builtInWorkflowReady") : t("customStepHint");
+  const globalProvider = config.llm?.default_provider || "";
+
+  const applyGlobalProviderToAll = () => {
+    if (!globalProvider || !providers[globalProvider]) return;
+    const stepCount = Object.values(workflows).reduce(
+      (total, workflow) => total + Object.keys(workflow.steps || {}).length,
+      0,
+    );
+    if (!window.confirm(t("applyAllConfirm", { provider: globalProvider, stepCount }))) return;
+    onChange(applyProviderToAllWorkflows(config, globalProvider));
+  };
 
   return (
     <Card className="border border-border bg-surface shadow-sm">
@@ -143,6 +163,21 @@ export function WorkflowCard({ config, onChange }: Props) {
         <p className="max-w-3xl text-sm leading-6 text-muted">{t("description")}</p>
       </Card.Header>
       <Card.Content className="space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background/60 p-3">
+          <div>
+            <div className="text-sm font-semibold text-foreground">{t("applyAllTitle")}</div>
+            <p className="mt-1 text-xs text-muted">
+              {t("applyAllHint", { provider: globalProvider || t("notConfigured") })}
+            </p>
+          </div>
+          <Button
+            variant="secondary"
+            isDisabled={!globalProvider || !providers[globalProvider]}
+            onPress={applyGlobalProviderToAll}
+          >
+            {t("applyAllAction")}
+          </Button>
+        </div>
         <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
           <aside className="rounded-lg border border-border bg-background/60 p-3">
             <div className="mb-3 flex items-center justify-between gap-2">
@@ -158,7 +193,7 @@ export function WorkflowCard({ config, onChange }: Props) {
             <div className="space-y-1">
               {workflowNames.map((workflowName) => {
                 const workflow = workflows[workflowName];
-                const count = getWorkflowStepNames(workflowName, workflow).length;
+                const count = getWorkflowStepNames(workflow, definitions.get(workflowName)).length;
                 const isSelected = effectiveSelectedWorkflowName === workflowName;
                 return (
                   <button
@@ -243,7 +278,7 @@ export function WorkflowCard({ config, onChange }: Props) {
 
                 <Select
                   selectedKey={
-                    formatReviewOptions.includes(formatReviewProvider)
+                    formatReviewProvider === AUTO_REVIEW_KEY || formatReviewOptions.includes(formatReviewProvider)
                       ? formatReviewProvider
                       : GLOBAL_DEFAULT_KEY
                   }
@@ -261,6 +296,9 @@ export function WorkflowCard({ config, onChange }: Props) {
                     <ListBox>
                       <ListBoxItem key={GLOBAL_DEFAULT_KEY} id={GLOBAL_DEFAULT_KEY}>
                         {t("globalDefault")}
+                      </ListBoxItem>
+                      <ListBoxItem key={AUTO_REVIEW_KEY} id={AUTO_REVIEW_KEY}>
+                        {t("autoReview")}
                       </ListBoxItem>
                       {formatReviewOptions.map((alias) => (
                         <ListBoxItem

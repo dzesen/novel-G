@@ -8,6 +8,8 @@ from backend.llm.exceptions import (
     LLMRateLimitError,
     LLMResponseError,
     LLMSchemaError,
+    LLMSchemaUnsupportedError,
+    LLMStructuredValidationError,
     LLMTimeoutError,
 )
 from backend.llm.factory import create_llm_client
@@ -32,6 +34,8 @@ __all__ = [
     "LLMTimeoutError",
     "LLMResponseError",
     "LLMSchemaError",
+    "LLMSchemaUnsupportedError",
+    "LLMStructuredValidationError",
     "create_llm_client",
     "get_llm_config",
     "get_provider_config",

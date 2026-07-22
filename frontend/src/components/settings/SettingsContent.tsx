@@ -89,6 +89,8 @@ export default function SettingsContent({
     fetchConfig,
     saveConfig,
     queueProviderRename,
+    queueProviderDelete,
+    workflowCatalog,
     setConfig,
     clearMessages,
   } = useConfig();
@@ -218,11 +220,20 @@ export default function SettingsContent({
           <ProviderCard
             config={config}
             onChange={setConfig}
-            onProviderRename={(from, to) => queueProviderRename({ from, to })}
+            onProviderRename={(from, to) => queueProviderRename({
+              kind: "rename",
+              from_alias: from,
+              to_alias: to,
+            })}
+            onProviderDelete={(alias, replacementDefaultAlias) => queueProviderDelete({
+              kind: "delete",
+              alias,
+              replacement_default_alias: replacementDefaultAlias || null,
+            })}
           />
         );
       case "workflow":
-        return <WorkflowCard config={config} onChange={setConfig} />;
+        return <WorkflowCard config={config} catalog={workflowCatalog} onChange={setConfig} />;
     }
   };
 

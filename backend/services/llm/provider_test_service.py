@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from copy import deepcopy
 from collections.abc import Awaitable, Callable
 from typing import Literal
 
@@ -18,7 +19,7 @@ from backend.llm.models import LLMFunctionCallProbe, LLMRequest, TokenUsage
 from backend.llm.prompts.prompt_selector import load_llm_provider_test_prompts
 
 ProviderTestCapability = Literal[
-    "connection", "streaming", "stream_usage", "json_schema", "function_calling"
+    "connection", "streaming", "stream_usage", "json_object", "json_schema", "function_calling"
 ]
 ProviderTestStatus = Literal["passed", "failed", "skipped"]
 ClientFactory = Callable[[LLMProviderConfig, str], BaseLLMClient]
@@ -34,6 +35,61 @@ class ProviderTestRequest(BaseModel):
 
     alias: str = Field(default="", description="当前 Provider 别名")
     provider: LLMProviderConfig = Field(description="当前表单中的 Provider 配置")
+    secret_mode: Literal["saved", "request"] = Field(
+        default="request",
+        description="复用已保存密钥或使用仅限本次测试的新密钥",
+    )
+    request_api_key: str | None = Field(
+        default=None,
+        description="secret_mode=request 时使用；不会写入配置",
+    )
+    persist_capabilities: bool = Field(default=False, exclude=True)
+
+
+def resolve_provider_test_request(
+    request: ProviderTestRequest,
+    saved_config: dict,
+) -> ProviderTestRequest:
+    """把非密钥草稿与显式密钥来源合并为一次性测试请求。"""
+    alias = request.alias.strip()
+    providers = saved_config.get("llm", {}).get("providers", {})
+    saved_provider = providers.get(alias) if isinstance(providers, dict) else None
+    if not isinstance(saved_provider, dict):
+        saved_provider = {}
+
+    draft_fields = request.provider.model_dump(exclude_unset=True)
+    draft_fields.pop("api_key", None)
+    merged = deepcopy(saved_provider)
+    merged.update(draft_fields)
+
+    if request.secret_mode == "saved":
+        if not alias or not saved_provider:
+            raise ValueError("Saved Provider does not exist")
+        api_key = str(saved_provider.get("api_key") or "")
+        if not api_key:
+            raise ValueError("Saved Provider does not have an API Key")
+    else:
+        api_key = str(request.request_api_key or request.provider.api_key or "")
+        if not api_key:
+            raise ValueError("A request API Key is required for this Provider test")
+
+    saved_nonsecret = deepcopy(saved_provider)
+    saved_nonsecret.pop("api_key", None)
+    merged_nonsecret = deepcopy(merged)
+    merged_nonsecret.pop("api_key", None)
+    can_persist = (
+        request.secret_mode == "saved"
+        and bool(saved_provider)
+        and merged_nonsecret == saved_nonsecret
+    )
+    merged["api_key"] = api_key
+    return request.model_copy(
+        update={
+            "provider": LLMProviderConfig.model_validate(merged),
+            "request_api_key": None,
+            "persist_capabilities": can_persist,
+        }
+    )
 
 
 class ProviderCapabilityResult(BaseModel):
@@ -50,9 +106,12 @@ class ProviderCapabilityRecommendation(BaseModel):
     """接口测试完成后建议回填的 Provider 能力开关。"""
 
     supports_streaming: bool = Field(default=False, description="是否建议启用流式输出")
-    supports_json_schema: bool = Field(default=False, description="是否建议启用 JSON Schema")
     supports_function_calling: bool = Field(default=False, description="是否建议启用 Function Calling")
     supports_stream_usage: bool = Field(default=False, description="是否建议启用流式 Token 用量统计")
+    structured_output: Literal["prompt_json", "json_object", "schema_enforced"] = Field(
+        default="prompt_json",
+        description="建议使用的结构化输出协议",
+    )
 
 
 class ProviderTestResponse(BaseModel):
@@ -281,6 +340,7 @@ async def test_llm_provider_capabilities(
         skipped = [
             _result("streaming", "流式输出", "skipped", message="连接测试未通过"),
             _result("stream_usage", "流式用量统计", "skipped", message="连接测试未通过"),
+            _result("json_object", "JSON Object", "skipped", message="连接测试未通过"),
             _result("json_schema", "JSON Schema", "skipped", message="连接测试未通过"),
             _result("function_calling", "Function Calling", "skipped", message="连接测试未通过"),
         ]
@@ -368,6 +428,7 @@ async def test_llm_provider_capabilities(
                         message=f"连接测试未通过；初次流式失败: {initial_stream_result.message}",
                     ),
                     _result("stream_usage", "流式用量统计", "skipped", message="连接测试未通过"),
+                    _result("json_object", "JSON Object", "skipped", message="连接测试未通过"),
                     _result("json_schema", "JSON Schema", "skipped", message="连接测试未通过"),
                     _result("function_calling", "Function Calling", "skipped", message="连接测试未通过"),
                 ]
@@ -440,6 +501,21 @@ async def test_llm_provider_capabilities(
         if parsed.code != "ok":
             raise ValueError("结构化响应字段不符合预期")
 
+    async def run_json_object() -> None:
+        response = await client.text_generate(
+            _build_probe_request(prompts["json_object_probe_prompt"]).model_copy(
+                update={"metadata": {"structured_output": "json_object"}}
+            )
+        )
+        log_provider_test_raw_response(
+            alias,
+            "json_object",
+            response.raw_response or {"content": response.content},
+        )
+        parsed = ProviderJsonProbeSchema.model_validate_json(response.content)
+        if parsed.code != "ok":
+            raise ValueError("JSON Object 响应字段不符合预期")
+
     async def run_function_calling() -> None:
         """执行 Function Calling 完整两轮能力测试。
 
@@ -482,6 +558,7 @@ async def test_llm_provider_capabilities(
         )
     results.append(usage_result)
 
+    results.append(await _run_step("json_object", "JSON Object", api_key, run_json_object))
     results.append(await _run_step("json_schema", "JSON Schema", api_key, run_json_schema))
     results.append(await _run_step("function_calling", "Function Calling", api_key, run_function_calling))
 
@@ -489,9 +566,15 @@ async def test_llm_provider_capabilities(
     statuses = {item.capability: item.status for item in results}
     recommendation = ProviderCapabilityRecommendation(
         supports_streaming=statuses.get("streaming") == "passed",
-        supports_json_schema=statuses.get("json_schema") == "passed",
         supports_function_calling=statuses.get("function_calling") == "passed",
         supports_stream_usage=statuses.get("stream_usage") == "passed",
+        structured_output=(
+            "schema_enforced"
+            if statuses.get("json_schema") == "passed"
+            else "json_object"
+            if statuses.get("json_object") == "passed"
+            else "prompt_json"
+        ),
     )
     passed_count = sum(1 for item in results if item.status == "passed")
     return ProviderTestResponse(

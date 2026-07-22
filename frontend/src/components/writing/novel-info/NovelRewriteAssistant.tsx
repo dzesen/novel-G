@@ -22,7 +22,7 @@ import {
   normalizeRewriteState,
   selectRewriteRevision,
 } from "@/lib/rewriteDraftState";
-import { normalizeAppConfig, type AppConfig } from "@/types/config";
+import { normalizeAppConfig, type ConfigView } from "@/types/config";
 import type {
   RewriteChatMessage,
   RewriteNovelFieldRequest,
@@ -139,10 +139,10 @@ export default function NovelRewriteAssistant({
     async function loadProviders() {
       try {
         setProviderLoading(true);
-        const res = await apiGet<{ data: AppConfig }>("/api/config");
+        const res = await apiGet<ConfigView>("/api/config");
         if (!mounted) return;
 
-        const config = normalizeAppConfig(res.data);
+        const config = normalizeAppConfig(res.editable_data);
         const enabledProviders = Object.entries(config.llm.providers)
           .filter(([, provider]) => provider.enabled)
           .map(([alias]) => alias);

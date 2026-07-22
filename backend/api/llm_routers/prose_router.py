@@ -31,6 +31,7 @@ from backend.services.llm.context_builder import (
 from backend.services.llm.prose_runner import stream_prose
 from backend.services.llm.workflow_runner import sse_event
 from backend.services.llm.workflow_service import get_llm_service_for_step
+from backend.services.llm.generation_runtime import WorkflowStepTarget, create_generation_runtime
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
 logger = logging.getLogger(__name__)
@@ -113,7 +114,15 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
             )
 
         try:
-            service = get_llm_service_for_step(PROSE_WORKFLOW, PROSE_STEP)
+            runtime = create_generation_runtime()
+            try:
+                plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
+                service = None
+            except ValueError:
+                # 迁移兼容：测试/嵌入方可能仍通过旧 seam 注入临时 service。
+                service = get_llm_service_for_step(PROSE_WORKFLOW, PROSE_STEP)
+                runtime = None
+                plan = None
         except Exception as exc:
             logger.exception(
                 "[%s] request_id=%s failed to resolve service", PROSE_WORKFLOW, request_id
@@ -129,6 +138,8 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
             gen_kwargs=gen_kwargs,
             request_id=request_id,
             is_disconnected=request.is_disconnected,
+            runtime=runtime,
+            generation_plan=plan,
         ):
             yield frame
 
