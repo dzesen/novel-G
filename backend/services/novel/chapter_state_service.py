@@ -28,6 +28,7 @@ from backend.db.mutation import MutationCommand, commit_mutation
 from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.state_validation import validate_state_ids
+from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.novel.state_timeline import record_acceptance
 
 logger = logging.getLogger(__name__)
@@ -45,10 +46,24 @@ class ChapterStateService:
         planned = data["character_updates"]
         skipped_duplicate_facts = list(command.get("skipped_duplicate_facts") or [])
         acceptance_metadata = command.get("acceptance_metadata") or {}
+        proposal_claim = command.get("proposal_claim")
         states_updated = 0
         facts_appended = 0
         threads_updated = 0
         try:
+            if proposal_claim:
+                revision_receipt = (mutation.journal.get("receipts") or {}).get(
+                    "narrative_revision"
+                ) or {}
+                if "revision" not in revision_receipt:
+                    raise RuntimeError(
+                        "Proposal acceptance requires a narrative revision receipt"
+                    )
+                await state_proposal_module.claim_for_mutation(
+                    proposal_claim,
+                    mutation_revision=int(revision_receipt["revision"]),
+                    session=session,
+                )
             await chapter_repo.update_chapter(
                 chapter_id, {"summary": data["summary"]}, session=session
             )
@@ -119,7 +134,7 @@ class ChapterStateService:
                 )
                 await mutation.receipt("timeline", {"revision": timeline_revision})
 
-            return {
+            result = {
                 "chapter_id": chapter_id,
                 "states_updated": states_updated,
                 "facts_appended": facts_appended,
@@ -127,6 +142,11 @@ class ChapterStateService:
                 "skipped_duplicate_facts": skipped_duplicate_facts,
                 "timeline_revision": timeline_revision,
             }
+            if proposal_claim:
+                await state_proposal_module.mark_applied(
+                    proposal_claim, result, session=session
+                )
+            return result
         except Exception:
             logger.error(
                 "accept_chapter_state 中途失败：chapter_id=%s 已写 %s 个角色状态、"
@@ -144,6 +164,7 @@ class ChapterStateService:
         payload: Dict[str, Any],
         *,
         acceptance_metadata: Dict[str, Any] | None = None,
+        proposal_claim: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """接受状态回填预览：写章摘要、回填人物状态、推进伏笔状态。
 
@@ -222,6 +243,7 @@ class ChapterStateService:
                     **data,
                     "character_updates": planned,
                     "acceptance_metadata": acceptance_metadata or {},
+                    "proposal_claim": proposal_claim,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -229,10 +251,15 @@ class ChapterStateService:
             ).encode("utf-8")
         ).hexdigest()
 
+        idempotency_key = (
+            f"accept-state-proposal:{proposal_claim['proposal_id']}"
+            if proposal_claim
+            else f"accept-state:{chapter_id}:{digest}"
+        )
         return await commit_mutation(
             MutationCommand(
                 novel_id=novel_id,
-                idempotency_key=f"accept-state:{chapter_id}:{digest}",
+                idempotency_key=idempotency_key,
                 operation="accept_chapter_state",
                 payload={
                     "chapter_id": chapter_id,
@@ -240,6 +267,7 @@ class ChapterStateService:
                     "state": {**data, "character_updates": planned},
                     "skipped_duplicate_facts": skipped_duplicate_facts,
                     "acceptance_metadata": acceptance_metadata or {},
+                    "proposal_claim": proposal_claim,
                 },
                 before_image={"chapter_summary": chapter.get("summary", "")},
                 child_ids=child_ids,

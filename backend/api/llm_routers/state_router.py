@@ -1,6 +1,6 @@
 """AI 状态回填路由：正文 → 章摘要 + 伏笔推进 + 人物状态 + 一致性报告。
 
-**预览端从不写数据库**（落库在本模块的 accept 端点，走 ChapterStateService）。
+生成端只持久化租约与候选；叙事状态落库只发生在 accept 端点。
 与 outline_router 一致，依赖以 WorkflowDeps 在 event_stream 内装配，
 使测试可 monkeypatch 本模块的全局名。
 """
@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.api.llm_routers._common import GenerationParamsMixin, build_gen_kwargs
 from backend.db.errors import InvalidIdError, NotFoundError
+from backend.db.mutation import MutationConflictError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import to_object_id
@@ -111,9 +112,10 @@ def _replace_chapter_state(parsed, cleaned: dict) -> str:
 
 @router.post("/extract-chapter-state-by-ai")
 async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request):
-    """读本章正文与正文模式上下文包，生成状态回填预览（SSE）。不写数据库。"""
+    """读本章正文与上下文，先建生成租约，再以 SSE 返回状态提案。"""
     # 全部前置校验在开流**之前**完成：一旦开始 streaming，状态码已经发出，
     # 这些错误就只能降级成流里的一条帧（沿用 2a-2b / 2b-1 的既定做法）。
+    generation_lease = None
     try:
         await novel_repo.get_novel_by_id(req.novel_id)
         chapter = await chapter_repo.get_chapter_by_id(req.chapter_id)
@@ -131,12 +133,24 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             req.chapter_id,
             chapter=chapter,
         )
+        provider_alias = resolve_provider_for_step(STATE_WORKFLOW, STATE_STEP)
+        provider_config = get_provider_config(provider_alias)
+        generation_lease = await state_preview_store.begin(
+            req.novel_id,
+            req.chapter_id,
+            snapshot=generation_snapshot,
+            audit={
+                "workflow": STATE_WORKFLOW,
+                "step": STATE_STEP,
+                "provider_alias": provider_alias,
+                "provider_type": getattr(provider_config, "provider_type", None),
+                "model": getattr(provider_config, "model", None),
+            },
+        )
         inputs = await fetch_context_inputs(req.novel_id, req.chapter_id)
         # 用正文模式而非细纲模式：既有 permanent_facts 在正文模式的永不截断档里，
         # 而那正是一致性校验的判据基础，截掉它校验就变成瞎猜（设计 §4.2）。
         context = assemble_context(inputs)
-        provider_alias = resolve_provider_for_step(STATE_WORKFLOW, STATE_STEP)
-        provider_config = get_provider_config(provider_alias)
         estimated_input = estimate_tokens(context.to_prompt_text()) + estimate_tokens(content)
         reserved_output = int(req.max_tokens or getattr(provider_config, "max_tokens", None) or 4096)
         max_context_tokens = int(getattr(provider_config, "max_context_tokens", 128000))
@@ -151,15 +165,27 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
                 ),
             )
         await state_preview_store.ensure_current(generation_snapshot)
-    except HTTPException:
+    except HTTPException as exc:
+        if generation_lease is not None:
+            await state_preview_store.mark_failed(generation_lease, exc)
         # 故意抛出的 400 必须先于下面的宽泛 handler，否则会被降级成别的码。
         raise
     except NotFoundError as exc:
+        if generation_lease is not None:
+            await state_preview_store.mark_failed(generation_lease, exc)
         raise HTTPException(status_code=404, detail=str(exc))
     except InvalidIdError as exc:
+        if generation_lease is not None:
+            await state_preview_store.mark_failed(generation_lease, exc)
         raise HTTPException(status_code=400, detail=str(exc))
     except ContextBudgetError as exc:
+        if generation_lease is not None:
+            await state_preview_store.mark_failed(generation_lease, exc)
         raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        if generation_lease is not None:
+            await state_preview_store.mark_failed(generation_lease, exc)
+        raise
 
     params = {
         "context": context.to_prompt_text(),
@@ -187,38 +213,57 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             runtime=create_workflow_runtime(),
         )
         reported = False
-        async for frame in run_workflow(
-            workflow_name=STATE_WORKFLOW,
-            steps=CHAPTER_STATE_STEPS,
-            prompts=_load_prompts().get(CHAPTER_STATE_PROMPT_NAME, {}),
-            params=params,
-            gen_kwargs=build_gen_kwargs(req),
-            cached={},
-            deps=deps,
-            request_id=uuid4().hex[:8],
-            is_disconnected=request.is_disconnected,
-            log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
-        ):
-            parsed = parse_sse_event(frame)
-            payload = _extract_chapter_state(parsed)
-            if payload is None:
-                yield frame
-                continue
-            # AI 返回的每个 id 必须在 roster 内，不在则剔除并**明确上报**。
-            # 不上报的话，"AI 认错了人"会以"预览里少一行"的形式无声通过，而
-            # preview-then-accept 的全部意义就是让人拿最后一道关。
-            cleaned, dropped = validate_state_ids(payload, roster)
-            if dropped and not reported:
-                yield sse_event("id_validation", {"dropped": dropped})
-                reported = True
-            if preview_payload is None:
-                preview_payload = await state_preview_store.create(
-                    req.novel_id,
-                    req.chapter_id,
-                    cleaned,
-                    snapshot=generation_snapshot,
+        generation_audit: dict = {}
+        try:
+            async for frame in run_workflow(
+                workflow_name=STATE_WORKFLOW,
+                steps=CHAPTER_STATE_STEPS,
+                prompts=_load_prompts().get(CHAPTER_STATE_PROMPT_NAME, {}),
+                params=params,
+                gen_kwargs=build_gen_kwargs(req),
+                cached={},
+                deps=deps,
+                request_id=uuid4().hex[:8],
+                is_disconnected=request.is_disconnected,
+                log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
+            ):
+                parsed = parse_sse_event(frame)
+                if parsed is not None:
+                    _event_name, event_data = parsed
+                    usage = event_data.get("usage") or event_data.get("usage_so_far")
+                    if isinstance(usage, dict):
+                        generation_audit["usage"] = usage
+                payload = _extract_chapter_state(parsed)
+                if payload is None:
+                    yield frame
+                    continue
+                # AI 返回的每个 id 必须在 roster 内，不在则剔除并**明确上报**。
+                cleaned, dropped = validate_state_ids(payload, roster)
+                if dropped and not reported:
+                    yield sse_event("id_validation", {"dropped": dropped})
+                    reported = True
+                if preview_payload is None:
+                    preview_payload = await state_preview_store.publish(
+                        generation_lease,
+                        cleaned,
+                        audit=generation_audit,
+                    )
+                yield _replace_chapter_state(parsed, preview_payload)
+            if generation_audit:
+                await state_preview_store.record_generation_audit(
+                    generation_lease, generation_audit
                 )
-            yield _replace_chapter_state(parsed, preview_payload)
+            if preview_payload is None:
+                await state_preview_store.mark_failed(
+                    generation_lease,
+                    RuntimeError("State workflow ended without a proposal candidate"),
+                    audit=generation_audit,
+                )
+        except BaseException as exc:
+            await state_preview_store.mark_failed(
+                generation_lease, exc, audit=generation_audit
+            )
+            raise
 
     return StreamingResponse(
         event_stream(),
@@ -255,9 +300,9 @@ async def accept_chapter_state(req: AcceptChapterStateRequest):
         if req.preview_id or req.acceptance_token:
             if not req.preview_id or not req.acceptance_token:
                 raise StaleStatePreview("preview_id and acceptance_token are both required")
-            payload, preview_meta = await state_preview_store.consume(
+            return await state_preview_store.accept(
                 chapter_id=req.chapter_id,
-                preview_id=req.preview_id,
+                proposal_id=req.preview_id,
                 acceptance_token=req.acceptance_token,
                 selected_fact_ids=req.selected_fact_ids,
                 selected_thread_ids=req.selected_thread_ids,
@@ -282,6 +327,8 @@ async def accept_chapter_state(req: AcceptChapterStateRequest):
     except InvalidIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except StaleStatePreview as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except MutationConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

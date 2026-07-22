@@ -395,6 +395,7 @@ async def init_state_timeline_indexes():
         await db[collections.STATE_PREVIEWS].create_indexes([
             pymongo.IndexModel([("expires_at", 1)], expireAfterSeconds=0),
             pymongo.IndexModel([("novel_id", 1), ("chapter_id", 1)]),
+            pymongo.IndexModel([("status", 1), ("updated_at", 1)]),
         ])
         await db[collections.MUTATION_JOURNALS].create_indexes([
             pymongo.IndexModel(

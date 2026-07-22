@@ -3,25 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
-import json
 import time
 from copy import deepcopy
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from bson import ObjectId
-from pymongo import ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
 
-from backend.config.config import CONFIG_PATH
-from backend.config.lifecycle import FileSecretVersionStore
 from backend.db import collections
 from backend.db.mongo import get_database
-from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.character_state_repository import character_state_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
@@ -29,256 +19,17 @@ from backend.db.repositories.volume_repository import volume_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.db.transaction import run_mongo_write_unit
 from backend.services.novel.chapter_timeline import ChapterTimeline
-
-
-PREVIEW_TTL_SECONDS = 15 * 60
-
-
-class StaleStatePreview(ValueError):
-    """状态候选过期、重复使用，或绑定的正文/状态已变化。"""
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, (ObjectId, datetime)):
-        return str(value)
-    return value
-
-
-def _digest(value: Any) -> str:
-    encoded = json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _preview_key() -> bytes:
-    store = FileSecretVersionStore(
-        Path(CONFIG_PATH).with_name(".config-secret-versions.json")
-    )
-    return store.derive_key("chapter-state-preview")
-
-
-def _content_digest(chapter: dict[str, Any]) -> str:
-    return _digest({
-        "chapter_id": str(chapter.get("_id")),
-        "content": str(chapter.get("content") or ""),
-        "updated_at": chapter.get("updated_at"),
-    })
-
-
-@dataclass(frozen=True)
-class StateGenerationSnapshot:
-    novel_id: str
-    chapter_id: str
-    content_digest: str
-    narrative_revision: int
-    captured_at: datetime
-
-
-def add_selection_ids(candidate: dict[str, Any]) -> dict[str, Any]:
-    result = deepcopy(candidate)
-    for character in result.get("character_updates") or []:
-        character["selection_id"] = uuid4().hex
-        for fact in character.get("new_permanent_facts") or []:
-            fact["selection_id"] = uuid4().hex
-    for thread in result.get("thread_updates") or []:
-        thread["selection_id"] = uuid4().hex
-    return result
-
-
-class StatePreviewStore:
-    @property
-    def collection(self):
-        return get_database()[collections.STATE_PREVIEWS]
-
-    async def capture(
-        self,
-        novel_id: str,
-        chapter_id: str,
-        *,
-        chapter: dict[str, Any] | None = None,
-    ) -> StateGenerationSnapshot:
-        captured_chapter = chapter or await chapter_repo.get_chapter_by_id(chapter_id)
-        if str(captured_chapter.get("novel_id")) != str(novel_id):
-            raise ValueError("Chapter does not belong to novel")
-        return StateGenerationSnapshot(
-            novel_id=str(novel_id),
-            chapter_id=str(chapter_id),
-            content_digest=_content_digest(captured_chapter),
-            narrative_revision=await narrative_revision_store.current(novel_id),
-            captured_at=get_utc_now(),
-        )
-
-    async def ensure_current(self, snapshot: StateGenerationSnapshot) -> None:
-        chapter = await chapter_repo.get_chapter_by_id(snapshot.chapter_id)
-        if _content_digest(chapter) != snapshot.content_digest:
-            raise StaleStatePreview("Chapter content changed during state generation")
-        if (
-            await narrative_revision_store.current(snapshot.novel_id)
-            != snapshot.narrative_revision
-        ):
-            raise StaleStatePreview(
-                "Narrative state changed during generation"
-            )
-
-    async def create(
-        self,
-        novel_id: str,
-        chapter_id: str,
-        candidate: dict[str, Any],
-        *,
-        snapshot: StateGenerationSnapshot | None = None,
-    ) -> dict[str, Any]:
-        active_snapshot = snapshot or await self.capture(novel_id, chapter_id)
-        if (
-            active_snapshot.novel_id != str(novel_id)
-            or active_snapshot.chapter_id != str(chapter_id)
-        ):
-            raise ValueError("Generation snapshot belongs to another chapter")
-        await self.ensure_current(active_snapshot)
-        prepared = add_selection_ids(candidate)
-        preview_id = ObjectId()
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=PREVIEW_TTL_SECONDS)
-        content_digest = active_snapshot.content_digest
-        state_revision = active_snapshot.narrative_revision
-        candidate_digest = _digest(prepared)
-        token_payload = f"{preview_id}:{content_digest}:{state_revision}:{candidate_digest}:{int(expires_at.timestamp())}"
-        token = hmac.new(_preview_key(), token_payload.encode("utf-8"), hashlib.sha256).hexdigest()
-        await self.collection.insert_one({
-            "_id": preview_id,
-            "novel_id": to_object_id(novel_id),
-            "chapter_id": to_object_id(chapter_id),
-            "candidate": prepared,
-            "content_digest": content_digest,
-            "state_revision": state_revision,
-            "narrative_revision": state_revision,
-            "generation_captured_at": active_snapshot.captured_at,
-            "candidate_digest": candidate_digest,
-            "token_digest": hashlib.sha256(token.encode("ascii")).hexdigest(),
-            "expires_at": expires_at,
-            "used_at": None,
-            "created_at": get_utc_now(),
-            "is_deleted": False,
-        })
-        return {
-            **prepared,
-            "preview_id": str(preview_id),
-            "acceptance_token": token,
-            "preview_expires_at": expires_at.isoformat(),
-        }
-
-    async def consume(
-        self,
-        *,
-        chapter_id: str,
-        preview_id: str,
-        acceptance_token: str,
-        selected_fact_ids: list[str],
-        selected_thread_ids: list[str],
-        edits: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        preview = await self.collection.find_one({"_id": to_object_id(preview_id)})
-        if not preview or preview.get("used_at") is not None:
-            raise StaleStatePreview("State preview is missing or has already been accepted")
-        now = datetime.now(timezone.utc)
-        expires_at = preview.get("expires_at")
-        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not isinstance(expires_at, datetime) or expires_at <= now:
-            raise StaleStatePreview("State preview has expired")
-        if str(preview.get("chapter_id")) != str(chapter_id):
-            raise StaleStatePreview("State preview belongs to another chapter")
-        expected = hashlib.sha256(acceptance_token.encode("ascii")).hexdigest()
-        if not hmac.compare_digest(expected, str(preview.get("token_digest") or "")):
-            raise StaleStatePreview("State preview token is invalid")
-        chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-        if _content_digest(chapter) != preview.get("content_digest"):
-            raise StaleStatePreview("Chapter content changed after state generation")
-        novel_id = str(preview["novel_id"])
-        stored_revision = preview.get(
-            "narrative_revision", preview.get("state_revision")
-        )
-        if await narrative_revision_store.current(novel_id) != stored_revision:
-            raise StaleStatePreview("Narrative state changed after state generation")
-
-        candidate = deepcopy(preview["candidate"])
-        facts_by_id = {
-            fact["selection_id"]: (character, fact)
-            for character in candidate.get("character_updates") or []
-            for fact in character.get("new_permanent_facts") or []
-        }
-        threads_by_id = {
-            thread["selection_id"]: thread
-            for thread in candidate.get("thread_updates") or []
-        }
-        if not set(selected_fact_ids).issubset(facts_by_id):
-            raise StaleStatePreview("Unknown permanent-fact selection id")
-        if not set(selected_thread_ids).issubset(threads_by_id):
-            raise StaleStatePreview("Unknown plot-thread selection id")
-
-        allowed_edits = edits or {}
-        unknown_edits = set(allowed_edits) - {"summary", "current_states"}
-        if unknown_edits:
-            raise StaleStatePreview(f"Unsupported preview edits: {sorted(unknown_edits)}")
-        current_state_edits = allowed_edits.get("current_states") or {}
-        payload = {
-            "summary": str(allowed_edits.get("summary", candidate.get("summary") or "")),
-            "character_updates": [],
-            "accepted_thread_updates": [],
-        }
-        for character in candidate.get("character_updates") or []:
-            card_id = str(character["card_id"])
-            selected = [
-                {key: value for key, value in fact.items() if key != "selection_id"}
-                for fact in character.get("new_permanent_facts") or []
-                if fact["selection_id"] in selected_fact_ids
-            ]
-            payload["character_updates"].append({
-                "card_id": card_id,
-                "current_state": str(current_state_edits.get(card_id, character.get("current_state") or "")),
-                "accepted_permanent_facts": selected,
-            })
-        payload["accepted_thread_updates"] = [
-            {"thread_id": str(thread["thread_id"]), "status": thread["status"]}
-            for thread in candidate.get("thread_updates") or []
-            if thread["selection_id"] in selected_thread_ids
-        ]
-        consumed = await self.collection.find_one_and_update(
-            {"_id": preview["_id"], "used_at": None},
-            {"$set": {"used_at": now}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if consumed is None:
-            raise StaleStatePreview("State preview was accepted concurrently")
-        return payload, {
-            "novel_id": novel_id,
-            "manual_edits": allowed_edits,
-            "preview_id": preview_id,
-            "candidate_digest": preview.get("candidate_digest"),
-            "evidence": [
-                {
-                    "selection_id": thread.get("selection_id"),
-                    "thread_id": str(thread.get("thread_id")),
-                    "evidence": str(thread.get("evidence") or ""),
-                    "selected": thread.get("selection_id") in selected_thread_ids,
-                }
-                for thread in candidate.get("thread_updates") or []
-            ],
-            "consistency_issues": deepcopy(candidate.get("consistency_issues") or []),
-            "human_feedback": {
-                "selected_fact_count": len(selected_fact_ids),
-                "rejected_fact_count": max(0, len(facts_by_id) - len(selected_fact_ids)),
-                "selected_thread_count": len(selected_thread_ids),
-                "rejected_thread_count": max(0, len(threads_by_id) - len(selected_thread_ids)),
-                "edited_fields": sorted(allowed_edits),
-            },
-            "confidence": "human_reviewed",
-        }
-
-
-state_preview_store = StatePreviewStore()
+from backend.services.novel.state_proposal import (
+    StaleStatePreview,
+    StateGenerationSnapshot,
+    StateProposalLease,
+    StateProposalModule,
+    _content_digest,
+    _digest,
+    add_selection_ids,
+    state_preview_store,
+    state_proposal_module,
+)
 
 
 async def record_acceptance(
