@@ -41,6 +41,7 @@ class PlotThreadService:
             )
             effective = command.get("effective_chapter_id")
             if effective:
+                await mutation.advance_phase("timeline_writes")
                 await record_plot_thread_event(
                     novel_id,
                     str(effective),
@@ -87,6 +88,7 @@ class PlotThreadService:
             )
             effective = command.get("effective_chapter_id")
             if effective:
+                await mutation.advance_phase("timeline_writes")
                 await record_manual_correction(
                     novel_id,
                     str(effective),
@@ -156,6 +158,7 @@ class PlotThreadService:
                 )
             effective = command.get("effective_chapter_id")
             if effective:
+                await mutation.advance_phase("timeline_writes")
                 await record_plot_thread_event(
                     novel_id,
                     str(effective),

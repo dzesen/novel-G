@@ -37,6 +37,7 @@ class VolumeService:
     @staticmethod
     async def _refresh_v2_stats(session, mutation) -> bool:
         version = int(mutation.journal.get("command", {}).get("version") or 1)
+        await mutation.advance_phase("derived_data")
         if version < 2:
             return False
         novel_id = str(mutation.journal["novel_id"])
@@ -188,6 +189,7 @@ class VolumeService:
                 completed_volumes += 1
                 completed_chapters += len(chapter_docs)
                 if int(mutation.journal["command"].get("version") or 1) >= 2:
+                    await mutation.advance_phase("derived_data")
                     partial_stats = await derived_stats.refresh(
                         novel_id, session=session
                     )
@@ -380,6 +382,7 @@ class VolumeService:
         await mutation.receipt("volume", {"volume_id": volume_id})
         stale_from = command.get("stale_from_chapter_id")
         if stale_from:
+            await mutation.advance_phase("timeline_writes")
             await mark_from_chapter_stale(
                 novel_id, str(stale_from), session=session
             )
@@ -395,6 +398,7 @@ class VolumeService:
         novel_id = str(mutation.journal["novel_id"])
         chapter_ids = [str(item) for item in command["chapter_ids"]]
         if chapter_ids and not mutation.was_received("stale"):
+            await mutation.advance_phase("timeline_writes")
             await mark_downstream_stale(novel_id, chapter_ids[0], session=session)
             await mutation.receipt("stale", {"chapter_id": chapter_ids[0]})
 
@@ -493,6 +497,14 @@ class VolumeService:
         )
         await mutation.receipt("chapters", {"chapter_ids": command["chapter_ids"]})
 
+        if command["chapter_ids"]:
+            await mutation.advance_phase("timeline_writes")
+            await mark_downstream_stale(
+                novel_id, str(command["chapter_ids"][0]), session=session
+            )
+            await mutation.receipt(
+                "stale", {"chapter_id": str(command["chapter_ids"][0])}
+            )
         if not await VolumeService._refresh_v2_stats(session, mutation):
             current_novel = await novel_repo.get_novel_by_id(novel_id, session=session)
             target = command["novel_stats_after"]
@@ -506,13 +518,6 @@ class VolumeService:
                     novel_id, deltas, session=session
                 )
             await mutation.receipt("novel_stats", target)
-        if command["chapter_ids"]:
-            await mark_downstream_stale(
-                novel_id, str(command["chapter_ids"][0]), session=session
-            )
-            await mutation.receipt(
-                "stale", {"chapter_id": str(command["chapter_ids"][0])}
-            )
         return {"volume_id": volume_id, "restored": True}
 
     @staticmethod
@@ -556,6 +561,8 @@ class VolumeService:
         command = mutation.journal["command"]["payload"]
         volume_id = str(command["volume_id"])
         obj_id = to_object_id(volume_id)
+        if command["chapters"]:
+            await mutation.advance_phase("timeline_writes")
         for index, chapter in enumerate(command["chapters"]):
             receipt_key = f"tombstone_{index}"
             if mutation.was_received(receipt_key):

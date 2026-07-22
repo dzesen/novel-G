@@ -61,12 +61,16 @@ async def lifespan(app: FastAPI):
     # Initialize DB Indexes
     await init_all_indexes()
     recovery = await recover_pending_mutations()
-    if recovery["recovered"] or recovery["failed"] or recovery["unsupported"]:
+    if any(recovery.values()):
         logger.info(
-            "Mutation recovery: recovered=%d failed=%d unsupported=%d",
+            "Mutation recovery: recovered=%d failed=%d unsupported=%d "
+            "deferred=%d quarantined=%d conflicts=%d",
             len(recovery["recovered"]),
             len(recovery["failed"]),
             len(recovery["unsupported"]),
+            len(recovery["deferred"]),
+            len(recovery["quarantined"]),
+            len(recovery["conflicts"]),
         )
     await create_automatic_backup_if_due()
     interrupted = await mark_running_jobs_interrupted()

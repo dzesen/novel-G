@@ -22,6 +22,14 @@ MutationCallback = Callable[[Any, "MutationRecorder"], Awaitable[T]]
 _LOCKS: dict[str, asyncio.Lock] = {}
 _NOVEL_LOCKS: dict[str, asyncio.Lock] = {}
 logger = logging.getLogger(__name__)
+MUTATION_PHASES = (
+    "intent",
+    "primary_writes",
+    "timeline_writes",
+    "derived_data",
+    "complete",
+)
+_PHASE_RANK = {phase: index for index, phase in enumerate(MUTATION_PHASES)}
 
 
 class MutationConflictError(RuntimeError):
@@ -63,21 +71,47 @@ class MutationCommand:
     child_ids: dict[str, str] = field(default_factory=dict)
     version: int = 1
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.novel_id, str) or not self.novel_id.strip():
+            raise ValueError("novel_id must be a non-empty string")
+        if not isinstance(self.idempotency_key, str) or not self.idempotency_key.strip():
+            raise ValueError("idempotency_key must be a non-empty string")
+        if not isinstance(self.operation, str) or not self.operation.strip():
+            raise ValueError("operation must be a non-empty string")
+        if (
+            not isinstance(self.version, int)
+            or isinstance(self.version, bool)
+            or self.version < 1
+        ):
+            raise ValueError("version must be a positive integer")
+        if not isinstance(self.payload, dict):
+            raise TypeError("payload must be a dictionary")
+        if self.before_image is not None and not isinstance(self.before_image, dict):
+            raise TypeError("before_image must be a dictionary or None")
+        if not isinstance(self.child_ids, dict):
+            raise TypeError("child_ids must be a dictionary")
+
     @classmethod
     def from_journal(cls, journal: dict[str, Any]) -> "MutationCommand":
         """从持久化 intent 重建命令，供进程重启后的确定性恢复使用。"""
         stored = journal.get("command") or {}
+        raw_child_ids = stored.get("child_ids", {})
+        child_ids = (
+            {
+                str(key): str(value)
+                for key, value in raw_child_ids.items()
+            }
+            if isinstance(raw_child_ids, dict)
+            else raw_child_ids
+        )
         return cls(
             novel_id=str(journal["novel_id"]),
             idempotency_key=str(journal["idempotency_key"]),
             operation=str(journal["operation"]),
-            payload=deepcopy(stored.get("payload") or {}),
+            payload=deepcopy(stored.get("payload", {})),
             before_image=deepcopy(stored.get("before_image")),
-            child_ids={
-                str(key): str(value)
-                for key, value in (stored.get("child_ids") or {}).items()
-            },
-            version=int(stored.get("version") or 1),
+            child_ids=child_ids,
+            version=stored.get("version", 1),
         )
 
     def digest(self) -> str:
@@ -131,6 +165,21 @@ class MutationRecorder:
     def was_received(self, key: str) -> bool:
         return key in (self.journal.get("receipts") or {})
 
+    async def advance_phase(self, phase: str) -> None:
+        if phase not in _PHASE_RANK:
+            raise ValueError(f"Unknown mutation phase: {phase}")
+        current = str(self.journal.get("phase") or "intent")
+        if current not in _PHASE_RANK:
+            raise ValueError(f"Unknown persisted mutation phase: {current}")
+        if _PHASE_RANK[phase] <= _PHASE_RANK[current]:
+            return
+        await get_database()[collections.MUTATION_JOURNALS].update_one(
+            {"_id": self.journal["_id"]},
+            {"$set": {"phase": phase, "updated_at": get_utc_now()}},
+            session=self.session,
+        )
+        self.journal["phase"] = phase
+
     async def receipt(self, key: str, value: Any) -> None:
         if self.was_received(key):
             return
@@ -181,7 +230,28 @@ class MutationEngine:
 
         for journal in await list_recoverable_mutations(novel_id):
             journal_id = str(journal["_id"])
-            command = MutationCommand.from_journal(journal)
+            try:
+                command = MutationCommand.from_journal(journal)
+            except (KeyError, TypeError, ValueError) as exc:
+                stored_command = journal.get("command") or {}
+                item = {
+                    "journal_id": journal_id,
+                    "operation": str(journal.get("operation") or ""),
+                    "version": stored_command.get("version"),
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                await collection.update_one(
+                    {"_id": journal["_id"]},
+                    {"$set": {
+                        "status": "quarantined",
+                        "last_recovery_error": item,
+                        "quarantined_at": self._now(),
+                        "updated_at": self._now(),
+                    }},
+                )
+                quarantined.append(item)
+                continue
             if (command.operation, command.version) not in self._handlers:
                 item = {
                     "journal_id": journal_id,
@@ -326,6 +396,7 @@ async def _commit_mutation(command: MutationCommand, callback: MutationCallback[
                     },
                     "receipts": {},
                     "status": "intent",
+                    "phase": "intent",
                     "created_at": now,
                     "updated_at": now,
                     "is_deleted": False,
@@ -359,11 +430,14 @@ async def _commit_mutation(command: MutationCommand, callback: MutationCallback[
                 {"$set": {"status": "running", "updated_at": get_utc_now()}},
                 session=session,
             )
-            result = await callback(session, MutationRecorder(journal, session))
+            recorder = MutationRecorder(journal, session)
+            await recorder.advance_phase("primary_writes")
+            result = await callback(session, recorder)
             await collection.update_one(
                 {"_id": journal["_id"]},
                 {"$set": {
                     "status": "completed",
+                    "phase": "complete",
                     "result": deepcopy(result),
                     "updated_at": get_utc_now(),
                 }},
@@ -397,6 +471,7 @@ async def _commit_mutation(command: MutationCommand, callback: MutationCallback[
                             "child_ids": deepcopy(command.child_ids),
                         },
                         "receipts": {},
+                        "phase": "intent",
                         "created_at": get_utc_now(),
                         "is_deleted": False,
                     }},

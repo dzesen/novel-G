@@ -59,6 +59,7 @@ class ChapterService:
     @staticmethod
     async def _refresh_v2_stats(session, mutation) -> bool:
         version = int(mutation.journal.get("command", {}).get("version") or 1)
+        await mutation.advance_phase("derived_data")
         if version < 2:
             return False
         novel_id = str(mutation.journal["novel_id"])
@@ -236,6 +237,10 @@ class ChapterService:
             chapter_id, command["update"], session=session
         )
         await mutation.receipt("chapter", {"chapter_id": chapter_id})
+        if command.get("mark_stale"):
+            await mutation.advance_phase("timeline_writes")
+            await mark_downstream_stale(novel_id, chapter_id, session=session)
+            await mutation.receipt("stale", {"chapter_id": chapter_id})
         if not await ChapterService._refresh_v2_stats(session, mutation):
             await volume_repo.update_one(
                 {"_id": to_object_id(command["volume_id"])},
@@ -255,9 +260,6 @@ class ChapterService:
                     novel_id, deltas, session=session
                 )
             await mutation.receipt("novel_stats", target)
-        if command.get("mark_stale"):
-            await mark_downstream_stale(novel_id, chapter_id, session=session)
-            await mutation.receipt("stale", {"chapter_id": chapter_id})
         return {"chapter_id": chapter_id, "updated": True}
 
     @staticmethod
@@ -270,6 +272,7 @@ class ChapterService:
         payload = command["outline"]
         previous_thread_ids = [str(item) for item in command["previous_thread_ids"]]
         created_thread_ids: List[str] = []
+        await mutation.advance_phase("timeline_writes")
         try:
             for index, thread in enumerate(payload["new_threads"]):
                 child_key = f"thread_{index}"
@@ -541,6 +544,7 @@ class ChapterService:
             chapter_id, {"outline": command["outline"]}, session=session
         )
         await mutation.receipt("outline", {"chapter_id": chapter_id})
+        await mutation.advance_phase("timeline_writes")
         await mark_downstream_stale(novel_id, chapter_id, session=session)
         await mutation.receipt("stale", {"chapter_id": chapter_id})
         return await chapter_repo.get_chapter_by_id(chapter_id, session=session)
@@ -552,6 +556,7 @@ class ChapterService:
         chapter_id = str(command["chapter_id"])
         novel_id = str(mutation.journal["novel_id"])
         if not mutation.was_received("stale"):
+            await mutation.advance_phase("timeline_writes")
             await mark_downstream_stale(
                 novel_id, chapter_id, session=session
             )
@@ -611,6 +616,9 @@ class ChapterService:
         if stored.get("is_deleted"):
             await chapter_repo.restore_chapter(chapter_id, session=session)
         await mutation.receipt("chapter", {"chapter_id": chapter_id})
+        await mutation.advance_phase("timeline_writes")
+        await mark_downstream_stale(novel_id, chapter_id, session=session)
+        await mutation.receipt("stale", {"chapter_id": chapter_id})
         if not await ChapterService._refresh_v2_stats(session, mutation):
             await volume_repo.update_one(
                 {"_id": to_object_id(chapter["volume_id"])},
@@ -624,8 +632,6 @@ class ChapterService:
                 session=session,
             )
             await mutation.receipt("novel_stats", command["novel_stats_after"])
-        await mark_downstream_stale(novel_id, chapter_id, session=session)
-        await mutation.receipt("stale", {"chapter_id": chapter_id})
         return {"chapter_id": chapter_id, "restored": True}
 
     @staticmethod
@@ -658,6 +664,7 @@ class ChapterService:
         chapter = command["chapter"]
         chapter_id = str(command["chapter_id"])
         if not mutation.was_received("tombstone"):
+            await mutation.advance_phase("timeline_writes")
             await record_chapter_tombstone(chapter, session=session)
             await mutation.receipt("tombstone", {"chapter_id": chapter_id})
         stored = await chapter_repo.find_one(

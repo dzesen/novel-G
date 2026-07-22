@@ -109,6 +109,7 @@ class ChapterStateService:
                         **update,
                         "accepted_permanent_facts": facts,
                     })
+                await mutation.advance_phase("timeline_writes")
                 timeline_revision = await record_acceptance(
                     novel_id,
                     chapter_id,

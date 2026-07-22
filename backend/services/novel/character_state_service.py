@@ -45,6 +45,7 @@ class CharacterStateService:
             as_of_chapter_id=str(command["effective_chapter_id"]),
         )
         await mutation.receipt("state", {"card_id": str(command["card_id"])})
+        await mutation.advance_phase("timeline_writes")
         await record_manual_correction(
             novel_id,
             str(command["effective_chapter_id"]),
@@ -109,6 +110,7 @@ class CharacterStateService:
             session=session,
         )
         await mutation.receipt("fact", {"fact_id": str(command["fact_id"])})
+        await mutation.advance_phase("timeline_writes")
         await record_manual_correction(
             novel_id,
             str(command["effective_chapter_id"]),
@@ -186,6 +188,7 @@ class CharacterStateService:
                 session=session,
             )
         await mutation.receipt("fact", {"fact_id": str(command["fact_id"])})
+        await mutation.advance_phase("timeline_writes")
         await record_manual_correction(
             novel_id,
             str(command["effective_chapter_id"]),
