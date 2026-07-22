@@ -23,7 +23,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import to_object_id
 from backend.llm.config import get_llm_config, get_provider_config
 from backend.llm.prompts.prompt_selector import CHAPTER_STATE_PROMPT_NAME, load_prompt_config
-from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema, ChapterStateResultSchema
+from backend.llm.schemas.novel_pydantic import ChapterStateResultSchema
 from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_context,
@@ -41,11 +41,10 @@ from backend.services.llm.generation_runtime import create_workflow_runtime
 from backend.services.llm.workflow_service import (
     resolve_provider_for_step,
 )
-from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.state_validation import validate_state_ids
-from backend.services.novel.state_timeline import (
+from backend.services.novel.state_proposal import (
     StaleStatePreview,
-    state_preview_store,
+    state_proposal_module,
 )
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -128,14 +127,14 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             raise HTTPException(
                 status_code=400, detail="本章还没有已保存的正文，请先写好并保存正文"
             )
-        generation_snapshot = await state_preview_store.capture(
+        generation_snapshot = await state_proposal_module.capture(
             req.novel_id,
             req.chapter_id,
             chapter=chapter,
         )
         provider_alias = resolve_provider_for_step(STATE_WORKFLOW, STATE_STEP)
         provider_config = get_provider_config(provider_alias)
-        generation_lease = await state_preview_store.begin(
+        generation_lease = await state_proposal_module.begin(
             req.novel_id,
             req.chapter_id,
             snapshot=generation_snapshot,
@@ -164,27 +163,27 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
                     "请精简上下文或选择更大窗口的模型。"
                 ),
             )
-        await state_preview_store.ensure_current(generation_snapshot)
+        await state_proposal_module.ensure_current(generation_snapshot)
     except HTTPException as exc:
         if generation_lease is not None:
-            await state_preview_store.mark_failed(generation_lease, exc)
+            await state_proposal_module.mark_failed(generation_lease, exc)
         # 故意抛出的 400 必须先于下面的宽泛 handler，否则会被降级成别的码。
         raise
     except NotFoundError as exc:
         if generation_lease is not None:
-            await state_preview_store.mark_failed(generation_lease, exc)
+            await state_proposal_module.mark_failed(generation_lease, exc)
         raise HTTPException(status_code=404, detail=str(exc))
     except InvalidIdError as exc:
         if generation_lease is not None:
-            await state_preview_store.mark_failed(generation_lease, exc)
+            await state_proposal_module.mark_failed(generation_lease, exc)
         raise HTTPException(status_code=400, detail=str(exc))
     except ContextBudgetError as exc:
         if generation_lease is not None:
-            await state_preview_store.mark_failed(generation_lease, exc)
+            await state_proposal_module.mark_failed(generation_lease, exc)
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         if generation_lease is not None:
-            await state_preview_store.mark_failed(generation_lease, exc)
+            await state_proposal_module.mark_failed(generation_lease, exc)
         raise
 
     params = {
@@ -243,24 +242,24 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
                     yield sse_event("id_validation", {"dropped": dropped})
                     reported = True
                 if preview_payload is None:
-                    preview_payload = await state_preview_store.publish(
+                    preview_payload = await state_proposal_module.publish(
                         generation_lease,
                         cleaned,
                         audit=generation_audit,
                     )
                 yield _replace_chapter_state(parsed, preview_payload)
             if generation_audit:
-                await state_preview_store.record_generation_audit(
+                await state_proposal_module.record_generation_audit(
                     generation_lease, generation_audit
                 )
             if preview_payload is None:
-                await state_preview_store.mark_failed(
+                await state_proposal_module.mark_failed(
                     generation_lease,
                     RuntimeError("State workflow ended without a proposal candidate"),
                     audit=generation_audit,
                 )
         except BaseException as exc:
-            await state_preview_store.mark_failed(
+            await state_proposal_module.mark_failed(
                 generation_lease, exc, audit=generation_audit
             )
             raise
@@ -282,45 +281,24 @@ class AcceptChapterStateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chapter_id: str = Field(..., min_length=1)
-    preview_id: str | None = None
-    acceptance_token: str | None = None
+    proposal_id: str = Field(..., min_length=1)
+    acceptance_token: str = Field(..., min_length=1)
     selected_fact_ids: list[str] = Field(default_factory=list)
     selected_thread_ids: list[str] = Field(default_factory=list)
     edits: dict = Field(default_factory=dict)
-    # 旧客户端兼容输入；新 UI 只发送 preview + selection IDs。
-    summary: str | None = None
-    character_updates: list[dict] = Field(default_factory=list)
-    accepted_thread_updates: list[dict] = Field(default_factory=list)
 
 
 @router.post("/accept-chapter-state")
 async def accept_chapter_state(req: AcceptChapterStateRequest):
     """接受状态回填：写章摘要、回填人物状态、推进伏笔状态。"""
     try:
-        if req.preview_id or req.acceptance_token:
-            if not req.preview_id or not req.acceptance_token:
-                raise StaleStatePreview("preview_id and acceptance_token are both required")
-            return await state_preview_store.accept(
-                chapter_id=req.chapter_id,
-                proposal_id=req.preview_id,
-                acceptance_token=req.acceptance_token,
-                selected_fact_ids=req.selected_fact_ids,
-                selected_thread_ids=req.selected_thread_ids,
-                edits=req.edits,
-            )
-        else:
-            if req.summary is None:
-                raise ValueError("summary is required for legacy state acceptance")
-            payload = {
-                "summary": req.summary,
-                "character_updates": req.character_updates,
-                "accepted_thread_updates": req.accepted_thread_updates,
-            }
-            preview_meta = {"source": "legacy_accept", "confidence": "unrated"}
-        return await ChapterStateService.accept_chapter_state(
-            req.chapter_id,
-            payload,
-            acceptance_metadata=preview_meta,
+        return await state_proposal_module.accept(
+            chapter_id=req.chapter_id,
+            proposal_id=req.proposal_id,
+            acceptance_token=req.acceptance_token,
+            selected_fact_ids=req.selected_fact_ids,
+            selected_thread_ids=req.selected_thread_ids,
+            edits=req.edits,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

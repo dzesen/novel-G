@@ -41,30 +41,6 @@ def order_book_chapters(chapters: List[Dict[str, Any]],
     return sorted(chapters, key=_key)
 
 
-def result_to_accept_state(result: Dict[str, Any]) -> Dict[str, Any]:
-    """ChapterStateResultSchema dump → ChapterStateAcceptSchema dump（自动接受全部）。
-
-    设计 §5：批量即时提交全部——new_permanent_facts 全进 accepted_permanent_facts，
-    thread_updates 全进 accepted_thread_updates（去掉只给人看的 evidence）。
-    consistency_issues 不进 accept（不入库），由引擎另取。
-    """
-    return {
-        "summary": result["summary"],
-        "character_updates": [
-            {
-                "card_id": cu["card_id"],
-                "current_state": cu.get("current_state", ""),
-                "accepted_permanent_facts": [dict(f) for f in cu.get("new_permanent_facts", [])],
-            }
-            for cu in result.get("character_updates", [])
-        ],
-        "accepted_thread_updates": [
-            {"thread_id": tu["thread_id"], "status": tu["status"]}
-            for tu in result.get("thread_updates", [])
-        ],
-    }
-
-
 def should_checkpoint(progress_len: int, last_checkpoint_index: int, interval: int) -> bool:
     """距上次检查点已满 interval 章。任何 resume 会把 last_checkpoint_index 推进到当前
     progress 长度（设计 §7），故此处只需判增量。"""

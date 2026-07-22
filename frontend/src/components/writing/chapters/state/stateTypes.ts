@@ -42,9 +42,9 @@ export interface ChapterStateResult {
   character_updates: CharacterStateUpdate[];
   thread_updates: ThreadStatusUpdate[];
   consistency_issues: ConsistencyIssue[];
-  preview_id?: string;
+  proposal_id?: string;
   acceptance_token?: string;
-  preview_expires_at?: string;
+  proposal_expires_at?: string;
 }
 
 /** accept 端点的返回。skipped_duplicate_facts 必须显示——去重不得静默（设计 §5.3）。 */

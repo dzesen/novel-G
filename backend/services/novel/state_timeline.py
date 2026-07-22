@@ -20,15 +20,8 @@ from backend.db.utils import get_utc_now, to_object_id
 from backend.db.transaction import run_mongo_write_unit
 from backend.services.novel.chapter_timeline import ChapterTimeline
 from backend.services.novel.state_proposal import (
-    StaleStatePreview,
-    StateGenerationSnapshot,
-    StateProposalLease,
-    StateProposalModule,
     _content_digest,
     _digest,
-    add_selection_ids,
-    state_preview_store,
-    state_proposal_module,
 )
 
 

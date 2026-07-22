@@ -92,6 +92,26 @@ class StateProposalLease:
     snapshot: StateGenerationSnapshot
 
 
+@dataclass(frozen=True)
+class SelectAllPolicy:
+    """Deterministic headless policy that accepts every selectable candidate."""
+
+    name: str = "select_all"
+    version: str = "1"
+
+    def decide(self, proposal: dict[str, Any]) -> tuple[list[str], list[str]]:
+        fact_ids = [
+            str(fact["selection_id"])
+            for character in proposal.get("character_updates") or []
+            for fact in character.get("new_permanent_facts") or []
+        ]
+        thread_ids = [
+            str(thread["selection_id"])
+            for thread in proposal.get("thread_updates") or []
+        ]
+        return fact_ids, thread_ids
+
+
 def add_selection_ids(candidate: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(candidate)
     for character in result.get("character_updates") or []:
@@ -246,10 +266,8 @@ class StateProposalModule:
         return {
             **prepared,
             "proposal_id": str(lease.proposal_id),
-            "preview_id": str(lease.proposal_id),
             "acceptance_token": token,
             "proposal_expires_at": expires_at.isoformat(),
-            "preview_expires_at": expires_at.isoformat(),
         }
 
     async def mark_failed(
@@ -438,7 +456,6 @@ class StateProposalModule:
             "novel_id": novel_id,
             "manual_edits": allowed_edits,
             "proposal_id": proposal_id,
-            "preview_id": proposal_id,
             "candidate_digest": proposal.get("candidate_digest"),
             "decision_policy": policy,
             "evidence": [
@@ -523,9 +540,7 @@ class StateProposalModule:
         proposal = await self.collection.find_one(
             {"_id": to_object_id(proposal_id)}
         )
-        if proposal and proposal.get("status") == "applied":
-            return deepcopy(proposal.get("accept_result") or {})
-        if proposal and proposal.get("status") == "claimed":
+        if proposal and proposal.get("status") in {"claimed", "applied"}:
             journal = await get_database()[collections.MUTATION_JOURNALS].find_one(
                 {
                     "novel_id": proposal["novel_id"],
@@ -536,15 +551,42 @@ class StateProposalModule:
                 raise MutationConflictError(
                     "Claimed state proposal has no recoverable mutation intent"
                 )
+            if journal.get("status") == "completed":
+                return deepcopy(
+                    journal.get("result") or proposal.get("accept_result") or {}
+                )
             return await resume_persisted_mutation(
                 journal, ChapterStateService._execute_accept_chapter_state
             )
 
-        return await ChapterStateService.accept_chapter_state(
+        return await ChapterStateService._accept_proposal_state(
             chapter_id,
             payload,
             acceptance_metadata=metadata,
             proposal_claim=claim,
+        )
+
+    async def run_auto(
+        self,
+        *,
+        chapter_id: str,
+        proposal: dict[str, Any],
+        policy: SelectAllPolicy,
+    ) -> dict[str, Any]:
+        """Apply a versioned automatic decision through the normal accept path."""
+        proposal_id = str(proposal.get("proposal_id") or "")
+        acceptance_token = str(proposal.get("acceptance_token") or "")
+        if not proposal_id or not acceptance_token:
+            raise ValueError("Automatic state acceptance requires a proposal handle")
+        selected_fact_ids, selected_thread_ids = policy.decide(proposal)
+        return await self.accept(
+            chapter_id=chapter_id,
+            proposal_id=proposal_id,
+            acceptance_token=acceptance_token,
+            selected_fact_ids=selected_fact_ids,
+            selected_thread_ids=selected_thread_ids,
+            policy_name=policy.name,
+            policy_version=policy.version,
         )
 
     async def claim_for_mutation(
@@ -573,6 +615,34 @@ class StateProposalModule:
             )
         if current.get("status") != "proposed":
             raise MutationConflictError("State proposal cannot be claimed")
+        expires_at = current.get("expires_at")
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
+            await self.collection.update_one(
+                {"_id": proposal_id, "status": "proposed"},
+                {"$set": {"status": "expired", "updated_at": get_utc_now()}},
+                session=session,
+            )
+            raise MutationConflictError("State proposal expired before claim")
+        chapter = await chapter_repo.get_chapter_by_id(
+            str(current["chapter_id"]), session=session
+        )
+        if _content_digest(chapter) != current.get("content_digest"):
+            await self.collection.update_one(
+                {"_id": proposal_id, "status": "proposed"},
+                {
+                    "$set": {
+                        "status": "stale",
+                        "stale_reason": "Chapter content changed before claim",
+                        "updated_at": get_utc_now(),
+                    }
+                },
+                session=session,
+            )
+            raise MutationConflictError(
+                "Chapter content changed before proposal acceptance"
+            )
         if mutation_revision != expected_revision + 1:
             await self.collection.update_one(
                 {"_id": proposal_id, "status": "proposed"},
@@ -661,5 +731,3 @@ class StateProposalModule:
 
 
 state_proposal_module = StateProposalModule()
-# Temporary compatibility name for callers being migrated in S2.
-state_preview_store = state_proposal_module

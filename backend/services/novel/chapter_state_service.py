@@ -159,7 +159,7 @@ class ChapterStateService:
             raise
 
     @staticmethod
-    async def accept_chapter_state(
+    async def _commit_chapter_state(
         chapter_id: str,
         payload: Dict[str, Any],
         *,
@@ -273,4 +273,42 @@ class ChapterStateService:
                 child_ids=child_ids,
             ),
             ChapterStateService._execute_accept_chapter_state,
+        )
+
+    @staticmethod
+    async def _accept_proposal_state(
+        chapter_id: str,
+        payload: Dict[str, Any],
+        *,
+        acceptance_metadata: Dict[str, Any],
+        proposal_claim: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Internal Proposal-only entrypoint; callers cannot omit claim identity."""
+        if not proposal_claim.get("proposal_id"):
+            raise ValueError("Proposal acceptance requires proposal_id")
+        return await ChapterStateService._commit_chapter_state(
+            chapter_id,
+            payload,
+            acceptance_metadata=acceptance_metadata,
+            proposal_claim=proposal_claim,
+        )
+
+    @staticmethod
+    async def import_legacy_chapter_state(
+        chapter_id: str,
+        payload: Dict[str, Any],
+        *,
+        import_metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Explicit offline migration seam; it is intentionally not exposed by HTTP."""
+        metadata = {
+            "confidence": "unrated",
+            **(import_metadata or {}),
+            "source": "legacy_import",
+        }
+        return await ChapterStateService._commit_chapter_state(
+            chapter_id,
+            payload,
+            acceptance_metadata=metadata,
+            proposal_claim=None,
         )

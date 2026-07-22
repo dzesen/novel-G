@@ -143,7 +143,7 @@ export function StateBackfillPanel({
 
   const accept = async () => {
     if (!stream.result) return;
-    if (!stream.result.preview_id || !stream.result.acceptance_token) {
+    if (!stream.result.proposal_id || !stream.result.acceptance_token) {
       setAcceptError(t("stalePreview"));
       return;
     }
@@ -154,7 +154,7 @@ export function StateBackfillPanel({
         "/api/llm/accept-chapter-state",
         {
           chapter_id: chapterId,
-          preview_id: stream.result.preview_id,
+          proposal_id: stream.result.proposal_id,
           acceptance_token: stream.result.acceptance_token,
           selected_fact_ids: stream.result.character_updates.flatMap((update) =>
             update.new_permanent_facts

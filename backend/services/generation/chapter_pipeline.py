@@ -8,9 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List
 
-from backend.services.generation.job_planner import result_to_accept_state
-
-
 @dataclass
 class ChapterOutcome:
     chapter_id: str
@@ -134,8 +131,7 @@ async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipel
             outcome.consistency_issues = list(result.get("consistency_issues", []))
             outcome.dropped_ids.update(dropped)
             _record_truncation(outcome, "state", truncation)
-            accept_payload = result_to_accept_state(result)
-            report = await deps.accept_state(chapter_id, accept_payload)
+            report = await deps.accept_state(chapter_id, result)
         except Exception as exc:
             raise _capture_failure(outcome, "state", exc) from exc
         outcome.steps_done.append("state")

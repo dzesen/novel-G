@@ -41,8 +41,10 @@ from backend.api.llm_routers.state_router import (
 )
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
 from backend.services.novel.chapter_service import ChapterService
-from backend.services.novel.chapter_state_service import ChapterStateService
-from backend.services.novel.state_timeline import state_preview_store
+from backend.services.novel.state_proposal import (
+    SelectAllPolicy,
+    state_proposal_module,
+)
 
 CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
 
@@ -184,43 +186,64 @@ async def generate_state(
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     chapter_id = str(chapter["_id"])
     fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-    generation_snapshot = await state_preview_store.capture(
+    generation_snapshot = await state_proposal_module.capture(
         novel_id,
         chapter_id,
         chapter=fresh_chapter,
     )
-    inputs = await fetch_context_inputs(novel_id, chapter_id)
-    context = assemble_context(inputs)
-    roster = inputs["roster"]
-    # 正文必须重新查库取：调用方传入的 chapter 是 chapter_pipeline.run_chapter
-    # 的入口快照，只用于 skip-existing 判断。同一轮内，本步之前的
-    # generate_prose/write_prose 很可能刚把正文写进了库，而入口快照仍是写入前
-    # 的空正文——不重新查库会把空文本喂给状态回填工作流，让摘要/人物状态/伏笔
-    # 推进全部基于"没有正文"生成（state_router.extract_chapter_state_by_ai 同样
-    # 是先查库拿 content，从不信任调用方快照）。fetch_context_inputs 不产出
-    # content 字段（它只为 assemble_context 服务），故这里单独查一次章节。
-    params = {
-        "context": context.to_prompt_text(),
-        "chapter_order": int(chapter.get("order_index") or 0),
-        "chapter_title": str(chapter.get("title") or ""),
-        "chapter_content": str(fresh_chapter.get("content") or "").strip(),
-    }
-    deps = _deps_for(STATE_WORKFLOW, attempt_scope)
-    await state_preview_store.ensure_current(generation_snapshot)
-    frames = run_workflow(
-        workflow_name=STATE_WORKFLOW, steps=CHAPTER_STATE_STEPS,
-        prompts=load_prompt_config().get(CHAPTER_STATE_PROMPT_NAME, {}),
-        params=params, gen_kwargs={}, cached={}, deps=deps,
-        request_id=uuid4().hex[:8],
+    generation_lease = await state_proposal_module.begin(
+        novel_id,
+        chapter_id,
+        snapshot=generation_snapshot,
+        audit={"workflow": STATE_WORKFLOW, "step": STATE_STEP, "mode": "headless"},
     )
-    result, tokens = await run_workflow_to_result(STATE_STEP, frames)
-    await state_preview_store.ensure_current(generation_snapshot)
-    cleaned, dropped = validate_state_ids(result, roster)
-    truncation = {
-        "truncated_sections": list(context.truncated_sections),
-        "dropped_item_counts": dict(context.dropped_item_counts),
-    }
-    return cleaned, dropped, tokens, truncation, _serialize_attempts(deps.runtime)
+    try:
+        inputs = await fetch_context_inputs(novel_id, chapter_id)
+        context = assemble_context(inputs)
+        roster = inputs["roster"]
+        # 正文必须重新查库取：调用方传入的 chapter 是管线入口快照，只用于
+        # skip-existing；同轮先前步骤可能刚写入正文。
+        params = {
+            "context": context.to_prompt_text(),
+            "chapter_order": int(chapter.get("order_index") or 0),
+            "chapter_title": str(chapter.get("title") or ""),
+            "chapter_content": str(fresh_chapter.get("content") or "").strip(),
+        }
+        deps = _deps_for(STATE_WORKFLOW, attempt_scope)
+        await state_proposal_module.ensure_current(generation_snapshot)
+        frames = run_workflow(
+            workflow_name=STATE_WORKFLOW, steps=CHAPTER_STATE_STEPS,
+            prompts=load_prompt_config().get(CHAPTER_STATE_PROMPT_NAME, {}),
+            params=params, gen_kwargs={}, cached={}, deps=deps,
+            request_id=uuid4().hex[:8],
+        )
+        result, tokens = await run_workflow_to_result(STATE_STEP, frames)
+        await state_proposal_module.ensure_current(generation_snapshot)
+        cleaned, dropped = validate_state_ids(result, roster)
+        attempts = _serialize_attempts(deps.runtime)
+        proposal = await state_proposal_module.publish(
+            generation_lease,
+            cleaned,
+            audit={
+                "usage": {"total_tokens": tokens},
+                "attempts": attempts,
+            },
+        )
+        truncation = {
+            "truncated_sections": list(context.truncated_sections),
+            "dropped_item_counts": dict(context.dropped_item_counts),
+        }
+        return proposal, dropped, tokens, truncation, attempts
+    except BaseException as exc:
+        await state_proposal_module.mark_failed(
+            generation_lease,
+            exc,
+            audit={
+                "usage": getattr(exc, "usage", None) or {},
+                "attempts": list(getattr(exc, "attempts", None) or []),
+            },
+        )
+        raise
 
 
 def _serialize_attempts(runtime) -> list[dict[str, Any]]:
@@ -246,8 +269,12 @@ async def _write_prose(chapter_id: str, text: str) -> None:
     await ChapterService.update_chapter(chapter_id, {"content": text})
 
 
-async def _accept_state(chapter_id: str, accept_payload: dict) -> dict:
-    return await ChapterStateService.accept_chapter_state(chapter_id, accept_payload)
+async def _accept_state(chapter_id: str, proposal: dict) -> dict:
+    return await state_proposal_module.run_auto(
+        chapter_id=chapter_id,
+        proposal=proposal,
+        policy=SelectAllPolicy(),
+    )
 
 
 def build_chapter_pipeline_deps(
