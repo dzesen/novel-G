@@ -42,6 +42,7 @@ from backend.api.llm_routers.state_router import (
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
 from backend.services.novel.chapter_service import ChapterService
 from backend.services.novel.chapter_state_service import ChapterStateService
+from backend.services.novel.state_timeline import state_preview_store
 
 CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
 
@@ -182,6 +183,12 @@ async def generate_state(
     attempt_scope: AttemptScope | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     chapter_id = str(chapter["_id"])
+    fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+    generation_snapshot = await state_preview_store.capture(
+        novel_id,
+        chapter_id,
+        chapter=fresh_chapter,
+    )
     inputs = await fetch_context_inputs(novel_id, chapter_id)
     context = assemble_context(inputs)
     roster = inputs["roster"]
@@ -192,7 +199,6 @@ async def generate_state(
     # 推进全部基于"没有正文"生成（state_router.extract_chapter_state_by_ai 同样
     # 是先查库拿 content，从不信任调用方快照）。fetch_context_inputs 不产出
     # content 字段（它只为 assemble_context 服务），故这里单独查一次章节。
-    fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
     params = {
         "context": context.to_prompt_text(),
         "chapter_order": int(chapter.get("order_index") or 0),
@@ -200,6 +206,7 @@ async def generate_state(
         "chapter_content": str(fresh_chapter.get("content") or "").strip(),
     }
     deps = _deps_for(STATE_WORKFLOW, attempt_scope)
+    await state_preview_store.ensure_current(generation_snapshot)
     frames = run_workflow(
         workflow_name=STATE_WORKFLOW, steps=CHAPTER_STATE_STEPS,
         prompts=load_prompt_config().get(CHAPTER_STATE_PROMPT_NAME, {}),
@@ -207,6 +214,7 @@ async def generate_state(
         request_id=uuid4().hex[:8],
     )
     result, tokens = await run_workflow_to_result(STATE_STEP, frames)
+    await state_preview_store.ensure_current(generation_snapshot)
     cleaned, dropped = validate_state_ids(result, roster)
     truncation = {
         "truncated_sections": list(context.truncated_sections),

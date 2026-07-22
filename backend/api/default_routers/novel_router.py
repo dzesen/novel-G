@@ -93,6 +93,8 @@ async def get_novel(novel_id: str):
     try:
         novel = await novel_repo.get_novel_by_id(novel_id)
         novel["_id"] = str(novel["_id"])
+        novel.pop("narrative_revision", None)
+        novel.pop("narrative_revision_operations", None)
         novel["stats"] = {
             "chapter_count": novel.get("current_chapter_count", 0),
             "total_word_count": novel.get("current_word_count", 0)

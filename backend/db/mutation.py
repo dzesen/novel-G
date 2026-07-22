@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 from backend.db import collections
 from backend.db.mongo import get_database
+from backend.db.narrative_revision import narrative_revision_store
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import get_utc_now, to_object_id
 
@@ -38,6 +39,12 @@ class MutationConflictError(RuntimeError):
 
 class UnsupportedMutationError(RuntimeError):
     """命令的 operation/version 没有已注册 handler。"""
+
+
+@dataclass(frozen=True)
+class MutationHandlerSpec(Generic[T]):
+    callback: MutationCallback[T]
+    advances_narrative_revision: bool = False
 
 
 def _digest_value(value: Any) -> Any:
@@ -196,24 +203,38 @@ class MutationEngine:
 
     def __init__(
         self,
-        handlers: dict[tuple[str, int], MutationCallback[Any]],
+        handlers: dict[
+            tuple[str, int],
+            MutationCallback[Any] | MutationHandlerSpec[Any],
+        ],
         *,
         recovery_policy: RecoveryPolicy | None = None,
         now: Callable[[], datetime] = get_utc_now,
     ) -> None:
-        self._handlers = dict(handlers)
+        self._handlers = {
+            key: (
+                value
+                if isinstance(value, MutationHandlerSpec)
+                else MutationHandlerSpec(value)
+            )
+            for key, value in handlers.items()
+        }
         self._recovery_policy = recovery_policy or RecoveryPolicy()
         self._now = now
 
     async def execute(self, command: MutationCommand) -> Any:
-        callback = self._handlers.get((command.operation, command.version))
-        if callback is None:
+        spec = self._handlers.get((command.operation, command.version))
+        if spec is None:
             raise UnsupportedMutationError(
                 f"Unsupported mutation command: {command.operation}@{command.version}"
             )
         novel_lock = _NOVEL_LOCKS.setdefault(command.novel_id, asyncio.Lock())
         async with novel_lock:
-            return await _commit_mutation(command, callback)
+            return await _commit_mutation(
+                command,
+                spec.callback,
+                advances_narrative_revision=spec.advances_narrative_revision,
+            )
 
     async def recover(
         self, scope: RecoveryScope | None = None
@@ -371,7 +392,12 @@ class MutationEngine:
         }
 
 
-async def _commit_mutation(command: MutationCommand, callback: MutationCallback[T]) -> T:
+async def _commit_mutation(
+    command: MutationCommand,
+    callback: MutationCallback[T],
+    *,
+    advances_narrative_revision: bool = False,
+) -> T:
     """提交完整命令；standalone 崩溃后以稳定子 ID 和逐项回执安全重放。"""
     lock = _LOCKS.setdefault(command.idempotency_key, asyncio.Lock())
     async with lock:
@@ -431,6 +457,18 @@ async def _commit_mutation(command: MutationCommand, callback: MutationCallback[
                 session=session,
             )
             recorder = MutationRecorder(journal, session)
+            if advances_narrative_revision:
+                revision = await narrative_revision_store.advance(
+                    command.novel_id,
+                    (
+                        f"{command.operation}@{command.version}:"
+                        f"{command.idempotency_key}:{command_digest}"
+                    ),
+                    session=session,
+                )
+                await recorder.receipt(
+                    "narrative_revision", {"revision": revision}
+                )
             await recorder.advance_phase("primary_writes")
             result = await callback(session, recorder)
             await collection.update_one(
@@ -485,9 +523,19 @@ async def _commit_mutation(command: MutationCommand, callback: MutationCallback[
             raise
 
 
-async def commit_mutation(command: MutationCommand, callback: MutationCallback[T]) -> T:
+async def commit_mutation(
+    command: MutationCommand,
+    callback: MutationCallback[T],
+    *,
+    advances_narrative_revision: bool = True,
+) -> T:
     """旧调用者兼容入口；执行仍经过 MutationEngine 的 operation/version seam。"""
-    engine = MutationEngine({(command.operation, command.version): callback})
+    engine = MutationEngine({
+        (command.operation, command.version): MutationHandlerSpec(
+            callback,
+            advances_narrative_revision=advances_narrative_revision,
+        )
+    })
     return await engine.execute(command)
 
 

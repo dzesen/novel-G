@@ -126,6 +126,11 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             raise HTTPException(
                 status_code=400, detail="本章还没有已保存的正文，请先写好并保存正文"
             )
+        generation_snapshot = await state_preview_store.capture(
+            req.novel_id,
+            req.chapter_id,
+            chapter=chapter,
+        )
         inputs = await fetch_context_inputs(req.novel_id, req.chapter_id)
         # 用正文模式而非细纲模式：既有 permanent_facts 在正文模式的永不截断档里，
         # 而那正是一致性校验的判据基础，截掉它校验就变成瞎猜（设计 §4.2）。
@@ -145,6 +150,7 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
                     "请精简上下文或选择更大窗口的模型。"
                 ),
             )
+        await state_preview_store.ensure_current(generation_snapshot)
     except HTTPException:
         # 故意抛出的 400 必须先于下面的宽泛 handler，否则会被降级成别的码。
         raise
@@ -210,6 +216,7 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
                     req.novel_id,
                     req.chapter_id,
                     cleaned,
+                    snapshot=generation_snapshot,
                 )
             yield _replace_chapter_state(parsed, preview_payload)
 

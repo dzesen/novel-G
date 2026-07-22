@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
-from backend.db.mutation import MutationEngine, RecoveryScope
+from backend.db.mutation import MutationEngine, MutationHandlerSpec, RecoveryScope
 from backend.services.novel.chapter_service import ChapterService
 from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.character_state_service import CharacterStateService
@@ -15,9 +15,9 @@ from backend.services.novel.volume_service import VolumeService
 MutationExecutor = Callable[[Any, Any], Awaitable[Any]]
 
 
-def _executors() -> dict[tuple[str, int], MutationExecutor]:
+def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
     # 延迟构建目录，避免服务模块导入期间形成循环依赖。
-    return {
+    callbacks: dict[tuple[str, int], MutationExecutor] = {
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
         ("create_chapter", 1): ChapterService._execute_create_chapter,
@@ -46,6 +46,13 @@ def _executors() -> dict[tuple[str, int], MutationExecutor]:
         ("create_volume", 1): VolumeService._execute_create_volume,
         ("create_volume", 2): VolumeService._execute_create_volume,
         ("update_volume", 1): VolumeService._execute_update_volume,
+    }
+    return {
+        key: MutationHandlerSpec(
+            callback,
+            advances_narrative_revision=True,
+        )
+        for key, callback in callbacks.items()
     }
 
 

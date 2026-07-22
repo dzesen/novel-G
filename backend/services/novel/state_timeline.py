@@ -7,6 +7,7 @@ import hmac
 import json
 import time
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from backend.config.config import CONFIG_PATH
 from backend.config.lifecycle import FileSecretVersionStore
 from backend.db import collections
 from backend.db.mongo import get_database
+from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.character_state_repository import character_state_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
@@ -66,10 +68,13 @@ def _content_digest(chapter: dict[str, Any]) -> str:
     })
 
 
-async def _state_revision(novel_id: str) -> str:
-    states = await character_state_repo.list_states(novel_id)
-    threads = await plot_thread_repo.list_threads(novel_id)
-    return _digest({"states": states, "threads": threads})
+@dataclass(frozen=True)
+class StateGenerationSnapshot:
+    novel_id: str
+    chapter_id: str
+    content_digest: str
+    narrative_revision: int
+    captured_at: datetime
 
 
 def add_selection_ids(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -88,20 +93,56 @@ class StatePreviewStore:
     def collection(self):
         return get_database()[collections.STATE_PREVIEWS]
 
+    async def capture(
+        self,
+        novel_id: str,
+        chapter_id: str,
+        *,
+        chapter: dict[str, Any] | None = None,
+    ) -> StateGenerationSnapshot:
+        captured_chapter = chapter or await chapter_repo.get_chapter_by_id(chapter_id)
+        if str(captured_chapter.get("novel_id")) != str(novel_id):
+            raise ValueError("Chapter does not belong to novel")
+        return StateGenerationSnapshot(
+            novel_id=str(novel_id),
+            chapter_id=str(chapter_id),
+            content_digest=_content_digest(captured_chapter),
+            narrative_revision=await narrative_revision_store.current(novel_id),
+            captured_at=get_utc_now(),
+        )
+
+    async def ensure_current(self, snapshot: StateGenerationSnapshot) -> None:
+        chapter = await chapter_repo.get_chapter_by_id(snapshot.chapter_id)
+        if _content_digest(chapter) != snapshot.content_digest:
+            raise StaleStatePreview("Chapter content changed during state generation")
+        if (
+            await narrative_revision_store.current(snapshot.novel_id)
+            != snapshot.narrative_revision
+        ):
+            raise StaleStatePreview(
+                "Narrative state changed during generation"
+            )
+
     async def create(
         self,
         novel_id: str,
         chapter_id: str,
         candidate: dict[str, Any],
+        *,
+        snapshot: StateGenerationSnapshot | None = None,
     ) -> dict[str, Any]:
-        chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-        if str(chapter.get("novel_id")) != str(novel_id):
-            raise ValueError("Chapter does not belong to novel")
+        active_snapshot = snapshot or await self.capture(novel_id, chapter_id)
+        if (
+            active_snapshot.novel_id != str(novel_id)
+            or active_snapshot.chapter_id != str(chapter_id)
+        ):
+            raise ValueError("Generation snapshot belongs to another chapter")
+        await self.ensure_current(active_snapshot)
         prepared = add_selection_ids(candidate)
         preview_id = ObjectId()
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=PREVIEW_TTL_SECONDS)
-        content_digest = _content_digest(chapter)
-        state_revision = await _state_revision(novel_id)
+        content_digest = active_snapshot.content_digest
+        state_revision = active_snapshot.narrative_revision
         candidate_digest = _digest(prepared)
         token_payload = f"{preview_id}:{content_digest}:{state_revision}:{candidate_digest}:{int(expires_at.timestamp())}"
         token = hmac.new(_preview_key(), token_payload.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -112,6 +153,8 @@ class StatePreviewStore:
             "candidate": prepared,
             "content_digest": content_digest,
             "state_revision": state_revision,
+            "narrative_revision": state_revision,
+            "generation_captured_at": active_snapshot.captured_at,
             "candidate_digest": candidate_digest,
             "token_digest": hashlib.sha256(token.encode("ascii")).hexdigest(),
             "expires_at": expires_at,
@@ -154,7 +197,10 @@ class StatePreviewStore:
         if _content_digest(chapter) != preview.get("content_digest"):
             raise StaleStatePreview("Chapter content changed after state generation")
         novel_id = str(preview["novel_id"])
-        if await _state_revision(novel_id) != preview.get("state_revision"):
+        stored_revision = preview.get(
+            "narrative_revision", preview.get("state_revision")
+        )
+        if await narrative_revision_store.current(novel_id) != stored_revision:
             raise StaleStatePreview("Narrative state changed after state generation")
 
         candidate = deepcopy(preview["candidate"])
