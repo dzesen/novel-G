@@ -6,23 +6,23 @@ outline_router / prose_router / state_router 的开流前设置——那几处�
 """
 from __future__ import annotations
 
-from typing import Any, AsyncGenerator, Dict, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 from uuid import uuid4
 
-from backend.llm.config import get_provider_config
 from backend.llm.prompts.prompt_selector import (
     CHAPTER_OUTLINE_PROMPT_NAME, CHAPTER_STATE_PROMPT_NAME, PROSE_PROMPT_NAME, load_prompt_config,
 )
 from backend.services.llm.context_builder import (
     assemble_context, assemble_outline_context, fetch_context_inputs,
 )
-from backend.services.llm.format_review_service import validate_and_fix_format
 from backend.services.llm.prose_runner import stream_prose
 from backend.services.llm.workflow_runner import (
     WorkflowDeps, WorkflowFailed, parse_sse_event, run_workflow, run_workflow_to_result,
 )
-from backend.services.llm.workflow_service import (
-    get_llm_service_for_step, resolve_provider_for_step, resolve_timeout_for_step,
+from backend.services.llm.generation_runtime import (
+    AttemptScope,
+    WorkflowStepTarget,
+    create_generation_runtime,
 )
 from backend.services.novel.state_validation import validate_state_ids
 from backend.services.novel.outline_validation import validate_outline_ids
@@ -46,20 +46,34 @@ from backend.services.novel.chapter_state_service import ChapterStateService
 CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
 
 
-def _supports_schema(workflow_name: str):
-    def check(step_name: str) -> bool:
-        provider = resolve_provider_for_step(workflow_name, step_name)
-        return bool(provider) and get_provider_config(provider).supports_json_schema
-    return check
+def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
+    """按当前不可变 GenerationPlan 计算一章的最大语义调用数。"""
+    runtime = create_generation_runtime()
+    slots = 0
+    if not chapter.get("outline"):
+        slots += runtime.plan_structured(
+            WorkflowStepTarget(CHAPTER_OUTLINE_WORKFLOW, CHAPTER_OUTLINE_STEP)
+        ).max_semantic_attempts
+    if not str(chapter.get("content") or "").strip():
+        slots += runtime.plan_text(
+            WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+        ).max_semantic_attempts
+    if not str(chapter.get("summary") or "").strip():
+        slots += runtime.plan_structured(
+            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        ).max_semantic_attempts
+    return slots
 
 
-def _deps_for(workflow_name: str) -> WorkflowDeps:
+def estimate_worklist_attempt_capacity(chapters: list[Dict[str, Any]]) -> int:
+    """固定总容量等于当前工作清单各章计划上限之和，最少保留一槽。"""
+    return max(1, sum(estimate_chapter_attempt_slots(chapter) for chapter in chapters))
+
+
+def _deps_for(workflow_name: str, attempt_scope: AttemptScope | None = None) -> WorkflowDeps:
+    del workflow_name
     return WorkflowDeps(
-        resolve_provider=resolve_provider_for_step,
-        resolve_timeout=resolve_timeout_for_step,
-        get_service=get_llm_service_for_step,
-        supports_schema=_supports_schema(workflow_name),
-        fix_format=validate_and_fix_format,
+        runtime=create_generation_runtime(attempt_scope=attempt_scope),
     )
 
 
@@ -72,12 +86,20 @@ async def _consume_prose_frames(frames: AsyncGenerator[str, None]) -> Tuple[str,
         event, data = parsed
         if event == "done":
             if not data.get("success"):
-                raise WorkflowFailed(data.get("error") or "prose generation failed")
+                raise WorkflowFailed(
+                    data.get("error") or "prose generation failed",
+                    usage=data.get("usage_so_far"),
+                    attempts=data.get("attempts"),
+                )
             return str(data.get("text") or ""), int((data.get("usage") or {}).get("total_tokens") or 0)
     raise WorkflowFailed("prose stream ended without a done event")
 
 
-async def generate_outline(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, dict, int, dict]:
+async def generate_outline(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    attempt_scope: AttemptScope | None = None,
+) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_outline_context(inputs)
     roster = inputs["roster"]
@@ -93,10 +115,11 @@ async def generate_outline(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict
         "chapter_title": str(chapter.get("title") or ""),
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
+    deps = _deps_for(CHAPTER_OUTLINE_WORKFLOW, attempt_scope)
     frames = run_workflow(
         workflow_name=CHAPTER_OUTLINE_WORKFLOW, steps=CHAPTER_OUTLINE_STEPS,
         prompts=load_prompt_config().get(CHAPTER_OUTLINE_PROMPT_NAME, {}),
-        params=params, gen_kwargs={}, cached={}, deps=_deps_for(CHAPTER_OUTLINE_WORKFLOW),
+        params=params, gen_kwargs={}, cached={}, deps=deps,
         request_id=uuid4().hex[:8],
     )
     result, tokens = await run_workflow_to_result(CHAPTER_OUTLINE_STEP, frames)
@@ -105,10 +128,14 @@ async def generate_outline(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict
         "truncated_sections": list(context.truncated_sections),
         "dropped_item_counts": dict(context.dropped_item_counts),
     }
-    return cleaned, dropped, tokens, truncation
+    return cleaned, dropped, tokens, truncation, _serialize_attempts(deps.runtime)
 
 
-async def generate_prose(novel_id: str, chapter: Dict[str, Any]) -> Tuple[str, int, dict]:
+async def generate_prose(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    attempt_scope: AttemptScope | None = None,
+) -> tuple[str, int, dict, list[dict[str, Any]]]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_context(inputs)
     # outline 取 fetch_context_inputs 内部刚刚重新查库得到的版本，不用调用方传入
@@ -134,20 +161,26 @@ async def generate_prose(novel_id: str, chapter: Dict[str, Any]) -> Tuple[str, i
         )
         + "\n" + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"]
     )
-    service = get_llm_service_for_step(PROSE_WORKFLOW, PROSE_STEP)
+    runtime = create_generation_runtime(attempt_scope=attempt_scope)
+    plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
     frames = stream_prose(
         workflow_name=PROSE_WORKFLOW, step_key=PROSE_STEP, prompt=prompt,
-        service=service, gen_kwargs={}, request_id=uuid4().hex[:8],
+        service=None, gen_kwargs={}, request_id=uuid4().hex[:8],
+        runtime=runtime, generation_plan=plan,
     )
     text, tokens = await _consume_prose_frames(frames)
     truncation = {
         "truncated_sections": list(context.truncated_sections),
         "dropped_item_counts": dict(context.dropped_item_counts),
     }
-    return text, tokens, truncation
+    return text, tokens, truncation, _serialize_attempts(runtime)
 
 
-async def generate_state(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, dict, int, dict]:
+async def generate_state(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    attempt_scope: AttemptScope | None = None,
+) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     chapter_id = str(chapter["_id"])
     inputs = await fetch_context_inputs(novel_id, chapter_id)
     context = assemble_context(inputs)
@@ -166,10 +199,11 @@ async def generate_state(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, 
         "chapter_title": str(chapter.get("title") or ""),
         "chapter_content": str(fresh_chapter.get("content") or "").strip(),
     }
+    deps = _deps_for(STATE_WORKFLOW, attempt_scope)
     frames = run_workflow(
         workflow_name=STATE_WORKFLOW, steps=CHAPTER_STATE_STEPS,
         prompts=load_prompt_config().get(CHAPTER_STATE_PROMPT_NAME, {}),
-        params=params, gen_kwargs={}, cached={}, deps=_deps_for(STATE_WORKFLOW),
+        params=params, gen_kwargs={}, cached={}, deps=deps,
         request_id=uuid4().hex[:8],
     )
     result, tokens = await run_workflow_to_result(STATE_STEP, frames)
@@ -178,7 +212,22 @@ async def generate_state(novel_id: str, chapter: Dict[str, Any]) -> Tuple[dict, 
         "truncated_sections": list(context.truncated_sections),
         "dropped_item_counts": dict(context.dropped_item_counts),
     }
-    return cleaned, dropped, tokens, truncation
+    return cleaned, dropped, tokens, truncation, _serialize_attempts(deps.runtime)
+
+
+def _serialize_attempts(runtime) -> list[dict[str, Any]]:
+    if runtime is None:
+        return []
+    return [
+        {
+            "attempt_id": item.attempt_id,
+            "provider_alias": item.provider_alias,
+            "phase": item.phase,
+            "state": item.state,
+            "usage": item.usage.model_dump(),
+        }
+        for item in runtime.attempts
+    ]
 
 
 async def _accept_outline(chapter_id: str, result: dict) -> None:
@@ -193,8 +242,21 @@ async def _accept_state(chapter_id: str, accept_payload: dict) -> dict:
     return await ChapterStateService.accept_chapter_state(chapter_id, accept_payload)
 
 
-def build_chapter_pipeline_deps() -> ChapterPipelineDeps:
+def build_chapter_pipeline_deps(
+    attempt_scope_factory: Callable[[str], AttemptScope] | None = None,
+) -> ChapterPipelineDeps:
+    def scope(step: str) -> AttemptScope | None:
+        return attempt_scope_factory(step) if attempt_scope_factory is not None else None
+
     return ChapterPipelineDeps(
-        generate_outline=generate_outline, generate_prose=generate_prose, generate_state=generate_state,
+        generate_outline=lambda novel_id, chapter: generate_outline(
+            novel_id, chapter, scope("outline")
+        ),
+        generate_prose=lambda novel_id, chapter: generate_prose(
+            novel_id, chapter, scope("prose")
+        ),
+        generate_state=lambda novel_id, chapter: generate_state(
+            novel_id, chapter, scope("state")
+        ),
         accept_outline=_accept_outline, write_prose=_write_prose, accept_state=_accept_state,
     )

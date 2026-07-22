@@ -61,12 +61,15 @@ export default function BatchGenerationPanel({
   const chapterById = useMemo(() => new Map(chapters.map((c) => [c._id, c])), [chapters]);
   const titleForChapter = (id: string) => chapterById.get(id)?.title ?? id;
 
-  const control = async (action: "pause" | "resume" | "abort") => {
+  const control = async (
+    action: "pause" | "resume" | "abort",
+    body: Record<string, boolean> = {},
+  ) => {
     if (!job) return;
     setControlBusy(true);
     setControlError(null);
     try {
-      const next = await apiPost<GenerationJob>(`/api/generation-jobs/${job._id}/${action}`, {});
+      const next = await apiPost<GenerationJob>(`/api/generation-jobs/${job._id}/${action}`, body);
       setJob(next);
     } catch (err) {
       // resume 可能 409（别处有在跑作业）；原样展示（设计 §7.4）。
@@ -173,6 +176,8 @@ export default function BatchGenerationPanel({
           onJumpToChapter={onJumpToChapter}
           onNavigateToMemory={onNavigateToMemory}
           onResume={() => void control("resume")}
+          onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
+          onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
           onAbort={() => setAbortConfirm(true)}
           busy={controlBusy}
           controlError={controlError}

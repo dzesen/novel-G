@@ -33,6 +33,11 @@ class StartJobRequest(BaseModel):
     token_budget: Optional[int] = Field(default=None, ge=1)
 
 
+class ResumeJobRequest(BaseModel):
+    confirm_uncertain_retry: bool = False
+    skip_uncertain: bool = False
+
+
 def _handle(exc: Exception) -> HTTPException:
     if isinstance(exc, ConflictError):
         return HTTPException(status_code=409, detail=str(exc))
@@ -94,9 +99,16 @@ async def pause_job(job_id: str):
 
 
 @router.post("/{job_id}/resume")
-async def resume_job(job_id: str):
+async def resume_job(job_id: str, req: ResumeJobRequest | None = None):
     try:
-        return _serialize_job(await GenerationJobService.resume_job(job_id))
+        body = req or ResumeJobRequest()
+        if body.confirm_uncertain_retry and body.skip_uncertain:
+            raise ValueError("confirm_uncertain_retry and skip_uncertain are mutually exclusive")
+        return _serialize_job(await GenerationJobService.resume_job(
+            job_id,
+            confirm_uncertain_retry=body.confirm_uncertain_retry,
+            skip_uncertain=body.skip_uncertain,
+        ))
     except Exception as exc:
         raise _handle(exc) from exc
 
@@ -113,6 +125,14 @@ async def mark_running_jobs_interrupted() -> int:
     """启动时把上次进程遗留的 running 作业置 interrupted（设计 §4.3）。返回置换数量。"""
     running = await generation_job_repo.list_running_jobs()
     for job in running:
-        await generation_job_repo.update_job_fields(str(job["_id"]),
-                                                    {"status": "interrupted", "current_chapter_id": None})
+        job_id = str(job["_id"])
+        uncertain = await generation_job_repo.mark_claimed_attempts_uncertain(
+            job_id, "backend process interrupted before usage was recorded"
+        )
+        await generation_job_repo.update_job_fields(job_id, {
+            "status": "interrupted",
+            "pause_reason": "uncertain_attempt" if uncertain else "process_restart",
+            "current_chapter_id": None,
+            "active_slot": None,
+        })
     return len(running)

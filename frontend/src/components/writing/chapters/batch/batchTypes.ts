@@ -5,7 +5,16 @@ export type JobStatus =
   | "pending" | "running" | "paused"
   | "completed" | "aborted" | "failed" | "interrupted";
 
-export type PauseReason = "checkpoint" | "conflict" | "cost_cap" | "manual" | null;
+export type PauseReason =
+  | "checkpoint" | "conflict" | "cost_cap" | "manual"
+  | "attempt_capacity" | "uncertain_attempt" | "uncertain_skipped" | "process_restart"
+  | null;
+
+export interface AttemptSummary {
+  attempt_id: string;
+  usage: { input_tokens: number; output_tokens: number; total_tokens: number };
+  accounted_at: string;
+}
 
 export interface ConsistencyIssue {
   card_id: string | null;
@@ -54,6 +63,10 @@ export interface GenerationJob {
   progress: ChapterProgress[];
   last_checkpoint_index: number;
   error: JobError | null;
+  usage_attempt_capacity: number;
+  usage_attempt_claimed: number;
+  usage_attempt_summaries: AttemptSummary[];
+  has_uncertain_attempts: boolean;
   created_at: string;
   updated_at: string;
 }

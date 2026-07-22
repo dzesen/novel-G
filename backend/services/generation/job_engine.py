@@ -11,9 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from backend.db.utils import get_utc_now
-from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.db.repositories.generation_job_repository import (
+    AttemptCapacityExceeded,
+    generation_job_repo,
+)
 from backend.services.generation import job_planner
-from backend.services.generation.chapter_pipeline import ChapterOutcome
+from backend.services.generation.chapter_pipeline import ChapterOutcome, ChapterPipelineFailed
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +44,31 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "facts_added": outcome.facts_added, "threads_advanced": outcome.threads_advanced,
         "summary_written": outcome.summary_written, "dropped_ids": outcome.dropped_ids,
         "truncations": outcome.truncations,
+        "attempts": outcome.attempts,
         "completed_at": get_utc_now(),
     }
 
 
 async def _pause(repo, job_id: str, reason: str) -> None:
-    await repo.update_job_fields(job_id, {"status": "paused", "pause_reason": reason, "current_chapter_id": None})
+    await repo.update_job_fields(job_id, {
+        "status": "paused",
+        "pause_reason": reason,
+        "current_chapter_id": None,
+        "active_slot": None,
+    })
+
+
+async def _persist_attempts(repo, job_id: str, attempts: list[dict]) -> None:
+    account = getattr(repo, "account_attempt", None)
+    if account is None:
+        return
+    from backend.llm.models import TokenUsage
+
+    for attempt in attempts:
+        attempt_id = str(attempt.get("attempt_id") or "")
+        if not attempt_id:
+            continue
+        await account(job_id, attempt_id, TokenUsage.model_validate(attempt.get("usage") or {}))
 
 
 async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo=generation_job_repo) -> None:
@@ -54,7 +76,9 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
     try:
         while True:
             if control.abort_requested:
-                await repo.update_job_fields(job_id, {"status": "aborted", "current_chapter_id": None})
+                await repo.update_job_fields(job_id, {
+                    "status": "aborted", "current_chapter_id": None, "active_slot": None,
+                })
                 return
 
             job = await repo.get_job(job_id)
@@ -67,21 +91,46 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             chapters = await deps.list_worklist_chapters()
             chapter = job_planner.first_needing_work(chapters)
             if chapter is None:
-                await repo.update_job_fields(job_id, {"status": "completed", "current_chapter_id": None})
+                await repo.update_job_fields(job_id, {
+                    "status": "completed", "current_chapter_id": None, "active_slot": None,
+                })
                 return
 
             await repo.update_job_fields(job_id, {"current_chapter_id": str(chapter["_id"])})
             try:
                 outcome = await deps.run_chapter(str(job["novel_id"]), chapter)
+            except AttemptCapacityExceeded:
+                await _pause(repo, job_id, "attempt_capacity")
+                return
             except Exception as exc:  # noqa: BLE001 — fail-fast，人工 resume 即重试
                 logger.exception("[job %s] chapter %s failed", job_id, chapter.get("_id"))
+                failed_outcome = exc.outcome if isinstance(exc, ChapterPipelineFailed) else None
+                attempts = list(getattr(exc, "attempts", []) or [])
+                if failed_outcome is not None:
+                    attempts = list(failed_outcome.attempts)
+                await _persist_attempts(repo, job_id, attempts)
+                latest_job = await repo.get_job(job_id)
+                has_uncertain = bool(latest_job.get("has_uncertain_attempts"))
                 await repo.update_job_fields(job_id, {
-                    "status": "failed", "current_chapter_id": None,
-                    "error": {"step": "run_chapter", "chapter_id": str(chapter["_id"]), "message": str(exc)},
+                    "status": "interrupted" if has_uncertain else "failed",
+                    "pause_reason": "uncertain_attempt" if has_uncertain else None,
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": getattr(exc, "step", "run_chapter"),
+                        "chapter_id": str(chapter["_id"]),
+                        "message": str(exc),
+                        "attempts": attempts,
+                    },
                 })
                 return
 
-            await repo.append_progress(job_id, outcome_to_progress(outcome), tokens_delta=outcome.tokens)
+            await _persist_attempts(repo, job_id, outcome.attempts)
+            await repo.append_progress(
+                job_id,
+                outcome_to_progress(outcome),
+                tokens_delta=0 if outcome.attempts else outcome.tokens,
+            )
 
             # 暂停判定（顺序：冲突 > 手动 > 计划检查点）。
             if outcome.consistency_issues:

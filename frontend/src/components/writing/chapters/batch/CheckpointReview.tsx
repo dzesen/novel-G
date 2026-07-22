@@ -10,6 +10,8 @@ interface CheckpointReviewProps {
   onJumpToChapter: (chapterId: string) => void;
   onNavigateToMemory: () => void;
   onResume: () => void;
+  onRetryUncertain: () => void;
+  onSkipUncertain: () => void;
   onAbort: () => void;
   busy: boolean;
   controlError: string | null;
@@ -36,6 +38,7 @@ function Banner({ job }: { job: GenerationJob }) {
   const key =
     job.pause_reason === "conflict" ? "reasonConflict"
       : job.pause_reason === "cost_cap" ? "reasonCostCap"
+        : job.pause_reason === "attempt_capacity" ? "reasonAttemptCapacity"
         : job.pause_reason === "manual" ? "reasonManual"
           : "reasonCheckpoint";
   const tone =
@@ -141,12 +144,15 @@ export default function CheckpointReview({
   onJumpToChapter,
   onNavigateToMemory,
   onResume,
+  onRetryUncertain,
+  onSkipUncertain,
   onAbort,
   busy,
   controlError,
 }: CheckpointReviewProps) {
   const t = useTranslations("writing.batch");
   const reviewWindow = checkpointWindow(job);
+  const hasUncertainAttempt = job.has_uncertain_attempts || job.pause_reason === "uncertain_attempt";
 
   return (
     <div className="grid gap-3 border-b border-border bg-surface-secondary/40 px-4 py-3">
@@ -156,15 +162,32 @@ export default function CheckpointReview({
           <Button variant="outline" size="sm" onPress={onAbort} isDisabled={busy}>
             {t("abort")}
           </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            className="bg-accent text-white hover:bg-accent-hover"
-            onPress={onResume}
-            isDisabled={busy}
-          >
-            {busy ? t("resuming") : t("resume")}
-          </Button>
+          {hasUncertainAttempt ? (
+            <>
+              <Button variant="outline" size="sm" onPress={onSkipUncertain} isDisabled={busy}>
+                {t("uncertainSkip")}
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                className="bg-accent text-white hover:bg-accent-hover"
+                onPress={onRetryUncertain}
+                isDisabled={busy}
+              >
+                {busy ? t("resuming") : t("uncertainRetry")}
+              </Button>
+            </>
+          ) : (
+            <Button
+              variant="primary"
+              size="sm"
+              className="bg-accent text-white hover:bg-accent-hover"
+              onPress={onResume}
+              isDisabled={busy}
+            >
+              {busy ? t("resuming") : t("resume")}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -173,6 +196,11 @@ export default function CheckpointReview({
         <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
           {t("controlError", { message: controlError })}
         </div>
+      )}
+      {hasUncertainAttempt && (
+        <p className="text-xs leading-5 text-amber-700 dark:text-amber-300">
+          {t("uncertainDetail")}
+        </p>
       )}
 
       {reviewWindow.length === 0 ? (
