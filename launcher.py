@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import codecs
+import json
 import locale
 import os
 import shutil
@@ -19,6 +20,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal, TextIO
+from urllib.request import Request, urlopen
 
 import customtkinter as ctk
 
@@ -39,7 +41,7 @@ MAX_PENDING_LOG_CHARS = 160_000
 RETAIN_PENDING_LOG_CHARS = 90_000
 MAX_LOG_FILES = 100
 
-ServiceState = Literal["stopped", "starting", "running", "stopping"]
+ServiceState = Literal["stopped", "starting", "running", "external", "stopping"]
 PreflightCheck = Callable[[], tuple[bool, str]]
 
 _LOG_DIR_LOCK = threading.Lock()
@@ -50,43 +52,22 @@ def is_port_in_use(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
-def kill_port(port: int) -> bool:
-    """终止占用指定端口的进程 (Windows)。"""
-    if sys.platform != "win32":
-        return False
-
+def identify_novel_g_service(
+    health_url: str,
+    expected_service: str,
+    timeout: float = 1.5,
+) -> tuple[bool, str]:
+    """通过不可变服务标记识别端口上的已有 Novel-G 实例。"""
     try:
-        result = subprocess.run(
-            ["netstat", "-ano", "-p", "TCP"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and f":{port}" in parts[1] and parts[3] == "LISTENING":
-                pid = parts[4]
-                subprocess.run(
-                    ["taskkill", "/PID", pid, "/T", "/F"],
-                    check=False,
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                return True
-    except Exception:
-        pass
-
-    return False
-
-
-def wait_for_port_release(port: int, timeout: float = 3.0, interval: float = 0.2) -> bool:
-    """后台轮询端口释放，避免阻塞 Tk 主线程。"""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not is_port_in_use(port):
-            return True
-        time.sleep(interval)
-    return not is_port_in_use(port)
+        request = Request(health_url, headers={"Accept": "application/json"})
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed local URL
+            payload = json.loads(response.read(4096).decode("utf-8"))
+    except Exception as exc:
+        return False, f"健康检查失败：{type(exc).__name__}"
+    actual = payload.get("service") if isinstance(payload, dict) else None
+    if isinstance(payload, dict) and payload.get("status") == "ok" and actual == expected_service:
+        return True, f"已识别 {expected_service}"
+    return False, f"服务标记不匹配（收到 {actual or 'unknown'}）"
 
 
 def ensure_logs_dir() -> Path:
@@ -205,6 +186,8 @@ class ServicePanel(ctk.CTkFrame):
         accent_color: str,
         env: dict[str, str] | None = None,
         preflight: PreflightCheck | None = None,
+        health_url: str = "",
+        service_marker: str = "",
     ):
         super().__init__(
             master,
@@ -221,6 +204,8 @@ class ServicePanel(ctk.CTkFrame):
         self.url = url
         self.accent_color = accent_color
         self.preflight = preflight
+        self.health_url = health_url
+        self.service_marker = service_marker
 
         self._proc: subprocess.Popen | None = None
         self._monitor_thread: threading.Thread | None = None
@@ -429,6 +414,14 @@ class ServicePanel(ctk.CTkFrame):
                 "stop": "normal",
                 "border": self.accent_color,
             },
+            "external": {
+                "label": "已有实例",
+                "badge_fg": ("#dbeafe", "#172554"),
+                "badge_text": ("#1d4ed8", "#93c5fd"),
+                "start": "disabled",
+                "stop": "disabled",
+                "border": "#2563eb",
+            },
             "stopping": {
                 "label": "停止中",
                 "badge_fg": ("#ffedd5", "#46200f"),
@@ -625,16 +618,26 @@ class ServicePanel(ctk.CTkFrame):
                 return
 
         if is_port_in_use(self.port):
-            self.write_log(f"[WARN] 端口 {self.port} 已被占用，正在终止残留进程...\n")
-            kill_port(self.port)
-            if not wait_for_port_release(self.port):
-                self.write_log(f"[ERROR] 无法释放端口 {self.port}\n")
+            matched, detail = identify_novel_g_service(
+                self.health_url,
+                self.service_marker,
+            )
+            if matched:
+                self.write_log(f"[INFO] 端口 {self.port} 上{detail}；Launcher 不接管该进程。\n")
                 self._close_log_file()
                 with self._state_lock:
-                    self._state = "stopped"
-                self._queue_event("status", "stopped")
+                    self._state = "external"
+                self._queue_event("status", "external")
                 return
-            self.write_log(f"[INFO] 端口 {self.port} 已释放\n")
+            self.write_log(
+                f"[ERROR] 端口 {self.port} 已被未知进程占用（{detail}）。"
+                "为避免误伤，Launcher 已停止启动且不会终止该进程。\n"
+            )
+            self._close_log_file()
+            with self._state_lock:
+                self._state = "stopped"
+            self._queue_event("status", "stopped")
+            return
 
         kwargs = {
             "cwd": self.cwd,
@@ -819,9 +822,11 @@ class App(ctk.CTk):
             command=[str(VENV_PYTHON), "main.py"],
             cwd=BASE_DIR,
             port=BACKEND_PORT,
-            url=f"http://localhost:{BACKEND_PORT}/docs",
+            url=f"http://127.0.0.1:{BACKEND_PORT}/docs",
             accent_color="#15803d",
             preflight=self._check_backend_environment,
+            health_url=f"http://127.0.0.1:{BACKEND_PORT}/api/health",
+            service_marker="novel-g-backend",
         )
         self.backend.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
@@ -840,9 +845,11 @@ class App(ctk.CTk):
             command=[],
             cwd=FRONTEND_DIR,
             port=FRONTEND_PORT,
-            url=f"http://localhost:{FRONTEND_PORT}",
+            url=f"http://127.0.0.1:{FRONTEND_PORT}",
             accent_color="#2563eb",
             preflight=self._check_frontend_environment,
+            health_url=f"http://127.0.0.1:{FRONTEND_PORT}/api/health",
+            service_marker="novel-g-frontend",
         )
         self.frontend.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
@@ -917,6 +924,9 @@ class App(ctk.CTk):
         if not next_package.is_file():
             return False, "[ERROR] 前端依赖尚未安装，请先双击 setup.bat。"
 
+        if self.frontend_mode.get() == "生产模式" and not (FRONTEND_DIR / ".next" / "BUILD_ID").is_file():
+            return False, "[ERROR] 未找到生产构建，请重新运行 setup.bat 生成并复用 .next 构建。"
+
         return True, f"[OK] Node.js {version_text} 与前端依赖均已就绪。"
 
     def _on_theme_mode_change(self, mode: str) -> None:
@@ -929,10 +939,7 @@ class App(ctk.CTk):
 
     def _on_frontend_mode_change(self, mode: str) -> None:
         if mode == "生产模式":
-            if sys.platform == "win32":
-                cmd = ["cmd.exe", "/c", f"{self.npm_cmd} run build && {self.npm_cmd} run start"]
-            else:
-                cmd = ["sh", "-c", f"{self.npm_cmd} run build && {self.npm_cmd} run start"]
+            cmd = [self.npm_cmd, "run", "start"]
         else:
             cmd = [self.npm_cmd, "run", "dev"]
 

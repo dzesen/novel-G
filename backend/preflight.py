@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from urllib.parse import urlsplit
 
 from pymongo import MongoClient
@@ -19,6 +20,8 @@ def _display_mongo_target(uri: str) -> str:
 
 def run_preflight() -> tuple[bool, str]:
     """Check imports/config and verify that the configured MongoDB is reachable."""
+    if sys.version_info < (3, 9):
+        return False, "[ERROR] Python 版本过低；至少需要 3.9，推荐 3.10 或更高版本。"
     mongo_uri = str(get_config_value("mongodb_url", "mongodb://localhost:27017"))
     database_name = str(get_config_value("mongo_database_name", "novel_generator"))
     timeout_ms = min(int(get_config_value("mongo_timeout_ms", 5000)), 5000)
@@ -36,7 +39,12 @@ def run_preflight() -> tuple[bool, str]:
     finally:
         client.close()
 
-    return True, f"[OK] Python 依赖正常，MongoDB {target}/{database_name} 可连接。"
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    recommendation = "（建议升级到 3.10+）" if sys.version_info < (3, 10) else ""
+    return True, (
+        f"[OK] Python {version}{recommendation} 依赖正常，"
+        f"MongoDB {target}/{database_name} 可连接。"
+    )
 
 
 def main() -> int:
