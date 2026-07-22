@@ -340,7 +340,7 @@ export default function ChapterOutlinePanel({
                 addLabel={t("addThread")}
                 removeLabel={t("removeRow")}
                 onChange={(new_threads) => patch({ new_threads })}
-                blank={{ name: "", description: "", due_chapter_order: null, importance: "sub" }}
+                blank={{ name: "", description: "", due_target: null, importance: "sub" }}
                 render={(thread, update) => (
                   <div className="grid gap-3 md:grid-cols-2">
                     <Field label={t("fieldThreadName")}>
@@ -353,9 +353,18 @@ export default function ChapterOutlinePanel({
                     <Field label={t("fieldThreadDue")}>
                       <input
                         type="number"
-                        value={thread.due_chapter_order ?? ""}
+                        value={
+                          thread.due_target?.kind === "planned_ordinal"
+                            ? thread.due_target.ordinal
+                            : thread.due_chapter_order ?? ""
+                        }
                         onChange={(e) =>
-                          update({ due_chapter_order: e.target.value ? Number(e.target.value) : null })
+                          update({
+                            due_target: e.target.value
+                              ? { kind: "planned_ordinal", ordinal: Number(e.target.value) }
+                              : null,
+                            due_chapter_order: undefined,
+                          })
                         }
                         className="min-h-9 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent"
                       />

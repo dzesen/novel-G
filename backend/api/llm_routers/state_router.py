@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.api.llm_routers._common import GenerationParamsMixin, build_gen_kwargs
 from backend.db.errors import InvalidIdError, NotFoundError
@@ -26,9 +26,9 @@ from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema, Chapter
 from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_context,
+    estimate_tokens,
     fetch_context_inputs,
 )
-from backend.services.llm.format_review_service import validate_and_fix_format
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
     WorkflowStep,
@@ -36,13 +36,16 @@ from backend.services.llm.workflow_runner import (
     run_workflow,
     sse_event,
 )
+from backend.services.llm.generation_runtime import create_workflow_runtime
 from backend.services.llm.workflow_service import (
-    get_llm_service_for_step,
     resolve_provider_for_step,
-    resolve_timeout_for_step,
 )
 from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.state_validation import validate_state_ids
+from backend.services.novel.state_timeline import (
+    StaleStatePreview,
+    state_preview_store,
+)
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
 logger = logging.getLogger(__name__)
@@ -53,15 +56,6 @@ STATE_STEP = "chapter_state"
 
 def _load_prompts() -> dict:
     return load_prompt_config()
-
-
-def _check_state_json_schema_support(
-    step_name: str, workflow_name: str = STATE_WORKFLOW
-) -> bool:
-    provider = resolve_provider_for_step(workflow_name, step_name)
-    if not provider:
-        return False
-    return get_provider_config(provider).supports_json_schema
 
 
 CHAPTER_STATE_STEPS: tuple[WorkflowStep, ...] = (
@@ -136,6 +130,21 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         # 用正文模式而非细纲模式：既有 permanent_facts 在正文模式的永不截断档里，
         # 而那正是一致性校验的判据基础，截掉它校验就变成瞎猜（设计 §4.2）。
         context = assemble_context(inputs)
+        provider_alias = resolve_provider_for_step(STATE_WORKFLOW, STATE_STEP)
+        provider_config = get_provider_config(provider_alias)
+        estimated_input = estimate_tokens(context.to_prompt_text()) + estimate_tokens(content)
+        reserved_output = int(req.max_tokens or getattr(provider_config, "max_tokens", None) or 4096)
+        max_context_tokens = int(getattr(provider_config, "max_context_tokens", 128000))
+        if estimated_input + reserved_output > max_context_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "本章正文与上下文预计超过模型窗口："
+                    f"输入约 {estimated_input} tokens，输出预留 {reserved_output}，"
+                    f"窗口 {max_context_tokens}。"
+                    "请精简上下文或选择更大窗口的模型。"
+                ),
+            )
     except HTTPException:
         # 故意抛出的 400 必须先于下面的宽泛 handler，否则会被降级成别的码。
         raise
@@ -150,13 +159,13 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         "context": context.to_prompt_text(),
         "chapter_order": int(chapter.get("order_index") or 0),
         "chapter_title": str(chapter.get("title") or ""),
-        # 正文不进 context_builder、不受 token 预算管辖：截断正文等于让 AI
-        # 总结半章还不告诉你（设计 §4.2，已知局限 §9.2）。
+        # 正文不进 context_builder，也不会被截断；上方已把完整正文纳入模型窗口预检。
         "chapter_content": content,
     }
     roster = inputs["roster"]
 
     async def event_stream() -> AsyncGenerator[str, None]:
+        preview_payload: dict | None = None
         if context.truncated_sections or context.dropped_item_counts:
             # 截断在 LLM 调用之前就已知，故立刻告知前端而不是挂到 step done 上
             # （那是 usage 的路）。沿用 2a 设计 §6。
@@ -169,11 +178,7 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             )
 
         deps = WorkflowDeps(
-            resolve_provider=resolve_provider_for_step,
-            resolve_timeout=resolve_timeout_for_step,
-            get_service=get_llm_service_for_step,
-            supports_schema=_check_state_json_schema_support,
-            fix_format=validate_and_fix_format,
+            runtime=create_workflow_runtime(),
         )
         reported = False
         async for frame in run_workflow(
@@ -200,7 +205,13 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             if dropped and not reported:
                 yield sse_event("id_validation", {"dropped": dropped})
                 reported = True
-            yield _replace_chapter_state(parsed, cleaned)
+            if preview_payload is None:
+                preview_payload = await state_preview_store.create(
+                    req.novel_id,
+                    req.chapter_id,
+                    cleaned,
+                )
+            yield _replace_chapter_state(parsed, preview_payload)
 
     return StreamingResponse(
         event_stream(),
@@ -209,25 +220,61 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
     )
 
 
-class AcceptChapterStateRequest(ChapterStateAcceptSchema):
+class AcceptChapterStateRequest(BaseModel):
     """accept 端点入参：在 payload 之外多带一个 chapter_id。
 
     继承 ChapterStateAcceptSchema 而非重复其字段，故 extra="forbid" 一并继承——
     多余字段仍会被拒。传给服务层时要**去掉 chapter_id**，那是定位参数不是数据。
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     chapter_id: str = Field(..., min_length=1)
+    preview_id: str | None = None
+    acceptance_token: str | None = None
+    selected_fact_ids: list[str] = Field(default_factory=list)
+    selected_thread_ids: list[str] = Field(default_factory=list)
+    edits: dict = Field(default_factory=dict)
+    # 旧客户端兼容输入；新 UI 只发送 preview + selection IDs。
+    summary: str | None = None
+    character_updates: list[dict] = Field(default_factory=list)
+    accepted_thread_updates: list[dict] = Field(default_factory=list)
 
 
 @router.post("/accept-chapter-state")
 async def accept_chapter_state(req: AcceptChapterStateRequest):
     """接受状态回填：写章摘要、回填人物状态、推进伏笔状态。"""
-    payload = req.model_dump(exclude={"chapter_id"})
     try:
-        return await ChapterStateService.accept_chapter_state(req.chapter_id, payload)
+        if req.preview_id or req.acceptance_token:
+            if not req.preview_id or not req.acceptance_token:
+                raise StaleStatePreview("preview_id and acceptance_token are both required")
+            payload, preview_meta = await state_preview_store.consume(
+                chapter_id=req.chapter_id,
+                preview_id=req.preview_id,
+                acceptance_token=req.acceptance_token,
+                selected_fact_ids=req.selected_fact_ids,
+                selected_thread_ids=req.selected_thread_ids,
+                edits=req.edits,
+            )
+        else:
+            if req.summary is None:
+                raise ValueError("summary is required for legacy state acceptance")
+            payload = {
+                "summary": req.summary,
+                "character_updates": req.character_updates,
+                "accepted_thread_updates": req.accepted_thread_updates,
+            }
+            preview_meta = {"source": "legacy_accept", "confidence": "unrated"}
+        return await ChapterStateService.accept_chapter_state(
+            req.chapter_id,
+            payload,
+            acceptance_metadata=preview_meta,
+        )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except InvalidIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except StaleStatePreview as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

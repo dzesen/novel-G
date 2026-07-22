@@ -5,6 +5,12 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { apiGet, apiPost, apiPut, apiDelete } from "@/lib/api";
 import type { PlotThread, ThreadStatus, ThreadImportance } from "../chapters/outline/outlineTypes";
+import type { ChapterSummary, VolumeSummary } from "@/types/novel";
+import {
+  plotThreadDraftToPayload,
+  plotThreadToDraft,
+  type ThreadDraft,
+} from "./plotThreadDraft";
 
 interface Props {
   mode: "create" | "edit";
@@ -14,47 +20,10 @@ interface Props {
 const STATUS_VALUES: ThreadStatus[] = ["planted", "developing", "resolved", "abandoned"];
 const IMPORTANCE_VALUES: ThreadImportance[] = ["main", "sub"];
 
-type ThreadDraft = {
-  name: string;
-  description: string;
-  status: ThreadStatus;
-  importance: ThreadImportance;
-  planted_chapter_order: string;
-  due_chapter_order: string;
-  resolved_chapter_order: string;
-  notes: string;
-};
-
-function toDraft(t: PlotThread): ThreadDraft {
-  return {
-    name: t.name,
-    description: t.description ?? "",
-    status: t.status,
-    importance: t.importance,
-    planted_chapter_order: t.planted_chapter_order != null ? String(t.planted_chapter_order) : "",
-    due_chapter_order: t.due_chapter_order != null ? String(t.due_chapter_order) : "",
-    resolved_chapter_order: t.resolved_chapter_order != null ? String(t.resolved_chapter_order) : "",
-    notes: t.notes ?? "",
-  };
-}
-
-function draftToPayload(d: ThreadDraft) {
-  const num = (s: string) => (s.trim() === "" ? null : Number(s));
-  return {
-    name: d.name,
-    description: d.description,
-    status: d.status,
-    importance: d.importance,
-    planted_chapter_order: num(d.planted_chapter_order),
-    due_chapter_order: num(d.due_chapter_order),
-    resolved_chapter_order: num(d.resolved_chapter_order),
-    notes: d.notes,
-  };
-}
-
 export default function PlotThreadWorkspace({ novelId }: Props) {
   const t = useTranslations("plotThreads");
   const [threads, setThreads] = useState<PlotThread[]>([]);
+  const [chapters, setChapters] = useState<Array<ChapterSummary & { label: string }>>([]);
   const [error, setError] = useState<string | null>(null);
   const [orphansOnly, setOrphansOnly] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -67,8 +36,18 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
     setError(null);
     try {
       const query = orphansOnly ? "?with_reference_audit=true" : "";
-      const res = await apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}${query}`);
+      const [res, chapterRes, volumeRes] = await Promise.all([
+        apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}${query}`),
+        apiGet<{ data: ChapterSummary[] }>(`/api/chapters/novel/${novelId}`),
+        apiGet<{ data: VolumeSummary[] }>(`/api/volumes/novel/${novelId}`),
+      ]);
       setThreads(res.data);
+      const volumeOrders = Object.fromEntries(volumeRes.data.map((volume) => [volume._id, volume.order_index]));
+      setChapters(
+        [...chapterRes.data]
+          .sort((a, b) => (volumeOrders[a.volume_id] ?? 0) - (volumeOrders[b.volume_id] ?? 0) || a.order_index - b.order_index)
+          .map((chapter) => ({ ...chapter, label: `第${volumeOrders[chapter.volume_id] ?? "?"}卷·第${chapter.order_index}章 ${chapter.title}` })),
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : t("loadError"));
     }
@@ -91,13 +70,15 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
     setEditingId(null);
     setDraft({
       name: "", description: "", status: "planted", importance: "sub",
-      planted_chapter_order: "", due_chapter_order: "", resolved_chapter_order: "", notes: "",
+      planted_chapter_id: "", legacy_planted_chapter_order: null,
+      due_kind: "none", due_value: "", resolved_chapter_id: "",
+      legacy_resolved_chapter_order: null, notes: "",
     });
   };
   const startEdit = (th: PlotThread) => {
     setCreating(false);
     setEditingId(th._id);
-    setDraft(toDraft(th));
+    setDraft(plotThreadToDraft(th));
   };
   const cancel = () => {
     setCreating(false);
@@ -109,9 +90,9 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
     if (!draft) return;
     try {
       if (creating) {
-        await apiPost(`/api/plot-threads/novel/${novelId}`, draftToPayload(draft));
+        await apiPost(`/api/plot-threads/novel/${novelId}`, plotThreadDraftToPayload(draft, chapters));
       } else if (editingId) {
-        await apiPut(`/api/plot-threads/novel/${novelId}/${editingId}`, draftToPayload(draft));
+        await apiPut(`/api/plot-threads/novel/${novelId}/${editingId}`, plotThreadDraftToPayload(draft, chapters));
       }
       cancel();
       await load();
@@ -142,9 +123,17 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
       {field(t("name"), <input className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} />)}
       {field(t("importance"), <select className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.importance} onChange={(e) => setDraft({ ...draft, importance: e.target.value as ThreadImportance })}>{IMPORTANCE_VALUES.map((v) => <option key={v} value={v}>{t(`importance${v === "main" ? "Main" : "Sub"}`)}</option>)}</select>)}
       {field(t("status"), <select className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value as ThreadStatus })}>{STATUS_VALUES.map((v) => <option key={v} value={v}>{t(`status${v.charAt(0).toUpperCase()}${v.slice(1)}`)}</option>)}</select>)}
-      {field(t("dueChapter"), <input type="number" className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.due_chapter_order} onChange={(e) => setDraft({ ...draft, due_chapter_order: e.target.value })} />)}
-      {field(t("plantedChapter"), <input type="number" className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.planted_chapter_order} onChange={(e) => setDraft({ ...draft, planted_chapter_order: e.target.value })} />)}
-      {field(t("resolvedChapter"), <input type="number" className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.resolved_chapter_order} onChange={(e) => setDraft({ ...draft, resolved_chapter_order: e.target.value })} />)}
+      {field(t("plantedChapter"), <>
+        <select className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.planted_chapter_id} onChange={(e) => setDraft({ ...draft, planted_chapter_id: e.target.value, legacy_planted_chapter_order: null })}><option value="">{t("noChapter")}</option>{chapters.map((chapter) => <option key={chapter._id} value={chapter._id}>{chapter.label}</option>)}</select>
+        {draft.legacy_planted_chapter_order != null && <span className="text-xs text-amber-700">{t("legacyChapterOrder", { order: draft.legacy_planted_chapter_order })} {t("mapLegacyChapter")}</span>}
+      </>)}
+      {field(t("dueType"), <select className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.due_kind} onChange={(e) => setDraft({ ...draft, due_kind: e.target.value as ThreadDraft["due_kind"], due_value: "" })}><option value="none">{t("noChapter")}</option><option value="chapter">{t("existingChapter")}</option><option value="planned_ordinal">{t("plannedOrdinal")}</option></select>)}
+      {draft.due_kind === "chapter" && field(t("dueChapter"), <select className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.due_value} onChange={(e) => setDraft({ ...draft, due_value: e.target.value })}><option value="">{t("noChapter")}</option>{chapters.map((chapter) => <option key={chapter._id} value={chapter._id}>{chapter.label}</option>)}</select>)}
+      {draft.due_kind === "planned_ordinal" && field(t("plannedOrdinal"), <input type="number" min={1} className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.due_value} onChange={(e) => setDraft({ ...draft, due_value: e.target.value })} />)}
+      {field(t("resolvedChapter"), <>
+        <select className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.resolved_chapter_id} onChange={(e) => setDraft({ ...draft, resolved_chapter_id: e.target.value, legacy_resolved_chapter_order: null })}><option value="">{t("noChapter")}</option>{chapters.map((chapter) => <option key={chapter._id} value={chapter._id}>{chapter.label}</option>)}</select>
+        {draft.legacy_resolved_chapter_order != null && <span className="text-xs text-amber-700">{t("legacyChapterOrder", { order: draft.legacy_resolved_chapter_order })} {t("mapLegacyChapter")}</span>}
+      </>)}
       <div className="md:col-span-2">{field(t("description"), <textarea className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} />)}</div>
       <div className="md:col-span-2">{field(t("notes"), <textarea className="rounded border border-border bg-surface-secondary px-2 py-1" value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />)}</div>
       <div className="flex gap-2 md:col-span-2">
@@ -185,8 +174,8 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
                 {th.description && <p className="text-sm text-muted">{th.description}</p>}
                 {orphansOnly && (
                   <p className="text-xs text-muted">
-                    {(th.referenced_by_chapter_orders?.length ?? 0) > 0
-                      ? `${t("referencedBy")}${th.referenced_by_chapter_orders!.join(", ")}`
+                    {(th.referenced_by_chapters?.length ?? 0) > 0
+                      ? `${t("referencedBy")}${th.referenced_by_chapters!.map((item) => item.label).join(", ")}`
                       : t("notReferenced")}
                   </p>
                 )}

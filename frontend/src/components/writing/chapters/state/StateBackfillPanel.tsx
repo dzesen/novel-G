@@ -143,6 +143,10 @@ export function StateBackfillPanel({
 
   const accept = async () => {
     if (!stream.result) return;
+    if (!stream.result.preview_id || !stream.result.acceptance_token) {
+      setAcceptError(t("stalePreview"));
+      return;
+    }
     setAccepting(true);
     setAcceptError("");
     try {
@@ -150,17 +154,24 @@ export function StateBackfillPanel({
         "/api/llm/accept-chapter-state",
         {
           chapter_id: chapterId,
-          summary: stream.result.summary,
-          character_updates: stream.result.character_updates.map((update) => ({
-            card_id: update.card_id,
-            current_state: update.current_state,
-            accepted_permanent_facts: update.new_permanent_facts.filter((fact, index) =>
-              checkedFacts.has(factKey(update.card_id, index, fact))
-            ),
-          })),
-          accepted_thread_updates: stream.result.thread_updates
+          preview_id: stream.result.preview_id,
+          acceptance_token: stream.result.acceptance_token,
+          selected_fact_ids: stream.result.character_updates.flatMap((update) =>
+            update.new_permanent_facts
+              .filter((fact, index) => checkedFacts.has(factKey(update.card_id, index, fact)))
+              .map((fact) => fact.selection_id)
+              .filter((id): id is string => Boolean(id))
+          ),
+          selected_thread_ids: stream.result.thread_updates
             .filter((item) => checkedThreads.has(item.thread_id))
-            .map((item) => ({ thread_id: item.thread_id, status: item.status })),
+            .map((item) => item.selection_id)
+            .filter((id): id is string => Boolean(id)),
+          edits: {
+            summary: stream.result.summary,
+            current_states: Object.fromEntries(
+              stream.result.character_updates.map((update) => [update.card_id, update.current_state])
+            ),
+          },
         }
       );
       setAcceptResult(response);

@@ -344,11 +344,69 @@ async def init_generation_job_indexes():
                 ("created_at", pymongo.DESCENDING),
             ]),
             pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
+            pymongo.IndexModel(
+                [("active_slot", pymongo.ASCENDING)],
+                unique=True,
+                partialFilterExpression={"active_slot": "global", "is_deleted": False},
+                name="single_active_generation_job",
+            ),
         ]
         await jobs_collection.create_indexes(indexes)
         logger.info("成功初始化'generation_jobs'集合的索引。")
     except Exception as exc:
         logger.error("初始化 generation_jobs 索引失败：%s", exc)
+
+
+async def init_state_timeline_indexes():
+    """初始化可回放状态时间线、预览与 standalone journal 索引。"""
+    try:
+        db = get_database()
+        await db[collections.CHAPTER_STATE_DELTAS].create_indexes([
+            pymongo.IndexModel(
+                [("novel_id", 1), ("chapter_id", 1)],
+                unique=True,
+                name="chapter_state_delta_unique",
+            ),
+            pymongo.IndexModel([("novel_id", 1), ("stale", 1)]),
+        ])
+        await db[collections.CHARACTER_STATE_SNAPSHOTS].create_indexes([
+            pymongo.IndexModel(
+                [("novel_id", 1), ("chapter_id", 1), ("card_id", 1)],
+                unique=True,
+                name="character_snapshot_unique",
+            ),
+            pymongo.IndexModel([("novel_id", 1), ("card_id", 1), ("stale", 1)]),
+        ])
+        await db[collections.PLOT_THREAD_EVENTS].create_indexes([
+            pymongo.IndexModel(
+                [("novel_id", 1), ("idempotency_key", 1)],
+                unique=True,
+                name="plot_thread_event_idempotent",
+            ),
+            pymongo.IndexModel([("novel_id", 1), ("chapter_id", 1)]),
+        ])
+        await db[collections.MANUAL_CORRECTIONS].create_indexes([
+            pymongo.IndexModel(
+                [("novel_id", 1), ("idempotency_key", 1)],
+                unique=True,
+                name="manual_correction_idempotent",
+            ),
+        ])
+        await db[collections.STATE_PREVIEWS].create_indexes([
+            pymongo.IndexModel([("expires_at", 1)], expireAfterSeconds=0),
+            pymongo.IndexModel([("novel_id", 1), ("chapter_id", 1)]),
+        ])
+        await db[collections.MUTATION_JOURNALS].create_indexes([
+            pymongo.IndexModel(
+                [("novel_id", 1), ("idempotency_key", 1)],
+                unique=True,
+                name="mutation_journal_idempotent",
+            ),
+            pymongo.IndexModel([("status", 1), ("updated_at", 1)]),
+        ])
+        logger.info("成功初始化状态时间线与 mutation journal 索引。")
+    except Exception as exc:
+        logger.error("初始化状态时间线索引失败：%s", exc)
 
 
 async def init_all_indexes():
@@ -362,4 +420,5 @@ async def init_all_indexes():
     await init_plot_thread_indexes()
     await init_character_state_indexes()
     await init_generation_job_indexes()
+    await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

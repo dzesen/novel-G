@@ -31,10 +31,16 @@ export interface Scene {
 
 export type ThreadImportance = "main" | "sub";
 
+export type DueTarget =
+  | { kind: "chapter"; chapter_id: string }
+  | { kind: "planned_ordinal"; ordinal: number };
+
 export interface NewThread {
   name: string;
   description: string;
-  due_chapter_order: number | null;
+  due_target: DueTarget | null;
+  /** 仅用于读取旧预览；保存时后端转换为 due_target。 */
+  due_chapter_order?: number | null;
   importance: ThreadImportance;
 }
 
@@ -90,11 +96,15 @@ export interface PlotThread {
   status: ThreadStatus;
   importance: ThreadImportance;
   due_chapter_order: number | null;
+  due_target?: DueTarget | null;
+  planted_chapter_id?: string | null;
+  resolved_chapter_id?: string | null;
   planted_chapter_order?: number | null;
   resolved_chapter_order?: number | null;
   notes?: string;
   source?: ThreadSource;
   referenced_by_chapter_orders?: number[];
+  referenced_by_chapters?: Array<{ chapter_id: string; book_ordinal: number; label: string }>;
 }
 
 /** 细纲的作者字段（生成与编辑共用；= ChapterOutlineResult 去掉 new_threads）。 */

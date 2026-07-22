@@ -14,6 +14,9 @@ from pydantic import BaseModel
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.character_state_repository import character_state_repo
+from backend.services.novel.chapter_timeline import validate_chapter_reference
+from backend.services.novel.character_state_service import CharacterStateService
+from backend.services.novel.state_timeline import latest_chapter_id
 
 
 router = APIRouter(prefix="/api/character-states", tags=["character-states"])
@@ -22,6 +25,7 @@ router = APIRouter(prefix="/api/character-states", tags=["character-states"])
 class CurrentStateUpdateRequest(BaseModel):
     current_state: str
     as_of_chapter_order: int
+    as_of_chapter_id: Optional[str] = None
 
 
 class PermanentFactUpdateRequest(BaseModel):
@@ -29,6 +33,7 @@ class PermanentFactUpdateRequest(BaseModel):
     fact: Optional[str] = None
     kind: Optional[str] = None
     chapter_order: Optional[int] = None
+    source_chapter_id: Optional[str] = None
 
 
 def _serialize_state(state: dict) -> dict:
@@ -38,10 +43,14 @@ def _serialize_state(state: dict) -> dict:
         if key in result:
             result[key] = str(result[key])
     facts = []
+    if result.get("as_of_chapter_id") is not None:
+        result["as_of_chapter_id"] = str(result["as_of_chapter_id"])
     for fact in result.get("permanent_facts") or []:
         item = dict(fact)
         if "id" in item:
             item["id"] = str(item["id"])
+        if item.get("source_chapter_id") is not None:
+            item["source_chapter_id"] = str(item["source_chapter_id"])
         facts.append(item)
     result["permanent_facts"] = facts
     return result
@@ -69,10 +78,20 @@ async def list_states(novel_id: str):
 @router.put("/novel/{novel_id}/card/{card_id}/current-state")
 async def edit_current_state(novel_id: str, card_id: str, req: CurrentStateUpdateRequest):
     try:
-        await character_state_repo.set_current_state(
-            novel_id, card_id, req.current_state, req.as_of_chapter_order
-        )
-        state = await character_state_repo.get_state(novel_id, card_id)
+        chapter_order = req.as_of_chapter_order
+        if req.as_of_chapter_id:
+            chapter = await validate_chapter_reference(novel_id, req.as_of_chapter_id)
+            chapter_order = int(chapter.get("order_index") or 0)
+        if req.as_of_chapter_id:
+            state = await CharacterStateService.update_current_state(
+                novel_id, card_id, req.current_state, req.as_of_chapter_id, chapter_order
+            )
+        else:
+            # 仅保留给旧客户端的裸章号兼容入口；当前 UI 总是提交稳定章节 ID。
+            await character_state_repo.set_current_state(
+                novel_id, card_id, req.current_state, chapter_order
+            )
+            state = await character_state_repo.get_state(novel_id, card_id)
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
@@ -83,10 +102,19 @@ async def edit_current_state(novel_id: str, card_id: str, req: CurrentStateUpdat
 @router.put("/novel/{novel_id}/card/{card_id}/facts/{fact_id}")
 async def edit_fact(novel_id: str, card_id: str, fact_id: str, req: PermanentFactUpdateRequest):
     try:
-        await character_state_repo.update_permanent_fact(
-            novel_id, card_id, fact_id, req.model_dump(exclude_unset=True)
-        )
-        state = await character_state_repo.get_state(novel_id, card_id)
+        fields = req.model_dump(exclude_unset=True)
+        if req.source_chapter_id:
+            chapter = await validate_chapter_reference(novel_id, req.source_chapter_id)
+            fields["chapter_order"] = int(chapter.get("order_index") or 0)
+        if req.source_chapter_id:
+            state = await CharacterStateService.update_fact(
+                novel_id, card_id, fact_id, fields, req.source_chapter_id
+            )
+        else:
+            await character_state_repo.update_permanent_fact(
+                novel_id, card_id, fact_id, fields
+            )
+            state = await character_state_repo.get_state(novel_id, card_id)
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
@@ -95,10 +123,24 @@ async def edit_fact(novel_id: str, card_id: str, fact_id: str, req: PermanentFac
 
 
 @router.delete("/novel/{novel_id}/card/{card_id}/facts/{fact_id}")
-async def delete_fact(novel_id: str, card_id: str, fact_id: str):
+async def delete_fact(
+    novel_id: str,
+    card_id: str,
+    fact_id: str,
+    effective_chapter_id: Optional[str] = None,
+):
     try:
-        await character_state_repo.delete_permanent_fact(novel_id, card_id, fact_id)
-        state = await character_state_repo.get_state(novel_id, card_id)
+        before = await character_state_repo.get_state(novel_id, card_id)
+        if not any(
+            str(fact.get("id")) == fact_id
+            for fact in (before or {}).get("permanent_facts") or []
+        ):
+            raise NotFoundError(f"Permanent fact '{fact_id}' was not found")
+        effective_id = effective_chapter_id or await latest_chapter_id(novel_id)
+        await validate_chapter_reference(novel_id, effective_id)
+        state = await CharacterStateService.delete_fact(
+            novel_id, card_id, fact_id, effective_id
+        )
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)

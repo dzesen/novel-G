@@ -13,26 +13,136 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from typing import Any, Dict, List
 
 from pydantic import ValidationError
+from bson import ObjectId
 
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.character_state_repository import character_state_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.transaction import run_mongo_write_unit
+from backend.db.mutation import MutationCommand, commit_mutation
 from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.state_validation import validate_state_ids
+from backend.services.novel.state_timeline import record_acceptance
 
 logger = logging.getLogger(__name__)
 
 
 class ChapterStateService:
     @staticmethod
+    async def _execute_accept_chapter_state(session, mutation):
+        """从持久化命令恢复状态接受，不重新计算去重或生成新的事实 ID。"""
+        command = mutation.journal["command"]["payload"]
+        novel_id = str(mutation.journal["novel_id"])
+        chapter_id = str(command["chapter_id"])
+        chapter_order = int(command["chapter_order"])
+        data = command["state"]
+        planned = data["character_updates"]
+        skipped_duplicate_facts = list(command.get("skipped_duplicate_facts") or [])
+        acceptance_metadata = command.get("acceptance_metadata") or {}
+        states_updated = 0
+        facts_appended = 0
+        threads_updated = 0
+        try:
+            await chapter_repo.update_chapter(
+                chapter_id, {"summary": data["summary"]}, session=session
+            )
+
+            for character_index, update in enumerate(planned):
+                await character_state_repo.upsert_state(
+                    novel_id,
+                    update["card_id"],
+                    update["current_state"],
+                    chapter_order,
+                    session=session,
+                    as_of_chapter_id=chapter_id,
+                )
+                states_updated += 1
+                for fact_index, fact in enumerate(update["accepted_permanent_facts"]):
+                    child_key = f"fact_{character_index}_{fact_index}"
+                    if mutation.was_received(child_key):
+                        facts_appended += 1
+                        continue
+                    await character_state_repo.append_permanent_fact(
+                        novel_id,
+                        update["card_id"],
+                        {**fact, "id": mutation.child_id(child_key)},
+                        session=session,
+                    )
+                    await mutation.receipt(
+                        child_key, {"fact_id": mutation.child_id(child_key)}
+                    )
+                    facts_appended += 1
+
+            for thread_index, thread in enumerate(data["accepted_thread_updates"]):
+                child_key = f"thread_update_{thread_index}"
+                if mutation.was_received(child_key):
+                    threads_updated += 1
+                    continue
+                changes: Dict[str, Any] = {"status": thread["status"]}
+                if thread["status"] == "resolved":
+                    changes["resolved_chapter_order"] = chapter_order
+                    changes["resolved_chapter_id"] = chapter_id
+                await plot_thread_repo.update_thread(
+                    novel_id, thread["thread_id"], changes, session=session
+                )
+                await mutation.receipt(child_key, {"thread_id": thread["thread_id"]})
+                threads_updated += 1
+
+            if mutation.was_received("timeline"):
+                timeline_revision = int(
+                    mutation.journal["receipts"]["timeline"]["revision"]
+                )
+            else:
+                timeline_updates = []
+                for character_index, update in enumerate(planned):
+                    facts = []
+                    for fact_index, fact in enumerate(update["accepted_permanent_facts"]):
+                        child_key = f"fact_{character_index}_{fact_index}"
+                        facts.append({**fact, "id": mutation.child_id(child_key)})
+                    timeline_updates.append({
+                        **update,
+                        "accepted_permanent_facts": facts,
+                    })
+                timeline_revision = await record_acceptance(
+                    novel_id,
+                    chapter_id,
+                    {**data, "character_updates": timeline_updates},
+                    evaluation=acceptance_metadata,
+                    session=session,
+                )
+                await mutation.receipt("timeline", {"revision": timeline_revision})
+
+            return {
+                "chapter_id": chapter_id,
+                "states_updated": states_updated,
+                "facts_appended": facts_appended,
+                "threads_updated": threads_updated,
+                "skipped_duplicate_facts": skipped_duplicate_facts,
+                "timeline_revision": timeline_revision,
+            }
+        except Exception:
+            logger.error(
+                "accept_chapter_state 中途失败：chapter_id=%s 已写 %s 个角色状态、"
+                "%s 条永久事实、%s 个伏笔（非原子，将由 mutation journal 恢复）",
+                chapter_id,
+                states_updated,
+                facts_appended,
+                threads_updated,
+            )
+            raise
+
+    @staticmethod
     async def accept_chapter_state(
         chapter_id: str,
         payload: Dict[str, Any],
+        *,
+        acceptance_metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """接受状态回填预览：写章摘要、回填人物状态、推进伏笔状态。
 
@@ -71,8 +181,7 @@ class ChapterStateService:
             raise ValueError(f"状态回填引用了该小说中不存在的 id，未做任何写入：{details}")
 
         # 层 1c：去重判定也放在写前——需要读库里现有的事实，而这是读不是写。
-        # 同章同文本即视为重复（设计 §5.3）。跨章不去重：不同 chapter_order
-        # 是不同的断言。
+        # 同一稳定 chapter_id + 同文本才视为重复；跨卷同号不再互相吞掉。
         planned: List[Dict[str, Any]] = []
         skipped_duplicate_facts: List[str] = []
         for update in data["character_updates"]:
@@ -82,7 +191,7 @@ class ChapterStateService:
             existing_texts = {
                 str(fact.get("fact", "")).strip()
                 for fact in ((state or {}).get("permanent_facts") or [])
-                if int(fact.get("chapter_order", 0)) == chapter_order
+                if str(fact.get("source_chapter_id") or "") == chapter_id
             }
 
             fresh = []
@@ -93,63 +202,46 @@ class ChapterStateService:
                     skipped_duplicate_facts.append(text)
                     continue
                 existing_texts.add(text)
-                fresh.append({**fact, "chapter_order": chapter_order})
+                fresh.append(
+                    {
+                        **fact,
+                        "chapter_order": chapter_order,
+                        "source_chapter_id": chapter_id,
+                    }
+                )
             planned.append({**update, "accepted_permanent_facts": fresh})
 
-        async def _write(session):
-            states_updated = 0
-            facts_appended = 0
-            threads_updated = 0
-            try:
-                await chapter_repo.update_chapter(
-                    chapter_id, {"summary": data["summary"]}, session=session
-                )
+        child_ids = {}
+        for character_index, update in enumerate(planned):
+            for fact_index, _fact in enumerate(update["accepted_permanent_facts"]):
+                child_ids[f"fact_{character_index}_{fact_index}"] = str(ObjectId())
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    **data,
+                    "character_updates": planned,
+                    "acceptance_metadata": acceptance_metadata or {},
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
 
-                for update in planned:
-                    # **顺序是硬约束**：append_permanent_fact 在状态文档不存在时抛
-                    # NotFoundError（阶段 1 刻意如此——永久事实绝不能被静默丢弃）。
-                    # 因此无条件先 upsert_state，即使该角色只有事实被勾选、
-                    # current_state 为空文本。颠倒过来，首次出场的角色永远存不进事实。
-                    await character_state_repo.upsert_state(
-                        novel_id,
-                        update["card_id"],
-                        update["current_state"],
-                        chapter_order,
-                        session=session,
-                    )
-                    states_updated += 1
-                    for fact in update["accepted_permanent_facts"]:
-                        await character_state_repo.append_permanent_fact(
-                            novel_id, update["card_id"], fact, session=session
-                        )
-                        facts_appended += 1
-
-                for thread in data["accepted_thread_updates"]:
-                    changes: Dict[str, Any] = {"status": thread["status"]}
-                    if thread["status"] == "resolved":
-                        changes["resolved_chapter_order"] = chapter_order
-                    await plot_thread_repo.update_thread(
-                        novel_id, thread["thread_id"], changes, session=session
-                    )
-                    threads_updated += 1
-
-                return {
+        return await commit_mutation(
+            MutationCommand(
+                novel_id=novel_id,
+                idempotency_key=f"accept-state:{chapter_id}:{digest}",
+                operation="accept_chapter_state",
+                payload={
                     "chapter_id": chapter_id,
-                    "states_updated": states_updated,
-                    "facts_appended": facts_appended,
-                    "threads_updated": threads_updated,
+                    "chapter_order": chapter_order,
+                    "state": {**data, "character_updates": planned},
                     "skipped_duplicate_facts": skipped_duplicate_facts,
-                }
-            except Exception:
-                # 失败精确上报已写内容，不谎报回滚（单机无事务）。
-                logger.error(
-                    "accept_chapter_state 中途失败：chapter_id=%s 已写 %s 个角色状态、"
-                    "%s 条永久事实、%s 个伏笔（非原子，未回滚）",
-                    chapter_id,
-                    states_updated,
-                    facts_appended,
-                    threads_updated,
-                )
-                raise
-
-        return await run_mongo_write_unit(_write, "accept_chapter_state")
+                    "acceptance_metadata": acceptance_metadata or {},
+                },
+                before_image={"chapter_summary": chapter.get("summary", "")},
+                child_ids=child_ids,
+            ),
+            ChapterStateService._execute_accept_chapter_state,
+        )

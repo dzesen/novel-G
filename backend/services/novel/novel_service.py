@@ -56,6 +56,12 @@ class NovelService:
             plot_threads_repo = BaseRepository(collections.PLOT_THREADS)
             character_states_repo = BaseRepository(collections.CHARACTER_STATES)
             generation_jobs_repo = BaseRepository(collections.GENERATION_JOBS)
+            chapter_state_deltas_repo = BaseRepository(collections.CHAPTER_STATE_DELTAS)
+            character_state_snapshots_repo = BaseRepository(collections.CHARACTER_STATE_SNAPSHOTS)
+            plot_thread_events_repo = BaseRepository(collections.PLOT_THREAD_EVENTS)
+            manual_corrections_repo = BaseRepository(collections.MANUAL_CORRECTIONS)
+            state_previews_repo = BaseRepository(collections.STATE_PREVIEWS)
+            mutation_journals_repo = BaseRepository(collections.MUTATION_JOURNALS)
 
             stats = {}
 
@@ -72,6 +78,12 @@ class NovelService:
             stats["plot_threads_deleted"] = await plot_threads_repo.hard_delete_many(query, session=session)
             stats["character_states_deleted"] = await character_states_repo.hard_delete_many(query, session=session)
             stats["generation_jobs_deleted"] = await generation_jobs_repo.hard_delete_many(query, session=session)
+            stats["chapter_state_deltas_deleted"] = await chapter_state_deltas_repo.hard_delete_many(query, session=session)
+            stats["character_state_snapshots_deleted"] = await character_state_snapshots_repo.hard_delete_many(query, session=session)
+            stats["plot_thread_events_deleted"] = await plot_thread_events_repo.hard_delete_many(query, session=session)
+            stats["manual_corrections_deleted"] = await manual_corrections_repo.hard_delete_many(query, session=session)
+            stats["state_previews_deleted"] = await state_previews_repo.hard_delete_many(query, session=session)
+            stats["mutation_journals_deleted"] = await mutation_journals_repo.hard_delete_many(query, session=session)
 
             novel_deleted = await novel_repo.hard_delete_one({"_id": obj_id}, session=session)
             stats["novel_deleted"] = 1 if novel_deleted else 0

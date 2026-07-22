@@ -24,6 +24,12 @@ CHARACTER_STATES = "character_states"
 # 本集合有写入方（作业引擎），generation_tasks 无。级联 stats key 用规则名
 # generation_jobs_deleted，勿沿用 generation_tasks 那条不规则的 tasks_deleted。
 GENERATION_JOBS = "generation_jobs"
+CHAPTER_STATE_DELTAS = "chapter_state_deltas"
+CHARACTER_STATE_SNAPSHOTS = "character_state_snapshots"
+PLOT_THREAD_EVENTS = "plot_thread_events"
+MANUAL_CORRECTIONS = "manual_corrections"
+STATE_PREVIEWS = "state_previews"
+MUTATION_JOURNALS = "mutation_journals"
 
 ACTIVE_COLLECTIONS = frozenset({
     NOVELS,
@@ -36,6 +42,12 @@ ACTIVE_COLLECTIONS = frozenset({
     PLOT_THREADS,
     CHARACTER_STATES,
     GENERATION_JOBS,
+    CHAPTER_STATE_DELTAS,
+    CHARACTER_STATE_SNAPSHOTS,
+    PLOT_THREAD_EVENTS,
+    MANUAL_CORRECTIONS,
+    STATE_PREVIEWS,
+    MUTATION_JOURNALS,
 })
 
 # 遗留集合：仓储模块已删除，当前无任何写入方。

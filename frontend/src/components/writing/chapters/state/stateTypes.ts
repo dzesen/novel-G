@@ -13,18 +13,21 @@ export type FactKind = "death" | "injury" | "identity" | "relation" | "ability";
 export interface PermanentFactProposal {
   fact: string;
   kind: FactKind;
+  selection_id?: string;
 }
 
 export interface CharacterStateUpdate {
   card_id: string;
   current_state: string;
   new_permanent_facts: PermanentFactProposal[];
+  selection_id?: string;
 }
 
 export interface ThreadStatusUpdate {
   thread_id: string;
   status: "developing" | "resolved";
   evidence: string;
+  selection_id?: string;
 }
 
 export interface ConsistencyIssue {
@@ -39,6 +42,9 @@ export interface ChapterStateResult {
   character_updates: CharacterStateUpdate[];
   thread_updates: ThreadStatusUpdate[];
   consistency_issues: ConsistencyIssue[];
+  preview_id?: string;
+  acceptance_token?: string;
+  preview_expires_at?: string;
 }
 
 /** accept 端点的返回。skipped_duplicate_facts 必须显示——去重不得静默（设计 §5.3）。 */
@@ -48,4 +54,5 @@ export interface ChapterStateAcceptResponse {
   facts_appended: number;
   threads_updated: number;
   skipped_duplicate_facts: string[];
+  timeline_revision?: number;
 }

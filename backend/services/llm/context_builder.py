@@ -26,6 +26,8 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSES, plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
+from backend.services.novel.chapter_timeline import ChapterTimeline
+from backend.services.novel.state_timeline import has_tracked_timeline, snapshot_before
 from backend.db.repositories.worldbook_repository import worldbook_repo
 
 # 默认上下文预算。写到第 87 章时，"最近 K 章 + 所有活跃伏笔 + 相关卡片"
@@ -118,10 +120,13 @@ def _volume_section(volume: dict) -> "Optional[ContextSection]":
 def _recent_chapters_section(recent: list) -> "Optional[ContextSection]":
     """装 recent 章摘要段，每章一条可独立丢弃的 item。两模式共用（§4.2 共享 helper）。
 
-    drop_rank = order_index：最旧的 order_index 最小 → 逐项截断时最先丢。
+    drop_rank = book_ordinal：最旧的全书位置最小 → 逐项截断时最先丢。
     """
     items = [
-        ContextItem(text=f"第 {c['order_index']} 章：{c['summary']}", drop_rank=int(c["order_index"]))
+        ContextItem(
+            text=f"{c.get('display_label') or ('第 %s 章' % c['order_index'])}：{c['summary']}",
+            drop_rank=int(c.get("book_ordinal") or c["order_index"]),
+        )
         for c in recent if c.get("summary")
     ]
     if not items:
@@ -205,17 +210,27 @@ OUTLINE_SECTION_PRIORITY = {
 OUTLINE_NEVER_TRUNCATE = {name for name, weight in OUTLINE_SECTION_PRIORITY.items() if weight >= 100}
 
 
-def _facts_up_to(state: dict, chapter_order: int) -> list:
-    """取 chapter_order 及之前确立的永久事实。
+def _facts_up_to(state: dict, chapter_order: int, book_ordinal: int | None = None) -> list:
+    """取目标章节及之前确立的永久事实。
 
-    过滤是回溯的关键：重写第 30 章时喂入第 80 章的事实就是剧透。
+    新数据按稳定 source_chapter_id 派生的全书序过滤；历史裸章号只有在整本
+    唯一匹配时才会由取数层补 `_source_book_ordinal`，歧义数据保守排除。
     """
     facts = state.get("permanent_facts") or []
+    if book_ordinal is not None:
+        return [
+            fact for fact in facts
+            if isinstance(fact.get("_source_book_ordinal"), int)
+            and fact["_source_book_ordinal"] <= book_ordinal
+        ]
     return [f for f in facts if int(f.get("chapter_order", 0)) <= chapter_order]
 
 
 def _format_facts(name: str, facts: list) -> str:
-    lines = [f"- {f['fact']}（第 {f['chapter_order']} 章确立，{f['kind']}）" for f in facts]
+    lines = [
+        f"- {fact['fact']}（{fact.get('_source_label') or ('第 %s 章' % fact.get('chapter_order', '?'))}确立，{fact['kind']}）"
+        for fact in facts
+    ]
     return f"{name} 的既定事实：\n" + "\n".join(lines)
 
 
@@ -294,6 +309,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     cards = inputs.get("cards") or {}
     states = inputs.get("states") or {}
     chapter_order = int(chapter.get("order_index") or 0)
+    book_ordinal = chapter.get("book_ordinal")
 
     present_ids = list(outline.get("present_character_card_ids") or [])
     sections: List[ContextSection] = []
@@ -311,7 +327,11 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
             continue
         state = states.get(card_id) or {}
         block = f"{card['name']}：{card.get('description', '')}"
-        if state.get("current_state"):
+        state_ordinal = state.get("_as_of_book_ordinal")
+        if state.get("current_state") and (
+            book_ordinal is None
+            or (isinstance(state_ordinal, int) and state_ordinal <= book_ordinal)
+        ):
             block += f"\n当下状态（截至第 {state.get('as_of_chapter_order', chapter_order)} 章）：{state['current_state']}"
         present_blocks.append(block)
     if present_blocks:
@@ -348,7 +368,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         state = states.get(card_id)
         if not card or not state:
             continue
-        facts = _facts_up_to(state, chapter_order)
+        facts = _facts_up_to(state, chapter_order, book_ordinal)
         if facts:
             fact_blocks.append(_format_facts(card["name"], facts))
     if fact_blocks:
@@ -511,6 +531,7 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
     states = inputs.get("states") or {}
     roster = inputs.get("roster") or {}
     chapter_order = int(chapter.get("order_index") or 0)
+    book_ordinal = chapter.get("book_ordinal")
 
     sections: List[ContextSection] = []
 
@@ -528,7 +549,7 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
             state = states.get(card_id)
             if not state:
                 continue
-            facts = _facts_up_to(state, chapter_order)
+            facts = _facts_up_to(state, chapter_order, book_ordinal)
             if facts:
                 fact_blocks.append(_format_facts(card["name"], facts))
     if fact_blocks:
@@ -583,13 +604,23 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
 
     order_index = int(chapter.get("order_index") or 0)
     all_chapters = await chapter_repo.get_chapters_by_novel(novel_id)
+    volumes = await volume_repo.get_volumes_by_novel(novel_id)
+    timeline = ChapterTimeline(volumes, all_chapters)
+    target_position = timeline.position(chapter_id)
+    chapter_by_id = {str(item["_id"]): item for item in all_chapters}
     recent = [
-        {"order_index": int(c.get("order_index") or 0), "summary": c.get("summary", "")}
-        for c in all_chapters
-        if 0 < int(c.get("order_index") or 0) < order_index
+        {
+            "order_index": position.chapter_order,
+            "book_ordinal": position.book_ordinal,
+            "display_label": (
+                f"第 {position.chapter_order} 章"
+                if position.volume_order == target_position.volume_order
+                else position.label
+            ),
+            "summary": chapter_by_id[position.chapter_id].get("summary", ""),
+        }
+        for position in timeline.recent_before(chapter_id, RECENT_CHAPTER_COUNT)
     ]
-    recent.sort(key=lambda c: c["order_index"])
-    recent = recent[-RECENT_CHAPTER_COUNT:]
 
     card_docs = await character_repo.list_cards(novel_id, "character")
     cards = {
@@ -612,14 +643,52 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             }
 
     state_docs = await character_state_repo.list_states(novel_id)
-    states = {
-        str(state["card_id"]): {
+    historical_snapshots = await snapshot_before(novel_id, chapter_id)
+    if historical_snapshots or await has_tracked_timeline(novel_id):
+        state_docs = [
+            {
+                **snapshot,
+                "as_of_chapter_id": snapshot.get("chapter_id"),
+                "as_of_chapter_order": timeline.position(
+                    str(snapshot["chapter_id"])
+                ).chapter_order,
+            }
+            for snapshot in historical_snapshots
+        ]
+    states = {}
+    for state in state_docs:
+        facts = []
+        for raw_fact in state.get("permanent_facts") or []:
+            fact = dict(raw_fact)
+            source_id = fact.get("source_chapter_id")
+            try:
+                source_position = (
+                    timeline.position(str(source_id))
+                    if source_id
+                    else timeline.unique_legacy_order(int(fact.get("chapter_order") or 0))
+                )
+            except ValueError:
+                source_position = None
+            if source_position is not None:
+                fact["_source_book_ordinal"] = source_position.book_ordinal
+                fact["_source_label"] = source_position.label
+            facts.append(fact)
+        as_of_id = state.get("as_of_chapter_id")
+        try:
+            as_of_position = (
+                timeline.position(str(as_of_id))
+                if as_of_id
+                else timeline.unique_legacy_order(int(state.get("as_of_chapter_order") or 0))
+            )
+        except ValueError:
+            as_of_position = None
+        states[str(state["card_id"])] = {
             "current_state": state.get("current_state", ""),
             "as_of_chapter_order": state.get("as_of_chapter_order", 0),
-            "permanent_facts": state.get("permanent_facts", []),
+            "as_of_chapter_id": str(as_of_id) if as_of_id else None,
+            "_as_of_book_ordinal": as_of_position.book_ordinal if as_of_position else None,
+            "permanent_facts": facts,
         }
-        for state in state_docs
-    }
 
     thread_docs = await plot_thread_repo.list_threads(
         novel_id, statuses=ACTIVE_THREAD_STATUSES
@@ -680,7 +749,12 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             "era_background": novel.get("era_background", ""),
         },
         "volume": {"summary": volume.get("summary", ""), "arc": volume.get("arc", "")},
-        "chapter": {"order_index": order_index, "outline": outline},
+        "chapter": {
+            "order_index": order_index,
+            "book_ordinal": target_position.book_ordinal,
+            "chapter_id": chapter_id,
+            "outline": outline,
+        },
         "recent_chapters": recent,
         "cards": cards,
         "worldbook_cards": worldbook_cards,

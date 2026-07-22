@@ -44,6 +44,8 @@ class CharacterStateRepository(BaseRepository):
         current_state: str,
         as_of_chapter_order: int,
         session: AsyncClientSession | None = None,
+        *,
+        as_of_chapter_id: str | None = None,
     ) -> str:
         """写入或覆盖某角色的当下状态。
 
@@ -66,14 +68,18 @@ class CharacterStateRepository(BaseRepository):
         novel_obj_id = to_object_id(novel_id)
         card_obj_id = to_object_id(card_id)
         now = get_utc_now()
+        state_fields = {
+            "current_state": str(current_state).strip(),
+            "as_of_chapter_order": int(as_of_chapter_order),
+            "updated_at": now,
+        }
+        if as_of_chapter_id:
+            state_fields["as_of_chapter_id"] = to_object_id(as_of_chapter_id)
+            state_fields["history_status"] = "tracked"
         result = await self.collection.update_one(
             {"novel_id": novel_obj_id, "card_id": card_obj_id},
             {
-                "$set": {
-                    "current_state": str(current_state).strip(),
-                    "as_of_chapter_order": int(as_of_chapter_order),
-                    "updated_at": now,
-                },
+                "$set": state_fields,
                 "$setOnInsert": {
                     "novel_id": novel_obj_id,
                     "card_id": card_obj_id,
@@ -148,17 +154,24 @@ class CharacterStateRepository(BaseRepository):
             raise ValueError("chapter_order must be greater than 0")
 
         current = await self._get_state(novel_id, card_id, session=session)
+        stored_fact = {
+            "id": to_object_id(fact["id"]) if fact.get("id") else ObjectId(),
+            "chapter_order": chapter_order,
+            "fact": text,
+            "kind": kind,
+            "created_at": get_utc_now(),
+        }
+        if fact.get("source_chapter_id"):
+            stored_fact["source_chapter_id"] = to_object_id(fact["source_chapter_id"])
+            stored_fact["source_status"] = "tracked"
         result = await self.collection.update_one(
-            {"_id": current["_id"]},
+            {
+                "_id": current["_id"],
+                "permanent_facts.id": {"$ne": stored_fact["id"]},
+            },
             {
                 "$push": {
-                    "permanent_facts": {
-                        "id": ObjectId(),
-                        "chapter_order": chapter_order,
-                        "fact": text,
-                        "kind": kind,
-                        "created_at": get_utc_now(),
-                    }
+                    "permanent_facts": stored_fact
                 },
                 "$set": {"updated_at": get_utc_now()},
             },
@@ -207,6 +220,8 @@ class CharacterStateRepository(BaseRepository):
         current_state: str,
         as_of_chapter_order: int,
         session: AsyncClientSession | None = None,
+        *,
+        as_of_chapter_id: str | None = None,
     ) -> bool:
         """人工订正 current_state。要求文档已存在，否则抛 NotFoundError。
 
@@ -215,6 +230,13 @@ class CharacterStateRepository(BaseRepository):
         if as_of_chapter_order <= 0:
             raise ValueError("as_of_chapter_order must be greater than 0")
         now = get_utc_now()
+        state_fields = {
+            "current_state": str(current_state).strip(),
+            "as_of_chapter_order": int(as_of_chapter_order),
+            "updated_at": now,
+        }
+        if as_of_chapter_id:
+            state_fields["as_of_chapter_id"] = to_object_id(as_of_chapter_id)
         result = await self.collection.update_one(
             {
                 "novel_id": to_object_id(novel_id),
@@ -222,11 +244,7 @@ class CharacterStateRepository(BaseRepository):
                 "is_deleted": False,
             },
             {
-                "$set": {
-                    "current_state": str(current_state).strip(),
-                    "as_of_chapter_order": int(as_of_chapter_order),
-                    "updated_at": now,
-                }
+                "$set": state_fields
             },
             session=session,
         )
@@ -262,6 +280,10 @@ class CharacterStateRepository(BaseRepository):
             if chapter_order <= 0:
                 raise ValueError("chapter_order must be greater than 0")
             set_ops["permanent_facts.$.chapter_order"] = chapter_order
+        if fields.get("source_chapter_id") is not None:
+            set_ops["permanent_facts.$.source_chapter_id"] = to_object_id(
+                fields["source_chapter_id"]
+            )
         if not set_ops:
             return False
         set_ops["updated_at"] = get_utc_now()
