@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import logging
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
@@ -33,7 +33,6 @@ from backend.services.llm.context_builder import (
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
     WorkflowStep,
-    parse_sse_event,
     run_workflow,
     sse_event,
 )
@@ -41,7 +40,6 @@ from backend.services.llm.generation_runtime import create_workflow_runtime
 from backend.services.llm.workflow_service import (
     resolve_provider_for_step,
 )
-from backend.services.novel.state_validation import validate_state_ids
 from backend.services.novel.state_proposal import (
     StaleStatePreview,
     state_proposal_module,
@@ -75,38 +73,6 @@ CHAPTER_STATE_STEPS: tuple[WorkflowStep, ...] = (
 class ChapterStateRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
     chapter_id: str = Field(..., min_length=1)
-
-
-def _extract_chapter_state(parsed) -> Optional[dict]:
-    """从一帧解析结果里取出回填数据；该帧不携带它则返回 None。
-
-    **两类**帧携带它：单步的 step done（data 直接是回填数据）与工作流 done
-    （result.chapter_state）。两处都要清洗——只清 done 的话，前端按 step 帧
-    渲染时用的仍是未校验的原始 id。
-    """
-    if parsed is None:
-        return None
-    event, data = parsed
-    if event == "step" and data.get("step") == STATE_STEP and data.get("status") == "done":
-        payload = data.get("data")
-        return payload if isinstance(payload, dict) else None
-    if event == "done" and data.get("success") and isinstance(data.get("result"), dict):
-        payload = data["result"].get(STATE_STEP)
-        return payload if isinstance(payload, dict) else None
-    return None
-
-
-def _replace_chapter_state(parsed, cleaned: dict) -> str:
-    """把清洗后的数据写回帧并重新序列化。只在 _extract_chapter_state 命中时调用。"""
-    event, data = parsed
-    data = dict(data)
-    if event == "step":
-        data["data"] = cleaned
-    else:
-        result = dict(data["result"])
-        result[STATE_STEP] = cleaned
-        data["result"] = result
-    return sse_event(event, data)
 
 
 @router.post("/extract-chapter-state-by-ai")
@@ -196,7 +162,6 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
     roster = inputs["roster"]
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        preview_payload: dict | None = None
         if context.truncated_sections or context.dropped_item_counts:
             # 截断在 LLM 调用之前就已知，故立刻告知前端而不是挂到 step done 上
             # （那是 usage 的路）。沿用 2a 设计 §6。
@@ -211,58 +176,25 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         deps = WorkflowDeps(
             runtime=create_workflow_runtime(),
         )
-        reported = False
-        generation_audit: dict = {}
-        try:
-            async for frame in run_workflow(
-                workflow_name=STATE_WORKFLOW,
-                steps=CHAPTER_STATE_STEPS,
-                prompts=_load_prompts().get(CHAPTER_STATE_PROMPT_NAME, {}),
-                params=params,
-                gen_kwargs=build_gen_kwargs(req),
-                cached={},
-                deps=deps,
-                request_id=uuid4().hex[:8],
-                is_disconnected=request.is_disconnected,
-                log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
-            ):
-                parsed = parse_sse_event(frame)
-                if parsed is not None:
-                    _event_name, event_data = parsed
-                    usage = event_data.get("usage") or event_data.get("usage_so_far")
-                    if isinstance(usage, dict):
-                        generation_audit["usage"] = usage
-                payload = _extract_chapter_state(parsed)
-                if payload is None:
-                    yield frame
-                    continue
-                # AI 返回的每个 id 必须在 roster 内，不在则剔除并**明确上报**。
-                cleaned, dropped = validate_state_ids(payload, roster)
-                if dropped and not reported:
-                    yield sse_event("id_validation", {"dropped": dropped})
-                    reported = True
-                if preview_payload is None:
-                    preview_payload = await state_proposal_module.publish(
-                        generation_lease,
-                        cleaned,
-                        audit=generation_audit,
-                    )
-                yield _replace_chapter_state(parsed, preview_payload)
-            if generation_audit:
-                await state_proposal_module.record_generation_audit(
-                    generation_lease, generation_audit
-                )
-            if preview_payload is None:
-                await state_proposal_module.mark_failed(
-                    generation_lease,
-                    RuntimeError("State workflow ended without a proposal candidate"),
-                    audit=generation_audit,
-                )
-        except BaseException as exc:
-            await state_proposal_module.mark_failed(
-                generation_lease, exc, audit=generation_audit
-            )
-            raise
+        frames = run_workflow(
+            workflow_name=STATE_WORKFLOW,
+            steps=CHAPTER_STATE_STEPS,
+            prompts=_load_prompts().get(CHAPTER_STATE_PROMPT_NAME, {}),
+            params=params,
+            gen_kwargs=build_gen_kwargs(req),
+            cached={},
+            deps=deps,
+            request_id=uuid4().hex[:8],
+            is_disconnected=request.is_disconnected,
+            log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
+        )
+        async for frame in state_proposal_module.stream_preview(
+            generation_lease,
+            frames,
+            roster=roster,
+            state_step=STATE_STEP,
+        ):
+            yield frame
 
     return StreamingResponse(
         event_stream(),

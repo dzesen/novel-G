@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from collections.abc import AsyncIterable, AsyncIterator
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,8 @@ from backend.db.mutation import MutationConflictError
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
+from backend.services.llm.workflow_runner import parse_sse_event, sse_event
+from backend.services.novel.state_validation import validate_state_ids
 
 
 PROPOSAL_TTL_SECONDS = 15 * 60
@@ -324,6 +327,78 @@ class StateProposalModule:
             },
         )
 
+    async def stream_preview(
+        self,
+        lease: StateProposalLease,
+        frames: AsyncIterable[str],
+        *,
+        roster: dict[str, Any],
+        state_step: str = "chapter_state",
+    ) -> AsyncIterator[str]:
+        """Own SSE candidate validation, publication, auditing, and failure state."""
+        proposal_payload: dict[str, Any] | None = None
+        generation_audit: dict[str, Any] = {}
+        reported_invalid_ids = False
+        try:
+            async for frame in frames:
+                parsed = parse_sse_event(frame)
+                if parsed is None:
+                    yield frame
+                    continue
+                event, event_data = parsed
+                usage = event_data.get("usage") or event_data.get("usage_so_far")
+                if isinstance(usage, dict):
+                    generation_audit["usage"] = usage
+                candidate = None
+                if (
+                    event == "step"
+                    and event_data.get("step") == state_step
+                    and event_data.get("status") == "done"
+                    and isinstance(event_data.get("data"), dict)
+                ):
+                    candidate = event_data["data"]
+                elif (
+                    event == "done"
+                    and event_data.get("success")
+                    and isinstance(event_data.get("result"), dict)
+                    and isinstance(event_data["result"].get(state_step), dict)
+                ):
+                    candidate = event_data["result"][state_step]
+                if candidate is None:
+                    yield frame
+                    continue
+
+                cleaned, dropped = validate_state_ids(candidate, roster)
+                if dropped and not reported_invalid_ids:
+                    yield sse_event("id_validation", {"dropped": dropped})
+                    reported_invalid_ids = True
+                if proposal_payload is None:
+                    proposal_payload = await self.publish(
+                        lease,
+                        cleaned,
+                        audit=generation_audit,
+                    )
+                replacement = dict(event_data)
+                if event == "step":
+                    replacement["data"] = proposal_payload
+                else:
+                    result = dict(replacement["result"])
+                    result[state_step] = proposal_payload
+                    replacement["result"] = result
+                yield sse_event(event, replacement)
+
+            if generation_audit:
+                await self.record_generation_audit(lease, generation_audit)
+            if proposal_payload is None:
+                await self.mark_failed(
+                    lease,
+                    RuntimeError("State workflow ended without a proposal candidate"),
+                    audit=generation_audit,
+                )
+        except BaseException as exc:
+            await self.mark_failed(lease, exc, audit=generation_audit)
+            raise
+
     async def create(
         self,
         novel_id: str,
@@ -392,11 +467,31 @@ class StateProposalModule:
         if proposal.get("status") == "proposed":
             chapter = await chapter_repo.get_chapter_by_id(chapter_id)
             if _content_digest(chapter) != proposal.get("content_digest"):
+                await self.collection.update_one(
+                    {"_id": proposal["_id"], "status": "proposed"},
+                    {
+                        "$set": {
+                            "status": "stale",
+                            "stale_reason": "Chapter content changed after state generation",
+                            "updated_at": get_utc_now(),
+                        }
+                    },
+                )
                 raise StaleStatePreview("Chapter content changed after state generation")
             stored_revision = int(
                 proposal.get("narrative_revision", proposal.get("state_revision") or 0)
             )
             if await narrative_revision_store.current(novel_id) != stored_revision:
+                await self.collection.update_one(
+                    {"_id": proposal["_id"], "status": "proposed"},
+                    {
+                        "$set": {
+                            "status": "stale",
+                            "stale_reason": "Narrative state changed after state generation",
+                            "updated_at": get_utc_now(),
+                        }
+                    },
+                )
                 raise StaleStatePreview("Narrative state changed after state generation")
 
         candidate = deepcopy(proposal["candidate"])

@@ -33,6 +33,57 @@ def _fact_from_state(state: dict[str, Any] | None, fact_id: str) -> dict[str, An
 
 class CharacterStateService:
     @staticmethod
+    async def _execute_legacy_update_current_state(session, mutation):
+        command = mutation.journal["command"]["payload"]
+        novel_id = str(mutation.journal["novel_id"])
+        await character_state_repo.set_current_state(
+            novel_id,
+            str(command["card_id"]),
+            str(command["current_state"]),
+            int(command["chapter_order"]),
+            session=session,
+        )
+        state = await character_state_repo.get_state(
+            novel_id, str(command["card_id"]), session=session
+        )
+        if state is None:
+            raise NotFoundError(
+                f"Character state for card '{command['card_id']}' was not found"
+            )
+        return state
+
+    @staticmethod
+    async def update_current_state_legacy(
+        novel_id: str,
+        card_id: str,
+        current_state: str,
+        chapter_order: int,
+    ) -> dict[str, Any]:
+        if int(chapter_order) <= 0:
+            raise ValueError("as_of_chapter_order must be greater than 0")
+        state = await character_state_repo.get_state(novel_id, card_id)
+        if state is None:
+            raise NotFoundError(f"Character state for card '{card_id}' was not found")
+        payload = {
+            "card_id": card_id,
+            "current_state": str(current_state),
+            "chapter_order": int(chapter_order),
+        }
+        return await commit_mutation(
+            MutationCommand(
+                novel_id=novel_id,
+                idempotency_key=(
+                    f"legacy-update-character-state:{card_id}:"
+                    f"{state.get('updated_at')}:{_digest(payload)}"
+                ),
+                operation="legacy_update_character_current_state",
+                payload=payload,
+                before_image={"state": state},
+            ),
+            CharacterStateService._execute_legacy_update_current_state,
+        )
+
+    @staticmethod
     async def _execute_update_current_state(session, mutation):
         command = mutation.journal["command"]["payload"]
         novel_id = str(mutation.journal["novel_id"])
@@ -130,6 +181,59 @@ class CharacterStateService:
                 f"Character state for card '{command['card_id']}' was not found"
             )
         return state
+
+    @staticmethod
+    async def _execute_legacy_update_fact(session, mutation):
+        command = mutation.journal["command"]["payload"]
+        novel_id = str(mutation.journal["novel_id"])
+        await character_state_repo.update_permanent_fact(
+            novel_id,
+            str(command["card_id"]),
+            str(command["fact_id"]),
+            dict(command["fields"]),
+            session=session,
+        )
+        state = await character_state_repo.get_state(
+            novel_id, str(command["card_id"]), session=session
+        )
+        if state is None:
+            raise NotFoundError(
+                f"Character state for card '{command['card_id']}' was not found"
+            )
+        return state
+
+    @staticmethod
+    async def update_fact_legacy(
+        novel_id: str,
+        card_id: str,
+        fact_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        prepared = dict(fields)
+        if prepared.get("fact") is not None and not str(prepared["fact"]).strip():
+            raise ValueError("Permanent fact text cannot be empty")
+        if prepared.get("kind") is not None and str(prepared["kind"]) not in FACT_KIND_VALUES:
+            raise ValueError(f"Unsupported permanent fact kind: {prepared['kind']}")
+        if prepared.get("chapter_order") is not None and int(prepared["chapter_order"]) <= 0:
+            raise ValueError("chapter_order must be greater than 0")
+        state = await character_state_repo.get_state(novel_id, card_id)
+        fact = _fact_from_state(state, fact_id)
+        if not prepared:
+            return state
+        payload = {"card_id": card_id, "fact_id": fact_id, "fields": prepared}
+        return await commit_mutation(
+            MutationCommand(
+                novel_id=novel_id,
+                idempotency_key=(
+                    f"legacy-update-permanent-fact:{fact_id}:"
+                    f"{state.get('updated_at')}:{_digest(payload)}"
+                ),
+                operation="legacy_update_permanent_fact",
+                payload=payload,
+                before_image={"fact": fact},
+            ),
+            CharacterStateService._execute_legacy_update_fact,
+        )
 
     @staticmethod
     async def update_fact(

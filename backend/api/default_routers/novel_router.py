@@ -109,7 +109,9 @@ async def get_novel(novel_id: str):
 async def update_novel(novel_id: str, req: UpdateNovelRequest):
     """更新指定小说的基础信息（如标题、简介等）。"""
     try:
-        success = await novel_repo.update_novel_info(novel_id, req.model_dump(exclude_unset=True))
+        success = await NovelService.update_novel_info(
+            novel_id, req.model_dump(exclude_unset=True)
+        )
         return {"success": success}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -127,7 +129,7 @@ async def update_status(novel_id: str, req: StatusUpdate):
 async def soft_delete(novel_id: str):
     """软删除指定的小说及将其放入回收站。"""
     try:
-        success = await novel_repo.soft_delete_novel(novel_id)
+        success = await NovelService.soft_delete_novel(novel_id)
         return {"success": success}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -136,7 +138,7 @@ async def soft_delete(novel_id: str):
 async def restore_novel(novel_id: str):
     """从回收站中恢复（取消软删除）指定的小说。"""
     try:
-        success = await novel_repo.restore_novel(novel_id)
+        success = await NovelService.restore_novel(novel_id)
         return {"success": success}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

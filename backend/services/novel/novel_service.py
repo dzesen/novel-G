@@ -1,4 +1,8 @@
+import hashlib
+import json
 from typing import Tuple, Dict, Any
+
+from backend.db.mutation import MutationCommand, commit_mutation
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db import collections
 from backend.db.base import BaseRepository
@@ -7,6 +11,110 @@ from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import to_object_id
 
 class NovelService:
+    CONTEXT_FIELDS = frozenset(
+        {
+            "core_seed",
+            "worldview",
+            "writing_style",
+            "narrative_pov",
+            "tone",
+            "era_background",
+        }
+    )
+
+    @staticmethod
+    async def _execute_update_novel_info(session, mutation):
+        command = mutation.journal["command"]["payload"]
+        await novel_repo.update_novel_info(
+            str(mutation.journal["novel_id"]),
+            command["changes"],
+            session=session,
+        )
+        return True
+
+    @staticmethod
+    async def update_novel_info(novel_id: str, update_data: Dict[str, Any]) -> bool:
+        current = await novel_repo.get_novel_by_id(novel_id)
+        protected = {"_id", "created_at", "updated_at", "is_deleted", "deleted_at"}
+        changes = {
+            key: value
+            for key, value in update_data.items()
+            if key not in protected and current.get(key) != value
+        }
+        if not changes:
+            return False
+        affects_context = bool(set(changes) & NovelService.CONTEXT_FIELDS)
+        operation = (
+            "update_novel_context" if affects_context else "update_novel_metadata"
+        )
+        digest = hashlib.sha256(
+            json.dumps(changes, ensure_ascii=False, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return await commit_mutation(
+            MutationCommand(
+                novel_id=novel_id,
+                idempotency_key=(
+                    f"update-novel-info:{novel_id}:{current.get('updated_at')}:{digest}"
+                ),
+                operation=operation,
+                payload={"changes": changes},
+                before_image={key: current.get(key) for key in changes},
+            ),
+            NovelService._execute_update_novel_info,
+            advances_narrative_revision=affects_context,
+        )
+
+    @staticmethod
+    async def _execute_novel_lifecycle(session, mutation):
+        novel_id = str(mutation.journal["novel_id"])
+        operation = str(mutation.journal["operation"])
+        current = await novel_repo.get_novel_by_id(
+            novel_id, include_deleted=True, session=session
+        )
+        if operation == "soft_delete_novel":
+            if not current.get("is_deleted"):
+                await novel_repo.soft_delete_novel(novel_id, session=session)
+            return True
+        if operation == "restore_novel":
+            if current.get("is_deleted"):
+                await novel_repo.restore_novel(novel_id, session=session)
+            return True
+        raise ValueError(f"Unsupported novel lifecycle mutation: {operation}")
+
+    @staticmethod
+    async def soft_delete_novel(novel_id: str) -> bool:
+        current = await novel_repo.get_novel_by_id(novel_id)
+        return await NovelService._commit_lifecycle(
+            novel_id, current, "soft_delete_novel"
+        )
+
+    @staticmethod
+    async def restore_novel(novel_id: str) -> bool:
+        current = await novel_repo.get_novel_by_id(novel_id, include_deleted=True)
+        if not current.get("is_deleted"):
+            raise ValueError("Only deleted novels can be restored")
+        return await NovelService._commit_lifecycle(novel_id, current, "restore_novel")
+
+    @staticmethod
+    async def _commit_lifecycle(
+        novel_id: str, current: Dict[str, Any], operation: str
+    ) -> bool:
+        return await commit_mutation(
+            MutationCommand(
+                novel_id=novel_id,
+                idempotency_key=f"{operation}:{novel_id}:{current.get('updated_at')}",
+                operation=operation,
+                payload={},
+                before_image={
+                    "is_deleted": bool(current.get("is_deleted")),
+                    "updated_at": current.get("updated_at"),
+                },
+            ),
+            NovelService._execute_novel_lifecycle,
+        )
+
     @staticmethod
     async def check_novel_before_delete(novel_id: str) -> Tuple[bool, str]:
         """

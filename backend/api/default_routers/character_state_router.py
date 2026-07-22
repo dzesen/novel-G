@@ -88,10 +88,9 @@ async def edit_current_state(novel_id: str, card_id: str, req: CurrentStateUpdat
             )
         else:
             # 仅保留给旧客户端的裸章号兼容入口；当前 UI 总是提交稳定章节 ID。
-            await character_state_repo.set_current_state(
+            state = await CharacterStateService.update_current_state_legacy(
                 novel_id, card_id, req.current_state, chapter_order
             )
-            state = await character_state_repo.get_state(novel_id, card_id)
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
@@ -111,10 +110,9 @@ async def edit_fact(novel_id: str, card_id: str, fact_id: str, req: PermanentFac
                 novel_id, card_id, fact_id, fields, req.source_chapter_id
             )
         else:
-            await character_state_repo.update_permanent_fact(
+            state = await CharacterStateService.update_fact_legacy(
                 novel_id, card_id, fact_id, fields
             )
-            state = await character_state_repo.get_state(novel_id, card_id)
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)

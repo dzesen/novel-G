@@ -47,6 +47,8 @@ class ReferenceCardRepository(BaseRepository):
         card_type: str,
         data: Dict[str, Any],
         session: AsyncClientSession | None = None,
+        *,
+        card_id: str | None = None,
     ) -> str:
         self._validate_type(card_type)
         name = str(data.get("name", "")).strip()
@@ -69,6 +71,8 @@ class ReferenceCardRepository(BaseRepository):
             "importance": importance,
             "sort_order": int(data.get("sort_order") or await self._next_sort_order(obj_id, card_type, session)),
         }
+        if card_id is not None:
+            prepared["_id"] = to_object_id(card_id)
         return await self.insert_one(prepared, session=session)
 
     async def list_cards(
