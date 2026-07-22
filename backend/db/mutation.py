@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 from backend.db import collections
@@ -16,6 +20,36 @@ from backend.db.utils import get_utc_now, to_object_id
 T = TypeVar("T")
 MutationCallback = Callable[[Any, "MutationRecorder"], Awaitable[T]]
 _LOCKS: dict[str, asyncio.Lock] = {}
+logger = logging.getLogger(__name__)
+
+
+class MutationConflictError(RuntimeError):
+    """同一幂等键被绑定到内容不同的命令。"""
+
+
+class UnsupportedMutationError(RuntimeError):
+    """命令的 operation/version 没有已注册 handler。"""
+
+
+def _digest_value(value: Any) -> Any:
+    """规范化为 MongoDB 往返后仍稳定的 JSON 形状。"""
+    if isinstance(value, dict):
+        return {
+            str(key): _digest_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_digest_value(item) for item in value]
+    if isinstance(value, datetime):
+        normalized = value
+        if normalized.tzinfo is not None:
+            normalized = normalized.astimezone(timezone.utc).replace(tzinfo=None)
+        # BSON datetime 只保留毫秒；摘要必须使用相同精度。
+        normalized = normalized.replace(
+            microsecond=(normalized.microsecond // 1000) * 1000
+        )
+        return {"$datetime_utc": normalized.isoformat(timespec="milliseconds")}
+    return value
 
 
 @dataclass(frozen=True)
@@ -45,6 +79,28 @@ class MutationCommand:
             version=int(stored.get("version") or 1),
         )
 
+    def digest(self) -> str:
+        """返回不含 novel/idempotency 定位字段的稳定命令摘要。"""
+        encoded = json.dumps(
+            _digest_value({
+                "operation": self.operation,
+                "version": self.version,
+                "payload": self.payload,
+                "before_image": self.before_image,
+                "child_ids": self.child_ids,
+            }),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
+class RecoveryScope:
+    novel_id: str | None = None
+
 
 class MutationRecorder:
     def __init__(self, journal: dict[str, Any], session: Any) -> None:
@@ -68,11 +124,78 @@ class MutationRecorder:
         self.journal.setdefault("receipts", {})[key] = deepcopy(value)
 
 
-async def commit_mutation(command: MutationCommand, callback: MutationCallback[T]) -> T:
+class MutationEngine:
+    """通过 operation/version 选择 handler，并隐藏 journal 提交细节。"""
+
+    def __init__(
+        self,
+        handlers: dict[tuple[str, int], MutationCallback[Any]],
+    ) -> None:
+        self._handlers = dict(handlers)
+
+    async def execute(self, command: MutationCommand) -> Any:
+        callback = self._handlers.get((command.operation, command.version))
+        if callback is None:
+            raise UnsupportedMutationError(
+                f"Unsupported mutation command: {command.operation}@{command.version}"
+            )
+        return await _commit_mutation(command, callback)
+
+    async def recover(
+        self, scope: RecoveryScope | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """恢复 scope 内的 journal；未知 operation/version 只报告、不执行。"""
+        recovered: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        unsupported: list[dict[str, Any]] = []
+        novel_id = scope.novel_id if scope is not None else None
+
+        for journal in await list_recoverable_mutations(novel_id):
+            journal_id = str(journal["_id"])
+            command = MutationCommand.from_journal(journal)
+            if (command.operation, command.version) not in self._handlers:
+                unsupported.append({
+                    "journal_id": journal_id,
+                    "operation": command.operation,
+                    "version": command.version,
+                })
+                continue
+            try:
+                result = await self.execute(command)
+                recovered.append({
+                    "journal_id": journal_id,
+                    "operation": command.operation,
+                    "version": command.version,
+                    "result": result,
+                })
+            except Exception as exc:
+                logger.exception(
+                    "Mutation recovery failed: journal_id=%s operation=%s version=%s",
+                    journal_id,
+                    command.operation,
+                    command.version,
+                )
+                failed.append({
+                    "journal_id": journal_id,
+                    "operation": command.operation,
+                    "version": command.version,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                })
+
+        return {
+            "recovered": recovered,
+            "failed": failed,
+            "unsupported": unsupported,
+        }
+
+
+async def _commit_mutation(command: MutationCommand, callback: MutationCallback[T]) -> T:
     """提交完整命令；standalone 崩溃后以稳定子 ID 和逐项回执安全重放。"""
     lock = _LOCKS.setdefault(command.idempotency_key, asyncio.Lock())
     async with lock:
         collection = get_database()[collections.MUTATION_JOURNALS]
+        command_digest = command.digest()
 
         async def execute(session):
             now = get_utc_now()
@@ -83,6 +206,7 @@ async def commit_mutation(command: MutationCommand, callback: MutationCallback[T
                 },
                 {"$setOnInsert": {
                     "operation": command.operation,
+                    "command_digest": command_digest,
                     "command": {
                         "version": command.version,
                         "payload": deepcopy(command.payload),
@@ -105,6 +229,18 @@ async def commit_mutation(command: MutationCommand, callback: MutationCallback[T
                 },
                 session=session,
             )
+            stored_digest = str(journal.get("command_digest") or "")
+            if not stored_digest:
+                stored_digest = MutationCommand.from_journal(journal).digest()
+                await collection.update_one(
+                    {"_id": journal["_id"], "command_digest": {"$exists": False}},
+                    {"$set": {"command_digest": stored_digest}},
+                    session=session,
+                )
+            if stored_digest != command_digest:
+                raise MutationConflictError(
+                    "The idempotency key is already bound to a different command"
+                )
             if journal.get("status") == "completed":
                 return deepcopy(journal.get("result"))
             await collection.update_one(
@@ -126,6 +262,9 @@ async def commit_mutation(command: MutationCommand, callback: MutationCallback[T
 
         try:
             return await run_mongo_write_unit(execute, command.operation)
+        except MutationConflictError:
+            # 冲突属于调用者错误，不能把已存在的正确 journal 改成 failed。
+            raise
         except BaseException as exc:
             # 事务模式下 intent 可能随事务回滚而不存在；upsert 一条安全失败记录。
             failure_write = collection.update_one(
@@ -139,6 +278,7 @@ async def commit_mutation(command: MutationCommand, callback: MutationCallback[T
                         "updated_at": get_utc_now(),
                     }, "$setOnInsert": {
                         "operation": command.operation,
+                        "command_digest": command_digest,
                         "command": {
                             "version": command.version,
                             "payload": deepcopy(command.payload),
@@ -157,6 +297,12 @@ async def commit_mutation(command: MutationCommand, callback: MutationCallback[T
             else:
                 await failure_write
             raise
+
+
+async def commit_mutation(command: MutationCommand, callback: MutationCallback[T]) -> T:
+    """旧调用者兼容入口；执行仍经过 MutationEngine 的 operation/version seam。"""
+    engine = MutationEngine({(command.operation, command.version): callback})
+    return await engine.execute(command)
 
 
 async def list_recoverable_mutations(novel_id: str | None = None) -> list[dict[str, Any]]:
