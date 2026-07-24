@@ -7,7 +7,7 @@ if not exist ".venv\Scripts\pythonw.exe" (
     pause
     exit /b 1
 )
-".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 11) ^<= sys.version_info ^< (3, 13) else 1)" >nul 2>nul
+".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info < (3, 13) else 1)" >nul 2>nul
 if errorlevel 1 (
     echo [错误] 当前 .venv 不是受支持的 Python 3.11/3.12，请重新运行 setup.bat。
     pause
