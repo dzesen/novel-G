@@ -19,6 +19,7 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.services.novel.chapter_timeline import ChapterTimeline
+from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.services.novel.state_timeline import (
     record_manual_correction,
     record_plot_thread_event,
@@ -41,14 +42,25 @@ class PlotThreadService:
             )
             effective = command.get("effective_chapter_id")
             if effective:
+                stored = await plot_thread_repo.get_thread(
+                    novel_id, thread_id, session=session
+                )
                 await mutation.advance_phase("timeline_writes")
                 await record_plot_thread_event(
                     novel_id,
                     str(effective),
                     thread_id,
                     "planted",
-                    {"source": str(command["data"].get("source") or "manual")},
+                    {
+                        "source": str(command["data"].get("source") or "manual"),
+                        "thread": stored,
+                    },
                     idempotency_key=f"manual:{thread_id}:planted",
+                    source_operation=str(mutation.journal["operation"]),
+                    source_operation_id=str(mutation.journal["idempotency_key"]),
+                    source_revision=int(
+                        mutation.journal["command"].get("version") or 1
+                    ),
                     session=session,
                 )
             await mutation.receipt("thread", {"thread_id": thread_id})
@@ -95,8 +107,18 @@ class PlotThreadService:
                     "plot_thread",
                     thread_id,
                     command["data"],
+                    baseline=mutation.journal.get("command", {}).get(
+                        "before_image"
+                    ),
+                    source_operation=str(mutation.journal["operation"]),
+                    source_operation_id=str(mutation.journal["idempotency_key"]),
+                    source_revision=int(
+                        mutation.journal["command"].get("version") or 1
+                    ),
                     session=session,
                 )
+                await mutation.advance_phase("derived_data")
+                await narrative_timeline.refresh(novel_id, session=session)
             await mutation.receipt("update", {"thread_id": thread_id})
         return {"thread_id": thread_id, "updated": True}
 
@@ -166,6 +188,11 @@ class PlotThreadService:
                     "soft_deleted",
                     {},
                     idempotency_key=f"manual:{thread_id}:soft_deleted:{effective}",
+                    source_operation=str(mutation.journal["operation"]),
+                    source_operation_id=str(mutation.journal["idempotency_key"]),
+                    source_revision=int(
+                        mutation.journal["command"].get("version") or 1
+                    ),
                     session=session,
                 )
             await mutation.receipt("delete", {"thread_id": thread_id})

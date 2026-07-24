@@ -17,9 +17,8 @@ from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
 from backend.services.novel.outline_validation import validate_chapter_ranges
 from backend.services.novel.chapter_timeline import ChapterTimeline
 from backend.services.novel.derived_stats import derived_stats
+from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.services.novel.state_timeline import (
-    mark_from_chapter_stale,
-    mark_downstream_stale,
     record_chapter_tombstone,
 )
 
@@ -44,6 +43,17 @@ class VolumeService:
         report = await derived_stats.refresh(novel_id, session=session)
         await mutation.receipt("derived_stats", report)
         return True
+
+    @staticmethod
+    async def _refresh_narrative(session, mutation) -> dict[str, Any]:
+        await mutation.advance_phase("derived_data")
+        report = await narrative_timeline.refresh(
+            str(mutation.journal["novel_id"]), session=session
+        )
+        await mutation.receipt(
+            "narrative_projection", {"digest": report["digest"]}
+        )
+        return report
 
     @staticmethod
     async def _execute_create_volume(session, mutation):
@@ -382,11 +392,7 @@ class VolumeService:
         await mutation.receipt("volume", {"volume_id": volume_id})
         stale_from = command.get("stale_from_chapter_id")
         if stale_from:
-            await mutation.advance_phase("timeline_writes")
-            await mark_from_chapter_stale(
-                novel_id, str(stale_from), session=session
-            )
-            await mutation.receipt("stale", {"chapter_id": str(stale_from)})
+            await VolumeService._refresh_narrative(session, mutation)
         return {"volume_id": volume_id, "updated": True}
 
     # 软删除（级联） 
@@ -397,11 +403,6 @@ class VolumeService:
         volume_id = str(command["volume_id"])
         novel_id = str(mutation.journal["novel_id"])
         chapter_ids = [str(item) for item in command["chapter_ids"]]
-        if chapter_ids and not mutation.was_received("stale"):
-            await mutation.advance_phase("timeline_writes")
-            await mark_downstream_stale(novel_id, chapter_ids[0], session=session)
-            await mutation.receipt("stale", {"chapter_id": chapter_ids[0]})
-
         obj_id = to_object_id(volume_id)
         stored = await volume_repo.find_one(
             {"_id": obj_id}, include_deleted=True, session=session
@@ -438,6 +439,7 @@ class VolumeService:
                     novel_id, deltas, session=session
                 )
             await mutation.receipt("novel_stats", target)
+        await VolumeService._refresh_narrative(session, mutation)
         return {"volume_id": volume_id, "deleted": True}
 
     @staticmethod
@@ -497,14 +499,6 @@ class VolumeService:
         )
         await mutation.receipt("chapters", {"chapter_ids": command["chapter_ids"]})
 
-        if command["chapter_ids"]:
-            await mutation.advance_phase("timeline_writes")
-            await mark_downstream_stale(
-                novel_id, str(command["chapter_ids"][0]), session=session
-            )
-            await mutation.receipt(
-                "stale", {"chapter_id": str(command["chapter_ids"][0])}
-            )
         if not await VolumeService._refresh_v2_stats(session, mutation):
             current_novel = await novel_repo.get_novel_by_id(novel_id, session=session)
             target = command["novel_stats_after"]
@@ -518,6 +512,7 @@ class VolumeService:
                     novel_id, deltas, session=session
                 )
             await mutation.receipt("novel_stats", target)
+        await VolumeService._refresh_narrative(session, mutation)
         return {"volume_id": volume_id, "restored": True}
 
     @staticmethod
@@ -581,6 +576,7 @@ class VolumeService:
         if stored is not None:
             await volume_repo.hard_delete_volume(volume_id, session=session)
         await mutation.receipt("volume", {"volume_id": volume_id})
+        await VolumeService._refresh_narrative(session, mutation)
         return {
             "chapters_deleted": int(command["chapter_count"]),
             "volume_deleted": 1,

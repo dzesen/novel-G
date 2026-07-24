@@ -27,7 +27,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSES, plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.services.novel.chapter_timeline import ChapterTimeline
-from backend.services.novel.state_timeline import has_tracked_timeline, snapshot_before
+from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.db.repositories.worldbook_repository import worldbook_repo
 
 # 默认上下文预算。写到第 87 章时，"最近 K 章 + 所有活跃伏笔 + 相关卡片"
@@ -642,19 +642,12 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
                 "card_type": card.get("card_type", card_type),
             }
 
-    state_docs = await character_state_repo.list_states(novel_id)
-    historical_snapshots = await snapshot_before(novel_id, chapter_id)
-    if historical_snapshots or await has_tracked_timeline(novel_id):
-        state_docs = [
-            {
-                **snapshot,
-                "as_of_chapter_id": snapshot.get("chapter_id"),
-                "as_of_chapter_order": timeline.position(
-                    str(snapshot["chapter_id"])
-                ).chapter_order,
-            }
-            for snapshot in historical_snapshots
-        ]
+    projection = await narrative_timeline.context_before(novel_id, chapter_id)
+    state_docs = (
+        projection.state_documents()
+        if projection.states_tracked
+        else await character_state_repo.list_states(novel_id)
+    )
     states = {}
     for state in state_docs:
         facts = []
@@ -690,8 +683,12 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             "permanent_facts": facts,
         }
 
-    thread_docs = await plot_thread_repo.list_threads(
-        novel_id, statuses=ACTIVE_THREAD_STATUSES
+    thread_docs = (
+        projection.active_threads
+        if projection.threads_tracked
+        else await plot_thread_repo.list_threads(
+            novel_id, statuses=ACTIVE_THREAD_STATUSES
+        )
     )
     threads = [
         {

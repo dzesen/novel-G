@@ -30,6 +30,7 @@ from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.state_validation import validate_state_ids
 from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.novel.state_timeline import record_acceptance
+from backend.services.novel.narrative_timeline import narrative_timeline
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +117,16 @@ class ChapterStateService:
             else:
                 timeline_updates = []
                 for character_index, update in enumerate(planned):
-                    facts = []
+                    facts = list(update.get("retained_permanent_facts") or [])
                     for fact_index, fact in enumerate(update["accepted_permanent_facts"]):
                         child_key = f"fact_{character_index}_{fact_index}"
                         facts.append({**fact, "id": mutation.child_id(child_key)})
                     timeline_updates.append({
-                        **update,
+                        **{
+                            key: value
+                            for key, value in update.items()
+                            if key != "retained_permanent_facts"
+                        },
                         "accepted_permanent_facts": facts,
                     })
                 await mutation.advance_phase("timeline_writes")
@@ -134,6 +139,20 @@ class ChapterStateService:
                 )
                 await mutation.receipt("timeline", {"revision": timeline_revision})
 
+            if mutation.was_received("projection"):
+                projection_digest = str(
+                    mutation.journal["receipts"]["projection"]["digest"]
+                )
+            else:
+                await mutation.advance_phase("derived_data")
+                refresh_report = await narrative_timeline.refresh(
+                    novel_id, session=session
+                )
+                projection_digest = str(refresh_report["digest"])
+                await mutation.receipt(
+                    "projection", {"digest": projection_digest}
+                )
+
             result = {
                 "chapter_id": chapter_id,
                 "states_updated": states_updated,
@@ -141,6 +160,7 @@ class ChapterStateService:
                 "threads_updated": threads_updated,
                 "skipped_duplicate_facts": skipped_duplicate_facts,
                 "timeline_revision": timeline_revision,
+                "projection_digest": projection_digest,
             }
             if proposal_claim:
                 await state_proposal_module.mark_applied(
@@ -210,20 +230,31 @@ class ChapterStateService:
             # get_state 对不存在的角色返回 None（**不抛异常**），故这里是普通的
             # None 判断，不需要 try/except——首次出场的角色自然没有重复项。
             state = await character_state_repo.get_state(novel_id, update["card_id"])
-            existing_texts = {
-                str(fact.get("fact", "")).strip()
+            existing_by_text = {
+                str(fact.get("fact", "")).strip(): fact
                 for fact in ((state or {}).get("permanent_facts") or [])
                 if str(fact.get("source_chapter_id") or "") == chapter_id
             }
 
             fresh = []
+            retained = []
             for fact in update["accepted_permanent_facts"]:
                 text = str(fact["fact"]).strip()
-                if text in existing_texts:
+                if text in existing_by_text:
                     # **不静默**：跳过了什么必须报回给调用方（设计 §5.3）。
                     skipped_duplicate_facts.append(text)
+                    existing = existing_by_text[text]
+                    retained.append(
+                        {
+                            "id": str(existing["id"]),
+                            "chapter_order": chapter_order,
+                            "source_chapter_id": chapter_id,
+                            "fact": text,
+                            "kind": str(existing["kind"]),
+                        }
+                    )
                     continue
-                existing_texts.add(text)
+                existing_by_text[text] = fact
                 fresh.append(
                     {
                         **fact,
@@ -231,7 +262,13 @@ class ChapterStateService:
                         "source_chapter_id": chapter_id,
                     }
                 )
-            planned.append({**update, "accepted_permanent_facts": fresh})
+            planned.append(
+                {
+                    **update,
+                    "accepted_permanent_facts": fresh,
+                    "retained_permanent_facts": retained,
+                }
+            )
 
         child_ids = {}
         for character_index, update in enumerate(planned):

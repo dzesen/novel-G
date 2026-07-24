@@ -13,6 +13,7 @@ from backend.db.repositories.character_state_repository import (
     character_state_repo,
 )
 from backend.db.utils import to_object_id
+from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.services.novel.state_timeline import record_manual_correction
 
 
@@ -32,6 +33,43 @@ def _fact_from_state(state: dict[str, Any] | None, fact_id: str) -> dict[str, An
 
 
 class CharacterStateService:
+    @staticmethod
+    async def _record_correction_and_refresh(
+        session,
+        mutation,
+        *,
+        correction_type: str,
+        subject_id: str,
+        fields: dict[str, Any],
+    ) -> None:
+        command = mutation.journal["command"]["payload"]
+        novel_id = str(mutation.journal["novel_id"])
+        effective_chapter_id = str(command["effective_chapter_id"])
+        if not mutation.was_received("correction"):
+            await mutation.advance_phase("timeline_writes")
+            await record_manual_correction(
+                novel_id,
+                effective_chapter_id,
+                correction_type,
+                subject_id,
+                fields,
+                baseline=command.get("state_baseline"),
+                source_operation=str(mutation.journal["operation"]),
+                source_operation_id=str(mutation.journal["idempotency_key"]),
+                source_revision=int(
+                    mutation.journal["command"].get("version") or 1
+                ),
+                session=session,
+            )
+            await mutation.receipt(
+                "correction", {"effective_chapter_id": effective_chapter_id}
+            )
+        # Primary materialized writes can be replayed before journal completion.
+        # Refresh every time so an old effective chapter never becomes "current".
+        await mutation.advance_phase("derived_data")
+        report = await narrative_timeline.refresh(novel_id, session=session)
+        await mutation.receipt("projection", {"digest": report["digest"]})
+
     @staticmethod
     async def _execute_legacy_update_current_state(session, mutation):
         command = mutation.journal["command"]["payload"]
@@ -53,37 +91,6 @@ class CharacterStateService:
         return state
 
     @staticmethod
-    async def update_current_state_legacy(
-        novel_id: str,
-        card_id: str,
-        current_state: str,
-        chapter_order: int,
-    ) -> dict[str, Any]:
-        if int(chapter_order) <= 0:
-            raise ValueError("as_of_chapter_order must be greater than 0")
-        state = await character_state_repo.get_state(novel_id, card_id)
-        if state is None:
-            raise NotFoundError(f"Character state for card '{card_id}' was not found")
-        payload = {
-            "card_id": card_id,
-            "current_state": str(current_state),
-            "chapter_order": int(chapter_order),
-        }
-        return await commit_mutation(
-            MutationCommand(
-                novel_id=novel_id,
-                idempotency_key=(
-                    f"legacy-update-character-state:{card_id}:"
-                    f"{state.get('updated_at')}:{_digest(payload)}"
-                ),
-                operation="legacy_update_character_current_state",
-                payload=payload,
-                before_image={"state": state},
-            ),
-            CharacterStateService._execute_legacy_update_current_state,
-        )
-
-    @staticmethod
     async def _execute_update_current_state(session, mutation):
         command = mutation.journal["command"]["payload"]
         novel_id = str(mutation.journal["novel_id"])
@@ -96,17 +103,12 @@ class CharacterStateService:
             as_of_chapter_id=str(command["effective_chapter_id"]),
         )
         await mutation.receipt("state", {"card_id": str(command["card_id"])})
-        await mutation.advance_phase("timeline_writes")
-        await record_manual_correction(
-            novel_id,
-            str(command["effective_chapter_id"]),
-            "character_current_state",
-            str(command["card_id"]),
-            {"current_state": str(command["current_state"])},
-            session=session,
-        )
-        await mutation.receipt(
-            "correction", {"effective_chapter_id": str(command["effective_chapter_id"])}
+        await CharacterStateService._record_correction_and_refresh(
+            session,
+            mutation,
+            correction_type="character_current_state",
+            subject_id=str(command["card_id"]),
+            fields={"current_state": str(command["current_state"])},
         )
         state = await character_state_repo.get_state(
             novel_id, str(command["card_id"]), session=session
@@ -135,6 +137,7 @@ class CharacterStateService:
             "current_state": str(current_state),
             "effective_chapter_id": effective_chapter_id,
             "chapter_order": int(chapter_order),
+            "state_baseline": state,
         }
         return await commit_mutation(
             MutationCommand(
@@ -161,17 +164,12 @@ class CharacterStateService:
             session=session,
         )
         await mutation.receipt("fact", {"fact_id": str(command["fact_id"])})
-        await mutation.advance_phase("timeline_writes")
-        await record_manual_correction(
-            novel_id,
-            str(command["effective_chapter_id"]),
-            "permanent_fact",
-            str(command["fact_id"]),
-            dict(command["fields"]),
-            session=session,
-        )
-        await mutation.receipt(
-            "correction", {"effective_chapter_id": str(command["effective_chapter_id"])}
+        await CharacterStateService._record_correction_and_refresh(
+            session,
+            mutation,
+            correction_type="permanent_fact",
+            subject_id=str(command["fact_id"]),
+            fields=dict(command["fields"]),
         )
         state = await character_state_repo.get_state(
             novel_id, str(command["card_id"]), session=session
@@ -203,39 +201,6 @@ class CharacterStateService:
         return state
 
     @staticmethod
-    async def update_fact_legacy(
-        novel_id: str,
-        card_id: str,
-        fact_id: str,
-        fields: dict[str, Any],
-    ) -> dict[str, Any]:
-        prepared = dict(fields)
-        if prepared.get("fact") is not None and not str(prepared["fact"]).strip():
-            raise ValueError("Permanent fact text cannot be empty")
-        if prepared.get("kind") is not None and str(prepared["kind"]) not in FACT_KIND_VALUES:
-            raise ValueError(f"Unsupported permanent fact kind: {prepared['kind']}")
-        if prepared.get("chapter_order") is not None and int(prepared["chapter_order"]) <= 0:
-            raise ValueError("chapter_order must be greater than 0")
-        state = await character_state_repo.get_state(novel_id, card_id)
-        fact = _fact_from_state(state, fact_id)
-        if not prepared:
-            return state
-        payload = {"card_id": card_id, "fact_id": fact_id, "fields": prepared}
-        return await commit_mutation(
-            MutationCommand(
-                novel_id=novel_id,
-                idempotency_key=(
-                    f"legacy-update-permanent-fact:{fact_id}:"
-                    f"{state.get('updated_at')}:{_digest(payload)}"
-                ),
-                operation="legacy_update_permanent_fact",
-                payload=payload,
-                before_image={"fact": fact},
-            ),
-            CharacterStateService._execute_legacy_update_fact,
-        )
-
-    @staticmethod
     async def update_fact(
         novel_id: str,
         card_id: str,
@@ -259,6 +224,7 @@ class CharacterStateService:
             "fact_id": fact_id,
             "fields": prepared,
             "effective_chapter_id": effective_chapter_id,
+            "state_baseline": state,
         }
         return await commit_mutation(
             MutationCommand(
@@ -292,20 +258,15 @@ class CharacterStateService:
                 session=session,
             )
         await mutation.receipt("fact", {"fact_id": str(command["fact_id"])})
-        await mutation.advance_phase("timeline_writes")
-        await record_manual_correction(
-            novel_id,
-            str(command["effective_chapter_id"]),
-            "permanent_fact_delete",
-            str(command["fact_id"]),
-            {
+        await CharacterStateService._record_correction_and_refresh(
+            session,
+            mutation,
+            correction_type="permanent_fact_delete",
+            subject_id=str(command["fact_id"]),
+            fields={
                 "card_id": str(command["card_id"]),
                 "fact_snapshot": command["fact_snapshot"],
             },
-            session=session,
-        )
-        await mutation.receipt(
-            "correction", {"effective_chapter_id": str(command["effective_chapter_id"])}
         )
         state = await character_state_repo.get_state(
             novel_id, str(command["card_id"]), session=session
@@ -330,6 +291,7 @@ class CharacterStateService:
             "fact_id": fact_id,
             "effective_chapter_id": effective_chapter_id,
             "fact_snapshot": fact,
+            "state_baseline": state,
         }
         return await commit_mutation(
             MutationCommand(

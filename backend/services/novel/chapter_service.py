@@ -24,9 +24,9 @@ from backend.llm.schemas.novel_pydantic import (
 )
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.derived_stats import derived_stats
+from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.services.novel.outline_validation import validate_outline_ids
 from backend.services.novel.state_timeline import (
-    mark_downstream_stale,
     record_chapter_tombstone,
     record_plot_thread_event,
 )
@@ -68,6 +68,17 @@ class ChapterService:
         return True
 
     @staticmethod
+    async def _refresh_narrative(session, mutation) -> dict[str, Any]:
+        await mutation.advance_phase("derived_data")
+        report = await narrative_timeline.refresh(
+            str(mutation.journal["novel_id"]), session=session
+        )
+        await mutation.receipt(
+            "narrative_projection", {"digest": report["digest"]}
+        )
+        return report
+
+    @staticmethod
     async def _execute_create_chapter(session, mutation):
         command = mutation.journal["command"]["payload"]
         chapter_id = mutation.child_id("chapter")
@@ -102,6 +113,7 @@ class ChapterService:
                     novel_id, deltas, session=session
                 )
             await mutation.receipt("novel_stats", target)
+        await ChapterService._refresh_narrative(session, mutation)
         return chapter_id
 
     @staticmethod
@@ -237,10 +249,6 @@ class ChapterService:
             chapter_id, command["update"], session=session
         )
         await mutation.receipt("chapter", {"chapter_id": chapter_id})
-        if command.get("mark_stale"):
-            await mutation.advance_phase("timeline_writes")
-            await mark_downstream_stale(novel_id, chapter_id, session=session)
-            await mutation.receipt("stale", {"chapter_id": chapter_id})
         if not await ChapterService._refresh_v2_stats(session, mutation):
             await volume_repo.update_one(
                 {"_id": to_object_id(command["volume_id"])},
@@ -260,6 +268,8 @@ class ChapterService:
                     novel_id, deltas, session=session
                 )
             await mutation.receipt("novel_stats", target)
+        if command.get("mark_stale"):
+            await ChapterService._refresh_narrative(session, mutation)
         return {"chapter_id": chapter_id, "updated": True}
 
     @staticmethod
@@ -303,13 +313,21 @@ class ChapterService:
                         session=session,
                     )
                 )
+                stored_thread = await plot_thread_repo.get_thread(
+                    novel_id, stable_id, session=session
+                )
                 await record_plot_thread_event(
                     novel_id,
                     chapter_id,
                     stable_id,
                     "planted",
-                    {"source": "outline"},
+                    {"source": "outline", "thread": stored_thread},
                     idempotency_key=f"outline:{chapter_id}:{stable_id}:planted",
+                    source_operation=str(mutation.journal["operation"]),
+                    source_operation_id=str(mutation.journal["idempotency_key"]),
+                    source_revision=int(
+                        mutation.journal["command"].get("version") or 1
+                    ),
                     session=session,
                 )
                 # 只有领域对象和时间线事件都成功后才记录子步骤完成。
@@ -339,8 +357,7 @@ class ChapterService:
             }
             await chapter_repo.update_chapter(chapter_id, {"outline": stored}, session=session)
             await mutation.receipt("outline", {"chapter_id": chapter_id})
-            await mark_downstream_stale(novel_id, chapter_id, session=session)
-            await mutation.receipt("stale", {"chapter_id": chapter_id})
+            await ChapterService._refresh_narrative(session, mutation)
             return {
                 "chapter_id": chapter_id,
                 "created_thread_ids": created_thread_ids,
@@ -544,9 +561,7 @@ class ChapterService:
             chapter_id, {"outline": command["outline"]}, session=session
         )
         await mutation.receipt("outline", {"chapter_id": chapter_id})
-        await mutation.advance_phase("timeline_writes")
-        await mark_downstream_stale(novel_id, chapter_id, session=session)
-        await mutation.receipt("stale", {"chapter_id": chapter_id})
+        await ChapterService._refresh_narrative(session, mutation)
         return await chapter_repo.get_chapter_by_id(chapter_id, session=session)
 
     @staticmethod
@@ -555,13 +570,6 @@ class ChapterService:
         chapter = command["chapter"]
         chapter_id = str(command["chapter_id"])
         novel_id = str(mutation.journal["novel_id"])
-        if not mutation.was_received("stale"):
-            await mutation.advance_phase("timeline_writes")
-            await mark_downstream_stale(
-                novel_id, chapter_id, session=session
-            )
-            await mutation.receipt("stale", {"chapter_id": chapter_id})
-
         stored = await chapter_repo.get_chapter_by_id(
             chapter_id, include_deleted=True, session=session
         )
@@ -582,6 +590,7 @@ class ChapterService:
                 session=session,
             )
             await mutation.receipt("novel_stats", command["novel_stats_after"])
+        await ChapterService._refresh_narrative(session, mutation)
         return {"chapter_id": chapter_id, "deleted": True}
 
     @staticmethod
@@ -616,9 +625,6 @@ class ChapterService:
         if stored.get("is_deleted"):
             await chapter_repo.restore_chapter(chapter_id, session=session)
         await mutation.receipt("chapter", {"chapter_id": chapter_id})
-        await mutation.advance_phase("timeline_writes")
-        await mark_downstream_stale(novel_id, chapter_id, session=session)
-        await mutation.receipt("stale", {"chapter_id": chapter_id})
         if not await ChapterService._refresh_v2_stats(session, mutation):
             await volume_repo.update_one(
                 {"_id": to_object_id(chapter["volume_id"])},
@@ -632,6 +638,7 @@ class ChapterService:
                 session=session,
             )
             await mutation.receipt("novel_stats", command["novel_stats_after"])
+        await ChapterService._refresh_narrative(session, mutation)
         return {"chapter_id": chapter_id, "restored": True}
 
     @staticmethod
@@ -673,6 +680,7 @@ class ChapterService:
         if stored is not None:
             await chapter_repo.hard_delete_chapter(chapter_id, session=session)
         await mutation.receipt("chapter", {"chapter_id": chapter_id})
+        await ChapterService._refresh_narrative(session, mutation)
         return {"chapter_id": chapter_id, "deleted": True}
 
     @staticmethod
