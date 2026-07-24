@@ -636,6 +636,11 @@ class StateProposalModule:
             {"_id": to_object_id(proposal_id)}
         )
         if proposal and proposal.get("status") in {"claimed", "applied"}:
+            stored_claim = proposal.get("claim") or {}
+            if stored_claim.get("decision_digest") != claim.get("decision_digest"):
+                raise MutationConflictError(
+                    "State proposal is already claimed by a different decision"
+                )
             journal = await get_database()[collections.MUTATION_JOURNALS].find_one(
                 {
                     "novel_id": proposal["novel_id"],
