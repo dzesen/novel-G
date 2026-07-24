@@ -60,8 +60,17 @@ class LLMService:
     互相覆盖 last_usage。当前每个工作流步骤各建一个实例，天然满足该约束。
     """
 
-    def __init__(self, provider_name: str | None = None, timeout_seconds: int | None = None) -> None:
-        self._client = create_llm_client(provider_name, timeout_seconds=timeout_seconds)
+    def __init__(
+        self,
+        provider_name: str | None = None,
+        timeout_seconds: int | None = None,
+        max_retries: int | None = None,
+    ) -> None:
+        self._client = create_llm_client(
+            provider_name,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+        )
         self._provider_name = getattr(self._client, "provider_name", provider_name or "default")
         client_config = getattr(self._client, "config", None)
         self._max_concurrency = int(getattr(client_config, "max_concurrency", 0))

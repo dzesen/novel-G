@@ -34,6 +34,10 @@ class JobAttemptScope:
         return tuple(self._attempts.values())
 
     @property
+    def claimed_attempt_ids(self) -> tuple[str, ...]:
+        return tuple(self._claims)
+
+    @property
     def uncertain_attempt_ids(self) -> tuple[str, ...]:
         return tuple(self._uncertain)
 

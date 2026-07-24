@@ -35,6 +35,12 @@ class GeminiClient(BaseLLMClient):
             "timeout": int(config.timeout_seconds * 1000),
             "client_args": {"trust_env": config.use_system_proxy},
             "async_client_args": {"trust_env": config.use_system_proxy},
+            # google-genai defaults to five total attempts when retry_options is
+            # omitted. Our config stores retries after the original request, so
+            # always set the SDK's total-attempt count explicitly.
+            "retry_options": types.HttpRetryOptions(
+                attempts=config.max_retries + 1,
+            ),
         }
         if config.base_url:
             http_options_kwargs["base_url"] = config.base_url

@@ -26,6 +26,29 @@ class StructuredOutputMode(str, Enum):
     SCHEMA_ENFORCED = "schema_enforced"
 
 
+def _redacted_config_revision(
+    config: dict[str, Any],
+    *,
+    secret_revision_state: dict[str, Any] | None = None,
+) -> str:
+    """生成不直接依赖密钥原值、仍可结合密钥世代失效的配置摘要。"""
+    editable = json.loads(json.dumps(config))
+    editable.pop("revision", None)
+    providers = editable.get("llm", {}).get("providers", {})
+    if isinstance(providers, dict):
+        for provider in providers.values():
+            if not isinstance(provider, dict):
+                continue
+            provider.pop("_capability_profile", None)
+            provider["api_key"] = bool(provider.get("api_key"))
+    payload: dict[str, Any] = {"editable": editable}
+    if secret_revision_state is not None:
+        payload["secret_revision_state"] = secret_revision_state
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class WorkflowStepTarget:
     workflow_name: str
@@ -100,6 +123,10 @@ class InMemoryAttemptScope:
     @property
     def attempts(self) -> tuple[AttemptUsage, ...]:
         return tuple(self._accounted.values())
+
+    @property
+    def claimed_attempt_ids(self) -> tuple[str, ...]:
+        return tuple(self._claimed)
 
     @property
     def uncertain_attempt_ids(self) -> tuple[str, ...]:
@@ -238,6 +265,19 @@ class GenerationRuntime:
         return tuple(getattr(self._attempt_scope, "attempts", ()))
 
     @property
+    def claimed_attempt_count(self) -> int:
+        claimed = getattr(self._attempt_scope, "claimed_attempt_ids", None)
+        if claimed is not None:
+            return len(claimed)
+        return len(self.attempts) + len(
+            getattr(self._attempt_scope, "uncertain_attempt_ids", ())
+        )
+
+    @property
+    def uncertain_attempt_count(self) -> int:
+        return len(getattr(self._attempt_scope, "uncertain_attempt_ids", ()))
+
+    @property
     def usage(self) -> TokenUsage:
         return _add_usage(self.attempts)
 
@@ -246,17 +286,9 @@ class GenerationRuntime:
         explicit = str(config.get("revision") or "")
         if explicit:
             return explicit
-        # 该摘要只在进程内比较，不返回客户端；包含密钥可检测手工 Key 变化，
-        # 但排除独立能力缓存，后者由 capability_snapshot 单独约束。
-        editable = json.loads(json.dumps(config))
-        providers = editable.get("llm", {}).get("providers", {})
-        if isinstance(providers, dict):
-            for provider in providers.values():
-                if isinstance(provider, dict):
-                    provider.pop("_capability_profile", None)
-        return hashlib.sha256(
-            json.dumps(editable, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        # 自定义/测试 Runtime 没有 SecretVersionStore；fallback 只使用脱敏配置。
+        # 生产 create_generation_runtime 会注入带私有 HMAC 密钥世代的显式 revision。
+        return _redacted_config_revision(config)
 
     @staticmethod
     def _capability_snapshot(config: dict[str, Any]) -> str:
@@ -456,7 +488,11 @@ class GenerationRuntime:
         await self._attempt_scope.account(attempt_id, usage)
 
 
-def create_generation_runtime(attempt_scope: AttemptScope | None = None) -> GenerationRuntime:
+def create_generation_runtime(
+    attempt_scope: AttemptScope | None = None,
+    *,
+    max_provider_retries: int | None = None,
+) -> GenerationRuntime:
     """使用当前应用配置和 LLMService 创建一次工作流专用运行时。"""
     from copy import deepcopy
     from pathlib import Path
@@ -477,6 +513,11 @@ def create_generation_runtime(attempt_scope: AttemptScope | None = None) -> Gene
 
     def supplied_config() -> dict[str, Any]:
         config = deepcopy(get_all_config(force_reload=True))
+        secret_store.sync(config)
+        config["revision"] = _redacted_config_revision(
+            config,
+            secret_revision_state=secret_store.revision_state(),
+        )
         providers = config.get("llm", {}).get("providers", {})
         if isinstance(providers, dict):
             for alias, provider in providers.items():
@@ -495,6 +536,7 @@ def create_generation_runtime(attempt_scope: AttemptScope | None = None) -> Gene
         adapter_factory=lambda alias, timeout: LLMService(
             provider_name=alias,
             timeout_seconds=timeout,
+            max_retries=max_provider_retries,
         ),
         attempt_scope=attempt_scope,
     )

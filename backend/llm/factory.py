@@ -10,6 +10,7 @@ def create_llm_client(
     provider_name: str | None = None,
     *,
     timeout_seconds: int | None = None,
+    max_retries: int | None = None,
 ) -> BaseLLMClient:
     """根据服务商别名创建 LLM 客户端。
 
@@ -22,6 +23,8 @@ def create_llm_client(
     Args:
         provider_name: 用户自定义 Provider 别名，空值表示默认 Provider。
         timeout_seconds: 临时覆盖的请求超时时间。
+        max_retries: 临时覆盖 SDK 传输重试次数；验收工具用 0 将外部请求数
+            与语义 attempt 上限对齐。
 
     Returns:
         对应类型的 LLM 客户端实例。
@@ -31,6 +34,7 @@ def create_llm_client(
         config,
         provider_name=provider_name,
         timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
         require_enabled=True,
     )
 
@@ -40,6 +44,7 @@ def create_llm_client_from_config(
     provider_name: str | None = None,
     *,
     timeout_seconds: int | None = None,
+    max_retries: int | None = None,
     require_enabled: bool = True,
 ) -> BaseLLMClient:
     """根据已解析的 Provider 配置创建 LLM 客户端。
@@ -48,6 +53,7 @@ def create_llm_client_from_config(
         config: 已解析的单个 Provider 配置。
         provider_name: 用户自定义别名，用于日志与错误定位。
         timeout_seconds: 临时覆盖的请求超时时间。
+        max_retries: 临时覆盖 SDK 传输重试次数。
         require_enabled: 是否要求 Provider 已启用。
 
     Returns:
@@ -56,8 +62,15 @@ def create_llm_client_from_config(
     Raises:
         ValueError: Provider 未启用、缺少 API Key 或类型不受支持时抛出。
     """
+    overrides: dict[str, int] = {}
     if timeout_seconds is not None and timeout_seconds > 0:
-        config = config.model_copy(update={"timeout_seconds": timeout_seconds})
+        overrides["timeout_seconds"] = timeout_seconds
+    if max_retries is not None:
+        if max_retries < 0:
+            raise ValueError("max_retries must not be negative")
+        overrides["max_retries"] = max_retries
+    if overrides:
+        config = config.model_copy(update=overrides)
 
     if require_enabled and not config.enabled:
         name = provider_name or "default"
