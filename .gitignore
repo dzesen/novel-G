@@ -3,6 +3,7 @@
 /Developer_Documentation/
 /logs/
 /backups/
+/reports/
 .venv/
 .vscode/
 .pytest_cache/
