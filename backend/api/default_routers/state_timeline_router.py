@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.novel.narrative_timeline import narrative_timeline
+from backend.api.default_routers.auth_router import require_owned_path_resource
 
 
-router = APIRouter(prefix="/api/state-timeline", tags=["state-timeline"])
+router = APIRouter(
+    prefix="/api/state-timeline",
+    tags=["state-timeline"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 def _client_error(exc: Exception) -> HTTPException:

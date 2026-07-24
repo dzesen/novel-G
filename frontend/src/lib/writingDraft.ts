@@ -1,8 +1,17 @@
 import type { WritingDraft } from "@/types/novel";
+import { buildUserStorageKey } from "@/lib/userStorage";
 
-const DRAFT_KEY_PREFIX = "writing_draft:";
-const CURRENT_DRAFT_KEY = "writing_draft_current";
-const LEGACY_DRAFT_KEY = "writing_draft";
+function draftKey(draftId: string): string | null {
+  return buildUserStorageKey("draft", draftId);
+}
+
+function currentDraftKey(): string | null {
+  return buildUserStorageKey("draft", "current");
+}
+
+function fallbackDraftKey(): string | null {
+  return buildUserStorageKey("draft", "session");
+}
 
 function createDraftId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -14,7 +23,8 @@ function createDraftId(): string {
 
 function getCurrentDraftId(): string | null {
   try {
-    return localStorage.getItem(CURRENT_DRAFT_KEY);
+    const key = currentDraftKey();
+    return key ? localStorage.getItem(key) : null;
   } catch {
     return null;
   }
@@ -41,11 +51,15 @@ function persistWritingDraft(draft: WritingDraft, draftId: string): void {
   const serialized = JSON.stringify(draft);
 
   try {
-    localStorage.setItem(`${DRAFT_KEY_PREFIX}${draftId}`, serialized);
-    localStorage.setItem(CURRENT_DRAFT_KEY, draftId);
+    const itemKey = draftKey(draftId);
+    const currentKey = currentDraftKey();
+    if (!itemKey || !currentKey) return;
+    localStorage.setItem(itemKey, serialized);
+    localStorage.setItem(currentKey, draftId);
   } catch {
     try {
-      sessionStorage.setItem(LEGACY_DRAFT_KEY, serialized);
+      const sessionKey = fallbackDraftKey();
+      if (sessionKey) sessionStorage.setItem(sessionKey, serialized);
     } catch {
       // ignore
     }
@@ -80,13 +94,16 @@ export function saveWritingDraft(draft: WritingDraft): string {
 export function loadWritingDraft(draftId?: string): WritingDraft | null {
   const candidateKeys: string[] = [];
   if (draftId) {
-    candidateKeys.push(`${DRAFT_KEY_PREFIX}${draftId}`);
+    const key = draftKey(draftId);
+    if (key) candidateKeys.push(key);
   }
 
   try {
-    const currentDraftId = localStorage.getItem(CURRENT_DRAFT_KEY);
+    const currentKey = currentDraftKey();
+    const currentDraftId = currentKey ? localStorage.getItem(currentKey) : null;
     if (currentDraftId) {
-      candidateKeys.push(`${DRAFT_KEY_PREFIX}${currentDraftId}`);
+      const key = draftKey(currentDraftId);
+      if (key) candidateKeys.push(key);
     }
 
     for (const key of Array.from(new Set(candidateKeys))) {
@@ -100,7 +117,8 @@ export function loadWritingDraft(draftId?: string): WritingDraft | null {
   }
 
   try {
-    return parseDraft(sessionStorage.getItem(LEGACY_DRAFT_KEY));
+    const sessionKey = fallbackDraftKey();
+    return sessionKey ? parseDraft(sessionStorage.getItem(sessionKey)) : null;
   } catch {
     return null;
   }
@@ -145,19 +163,22 @@ export function updateWritingDraft(
 export function clearWritingDraft(draftId?: string): void {
   try {
     if (draftId) {
-      localStorage.removeItem(`${DRAFT_KEY_PREFIX}${draftId}`);
+      const key = draftKey(draftId);
+      if (key) localStorage.removeItem(key);
     }
 
-    const currentDraftId = localStorage.getItem(CURRENT_DRAFT_KEY);
+    const currentKey = currentDraftKey();
+    const currentDraftId = currentKey ? localStorage.getItem(currentKey) : null;
     if (!draftId || currentDraftId === draftId) {
-      localStorage.removeItem(CURRENT_DRAFT_KEY);
+      if (currentKey) localStorage.removeItem(currentKey);
     }
   } catch {
     // 清理失败不应阻塞页面跳转或小说保存。
   }
 
   try {
-    sessionStorage.removeItem(LEGACY_DRAFT_KEY);
+    const sessionKey = fallbackDraftKey();
+    if (sessionKey) sessionStorage.removeItem(sessionKey);
   } catch {
     // ignore
   }

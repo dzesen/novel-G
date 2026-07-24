@@ -1,4 +1,5 @@
 import type { AICreateCachedSteps, AICreateStepKey } from "@/types/novel";
+import { buildUserStorageKey } from "@/lib/userStorage";
 
 export interface AICreateCacheInput {
   user_idea: string;
@@ -13,7 +14,6 @@ export interface AICreateCacheRecord {
   updated_at: string;
 }
 
-const AI_CREATE_CACHE_KEY = "ai_create_novel_cache";
 const STEP_ORDER: AICreateStepKey[] = ["expand_idea", "extract_idea", "core_seed", "novel_meta"];
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -124,7 +124,9 @@ export function loadAICreateCache(): AICreateCacheRecord | null {
   }
 
   try {
-    const raw = window.localStorage.getItem(AI_CREATE_CACHE_KEY);
+    const cacheKey = buildUserStorageKey("ai-create");
+    if (!cacheKey) return null;
+    const raw = window.localStorage.getItem(cacheKey);
     if (!raw) {
       return null;
     }
@@ -182,7 +184,9 @@ export function saveAICreateCache(
   };
 
   try {
-    window.localStorage.setItem(AI_CREATE_CACHE_KEY, JSON.stringify(record));
+    const cacheKey = buildUserStorageKey("ai-create");
+    if (!cacheKey) return;
+    window.localStorage.setItem(cacheKey, JSON.stringify(record));
   } catch {
     // 本地存储不可用时不中断生成流程，当前页面内状态仍可继续重试。
   }
@@ -203,7 +207,8 @@ export function clearAICreateCache(): void {
   }
 
   try {
-    window.localStorage.removeItem(AI_CREATE_CACHE_KEY);
+    const cacheKey = buildUserStorageKey("ai-create");
+    if (cacheKey) window.localStorage.removeItem(cacheKey);
   } catch {
     // 清理失败不影响后续页面跳转或再次创建。
   }

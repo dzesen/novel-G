@@ -36,6 +36,7 @@ from backend.api.default_routers.generation_job_router import (
     mark_running_jobs_interrupted,
 )
 from backend.api.default_routers.state_timeline_router import router as state_timeline_router
+from backend.api.default_routers.auth_router import router as auth_router
 
 apply_runtime_flags_from_argv()
 
@@ -108,6 +109,7 @@ import os
 os.makedirs("static/covers", exist_ok=True)
 app.mount("/static/covers", StaticFiles(directory="static/covers"), name="static_covers")
 
+app.include_router(auth_router)
 app.include_router(novel_router)
 app.include_router(volume_router)
 app.include_router(chapter_router)

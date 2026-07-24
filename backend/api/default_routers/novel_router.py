@@ -1,10 +1,17 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.novel.novel_service import NovelService
 from backend.db.errors import NotFoundError, InvalidIdError
+from backend.db.utils import to_object_id
+from backend.services.auth.identity_service import Actor
+from backend.services.auth.novel_access_service import (
+    NovelAccessService,
+    get_novel_access_service,
+)
+from backend.api.default_routers.auth_router import require_actor, require_csrf_actor
 
 router = APIRouter(prefix="/api/novels", tags=["novels"])
 
@@ -52,9 +59,20 @@ class StatusUpdate(BaseModel):
     status: str
 
 @router.post("/create")
-async def create_novel(req: CreateNovelRequest):
+async def create_novel(
+    req: CreateNovelRequest,
+    actor: Actor = Depends(require_csrf_actor),
+):
     """创建一个新的小说项目。"""
     data = req.model_dump(exclude_unset=True)
+    owner_id = to_object_id(actor.id)
+    data.update(
+        {
+            "owner_id": owner_id,
+            "created_by": owner_id,
+            "creation_source": "manual",
+        }
+    )
     try:
         novel_id = await novel_repo.create_novel(data)
         return {"id": novel_id, "message": "Novel created"}
@@ -62,9 +80,9 @@ async def create_novel(req: CreateNovelRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/list")
-async def get_all_novels():
+async def get_all_novels(actor: Actor = Depends(require_actor)):
     """获取所有小说的列表，仅包含基础信息。"""
-    novels = await novel_repo.get_all_novels()
+    novels = await novel_repo.get_all_novels(actor.id)
     for novel in novels:
         if "_id" in novel:
             novel["_id"] = str(novel["_id"])
@@ -75,9 +93,9 @@ async def get_all_novels():
     return {"data": novels}
 
 @router.get("/deleted/list")
-async def get_deleted_novels():
+async def get_deleted_novels(actor: Actor = Depends(require_actor)):
     """获取所有已软删除的小说列表（回收站）。"""
-    novels = await novel_repo.get_deleted_novels()
+    novels = await novel_repo.get_deleted_novels(actor.id)
     for novel in novels:
         if "_id" in novel:
             novel["_id"] = str(novel["_id"])
@@ -88,11 +106,17 @@ async def get_deleted_novels():
     return {"data": novels}
 
 @router.get("/{novel_id}")
-async def get_novel(novel_id: str):
+async def get_novel(
+    novel_id: str,
+    actor: Actor = Depends(require_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """根据ID获取指定小说的详细信息。"""
     try:
-        novel = await novel_repo.get_novel_by_id(novel_id)
+        novel = await access.require_owned_novel(actor, novel_id)
         novel["_id"] = str(novel["_id"])
+        novel["owner_id"] = str(novel["owner_id"])
+        novel["created_by"] = str(novel["created_by"])
         novel.pop("narrative_revision", None)
         novel.pop("narrative_revision_operations", None)
         novel["stats"] = {
@@ -106,49 +130,96 @@ async def get_novel(novel_id: str):
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.put("/{novel_id}")
-async def update_novel(novel_id: str, req: UpdateNovelRequest):
+async def update_novel(
+    novel_id: str,
+    req: UpdateNovelRequest,
+    actor: Actor = Depends(require_csrf_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """更新指定小说的基础信息（如标题、简介等）。"""
     try:
+        await access.require_owned_novel(actor, novel_id)
         success = await NovelService.update_novel_info(
             novel_id, req.model_dump(exclude_unset=True)
         )
         return {"success": success}
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.patch("/{novel_id}/status")
-async def update_status(novel_id: str, req: StatusUpdate):
+async def update_status(
+    novel_id: str,
+    req: StatusUpdate,
+    actor: Actor = Depends(require_csrf_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """更新指定小说的状态（例如从草稿变为连载中）。"""
     try:
+        await access.require_owned_novel(actor, novel_id)
         success = await novel_repo.update_novel_status(novel_id, req.status)
         return {"success": success}
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.delete("/{novel_id}")
-async def soft_delete(novel_id: str):
+async def soft_delete(
+    novel_id: str,
+    actor: Actor = Depends(require_csrf_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """软删除指定的小说及将其放入回收站。"""
     try:
+        await access.require_owned_novel(actor, novel_id)
         success = await NovelService.soft_delete_novel(novel_id)
         return {"success": success}
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/{novel_id}/restore")
-async def restore_novel(novel_id: str):
+async def restore_novel(
+    novel_id: str,
+    actor: Actor = Depends(require_csrf_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """从回收站中恢复（取消软删除）指定的小说。"""
     try:
+        await access.require_owned_novel(actor, novel_id, include_deleted=True)
         success = await NovelService.restore_novel(novel_id)
         return {"success": success}
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.delete("/{novel_id}/hard")
-async def hard_delete(novel_id: str):
+async def hard_delete(
+    novel_id: str,
+    actor: Actor = Depends(require_csrf_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """彻底（物理）删除指定的小说及其所有关联数据，不可恢复。"""
     try:
+        await access.require_owned_novel(actor, novel_id, include_deleted=True)
         stats = await NovelService.hard_delete_novel(novel_id)
         return {"message": "Hard deleted successfully", "stats": stats}
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

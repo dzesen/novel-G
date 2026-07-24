@@ -4,14 +4,24 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.db.errors import DuplicateKeyError, InvalidIdError, NotFoundError
 from backend.services.novel.chapter_service import ChapterService
+from backend.api.default_routers.auth_router import require_owned_path_resource
+from backend.services.auth.identity_service import Actor
+from backend.services.auth.novel_access_service import (
+    NovelAccessService,
+    get_novel_access_service,
+)
 
 
-router = APIRouter(prefix="/api/chapters", tags=["chapters"])
+router = APIRouter(
+    prefix="/api/chapters",
+    tags=["chapters"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 class CreateChapterRequest(BaseModel):
@@ -84,8 +94,13 @@ def _handle_client_error(exc: Exception) -> HTTPException:
 
 
 @router.post("/create")
-async def create_chapter(req: CreateChapterRequest):
+async def create_chapter(
+    req: CreateChapterRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     try:
+        await access.require_owned_novel(actor, req.novel_id)
         chapter_id = await ChapterService.create_chapter(req.model_dump())
         return {"id": chapter_id, "message": "Chapter created"}
     except (NotFoundError, DuplicateKeyError, InvalidIdError, ValueError) as exc:

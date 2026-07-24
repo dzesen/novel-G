@@ -1,9 +1,14 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.services.novel.faction_relation_service import FactionRelationService
+from backend.api.default_routers.auth_router import require_owned_path_resource
 
-router = APIRouter(prefix="/api/faction-relations", tags=["faction-relations"])
+router = APIRouter(
+    prefix="/api/faction-relations",
+    tags=["faction-relations"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 def _serialize_relation(relation: dict) -> dict:

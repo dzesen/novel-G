@@ -123,6 +123,12 @@ llm:
         create_core_factions:
           provider: ""
           timeout_seconds: null
+    create_reference_cards_by_ai:
+      default_provider: ""
+      steps:
+        reference_cards:
+          provider: ""
+          timeout_seconds: null
     create_volume_outline_by_ai:
       default_provider: ""
       steps:

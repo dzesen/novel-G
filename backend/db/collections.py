@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # 在用集合：有仓储、有写入方。
 NOVELS = "novels"
+USERS = "users"
 VOLUMES = "volumes"
 CHAPTERS = "chapters"
 CHARACTERS = "characters"
@@ -29,10 +30,12 @@ CHARACTER_STATE_SNAPSHOTS = "character_state_snapshots"
 PLOT_THREAD_EVENTS = "plot_thread_events"
 MANUAL_CORRECTIONS = "manual_corrections"
 STATE_PREVIEWS = "state_previews"
+REFERENCE_CARD_PROPOSALS = "reference_card_proposals"
 MUTATION_JOURNALS = "mutation_journals"
 
 ACTIVE_COLLECTIONS = frozenset({
     NOVELS,
+    USERS,
     VOLUMES,
     CHAPTERS,
     CHARACTERS,
@@ -47,8 +50,15 @@ ACTIVE_COLLECTIONS = frozenset({
     PLOT_THREAD_EVENTS,
     MANUAL_CORRECTIONS,
     STATE_PREVIEWS,
+    REFERENCE_CARD_PROPOSALS,
     MUTATION_JOURNALS,
 })
+
+# 运行时集合不会进入备份。会话在恢复后必须重新建立，避免把可用凭据材料
+# 搬进快照，也避免恢复旧用户状态后意外复活旧会话。
+AUTH_SESSIONS = "auth_sessions"
+AUTH_LOGIN_ATTEMPTS = "auth_login_attempts"
+EPHEMERAL_COLLECTIONS = frozenset({AUTH_SESSIONS, AUTH_LOGIN_ATTEMPTS})
 
 # 遗留集合：仓储模块已删除，当前无任何写入方。
 # 仍保留的原因：novel_service.hard_delete_novel 仍按 novel_id 做防御性清理，
@@ -68,10 +78,11 @@ LEGACY_COLLECTIONS = frozenset({
 })
 
 ALL_COLLECTIONS = ACTIVE_COLLECTIONS | LEGACY_COLLECTIONS
+REGISTERED_COLLECTIONS = ALL_COLLECTIONS | EPHEMERAL_COLLECTIONS
 
 # 小说作用域集合：除 NOVELS（被删除的根记录，按 _id 删）外，其余每个集合
 # 的每条记录都挂着 novel_id，novel_service.hard_delete_novel 的级联清理
 # 必须覆盖到这里的每一个，一个不落——包括上面三个遗留幽灵集合。
 # tests/test_novel_service.py 拿它核对级联的完整性，用法与
 # BACKUP_COLLECTIONS 的覆盖测试同源。
-NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS}
+NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS, USERS}

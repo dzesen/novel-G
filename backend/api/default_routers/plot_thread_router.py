@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.utils import to_object_id
+from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.services.novel.plot_thread_service import (
     PlotThreadService,
     audit_thread_reference_chapters,
@@ -27,7 +28,11 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.volume_repository import volume_repo
 
 
-router = APIRouter(prefix="/api/plot-threads", tags=["plot-threads"])
+router = APIRouter(
+    prefix="/api/plot-threads",
+    tags=["plot-threads"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 class PlotThreadCreateRequest(BaseModel):

@@ -28,7 +28,11 @@ from backend.db.collections import (
     PLOT_THREADS,
     PLOT_THREAD_EVENTS,
     STATE_PREVIEWS,
+    REFERENCE_CARD_PROPOSALS,
     MUTATION_JOURNALS,
+    USERS,
+    AUTH_LOGIN_ATTEMPTS,
+    AUTH_SESSIONS,
     VOLUMES,
     WORLDBOOK,
 )
@@ -46,6 +50,7 @@ MAX_BACKUP_BYTES = 100 * 1024 * 1024
 # 恢复按本元组顺序 delete_many + insert_many，故保持有序且不重复。
 # 新增集合务必同步登记，test_backup_covers_every_registered_collection 会守着这条。
 BACKUP_COLLECTIONS = (
+    USERS,
     NOVELS,
     VOLUMES,
     CHAPTERS,
@@ -64,6 +69,7 @@ BACKUP_COLLECTIONS = (
     PLOT_THREAD_EVENTS,
     MANUAL_CORRECTIONS,
     STATE_PREVIEWS,
+    REFERENCE_CARD_PROPOSALS,
     MUTATION_JOURNALS,
 )
 
@@ -170,6 +176,11 @@ async def restore_backup(payload: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         raise
+    # 会话与登录失败计数属于运行时认证状态，不进入快照。恢复用户与所有权后
+    # 统一清空，防止旧会话命中恢复后的 user_id/session_version，也避免恢复后
+    # 无法解释的历史限流继续生效。
+    await get_database()[AUTH_SESSIONS].delete_many({})
+    await get_database()[AUTH_LOGIN_ATTEMPTS].delete_many({})
     result = {
         name: len(validated["collections"].get(name, []))
         for name in BACKUP_COLLECTIONS

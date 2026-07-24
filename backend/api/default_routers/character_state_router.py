@@ -9,17 +9,22 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.character_state_repository import character_state_repo
 from backend.services.novel.chapter_timeline import validate_chapter_reference
 from backend.services.novel.character_state_service import CharacterStateService
+from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.services.novel.state_timeline import latest_chapter_id
 
 
-router = APIRouter(prefix="/api/character-states", tags=["character-states"])
+router = APIRouter(
+    prefix="/api/character-states",
+    tags=["character-states"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 class CurrentStateUpdateRequest(BaseModel):

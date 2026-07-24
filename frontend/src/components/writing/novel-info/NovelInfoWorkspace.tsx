@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslations } from "next-intl";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
-import { apiGet, apiPost } from "@/lib/api";
+import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type {
   CreateNovelRequest,
   NovelDetail,
@@ -83,12 +83,16 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       const novel = await apiGet<NovelDetail>(`/api/novels/${novelId}`);
       setData(novel as unknown as Record<string, unknown>);
       setHasChapters((novel.stats?.chapter_count ?? 0) > 0);
-    } catch {
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) {
+        router.replace(`/${locale}`);
+        return;
+      }
       setLoadError(true);
     } finally {
       setLoading(false);
     }
-  }, [novelId]);
+  }, [locale, novelId, router]);
 
   useEffect(() => {
     if (mode === "edit") {
@@ -111,7 +115,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
   }, [mode, loadNovel, draftId]);
 
   /* create novel */
-  const handleCreate = async () => {
+  const handleCreate = async (openCardCuration: boolean) => {
     try {
       setCreating(true);
       const payload: CreateNovelRequest = {
@@ -136,7 +140,8 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       };
       const res = await apiPost<{ id: string }>("/api/novels/create", payload);
       clearWritingDraft(draftId);
-      router.push(`/${locale}/writing/${res.id}`);
+      const curationQuery = openCardCuration ? "?curateCards=1" : "";
+      router.push(`/${locale}/writing/${res.id}${curationQuery}`);
     } catch {
       alert(tw("createFailed"));
     } finally {
@@ -292,12 +297,19 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
             {twd("backToCreate")}
           </Button>
           <Button
+            variant="outline"
+            onPress={() => void handleCreate(false)}
+            isDisabled={creating || !data.title}
+          >
+            {creating ? tw("creating") : tw("saveOnly")}
+          </Button>
+          <Button
             variant="primary"
-            onPress={handleCreate}
+            onPress={() => void handleCreate(true)}
             isDisabled={creating || !data.title}
             className="bg-accent text-white hover:bg-accent-hover"
           >
-            {creating ? tw("creating") : tw("saveCreate")}
+            {creating ? tw("creating") : tw("saveAndCurate")}
           </Button>
         </StickyActionBar>
       )}

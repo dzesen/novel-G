@@ -35,7 +35,16 @@ class NovelService:
     @staticmethod
     async def update_novel_info(novel_id: str, update_data: Dict[str, Any]) -> bool:
         current = await novel_repo.get_novel_by_id(novel_id)
-        protected = {"_id", "created_at", "updated_at", "is_deleted", "deleted_at"}
+        protected = {
+            "_id",
+            "created_at",
+            "updated_at",
+            "is_deleted",
+            "deleted_at",
+            "owner_id",
+            "created_by",
+            "creation_source",
+        }
         changes = {
             key: value
             for key, value in update_data.items()
@@ -169,6 +178,9 @@ class NovelService:
             plot_thread_events_repo = BaseRepository(collections.PLOT_THREAD_EVENTS)
             manual_corrections_repo = BaseRepository(collections.MANUAL_CORRECTIONS)
             state_previews_repo = BaseRepository(collections.STATE_PREVIEWS)
+            reference_card_proposals_repo = BaseRepository(
+                collections.REFERENCE_CARD_PROPOSALS
+            )
             mutation_journals_repo = BaseRepository(collections.MUTATION_JOURNALS)
 
             stats = {}
@@ -191,6 +203,7 @@ class NovelService:
             stats["plot_thread_events_deleted"] = await plot_thread_events_repo.hard_delete_many(query, session=session)
             stats["manual_corrections_deleted"] = await manual_corrections_repo.hard_delete_many(query, session=session)
             stats["state_previews_deleted"] = await state_previews_repo.hard_delete_many(query, session=session)
+            stats["reference_card_proposals_deleted"] = await reference_card_proposals_repo.hard_delete_many(query, session=session)
             stats["mutation_journals_deleted"] = await mutation_journals_repo.hard_delete_many(query, session=session)
 
             novel_deleted = await novel_repo.hard_delete_one({"_id": obj_id}, session=session)

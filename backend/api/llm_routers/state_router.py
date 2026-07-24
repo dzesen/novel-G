@@ -11,7 +11,7 @@ import logging
 from typing import AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -45,7 +45,13 @@ from backend.services.novel.state_proposal import (
     state_proposal_module,
 )
 
-router = APIRouter(prefix="/api/llm", tags=["llm"])
+from backend.api.default_routers.auth_router import require_owned_body_resource
+
+router = APIRouter(
+    prefix="/api/llm",
+    tags=["llm"],
+    dependencies=[Depends(require_owned_body_resource)],
+)
 logger = logging.getLogger(__name__)
 
 STATE_WORKFLOW = "extract_chapter_state_by_ai"

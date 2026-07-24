@@ -48,6 +48,11 @@ async def init_novel_indexes():
         logger.info("正在初始化'novels'集合的索引...")
         
         indexes = [
+            pymongo.IndexModel([
+                ("owner_id", pymongo.ASCENDING),
+                ("is_deleted", pymongo.ASCENDING),
+                ("updated_at", pymongo.DESCENDING),
+            ]),
             # 单字段索引
             pymongo.IndexModel([("title", pymongo.ASCENDING)]),
             pymongo.IndexModel([("status", pymongo.ASCENDING)]),
@@ -72,6 +77,53 @@ async def init_novel_indexes():
         logger.info("成功初始化'novels'集合的索引。")
     except Exception as e:
         logger.error(f"初始化novel索引失败：{e}")
+
+
+async def init_identity_indexes():
+    """初始化本地用户和不透明会话索引。"""
+    try:
+        db = get_database()
+        await db[collections.USERS].create_indexes([
+            pymongo.IndexModel(
+                [("normalized_username", pymongo.ASCENDING)],
+                unique=True,
+                partialFilterExpression={"is_deleted": False},
+                name="users_active_normalized_username_unique",
+            ),
+            pymongo.IndexModel(
+                [("bootstrap_slot", pymongo.ASCENDING)],
+                unique=True,
+                partialFilterExpression={
+                    "bootstrap_slot": "initial",
+                    "is_deleted": False,
+                },
+                name="users_initial_admin_unique",
+            ),
+            pymongo.IndexModel([("role", pymongo.ASCENDING), ("status", pymongo.ASCENDING)]),
+        ])
+        await db[collections.AUTH_SESSIONS].create_indexes([
+            pymongo.IndexModel(
+                [("token_digest", pymongo.ASCENDING)],
+                unique=True,
+                name="auth_sessions_token_digest_unique",
+            ),
+            pymongo.IndexModel([("user_id", pymongo.ASCENDING), ("revoked_at", pymongo.ASCENDING)]),
+            pymongo.IndexModel(
+                [("expires_at", pymongo.ASCENDING)],
+                expireAfterSeconds=0,
+                name="auth_sessions_expiry_ttl",
+            ),
+        ])
+        await db[collections.AUTH_LOGIN_ATTEMPTS].create_indexes([
+            pymongo.IndexModel(
+                [("expires_at", pymongo.ASCENDING)],
+                expireAfterSeconds=0,
+                name="auth_login_attempts_expiry_ttl",
+            ),
+        ])
+        logger.info("成功初始化本地用户与认证会话索引。")
+    except Exception as exc:
+        logger.error("初始化认证索引失败：%s", exc)
 
 
 async def init_volume_indexes():
@@ -231,6 +283,38 @@ async def init_reference_card_indexes():
         logger.info("成功初始化人物与世界资料卡索引。")
     except Exception as exc:
         logger.error("初始化 reference card 索引失败：%s", exc)
+
+
+async def init_reference_card_proposal_indexes():
+    """Initialize persisted proposal lookup and retention indexes."""
+    try:
+        collection = get_database()[collections.REFERENCE_CARD_PROPOSALS]
+        await collection.create_indexes([
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+                ("updated_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("source_digest", pymongo.ASCENDING),
+                ("card_set_digest", pymongo.ASCENDING),
+            ]),
+            pymongo.IndexModel(
+                [("novel_id", pymongo.ASCENDING)],
+                unique=True,
+                partialFilterExpression={"status": "generating"},
+                name="reference_card_proposals_single_generation_lease",
+            ),
+            pymongo.IndexModel(
+                [("purge_after", pymongo.ASCENDING)],
+                expireAfterSeconds=0,
+                name="reference_card_proposals_retention_ttl",
+            ),
+        ])
+        logger.info("Initialized reference-card proposal indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize reference-card proposal indexes: %s", exc)
 
 
 async def init_faction_relation_indexes():
@@ -412,10 +496,12 @@ async def init_state_timeline_indexes():
 
 async def init_all_indexes():
     """初始化所有数据库索引。"""
+    await init_identity_indexes()
     await init_novel_indexes()
     await init_volume_indexes()
     await init_chapter_indexes()
     await init_reference_card_indexes()
+    await init_reference_card_proposal_indexes()
     await init_faction_indexes()
     await init_faction_relation_indexes()
     await init_plot_thread_indexes()

@@ -5,11 +5,14 @@ import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiDelete, apiGet, apiPost, apiPut } from "@/lib/api";
 import type { ReferenceCard, ReferenceCardType } from "@/types/novel";
+import ReferenceCardCurationDialog from "./ReferenceCardCurationDialog";
 
 interface ReferenceCardsWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
   cardType: ReferenceCardType;
+  openCurationOnMount?: boolean;
+  onCurationOpened?: () => void;
 }
 
 interface CardDraft {
@@ -18,11 +21,12 @@ interface CardDraft {
   description: string;
   details: Record<string, string>;
   tags: string[];
+  importance: "main" | "sub";
 }
 
 const DETAIL_FIELDS: Record<ReferenceCardType, string[]> = {
   character: ["role", "age", "appearance", "personality", "motivation", "arc", "abilities", "relationships"],
-  location: ["category", "atmosphere", "geography", "history", "importance", "dangers"],
+  location: ["category", "atmosphere", "geography", "history", "story_importance", "dangers"],
   item: ["category", "appearance", "origin", "abilities", "limitations", "owner"],
   rule: ["category", "principle", "scope", "cost", "exceptions", "examples"],
 };
@@ -34,6 +38,7 @@ function createDraft(card?: ReferenceCard): CardDraft {
     description: card?.description ?? "",
     details: { ...(card?.details ?? {}) },
     tags: [...(card?.tags ?? [])],
+    importance: card?.importance ?? "sub",
   };
 }
 
@@ -41,7 +46,13 @@ function splitTags(value: string): string[] {
   return value.split(/[,，、;；\n]/).map((tag) => tag.trim()).filter(Boolean);
 }
 
-export default function ReferenceCardsWorkspace({ mode, novelId, cardType }: ReferenceCardsWorkspaceProps) {
+export default function ReferenceCardsWorkspace({
+  mode,
+  novelId,
+  cardType,
+  openCurationOnMount = false,
+  onCurationOpened,
+}: ReferenceCardsWorkspaceProps) {
   const t = useTranslations("writing.referenceCards");
   const [cards, setCards] = useState<ReferenceCard[]>([]);
   const [trash, setTrash] = useState<ReferenceCard[]>([]);
@@ -53,6 +64,7 @@ export default function ReferenceCardsWorkspace({ mode, novelId, cardType }: Ref
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showCuration, setShowCuration] = useState(false);
 
   const selectedCard = useMemo(
     () => cards.find((card) => card._id === selectedId) ?? null,
@@ -96,6 +108,13 @@ export default function ReferenceCardsWorkspace({ mode, novelId, cardType }: Ref
   useEffect(() => {
     void loadCards();
   }, [loadCards]);
+
+  useEffect(() => {
+    if (mode === "edit" && novelId && openCurationOnMount) {
+      setShowCuration(true);
+      onCurationOpened?.();
+    }
+  }, [mode, novelId, onCurationOpened, openCurationOnMount]);
 
   useEffect(() => {
     if (selectedCard && !creating) setDraft(createDraft(selectedCard));
@@ -200,14 +219,23 @@ export default function ReferenceCardsWorkspace({ mode, novelId, cardType }: Ref
               <h1 className="text-lg font-semibold text-foreground">{t(`types.${cardType}`)}</h1>
               <p className="mt-1 text-xs text-muted">{t(`typeDescriptions.${cardType}`)}</p>
             </div>
-            <button
-              type="button"
-              onClick={startCreating}
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-accent text-lg text-white transition-colors hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-              aria-label={t("newCard")}
-            >
-              +
-            </button>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => setShowCuration(true)}
+                className="inline-flex h-9 items-center justify-center rounded-lg border border-accent/30 bg-accent/10 px-3 text-xs font-semibold text-accent transition-colors hover:bg-accent/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {t("aiCuration")}
+              </button>
+              <button
+                type="button"
+                onClick={startCreating}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-accent text-lg text-white transition-colors hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                aria-label={t("newCard")}
+              >
+                +
+              </button>
+            </div>
           </div>
           <input
             value={search}
@@ -279,6 +307,17 @@ export default function ReferenceCardsWorkspace({ mode, novelId, cardType }: Ref
             <div className="mt-6 grid gap-5 md:grid-cols-2">
               <Field label={t("fields.name")} value={draft.name} onChange={(value) => setDraft((current) => ({ ...current, name: value }))} />
               <Field label={t("fields.subtitle")} value={draft.subtitle} onChange={(value) => setDraft((current) => ({ ...current, subtitle: value }))} />
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-foreground">{t("fields.cardImportance")}</span>
+                <select
+                  value={draft.importance}
+                  onChange={(event) => setDraft((current) => ({ ...current, importance: event.target.value as "main" | "sub" }))}
+                  className="w-full rounded-lg border border-border bg-surface px-3 py-2.5 text-sm text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+                >
+                  <option value="main">{t("importanceMainGeneric")}</option>
+                  <option value="sub">{t("importanceSubGeneric")}</option>
+                </select>
+              </label>
               <TextArea className="md:col-span-2" label={t("fields.description")} value={draft.description} onChange={(value) => setDraft((current) => ({ ...current, description: value }))} />
               {DETAIL_FIELDS[cardType].map((field) => (
                 <TextArea
@@ -301,6 +340,12 @@ export default function ReferenceCardsWorkspace({ mode, novelId, cardType }: Ref
           </div>
         )}
       </main>
+      <ReferenceCardCurationDialog
+        novelId={novelId}
+        isOpen={showCuration}
+        onClose={() => setShowCuration(false)}
+        onApplied={loadCards}
+      />
     </div>
   );
 }

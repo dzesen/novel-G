@@ -12,3 +12,4 @@ pymongo==4.17.0
 httpx==0.28.1
 pytest==8.4.2
 anyio==4.12.1
+argon2-cffi==25.1.0

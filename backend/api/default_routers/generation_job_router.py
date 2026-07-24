@@ -3,14 +3,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.services.generation.job_service import ConflictError, GenerationJobService
+from backend.api.default_routers.auth_router import require_owned_path_resource
 
-router = APIRouter(prefix="/api/generation-jobs", tags=["generation-jobs"])
+router = APIRouter(
+    prefix="/api/generation-jobs",
+    tags=["generation-jobs"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 _ID_FIELDS = ("_id", "novel_id", "volume_id", "current_chapter_id")
 

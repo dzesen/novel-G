@@ -14,6 +14,7 @@ from backend.services.novel.character_state_service import CharacterStateService
 from backend.services.novel.plot_thread_service import PlotThreadService
 from backend.services.novel.novel_service import NovelService
 from backend.services.novel.reference_card_service import ReferenceCardService
+from backend.services.novel.reference_card_curation import ReferenceCardCurationService
 from backend.services.novel.volume_service import VolumeService
 
 
@@ -63,6 +64,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("soft_delete_reference_card", 1): ReferenceCardService._execute_mutation,
         ("restore_reference_card", 1): ReferenceCardService._execute_mutation,
         ("hard_delete_reference_card", 1): ReferenceCardService._execute_mutation,
+        ("apply_reference_card_plan", 1): ReferenceCardCurationService._execute_apply,
     }
     non_narrative_operations = {"update_novel_metadata", "update_reference_card_metadata"}
     return {
@@ -78,12 +80,16 @@ async def _sync_quarantined_proposals(
     report: dict[str, list[dict[str, Any]]]
 ) -> None:
     journals = get_database()[collections.MUTATION_JOURNALS]
-    proposals = get_database()[collections.STATE_PREVIEWS]
     for item in report.get("quarantined") or []:
         journal = await journals.find_one({"_id": to_object_id(item["journal_id"])})
         command = ((journal or {}).get("command") or {}).get("payload") or {}
-        claim = command.get("proposal_claim") or {}
-        proposal_id = claim.get("proposal_id")
+        if (journal or {}).get("operation") == "apply_reference_card_plan":
+            proposals = get_database()[collections.REFERENCE_CARD_PROPOSALS]
+            proposal_id = command.get("proposal_id")
+        else:
+            proposals = get_database()[collections.STATE_PREVIEWS]
+            claim = command.get("proposal_claim") or {}
+            proposal_id = claim.get("proposal_id")
         if not proposal_id:
             continue
         await proposals.update_one(

@@ -1,4 +1,5 @@
 import type { ChapterDetail, ChapterDraft } from "@/types/novel";
+import { buildUserStorageKey } from "@/lib/userStorage";
 
 const CJK_OR_WORD = /[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
 
@@ -20,14 +21,16 @@ export function chapterToDraft(chapter: ChapterDetail): ChapterDraft {
   };
 }
 
-function storageKey(chapterId: string): string {
-  return `novel-generator:chapter-draft:${chapterId}`;
+function storageKey(chapterId: string): string | null {
+  return buildUserStorageKey("chapter", chapterId);
 }
 
 export function saveLocalChapterDraft(chapterId: string, draft: ChapterDraft): void {
   if (typeof window === "undefined") return;
+  const key = storageKey(chapterId);
+  if (!key) return;
   const value: LocalChapterDraft = { draft, savedAt: new Date().toISOString() };
-  window.localStorage.setItem(storageKey(chapterId), JSON.stringify(value));
+  window.localStorage.setItem(key, JSON.stringify(value));
 }
 
 export function loadNewerLocalChapterDraft(
@@ -35,24 +38,28 @@ export function loadNewerLocalChapterDraft(
 ): ChapterDraft | null {
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.localStorage.getItem(storageKey(chapter._id));
+    const key = storageKey(chapter._id);
+    if (!key) return null;
+    const raw = window.localStorage.getItem(key);
     if (!raw) return null;
     const value = JSON.parse(raw) as LocalChapterDraft;
     if (!value?.draft || !value.savedAt) return null;
     if (new Date(value.savedAt).getTime() <= new Date(chapter.updated_at).getTime()) {
-      window.localStorage.removeItem(storageKey(chapter._id));
+      window.localStorage.removeItem(key);
       return null;
     }
     return value.draft;
   } catch {
-    window.localStorage.removeItem(storageKey(chapter._id));
+    const key = storageKey(chapter._id);
+    if (key) window.localStorage.removeItem(key);
     return null;
   }
 }
 
 export function clearLocalChapterDraft(chapterId: string): void {
   if (typeof window !== "undefined") {
-    window.localStorage.removeItem(storageKey(chapterId));
+    const key = storageKey(chapterId);
+    if (key) window.localStorage.removeItem(key);
   }
 }
 

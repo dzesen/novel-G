@@ -8,7 +8,7 @@ import re
 from typing import Any, AsyncGenerator, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -47,7 +47,13 @@ from backend.llm.schemas.novel_pydantic import (
     NovelMetaSchema,
 )
 
-router = APIRouter(prefix="/api/llm", tags=["llm"])
+from backend.api.default_routers.auth_router import require_owned_body_resource
+
+router = APIRouter(
+    prefix="/api/llm",
+    tags=["llm"],
+    dependencies=[Depends(require_owned_body_resource)],
+)
 
 WORKFLOW_NAME = "create_novel_by_ai"
 FACTIONS_WORKFLOW_NAME = "create_factions_by_ai"

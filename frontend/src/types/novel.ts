@@ -118,6 +118,77 @@ export interface ReferenceCard {
   updated_at: string;
 }
 
+export type ReferenceCardCurationAction =
+  | "create"
+  | "merge"
+  | "restore_merge"
+  | "skip";
+
+export interface ReferenceCardCandidate {
+  candidate_id: string;
+  card_type: ReferenceCardType;
+  name: string;
+  subtitle: string;
+  description: string;
+  details: Record<string, string>;
+  tags: string[];
+  importance: "main" | "sub";
+  recommended_action: ReferenceCardCurationAction;
+  recommended_target_card_id?: string | null;
+  recommended_target?: Partial<ReferenceCard> | null;
+  field_conflicts: Array<{
+    field: string;
+    existing: unknown;
+    candidate: unknown;
+  }>;
+  warnings: Array<{
+    code: string;
+    message: string;
+    card_id?: string;
+    card_type?: ReferenceCardType;
+    name?: string;
+    score?: number;
+  }>;
+}
+
+export interface ReferenceCardCurationResult {
+  proposal_id: string;
+  counts: {
+    created: number;
+    merged: number;
+    restored_merged: number;
+    skipped: number;
+  };
+  mappings: Array<{
+    candidate_id: string;
+    action: ReferenceCardCurationAction;
+    card_id: string | null;
+  }>;
+}
+
+export interface ReferenceCardCurationProposal {
+  proposal_id: string;
+  novel_id: string;
+  status: "proposed" | "claimed" | "applied";
+  candidates: Record<
+    "characters" | "locations" | "items" | "rules",
+    ReferenceCardCandidate[]
+  >;
+  generation_audit: {
+    provider_alias?: string;
+    structured_output_mode?: string;
+    attempt_count?: number;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      total_tokens?: number;
+    };
+  };
+  proposal_expires_at: string;
+  acceptance_token: string;
+  apply_result?: ReferenceCardCurationResult;
+}
+
 export interface RewriteChatMessage {
   id: string;
   role: "user" | "assistant";

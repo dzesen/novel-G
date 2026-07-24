@@ -40,12 +40,11 @@ class NovelRepository(BaseRepository):
         
         return await self.insert_one(prepared, session=session)
 
-    async def get_all_novels(self) -> List[Dict[str, Any]]:
+    async def get_all_novels(self, owner_id: str) -> List[Dict[str, Any]]:
         """获取所有未删除的小说的简要信息（列表视图）"""
-        query = {}
         # 获取列表的部分信息
         cursor = self.collection.find(
-            {"is_deleted": False},
+            {"owner_id": to_object_id(owner_id), "is_deleted": False},
             projection={"_id": 1, "title": 1, "subtitle": 1, 
                         "genre": 1, "status": 1, "tags": 1, 
                         "cover_image": 1, "current_chapter_count": 1, "current_word_count": 1
@@ -53,10 +52,10 @@ class NovelRepository(BaseRepository):
         )
         return await cursor.to_list(length=None)
 
-    async def get_deleted_novels(self) -> List[Dict[str, Any]]:
+    async def get_deleted_novels(self, owner_id: str) -> List[Dict[str, Any]]:
         """获取所有已软删除的小说列表（回收站视图）"""
         cursor = self.collection.find(
-            {"is_deleted": True},
+            {"owner_id": to_object_id(owner_id), "is_deleted": True},
             projection={"_id": 1, "title": 1, "subtitle": 1,
                         "genre": 1, "status": 1, "tags": 1,
                         "cover_image": 1, "current_chapter_count": 1, "current_word_count": 1,
@@ -104,7 +103,16 @@ class NovelRepository(BaseRepository):
             实际修改成功时返回 True。
         """
         # 防止更新只读/审计字段
-        protected_fields = {"_id", "created_at", "updated_at", "is_deleted", "deleted_at"}
+        protected_fields = {
+            "_id",
+            "created_at",
+            "updated_at",
+            "is_deleted",
+            "deleted_at",
+            "owner_id",
+            "created_by",
+            "creation_source",
+        }
         filtered_data = {k: v for k, v in update_data.items() if k not in protected_fields}
         
         if not filtered_data:

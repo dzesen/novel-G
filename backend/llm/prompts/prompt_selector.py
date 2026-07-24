@@ -23,6 +23,7 @@ DEFAULT_PROMPT_FILENAME = "prompt_default.yaml"
 WORKFLOW_NAME = "create_novel_by_ai"
 REWRITE_NOVEL_FIELD_PROMPT_NAME = "rewrite_novel_field"
 CORE_FACTIONS_PROMPT_NAME = "create_factions_by_ai"
+REFERENCE_CARDS_PROMPT_NAME = "create_reference_cards_by_ai"
 VOLUME_OUTLINE_PROMPT_NAME = "create_volume_outline_by_ai"
 CHAPTER_OUTLINE_PROMPT_NAME = "create_chapter_outline_by_ai"
 PROSE_PROMPT_NAME = "write_chapter_by_ai"
@@ -76,6 +77,12 @@ REQUIRED_PROSE_PROMPT_KEYS: tuple[str, ...] = (
     "chapter_content_prompt_without_schema_suffix",
 )
 
+REQUIRED_REFERENCE_CARDS_PROMPT_KEYS: tuple[str, ...] = (
+    "reference_cards_prompt_base",
+    "reference_cards_prompt_with_schema_suffix",
+    "reference_cards_prompt_without_schema_suffix",
+)
+
 REQUIRED_CHAPTER_STATE_PROMPT_KEYS: tuple[str, ...] = (
     "chapter_state_prompt_base",
     "chapter_state_prompt_with_schema_suffix",
@@ -95,6 +102,7 @@ REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
     WORKFLOW_NAME: REQUIRED_CREATE_NOVEL_PROMPT_KEYS,
     REWRITE_NOVEL_FIELD_PROMPT_NAME: REQUIRED_REWRITE_NOVEL_FIELD_PROMPT_KEYS,
     CORE_FACTIONS_PROMPT_NAME: REQUIRED_CORE_FACTIONS_PROMPT_KEYS,
+    REFERENCE_CARDS_PROMPT_NAME: REQUIRED_REFERENCE_CARDS_PROMPT_KEYS,
     VOLUME_OUTLINE_PROMPT_NAME: REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS,
     CHAPTER_OUTLINE_PROMPT_NAME: REQUIRED_CHAPTER_OUTLINE_PROMPT_KEYS,
     PROSE_PROMPT_NAME: REQUIRED_PROSE_PROMPT_KEYS,
@@ -148,6 +156,10 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "narrative_pov",
         "era_background",
         "tags_json",
+    },
+    "reference_cards_prompt_base": {
+        "novel_json",
+        "existing_cards_json",
     },
     "function_result_probe_prompt": {"probe_token", "tool_result"},
     "volume_outline_prompt_base": {
@@ -427,6 +439,17 @@ def resolve_prompt_selection(prompt_dir: Path | None = None, *, emit_warning: bo
 
     try:
         custom_data = _read_yaml_mapping(custom_path)
+        # Older installations can have a valid custom prompt.yaml created before
+        # reference-card curation existed. Backfill only this newly introduced
+        # whole section so upgrading does not silently discard every established
+        # custom prompt. A present-but-invalid section still fails validation.
+        if (
+            REFERENCE_CARDS_PROMPT_NAME not in custom_data
+            and REFERENCE_CARDS_PROMPT_NAME in default_data
+        ):
+            custom_data[REFERENCE_CARDS_PROMPT_NAME] = deepcopy(
+                default_data[REFERENCE_CARDS_PROMPT_NAME]
+            )
         validate_prompt_data(custom_data, source_path=custom_path)
     except PromptConfigError as exc:
         reasons = (str(exc),)

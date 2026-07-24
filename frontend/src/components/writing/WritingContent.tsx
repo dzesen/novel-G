@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import type { WritingSidebarItem } from "@/types/novel";
 import WritingSidebar from "./WritingSidebar";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
@@ -17,7 +18,21 @@ interface WritingContentProps {
 }
 
 export default function WritingContent({ mode, novelId }: WritingContentProps) {
-  const [activeItem, setActiveItem] = useState<WritingSidebarItem>("novel-info");
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const requestedCardCuration =
+    mode === "edit" && searchParams.get("curateCards") === "1";
+  const [openCardCuration, setOpenCardCuration] = useState(requestedCardCuration);
+  const [activeItem, setActiveItem] = useState<WritingSidebarItem>(
+    requestedCardCuration ? "character-cards" : "novel-info",
+  );
+
+  useEffect(() => {
+    if (requestedCardCuration) {
+      router.replace(pathname);
+    }
+  }, [pathname, requestedCardCuration, router]);
 
   const renderMainArea = () => {
     if (activeItem === "novel-info") {
@@ -36,7 +51,16 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       );
     }
     if (activeItem === "character-cards") {
-      return <ReferenceCardsWorkspace key="character" mode={mode} novelId={novelId} cardType="character" />;
+      return (
+        <ReferenceCardsWorkspace
+          key="character"
+          mode={mode}
+          novelId={novelId}
+          cardType="character"
+          openCurationOnMount={openCardCuration}
+          onCurationOpened={() => setOpenCardCuration(false)}
+        />
+      );
     }
     if (activeItem === "location-cards") {
       return <ReferenceCardsWorkspace key="location" mode={mode} novelId={novelId} cardType="location" />;

@@ -13,7 +13,7 @@ import logging
 from typing import AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import Field
 
@@ -33,7 +33,13 @@ from backend.services.llm.workflow_runner import sse_event
 from backend.services.llm.workflow_service import get_llm_service_for_step
 from backend.services.llm.generation_runtime import WorkflowStepTarget, create_generation_runtime
 
-router = APIRouter(prefix="/api/llm", tags=["llm"])
+from backend.api.default_routers.auth_router import require_owned_body_resource
+
+router = APIRouter(
+    prefix="/api/llm",
+    tags=["llm"],
+    dependencies=[Depends(require_owned_body_resource)],
+)
 logger = logging.getLogger(__name__)
 
 PROSE_WORKFLOW = "write_chapter_by_ai"

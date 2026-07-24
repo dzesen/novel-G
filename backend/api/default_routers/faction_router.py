@@ -1,12 +1,17 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 
 from backend.db.errors import DuplicateKeyError, InvalidIdError, NotFoundError
 from backend.llm.schemas.novel_pydantic import CoreFactionsResultSchema
 from backend.services.novel.faction_service import FactionService
+from backend.api.default_routers.auth_router import require_owned_path_resource
 
-router = APIRouter(prefix="/api/factions", tags=["factions"])
+router = APIRouter(
+    prefix="/api/factions",
+    tags=["factions"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 class CreateFactionRequest(BaseModel):

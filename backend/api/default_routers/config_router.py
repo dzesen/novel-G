@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from backend.api.default_routers.auth_router import require_admin_request
 
 from backend.config import config as config_module
 from backend.config.capability_cache import FileCapabilityCacheStore
@@ -27,7 +28,11 @@ from backend.services.llm.provider_test_service import (
     test_llm_provider_capabilities,
 )
 
-router = APIRouter(prefix="/api/config", tags=["config"])
+router = APIRouter(
+    prefix="/api/config",
+    tags=["config"],
+    dependencies=[Depends(require_admin_request)],
+)
 logger = logging.getLogger(__name__)
 
 _lifecycle_cache: tuple[Path, ConfigLifecycle] | None = None

@@ -1,106 +1,152 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "");
+
+interface ApiAuthHooks {
+  getCsrfToken: () => string | null;
+  onUnauthorized: () => void;
+}
+
+let authHooks: ApiAuthHooks = {
+  getCsrfToken: () => null,
+  onUnauthorized: () => {},
+};
+
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+export function configureApiAuth(hooks: ApiAuthHooks): void {
+  authHooks = hooks;
+}
+
+export function getApiBase(): string {
+  if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
+  if (typeof window !== "undefined") {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return "http://localhost:8000";
+}
+
+function isUnsafeMethod(method: string): boolean {
+  return !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+}
+
+async function authorizedFetch(path: string, init: RequestInit): Promise<Response> {
+  const method = (init.method || "GET").toUpperCase();
+  const headers = {
+    ...(init.headers as Record<string, string> | undefined),
+  };
+  if (isUnsafeMethod(method)) {
+    const csrfToken = authHooks.getCsrfToken();
+    if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  }
+
+  const response = await fetch(`${getApiBase()}${path}`, {
+    ...init,
+    method,
+    headers,
+    credentials: "include",
+  });
+  if (response.status === 401) {
+    authHooks.onUnauthorized();
+  }
+  return response;
+}
+
+async function responseError(response: Response): Promise<ApiError> {
+  const body = await response.json().catch(() => null);
+  return new ApiError(body?.detail || `Request failed: ${response.status}`, response.status);
+}
+
+export async function apiRequest<T = unknown>(
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const response = await authorizedFetch(path, init);
+  if (!response.ok) throw await responseError(response);
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
 
 export function getImageUrl(url: string | null | undefined): string {
   if (!url) return "";
   if (url.startsWith("http") || url.startsWith("data:")) return url;
-  return `${API_BASE}${url}`;
+  return `${getApiBase()}${url}`;
 }
 
 export async function apiGet<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  return apiRequest<T>(path, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
     // 批量生成会在服务端改写章节内容，客户端若命中浏览器缓存会读到旧副本
     // （检查点复核里"点击跳转查看"会显示空章）——API 数据始终要最新。
     cache: "no-store",
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
-  }
-  return res.json();
 }
 
 export async function apiPut<T = unknown>(
   path: string,
   data: unknown
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  return apiRequest<T>(path, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
-  }
-  return res.json();
 }
 
 export async function apiPatch<T = unknown>(
   path: string,
   data: unknown
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  return apiRequest<T>(path, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
-  }
-  return res.json();
 }
 
 export async function apiPost<T = unknown>(
   path: string,
   data: unknown
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  return apiRequest<T>(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
-  }
-  return res.json();
 }
 
 export async function apiPostForm<T = unknown>(
   path: string,
   formData: FormData
 ): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await authorizedFetch(path, {
     method: "POST",
     body: formData,
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
+    throw await responseError(res);
   }
   return res.json();
 }
 
 export async function apiDelete<T = unknown>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  return apiRequest<T>(path, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
-  }
-  return res.json();
 }
 
 export async function apiDownload(path: string, fallbackFilename = "download"): Promise<void> {
-  const res = await fetch(`${API_BASE}${path}`, { method: "GET" });
+  const res = await authorizedFetch(path, { method: "GET" });
   if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
+    throw await responseError(res);
   }
 
   const disposition = res.headers.get("Content-Disposition") || "";
@@ -133,15 +179,14 @@ export async function apiPostSSE(
   onEvent: (event: string, data: Record<string, unknown>) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await authorizedFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
     signal,
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed: ${res.status}`);
+    throw await responseError(res);
   }
   const reader = res.body?.getReader();
   if (!reader) throw new Error("No response body");

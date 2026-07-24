@@ -1,11 +1,21 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Any, List, Optional
 
 from backend.services.novel.volume_service import VolumeService
 from backend.db.errors import NotFoundError, InvalidIdError, DuplicateKeyError
+from backend.api.default_routers.auth_router import require_owned_path_resource
+from backend.services.auth.identity_service import Actor
+from backend.services.auth.novel_access_service import (
+    NovelAccessService,
+    get_novel_access_service,
+)
 
-router = APIRouter(prefix="/api/volumes", tags=["volumes"])
+router = APIRouter(
+    prefix="/api/volumes",
+    tags=["volumes"],
+    dependencies=[Depends(require_owned_path_resource)],
+)
 
 
 class CreateVolumeRequest(BaseModel):
@@ -27,10 +37,15 @@ class AcceptVolumeOutlineRequest(BaseModel):
 
 
 @router.post("/create")
-async def create_volume(req: CreateVolumeRequest):
+async def create_volume(
+    req: CreateVolumeRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
     """创建一个新卷，挂载到指定小说下。"""
     data = req.model_dump(exclude_unset=True)
     try:
+        await access.require_owned_novel(actor, req.novel_id)
         volume_id = await VolumeService.create_volume(data)
         return {"id": volume_id, "message": "Volume created"}
     except NotFoundError as e:

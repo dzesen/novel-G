@@ -3,9 +3,14 @@ from __future__ import annotations
 import hashlib
 import os
 
-from fastapi import APIRouter, File, UploadFile, HTTPException
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException
+from backend.api.default_routers.auth_router import require_authenticated_request
 
-router = APIRouter(prefix="/api/upload", tags=["upload"])
+router = APIRouter(
+    prefix="/api/upload",
+    tags=["upload"],
+    dependencies=[Depends(require_authenticated_request)],
+)
 
 COVER_DIR = "static/covers"
 MAX_COVER_BYTES = 2 * 1024 * 1024

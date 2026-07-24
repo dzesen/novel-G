@@ -39,6 +39,16 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
         steps=(WorkflowStepDefinition(name="create_core_factions", label_key="settings.workflow.steps.create_core_factions"),),
     ),
     WorkflowDefinition(
+        name="create_reference_cards_by_ai",
+        label_key="settings.workflow.catalog.create_reference_cards_by_ai",
+        steps=(
+            WorkflowStepDefinition(
+                name="reference_cards",
+                label_key="settings.workflow.steps.reference_cards",
+            ),
+        ),
+    ),
+    WorkflowDefinition(
         name="create_volume_outline_by_ai",
         label_key="settings.workflow.catalog.create_volume_outline_by_ai",
         steps=(WorkflowStepDefinition(name="volume_outline", label_key="settings.workflow.steps.volume_outline"),),

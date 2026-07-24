@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from backend.db.collections import NOVELS
@@ -18,6 +18,10 @@ from backend.services.backup.backup_service import (
     parse_backup,
     restore_backup,
     serialize_backup,
+)
+from backend.api.default_routers.auth_router import (
+    require_admin_request,
+    require_owned_path_resource,
 )
 
 
@@ -34,12 +38,12 @@ def _attachment_headers(filename: str) -> dict[str, str]:
     }
 
 
-@router.get("/status")
+@router.get("/status", dependencies=[Depends(require_admin_request)])
 async def backup_status():
     return await get_backup_status()
 
 
-@router.get("/export")
+@router.get("/export", dependencies=[Depends(require_admin_request)])
 async def export_backup():
     snapshot = await create_backup_snapshot()
     created = snapshot["created_at"].strftime("%Y%m%d-%H%M%S")
@@ -51,7 +55,7 @@ async def export_backup():
     )
 
 
-@router.post("/restore")
+@router.post("/restore", dependencies=[Depends(require_admin_request)])
 async def import_backup(file: UploadFile = File(...)):
     content = await file.read(MAX_BACKUP_BYTES + 1)
     try:
@@ -64,7 +68,10 @@ async def import_backup(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Backup restore failed: {exc}") from exc
 
 
-@router.get("/novel/{novel_id}/text")
+@router.get(
+    "/novel/{novel_id}/text",
+    dependencies=[Depends(require_owned_path_resource)],
+)
 async def export_novel_text(novel_id: str):
     try:
         filename, content = await build_novel_text(novel_id)
@@ -79,7 +86,10 @@ async def export_novel_text(novel_id: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.get("/novel/{novel_id}/json")
+@router.get(
+    "/novel/{novel_id}/json",
+    dependencies=[Depends(require_owned_path_resource)],
+)
 async def export_novel_json(novel_id: str):
     try:
         snapshot = await build_novel_backup(novel_id)

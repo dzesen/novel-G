@@ -9,11 +9,12 @@ import { ProviderCard } from "@/components/settings/ProviderCard";
 import { WorkflowCard } from "@/components/settings/WorkflowCard";
 import { ThemeCard } from "@/components/settings/ThemeCard";
 import { BackupCard } from "@/components/settings/BackupCard";
+import { UserManagementCard } from "@/components/settings/UserManagementCard";
 import { validateConfig } from "@/lib/validation";
 import type { AppConfig } from "@/types/config";
 import { useRouter, usePathname } from "next/navigation";
 
-type SettingsSection = "theme" | "database" | "backup" | "provider" | "workflow";
+type SettingsSection = "theme" | "users" | "database" | "backup" | "provider" | "workflow";
 
 const NAV_ITEMS: { key: SettingsSection; icon: React.ReactNode }[] = [
   {
@@ -25,6 +26,17 @@ const NAV_ITEMS: { key: SettingsSection; icon: React.ReactNode }[] = [
         <circle cx="8.5" cy="7.5" r="2.5" />
         <circle cx="6.5" cy="12.5" r="2.5" />
         <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z" />
+      </svg>
+    ),
+  },
+  {
+    key: "users",
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+        <circle cx="9" cy="7" r="4" />
+        <path d="M19 8v6" />
+        <path d="M22 11h-6" />
       </svg>
     ),
   },
@@ -80,6 +92,7 @@ export default function SettingsContent({
   const currentLocale = pathname.startsWith("/en") ? "en" : "zh";
   const isModal = presentation === "modal";
   const [activeSection, setActiveSection] = useState<SettingsSection>("theme");
+  const showConfigActions = ["database", "provider", "workflow"].includes(activeSection);
   const {
     config,
     loading,
@@ -187,7 +200,7 @@ export default function SettingsContent({
           {!isModal && <p className="mt-1 text-sm text-muted">{t("description")}</p>}
         </div>
       </div>
-      <div className="flex shrink-0 gap-2">
+      {showConfigActions && <div className="flex shrink-0 gap-2">
         <Button
           variant="outline"
           onPress={handleReload}
@@ -203,11 +216,12 @@ export default function SettingsContent({
         >
           {saving ? t("saving") : t("save")}
         </Button>
-      </div>
+      </div>}
     </div>
   );
 
   const renderSectionContent = () => {
+    if (activeSection === "users") return <UserManagementCard />;
     if (activeSection === "backup") return <BackupCard />;
     if (!config) return null;
     switch (activeSection) {
@@ -274,11 +288,11 @@ export default function SettingsContent({
     </>
   );
 
-  const body = loading && activeSection !== "theme" && activeSection !== "backup" ? (
+  const body = loading && activeSection !== "theme" && activeSection !== "users" && activeSection !== "backup" ? (
     <div className="flex flex-1 items-center justify-center">
       <div className="text-muted">Loading...</div>
     </div>
-  ) : !config && activeSection !== "theme" && activeSection !== "backup" ? (
+  ) : !config && activeSection !== "theme" && activeSection !== "users" && activeSection !== "backup" ? (
     <div className="flex flex-1 items-center justify-center">
       <div className="text-muted">{error || "Failed to load"}</div>
     </div>
