@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/character-states", tags=["character-states"])
 
 class CurrentStateUpdateRequest(BaseModel):
     current_state: str
-    as_of_chapter_order: int
+    as_of_chapter_order: Optional[int] = None
     as_of_chapter_id: Optional[str] = None
 
 
@@ -78,19 +78,15 @@ async def list_states(novel_id: str):
 @router.put("/novel/{novel_id}/card/{card_id}/current-state")
 async def edit_current_state(novel_id: str, card_id: str, req: CurrentStateUpdateRequest):
     try:
-        chapter_order = req.as_of_chapter_order
-        if req.as_of_chapter_id:
-            chapter = await validate_chapter_reference(novel_id, req.as_of_chapter_id)
-            chapter_order = int(chapter.get("order_index") or 0)
-        if req.as_of_chapter_id:
-            state = await CharacterStateService.update_current_state(
-                novel_id, card_id, req.current_state, req.as_of_chapter_id, chapter_order
+        if not req.as_of_chapter_id:
+            raise ValueError(
+                "as_of_chapter_id is required; numeric chapter order is read-only compatibility data"
             )
-        else:
-            # 仅保留给旧客户端的裸章号兼容入口；当前 UI 总是提交稳定章节 ID。
-            state = await CharacterStateService.update_current_state_legacy(
-                novel_id, card_id, req.current_state, chapter_order
-            )
+        chapter = await validate_chapter_reference(novel_id, req.as_of_chapter_id)
+        chapter_order = int(chapter.get("order_index") or 0)
+        state = await CharacterStateService.update_current_state(
+            novel_id, card_id, req.current_state, req.as_of_chapter_id, chapter_order
+        )
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)
@@ -102,17 +98,15 @@ async def edit_current_state(novel_id: str, card_id: str, req: CurrentStateUpdat
 async def edit_fact(novel_id: str, card_id: str, fact_id: str, req: PermanentFactUpdateRequest):
     try:
         fields = req.model_dump(exclude_unset=True)
-        if req.source_chapter_id:
-            chapter = await validate_chapter_reference(novel_id, req.source_chapter_id)
-            fields["chapter_order"] = int(chapter.get("order_index") or 0)
-        if req.source_chapter_id:
-            state = await CharacterStateService.update_fact(
-                novel_id, card_id, fact_id, fields, req.source_chapter_id
+        if not req.source_chapter_id:
+            raise ValueError(
+                "source_chapter_id is required; numeric chapter order is read-only compatibility data"
             )
-        else:
-            state = await CharacterStateService.update_fact_legacy(
-                novel_id, card_id, fact_id, fields
-            )
+        chapter = await validate_chapter_reference(novel_id, req.source_chapter_id)
+        fields["chapter_order"] = int(chapter.get("order_index") or 0)
+        state = await CharacterStateService.update_fact(
+            novel_id, card_id, fact_id, fields, req.source_chapter_id
+        )
         if state is None:
             raise NotFoundError(f"Character state for card '{card_id}' was not found")
         return _serialize_state(state)

@@ -99,6 +99,11 @@ async def _normalize_chapter_references(novel_id: str, data: dict) -> dict:
         if chapter_id:
             chapter = await validate_chapter_reference(novel_id, chapter_id)
             prepared[snapshot_field] = int(chapter.get("order_index") or 0)
+        elif prepared.get(snapshot_field) is not None:
+            raise ValueError(
+                f"{id_field} is required when {snapshot_field} is supplied; "
+                "numeric chapter order is read-only compatibility data"
+            )
     due_target = prepared.get("due_target")
     if isinstance(due_target, dict) and due_target.get("kind") == "chapter":
         await validate_chapter_reference(novel_id, str(due_target.get("chapter_id") or ""))
@@ -150,6 +155,14 @@ async def create_thread(novel_id: str, req: PlotThreadCreateRequest):
         )
         data["source"] = "manual"
         effective = await _effective_chapter_id(novel_id, data)
+        if effective is None:
+            raise ValueError("A plot thread requires an active planted chapter")
+        if not data.get("planted_chapter_id"):
+            chapter = await validate_chapter_reference(novel_id, effective)
+            data["planted_chapter_id"] = effective
+            data["planted_chapter_order"] = int(chapter.get("order_index") or 0)
+        if data.get("status") == "resolved" and not data.get("resolved_chapter_id"):
+            raise ValueError("resolved_chapter_id is required when status is resolved")
         thread_id = await PlotThreadService.create_thread(
             novel_id, data, effective_chapter_id=effective
         )
@@ -167,6 +180,8 @@ async def update_thread(novel_id: str, thread_id: str, req: PlotThreadUpdateRequ
         data = await _normalize_chapter_references(
             novel_id, req.model_dump(exclude_unset=True)
         )
+        if data.get("status") == "resolved" and not data.get("resolved_chapter_id"):
+            raise ValueError("resolved_chapter_id is required when status is resolved")
         effective = await _effective_chapter_id(novel_id, data)
         await PlotThreadService.update_thread(
             novel_id, thread_id, data, effective_chapter_id=effective
