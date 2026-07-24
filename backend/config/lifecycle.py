@@ -329,6 +329,19 @@ def _provider_issues(raw_config: dict[str, Any]) -> list[ConfigIssue]:
                     message=f"Provider does not exist: {alias}",
                 )
             )
+        elif alias:
+            provider = providers.get(alias)
+            if (
+                not isinstance(provider, dict)
+                or provider.get("enabled", False) is not True
+            ):
+                issues.append(
+                    ConfigIssue(
+                        path=path,
+                        code="provider_disabled",
+                        message=f"Provider is disabled: {alias}",
+                    )
+                )
 
     check("llm.default_provider", llm_config.get("default_provider"))
     review = llm_config.get("format_review")
@@ -545,6 +558,15 @@ def _apply_provider_commands(
                     raise ValueError(
                         "Deleting the default provider requires a valid replacement default alias"
                     )
+                replacement_provider = providers[replacement]
+                if (
+                    not isinstance(replacement_provider, dict)
+                    or replacement_provider.get("enabled", False) is not True
+                ):
+                    raise ValueError(
+                        "Deleting the default provider requires an enabled "
+                        "replacement default alias"
+                    )
                 llm_config["default_provider"] = replacement
             del providers[alias]
             _clear_provider_references(llm_config, alias)
@@ -552,6 +574,28 @@ def _apply_provider_commands(
 
         raise ValueError(f"Unsupported Provider command: {command.kind}")
     return candidate
+
+
+def _delete_commands_replace_default(
+    raw_config: dict[str, Any],
+    commands: list[ProviderCommand],
+) -> bool:
+    llm_config = raw_config.get("llm")
+    if not isinstance(llm_config, dict):
+        return False
+    current_default = str(llm_config.get("default_provider") or "").strip()
+    replaced = False
+    for command in commands:
+        if isinstance(command, RenameProviderCommand):
+            if current_default == command.from_alias.strip():
+                current_default = command.to_alias.strip()
+        elif isinstance(command, DeleteProviderCommand):
+            if current_default == command.alias.strip():
+                current_default = (
+                    command.replacement_default_alias or ""
+                ).strip()
+                replaced = True
+    return replaced
 
 
 class ConfigLifecycle:
@@ -635,8 +679,27 @@ class ConfigLifecycle:
                 raise ConfigConflictError("Configuration revision is stale; reload before saving")
             if _contains_forbidden_secret_field(request.changes):
                 raise ValueError("Config changes must not contain api_key or has_api_key")
-            candidate = _apply_provider_commands(before, request.provider_commands, self._secret_store)
-            candidate = _merge_patch(candidate, request.changes)
+            command_candidate = _apply_provider_commands(
+                before,
+                request.provider_commands,
+                self._secret_store,
+            )
+            command_default = command_candidate.get("llm", {}).get(
+                "default_provider"
+            )
+            candidate = _merge_patch(command_candidate, request.changes)
+            if (
+                _delete_commands_replace_default(
+                    before,
+                    request.provider_commands,
+                )
+                and candidate.get("llm", {}).get("default_provider")
+                != command_default
+            ):
+                raise ValueError(
+                    "Provider delete changes must preserve the confirmed "
+                    "replacement default alias"
+                )
             before_references = _provider_reference_map(before)
             after_references = _provider_reference_map(candidate)
             reference_changes = [
@@ -727,8 +790,27 @@ class ConfigLifecycle:
             ):
                 self._validate_confirmation_token(request)
 
-            candidate = _apply_provider_commands(before, request.provider_commands, self._secret_store)
-            candidate = _merge_patch(candidate, request.changes)
+            command_candidate = _apply_provider_commands(
+                before,
+                request.provider_commands,
+                self._secret_store,
+            )
+            command_default = command_candidate.get("llm", {}).get(
+                "default_provider"
+            )
+            candidate = _merge_patch(command_candidate, request.changes)
+            if (
+                _delete_commands_replace_default(
+                    before,
+                    request.provider_commands,
+                )
+                and candidate.get("llm", {}).get("default_provider")
+                != command_default
+            ):
+                raise ValueError(
+                    "Provider delete changes must preserve the confirmed "
+                    "replacement default alias"
+                )
             providers = candidate.get("llm", {}).get("providers", {})
             if not isinstance(providers, dict):
                 raise ValueError("llm.providers must be a mapping")
@@ -748,7 +830,7 @@ class ConfigLifecycle:
                 )
             existing_issues = {
                 (issue.path, issue.code, issue.message)
-                for issue in _provider_issues(before)
+                for issue in _provider_issues(command_candidate)
             }
             for issue in _provider_issues(candidate):
                 if (issue.path, issue.code, issue.message) not in existing_issues:

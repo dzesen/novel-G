@@ -177,14 +177,24 @@ export function renameProviderAlias(config: AppConfig, currentAlias: string, nex
     workflows: mapWorkflowProviderAliases(config.llm.workflows, mapAlias),
   }};
 }
-export function removeProviderAlias(config: AppConfig, aliasToRemove: string): AppConfig {
+export function removeProviderAlias(
+  config: AppConfig,
+  aliasToRemove: string,
+  replacementDefaultAlias = "",
+): AppConfig {
   if (!(aliasToRemove in config.llm.providers)) return config;
   const providers = { ...config.llm.providers };
   delete providers[aliasToRemove];
+  const validReplacementDefaultAlias = isProviderSelectable(
+    providers,
+    replacementDefaultAlias,
+  ) ? replacementDefaultAlias : "";
   const mapAlias = (alias: string) => alias === aliasToRemove ? "" : alias;
   const review = config.llm.format_review;
   return { ...config, llm: { ...config.llm, providers,
-    default_provider: mapAlias(config.llm.default_provider),
+    default_provider: config.llm.default_provider === aliasToRemove
+      ? validReplacementDefaultAlias
+      : config.llm.default_provider,
     format_review: review.mode === "provider" && review.provider_alias === aliasToRemove
       ? { mode: "disabled", provider_alias: null } : review,
     workflows: mapWorkflowProviderAliases(config.llm.workflows, mapAlias),
@@ -207,6 +217,15 @@ export function getProviderAliasesForSelection(
   const aliases = Object.keys(providers).filter((alias) => isProviderSelectable(providers, alias, options));
   return currentAlias && currentAlias in providers && !aliases.includes(currentAlias)
     ? [currentAlias, ...aliases] : aliases;
+}
+
+export function getReplacementDefaultProviderAlias(
+  providers: Record<string, ProviderConfig>,
+  aliasToRemove: string,
+): string {
+  return getProviderAliasesForSelection(providers).find(
+    (alias) => alias !== aliasToRemove,
+  ) || "";
 }
 
 export function normalizeAppConfig(config: AppConfig, catalog: WorkflowDefinition[] = []): AppConfig {

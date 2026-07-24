@@ -26,6 +26,7 @@ import type {
 } from "@/types/config";
 import {
   getProviderAliasesForSelection,
+  getReplacementDefaultProviderAlias,
   isProviderSelectable,
   newProviderConfig,
   removeProviderAlias,
@@ -232,7 +233,9 @@ export function ProviderCard({ config, onChange, onProviderRename, onProviderDel
 
   const deleteProvider = (alias: string) => {
     const nextAliases = providerAliases.filter((item) => item !== alias);
-    const replacementDefaultAlias = defaultProvider === alias ? nextAliases[0] : undefined;
+    const replacementDefaultAlias = defaultProvider === alias
+      ? getReplacementDefaultProviderAlias(providers, alias)
+      : undefined;
     if (defaultProvider === alias && !replacementDefaultAlias) {
       window.alert(t("danger.defaultReplacementRequired"));
       return;
@@ -248,7 +251,7 @@ export function ProviderCard({ config, onChange, onProviderRename, onProviderDel
       return next;
     });
     onProviderDelete(alias, replacementDefaultAlias);
-    onChange(removeProviderAlias(config, alias));
+    onChange(removeProviderAlias(config, alias, replacementDefaultAlias));
   };
 
   const runProviderTest = async (alias: string) => {
