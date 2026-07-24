@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from collections import deque
 from datetime import datetime
@@ -28,6 +29,19 @@ BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 VENV_PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
 LOGS_DIR = BASE_DIR / "logs"
+LAUNCHER_STARTUP_LOG_ENV = "NOVEL_G_LAUNCHER_STARTUP_LOG"
+LOCAL_TCL_RUNTIME = BASE_DIR / ".venv" / "tcl-runtime"
+
+if (LOCAL_TCL_RUNTIME / "tcl8.6" / "init.tcl").is_file():
+    os.environ.setdefault(
+        "TCL_LIBRARY",
+        str(LOCAL_TCL_RUNTIME / "tcl8.6"),
+    )
+if (LOCAL_TCL_RUNTIME / "tk8.6" / "tk.tcl").is_file():
+    os.environ.setdefault(
+        "TK_LIBRARY",
+        str(LOCAL_TCL_RUNTIME / "tk8.6"),
+    )
 
 BACKEND_PORT = 8000
 FRONTEND_PORT = 3000
@@ -977,4 +991,53 @@ class App(ctk.CTk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    startup_check = "--check-startup" in sys.argv[1:]
+    try:
+        app = App()
+        if startup_check:
+            app.withdraw()
+            app.update_idletasks()
+            app.destroy()
+            print("[OK] Novel-G launcher GUI startup check passed.")
+        else:
+            app.mainloop()
+    except BaseException as exc:
+        if not startup_check:
+            try:
+                configured_log = os.environ.get(LAUNCHER_STARTUP_LOG_ENV, "").strip()
+                log_path = (
+                    Path(configured_log)
+                    if configured_log
+                    else ensure_logs_dir() / "launcher-startup.log"
+                )
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    log_file.write(
+                        "\n"
+                        f"[{datetime.now().isoformat(timespec='seconds')}] "
+                        "Launcher fatal error\n"
+                    )
+                    traceback.print_exception(
+                        type(exc),
+                        exc,
+                        exc.__traceback__,
+                        file=log_file,
+                    )
+            except Exception:
+                log_path = LOGS_DIR / "launcher-startup.log"
+
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+
+                    ctypes.windll.user32.MessageBoxW(
+                        None,
+                        "Novel-G 启动器未能打开。\n\n"
+                        f"错误：{type(exc).__name__}: {exc}\n\n"
+                        f"详细日志：{log_path}",
+                        "Novel-G 启动失败",
+                        0x10,
+                    )
+                except Exception:
+                    pass
+        raise

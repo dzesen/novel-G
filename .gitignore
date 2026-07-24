@@ -5,6 +5,7 @@
 /backups/
 /reports/
 .venv/
+/.npm-cache/
 .vscode/
 .pytest_cache/
 *.py[cod]
