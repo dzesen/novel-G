@@ -36,6 +36,7 @@ from backend.db.mongo import get_database
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.volume_repository import volume_repo
+from backend.runtime_reports import write_runtime_report
 
 
 logger = logging.getLogger(__name__)
@@ -76,14 +77,23 @@ def _backup_settings() -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def get_backup_directory() -> Path:
+def get_backup_directory(*, create: bool = True) -> Path:
     settings = _backup_settings()
     raw_directory = str(settings.get("directory", "backups")).strip() or "backups"
     path = Path(raw_directory)
     if not path.is_absolute():
         path = Path.cwd() / path
-    path.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
     return path.resolve()
+
+
+def _record_restore_report(payload: Dict[str, Any]) -> None:
+    """Diagnostics are best-effort and must never change restore semantics."""
+    try:
+        write_runtime_report("restore", payload)
+    except Exception:
+        logger.warning("Unable to write the local restore report.", exc_info=True)
 
 
 async def create_backup_snapshot() -> Dict[str, Any]:
@@ -149,14 +159,31 @@ async def restore_backup(payload: Dict[str, Any]) -> Dict[str, Any]:
     safety_path = await save_snapshot_file(safety_snapshot, prefix="pre-restore")
     try:
         await _replace_database_collections(validated["collections"])
-    except Exception:
+    except Exception as exc:
         logger.exception("Backup restore failed; restoring the pre-restore safety snapshot.")
         await _replace_database_collections(safety_snapshot["collections"])
+        _record_restore_report(
+            {
+                "status": "failed_rolled_back",
+                "error_type": type(exc).__name__,
+                "safety_snapshot": str(safety_path),
+            },
+        )
         raise
-    return {
+    result = {
         name: len(validated["collections"].get(name, []))
         for name in BACKUP_COLLECTIONS
     } | {"safety_snapshot": str(safety_path)}
+    _record_restore_report(
+        {
+            "status": "passed",
+            "safety_snapshot": str(safety_path),
+            "collection_counts": {
+                name: result[name] for name in BACKUP_COLLECTIONS
+            },
+        },
+    )
+    return result
 
 
 async def save_snapshot_file(snapshot: Dict[str, Any], *, prefix: str) -> Path:
@@ -194,8 +221,12 @@ async def create_automatic_backup_if_due() -> Path | None:
 
 async def get_backup_status() -> Dict[str, Any]:
     settings = _backup_settings()
-    directory = get_backup_directory()
-    files = sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    directory = get_backup_directory(create=False)
+    files = (
+        sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if directory.exists()
+        else []
+    )
     return {
         "enabled": settings.get("enabled", True) is not False,
         "interval_hours": max(1, int(settings.get("interval_hours", 24))),
