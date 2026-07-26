@@ -19,6 +19,7 @@ import time
 import traceback
 import webbrowser
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal, TextIO
@@ -138,6 +139,273 @@ def identify_novel_g_service(
     return False, f"服务标记不匹配（收到 {actual or 'unknown'}）"
 
 
+@dataclass(frozen=True)
+class WindowsProcessInfo:
+    pid: int
+    parent_pid: int
+    creation_time: str
+    executable_path: str
+    command_line: str
+
+
+@dataclass(frozen=True)
+class ExternalProcessFingerprint:
+    listener_pid: int
+    listener_creation_time: str
+    termination_pid: int
+    termination_creation_time: str
+
+
+def _normalize_windows_process_text(value: str) -> str:
+    return value.replace("/", "\\").casefold()
+
+
+def _matches_service_command(service_key: str, process: WindowsProcessInfo) -> bool:
+    command = _normalize_windows_process_text(process.command_line)
+    executable = _normalize_windows_process_text(process.executable_path)
+    if service_key == "backend":
+        return "main.py" in command and "python" in f"{executable} {command}"
+    if service_key == "frontend":
+        return "next" in command and any(
+            token in f" {command} " for token in (" start ", " dev ")
+        )
+    raise ValueError(f"不支持的服务类型：{service_key}")
+
+
+def select_trusted_external_process(
+    service_key: str,
+    process_chain: list[WindowsProcessInfo],
+    *,
+    project_root: Path = BASE_DIR,
+) -> ExternalProcessFingerprint | None:
+    """从监听进程到祖先进程中选择可安全终止的 Novel-G 进程树根。"""
+    if not process_chain:
+        return None
+
+    listener = process_chain[0]
+    if (
+        listener.pid <= 0
+        or not listener.creation_time
+        or not _matches_service_command(service_key, listener)
+    ):
+        return None
+
+    root = _normalize_windows_process_text(str(project_root.resolve())).rstrip("\\")
+    root_prefix = f"{root}\\"
+    trusted_candidates: list[WindowsProcessInfo] = []
+    for process in process_chain:
+        process_text = _normalize_windows_process_text(
+            f"{process.executable_path} {process.command_line}"
+        )
+        if (
+            process.pid > 0
+            and process.creation_time
+            and root_prefix in process_text
+            and _matches_service_command(service_key, process)
+        ):
+            trusted_candidates.append(process)
+
+    if not trusted_candidates:
+        return None
+
+    termination_target = trusted_candidates[-1]
+    return ExternalProcessFingerprint(
+        listener_pid=listener.pid,
+        listener_creation_time=listener.creation_time,
+        termination_pid=termination_target.pid,
+        termination_creation_time=termination_target.creation_time,
+    )
+
+
+def _read_windows_listener_process_chain(
+    port: int,
+) -> tuple[list[WindowsProcessInfo] | None, str]:
+    if sys.platform != "win32":
+        return None, "当前平台不支持安全接管外部进程"
+
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return None, "未找到 PowerShell，无法核验端口进程"
+
+    safe_port = int(port)
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$ownerPids = @(
+    Get-NetTCPConnection -State Listen -LocalPort {safe_port} |
+        Select-Object -ExpandProperty OwningProcess -Unique
+)
+if ($ownerPids.Count -ne 1) {{
+    [pscustomobject]@{{
+        status = 'ambiguous'
+        owner_pids = @($ownerPids)
+        chain = @()
+    }} | ConvertTo-Json -Compress -Depth 5
+    exit 0
+}}
+
+$listenerPid = [int]$ownerPids[0]
+$currentPid = $listenerPid
+$chain = @()
+$seen = @{{}}
+for ($depth = 0; $depth -lt 32 -and $currentPid -gt 0; $depth++) {{
+    if ($seen.ContainsKey($currentPid)) {{ break }}
+    $seen[$currentPid] = $true
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $currentPid"
+    if ($null -eq $process) {{ break }}
+    $creationTime = ''
+    if ($null -ne $process.CreationDate) {{
+        $creationTime = $process.CreationDate.ToUniversalTime().ToString('o')
+    }}
+    $chain += [pscustomobject]@{{
+        pid = [int]$process.ProcessId
+        parent_pid = [int]$process.ParentProcessId
+        creation_time = $creationTime
+        executable_path = [string]$process.ExecutablePath
+        command_line = [string]$process.CommandLine
+    }}
+    $currentPid = [int]$process.ParentProcessId
+}}
+
+[pscustomobject]@{{
+    status = 'ok'
+    listener_pid = $listenerPid
+    chain = @($chain)
+}} | ConvertTo-Json -Compress -Depth 5
+"""
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"读取端口进程失败：{type(exc).__name__}"
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return None, f"读取端口进程失败：{detail or f'code {result.returncode}'}"
+
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None, "端口进程信息不是有效 JSON"
+
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        owners = payload.get("owner_pids", []) if isinstance(payload, dict) else []
+        return None, f"端口监听进程不唯一：{owners}"
+
+    raw_chain = payload.get("chain")
+    if isinstance(raw_chain, dict):
+        raw_chain = [raw_chain]
+    if not isinstance(raw_chain, list):
+        return None, "未读取到监听进程树"
+
+    try:
+        process_chain = [
+            WindowsProcessInfo(
+                pid=int(item["pid"]),
+                parent_pid=int(item["parent_pid"]),
+                creation_time=str(item.get("creation_time") or ""),
+                executable_path=str(item.get("executable_path") or ""),
+                command_line=str(item.get("command_line") or ""),
+            )
+            for item in raw_chain
+            if isinstance(item, dict)
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None, "监听进程树字段无效"
+
+    if not process_chain:
+        return None, "监听进程树为空"
+    return process_chain, "已读取监听进程树"
+
+
+def discover_trusted_external_process(
+    port: int,
+    service_key: str,
+) -> tuple[ExternalProcessFingerprint | None, str]:
+    process_chain, detail = _read_windows_listener_process_chain(port)
+    if process_chain is None:
+        return None, detail
+
+    fingerprint = select_trusted_external_process(service_key, process_chain)
+    if fingerprint is None:
+        return None, "监听进程不属于当前 Novel-G 项目，已拒绝接管"
+    return (
+        fingerprint,
+        (
+            f"已验证监听 PID {fingerprint.listener_pid}，"
+            f"可安全终止进程树 PID {fingerprint.termination_pid}"
+        ),
+    )
+
+
+def terminate_trusted_external_service(
+    *,
+    port: int,
+    service_key: str,
+    health_url: str,
+    service_marker: str,
+    release_timeout: float = 8.0,
+) -> tuple[bool, str]:
+    """在服务标记和进程指纹两次一致时终止已有 Novel-G 实例。"""
+    matched, health_detail = identify_novel_g_service(health_url, service_marker)
+    if not matched:
+        return False, f"服务身份校验失败：{health_detail}"
+
+    first, first_detail = discover_trusted_external_process(port, service_key)
+    if first is None:
+        return False, first_detail
+
+    matched, health_detail = identify_novel_g_service(health_url, service_marker)
+    if not matched:
+        return False, f"二次服务身份校验失败：{health_detail}"
+
+    second, second_detail = discover_trusted_external_process(port, service_key)
+    if second is None:
+        return False, second_detail
+    if first != second:
+        return False, "监听进程在校验期间发生变化，已拒绝终止"
+    if sys.platform != "win32":
+        return False, "当前平台不支持安全终止外部进程"
+
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(second.termination_pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        return False, f"终止进程失败：{exc}"
+
+    deadline = time.monotonic() + max(0.1, release_timeout)
+    while time.monotonic() < deadline:
+        if not is_port_in_use(port):
+            return True, f"已停止 {service_marker}（PID {second.termination_pid}）"
+        time.sleep(0.1)
+
+    if result.returncode != 0:
+        output = (result.stderr or result.stdout or b"").decode(
+            locale.getpreferredencoding(False),
+            errors="replace",
+        ).strip()
+        return False, f"进程终止失败：{output or f'code {result.returncode}'}"
+    return False, f"已发送终止命令，但端口 {port} 未在限定时间内释放"
+
+
 def ensure_logs_dir() -> Path:
     with _LOG_DIR_LOCK:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -237,6 +505,55 @@ class AdaptiveStreamDecoder:
         decoded = self._buffer.decode(self._encodings[0], errors="replace")
         self._buffer.clear()
         return decoded
+
+
+def get_service_status_style(
+    state: ServiceState,
+    accent_color: str = "#15803d",
+) -> dict[str, object]:
+    styles = {
+        "stopped": {
+            "label": "已停止",
+            "badge_fg": ("gray86", "gray20"),
+            "badge_text": ("gray40", "gray70"),
+            "start": "normal",
+            "stop": "disabled",
+            "border": ("gray82", "gray22"),
+        },
+        "starting": {
+            "label": "启动中",
+            "badge_fg": ("#fef3c7", "#4a3410"),
+            "badge_text": ("#92400e", "#fbbf24"),
+            "start": "disabled",
+            "stop": "disabled",
+            "border": "#f59e0b",
+        },
+        "running": {
+            "label": "运行中",
+            "badge_fg": ("#dcfce7", "#0f3320"),
+            "badge_text": (accent_color, accent_color),
+            "start": "disabled",
+            "stop": "normal",
+            "border": accent_color,
+        },
+        "external": {
+            "label": "已有实例",
+            "badge_fg": ("#dbeafe", "#172554"),
+            "badge_text": ("#1d4ed8", "#93c5fd"),
+            "start": "disabled",
+            "stop": "normal",
+            "border": "#2563eb",
+        },
+        "stopping": {
+            "label": "停止中",
+            "badge_fg": ("#ffedd5", "#46200f"),
+            "badge_text": ("#c2410c", "#fb923c"),
+            "start": "disabled",
+            "stop": "disabled",
+            "border": "#f97316",
+        },
+    }
+    return styles[state]
 
 
 class ServicePanel(ctk.CTkFrame):
@@ -457,49 +774,7 @@ class ServicePanel(ctk.CTkFrame):
         return "".join(batch)
 
     def _apply_status(self, state: ServiceState) -> None:
-        styles = {
-            "stopped": {
-                "label": "已停止",
-                "badge_fg": ("gray86", "gray20"),
-                "badge_text": ("gray40", "gray70"),
-                "start": "normal",
-                "stop": "disabled",
-                "border": ("gray82", "gray22"),
-            },
-            "starting": {
-                "label": "启动中",
-                "badge_fg": ("#fef3c7", "#4a3410"),
-                "badge_text": ("#92400e", "#fbbf24"),
-                "start": "disabled",
-                "stop": "disabled",
-                "border": "#f59e0b",
-            },
-            "running": {
-                "label": "运行中",
-                "badge_fg": ("#dcfce7", "#0f3320"),
-                "badge_text": (self.accent_color, self.accent_color),
-                "start": "disabled",
-                "stop": "normal",
-                "border": self.accent_color,
-            },
-            "external": {
-                "label": "已有实例",
-                "badge_fg": ("#dbeafe", "#172554"),
-                "badge_text": ("#1d4ed8", "#93c5fd"),
-                "start": "disabled",
-                "stop": "disabled",
-                "border": "#2563eb",
-            },
-            "stopping": {
-                "label": "停止中",
-                "badge_fg": ("#ffedd5", "#46200f"),
-                "badge_text": ("#c2410c", "#fb923c"),
-                "start": "disabled",
-                "stop": "disabled",
-                "border": "#f97316",
-            },
-        }
-        style = styles[state]
+        style = get_service_status_style(state, self.accent_color)
         self.status_badge.configure(
             text=style["label"],
             fg_color=style["badge_fg"],
@@ -691,7 +966,20 @@ class ServicePanel(ctk.CTkFrame):
                 self.service_marker,
             )
             if matched:
-                self.write_log(f"[INFO] 端口 {self.port} 上{detail}；Launcher 不接管该进程。\n")
+                fingerprint, process_detail = discover_trusted_external_process(
+                    self.port,
+                    self.service_key,
+                )
+                if fingerprint is None:
+                    self.write_log(
+                        f"[WARN] 端口 {self.port} 上{detail}，但{process_detail}。"
+                        "停止操作会继续执行二次校验，校验不通过时不会终止进程。\n"
+                    )
+                else:
+                    self.write_log(
+                        f"[INFO] 端口 {self.port} 上{detail}；{process_detail}。"
+                        "可点击“停止”安全结束该实例。\n"
+                    )
                 self._close_log_file()
                 with self._state_lock:
                     self._state = "external"
@@ -780,15 +1068,41 @@ class ServicePanel(ctk.CTkFrame):
             except Exception:
                 pass
 
+    def _stop_external_worker(self) -> None:
+        self._open_log_file()
+        self.write_log(
+            f"[Launcher] 正在安全校验并停止端口 {self.port} 上的已有实例...\n"
+        )
+        stopped, detail = terminate_trusted_external_service(
+            port=self.port,
+            service_key=self.service_key,
+            health_url=self.health_url,
+            service_marker=self.service_marker,
+        )
+        self.write_log(
+            f"[{'OK' if stopped else 'ERROR'}] {detail}\n"
+        )
+        self._close_log_file()
+
+        with self._state_lock:
+            self._state = "stopped" if stopped else "external"
+        self._queue_event("status", "stopped" if stopped else "external")
+
     def stop(self) -> None:
         with self._state_lock:
             proc = self._proc
-            if self._state != "running" or proc is None:
+            if self._state == "running" and proc is not None:
+                worker = self._kill_proc
+                args = (proc,)
+            elif self._state == "external":
+                worker = self._stop_external_worker
+                args = ()
+            else:
                 return
             self._state = "stopping"
 
         self._apply_status("stopping")
-        threading.Thread(target=self._kill_proc, args=(proc,), daemon=True).start()
+        threading.Thread(target=worker, args=args, daemon=True).start()
 
     def clear_log(self) -> None:
         with self._log_lock:
