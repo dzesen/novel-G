@@ -25,6 +25,7 @@ from backend.runtime import (
     get_backend_log_level,
     is_backend_debug_enabled,
 )
+from backend.network_mode import get_backend_bind_host, get_cors_origins
 from backend.services.backup.backup_service import create_automatic_backup_if_due
 from backend.services.novel.mutation_recovery import recover_pending_mutations
 from backend.api.default_routers.backup_router import router as backup_router
@@ -54,7 +55,11 @@ async def lifespan(app: FastAPI):
     Returns:
         异步生命周期上下文生成器。
     """
-    logger.info("Backend startup: debug=%s docs=http://127.0.0.1:8000/docs", is_backend_debug_enabled())
+    logger.info(
+        "Backend startup: debug=%s bind_host=%s",
+        is_backend_debug_enabled(),
+        get_backend_bind_host(),
+    )
     # 启动早期读取一次提示词配置，让自定义 prompt.yaml 的错误能立刻出现在控制台日志中。
     load_prompt_config(force_reload=True)
     # Setup Mongo
@@ -94,10 +99,7 @@ async def health() -> dict[str, str]:
 # CORS — 允许前端开发服务器跨域访问
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -133,7 +135,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         app,
-        host="127.0.0.1",
+        host=get_backend_bind_host(),
         port=8000,
         reload=False,
         log_config=build_uvicorn_log_config(),

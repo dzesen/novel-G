@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import codecs
+import ipaddress
 import json
 import locale
 import os
@@ -64,6 +65,59 @@ _LOG_DIR_LOCK = threading.Lock()
 def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _is_usable_lan_ipv4(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return (
+        address.version == 4
+        and not address.is_loopback
+        and not address.is_link_local
+        and not address.is_multicast
+        and not address.is_unspecified
+    )
+
+
+def detect_lan_ipv4() -> str | None:
+    """Detect the IPv4 address selected by the operating system's default route."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))
+            candidate = str(sock.getsockname()[0])
+            if _is_usable_lan_ipv4(candidate):
+                return candidate
+    except OSError:
+        pass
+
+    try:
+        candidates = socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        return None
+    return next((candidate for candidate in candidates if _is_usable_lan_ipv4(candidate)), None)
+
+
+def build_backend_network_env(lan_ip: str | None) -> dict[str, str]:
+    if lan_ip is None:
+        return {
+            "NOVEL_G_BACKEND_HOST": "127.0.0.1",
+            "NOVEL_G_CORS_ORIGINS": "",
+        }
+    if not _is_usable_lan_ipv4(lan_ip):
+        raise ValueError(f"不可用的局域网 IPv4 地址：{lan_ip}")
+    return {
+        "NOVEL_G_BACKEND_HOST": "0.0.0.0",
+        "NOVEL_G_CORS_ORIGINS": f"http://{lan_ip}:{FRONTEND_PORT}",
+    }
+
+
+def build_frontend_command(npm_cmd: str, mode: str, lan_enabled: bool) -> list[str]:
+    script = "start" if mode == "生产模式" else "dev"
+    if lan_enabled:
+        script = f"{script}:lan"
+    return [npm_cmd, "run", script]
 
 
 def identify_novel_g_service(
@@ -764,6 +818,13 @@ class ServicePanel(ctk.CTkFrame):
     def set_command(self, command: list[str]) -> None:
         self.command = command
 
+    def set_env(self, env: dict[str, str]) -> None:
+        self.env = dict(env)
+
+    def is_active(self) -> bool:
+        with self._state_lock:
+            return self._state != "stopped"
+
 
 class App(ctk.CTk):
     def __init__(self):
@@ -778,6 +839,8 @@ class App(ctk.CTk):
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
+        self._lan_enabled = False
+        self._lan_ip: str | None = None
 
         self.npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
 
@@ -813,6 +876,24 @@ class App(ctk.CTk):
             hover_color="#b91c1c",
             command=self.stop_all,
         ).pack(side="left")
+
+        network_group = ctk.CTkFrame(toolbar, fg_color="transparent")
+        network_group.grid(row=0, column=1, sticky="w", padx=(18, 0), pady=10)
+
+        self.lan_mode = ctk.CTkCheckBox(
+            network_group,
+            text="局域网模式（可信网络）",
+            command=self._on_lan_mode_change,
+        )
+        self.lan_mode.pack(side="top", anchor="w")
+
+        self.network_hint = ctk.CTkLabel(
+            network_group,
+            text="仅本机访问",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray42", "gray68"),
+        )
+        self.network_hint.pack(side="top", anchor="w", pady=(3, 0))
 
         self.theme_selector = ctk.CTkSegmentedButton(
             toolbar,
@@ -876,6 +957,7 @@ class App(ctk.CTk):
         self.frontend_mode.pack(side="right")
         self.frontend_mode.set("生产模式")
         self._on_frontend_mode_change("生产模式")
+        self._apply_network_mode(False)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._atexit_cleanup)
@@ -951,13 +1033,56 @@ class App(ctk.CTk):
         }
         ctk.set_appearance_mode(mapping[mode])
 
-    def _on_frontend_mode_change(self, mode: str) -> None:
-        if mode == "生产模式":
-            cmd = [self.npm_cmd, "run", "start"]
-        else:
-            cmd = [self.npm_cmd, "run", "dev"]
+    def _apply_network_mode(self, enabled: bool) -> bool:
+        lan_ip = detect_lan_ipv4() if enabled else None
+        if enabled and lan_ip is None:
+            self._lan_enabled = False
+            self._lan_ip = None
+            self.lan_mode.deselect()
+            self.network_hint.configure(
+                text="未检测到可用的局域网 IPv4 地址",
+                text_color=("#b45309", "#fbbf24"),
+            )
+            return False
 
-        self.frontend.set_command(cmd)
+        self._lan_enabled = enabled
+        self._lan_ip = lan_ip
+        self.backend.set_env(build_backend_network_env(lan_ip))
+        browser_host = lan_ip if lan_ip else "127.0.0.1"
+        self.backend.url = f"http://{browser_host}:{BACKEND_PORT}/docs"
+        self.frontend.url = f"http://{browser_host}:{FRONTEND_PORT}"
+        self._on_frontend_mode_change(self.frontend_mode.get())
+
+        if lan_ip:
+            self.network_hint.configure(
+                text=f"访问：http://{lan_ip}:{FRONTEND_PORT}",
+                text_color=("#b45309", "#fbbf24"),
+            )
+        else:
+            self.network_hint.configure(
+                text="仅本机访问",
+                text_color=("gray42", "gray68"),
+            )
+        return True
+
+    def _on_lan_mode_change(self) -> None:
+        requested = bool(self.lan_mode.get())
+        if self.backend.is_active() or self.frontend.is_active():
+            if self._lan_enabled:
+                self.lan_mode.select()
+            else:
+                self.lan_mode.deselect()
+            self.network_hint.configure(
+                text="请先停止全部服务，再切换访问模式",
+                text_color=("#b45309", "#fbbf24"),
+            )
+            return
+        self._apply_network_mode(requested)
+
+    def _on_frontend_mode_change(self, mode: str) -> None:
+        self.frontend.set_command(
+            build_frontend_command(self.npm_cmd, mode, self._lan_enabled)
+        )
         if self.frontend.is_running():
             self.frontend.write_log("[INFO] 前端运行模式已切换，重启前端后生效。\n")
 

@@ -20,6 +20,7 @@ from backend.services.auth.identity_service import (
     get_identity_service,
 )
 from backend.db.errors import InvalidIdError, NotFoundError
+from backend.network_mode import is_lan_access_enabled, is_loopback_host
 from backend.services.auth.novel_access_service import (
     NovelAccessService,
     get_novel_access_service,
@@ -249,8 +250,15 @@ async def setup_status(
 async def setup_initial_admin(
     request: SetupRequest,
     response: Response,
+    http_request: Request,
     service: IdentityService = Depends(get_identity_service),
 ) -> dict[str, object]:
+    client_host = http_request.client.host if http_request.client else None
+    if is_lan_access_enabled() and not is_loopback_host(client_host):
+        raise HTTPException(
+            status_code=403,
+            detail="局域网模式下必须从运行服务的本机完成初始管理员设置",
+        )
     try:
         result = await service.setup_initial_admin(**request.model_dump())
     except IdentityConflictError as exc:
