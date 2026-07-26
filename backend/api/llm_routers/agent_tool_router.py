@@ -28,6 +28,7 @@ from backend.services.llm.agent_context import (
 from backend.services.llm.agent_orchestrator import (
     AgentOrchestrator,
     ContinuityReviewResult,
+    CreativeDirectionResult,
     CreativeInspirationResult,
 )
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
@@ -46,6 +47,8 @@ router = APIRouter(
 
 CREATIVE_WORKFLOW = "creative_inspiration_by_agent"
 CREATIVE_STEP = "inspiration"
+CREATIVE_DIRECTION_WORKFLOW = "creative_direction_by_agent"
+CREATIVE_DIRECTION_STEP = "direction"
 CONTINUITY_WORKFLOW = "continuity_review_by_agent"
 CONTINUITY_STEP = "review"
 logger = logging.getLogger(__name__)
@@ -66,6 +69,19 @@ class CreativeInspirationRequest(AgentScopeRequest):
     question: str = Field(min_length=2, max_length=2000)
     constraints: str = Field(default="", max_length=2000)
     idea_count: int = Field(default=4, ge=2, le=8)
+
+
+class CreativeDirectorRequest(GenerationParamsMixin):
+    """Inputs available before a novel resource exists."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_idea: str = Field(min_length=2, max_length=8000)
+    number_of_chapters: int = Field(default=100, ge=1, le=1000)
+    words_per_chapter: int = Field(default=3000, ge=500, le=10000)
+    agent_id: str = Field(min_length=1, max_length=120)
+    instruction: str = Field(default="", max_length=2000)
+    direction_count: int = Field(default=3, ge=2, le=4)
 
 
 class ContinuityReviewRequest(AgentScopeRequest):
@@ -111,6 +127,43 @@ def _creative_prompt(
 - 不得把建议写成已经发生的事实；不得悄悄推翻卷纲、人物永久事实或世界规则。
 - affected_elements、risks、suggested_changes 使用简短字符串数组。
 - framing 先概括当前创作空间与最关键约束。
+{suffix}""".strip()
+
+
+def _creative_direction_prompt(
+    *,
+    user_idea: str,
+    number_of_chapters: int,
+    words_per_chapter: int,
+    instruction: str,
+    direction_count: int,
+    json_only: bool,
+) -> str:
+    """Build the bounded pre-creation Creative Director prompt."""
+    suffix = (
+        "只输出合法 JSON 对象，不要使用 Markdown 代码块。"
+        if json_only
+        else "严格按照提供的 JSON Schema 输出。"
+    )
+    return f"""在正式创建小说前，为用户的原始灵感提出可选择的长篇创作方向。
+
+【用户原始创意】
+{user_idea.strip()}
+
+【预计体量】
+- 章节数：{number_of_chapters}
+- 每章字数：{words_per_chapter}
+
+【本次补充指令】
+{instruction.strip() or "无"}
+
+要求：
+- 恰好生成 {direction_count} 个方向；它们必须在核心矛盾、人物弧或故事引擎上真正不同。
+- 每个方向都要能支撑预计体量，说明持续制造情节的 story_engine，而不只是一次性反转。
+- 保留原始创意中最有辨识度的承诺，并明确 must_keep 与主要 risks。
+- pitch、core_conflict、protagonist_arc、world_hook 和 tone_and_style 必须可直接用于后续建书约束。
+- 这些只是预览候选，不得声称已经创建、保存或修改小说。
+- framing 简要说明原始创意最值得保留的部分和当前最关键的选择。
 {suffix}""".strip()
 
 
@@ -252,6 +305,75 @@ async def _record_run_failure(
         # outage is logged for operators but must not replace the Provider,
         # validation, or stale-context error the author needs to act on.
         logger.exception("Failed to persist Agent run failure for %s", run_id)
+
+
+@router.post("/creative-director")
+async def generate_creative_direction(
+    request: CreativeDirectorRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+) -> dict[str, Any]:
+    """Generate preview-only directions before a novel has been created."""
+    try:
+        profile = await catalog.resolve_profile(
+            actor,
+            agent_id=request.agent_id,
+            capability="novel_direction",
+        )
+        runtime = create_generation_runtime()
+        generated = await AgentOrchestrator(runtime).generate_structured(
+            profile=profile,
+            target=WorkflowStepTarget(
+                CREATIVE_DIRECTION_WORKFLOW,
+                CREATIVE_DIRECTION_STEP,
+            ),
+            schema=CreativeDirectionResult,
+            prompts=PromptPlan(
+                native_schema_prompt=_creative_direction_prompt(
+                    user_idea=request.user_idea,
+                    number_of_chapters=request.number_of_chapters,
+                    words_per_chapter=request.words_per_chapter,
+                    instruction=request.instruction,
+                    direction_count=request.direction_count,
+                    json_only=False,
+                ),
+                prompt_json_prompt=_creative_direction_prompt(
+                    user_idea=request.user_idea,
+                    number_of_chapters=request.number_of_chapters,
+                    words_per_chapter=request.words_per_chapter,
+                    instruction=request.instruction,
+                    direction_count=request.direction_count,
+                    json_only=True,
+                ),
+            ),
+            **build_gen_kwargs(request),
+        )
+        return {
+            "result": generated.value.model_dump(),
+            "agent_id": profile.agent_id,
+            "agent_version": profile.version,
+            "provider_alias": generated.plan.provider_alias,
+            "usage": generated.usage.model_dump(),
+            "attempts": [
+                {
+                    "attempt_id": item.attempt_id,
+                    "provider_alias": item.provider_alias,
+                    "phase": item.phase,
+                    "state": item.state,
+                    "usage": item.usage.model_dump(),
+                }
+                for item in generated.attempts
+            ],
+            "write_policy": "preview_only",
+        }
+    except (NotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "[creative_director] failed agent_id=%s",
+            request.agent_id,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/agent-inspiration")

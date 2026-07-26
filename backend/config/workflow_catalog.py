@@ -79,6 +79,16 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
         ),
     ),
     WorkflowDefinition(
+        name="creative_direction_by_agent",
+        label_key="settings.workflow.catalog.creative_direction_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="direction",
+                label_key="settings.workflow.steps.direction",
+            ),
+        ),
+    ),
+    WorkflowDefinition(
         name="creative_inspiration_by_agent",
         label_key="settings.workflow.catalog.creative_inspiration_by_agent",
         steps=(

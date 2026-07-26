@@ -33,6 +33,7 @@ from backend.services.llm.generation_runtime import (
     create_workflow_runtime,
 )
 from backend.services.llm.llm_service import LLMService
+from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
 from backend.services.novel.faction_service import FactionService
 from backend.llm.prompts.prompt_selector import (
     CORE_FACTIONS_PROMPT_NAME,
@@ -139,6 +140,37 @@ def _load_prompts() -> dict:
     return load_prompt_config()
 
 
+def _build_creation_idea(
+    user_idea: str,
+    creative_direction: CreativeDirectionSelection | None,
+) -> str:
+    """Combine the original idea with a user-confirmed direction."""
+    if creative_direction is None:
+        return user_idea
+
+    direction = creative_direction.direction
+    must_keep = "；".join(direction.must_keep) or "无额外条目"
+    risks = "；".join(direction.risks) or "无额外条目"
+    adjustments = creative_direction.user_adjustments.strip() or "无"
+    return f"""【用户原始创意】
+{user_idea.strip()}
+
+【用户已确认的创意总监方向——后续四步必须遵守】
+- 方向标题：{direction.title}
+- 核心提案：{direction.pitch}
+- 核心冲突：{direction.core_conflict}
+- 主角成长弧：{direction.protagonist_arc}
+- 长篇故事引擎：{direction.story_engine}
+- 世界观钩子：{direction.world_hook}
+- 基调与风格：{direction.tone_and_style}
+- 必须保留：{must_keep}
+- 已知风险：{risks}
+- 用户补充调整：{adjustments}
+
+执行约束：不得在扩写、提炼、核心种子或小说设定步骤中擅自改换上述方向；
+如细节存在空白，应在不违背原始创意和已确认方向的前提下补全。""".strip()
+
+
 AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key="expand_idea",
@@ -229,6 +261,7 @@ class AICreateNovelRequest(GenerationParamsMixin):
     user_idea: str
     number_of_chapters: int = 100
     words_per_chapter: int = 3000
+    creative_direction: CreativeDirectionSelection | None = None
     cached_steps: AICreateCachedSteps | None = None
 
 
@@ -617,7 +650,10 @@ async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
             steps=AI_CREATE_STEPS,
             prompts=_load_prompts().get(WORKFLOW_NAME, {}),
             params={
-                "user_idea": req.user_idea,
+                "user_idea": _build_creation_idea(
+                    req.user_idea,
+                    req.creative_direction,
+                ),
                 "number_of_chapters": req.number_of_chapters,
                 "words_per_chapter": req.words_per_chapter,
             },

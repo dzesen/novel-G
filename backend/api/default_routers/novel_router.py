@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, model_validator
+from typing import List, Literal, Optional
 
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.novel.novel_service import NovelService
@@ -12,6 +12,7 @@ from backend.services.auth.novel_access_service import (
     get_novel_access_service,
 )
 from backend.api.default_routers.auth_router import require_actor, require_csrf_actor
+from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
 
 router = APIRouter(prefix="/api/novels", tags=["novels"])
 
@@ -34,6 +35,16 @@ class CreateNovelRequest(BaseModel):
     core_idea: Optional[str] = None
     number_of_chapters: Optional[int] = None
     words_per_chapter: Optional[int] = None
+    creation_mode: Literal["manual", "ai"] = "manual"
+    creative_direction: CreativeDirectionSelection | None = None
+
+    @model_validator(mode="after")
+    def validate_creation_provenance(self):
+        if self.creative_direction is not None and self.creation_mode != "ai":
+            raise ValueError(
+                "creative_direction requires creation_mode='ai'"
+            )
+        return self
 
 class UpdateNovelRequest(BaseModel):
     title: Optional[str] = None
@@ -65,14 +76,20 @@ async def create_novel(
 ):
     """创建一个新的小说项目。"""
     data = req.model_dump(exclude_unset=True)
+    creation_mode = data.pop("creation_mode", req.creation_mode)
+    creative_direction = data.pop("creative_direction", None)
     owner_id = to_object_id(actor.id)
     data.update(
         {
             "owner_id": owner_id,
             "created_by": owner_id,
-            "creation_source": "manual",
+            "creation_source": creation_mode,
         }
     )
+    if creative_direction is not None:
+        data["creation_provenance"] = {
+            "creative_director": creative_direction,
+        }
     try:
         novel_id = await novel_repo.create_novel(data)
         return {"id": novel_id, "message": "Novel created"}

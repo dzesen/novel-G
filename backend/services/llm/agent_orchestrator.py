@@ -116,6 +116,18 @@ _AGENT_PROFILES: tuple[AgentProfile, ...] = (
         capabilities=("scene_rewrite",),
     ),
     AgentProfile(
+        agent_id="creative_director",
+        label="创意总监 Agent",
+        description="在新建小说前，把原始灵感发展为多个可比较、可持续推进的长篇创作方向。",
+        instruction=(
+            "你是创意总监 Agent。你负责在正式创建小说前澄清作品的核心承诺、长篇故事引擎、"
+            "人物成长与世界钩子，给出真正不同且可执行的方向。不得替用户直接确认方向，"
+            "不得把候选建议描述成已保存的小说事实。"
+        ),
+        capabilities=("novel_direction",),
+        generation_params={"temperature": 0.85, "max_tokens": 2600},
+    ),
+    AgentProfile(
         agent_id="creative_inspiration",
         label="创意启发 Agent",
         description="围绕当前小说约束提出多个可比较、可落地的创意方向。",
@@ -144,6 +156,43 @@ class SceneRewriteResult(BaseModel):
 
     summary: str = Field(min_length=5, max_length=1200)
     purpose: str = Field(min_length=5, max_length=600)
+
+
+class CreativeDirection(BaseModel):
+    """One candidate direction presented before the novel creation workflow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=2, max_length=120)
+    pitch: str = Field(min_length=20, max_length=1600)
+    core_conflict: str = Field(min_length=10, max_length=1200)
+    protagonist_arc: str = Field(min_length=10, max_length=1200)
+    story_engine: str = Field(min_length=10, max_length=1200)
+    world_hook: str = Field(min_length=10, max_length=1200)
+    tone_and_style: str = Field(min_length=2, max_length=500)
+    must_keep: list[str] = Field(default_factory=list, max_length=10)
+    risks: list[str] = Field(default_factory=list, max_length=8)
+
+
+class CreativeDirectionResult(BaseModel):
+    """Comparable directions returned by the pre-creation Creative Director."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    framing: str = Field(min_length=5, max_length=800)
+    directions: list[CreativeDirection] = Field(min_length=2, max_length=4)
+
+
+class CreativeDirectionSelection(BaseModel):
+    """A user-confirmed direction that becomes creation provenance and constraint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1, max_length=120)
+    agent_version: int = Field(ge=1)
+    provider_alias: str | None = Field(default=None, max_length=120)
+    direction: CreativeDirection
+    user_adjustments: str = Field(default="", max_length=2000)
 
 
 class CreativeIdea(BaseModel):

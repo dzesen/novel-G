@@ -159,6 +159,12 @@ llm:
         scene_rewrite:
           provider: ""
           timeout_seconds: null
+    creative_direction_by_agent:
+      default_provider: ""
+      steps:
+        direction:
+          provider: ""
+          timeout_seconds: null
     creative_inspiration_by_agent:
       default_provider: ""
       steps:

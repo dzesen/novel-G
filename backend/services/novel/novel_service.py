@@ -44,6 +44,7 @@ class NovelService:
             "owner_id",
             "created_by",
             "creation_source",
+            "creation_provenance",
         }
         changes = {
             key: value

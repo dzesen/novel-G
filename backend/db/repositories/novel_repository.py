@@ -112,6 +112,7 @@ class NovelRepository(BaseRepository):
             "owner_id",
             "created_by",
             "creation_source",
+            "creation_provenance",
         }
         filtered_data = {k: v for k, v in update_data.items() if k not in protected_fields}
         
