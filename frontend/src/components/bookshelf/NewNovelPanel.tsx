@@ -6,6 +6,7 @@ import { useRouter, usePathname } from "next/navigation";
 import { Card, Button } from "@heroui/react";
 import AICreateStepper from "./AICreateStepper";
 import type { AICreateResponse, WritingDraft } from "@/types/novel";
+import type { CreativeDirectionSelection } from "@/types/agent";
 import { saveWritingDraft } from "@/lib/writingDraft";
 import { clearAICreateCache } from "@/lib/aiCreateCache";
 
@@ -22,7 +23,12 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
   const locale = pathname.startsWith("/en") ? "en" : "zh";
   const [redirecting, setRedirecting] = useState(false);
 
-  const handleAIComplete = (result: AICreateResponse, chapters: number, wordsPerChapter: number) => {
+  const handleAIComplete = (
+    result: AICreateResponse,
+    chapters: number,
+    wordsPerChapter: number,
+    creativeDirection: CreativeDirectionSelection | null,
+  ) => {
     const meta = result.novel_meta;
     const plot = result.expand_idea?.plot ?? result.extract_idea.plot ?? "";
     const draft: WritingDraft = {
@@ -44,6 +50,8 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
       core_idea: result.extract_idea.core_idea,
       number_of_chapters: chapters,
       words_per_chapter: wordsPerChapter,
+      creation_mode: "ai",
+      ...(creativeDirection && { creative_direction: creativeDirection }),
     };
     const draftId = saveWritingDraft(draft);
     clearAICreateCache();

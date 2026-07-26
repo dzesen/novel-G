@@ -1,5 +1,6 @@
 import type { NovelRewriteFieldKey } from "@/lib/novelFields";
 import type { StoredChapterOutline } from "@/components/writing/chapters/outline/outlineTypes";
+import type { CreativeDirectionSelection } from "@/types/agent";
 
 export type { NovelRewriteFieldKey } from "@/lib/novelFields";
 
@@ -33,6 +34,10 @@ export interface NovelDetail extends NovelSummary {
   core_idea?: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
+  creation_source?: "manual" | "ai";
+  creation_provenance?: {
+    creative_director?: CreativeDirectionSelection;
+  };
 }
 
 export interface CreateNovelRequest {
@@ -54,6 +59,8 @@ export interface CreateNovelRequest {
   core_idea?: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
+  creation_mode?: "manual" | "ai";
+  creative_direction?: CreativeDirectionSelection;
 }
 
 export type ChapterStatus = "draft" | "writing" | "completed";
@@ -314,6 +321,7 @@ export interface AICreateRequest {
   user_idea: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
+  creative_direction?: CreativeDirectionSelection;
   cached_steps?: AICreateCachedSteps;
   // 可选生成参数
   temperature?: number | null;

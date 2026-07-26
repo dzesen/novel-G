@@ -1,9 +1,9 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
-import { Button } from "@heroui/react";
-import { apiPostSSE } from "@/lib/api";
+import { Button, Switch } from "@heroui/react";
+import { apiGet, apiPost, apiPostSSE } from "@/lib/api";
 import {
   clearAICreateCache,
   hasAICreateCachedSteps,
@@ -15,9 +15,20 @@ import {
 } from "@/lib/aiCreateCache";
 import { OptionalSliderParam, OptionalNumberParam, OptionalTextParam } from "@/components/shared/OptionalParamControls";
 import type { AICreateCachedSteps, AICreateRequest, AICreateResponse, AICreateStepKey } from "@/types/novel";
+import type {
+  AgentProfile,
+  CreativeDirection,
+  CreativeDirectionSelection,
+  CreativeDirectorResponse,
+} from "@/types/agent";
 
 interface AICreateStepperProps {
-  onComplete: (result: AICreateResponse, chapters: number, wordsPerChapter: number) => void;
+  onComplete: (
+    result: AICreateResponse,
+    chapters: number,
+    wordsPerChapter: number,
+    creativeDirection: CreativeDirectionSelection | null,
+  ) => void;
 }
 
 type StepStatus = "pending" | "running" | "done" | "error";
@@ -83,9 +94,33 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
   const t = useTranslations("create");
   const [initialCache] = useState(() => loadAICreateCache());
   const initialSteps = initialCache?.steps ?? {};
+  const initialCreativeDirection =
+    initialCache?.input.creative_direction ?? null;
   const [idea, setIdea] = useState(initialCache?.input.user_idea ?? "");
   const [chapters, setChapters] = useState(initialCache?.input.number_of_chapters ?? 600);
   const [wordsPerChapter, setWordsPerChapter] = useState(initialCache?.input.words_per_chapter ?? 3000);
+  const [directorEnabled, setDirectorEnabled] = useState(
+    initialCreativeDirection !== null,
+  );
+  const [directorAgents, setDirectorAgents] = useState<AgentProfile[]>([]);
+  const [selectedDirectorId, setSelectedDirectorId] = useState(
+    initialCreativeDirection?.agent_id ?? "creative_director",
+  );
+  const [directorInstruction, setDirectorInstruction] = useState("");
+  const [directorPreview, setDirectorPreview] =
+    useState<CreativeDirectorResponse | null>(null);
+  const [selectedDirectionIndex, setSelectedDirectionIndex] = useState<
+    number | null
+  >(initialCreativeDirection ? 0 : null);
+  const [confirmedDirection, setConfirmedDirection] =
+    useState<CreativeDirectionSelection | null>(initialCreativeDirection);
+  const [directorAdjustments, setDirectorAdjustments] = useState(
+    initialCreativeDirection?.user_adjustments ?? "",
+  );
+  const [isLoadingDirectorAgents, setIsLoadingDirectorAgents] = useState(false);
+  const [isDirecting, setIsDirecting] = useState(false);
+  const [directorAgentError, setDirectorAgentError] = useState("");
+  const [directorError, setDirectorError] = useState("");
   const [showGenParams, setShowGenParams] = useState(false);
   const [temperature, setTemperature] = useState<number | null>(null);
   const [topP, setTopP] = useState<number | null>(null);
@@ -101,6 +136,35 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
   const [result, setResult] = useState<AICreateResponse | null>(null);
   const cachedStepsRef = useRef<AICreateCachedSteps>(initialSteps);
 
+  useEffect(() => {
+    if (!directorEnabled || directorAgents.length > 0) return;
+
+    let active = true;
+    setIsLoadingDirectorAgents(true);
+    setDirectorAgentError("");
+    apiGet<{ data: AgentProfile[] }>("/api/agents?capability=novel_direction")
+      .then((response) => {
+        if (!active) return;
+        setDirectorAgents(response.data);
+        if (response.data.length === 0) {
+          setDirectorAgentError(t("director.noAgents"));
+        }
+      })
+      .catch((error) => {
+        if (!active) return;
+        setDirectorAgentError(
+          error instanceof Error ? error.message : t("director.loadFailed"),
+        );
+      })
+      .finally(() => {
+        if (active) setIsLoadingDirectorAgents(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [directorAgents.length, directorEnabled, t]);
+
   const stepLabelMap: Record<AICreateStepKey, string> = {
     expand_idea: t("stepExpandIdea"),
     extract_idea: t("stepExtractIdea"),
@@ -115,10 +179,12 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
     nextIdea = idea,
     nextChapters = chapters,
     nextWordsPerChapter = wordsPerChapter,
+    nextCreativeDirection = directorEnabled ? confirmedDirection : null,
   ): AICreateCacheInput => ({
     user_idea: nextIdea.trim(),
     number_of_chapters: nextChapters,
     words_per_chapter: nextWordsPerChapter,
+    creative_direction: nextCreativeDirection,
   });
 
   const setCachedStepsState = (nextSteps: AICreateCachedSteps) => {
@@ -133,9 +199,18 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
     setSteps(buildStepStates({}));
   };
 
+  const resetDirectorPreview = () => {
+    setDirectorPreview(null);
+    setSelectedDirectionIndex(null);
+    setConfirmedDirection(null);
+    setDirectorAdjustments("");
+    setDirectorError("");
+  };
+
   const handleIdeaChange = (value: string) => {
     if (value !== idea) {
       resetGenerationState();
+      resetDirectorPreview();
     }
     setIdea(value);
   };
@@ -143,6 +218,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
   const handleChaptersChange = (value: number) => {
     if (value !== chapters) {
       resetGenerationState();
+      resetDirectorPreview();
     }
     setChapters(value);
   };
@@ -150,13 +226,115 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
   const handleWordsPerChapterChange = (value: number) => {
     if (value !== wordsPerChapter) {
       resetGenerationState();
+      resetDirectorPreview();
     }
     setWordsPerChapter(value);
   };
 
+  const handleDirectorToggle = (enabled: boolean) => {
+    if (enabled === directorEnabled) return;
+    resetGenerationState();
+    resetDirectorPreview();
+    setDirectorEnabled(enabled);
+  };
+
+  const handleDirectorAgentChange = (agentId: string) => {
+    if (agentId === selectedDirectorId) return;
+    resetGenerationState();
+    resetDirectorPreview();
+    setSelectedDirectorId(agentId);
+  };
+
+  const handleDirectorInstructionChange = (value: string) => {
+    if (value !== directorInstruction && (directorPreview || confirmedDirection)) {
+      resetGenerationState();
+      resetDirectorPreview();
+    }
+    setDirectorInstruction(value);
+  };
+
+  const startCreativeDirector = async () => {
+    const originalIdea = idea.trim();
+    if (!originalIdea || !selectedDirectorId) return;
+
+    setDirectorError("");
+    setIsDirecting(true);
+
+    try {
+      const response = await apiPost<CreativeDirectorResponse>(
+        "/api/llm/creative-director",
+        {
+          user_idea: originalIdea,
+          number_of_chapters: chapters,
+          words_per_chapter: wordsPerChapter,
+          agent_id: selectedDirectorId,
+          direction_count: 3,
+          instruction: directorInstruction.trim(),
+          ...(temperature != null && { temperature }),
+          ...(topP != null && { top_p: topP }),
+          ...(maxTokens != null && { max_tokens: maxTokens }),
+          ...(presencePenalty != null && { presence_penalty: presencePenalty }),
+          ...(frequencyPenalty != null && { frequency_penalty: frequencyPenalty }),
+          ...(systemPrompt != null && { system_prompt: systemPrompt }),
+        },
+      );
+      resetGenerationState();
+      setDirectorPreview(response);
+      setSelectedDirectionIndex(null);
+      setConfirmedDirection(null);
+      setDirectorAdjustments("");
+    } catch (error) {
+      setDirectorError(
+        error instanceof Error ? error.message : t("director.generateFailed"),
+      );
+    } finally {
+      setIsDirecting(false);
+    }
+  };
+
+  const selectCreativeDirection = (
+    direction: CreativeDirection,
+    index: number,
+  ) => {
+    if (!directorPreview) return;
+    resetGenerationState();
+    const selection: CreativeDirectionSelection = {
+      agent_id: directorPreview.agent_id,
+      agent_version: directorPreview.agent_version,
+      provider_alias: directorPreview.provider_alias || null,
+      direction,
+      user_adjustments: "",
+    };
+    setSelectedDirectionIndex(index);
+    setConfirmedDirection(selection);
+    setDirectorAdjustments("");
+    saveAICreateCache(
+      getCurrentInput(idea, chapters, wordsPerChapter, selection),
+      {},
+    );
+  };
+
+  const handleDirectorAdjustmentsChange = (value: string) => {
+    setDirectorAdjustments(value);
+    if (!confirmedDirection) return;
+
+    resetGenerationState();
+    const selection = {
+      ...confirmedDirection,
+      user_adjustments: value,
+    };
+    setConfirmedDirection(selection);
+    saveAICreateCache(
+      getCurrentInput(idea, chapters, wordsPerChapter, selection),
+      {},
+    );
+  };
+
   const startGeneration = async () => {
     const input = getCurrentInput();
-    if (!input.user_idea) return;
+    if (!input.user_idea || (directorEnabled && !input.creative_direction)) {
+      return;
+    }
 
     const storedCache = loadAICreateCache();
     const reusableCachedSteps = storedCache && isSameAICreateInput(storedCache, input)
@@ -173,6 +351,9 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
       user_idea: input.user_idea,
       number_of_chapters: input.number_of_chapters,
       words_per_chapter: input.words_per_chapter,
+      ...(input.creative_direction && {
+        creative_direction: input.creative_direction,
+      }),
       ...(hasAICreateCachedSteps(normalizedCachedSteps) && { cached_steps: normalizedCachedSteps }),
       ...(temperature != null && { temperature }),
       ...(topP != null && { top_p: topP }),
@@ -225,7 +406,12 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
             if (data.success && data.result) {
               const res = data.result as AICreateResponse;
               setResult(res);
-              onComplete(res, input.number_of_chapters, input.words_per_chapter);
+              onComplete(
+                res,
+                input.number_of_chapters,
+                input.words_per_chapter,
+                input.creative_direction,
+              );
             }
           }
         },
@@ -258,6 +444,11 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
         ? t("continueAI")
         : t("startAI");
 
+  const displayedDirections = directorPreview?.result.directions ??
+    (confirmedDirection ? [confirmedDirection.direction] : []);
+  const directorLocked = isRunning || isDirecting;
+  const requiresDirection = directorEnabled && confirmedDirection === null;
+
   return (
     <div className="space-y-6 p-1">
       {/* Idea Input */}
@@ -270,7 +461,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
           placeholder={t("ideaPlaceholder")}
           value={idea}
           onChange={(e) => handleIdeaChange(e.target.value)}
-          disabled={isRunning}
+          disabled={directorLocked}
         />
       </div>
 
@@ -287,7 +478,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
             onChange={(e) => handleChaptersChange(Number(e.target.value) || 1)}
             min={1}
             max={1000}
-            disabled={isRunning}
+            disabled={directorLocked}
           />
         </div>
         <div>
@@ -301,10 +492,258 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
             onChange={(e) => handleWordsPerChapterChange(Number(e.target.value) || 1000)}
             min={500}
             max={10000}
-            disabled={isRunning}
+            disabled={directorLocked}
           />
         </div>
       </div>
+
+      {/* Optional pre-creation Creative Director */}
+      <section className="rounded-xl border border-border bg-surface-secondary/20 p-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-foreground">
+              {t("director.title")}
+            </h3>
+            <p className="mt-1 max-w-2xl text-xs leading-5 text-muted">
+              {t("director.description")}
+            </p>
+          </div>
+          <Switch
+            aria-label={t("director.toggle")}
+            isSelected={directorEnabled}
+            isDisabled={directorLocked}
+            onChange={handleDirectorToggle}
+            className="shrink-0"
+          >
+            <Switch.Control>
+              <Switch.Thumb />
+            </Switch.Control>
+          </Switch>
+        </div>
+
+        {directorEnabled && (
+          <div className="mt-4 space-y-4 border-t border-border pt-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <label
+                  htmlFor="creative-director-agent"
+                  className="mb-1 block text-xs font-medium text-foreground"
+                >
+                  {t("director.agentLabel")}
+                </label>
+                <select
+                  id="creative-director-agent"
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                  value={selectedDirectorId}
+                  onChange={(event) =>
+                    handleDirectorAgentChange(event.target.value)
+                  }
+                  disabled={directorLocked || isLoadingDirectorAgents}
+                >
+                  {selectedDirectorId &&
+                    !directorAgents.some(
+                      (agent) => agent.agent_id === selectedDirectorId,
+                    ) && (
+                      <option value={selectedDirectorId}>
+                        {confirmedDirection
+                          ? `${selectedDirectorId} (${t("director.cachedAgent")})`
+                          : selectedDirectorId}
+                      </option>
+                    )}
+                  {directorAgents.map((agent) => (
+                    <option key={agent.agent_id} value={agent.agent_id}>
+                      {agent.label}
+                      {agent.provider_alias
+                        ? ` · ${agent.provider_alias}`
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label
+                  htmlFor="creative-director-instruction"
+                  className="mb-1 block text-xs font-medium text-foreground"
+                >
+                  {t("director.instructionLabel")}
+                </label>
+                <input
+                  id="creative-director-instruction"
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                  value={directorInstruction}
+                  onChange={(event) =>
+                    handleDirectorInstructionChange(event.target.value)
+                  }
+                  placeholder={t("director.instructionPlaceholder")}
+                  maxLength={2000}
+                  disabled={directorLocked}
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Button
+                variant="secondary"
+                isDisabled={
+                  directorLocked ||
+                  !idea.trim() ||
+                  !selectedDirectorId ||
+                  directorAgents.length === 0
+                }
+                onPress={startCreativeDirector}
+              >
+                {isDirecting
+                  ? t("director.generating")
+                  : directorPreview || confirmedDirection
+                    ? t("director.regenerate")
+                    : t("director.generate")}
+              </Button>
+              <p className="text-xs leading-5 text-muted">
+                {t("director.costHint")}
+              </p>
+            </div>
+
+            {(directorAgentError || directorError) && (
+              <p
+                role="alert"
+                className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-950/30 dark:text-red-300"
+              >
+                {directorAgentError || directorError}
+              </p>
+            )}
+
+            {directorPreview && (
+              <div className="space-y-1">
+                <p className="text-sm leading-6 text-foreground">
+                  {directorPreview.result.framing}
+                </p>
+                <p className="text-xs text-muted">
+                  {t("director.usage", {
+                    attempts: directorPreview.attempts.length,
+                    tokens: directorPreview.usage.total_tokens ?? 0,
+                  })}
+                </p>
+              </div>
+            )}
+
+            {displayedDirections.length > 0 && (
+              <div className="space-y-3">
+                <p className="text-xs font-medium text-foreground">
+                  {t("director.chooseHint")}
+                </p>
+                <div
+                  className={
+                    displayedDirections.length === 1
+                      ? "grid max-w-3xl gap-3"
+                      : "grid gap-3 lg:grid-cols-3"
+                  }
+                >
+                  {displayedDirections.map((direction, index) => {
+                    const selected =
+                      confirmedDirection?.direction === direction ||
+                      selectedDirectionIndex === index;
+                    return (
+                      <button
+                        key={`${direction.title}-${index}`}
+                        type="button"
+                        aria-pressed={selected}
+                        className={`rounded-xl border p-4 text-left transition-colors focus:outline-none focus:ring-2 focus:ring-primary ${
+                          selected
+                            ? "border-primary bg-primary/5"
+                            : "border-border bg-background hover:border-primary/50"
+                        }`}
+                        onClick={() =>
+                          selectCreativeDirection(direction, index)
+                        }
+                        disabled={!directorPreview || directorLocked}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <h4 className="text-sm font-semibold text-foreground">
+                            {direction.title}
+                          </h4>
+                          {selected && (
+                            <span className="shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">
+                              {t("director.selected")}
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-foreground">
+                          {direction.pitch}
+                        </p>
+                        <dl className="mt-3 space-y-2 text-xs leading-5">
+                          <div>
+                            <dt className="font-medium text-foreground">
+                              {t("director.storyEngine")}
+                            </dt>
+                            <dd
+                              className={
+                                selected ? "text-muted" : "line-clamp-5 text-muted"
+                              }
+                            >
+                              {direction.story_engine}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="font-medium text-foreground">
+                              {t("director.coreConflict")}
+                            </dt>
+                            <dd
+                              className={
+                                selected ? "text-muted" : "line-clamp-4 text-muted"
+                              }
+                            >
+                              {direction.core_conflict}
+                            </dd>
+                          </div>
+                          {direction.risks.length > 0 && (
+                            <div>
+                              <dt className="font-medium text-foreground">
+                                {t("director.risks")}
+                              </dt>
+                              <dd
+                                className={
+                                  selected ? "text-muted" : "line-clamp-3 text-muted"
+                                }
+                              >
+                                {direction.risks.join(" · ")}
+                              </dd>
+                            </div>
+                          )}
+                        </dl>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {confirmedDirection && (
+              <div>
+                <label
+                  htmlFor="creative-director-adjustments"
+                  className="mb-1 block text-xs font-medium text-foreground"
+                >
+                  {t("director.adjustmentsLabel")}
+                </label>
+                <textarea
+                  id="creative-director-adjustments"
+                  className="min-h-20 w-full resize-y rounded-lg border border-border bg-background p-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                  value={directorAdjustments}
+                  onChange={(event) =>
+                    handleDirectorAdjustmentsChange(event.target.value)
+                  }
+                  placeholder={t("director.adjustmentsPlaceholder")}
+                  maxLength={2000}
+                  disabled={directorLocked}
+                />
+                <p className="mt-1 text-xs leading-5 text-muted">
+                  {t("director.constraintHint")}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
 
       {/* Generation Parameters (collapsible) */}
       <div>
@@ -312,7 +751,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
           type="button"
           className="flex items-center gap-2 text-sm font-medium text-muted hover:text-foreground transition-colors py-1"
           onClick={() => setShowGenParams(!showGenParams)}
-          disabled={isRunning}
+          disabled={directorLocked}
         >
           <svg
             className={`w-4 h-4 transition-transform ${showGenParams ? "rotate-90" : ""}`}
@@ -435,10 +874,10 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
       <Button
         variant="primary"
         className="w-full"
-        isDisabled={isRunning || !idea.trim()}
+        isDisabled={directorLocked || !idea.trim() || requiresDirection}
         onPress={startGeneration}
       >
-        {buttonLabel}
+        {requiresDirection ? t("director.confirmFirst") : buttonLabel}
       </Button>
     </div>
   );

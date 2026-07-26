@@ -118,6 +118,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
   const handleCreate = async (openCardCuration: boolean) => {
     try {
       setCreating(true);
+      const sourceDraft = data as Partial<WritingDraft>;
       const payload: CreateNovelRequest = {
         title: String(data.title || ""),
         subtitle: data.subtitle ? String(data.subtitle) : undefined,
@@ -137,6 +138,9 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         core_idea: data.core_idea ? String(data.core_idea) : undefined,
         number_of_chapters: data.number_of_chapters ? Number(data.number_of_chapters) : undefined,
         words_per_chapter: data.words_per_chapter ? Number(data.words_per_chapter) : undefined,
+        creation_mode:
+          sourceDraft.creation_mode === "ai" ? "ai" : "manual",
+        creative_direction: sourceDraft.creative_direction,
       };
       const res = await apiPost<{ id: string }>("/api/novels/create", payload);
       clearWritingDraft(draftId);

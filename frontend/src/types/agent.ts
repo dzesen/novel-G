@@ -3,6 +3,7 @@ export type AgentCapabilityId =
   | "chapter_prose"
   | "chapter_state"
   | "scene_rewrite"
+  | "novel_direction"
   | "creative_inspiration"
   | "continuity_review";
 
@@ -41,6 +42,45 @@ export interface AgentProfile {
   version: number;
   visibility: "private" | "shared";
   editable: boolean;
+}
+
+export interface CreativeDirection {
+  title: string;
+  pitch: string;
+  core_conflict: string;
+  protagonist_arc: string;
+  story_engine: string;
+  world_hook: string;
+  tone_and_style: string;
+  must_keep: string[];
+  risks: string[];
+}
+
+export interface CreativeDirectionResult {
+  framing: string;
+  directions: CreativeDirection[];
+}
+
+export interface CreativeDirectionSelection {
+  agent_id: string;
+  agent_version: number;
+  provider_alias: string | null;
+  direction: CreativeDirection;
+  user_adjustments: string;
+}
+
+export interface CreativeDirectorResponse {
+  result: CreativeDirectionResult;
+  agent_id: string;
+  agent_version: number;
+  provider_alias: string;
+  usage: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+  attempts: AgentRunAttempt[];
+  write_policy: "preview_only";
 }
 
 export interface AgentProviderOption {

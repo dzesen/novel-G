@@ -1,11 +1,13 @@
 import type { AICreateCachedSteps, AICreateStepKey } from "@/types/novel";
+import type { CreativeDirectionSelection } from "@/types/agent";
 import { buildUserStorageKey } from "@/lib/userStorage";
+import {
+  isSameAICreateInput,
+  type AICreateCacheInput,
+} from "@/lib/aiCreateCacheIdentity";
 
-export interface AICreateCacheInput {
-  user_idea: string;
-  number_of_chapters: number;
-  words_per_chapter: number;
-}
+export { isSameAICreateInput };
+export type { AICreateCacheInput };
 
 export interface AICreateCacheRecord {
   input: AICreateCacheInput;
@@ -28,6 +30,70 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
+function normalizeCreativeDirection(
+  value: unknown,
+): CreativeDirectionSelection | null {
+  if (!isObject(value) || !isObject(value.direction)) {
+    return null;
+  }
+
+  const direction = value.direction;
+  const requiredDirectionFields = [
+    "title",
+    "pitch",
+    "core_conflict",
+    "protagonist_arc",
+    "story_engine",
+    "world_hook",
+    "tone_and_style",
+  ] as const;
+  if (
+    !isString(value.agent_id) ||
+    typeof value.agent_version !== "number" ||
+    !Number.isInteger(value.agent_version) ||
+    value.agent_version < 1 ||
+    !requiredDirectionFields.every((field) => isString(direction[field])) ||
+    !isStringArray(direction.must_keep) ||
+    !isStringArray(direction.risks)
+  ) {
+    return null;
+  }
+
+  const providerAlias = value.provider_alias;
+  const userAdjustments = value.user_adjustments;
+  if (
+    providerAlias !== null &&
+    providerAlias !== undefined &&
+    typeof providerAlias !== "string"
+  ) {
+    return null;
+  }
+  if (
+    userAdjustments !== undefined &&
+    typeof userAdjustments !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    agent_id: value.agent_id,
+    agent_version: value.agent_version,
+    provider_alias: providerAlias || null,
+    direction: {
+      title: direction.title as string,
+      pitch: direction.pitch as string,
+      core_conflict: direction.core_conflict as string,
+      protagonist_arc: direction.protagonist_arc as string,
+      story_engine: direction.story_engine as string,
+      world_hook: direction.world_hook as string,
+      tone_and_style: direction.tone_and_style as string,
+      must_keep: [...direction.must_keep],
+      risks: [...direction.risks],
+    },
+    user_adjustments: userAdjustments || "",
+  };
+}
+
 function normalizeInput(value: unknown): AICreateCacheInput | null {
   if (!isObject(value)) {
     return null;
@@ -40,10 +106,24 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
     return null;
   }
 
+  const creativeDirection = value.creative_direction;
+  const normalizedCreativeDirection =
+    creativeDirection === null || creativeDirection === undefined
+      ? null
+      : normalizeCreativeDirection(creativeDirection);
+  if (
+    creativeDirection !== null &&
+    creativeDirection !== undefined &&
+    normalizedCreativeDirection === null
+  ) {
+    return null;
+  }
+
   return {
     user_idea: userIdea,
     number_of_chapters: chapters,
     words_per_chapter: wordsPerChapter,
+    creative_direction: normalizedCreativeDirection,
   };
 }
 
@@ -224,14 +304,6 @@ export function clearAICreateCache(): void {
  * Returns:
  *   核心输入完全一致时返回 true。
  */
-export function isSameAICreateInput(record: AICreateCacheRecord | null, input: AICreateCacheInput): boolean {
-  return (
-    record?.input.user_idea === input.user_idea &&
-    record.input.number_of_chapters === input.number_of_chapters &&
-    record.input.words_per_chapter === input.words_per_chapter
-  );
-}
-
 /**
  * 只保留从第一步开始连续存在的缓存步骤。
  *
