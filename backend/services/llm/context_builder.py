@@ -110,11 +110,44 @@ def _core_settings_section(novel: dict) -> "ContextSection":
     return _blob("core_settings", "\n".join(core_lines))
 
 
-def _volume_section(volume: dict) -> "Optional[ContextSection]":
-    """装 volume 段（本卷摘要 + 弧线）；两者皆空时返回 None。两模式共用。"""
-    if not (volume.get("summary") or volume.get("arc")):
+def _volume_section(volume: dict, chapter: dict) -> "Optional[ContextSection]":
+    """装配不可静默丢弃的当前卷结构契约；正文与细纲模式共用。"""
+    if not any(
+        volume.get(key)
+        for key in ("title", "summary", "arc", "order_index", "chapter_range")
+    ):
         return None
-    return _blob("volume", f"本卷摘要：{volume.get('summary', '')}\n本卷弧线：{volume.get('arc', '')}")
+
+    lines = [
+        "【当前卷大纲（必须遵守）】",
+        "本章细纲与正文必须服务于本卷大纲，不得提前完成后续卷目标，也不得偏离本卷弧线。",
+    ]
+    title = str(volume.get("title") or "").strip()
+    volume_order = int(volume.get("order_index") or 0)
+    if title:
+        prefix = f"第 {volume_order} 卷" if volume_order else "当前卷"
+        lines.append(f"{prefix}：《{title}》")
+
+    chapter_range = volume.get("chapter_range") or {}
+    start = chapter_range.get("start")
+    end = chapter_range.get("end")
+    if start is not None and end is not None:
+        lines.append(f"规划章节范围：全书第 {start}-{end} 章")
+
+    volume_chapter_index = chapter.get("volume_chapter_index")
+    volume_chapter_count = chapter.get("volume_chapter_count")
+    book_ordinal = chapter.get("book_ordinal")
+    if volume_chapter_index and volume_chapter_count:
+        progress = f"本卷第 {volume_chapter_index}/{volume_chapter_count} 章"
+        if book_ordinal:
+            progress += f"（全书叙事序第 {book_ordinal} 章）"
+        lines.append(f"当前进度：{progress}")
+
+    if volume.get("summary"):
+        lines.append(f"本卷剧情摘要：{volume['summary']}")
+    if volume.get("arc"):
+        lines.append(f"本卷弧线：{volume['arc']}")
+    return _blob("volume", "\n".join(lines))
 
 
 def _recent_chapters_section(recent: list) -> "Optional[ContextSection]":
@@ -176,7 +209,8 @@ class ChapterContext(BaseModel):
 
 # 截断优先级：数字越小越先被丢。九档对应设计 §5.1：core_settings /
 # chapter_outline / threads_to_resolve / permanent_facts / present_cards /
-# volume / recent_chapters / other_threads / minor_cards。第 9 档
+# volume / recent_chapters / other_threads / minor_cards。volume 现作为整卷/整本
+# 生成的结构契约进入永不截断档；第 9 档
 # minor_cards 见 §5.1 第 9 档，已实现。
 SECTION_PRIORITY = {
     "core_settings": 100,      # 永不截断
@@ -184,7 +218,7 @@ SECTION_PRIORITY = {
     "threads_to_resolve": 100, # 永不截断
     "permanent_facts": 100,    # 永不截断——防止"死人复活"的唯一屏障
     "present_cards": 50,
-    "volume": 40,
+    "volume": 100,             # 永不截断——整卷/整本生成的结构契约
     "recent_chapters": 30,
     "other_threads": 20,
     "minor_cards": 10,         # 最先丢：地点/物品/规则卡
@@ -203,7 +237,7 @@ OUTLINE_SECTION_PRIORITY = {
     "core_settings": 100,     # 永不截断
     "permanent_facts": 100,   # 永不截断——死人复活屏障
     "roster": 100,            # 永不截断——AI 选人/选物/选伏笔的唯一来源
-    "volume": 40,
+    "volume": 100,            # 永不截断——章节细纲必须服从本卷结构
     "recent_chapters": 30,
     "other_threads": 20,
 }
@@ -297,7 +331,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         装配好的 ChapterContext，含被截断段落的标识。
 
     Raises:
-        ContextBudgetError: 永不截断档（core_settings / chapter_outline /
+        ContextBudgetError: 永不截断档（core_settings / chapter_outline / volume /
             threads_to_resolve / permanent_facts）自身已超预算。permanent_facts
             随全书主要角色数量线性增长、无上界（§4.4 的 roster 有界假设在这里不
             成立），此为安全阀而非常态——写到中后期这一档迟早会撑爆窗口。
@@ -374,7 +408,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     if fact_blocks:
         sections.append(_blob("permanent_facts", "\n\n".join(fact_blocks)))
 
-    volume_section = _volume_section(volume)
+    volume_section = _volume_section(volume, chapter)
     if volume_section is not None:
         sections.append(volume_section)
 
@@ -521,7 +555,7 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
       工作流的输出，生成细纲时尚不存在。
 
     Raises:
-        ContextBudgetError: 永不截断档（尤其 roster）自身已超预算。roster 有界
+        ContextBudgetError: 永不截断档（尤其 roster 与 volume）自身已超预算。roster 有界
             （见 §4.4），此为安全阀而非常态。
     """
     novel = inputs.get("novel") or {}
@@ -555,7 +589,7 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
     if fact_blocks:
         sections.append(_blob("permanent_facts", "\n\n".join(fact_blocks)))
 
-    volume_section = _volume_section(volume)
+    volume_section = _volume_section(volume, chapter)
     if volume_section is not None:
         sections.append(volume_section)
 
@@ -607,6 +641,16 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     volumes = await volume_repo.get_volumes_by_novel(novel_id)
     timeline = ChapterTimeline(volumes, all_chapters)
     target_position = timeline.position(chapter_id)
+    volume_positions = [
+        position
+        for position in timeline.positions
+        if position.volume_id == target_position.volume_id
+    ]
+    volume_chapter_index = next(
+        index
+        for index, position in enumerate(volume_positions, start=1)
+        if position.chapter_id == chapter_id
+    )
     chapter_by_id = {str(item["_id"]): item for item in all_chapters}
     recent = [
         {
@@ -745,10 +789,18 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             "tone": novel.get("tone", ""),
             "era_background": novel.get("era_background", ""),
         },
-        "volume": {"summary": volume.get("summary", ""), "arc": volume.get("arc", "")},
+        "volume": {
+            "title": volume.get("title", ""),
+            "summary": volume.get("summary", ""),
+            "arc": volume.get("arc", ""),
+            "order_index": volume.get("order_index"),
+            "chapter_range": volume.get("chapter_range") or {},
+        },
         "chapter": {
             "order_index": order_index,
             "book_ordinal": target_position.book_ordinal,
+            "volume_chapter_index": volume_chapter_index,
+            "volume_chapter_count": len(volume_positions),
             "chapter_id": chapter_id,
             "outline": outline,
         },
