@@ -12,17 +12,22 @@ import type {
   AgentProviderOption,
   AgentScope,
   AgentToolMetadata,
+  ContinuityEvidenceReference,
   ContinuityReviewResult,
   CreativeInspirationResult,
 } from "@/types/agent";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
+import AgentRevisionWorkspace, {
+  type AgentRevisionSourceSelection,
+} from "./AgentRevisionWorkspace";
 
 interface Props {
   mode: "create" | "edit";
   novelId?: string;
+  onNavigateReference?: (reference: ContinuityEvidenceReference) => void;
 }
 
-type StudioTab = "creative" | "continuity" | "management";
+type StudioTab = "creative" | "continuity" | "history" | "management";
 
 interface AgentDraft {
   label: string;
@@ -97,7 +102,10 @@ function draftPayload(draft: AgentDraft) {
   };
 }
 
-export default function AgentStudioWorkspace({ novelId }: Props) {
+export default function AgentStudioWorkspace({
+  novelId,
+  onNavigateReference,
+}: Props) {
   const t = useTranslations("writing.agentStudio");
   const { user } = useAuth();
   const [tab, setTab] = useState<StudioTab>("creative");
@@ -126,6 +134,8 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
     useState<ContinuityReviewResult | null>(null);
   const [toolMetadata, setToolMetadata] =
     useState<AgentToolMetadata | null>(null);
+  const [revisionSource, setRevisionSource] =
+    useState<AgentRevisionSourceSelection | null>(null);
 
   const [managementFilter, setManagementFilter] = useState<
     AgentCapabilityId | "all"
@@ -355,6 +365,7 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
     setError(null);
     setNotice(null);
     setToolMetadata(null);
+    setRevisionSource(null);
     try {
       const base = {
         novel_id: novelId,
@@ -399,6 +410,24 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
     if (!result) return;
     await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
     setNotice(t("copied"));
+  };
+
+  const startRevision = (
+    sourceKind: AgentRevisionSourceSelection["sourceKind"],
+    sourceIndex: number,
+    label: string,
+  ) => {
+    if (!toolMetadata) return;
+    setRevisionSource({
+      runId: toolMetadata.run_id,
+      sourceKind,
+      sourceIndex,
+      label,
+      contextSnapshot: toolMetadata.context_snapshot,
+    });
+    setTab("history");
+    setError(null);
+    setNotice(null);
   };
 
   const scopeControls = (
@@ -688,6 +717,21 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
                         </div>
                       </div>
                     )}
+                    {toolMetadata && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          startRevision(
+                            "creative_idea",
+                            index,
+                            idea.title,
+                          )
+                        }
+                        className="mt-4 rounded-lg border border-accent px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:bg-accent hover:text-white"
+                      >
+                        {t("revisions.createFromResult")}
+                      </button>
+                    )}
                   </li>
                 ))}
               </ol>
@@ -749,12 +793,56 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
                           ))}
                         </ul>
                       </div>
+                      <div className="mt-3">
+                        <p className="text-xs font-semibold text-muted">
+                          {t("continuity.references")}
+                        </p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {issue.references.map((reference, refIndex) => (
+                            <button
+                              key={`${reference.kind}-${reference.label}-${refIndex}`}
+                              type="button"
+                              onClick={() =>
+                                onNavigateReference?.(reference)
+                              }
+                              disabled={!onNavigateReference}
+                              title={reference.excerpt || reference.label}
+                              className="max-w-full rounded-lg border border-border px-2.5 py-1 text-left text-xs text-muted transition-colors hover:border-accent hover:text-accent disabled:cursor-default disabled:opacity-70"
+                            >
+                              <span className="font-medium text-foreground">
+                                {t(
+                                  `continuity.referenceKind.${reference.kind}`,
+                                )}
+                              </span>
+                              {" · "}
+                              <span className="break-words">
+                                {reference.label}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                       <p className="mt-3 text-sm leading-6 text-muted">
                         <span className="font-medium text-foreground">
                           {t("continuity.suggestion")}：
                         </span>
                         {issue.suggestion}
                       </p>
+                      {toolMetadata && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            startRevision(
+                              "continuity_issue",
+                              index,
+                              issue.location,
+                            )
+                          }
+                          className="mt-4 rounded-lg border border-accent px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:bg-accent hover:text-white"
+                        >
+                          {t("revisions.createFromResult")}
+                        </button>
+                      )}
                     </li>
                   ))}
                 </ol>
@@ -1218,7 +1306,9 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
           role="tablist"
           aria-label={t("tabsLabel")}
         >
-          {(["creative", "continuity", "management"] as StudioTab[]).map(
+          {(
+            ["creative", "continuity", "history", "management"] as StudioTab[]
+          ).map(
             (item) => (
               <button
                 key={item}
@@ -1265,6 +1355,20 @@ export default function AgentStudioWorkspace({ novelId }: Props) {
           </div>
         ) : tab === "management" ? (
           renderManagement()
+        ) : tab === "history" ? (
+          novelId ? (
+            <AgentRevisionWorkspace
+              novelId={novelId}
+              volumes={volumes}
+              chapters={chapters}
+              source={revisionSource}
+              onClearSource={() => setRevisionSource(null)}
+            />
+          ) : (
+            <div className="rounded-lg border border-dashed border-border bg-surface px-6 py-12 text-center text-sm text-muted">
+              {t("needNovelDescription")}
+            </div>
+          )
         ) : (
           renderTool()
         )}

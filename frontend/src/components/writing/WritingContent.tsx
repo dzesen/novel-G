@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import type { ContinuityEvidenceReference } from "@/types/agent";
 import type { WritingSidebarItem } from "@/types/novel";
 import WritingSidebar from "./WritingSidebar";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
@@ -28,6 +29,8 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   const [activeItem, setActiveItem] = useState<WritingSidebarItem>(
     requestedCardCuration ? "character-cards" : "novel-info",
   );
+  const [evidenceReference, setEvidenceReference] =
+    useState<ContinuityEvidenceReference | null>(null);
 
   useEffect(() => {
     if (requestedCardCuration) {
@@ -48,11 +51,28 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           mode={mode}
           novelId={novelId}
           onNavigateToMemory={() => setActiveItem("character-memory")}
+          initialChapterId={evidenceReference?.chapter_id}
+          initialSceneIndex={evidenceReference?.scene_index}
         />
       );
     }
     if (activeItem === "agent-studio") {
-      return <AgentStudioWorkspace mode={mode} novelId={novelId} />;
+      return (
+        <AgentStudioWorkspace
+          mode={mode}
+          novelId={novelId}
+          onNavigateReference={(reference) => {
+            setEvidenceReference(reference);
+            if (reference.kind === "fact") {
+              setActiveItem("character-memory");
+            } else if (reference.kind === "thread") {
+              setActiveItem("plot-threads");
+            } else {
+              setActiveItem("chapter-editor");
+            }
+          }}
+        />
+      );
     }
     if (activeItem === "character-cards") {
       return (
@@ -79,10 +99,22 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       return <RelationshipWorkspace mode={mode} novelId={novelId} />;
     }
     if (activeItem === "plot-threads") {
-      return <PlotThreadWorkspace mode={mode} novelId={novelId} />;
+      return (
+        <PlotThreadWorkspace
+          mode={mode}
+          novelId={novelId}
+          initialThreadId={evidenceReference?.thread_id}
+        />
+      );
     }
     if (activeItem === "character-memory") {
-      return <CharacterMemoryWorkspace mode={mode} novelId={novelId} />;
+      return (
+        <CharacterMemoryWorkspace
+          mode={mode}
+          novelId={novelId}
+          initialFactId={evidenceReference?.fact_id}
+        />
+      );
     }
     const unreachable: never = activeItem;
     return unreachable;
@@ -90,7 +122,13 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
 
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col md:flex-row">
-      <WritingSidebar activeItem={activeItem} onSelect={setActiveItem} />
+      <WritingSidebar
+        activeItem={activeItem}
+        onSelect={(item) => {
+          setEvidenceReference(null);
+          setActiveItem(item);
+        }}
+      />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {renderMainArea()}
       </div>

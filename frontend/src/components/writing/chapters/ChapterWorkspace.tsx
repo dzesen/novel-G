@@ -30,13 +30,21 @@ interface ChapterWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
   onNavigateToMemory: () => void;
+  initialChapterId?: string;
+  initialSceneIndex?: number;
 }
 
 interface ListResponse<T> {
   data: T[];
 }
 
-export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: ChapterWorkspaceProps) {
+export default function ChapterWorkspace({
+  mode,
+  novelId,
+  onNavigateToMemory,
+  initialChapterId,
+  initialSceneIndex,
+}: ChapterWorkspaceProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tProse = useTranslations("writing.prose");
@@ -48,7 +56,9 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [trash, setTrash] = useState<ChapterSummary[]>([]);
   const [selectedVolumeId, setSelectedVolumeId] = useState<string | null>(null);
-  const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
+  const [selectedChapterId, setSelectedChapterId] = useState<string | null>(
+    initialChapterId ?? null,
+  );
   const [draft, setDraft] = useState<ChapterDraft | null>(null);
   const [chapterOutline, setChapterOutline] = useState<StoredChapterOutline | undefined>();
   const [updatedAt, setUpdatedAt] = useState<string | undefined>();
@@ -66,7 +76,7 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
   const [batchStartScope, setBatchStartScope] = useState<"volume" | "book" | null>(null);
 
   const revisionRef = useRef(0);
-  const selectedChapterIdRef = useRef<string | null>(null);
+  const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
   const loadSequenceRef = useRef(0);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -169,6 +179,20 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
   useEffect(() => {
     if (mode === "edit") void loadStructure();
   }, [loadStructure, mode]);
+
+  useEffect(() => {
+    if (
+      initialSceneIndex == null ||
+      !initialChapterId ||
+      !chapterOutline?.scenes?.[initialSceneIndex]
+    ) {
+      return;
+    }
+    setChapterOutlineOpen(true);
+    setStructureNotice(
+      t("evidenceSceneLocated", { scene: initialSceneIndex + 1 }),
+    );
+  }, [chapterOutline, initialChapterId, initialSceneIndex, t]);
 
   useEffect(() => {
     selectedChapterIdRef.current = selectedChapterId;

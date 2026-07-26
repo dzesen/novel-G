@@ -15,12 +15,16 @@ import {
 interface Props {
   mode: "create" | "edit";
   novelId?: string;
+  initialThreadId?: string;
 }
 
 const STATUS_VALUES: ThreadStatus[] = ["planted", "developing", "resolved", "abandoned"];
 const IMPORTANCE_VALUES: ThreadImportance[] = ["main", "sub"];
 
-export default function PlotThreadWorkspace({ novelId }: Props) {
+export default function PlotThreadWorkspace({
+  novelId,
+  initialThreadId,
+}: Props) {
   const t = useTranslations("plotThreads");
   const [threads, setThreads] = useState<PlotThread[]>([]);
   const [chapters, setChapters] = useState<Array<ChapterSummary & { label: string }>>([]);
@@ -56,6 +60,13 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!initialThreadId || threads.length === 0) return;
+    document
+      .getElementById(`thread-${initialThreadId}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [initialThreadId, threads]);
 
   if (!novelId) {
     return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;
@@ -162,7 +173,15 @@ export default function PlotThreadWorkspace({ novelId }: Props) {
 
       <ul className="flex flex-col gap-2">
         {visible.map((th) => (
-          <li key={th._id} className="rounded-lg border border-border bg-surface p-3">
+          <li
+            id={`thread-${th._id}`}
+            key={th._id}
+            className={`rounded-lg border bg-surface p-3 ${
+              initialThreadId === th._id
+                ? "border-accent ring-2 ring-accent/20"
+                : "border-border"
+            }`}
+          >
             {editingId === th._id ? editor : (
               <div className="flex flex-col gap-1">
                 <div className="flex flex-wrap items-center gap-2">

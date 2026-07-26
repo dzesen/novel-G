@@ -421,12 +421,13 @@
     "agentStudio": {
       "eyebrow": "受控智能协作",
       "title": "Agent 工作台",
-      "description": "在小说证据范围内获取创意方向和一致性问题，也可以为自己配置可复用的 Agent。所有结果先作为预览，不会直接改写正文或资料库。",
+      "description": "在小说证据范围内获取创意方向和一致性问题，也可以为自己配置可复用的 Agent。结果先形成预览；只有作者创建并接受修订提案后才会写入。",
       "skillBoundary": "能力由代码定义 · Agent 配置可管理",
       "tabsLabel": "Agent 工作台功能",
       "tabs": {
         "creative": "创意启发",
         "continuity": "一致性检查",
+        "history": "运行与修订",
         "management": "Agent 管理"
       },
       "loading": "正在载入 Agent 目录…",
@@ -436,7 +437,7 @@
       "running": "分析中…",
       "run": "生成预览",
       "previewBadge": "只读预览",
-      "previewOnlyHint": "生成结果只会显示在当前页面。确认内容后，由你决定是否手工采用。",
+      "previewOnlyHint": "生成本身只产生预览。可以复制结果，也可以创建带版本校验的修订提案后再接受。",
       "needNovelTitle": "先保存小说，再运行 Agent",
       "needNovelDescription": "Agent 管理仍可使用；创意启发和一致性检查需要一部已保存的小说作为证据来源。",
       "emptyResultTitle": "结果将在这里展开",
@@ -487,7 +488,14 @@
         "resultTitle": "一致性审查结果",
         "noIssues": "在本次实际覆盖的证据中，没有发现足够确定的问题。",
         "evidence": "证据",
+        "references": "可定位引用",
         "suggestion": "修正建议",
+        "referenceKind": {
+          "chapter": "章节",
+          "scene": "场景",
+          "fact": "永久事实",
+          "thread": "伏笔"
+        },
         "severity": {
           "high": "高",
           "medium": "中",
@@ -503,6 +511,76 @@
           "faction": "势力",
           "other": "其他"
         }
+      },
+      "revisions": {
+        "createFromResult": "形成修订提案",
+        "composerEyebrow": "作者控制的写入检查点",
+        "sourceMeta": "Agent {agent} · v{version} · Provider {provider} · 上下文 revision {revision}",
+        "cancel": "取消提案",
+        "targetKind": "修订目标",
+        "targetVolume": "目标卷",
+        "targetChapter": "目标章节",
+        "targetScene": "目标场景",
+        "target": {
+          "volume_outline": "卷纲",
+          "chapter_outline": "章节细纲",
+          "scene": "场景细纲",
+          "chapter_prose": "章节正文"
+        },
+        "volumeLabel": "第 {order} 卷 · {title}",
+        "chapterLabel": "第 {order} 章 · {title}",
+        "sceneLabel": "第 {order} 场 · {summary}",
+        "noScenes": "该章节还没有可修订的场景细纲。",
+        "fields": {
+          "summary": "卷摘要",
+          "arc": "卷内弧线",
+          "coreConflict": "核心冲突",
+          "endingHook": "结尾钩子",
+          "sceneSummary": "场景摘要",
+          "scenePurpose": "场景目的",
+          "fullProse": "替换后的完整正文"
+        },
+        "fullProseWarning": "正文提案采用整章替换。请保留所有不应删除的内容；接受前可在下方再次核对补丁。",
+        "staleHint": "创建与接受时都会复核小说 revision、目标资产 revision 和当前用户；内容已变化时会拒绝写入。",
+        "create": "创建修订提案",
+        "creating": "创建中…",
+        "created": "修订提案已创建，等待作者接受或拒绝。",
+        "createFailed": "修订提案创建失败",
+        "loadingTarget": "正在读取目标资产的最新版本…",
+        "targetFailed": "目标资产读取失败",
+        "proposalTitle": "待处理修订",
+        "proposalDescription": "每项提案都保留来源问题、Agent 版本、Provider、上下文 revision 和作者决定。",
+        "proposalEmpty": "还没有修订提案。请先从创意方案或一致性问题中选择一项。",
+        "proposalMeta": "{target} · Agent {agent} v{version} · Provider {provider}",
+        "status": {
+          "proposed": "待决定",
+          "applying": "应用中",
+          "applied": "已接受",
+          "rejected": "已拒绝",
+          "stale": "已过期"
+        },
+        "apply": "接受并写入",
+        "reject": "拒绝",
+        "applied": "修订已通过版本校验并写入。",
+        "rejected": "修订提案已拒绝。",
+        "rejectedByAuthor": "作者在 Agent 工作台拒绝",
+        "decisionFailed": "无法处理该提案",
+        "acceptedAudit": "写入审计：小说 revision {before} → {after}",
+        "runTitle": "Agent 运行历史",
+        "runDescription": "运行结果、实际 Provider、结构化输出尝试和 token 用量会保存在当前用户的小说下。",
+        "runEmpty": "还没有 Agent 运行记录。",
+        "creativeRun": "创意启发",
+        "continuityRun": "一致性检查",
+        "runMeta": "Agent {agent} v{version} · Provider {provider} · 上下文 revision {revision}",
+        "runStatus": {
+          "running": "运行中",
+          "completed": "已完成",
+          "failed": "失败",
+          "stale": "上下文已过期"
+        },
+        "usage": "{tokens} tokens · {attempts} 次尝试",
+        "loading": "正在载入运行与修订记录…",
+        "loadFailed": "运行与修订记录加载失败"
       },
       "management": {
         "catalogTitle": "Agent 目录",
@@ -650,6 +728,7 @@
       "exportFailed": "小说导出失败",
       "cancel": "取消",
       "dismiss": "关闭",
+      "evidenceSceneLocated": "已定位到第 {scene} 场；可在章节细纲中核对证据。",
       "untitled": "未命名章节",
       "createModeTitle": "保存小说后即可开始写章节",
       "createModeDescription": "当前小说仍是本地创建草稿。先在“小说信息”中保存，系统会为正式小说提供卷章目录、自动保存和导出功能。"

@@ -421,12 +421,13 @@
     "agentStudio": {
       "eyebrow": "Controlled intelligence",
       "title": "Agent Studio",
-      "description": "Explore creative directions and evidence-backed continuity issues, then configure reusable Agents of your own. Results remain previews and never rewrite prose or reference data directly.",
+      "description": "Explore creative directions and evidence-backed continuity issues, then configure reusable Agents of your own. Results begin as previews and are written only after the author creates and accepts a revision proposal.",
       "skillBoundary": "Code-owned capabilities · Manageable Agent profiles",
       "tabsLabel": "Agent Studio tools",
       "tabs": {
         "creative": "Creative Inspiration",
         "continuity": "Continuity Review",
+        "history": "Runs & Revisions",
         "management": "Agent Management"
       },
       "loading": "Loading Agent catalog…",
@@ -436,7 +437,7 @@
       "running": "Analyzing…",
       "run": "Generate preview",
       "previewBadge": "Read-only preview",
-      "previewOnlyHint": "Results stay on this page. You decide what, if anything, to apply manually.",
+      "previewOnlyHint": "Generation only creates a preview. Copy it, or create a revision proposal with stale checks before accepting any write.",
       "needNovelTitle": "Save the novel before running an Agent",
       "needNovelDescription": "Agent management is still available. Inspiration and continuity review need a saved novel as their evidence source.",
       "emptyResultTitle": "Results will unfold here",
@@ -487,7 +488,14 @@
         "resultTitle": "Continuity findings",
         "noIssues": "No sufficiently supported issues were found in the evidence actually covered by this run.",
         "evidence": "Evidence",
+        "references": "Navigable references",
         "suggestion": "Suggested fix",
+        "referenceKind": {
+          "chapter": "Chapter",
+          "scene": "Scene",
+          "fact": "Permanent fact",
+          "thread": "Plot thread"
+        },
         "severity": {
           "high": "High",
           "medium": "Medium",
@@ -503,6 +511,76 @@
           "faction": "Faction",
           "other": "Other"
         }
+      },
+      "revisions": {
+        "createFromResult": "Create revision proposal",
+        "composerEyebrow": "Author-controlled write checkpoint",
+        "sourceMeta": "Agent {agent} · v{version} · Provider {provider} · context revision {revision}",
+        "cancel": "Cancel proposal",
+        "targetKind": "Revision target",
+        "targetVolume": "Target volume",
+        "targetChapter": "Target chapter",
+        "targetScene": "Target scene",
+        "target": {
+          "volume_outline": "Volume outline",
+          "chapter_outline": "Chapter outline",
+          "scene": "Scene outline",
+          "chapter_prose": "Chapter prose"
+        },
+        "volumeLabel": "Volume {order} · {title}",
+        "chapterLabel": "Chapter {order} · {title}",
+        "sceneLabel": "Scene {order} · {summary}",
+        "noScenes": "This chapter has no scene outline to revise.",
+        "fields": {
+          "summary": "Volume summary",
+          "arc": "Volume arc",
+          "coreConflict": "Core conflict",
+          "endingHook": "Ending hook",
+          "sceneSummary": "Scene summary",
+          "scenePurpose": "Scene purpose",
+          "fullProse": "Complete replacement prose"
+        },
+        "fullProseWarning": "Prose proposals replace the entire chapter. Preserve everything that must remain; review the exact patch below before accepting.",
+        "staleHint": "Creation and acceptance both recheck novel revision, target asset revision, and ownership. Changed content is never overwritten.",
+        "create": "Create revision proposal",
+        "creating": "Creating…",
+        "created": "Revision proposal created and waiting for the author's decision.",
+        "createFailed": "Could not create the revision proposal",
+        "loadingTarget": "Loading the latest target asset…",
+        "targetFailed": "Could not load the target asset",
+        "proposalTitle": "Revision queue",
+        "proposalDescription": "Every proposal preserves its source issue, Agent version, Provider, context revision, and author decision.",
+        "proposalEmpty": "No revision proposals yet. Select a creative idea or continuity issue first.",
+        "proposalMeta": "{target} · Agent {agent} v{version} · Provider {provider}",
+        "status": {
+          "proposed": "Awaiting decision",
+          "applying": "Applying",
+          "applied": "Accepted",
+          "rejected": "Rejected",
+          "stale": "Stale"
+        },
+        "apply": "Accept and write",
+        "reject": "Reject",
+        "applied": "The revision passed stale checks and was written.",
+        "rejected": "The revision proposal was rejected.",
+        "rejectedByAuthor": "Rejected by the author in Agent Studio",
+        "decisionFailed": "Could not process this proposal",
+        "acceptedAudit": "Write audit: novel revision {before} → {after}",
+        "runTitle": "Agent run history",
+        "runDescription": "Results, actual Provider, structured-output attempts, and token usage are stored under this user's novel.",
+        "runEmpty": "No Agent runs yet.",
+        "creativeRun": "Creative inspiration",
+        "continuityRun": "Continuity review",
+        "runMeta": "Agent {agent} v{version} · Provider {provider} · context revision {revision}",
+        "runStatus": {
+          "running": "Running",
+          "completed": "Completed",
+          "failed": "Failed",
+          "stale": "Context stale"
+        },
+        "usage": "{tokens} tokens · {attempts} attempts",
+        "loading": "Loading runs and revisions…",
+        "loadFailed": "Could not load runs and revisions"
       },
       "management": {
         "catalogTitle": "Agent Catalog",
@@ -650,6 +728,7 @@
       "exportFailed": "Failed to export novel",
       "cancel": "Cancel",
       "dismiss": "Dismiss",
+      "evidenceSceneLocated": "Located scene {scene}; verify the evidence in the chapter outline.",
       "untitled": "Untitled chapter",
       "createModeTitle": "Save the novel to start writing chapters",
       "createModeDescription": "This novel is still a local creation draft. Save it from Novel Info to unlock the volume tree, autosave, and export tools."

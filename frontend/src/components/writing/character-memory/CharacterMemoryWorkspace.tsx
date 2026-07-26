@@ -10,6 +10,7 @@ import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 interface Props {
   mode: "create" | "edit";
   novelId?: string;
+  initialFactId?: string;
 }
 
 const FACT_KINDS: FactKind[] = ["death", "injury", "identity", "relation", "ability"];
@@ -19,7 +20,10 @@ interface CharacterCard {
   name: string;
 }
 
-export default function CharacterMemoryWorkspace({ novelId }: Props) {
+export default function CharacterMemoryWorkspace({
+  novelId,
+  initialFactId,
+}: Props) {
   const t = useTranslations("characterMemory");
   const [states, setStates] = useState<CharacterState[]>([]);
   const [names, setNames] = useState<Record<string, string>>({});
@@ -68,6 +72,13 @@ export default function CharacterMemoryWorkspace({ novelId }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!initialFactId || states.length === 0) return;
+    document
+      .getElementById(`fact-${initialFactId}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [initialFactId, states]);
 
   if (!novelId) {
     return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;
@@ -167,7 +178,15 @@ export default function CharacterMemoryWorkspace({ novelId }: Props) {
             {s.permanent_facts.length === 0 && <div className="text-sm text-muted">{t("noFacts")}</div>}
             <ul className="mt-1 flex flex-col gap-2">
               {s.permanent_facts.map((f) => (
-                <li key={f.id} className="rounded border border-border bg-surface-secondary p-2 text-sm">
+                <li
+                  id={`fact-${f.id}`}
+                  key={f.id}
+                  className={`rounded border bg-surface-secondary p-2 text-sm ${
+                    initialFactId === f.id
+                      ? "border-accent ring-2 ring-accent/20"
+                      : "border-border"
+                  }`}
+                >
                   {editingFactId === f.id && factDraft ? (
                     <div className="flex flex-wrap items-center gap-2">
                       <input className="flex-1 rounded border border-border bg-surface px-2 py-1" value={factDraft.fact} onChange={(e) => setFactDraft({ ...factDraft, fact: e.target.value })} />
