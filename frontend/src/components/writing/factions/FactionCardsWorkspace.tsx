@@ -4,6 +4,10 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiDelete, apiGet, apiPost, apiPut } from "@/lib/api";
+import {
+  buildCoreFactionsSaveRequest,
+  normalizeGeneratedPayload,
+} from "./factionPayload";
 import type {
   BulkCreateCoreFactionsResponse,
   CoreFaction,
@@ -63,29 +67,6 @@ function splitListText(value: string): string[] {
  */
 function joinListText(value: string[] | undefined): string {
   return (value ?? []).join("\n");
-}
-
-/**
- * 归一化 AI 生成结果，补齐前端编辑所需默认值。
- *
- * Args:
- *   payload: 后端返回的核心阵营与关系预览。
- *
- * Returns:
- *   可直接进入前端编辑状态的预览数据。
- */
-function normalizeGeneratedPayload(payload: CoreFactionsPayload): CoreFactionsPayload {
-  return {
-    core_factions: payload.core_factions.map((faction, index) =>
-      createFactionDraft(faction, index),
-    ),
-    faction_relations: payload.faction_relations.map((relation) => ({
-      ...relation,
-      hidden_tension: relation.hidden_tension ?? "",
-      intensity: relation.intensity ?? 3,
-      is_active: relation.is_active ?? true,
-    })),
-  };
 }
 
 /**
@@ -312,7 +293,7 @@ export default function FactionCardsWorkspace({ mode, novelId }: FactionCardsWor
       setError("");
       const saved = await apiPost<BulkCreateCoreFactionsResponse>(
         `/api/factions/novel/${novelId}/bulk-core-with-relations`,
-        preview,
+        buildCoreFactionsSaveRequest(preview),
       );
       setFactions((prev) => mergeUniqueByKey(prev, saved.factions.map((item, index) => createFactionDraft(item, index)), getFactionRenderKey));
       setRelations((prev) => mergeUniqueByKey(prev, saved.faction_relations, getRelationRenderKey));

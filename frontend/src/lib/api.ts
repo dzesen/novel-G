@@ -60,7 +60,31 @@ async function authorizedFetch(path: string, init: RequestInit): Promise<Respons
 
 async function responseError(response: Response): Promise<ApiError> {
   const body = await response.json().catch(() => null);
-  return new ApiError(body?.detail || `Request failed: ${response.status}`, response.status);
+  const detail = body?.detail;
+  let message = `Request failed: ${response.status}`;
+  if (typeof detail === "string" && detail.trim()) {
+    message = detail;
+  } else if (Array.isArray(detail)) {
+    const validationMessages = detail
+      .map((item) => {
+        if (!item || typeof item !== "object") return "";
+        const record = item as { loc?: unknown; msg?: unknown };
+        const location = Array.isArray(record.loc)
+          ? record.loc
+              .filter((part) => part !== "body")
+              .reduce<string>((path, part) => {
+                if (typeof part === "number") return `${path}[${part}]`;
+                return path ? `${path}.${String(part)}` : String(part);
+              }, "")
+          : "";
+        const issue = typeof record.msg === "string" ? record.msg : "";
+        if (!location) return issue;
+        return issue ? `${location}: ${issue}` : location;
+      })
+      .filter(Boolean);
+    if (validationMessages.length) message = validationMessages.join("；");
+  }
+  return new ApiError(message, response.status);
 }
 
 export async function apiRequest<T = unknown>(

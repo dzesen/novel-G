@@ -238,17 +238,9 @@ export type FactionRelationType =
   | "secret_cooperation"
   | "historical_enemy";
 
-export interface CoreFaction {
-  _id?: string;
-  novel_id?: string;
-  faction_id?: string;
-  is_deleted?: boolean;
-  deleted_at?: string | null;
+export interface GeneratedCoreFaction {
   name: string;
-  alias?: string[];
   faction_type: string;
-  level_type?: string;
-  parent_faction_id?: string | null;
   positioning: string;
   public_stance: string;
   core_goal: string;
@@ -259,9 +251,20 @@ export interface CoreFaction {
   conflict_with_mainline: string;
   is_public: boolean;
   influence_scope: string;
-  active_status?: string;
   expandability: string;
   tags: string[];
+}
+
+export interface CoreFaction extends GeneratedCoreFaction {
+  _id?: string;
+  novel_id?: string;
+  faction_id?: string;
+  is_deleted?: boolean;
+  deleted_at?: string | null;
+  alias?: string[];
+  level_type?: string;
+  parent_faction_id?: string | null;
+  active_status?: string;
   sort_order?: number;
 }
 
@@ -288,7 +291,7 @@ export interface GeneratedFactionRelation extends FactionRelation {
 }
 
 export interface CoreFactionsPayload {
-  core_factions: CoreFaction[];
+  core_factions: GeneratedCoreFaction[];
   faction_relations: GeneratedFactionRelation[];
 }
 
