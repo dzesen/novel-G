@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from typing import Any, Literal
 
+from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.character_repository import character_repo
 from backend.db.repositories.character_state_repository import character_state_repo
@@ -26,6 +28,38 @@ class AgentContextBundle:
     coverage: str
     truncated_sections: tuple[str, ...]
     target_label: str
+    novel_id: str = ""
+    scope: AgentScope = "novel"
+    volume_id: str | None = None
+    chapter_id: str | None = None
+    narrative_revision: int = 0
+    context_digest: str = ""
+    chapter_scene_counts: tuple[tuple[str, int], ...] = ()
+    fact_ids: tuple[str, ...] = ()
+    thread_ids: tuple[str, ...] = ()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "novel_id": self.novel_id,
+            "scope": self.scope,
+            "volume_id": self.volume_id,
+            "chapter_id": self.chapter_id,
+            "narrative_revision": self.narrative_revision,
+            "context_digest": self.context_digest,
+            "chapter_scene_counts": [
+                {
+                    "chapter_id": chapter_id,
+                    "scene_count": scene_count,
+                }
+                for chapter_id, scene_count in self.chapter_scene_counts
+            ],
+            "fact_ids": list(self.fact_ids),
+            "thread_ids": list(self.thread_ids),
+        }
+
+
+class StaleAgentContext(ValueError):
+    """The narrative changed while an Agent context was being used."""
 
 
 def _json(value: Any) -> str:
@@ -44,17 +78,61 @@ def _clip(value: str, limit: int) -> tuple[str, bool]:
 def _outline_view(outline: Any) -> dict[str, Any] | None:
     if not isinstance(outline, dict):
         return None
-    return {
+    result = {
         key: outline.get(key)
         for key in (
             "core_conflict",
             "ending_hook",
-            "scenes",
             "threads_resolved",
             "new_threads",
         )
         if outline.get(key)
-    } or None
+    }
+    scenes = outline.get("scenes")
+    if isinstance(scenes, list) and scenes:
+        result["scenes"] = [
+            {
+                "scene_index": index,
+                **(scene if isinstance(scene, dict) else {"summary": str(scene)}),
+            }
+            for index, scene in enumerate(scenes)
+        ]
+    return result or None
+
+
+async def ensure_agent_context_current(context: AgentContextBundle) -> None:
+    if not context.novel_id:
+        return
+    current = await narrative_revision_store.current(context.novel_id)
+    if current != context.narrative_revision:
+        raise StaleAgentContext(
+            "小说内容在 Agent 运行期间发生变化，请基于最新内容重新执行"
+        )
+
+
+def is_valid_evidence_reference(
+    context: AgentContextBundle,
+    reference: dict[str, Any],
+) -> bool:
+    """Validate model-produced IDs against the exact captured evidence packet."""
+    kind = str(reference.get("kind") or "")
+    chapter_id = str(reference.get("chapter_id") or "")
+    scene_counts = dict(context.chapter_scene_counts)
+    if kind == "chapter":
+        return bool(chapter_id and chapter_id in scene_counts)
+    if kind == "scene":
+        scene_index = reference.get("scene_index")
+        return (
+            bool(chapter_id and chapter_id in scene_counts)
+            and isinstance(scene_index, int)
+            and not isinstance(scene_index, bool)
+            and 0 <= scene_index < scene_counts[chapter_id]
+        )
+    if kind == "fact":
+        return str(reference.get("fact_id") or "") in set(context.fact_ids)
+    if kind == "thread":
+        return str(reference.get("thread_id") or "") in set(context.thread_ids)
+    return False
 
 
 async def build_agent_context(
@@ -79,6 +157,7 @@ async def build_agent_context(
     if scope == "chapter" and volume_id:
         raise ValueError("章节级 Agent 请求不能同时指定 volume_id")
 
+    captured_revision = await narrative_revision_store.current(novel_id)
     novel = await novel_repo.get_novel_by_id(novel_id)
     volumes = await volume_repo.get_volumes_by_novel(novel_id)
     all_chapters = await chapter_repo.get_chapters_by_novel(
@@ -136,16 +215,47 @@ async def build_agent_context(
                 "details": card.get("details", {}),
                 "importance": card.get("importance"),
             })
-    states = [
-        {
-            "card_id": str(item.get("card_id") or ""),
-            "current_state": item.get("current_state", ""),
-            "as_of_chapter_id": str(item.get("as_of_chapter_id") or ""),
-            "as_of_chapter_order": item.get("as_of_chapter_order"),
-            "permanent_facts": item.get("permanent_facts", []),
-        }
-        for item in await character_state_repo.list_states(novel_id)
-    ]
+    await character_state_repo.ensure_fact_ids(novel_id)
+    raw_states = await character_state_repo.list_states(novel_id)
+    states = []
+    fact_ids: list[str] = []
+    for item in raw_states:
+        facts = []
+        for fact in item.get("permanent_facts") or []:
+            if not isinstance(fact, dict):
+                facts.append(
+                    {
+                        "fact_id": "",
+                        "fact": str(fact),
+                        "kind": "",
+                        "chapter_order": None,
+                        "source_chapter_id": "",
+                    }
+                )
+                continue
+            fact_id = str(fact.get("id") or "")
+            if fact_id:
+                fact_ids.append(fact_id)
+            facts.append(
+                {
+                    "fact_id": fact_id,
+                    "fact": fact.get("fact", ""),
+                    "kind": fact.get("kind", ""),
+                    "chapter_order": fact.get("chapter_order"),
+                    "source_chapter_id": str(
+                        fact.get("source_chapter_id") or ""
+                    ),
+                }
+            )
+        states.append(
+            {
+                "card_id": str(item.get("card_id") or ""),
+                "current_state": item.get("current_state", ""),
+                "as_of_chapter_id": str(item.get("as_of_chapter_id") or ""),
+                "as_of_chapter_order": item.get("as_of_chapter_order"),
+                "permanent_facts": facts,
+            }
+        )
     factions = [
         {
             "name": item.get("name", ""),
@@ -157,8 +267,10 @@ async def build_agent_context(
         }
         for item in await faction_repo.get_factions_by_novel(novel_id)
     ]
+    raw_threads = await plot_thread_repo.list_threads(novel_id)
     threads = [
         {
+            "thread_id": str(item.get("_id") or ""),
             "name": item.get("name", ""),
             "description": item.get("description", ""),
             "status": item.get("status", ""),
@@ -168,7 +280,7 @@ async def build_agent_context(
             "resolved_chapter_order": item.get("resolved_chapter_order"),
             "due_target": item.get("due_target"),
         }
-        for item in await plot_thread_repo.list_threads(novel_id)
+        for item in raw_threads
     ]
 
     core = {
@@ -283,9 +395,58 @@ async def build_agent_context(
     )
     if truncated:
         coverage += f" 截断段落：{', '.join(truncated)}。"
+    text = "\n\n".join(rendered)
+    if await narrative_revision_store.current(novel_id) != captured_revision:
+        raise StaleAgentContext(
+            "小说内容在 Agent 上下文装配期间发生变化，请重试"
+        )
+    # Only authorize references whose stable ID was actually rendered into
+    # the bounded packet. A large novel may truncate later sections; IDs from
+    # those omitted sections must not be accepted merely because they existed
+    # in the database while the packet was assembled.
+    chapter_scene_counts = tuple(
+        (
+            str(item["_id"]),
+            len((item.get("outline") or {}).get("scenes") or []),
+        )
+        for item in selected_chapters
+        if str(item["_id"]) in text
+    )
+    context_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "novel_id": novel_id,
+                "scope": scope,
+                "volume_id": volume_id,
+                "chapter_id": chapter_id,
+                "narrative_revision": captured_revision,
+                "text": text,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return AgentContextBundle(
-        text="\n\n".join(rendered),
+        text=text,
         coverage=coverage,
         truncated_sections=tuple(truncated),
         target_label=target_label,
+        novel_id=novel_id,
+        scope=scope,
+        volume_id=volume_id,
+        chapter_id=chapter_id,
+        narrative_revision=captured_revision,
+        context_digest=context_digest,
+        chapter_scene_counts=chapter_scene_counts,
+        fact_ids=tuple(
+            sorted(fact_id for fact_id in set(fact_ids) if fact_id in text)
+        ),
+        thread_ids=tuple(
+            sorted(
+                str(item.get("_id") or "")
+                for item in raw_threads
+                if item.get("_id") and str(item["_id"]) in text
+            )
+        ),
     )

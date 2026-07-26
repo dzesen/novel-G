@@ -21,6 +21,8 @@ FACTION_RELATIONS = "faction_relations"
 PLOT_THREADS = "plot_threads"
 CHARACTER_STATES = "character_states"
 AGENT_DEFINITIONS = "agent_definitions"
+AGENT_RUNS = "agent_runs"
+AGENT_REVISION_PROPOSALS = "agent_revision_proposals"
 
 # 批量生成作业（阶段 3）。注意与遗留幽灵 GENERATION_TASKS 撞名但**不同集合**：
 # 本集合有写入方（作业引擎），generation_tasks 无。级联 stats key 用规则名
@@ -46,6 +48,8 @@ ACTIVE_COLLECTIONS = frozenset({
     PLOT_THREADS,
     CHARACTER_STATES,
     AGENT_DEFINITIONS,
+    AGENT_RUNS,
+    AGENT_REVISION_PROPOSALS,
     GENERATION_JOBS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.services.llm.generation_runtime import (
     ExplicitProviderTarget,
@@ -164,6 +164,34 @@ class CreativeInspirationResult(BaseModel):
     ideas: list[CreativeIdea] = Field(min_length=1, max_length=8)
 
 
+class ContinuityEvidenceReference(BaseModel):
+    """A stable, machine-navigable reference into the captured novel evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(pattern="^(chapter|scene|fact|thread)$")
+    label: str = Field(min_length=1, max_length=240)
+    excerpt: str = Field(default="", max_length=800)
+    chapter_id: str | None = Field(default=None, min_length=1, max_length=64)
+    scene_index: int | None = Field(default=None, ge=0)
+    fact_id: str | None = Field(default=None, min_length=1, max_length=64)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_reference_shape(self):
+        if self.kind == "chapter" and not self.chapter_id:
+            raise ValueError("chapter reference requires chapter_id")
+        if self.kind == "scene" and (
+            not self.chapter_id or self.scene_index is None
+        ):
+            raise ValueError("scene reference requires chapter_id and scene_index")
+        if self.kind == "fact" and not self.fact_id:
+            raise ValueError("fact reference requires fact_id")
+        if self.kind == "thread" and not self.thread_id:
+            raise ValueError("thread reference requires thread_id")
+        return self
+
+
 class ContinuityIssue(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -176,6 +204,10 @@ class ContinuityIssue(BaseModel):
     )
     location: str = Field(min_length=1, max_length=240)
     evidence: list[str] = Field(min_length=1, max_length=8)
+    references: list[ContinuityEvidenceReference] = Field(
+        min_length=1,
+        max_length=8,
+    )
     problem: str = Field(min_length=5, max_length=1200)
     suggestion: str = Field(min_length=5, max_length=1200)
     confidence: float = Field(ge=0, le=1)

@@ -13,6 +13,8 @@ from bson import json_util
 from backend.config import get_config_value
 from backend.db.collections import (
     AGENT_DEFINITIONS,
+    AGENT_REVISION_PROPOSALS,
+    AGENT_RUNS,
     CHAPTERS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,
@@ -53,6 +55,8 @@ MAX_BACKUP_BYTES = 100 * 1024 * 1024
 BACKUP_COLLECTIONS = (
     USERS,
     AGENT_DEFINITIONS,
+    AGENT_RUNS,
+    AGENT_REVISION_PROPOSALS,
     NOVELS,
     VOLUMES,
     CHAPTERS,

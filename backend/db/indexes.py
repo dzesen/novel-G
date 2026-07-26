@@ -152,6 +152,38 @@ async def init_agent_definition_indexes():
         logger.error("初始化 Agent 定义索引失败：%s", exc)
 
 
+async def init_agent_workbench_indexes():
+    """初始化 Agent 运行历史与修订提案查询索引。"""
+    try:
+        db = get_database()
+        await db[collections.AGENT_RUNS].create_indexes([
+            pymongo.IndexModel([
+                ("actor_id", pymongo.ASCENDING),
+                ("novel_id", pymongo.ASCENDING),
+                ("created_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+                ("updated_at", pymongo.DESCENDING),
+            ]),
+        ])
+        await db[collections.AGENT_REVISION_PROPOSALS].create_indexes([
+            pymongo.IndexModel([
+                ("actor_id", pymongo.ASCENDING),
+                ("novel_id", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+                ("created_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel(
+                [("run_id", pymongo.ASCENDING), ("source_kind", pymongo.ASCENDING)]
+            ),
+        ])
+        logger.info("成功初始化 Agent 运行历史与修订提案索引。")
+    except Exception as exc:
+        logger.error("初始化 Agent 工作台索引失败：%s", exc)
+
+
 async def init_volume_indexes():
     """初始化volumes集合的索引。"""
     try:
@@ -524,6 +556,7 @@ async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_identity_indexes()
     await init_agent_definition_indexes()
+    await init_agent_workbench_indexes()
     await init_novel_indexes()
     await init_volume_indexes()
     await init_chapter_indexes()

@@ -10,6 +10,7 @@ from backend.db.mutation import MutationEngine, MutationHandlerSpec, RecoverySco
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.novel.chapter_service import ChapterService
 from backend.services.novel.chapter_state_service import ChapterStateService
+from backend.services.novel.agent_revision import AgentRevisionProposalService
 from backend.services.novel.character_state_service import CharacterStateService
 from backend.services.novel.plot_thread_service import PlotThreadService
 from backend.services.novel.novel_service import NovelService
@@ -65,6 +66,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("restore_reference_card", 1): ReferenceCardService._execute_mutation,
         ("hard_delete_reference_card", 1): ReferenceCardService._execute_mutation,
         ("apply_reference_card_plan", 1): ReferenceCardCurationService._execute_apply,
+        ("apply_agent_revision_proposal", 1): AgentRevisionProposalService._execute_apply,
     }
     non_narrative_operations = {"update_novel_metadata", "update_reference_card_metadata"}
     return {
@@ -83,25 +85,44 @@ async def _sync_quarantined_proposals(
     for item in report.get("quarantined") or []:
         journal = await journals.find_one({"_id": to_object_id(item["journal_id"])})
         command = ((journal or {}).get("command") or {}).get("payload") or {}
-        if (journal or {}).get("operation") == "apply_reference_card_plan":
+        operation = (journal or {}).get("operation")
+        if operation == "apply_reference_card_plan":
             proposals = get_database()[collections.REFERENCE_CARD_PROPOSALS]
             proposal_id = command.get("proposal_id")
+            expected_status = "claimed"
+            quarantined_status = "quarantined"
+        elif operation == "apply_agent_revision_proposal":
+            proposals = get_database()[collections.AGENT_REVISION_PROPOSALS]
+            proposal_id = command.get("proposal_id")
+            expected_status = "applying"
+            # Agent revision proposals expose a closed author-facing state
+            # machine. A poisoned recovery is terminal and non-applicable, so
+            # surface it as stale while retaining the operator audit below.
+            quarantined_status = "stale"
         else:
             proposals = get_database()[collections.STATE_PREVIEWS]
             claim = command.get("proposal_claim") or {}
             proposal_id = claim.get("proposal_id")
+            expected_status = "claimed"
+            quarantined_status = "quarantined"
         if not proposal_id:
             continue
+        update: dict[str, Any] = {
+            "status": quarantined_status,
+            "quarantine_error": dict(item),
+            "quarantined_at": get_utc_now(),
+            "updated_at": get_utc_now(),
+        }
+        if operation == "apply_agent_revision_proposal":
+            update["stale_reason"] = (
+                "修订提案恢复失败，已隔离且不会继续写入；请重新运行 Agent"
+            )
         await proposals.update_one(
-            {"_id": to_object_id(proposal_id), "status": "claimed"},
             {
-                "$set": {
-                    "status": "quarantined",
-                    "quarantine_error": dict(item),
-                    "quarantined_at": get_utc_now(),
-                    "updated_at": get_utc_now(),
-                }
+                "_id": to_object_id(proposal_id),
+                "status": expected_status,
             },
+            {"$set": update},
         )
 
 
