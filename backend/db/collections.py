@@ -20,6 +20,7 @@ FACTIONS = "factions"
 FACTION_RELATIONS = "faction_relations"
 PLOT_THREADS = "plot_threads"
 CHARACTER_STATES = "character_states"
+AGENT_DEFINITIONS = "agent_definitions"
 
 # 批量生成作业（阶段 3）。注意与遗留幽灵 GENERATION_TASKS 撞名但**不同集合**：
 # 本集合有写入方（作业引擎），generation_tasks 无。级联 stats key 用规则名
@@ -44,6 +45,7 @@ ACTIVE_COLLECTIONS = frozenset({
     FACTION_RELATIONS,
     PLOT_THREADS,
     CHARACTER_STATES,
+    AGENT_DEFINITIONS,
     GENERATION_JOBS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,
@@ -85,4 +87,4 @@ REGISTERED_COLLECTIONS = ALL_COLLECTIONS | EPHEMERAL_COLLECTIONS
 # 必须覆盖到这里的每一个，一个不落——包括上面三个遗留幽灵集合。
 # tests/test_novel_service.py 拿它核对级联的完整性，用法与
 # BACKUP_COLLECTIONS 的覆盖测试同源。
-NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS, USERS}
+NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS, USERS, AGENT_DEFINITIONS}

@@ -12,6 +12,7 @@ from bson import json_util
 
 from backend.config import get_config_value
 from backend.db.collections import (
+    AGENT_DEFINITIONS,
     CHAPTERS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,
@@ -51,6 +52,7 @@ MAX_BACKUP_BYTES = 100 * 1024 * 1024
 # 新增集合务必同步登记，test_backup_covers_every_registered_collection 会守着这条。
 BACKUP_COLLECTIONS = (
     USERS,
+    AGENT_DEFINITIONS,
     NOVELS,
     VOLUMES,
     CHAPTERS,

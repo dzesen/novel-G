@@ -11,6 +11,7 @@ import ReferenceCardsWorkspace from "./reference-cards/ReferenceCardsWorkspace";
 import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
 import PlotThreadWorkspace from "./plot-threads/PlotThreadWorkspace";
 import CharacterMemoryWorkspace from "./character-memory/CharacterMemoryWorkspace";
+import AgentStudioWorkspace from "./agents/AgentStudioWorkspace";
 
 interface WritingContentProps {
   mode: "create" | "edit";
@@ -49,6 +50,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           onNavigateToMemory={() => setActiveItem("character-memory")}
         />
       );
+    }
+    if (activeItem === "agent-studio") {
+      return <AgentStudioWorkspace mode={mode} novelId={novelId} />;
     }
     if (activeItem === "character-cards") {
       return (

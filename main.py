@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.db.mongo import connect_to_mongo, close_mongo_connection
 from backend.db.indexes import init_all_indexes
+from backend.api.default_routers.agent_router import router as agent_router
 from backend.api.default_routers.config_router import router as config_router
 from backend.api.default_routers.novel_router import router as novel_router
 from backend.api.default_routers.upload_router import router as upload_router
@@ -18,6 +19,8 @@ from backend.api.llm_routers.create_novel_router import router as create_novel_r
 from backend.api.llm_routers.outline_router import router as outline_router
 from backend.api.llm_routers.prose_router import router as prose_router
 from backend.api.llm_routers.state_router import router as state_router
+from backend.api.llm_routers.agent_tool_router import router as agent_tool_router
+from backend.api.llm_routers.scene_agent_router import router as scene_agent_router
 from backend.llm.prompts.prompt_selector import load_prompt_config
 from backend.runtime import (
     apply_runtime_flags_from_argv,
@@ -112,6 +115,7 @@ os.makedirs("static/covers", exist_ok=True)
 app.mount("/static/covers", StaticFiles(directory="static/covers"), name="static_covers")
 
 app.include_router(auth_router)
+app.include_router(agent_router)
 app.include_router(novel_router)
 app.include_router(volume_router)
 app.include_router(chapter_router)
@@ -122,6 +126,8 @@ app.include_router(create_novel_router)
 app.include_router(outline_router)
 app.include_router(prose_router)
 app.include_router(state_router)
+app.include_router(agent_tool_router)
+app.include_router(scene_agent_router)
 app.include_router(upload_router)
 app.include_router(backup_router)
 app.include_router(reference_card_router)

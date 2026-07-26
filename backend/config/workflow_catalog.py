@@ -68,6 +68,36 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
         label_key="settings.workflow.catalog.extract_chapter_state_by_ai",
         steps=(WorkflowStepDefinition(name="chapter_state", label_key="settings.workflow.steps.chapter_state"),),
     ),
+    WorkflowDefinition(
+        name="rewrite_chapter_scene_by_agent",
+        label_key="settings.workflow.catalog.rewrite_chapter_scene_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="scene_rewrite",
+                label_key="settings.workflow.steps.scene_rewrite",
+            ),
+        ),
+    ),
+    WorkflowDefinition(
+        name="creative_inspiration_by_agent",
+        label_key="settings.workflow.catalog.creative_inspiration_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="inspiration",
+                label_key="settings.workflow.steps.inspiration",
+            ),
+        ),
+    ),
+    WorkflowDefinition(
+        name="continuity_review_by_agent",
+        label_key="settings.workflow.catalog.continuity_review_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="review",
+                label_key="settings.workflow.steps.review",
+            ),
+        ),
+    ),
 )
 
 

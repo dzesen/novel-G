@@ -28,6 +28,7 @@ from backend.services.llm.context_builder import (
     assemble_context,
     fetch_context_inputs,
 )
+from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.prose_runner import stream_prose
 from backend.services.llm.workflow_runner import sse_event
 from backend.services.llm.workflow_service import get_llm_service_for_step
@@ -94,7 +95,8 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
         or 3000
     )
     # 正文是纯文本，固定走 without_schema 后缀；本工作流从不请求 JSON Schema。
-    prompt = (
+    prompt = apply_agent_profile(
+        "chapter_writer",
         prompts[f"{PROSE_STEP}_prompt_base"].format(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),

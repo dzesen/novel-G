@@ -66,6 +66,7 @@ CHAPTER_STATE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key=STATE_STEP,
         schema=ChapterStateResultSchema,
+        agent_id="continuity_editor",
         prompt_args=lambda ctx: {
             "context": ctx.params["context"],
             "chapter_order": ctx.params["chapter_order"],

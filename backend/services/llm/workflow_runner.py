@@ -18,6 +18,7 @@ from typing import Any, AsyncGenerator
 from pydantic import BaseModel
 
 from backend.llm.models import TokenUsage
+from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.generation_runtime import (
     GenerationRuntime,
     PromptPlan,
@@ -65,6 +66,7 @@ class WorkflowStep:
     schema: type[BaseModel]
     prompt_args: Callable[[StepContext], dict[str, Any]]
     config_key: str | None = None
+    agent_id: str | None = None
 
     @property
     def resolved_config_key(self) -> str:
@@ -271,6 +273,7 @@ async def run_workflow(
                 "provider": provider,
                 "structured_output": generation_plan.mode.value,
                 "reviewer": generation_plan.reviewer_alias,
+                "agent": step.agent_id,
             },
         )
         _log(
@@ -287,6 +290,9 @@ async def run_workflow(
             )
             native_prompt = prompt_base + "\n" + prompts[f"{config_key}_prompt_with_schema_suffix"]
             prompt_json = prompt_base + "\n" + prompts[f"{config_key}_prompt_without_schema_suffix"]
+            if step.agent_id:
+                native_prompt = apply_agent_profile(step.agent_id, native_prompt)
+                prompt_json = apply_agent_profile(step.agent_id, prompt_json)
 
             coro = deps.runtime.generate_structured(
                 generation_plan,

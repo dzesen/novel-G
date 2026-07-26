@@ -14,6 +14,7 @@ class ChapterOutcome:
     order_index: int
     steps_done: List[str] = field(default_factory=list)
     steps_skipped: List[str] = field(default_factory=list)
+    agents_used: List[str] = field(default_factory=list)
     tokens: int = 0
     consistency_issues: List[dict] = field(default_factory=list)
     facts_added: int = 0
@@ -99,6 +100,7 @@ async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipel
         except Exception as exc:
             raise _capture_failure(outcome, "outline", exc) from exc
         outcome.steps_done.append("outline")
+        outcome.agents_used.append("chapter_planner")
         outcome.dropped_ids.update(dropped)
         _record_truncation(outcome, "outline", truncation)
 
@@ -116,6 +118,7 @@ async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipel
         except Exception as exc:
             raise _capture_failure(outcome, "prose", exc) from exc
         outcome.steps_done.append("prose")
+        outcome.agents_used.append("chapter_writer")
         _record_truncation(outcome, "prose", truncation)
 
     # 3. 状态回填
@@ -135,6 +138,7 @@ async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipel
         except Exception as exc:
             raise _capture_failure(outcome, "state", exc) from exc
         outcome.steps_done.append("state")
+        outcome.agents_used.append("continuity_editor")
         outcome.facts_added += int(report.get("facts_appended", 0))
         outcome.threads_advanced += int(report.get("threads_updated", 0))
         outcome.summary_written = True

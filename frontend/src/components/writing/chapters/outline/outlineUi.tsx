@@ -66,7 +66,7 @@ export function RowEditor<T>({
   removeLabel: string;
   blank: T;
   onChange: (rows: T[]) => void;
-  render: (row: T, update: (patch: Partial<T>) => void) => ReactNode;
+  render: (row: T, update: (patch: Partial<T>) => void, index: number) => ReactNode;
 }) {
   return (
     <section className="rounded-md border border-border bg-background p-4">
@@ -83,11 +83,15 @@ export function RowEditor<T>({
       <div className="grid gap-3">
         {rows.map((row, index) => (
           <div key={index} className="rounded-md border border-border bg-surface p-3">
-            {render(row, (rowPatch) => {
-              const next = [...rows];
-              next[index] = { ...next[index], ...rowPatch };
-              onChange(next);
-            })}
+            {render(
+              row,
+              (rowPatch) => {
+                const next = [...rows];
+                next[index] = { ...next[index], ...rowPatch };
+                onChange(next);
+              },
+              index,
+            )}
             <div className="mt-2 flex justify-end">
               <button
                 type="button"

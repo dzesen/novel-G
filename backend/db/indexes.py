@@ -126,6 +126,32 @@ async def init_identity_indexes():
         logger.error("初始化认证索引失败：%s", exc)
 
 
+async def init_agent_definition_indexes():
+    """初始化用户 Agent 定义的唯一性、可见性与列表索引。"""
+    try:
+        db = get_database()
+        await db[collections.AGENT_DEFINITIONS].create_indexes([
+            pymongo.IndexModel(
+                [("agent_id", pymongo.ASCENDING)],
+                unique=True,
+                name="agent_definitions_agent_id_unique",
+            ),
+            pymongo.IndexModel([
+                ("owner_id", pymongo.ASCENDING),
+                ("is_deleted", pymongo.ASCENDING),
+                ("updated_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("visibility", pymongo.ASCENDING),
+                ("enabled", pymongo.ASCENDING),
+                ("capability", pymongo.ASCENDING),
+            ]),
+        ])
+        logger.info("成功初始化 Agent 定义索引。")
+    except Exception as exc:
+        logger.error("初始化 Agent 定义索引失败：%s", exc)
+
+
 async def init_volume_indexes():
     """初始化volumes集合的索引。"""
     try:
@@ -497,6 +523,7 @@ async def init_state_timeline_indexes():
 async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_identity_indexes()
+    await init_agent_definition_indexes()
     await init_novel_indexes()
     await init_volume_indexes()
     await init_chapter_indexes()

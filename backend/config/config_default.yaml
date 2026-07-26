@@ -153,3 +153,21 @@ llm:
         chapter_state:
           provider: ""
           timeout_seconds: null
+    rewrite_chapter_scene_by_agent:
+      default_provider: ""
+      steps:
+        scene_rewrite:
+          provider: ""
+          timeout_seconds: null
+    creative_inspiration_by_agent:
+      default_provider: ""
+      steps:
+        inspiration:
+          provider: ""
+          timeout_seconds: null
+    continuity_review_by_agent:
+      default_provider: ""
+      steps:
+        review:
+          provider: ""
+          timeout_seconds: null

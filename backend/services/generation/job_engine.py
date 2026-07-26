@@ -40,6 +40,7 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
     return {
         "chapter_id": outcome.chapter_id, "order_index": outcome.order_index,
         "steps_done": outcome.steps_done, "steps_skipped": outcome.steps_skipped,
+        "agents_used": outcome.agents_used,
         "tokens": outcome.tokens, "consistency_issues": outcome.consistency_issues,
         "facts_added": outcome.facts_added, "threads_advanced": outcome.threads_advanced,
         "summary_written": outcome.summary_written, "dropped_ids": outcome.dropped_ids,

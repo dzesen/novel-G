@@ -268,6 +268,9 @@ export default function ChapterOutlinePanel({
                 value={editBuffer}
                 onChange={(patch) => setEditBuffer((cur) => (cur ? { ...cur, ...patch } : cur))}
                 roster={roster}
+                novelId={novelId}
+                chapterId={chapterId}
+                baseScenes={existingOutline?.scenes}
               />
               <div className="grid gap-2 rounded-md border border-border bg-background p-4">
                 <ReadOnlyIds label={t("threadsPlanted")} ids={editBuffer.threads_planted} nameById={roster.nameById} />

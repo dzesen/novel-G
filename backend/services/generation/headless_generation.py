@@ -15,6 +15,7 @@ from backend.llm.prompts.prompt_selector import (
 from backend.services.llm.context_builder import (
     assemble_context, assemble_outline_context, fetch_context_inputs,
 )
+from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.prose_runner import stream_prose
 from backend.services.llm.workflow_runner import (
     WorkflowDeps, WorkflowFailed, parse_sse_event, run_workflow, run_workflow_to_result,
@@ -155,7 +156,8 @@ async def generate_prose(
     novel = await novel_repo.get_novel_by_id(novel_id)
     words = outline.get("target_word_count") or novel.get("words_per_chapter") or 3000
     prompts = load_prompt_config().get(PROSE_PROMPT_NAME, {})
-    prompt = (
+    prompt = apply_agent_profile(
+        "chapter_writer",
         prompts[f"{PROSE_STEP}_prompt_base"].format(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),

@@ -375,6 +375,7 @@ export interface WritingDraft extends CreateNovelRequest {
 export type WritingSidebarItem =
   | "novel-info"
   | "chapter-editor"
+  | "agent-studio"
   | "character-cards"
   | "location-cards"
   | "faction-cards"

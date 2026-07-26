@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
+import { apiGet, apiPost } from "@/lib/api";
 import RosterPicker from "./RosterPicker";
 import { Field, RowEditor } from "./outlineUi";
 import type { ChapterOutlineAuthoredFields, Scene } from "./outlineTypes";
@@ -10,6 +12,21 @@ interface OutlineFieldsEditorProps {
   value: ChapterOutlineAuthoredFields;
   onChange: (patch: Partial<ChapterOutlineAuthoredFields>) => void;
   roster: ReturnType<typeof useRoster>;
+  novelId?: string;
+  chapterId?: string;
+  baseScenes?: Scene[];
+}
+
+interface SceneAgentProfile {
+  agent_id: string;
+  label: string;
+  description: string;
+}
+
+interface SceneRewriteResponse {
+  scene: Scene;
+  agent_id: string;
+  provider_alias: string;
 }
 
 /**
@@ -17,8 +34,73 @@ interface OutlineFieldsEditorProps {
  * 避免字段编辑器重复、约束漂移。不含 new_threads（预览自行追加）、
  * 不含 threads_planted（编辑态只读展示，见 ChapterOutlinePanel）。
  */
-export default function OutlineFieldsEditor({ value, onChange, roster }: OutlineFieldsEditorProps) {
+export default function OutlineFieldsEditor({
+  value,
+  onChange,
+  roster,
+  novelId,
+  chapterId,
+  baseScenes,
+}: OutlineFieldsEditorProps) {
   const t = useTranslations("writing.outline");
+  const [sceneAgents, setSceneAgents] = useState<SceneAgentProfile[]>([]);
+  const [agentSelections, setAgentSelections] = useState<Record<number, string>>({});
+  const [agentInstructions, setAgentInstructions] = useState<Record<number, string>>({});
+  const [rewriteCandidates, setRewriteCandidates] = useState<Record<number, SceneRewriteResponse>>({});
+  const [rewritingScene, setRewritingScene] = useState<number | null>(null);
+  const [agentErrors, setAgentErrors] = useState<Record<number, string>>({});
+  const sceneAgentMode = Boolean(novelId && chapterId && baseScenes);
+  const sceneStructureMatches = baseScenes?.length === value.scenes.length;
+
+  useEffect(() => {
+    if (!sceneAgentMode) return;
+    let active = true;
+    apiGet<{ data: SceneAgentProfile[] }>("/api/llm/scene-agents")
+      .then((response) => {
+        if (active) setSceneAgents(response.data);
+      })
+      .catch((error) => {
+        if (active) {
+          setAgentErrors({
+            [-1]: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [sceneAgentMode]);
+
+  const rewriteScene = async (index: number, scene: Scene) => {
+    if (!novelId || !chapterId || !baseScenes?.[index]) return;
+    const agentId = agentSelections[index] || sceneAgents[0]?.agent_id;
+    if (!agentId) return;
+    setRewritingScene(index);
+    setAgentErrors((current) => ({ ...current, [index]: "" }));
+    try {
+      const response = await apiPost<SceneRewriteResponse>(
+        "/api/llm/rewrite-chapter-scene",
+        {
+          novel_id: novelId,
+          chapter_id: chapterId,
+          scene_index: index,
+          base_scene: baseScenes[index],
+          scene,
+          agent_id: agentId,
+          instruction: agentInstructions[index] || "",
+        },
+      );
+      setRewriteCandidates((current) => ({ ...current, [index]: response }));
+    } catch (error) {
+      setAgentErrors((current) => ({
+        ...current,
+        [index]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setRewritingScene(null);
+    }
+  };
+
   return (
     <>
       <div className="grid gap-3 rounded-md border border-border bg-background p-4">
@@ -102,24 +184,131 @@ export default function OutlineFieldsEditor({ value, onChange, roster }: Outline
         removeLabel={t("removeRow")}
         onChange={(scenes) => onChange({ scenes })}
         blank={{ summary: "", purpose: "" }}
-        render={(scene, update) => (
-          <div className="grid gap-3 md:grid-cols-2">
-            <Field label={t("fieldSceneSummary")}>
-              <textarea
-                value={scene.summary}
-                rows={2}
-                onChange={(e) => update({ summary: e.target.value })}
-                className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-sm leading-5 text-foreground outline-none focus:border-accent"
-              />
-            </Field>
-            <Field label={t("fieldScenePurpose")}>
-              <textarea
-                value={scene.purpose}
-                rows={2}
-                onChange={(e) => update({ purpose: e.target.value })}
-                className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-sm leading-5 text-foreground outline-none focus:border-accent"
-              />
-            </Field>
+        render={(scene, update, index) => (
+          <div className="grid gap-3">
+            <div className="grid gap-3 md:grid-cols-2">
+              <Field label={t("fieldSceneSummary")}>
+                <textarea
+                  value={scene.summary}
+                  rows={2}
+                  onChange={(e) => update({ summary: e.target.value })}
+                  className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-sm leading-5 text-foreground outline-none focus:border-accent"
+                />
+              </Field>
+              <Field label={t("fieldScenePurpose")}>
+                <textarea
+                  value={scene.purpose}
+                  rows={2}
+                  onChange={(e) => update({ purpose: e.target.value })}
+                  className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-sm leading-5 text-foreground outline-none focus:border-accent"
+                />
+              </Field>
+            </div>
+
+            {sceneAgentMode && (
+              <div className="grid gap-2 rounded-md border border-border bg-background p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-semibold text-foreground">{t("sceneAgentTitle")}</span>
+                  <select
+                    aria-label={t("sceneAgentSelect")}
+                    value={agentSelections[index] || sceneAgents[0]?.agent_id || ""}
+                    onChange={(event) =>
+                      setAgentSelections((current) => ({
+                        ...current,
+                        [index]: event.target.value,
+                      }))
+                    }
+                    className="min-h-8 min-w-44 rounded-md border border-border bg-surface px-2 py-1 text-xs text-foreground outline-none focus:border-accent"
+                  >
+                    {sceneAgents.map((agent) => (
+                      <option key={agent.agent_id} value={agent.agent_id}>
+                        {agent.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void rewriteScene(index, scene)}
+                    disabled={
+                      rewritingScene !== null ||
+                      sceneAgents.length === 0 ||
+                      !sceneStructureMatches
+                    }
+                    className="min-h-8 rounded-md bg-accent px-3 py-1 text-xs font-medium text-white hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {rewritingScene === index ? t("sceneAgentRewriting") : t("sceneAgentRewrite")}
+                  </button>
+                </div>
+                <input
+                  value={agentInstructions[index] || ""}
+                  onChange={(event) =>
+                    setAgentInstructions((current) => ({
+                      ...current,
+                      [index]: event.target.value,
+                    }))
+                  }
+                  placeholder={t("sceneAgentInstructionPlaceholder")}
+                  className="min-h-8 w-full rounded-md border border-border bg-surface px-2 py-1 text-xs text-foreground outline-none placeholder:text-muted focus:border-accent"
+                />
+                {!sceneStructureMatches && (
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
+                    {t("sceneAgentStructureChanged")}
+                  </p>
+                )}
+                {agentErrors[index] && (
+                  <p className="text-xs text-red-600 dark:text-red-400">{agentErrors[index]}</p>
+                )}
+                {rewriteCandidates[index] && (
+                  <div className="grid gap-2 rounded-md border border-accent/40 bg-surface p-3">
+                    <p className="text-xs font-medium text-foreground">
+                      {t("sceneAgentPreview", {
+                        provider: rewriteCandidates[index].provider_alias,
+                      })}
+                    </p>
+                    <p className="text-xs leading-5 text-foreground">
+                      {rewriteCandidates[index].scene.summary}
+                    </p>
+                    <p className="text-xs leading-5 text-muted">
+                      {rewriteCandidates[index].scene.purpose}
+                    </p>
+                    <div className="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setRewriteCandidates((current) => {
+                            const next = { ...current };
+                            delete next[index];
+                            return next;
+                          })
+                        }
+                        className="rounded-md px-2 py-1 text-xs text-muted hover:bg-surface-secondary"
+                      >
+                        {t("sceneAgentDiscard")}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          update(rewriteCandidates[index].scene);
+                          setRewriteCandidates((current) => {
+                            const next = { ...current };
+                            delete next[index];
+                            return next;
+                          });
+                        }}
+                        className="rounded-md bg-accent px-2 py-1 text-xs font-medium text-white hover:bg-accent-hover"
+                      >
+                        {t("sceneAgentApply")}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+            {agentErrors[-1] && (
+              <p className="text-xs text-red-600 dark:text-red-400">
+                {t("sceneAgentLoadFailed", { error: agentErrors[-1] })}
+              </p>
+            )}
           </div>
         )}
       />

@@ -85,6 +85,7 @@ CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key="chapter_outline",
         schema=ChapterOutlineResultSchema,
+        agent_id="chapter_planner",
         prompt_args=lambda ctx: {
             "context": ctx.params["context"],
             "chapter_order": ctx.params["chapter_order"],
