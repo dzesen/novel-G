@@ -105,6 +105,22 @@ class VolumeRepository(BaseRepository):
             session=session,
         )
 
+    async def get_deleted_volumes_by_novel(
+        self,
+        novel_id: str,
+        session: AsyncClientSession | None = None,
+    ) -> List[Dict[str, Any]]:
+        """获取指定小说下已软删除的卷，供卷回收站恢复或彻底删除。"""
+        return await self.find_many(
+            {
+                "novel_id": to_object_id(novel_id),
+                "is_deleted": True,
+            },
+            include_deleted=True,
+            sort=[("deleted_at", -1), ("order_index", 1)],
+            session=session,
+        )
+
     async def get_volume_by_id(
         self,
         volume_id: str,

@@ -44,6 +44,7 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
   // 必须单独取一份 translator，不能借用上面几个 writing.* 的 t()。
   const tStateBackfill = useTranslations("stateBackfill");
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
+  const [volumeTrash, setVolumeTrash] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [trash, setTrash] = useState<ChapterSummary[]>([]);
   const [selectedVolumeId, setSelectedVolumeId] = useState<string | null>(null);
@@ -81,14 +82,16 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
       setStructureError("");
     }
     try {
-      const [volumeResponse, chapterResponse, trashResponse] = await Promise.all([
+      const [volumeResponse, volumeTrashResponse, chapterResponse, trashResponse] = await Promise.all([
         apiGet<ListResponse<VolumeSummary>>(`/api/volumes/novel/${novelId}`),
+        apiGet<ListResponse<VolumeSummary>>(`/api/volumes/novel/${novelId}/trash`),
         apiGet<ListResponse<ChapterSummary>>(`/api/chapters/novel/${novelId}`),
         apiGet<ListResponse<ChapterSummary>>(`/api/chapters/novel/${novelId}/trash`),
       ]);
       const nextVolumes = [...volumeResponse.data].sort((a, b) => a.order_index - b.order_index);
       const nextChapters = [...chapterResponse.data].sort((a, b) => a.order_index - b.order_index);
       setVolumes(nextVolumes);
+      setVolumeTrash(volumeTrashResponse.data);
       setChapters(nextChapters);
       setTrash(trashResponse.data);
       setSelectedVolumeId((current) => {
@@ -376,6 +379,91 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
     }
   };
 
+  const resetChapterPanels = () => {
+    setProseOpen(false);
+    setChapterOutlineOpen(false);
+    setStateBackfillOpen(false);
+    setStateBackfillBlocked("");
+  };
+
+  const deleteVolume = async (volumeId: string) => {
+    setStructureError("");
+    try {
+      const deletedChapterIds = chapters
+        .filter((chapter) => chapter.volume_id === volumeId)
+        .map((chapter) => chapter._id);
+      await apiDelete(`/api/volumes/${volumeId}`);
+      deletedChapterIds.forEach(clearLocalChapterDraft);
+      if (selectedChapterId && deletedChapterIds.includes(selectedChapterId)) {
+        selectedChapterIdRef.current = null;
+        setSelectedChapterId(null);
+        setDraft(null);
+        resetChapterPanels();
+      }
+      await loadStructure();
+    } catch (error) {
+      setStructureError(error instanceof Error ? error.message : t("deleteVolumeFailed"));
+      throw error;
+    }
+  };
+
+  const restoreVolume = async (volumeId: string) => {
+    setStructureError("");
+    try {
+      await apiPost(`/api/volumes/${volumeId}/restore`, {});
+      await loadStructure();
+      setSelectedVolumeId(volumeId);
+    } catch (error) {
+      setStructureError(error instanceof Error ? error.message : t("restoreVolumeFailed"));
+      throw error;
+    }
+  };
+
+  const hardDeleteVolume = async (volumeId: string) => {
+    setStructureError("");
+    try {
+      await apiDelete(`/api/volumes/${volumeId}/hard`);
+      await loadStructure();
+    } catch (error) {
+      setStructureError(error instanceof Error ? error.message : t("hardDeleteVolumeFailed"));
+      throw error;
+    }
+  };
+
+  const bulkDeleteChapters = async (chapterIds: string[]) => {
+    if (!novelId || chapterIds.length === 0) return;
+    setStructureError("");
+    try {
+      const result = await apiPost<{
+        requested: number;
+        deleted: string[];
+        failed: Array<{ chapter_id: string; detail: string }>;
+      }>("/api/chapters/bulk-delete", {
+        novel_id: novelId,
+        chapter_ids: chapterIds,
+      });
+      result.deleted.forEach(clearLocalChapterDraft);
+      if (selectedChapterId && result.deleted.includes(selectedChapterId)) {
+        selectedChapterIdRef.current = null;
+        setSelectedChapterId(null);
+        setDraft(null);
+        resetChapterPanels();
+      }
+      await loadStructure();
+      if (result.failed.length > 0) {
+        throw new Error(
+          t("bulkDeletePartialFailed", {
+            deleted: result.deleted.length,
+            failed: result.failed.length,
+          }),
+        );
+      }
+    } catch (error) {
+      setStructureError(error instanceof Error ? error.message : t("bulkDeleteFailed"));
+      throw error;
+    }
+  };
+
   const deleteChapter = async () => {
     if (!selectedChapterId) return;
     const deletedId = selectedChapterId;
@@ -384,12 +472,7 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
       clearLocalChapterDraft(deletedId);
       selectedChapterIdRef.current = null;
       setSelectedChapterId(null);
-      // 这里绕开了 selectChapter，所以要手动补上它顺带做的面板复位：
-      // 三个面板都以整容器覆盖的方式渲染，持有的 chapterId 会指向刚被删掉的章。
-      setProseOpen(false);
-      setChapterOutlineOpen(false);
-      setStateBackfillOpen(false);
-      setStateBackfillBlocked("");
+      resetChapterPanels();
       await loadStructure();
     } catch (error) {
       setStructureError(error instanceof Error ? error.message : t("deleteFailed"));
@@ -423,9 +506,10 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col md:flex-row">
+    <div className="relative flex h-full min-h-0 flex-col lg:flex-row">
       <ChapterNavigator
         volumes={volumes}
+        deletedVolumes={volumeTrash}
         chapters={chapters}
         trash={trash}
         selectedChapterId={selectedChapterId}
@@ -436,6 +520,10 @@ export default function ChapterWorkspace({ mode, novelId, onNavigateToMemory }: 
         onCreateVolume={createVolume}
         onCreateChapter={createChapter}
         onRestoreChapter={restoreChapter}
+        onDeleteVolume={deleteVolume}
+        onRestoreVolume={restoreVolume}
+        onHardDeleteVolume={hardDeleteVolume}
+        onBulkDeleteChapters={bulkDeleteChapters}
         onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
         onStartVolumeJob={() => setBatchStartScope("volume")}
         onStartBookJob={() => setBatchStartScope("book")}

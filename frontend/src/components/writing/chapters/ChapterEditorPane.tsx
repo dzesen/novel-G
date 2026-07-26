@@ -131,15 +131,15 @@ export default function ChapterEditorPane({
   return (
     <main className="flex min-h-0 flex-1 flex-col bg-surface">
       <header className="border-b border-border px-4 py-3 sm:px-6">
-        <div className="flex flex-wrap items-start gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-start">
           <input
             value={draft.title}
             onChange={(event) => onChange({ title: event.target.value })}
-            className="min-w-[16rem] flex-1 border-0 bg-transparent p-0 text-xl font-semibold text-foreground outline-none placeholder:text-muted focus:ring-0"
+            className="min-w-0 flex-1 border-0 bg-transparent p-0 text-xl font-semibold text-foreground outline-none placeholder:text-muted focus:ring-0"
             placeholder={t("chapterTitlePlaceholder")}
             aria-label={t("chapterTitle")}
           />
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 xl:max-w-[36rem] xl:justify-end">
             <button
               type="button"
               onClick={onOpenChapterOutline}

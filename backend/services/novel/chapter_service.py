@@ -614,6 +614,44 @@ class ChapterService:
         return bool(result["deleted"])
 
     @staticmethod
+    async def soft_delete_chapters(
+        novel_id: str,
+        chapter_ids: List[str],
+    ) -> Dict[str, Any]:
+        """预校验后顺序软删除多个章节，并精确返回每个失败项。"""
+        unique_ids = list(dict.fromkeys(str(item) for item in chapter_ids))
+        if not unique_ids:
+            raise ValueError("At least one chapter id is required")
+
+        expected_novel_id = to_object_id(novel_id)
+        for chapter_id in unique_ids:
+            chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+            if chapter["novel_id"] != expected_novel_id:
+                raise ValueError(
+                    f"Chapter {chapter_id} does not belong to the specified novel"
+                )
+
+        deleted: List[str] = []
+        failed: List[Dict[str, str]] = []
+        for chapter_id in unique_ids:
+            try:
+                await ChapterService.soft_delete_chapter(chapter_id)
+                deleted.append(chapter_id)
+            except Exception as exc:
+                logger.exception("Batch chapter delete failed for %s", chapter_id)
+                failed.append(
+                    {
+                        "chapter_id": chapter_id,
+                        "detail": str(exc) or type(exc).__name__,
+                    }
+                )
+        return {
+            "requested": len(unique_ids),
+            "deleted": deleted,
+            "failed": failed,
+        }
+
+    @staticmethod
     async def _execute_restore_chapter(session, mutation):
         command = mutation.journal["command"]["payload"]
         chapter = command["chapter"]

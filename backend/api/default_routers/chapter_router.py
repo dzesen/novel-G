@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -49,6 +49,11 @@ class AcceptChapterOutlineRequest(BaseModel):
 
 class UpdateChapterOutlineRequest(BaseModel):
     outline: dict
+
+
+class BulkDeleteChaptersRequest(BaseModel):
+    novel_id: str
+    chapter_ids: List[str] = Field(min_length=1, max_length=100)
 
 
 _OUTLINE_ID_FIELDS = (
@@ -183,6 +188,23 @@ async def update_chapter(chapter_id: str, req: UpdateChapterRequest):
         )
         return {"success": success}
     except (NotFoundError, DuplicateKeyError, InvalidIdError, ValueError) as exc:
+        raise _handle_client_error(exc) from exc
+
+
+@router.post("/bulk-delete")
+async def bulk_soft_delete_chapters(
+    req: BulkDeleteChaptersRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
+    """批量把至多 100 个章节移入回收站，返回逐项结果。"""
+    try:
+        await access.require_owned_novel(actor, req.novel_id)
+        return await ChapterService.soft_delete_chapters(
+            req.novel_id,
+            req.chapter_ids,
+        )
+    except (NotFoundError, InvalidIdError, ValueError) as exc:
         raise _handle_client_error(exc) from exc
 
 

@@ -137,6 +137,11 @@ class VolumeService:
         return count > 0
 
     @staticmethod
+    async def get_deleted_volumes_by_novel(novel_id: str) -> List[Dict[str, Any]]:
+        await novel_repo.get_novel_by_id(novel_id)
+        return await volume_repo.get_deleted_volumes_by_novel(novel_id)
+
+    @staticmethod
     async def _execute_accept_volume_outline(session, mutation):
         command = mutation.journal["command"]["payload"]
         novel_id = str(mutation.journal["novel_id"])

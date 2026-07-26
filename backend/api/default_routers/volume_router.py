@@ -36,6 +36,14 @@ class AcceptVolumeOutlineRequest(BaseModel):
     volumes: List[dict]
 
 
+def _serialize_volume(volume: dict) -> dict:
+    result = dict(volume)
+    for field in ("_id", "novel_id"):
+        if result.get(field) is not None:
+            result[field] = str(result[field])
+    return result
+
+
 @router.post("/create")
 async def create_volume(
     req: CreateVolumeRequest,
@@ -85,12 +93,19 @@ async def get_volumes_by_novel(novel_id: str):
     """获取指定小说下的所有卷列表（按 order_index 升序）。"""
     try:
         volumes = await VolumeService.get_volumes_by_novel(novel_id)
-        for v in volumes:
-            if "_id" in v:
-                v["_id"] = str(v["_id"])
-            if "novel_id" in v:
-                v["novel_id"] = str(v["novel_id"])
-        return {"data": volumes}
+        return {"data": [_serialize_volume(volume) for volume in volumes]}
+    except InvalidIdError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/novel/{novel_id}/trash")
+async def get_deleted_volumes_by_novel(novel_id: str):
+    """获取卷回收站；恢复卷时会一并恢复由该卷级联删除的章节。"""
+    try:
+        volumes = await VolumeService.get_deleted_volumes_by_novel(novel_id)
+        return {"data": [_serialize_volume(volume) for volume in volumes]}
+    except NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except InvalidIdError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
