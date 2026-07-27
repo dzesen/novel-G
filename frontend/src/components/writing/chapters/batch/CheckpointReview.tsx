@@ -3,6 +3,7 @@
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./batchTypes";
+import { buildChapterPresentation } from "./batchPresentation";
 
 interface CheckpointReviewProps {
   job: GenerationJob;
@@ -50,18 +51,29 @@ function Banner({ job }: { job: GenerationJob }) {
 
 function StepTags({ progress }: { progress: ChapterProgress }) {
   const t = useTranslations("writing.batch");
+  const { stepBadges } = buildChapterPresentation(progress);
   const label = (s: string) =>
     s === "outline" ? t("stepOutline") : s === "prose" ? t("stepProse") : s === "state" ? t("stepState") : s;
+  const statusLabel = (status: string) =>
+    status === "reused" ? t("reusedTag")
+      : status === "skipped" ? t("skippedTag")
+        : status === "degraded" ? t("degradedTag")
+          : status === "incomplete" ? t("incompleteTag")
+            : status === "blocked" ? t("blockedTag")
+              : status === "failed" ? t("failedTag")
+                : "";
+  const statusClass = (status: string) =>
+    status === "generated" ? "border-border bg-background text-foreground"
+      : status === "reused" ? "border-dashed border-border text-muted"
+        : status === "degraded" || status === "incomplete"
+          ? "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200"
+          : "border-red-300 bg-red-50 text-red-700 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-300";
   return (
     <div className="flex flex-wrap gap-1.5 text-[11px]">
-      {progress.steps_done.map((s) => (
-        <span key={`d-${s}`} className="rounded border border-border bg-background px-1.5 py-0.5 text-foreground">
-          {label(s)}
-        </span>
-      ))}
-      {progress.steps_skipped.map((s) => (
-        <span key={`s-${s}`} className="rounded border border-dashed border-border px-1.5 py-0.5 text-muted">
-          {label(s)}·{t("skippedTag")}
+      {stepBadges.map((badge) => (
+        <span key={`${badge.step}-${badge.status}`} className={`rounded border px-1.5 py-0.5 ${statusClass(badge.status)}`}>
+          {label(badge.step)}
+          {statusLabel(badge.status) && <>·{statusLabel(badge.status)}</>}
         </span>
       ))}
     </div>
@@ -81,6 +93,7 @@ function ChapterCard({
 }) {
   const t = useTranslations("writing.batch");
   const hasConflict = progress.consistency_issues.length > 0;
+  const presentation = buildChapterPresentation(progress);
   return (
     <div className={`rounded-md border p-3 ${hasConflict ? "border-red-300 dark:border-red-900/70" : "border-border"} bg-surface`}>
       <button type="button" onClick={onJump} title={t("jumpHint")} className="mb-2 block w-full text-left">
@@ -111,27 +124,61 @@ function ChapterCard({
         </div>
       )}
 
-      {(progress.truncations.length > 0 || Object.keys(progress.dropped_ids).length > 0) && (
+      {presentation.contextNotices.length > 0 && (
         <div className="mt-2 grid gap-1 rounded-md border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
           <span className="font-semibold">{t("truncationTitle")}</span>
-          {progress.truncations.map((tr, i) => (
+          {presentation.contextNotices.map((notice, i) => (
             <div key={i}>
-              {tr.truncated_sections.length > 0 && (
-                <div>{t("truncationSections", { step: tr.step, sections: tr.truncated_sections.join("、") })}</div>
+              {notice.truncatedSections.length > 0 && (
+                <div>{t("truncationSections", { step: notice.step ?? "-", sections: notice.truncatedSections.join("、") })}</div>
               )}
-              {Object.keys(tr.dropped_item_counts).length > 0 && (
+              {Object.keys(notice.droppedItemCounts).length > 0 && (
                 <div>
                   {t("truncationDropped", {
-                    step: tr.step,
-                    detail: Object.entries(tr.dropped_item_counts).map(([k, v]) => `${k} ${v}`).join("、"),
+                    step: notice.step ?? "-",
+                    detail: Object.entries(notice.droppedItemCounts).map(([k, v]) => `${k} ${v}`).join("、"),
                   })}
                 </div>
               )}
             </div>
           ))}
-          {Object.keys(progress.dropped_ids).length > 0 && (
-            <div>{t("droppedIdsWarning", { detail: Object.keys(progress.dropped_ids).join("、") })}</div>
-          )}
+        </div>
+      )}
+
+      {presentation.referenceNotices.length > 0 && (
+        <div className="mt-2 grid gap-1.5 rounded-md border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+          <span className="font-semibold">{t("referenceCleanupTitle")}</span>
+          {presentation.referenceNotices.map((notice, i) => (
+            <div key={`${notice.field}-${i}`}>
+              {t("referenceCleanupDetail", {
+                step: notice.step ?? "-",
+                field: notice.field,
+                values: notice.values.join("、"),
+              })}
+            </div>
+          ))}
+          <div>{t("referenceCleanupImpact")}</div>
+          <button type="button" onClick={onNavigateToMemory} className="justify-self-start font-medium text-accent hover:underline">
+            {t("referenceCleanupAction")}
+          </button>
+        </div>
+      )}
+
+      {presentation.referenceRemapNotices.length > 0 && (
+        <div className="mt-2 grid gap-1.5 rounded-md border border-blue-200 bg-blue-50 p-2 text-[11px] text-blue-800 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-200">
+          <span className="font-semibold">{t("referenceRemapTitle")}</span>
+          {presentation.referenceRemapNotices.map((notice, i) => (
+            <div key={`${notice.field}-${notice.from}-${i}`}>
+              {t("referenceRemapDetail", {
+                step: notice.step ?? "-",
+                field: notice.field,
+                from: notice.from,
+                to: notice.to,
+                matchedBy: notice.matchedBy,
+              })}
+            </div>
+          ))}
+          <div>{t("referenceRemapImpact")}</div>
         </div>
       )}
     </div>

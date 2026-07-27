@@ -28,6 +28,80 @@ export interface Truncation {
   dropped_item_counts: Record<string, number>;
 }
 
+export type StepOutcomeStatus =
+  | "generated"
+  | "reused"
+  | "skipped"
+  | "degraded"
+  | "incomplete"
+  | "blocked"
+  | "failed";
+
+export interface StepOutcome {
+  step: string;
+  status: StepOutcomeStatus;
+  reason_code: string | null;
+}
+
+export interface GenerationNotice {
+  code: string;
+  severity: "info" | "warning" | "error";
+  category: "reuse" | "skip" | "context" | "reference" | "reference_remap" | "consistency" | "provider" | "completion" | "recovery";
+  step: string | null;
+  details: Record<string, unknown>;
+  impact: string;
+  action_codes: string[];
+  requires_pause: boolean;
+}
+
+export type ReadinessIssueLevel = "warning" | "warning_requires_ack" | "blocked";
+
+export interface ReadinessIssue {
+  code: string;
+  level: ReadinessIssueLevel;
+  details: Record<string, unknown>;
+  action_codes: string[];
+}
+
+export interface ReadinessStepCounts {
+  generate: number;
+  reuse: number;
+}
+
+export interface GenerationReadiness {
+  version: number;
+  novel_id: string;
+  scope: "volume" | "book";
+  volume_id: string | null;
+  status: "ready" | "warning" | "warning_requires_ack" | "blocked";
+  digest: string;
+  issues: ReadinessIssue[];
+  work: {
+    chapter_count: number;
+    steps: Record<"outline" | "prose" | "state", ReadinessStepCounts>;
+  };
+  resources: Record<"character" | "location" | "item" | "rule", number> & {
+    narrative_revision: number;
+  };
+  planning: {
+    attempt_capacity: number;
+    providers: string[];
+    config_revision?: string;
+    capability_snapshot?: string;
+    prose_strategy?: {
+      single_call_chapters: number;
+      scene_segment_chapters: number;
+      unknown_outline_chapters: number;
+      maximum_prose_calls: number;
+      provider_alias?: string;
+      provider_model?: string;
+      max_output_tokens?: number | null;
+      safe_output_words?: number;
+      output_limit_known?: boolean;
+    };
+  };
+}
+
 export interface ChapterProgress {
   chapter_id: string;
   order_index: number;
@@ -40,6 +114,9 @@ export interface ChapterProgress {
   summary_written: boolean;
   dropped_ids: Record<string, unknown>;
   truncations: Truncation[];
+  /** 新作业写入；旧作业缺失时由 batchPresentation 从 legacy 字段投影。 */
+  step_outcomes?: StepOutcome[];
+  notices?: GenerationNotice[];
   completed_at: string;
 }
 

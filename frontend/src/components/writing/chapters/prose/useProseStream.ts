@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiPostSSE } from "@/lib/api";
 import type { ContextReport } from "../outline/outlineTypes";
+import { proseRunHasUncertainAttempt } from "./prosePresentation";
 
 /**
  * `cancelled` 与 `error` 是**两种不同的终态**：主动取消不是失败，
@@ -10,12 +11,50 @@ import type { ContextReport } from "../outline/outlineTypes";
  * （设计 §2「取消后的部分结果」）。细纲那条链没有这个区分，因为它的部分
  * 结果没有意义；正文有。
  */
-export type ProseStreamStatus = "idle" | "running" | "done" | "error" | "cancelled";
+export type ProseStreamStatus =
+  | "idle"
+  | "running"
+  | "done"
+  | "incomplete"
+  | "error"
+  | "cancelled";
 
 export interface ProseUsage {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+}
+
+export interface ProseCompletionInfo {
+  status: "complete" | "degraded" | "incomplete" | "stale";
+  can_write_formal_prose: boolean;
+  requested_word_count: number;
+  actual_word_count: number;
+  raw_character_count: number;
+  scene_count: number;
+  completed_scene_count: number;
+  finish_reason: string;
+  mode: "single_call" | "scene_segments";
+  reason_codes: string[];
+}
+
+export interface ProseRunSnapshot {
+  _id: string;
+  revision: number;
+  status: "active" | "incomplete" | "complete" | "stale";
+  assembled_text: string;
+  completion: ProseCompletionInfo | null;
+  segments?: Array<{ status?: string }>;
+}
+
+export interface ProseExecutionPlanInfo {
+  mode: "single_call" | "scene_segments";
+  requested_word_count: number;
+  scene_count: number;
+  scheduled_call_count: number;
+  call_count: number;
+  max_continuations: number;
+  reason_codes: string[];
 }
 
 /**
@@ -32,6 +71,11 @@ export function useProseStream() {
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
   const [error, setError] = useState("");
   const [usage, setUsage] = useState<ProseUsage | null>(null);
+  const [completion, setCompletion] = useState<ProseCompletionInfo | null>(null);
+  const [executionPlan, setExecutionPlan] = useState<ProseExecutionPlanInfo | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
+  const [runRevision, setRunRevision] = useState<number | null>(null);
+  const [hasUncertainAttempt, setHasUncertainAttempt] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   // 单调递增的"第几轮"：只被 start() 推进，cancel() 不动它。
@@ -72,7 +116,33 @@ export function useProseStream() {
     setContextReport(null);
     setError("");
     setUsage(null);
+    setCompletion(null);
+    setExecutionPlan(null);
+    setRunId(null);
+    setRunRevision(null);
+    setHasUncertainAttempt(false);
     bufferRef.current = "";
+  }, [cancel]);
+
+  const hydrate = useCallback((run: ProseRunSnapshot) => {
+    cancel();
+    runIdRef.current += 1;
+    const restoredText = run.assembled_text || "";
+    bufferRef.current = restoredText;
+    setText(restoredText);
+    setContextReport(null);
+    setError("");
+    setUsage(null);
+    setCompletion(run.completion);
+    setExecutionPlan(null);
+    setRunId(run._id);
+    setRunRevision(run.revision);
+    setHasUncertainAttempt(proseRunHasUncertainAttempt(run));
+    setStatus(
+      run.status === "complete" && run.completion?.can_write_formal_prose
+        ? "done"
+        : "incomplete",
+    );
   }, [cancel]);
 
   const start = useCallback(
@@ -86,10 +156,16 @@ export function useProseStream() {
       setError("");
       setContextReport(null);
       setUsage(null);
-      // 新一轮从空白开始：正文与细纲不同，把新章的 token 追加在旧章后面
-      // 会拼出一段没人想要的东西。
-      setText("");
-      bufferRef.current = "";
+      setExecutionPlan(null);
+      const resuming = typeof payload.resume_run_id === "string";
+      if (!resuming) {
+        setText("");
+        setCompletion(null);
+        setRunId(null);
+        setRunRevision(null);
+        setHasUncertainAttempt(false);
+        bufferRef.current = "";
+      }
 
       try {
         // 本 hook 只服务一个端点（不像 useOutlineStream 要服务两条链），
@@ -110,6 +186,19 @@ export function useProseStream() {
               return;
             }
 
+            if (event === "plan") {
+              setExecutionPlan(data as unknown as ProseExecutionPlanInfo);
+              return;
+            }
+
+            if (event === "run") {
+              if (typeof data.run_id === "string") setRunId(data.run_id);
+              if (typeof data.run_revision === "number") {
+                setRunRevision(data.run_revision);
+              }
+              return;
+            }
+
             if (event === "delta") {
               const chunk = typeof data.text === "string" ? data.text : "";
               if (!chunk) return;
@@ -119,22 +208,49 @@ export function useProseStream() {
             }
 
             if (event === "done") {
+              if (typeof data.text === "string") {
+                bufferRef.current = data.text;
+                setText(data.text);
+              }
+              if (data.usage && typeof data.usage === "object") {
+                setUsage(data.usage as ProseUsage);
+              }
+              if (typeof data.run_id === "string") setRunId(data.run_id);
+              if (typeof data.run_revision === "number") {
+                setRunRevision(data.run_revision);
+              }
+              if (typeof data.has_uncertain_attempt === "boolean") {
+                setHasUncertainAttempt(data.has_uncertain_attempt);
+              } else if (data.success) {
+                setHasUncertainAttempt(false);
+              }
+              if (typeof data.completion_status === "string") {
+                setCompletion({
+                  status: data.completion_status as ProseCompletionInfo["status"],
+                  can_write_formal_prose: Boolean(data.success),
+                  requested_word_count: Number(data.requested_word_count ?? 0),
+                  actual_word_count: Number(data.actual_word_count ?? 0),
+                  raw_character_count: Number(data.raw_character_count ?? 0),
+                  scene_count: Number(data.scene_count ?? 0),
+                  completed_scene_count: Number(data.completed_scene_count ?? 0),
+                  finish_reason: String(data.finish_reason ?? "unreported"),
+                  mode: data.mode === "scene_segments" ? "scene_segments" : "single_call",
+                  reason_codes: Array.isArray(data.reason_codes)
+                    ? data.reason_codes.map(String)
+                    : [],
+                });
+              }
               if (data.success) {
-                // done 带全文：用它覆盖累加结果，累加逻辑因此不再是唯一真相源
-                // （设计 §4）。注意这只覆盖成功路径——取消/失败时没有这一帧，
-                // 那半章仍然只有 bufferRef 这一份（设计 §7.3）。
-                if (typeof data.text === "string") {
-                  bufferRef.current = data.text;
-                  setText(data.text);
-                }
-                if (data.usage && typeof data.usage === "object") {
-                  setUsage(data.usage as ProseUsage);
-                }
                 setStatus("done");
                 return;
               } else {
                 setError(typeof data.error === "string" ? data.error : "生成失败");
-                setStatus("error");
+                setStatus(
+                  data.completion_status === "incomplete"
+                  || data.completion_status === "stale"
+                    ? "incomplete"
+                    : "error",
+                );
               }
             }
           },
@@ -157,5 +273,20 @@ export function useProseStream() {
     [cancel]
   );
 
-  return { status, text, contextReport, error, usage, start, cancel, reset };
+  return {
+    status,
+    text,
+    contextReport,
+    error,
+    usage,
+    completion,
+    executionPlan,
+    runId,
+    runRevision,
+    hasUncertainAttempt,
+    start,
+    cancel,
+    reset,
+    hydrate,
+  };
 }

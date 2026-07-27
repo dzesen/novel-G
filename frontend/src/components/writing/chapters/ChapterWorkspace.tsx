@@ -25,11 +25,13 @@ import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
 import type { StoredChapterOutline } from "./outline/outlineTypes";
 import ProsePanel from "./prose/ProsePanel";
 import { StateBackfillPanel } from "./state/StateBackfillPanel";
+import StateCompletenessAuditPanel from "./state/StateCompletenessAuditPanel";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
   onNavigateToMemory: () => void;
+  onNavigateToReferenceCards: () => void;
   initialChapterId?: string;
   initialSceneIndex?: number;
 }
@@ -42,6 +44,7 @@ export default function ChapterWorkspace({
   mode,
   novelId,
   onNavigateToMemory,
+  onNavigateToReferenceCards,
   initialChapterId,
   initialSceneIndex,
 }: ChapterWorkspaceProps) {
@@ -51,6 +54,7 @@ export default function ChapterWorkspace({
   // stateBackfill 是顶层命名空间（不在 writing 之下，见 T6 报告的偏离说明），
   // 必须单独取一份 translator，不能借用上面几个 writing.* 的 t()。
   const tStateBackfill = useTranslations("stateBackfill");
+  const tStateAudit = useTranslations("stateAudit");
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [volumeTrash, setVolumeTrash] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
@@ -72,6 +76,9 @@ export default function ChapterWorkspace({
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
   const [proseOpen, setProseOpen] = useState(false);
   const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
+  const [stateAuditOpen, setStateAuditOpen] = useState(false);
+  const [pendingStateRepairChapterId, setPendingStateRepairChapterId] =
+    useState<string | null>(null);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
   const [batchStartScope, setBatchStartScope] = useState<"volume" | "book" | null>(null);
 
@@ -304,6 +311,27 @@ export default function ChapterWorkspace({
     }
     setStateBackfillOpen(true);
   }, [flushDraft, tStateBackfill]);
+
+  useEffect(() => {
+    if (
+      !pendingStateRepairChapterId ||
+      selectedChapterId !== pendingStateRepairChapterId ||
+      chapterLoading ||
+      !draft
+    ) {
+      return;
+    }
+    setPendingStateRepairChapterId(null);
+    setStructureNotice(tStateAudit("repairLocated"));
+    void openStateBackfill();
+  }, [
+    chapterLoading,
+    draft,
+    openStateBackfill,
+    pendingStateRepairChapterId,
+    selectedChapterId,
+    tStateAudit,
+  ]);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -551,6 +579,7 @@ export default function ChapterWorkspace({
         onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
         onStartVolumeJob={() => setBatchStartScope("volume")}
         onStartBookJob={() => setBatchStartScope("book")}
+        onOpenStateAudit={() => setStateAuditOpen(true)}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <BatchGenerationPanel
@@ -563,6 +592,7 @@ export default function ChapterWorkspace({
           onJumpToChapter={selectChapter}
           onQuietRefresh={() => void loadStructure({ silent: true })}
           onNavigateToMemory={onNavigateToMemory}
+          onNavigateToReferenceCards={onNavigateToReferenceCards}
         />
         <ChapterEditorPane
           chapterId={selectedChapterId}
@@ -621,12 +651,17 @@ export default function ChapterWorkspace({
           chapterId={selectedChapterId}
           hasExistingContent={Boolean(draft?.content?.trim())}
           onClose={() => setProseOpen(false)}
-          onAccepted={(text) => {
-            // **只写草稿**，落库交给既有自动保存（设计 §2）。
-            // 这里绝不能像 accept 细纲那样回读服务端：那条路会把 updated_at 顶新、
-            // 让 loadNewerLocalChapterDraft 判定本地草稿过期并删掉备份——
-            // 整分支评审 Important #1 的原样重演。
-            changeDraft({ content: text });
+          onAccepted={(text, acceptanceState) => {
+            // ProseRun accept 已以 mutation 原子写入正式正文；这里同步当前编辑器
+            // 草稿，后续自动保存只会幂等写回同一份内容。不能立刻用 loadChapter
+            // 回读：它会把 updated_at 顶新，并可能把未保存的其他编辑器字段误判
+            // 为过期本地草稿后删除。
+            changeDraft({
+              content: text,
+              ...(acceptanceState === "partial_manual_required"
+                ? { status: "writing" as const }
+                : {}),
+            });
             setStructureNotice(tProse("acceptedNotice"));
           }}
         />
@@ -640,6 +675,19 @@ export default function ChapterWorkspace({
           onAccepted={() => {
             // 摘要已由后端写库；回读章节列表让摘要与字数显示跟上。
             void loadStructure();
+          }}
+        />
+      )}
+
+      {stateAuditOpen && novelId && (
+        <StateCompletenessAuditPanel
+          novelId={novelId}
+          selectedVolumeId={selectedVolumeId}
+          onClose={() => setStateAuditOpen(false)}
+          onLocate={(chapterId, repair) => {
+            setStateAuditOpen(false);
+            if (repair) setPendingStateRepairChapterId(chapterId);
+            selectChapter(chapterId);
           }}
         />
       )}

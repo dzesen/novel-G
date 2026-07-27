@@ -24,6 +24,7 @@ interface ChapterNavigatorProps {
   onOpenVolumeOutline: () => void;
   onStartVolumeJob: () => void;
   onStartBookJob: () => void;
+  onOpenStateAudit: () => void;
 }
 
 function PlusIcon() {
@@ -62,12 +63,13 @@ export default function ChapterNavigator({
   onOpenVolumeOutline,
   onStartVolumeJob,
   onStartBookJob,
+  onOpenStateAudit,
 }: ChapterNavigatorProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tBatch = useTranslations("writing.batch");
+  const tStateAudit = useTranslations("stateAudit");
   const selectedVolumeChapterCount = chapters.filter((c) => c.volume_id === selectedVolumeId).length;
-  const bookFillableCount = chapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
   const [showVolumeForm, setShowVolumeForm] = useState(false);
   const [volumeTitle, setVolumeTitle] = useState("");
   const [creatingVolume, setCreatingVolume] = useState(false);
@@ -166,7 +168,7 @@ export default function ChapterNavigator({
             <PlusIcon />
           </button>
         </div>
-        <div className="mt-3 grid grid-cols-3 gap-1.5">
+        <div className="mt-3 grid grid-cols-2 gap-1.5">
           <button
             type="button"
             onClick={onOpenVolumeOutline}
@@ -186,11 +188,19 @@ export default function ChapterNavigator({
           <button
             type="button"
             onClick={onStartBookJob}
-            disabled={bookFillableCount === 0}
+            disabled={chapters.length === 0}
             title={tBatch("startBookButtonTitle")}
             className="min-h-9 rounded-md border border-border px-2 py-1.5 text-[11px] font-medium leading-4 text-foreground transition-colors hover:bg-surface-secondary disabled:opacity-50"
           >
             {tBatch("startBookButton")}
+          </button>
+          <button
+            type="button"
+            onClick={onOpenStateAudit}
+            disabled={chapters.length === 0}
+            className="min-h-9 rounded-md border border-border px-2 py-1.5 text-[11px] font-medium leading-4 text-foreground transition-colors hover:bg-surface-secondary disabled:opacity-50"
+          >
+            {tStateAudit("openButton")}
           </button>
         </div>
       </div>

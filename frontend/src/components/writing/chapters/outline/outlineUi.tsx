@@ -13,9 +13,17 @@ export function Field({ label, children }: { label: string; children: ReactNode 
   );
 }
 
-export function Notice({ tone, children }: { tone: "warning" | "error"; children: ReactNode }) {
+export function Notice({
+  tone,
+  children,
+}: {
+  tone: "info" | "warning" | "error";
+  children: ReactNode;
+}) {
   const className =
-    tone === "warning"
+    tone === "info"
+      ? "mb-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-900/60 dark:bg-blue-950/40 dark:text-blue-200"
+      : tone === "warning"
       ? "mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
       : "mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300";
   return <div className={className}>{children}</div>;

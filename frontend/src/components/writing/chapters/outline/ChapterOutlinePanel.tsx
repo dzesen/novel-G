@@ -305,6 +305,16 @@ export default function ChapterOutlinePanel({
           )}
 
           <ContextNotices report={stream.contextReport} />
+          {stream.remappedReferences.length > 0 && (
+            <Notice tone="info">
+              {t("remappedIdsNotice", {
+                count: stream.remappedReferences.length,
+                detail: stream.remappedReferences
+                  .map((item) => `${item.from} → ${item.to} (${item.matched_by})`)
+                  .join("、"),
+              })}
+            </Notice>
+          )}
           {stream.droppedIds && Object.keys(stream.droppedIds).length > 0 && (
             <Notice tone="warning">
               {t("droppedIdsWarning", {

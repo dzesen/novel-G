@@ -1,15 +1,11 @@
 import type { ChapterDetail, ChapterDraft } from "@/types/novel";
 import { buildUserStorageKey } from "@/lib/userStorage";
 
-const CJK_OR_WORD = /[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g;
+export { countChapterWords } from "./chapterWordCount";
 
 interface LocalChapterDraft {
   draft: ChapterDraft;
   savedAt: string;
-}
-
-export function countChapterWords(content: string): number {
-  return content.match(CJK_OR_WORD)?.length ?? 0;
 }
 
 export function chapterToDraft(chapter: ChapterDetail): ChapterDraft {

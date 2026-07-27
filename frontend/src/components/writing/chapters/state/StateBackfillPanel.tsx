@@ -222,9 +222,18 @@ export function StateBackfillPanel({
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {roster.error && <Notice tone="warning">{roster.error}</Notice>}
 
-          {/* 六条约束之三：contextReport 与 droppedIds 复用 outlineUi 的通知组件，
-              生成中（context/id_validation 帧先于 step done 到达）即可见。 */}
+          {/* context / id_remapping / id_validation 都先于结果帧到达并即时可见。 */}
           <ContextNotices report={stream.contextReport} />
+          {stream.remappedReferences.length > 0 && (
+            <Notice tone="info">
+              {t("remappedIdsNotice", {
+                count: stream.remappedReferences.length,
+                detail: stream.remappedReferences
+                  .map((item) => `${item.from} → ${item.to} (${item.matched_by})`)
+                  .join("、"),
+              })}
+            </Notice>
+          )}
           {stream.droppedIds && Object.keys(stream.droppedIds).length > 0 && (
             <Notice tone="warning">
               {t("droppedIdsWarning", {

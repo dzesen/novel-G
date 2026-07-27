@@ -1,10 +1,18 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
-import { apiPost } from "@/lib/api";
-import type { GenerationJob } from "./batchTypes";
+import { apiGet, apiPost } from "@/lib/api";
+import type {
+  GenerationJob,
+  GenerationReadiness,
+  ReadinessIssue,
+} from "./batchTypes";
+import {
+  buildAuthorizedStartPayload,
+  readinessAllowsStart,
+} from "./readinessPresentation";
 
 interface StartJobDialogProps {
   scope: "volume" | "book";
@@ -15,6 +23,7 @@ interface StartJobDialogProps {
   fillableCount: number;
   onSubmitted: (job: GenerationJob) => void;
   onClose: () => void;
+  onNavigateToReferenceCards: () => void;
 }
 
 export default function StartJobDialog({
@@ -26,32 +35,113 @@ export default function StartJobDialog({
   fillableCount,
   onSubmitted,
   onClose,
+  onNavigateToReferenceCards,
 }: StartJobDialogProps) {
   const t = useTranslations("writing.batch");
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [tokenBudget, setTokenBudget] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [readiness, setReadiness] = useState<GenerationReadiness | null>(null);
+  const [readinessLoading, setReadinessLoading] = useState(true);
+  const [acknowledgedCodes, setAcknowledgedCodes] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
 
+  const loadReadiness = useCallback(async () => {
+    setReadinessLoading(true);
+    setError("");
+    try {
+      const report = await apiGet<GenerationReadiness>(
+        `/api/generation-jobs/${scope}/${targetId}/readiness`,
+      );
+      setReadiness(report);
+      setAcknowledgedCodes(new Set());
+    } catch (err) {
+      setReadiness(null);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReadinessLoading(false);
+    }
+  }, [scope, targetId]);
+
+  useEffect(() => {
+    void loadReadiness();
+  }, [loadReadiness]);
+
+  const issueCopy = (issue: ReadinessIssue) => {
+    switch (issue.code) {
+      case "character_cards_missing":
+        return {
+          title: t("readinessIssueCharacterCardsMissingTitle"),
+          body: t("readinessIssueCharacterCardsMissingBody"),
+        };
+      case "world_cards_missing":
+        return {
+          title: t("readinessIssueWorldCardsMissingTitle"),
+          body: t("readinessIssueWorldCardsMissingBody"),
+        };
+      case "reference_card_proposal_pending":
+        return {
+          title: t("readinessIssueProposalPendingTitle"),
+          body: t("readinessIssueProposalPendingBody"),
+        };
+      case "provider_plan_invalid":
+        return {
+          title: t("readinessIssueProviderInvalidTitle"),
+          body: t("readinessIssueProviderInvalidBody"),
+        };
+      case "no_generation_work":
+        return {
+          title: t("readinessIssueNoWorkTitle"),
+          body: t("readinessIssueNoWorkBody"),
+        };
+      case "prose_scene_segmentation_planned":
+        return {
+          title: t("readinessIssueProseSegmentsTitle"),
+          body: t("readinessIssueProseSegmentsBody", {
+            segmented: Number(issue.details.scene_segment_chapters ?? 0),
+            unknown: Number(issue.details.unknown_outline_chapters ?? 0),
+            calls: Number(issue.details.maximum_prose_calls ?? 0),
+          }),
+        };
+      case "partial_prose_requires_manual_completion":
+        return {
+          title: t("readinessIssuePartialProseTitle"),
+          body: t("readinessIssuePartialProseBody", {
+            count: Number(issue.details.chapter_count ?? 0),
+          }),
+        };
+      default:
+        return {
+          title: t("readinessIssueUnknownTitle"),
+          body: t("readinessIssueUnknownBody", { code: issue.code }),
+        };
+    }
+  };
+
   const submit = async () => {
+    if (!readiness || !readinessAllowsStart(readiness, acknowledgedCodes)) return;
     setSubmitting(true);
     setError("");
     try {
-      // 客户端夹到后端约束区间，避免越界值触发 422（其 detail 是数组、原样展示会成 [object Object]）。
-      // 后端：checkpoint_interval ge=1 le=1000；token_budget ge=1（空=不限）。
       const parsedBudget = Number(tokenBudget);
       const budget =
         tokenBudget.trim() && Number.isFinite(parsedBudget) && parsedBudget >= 1
           ? Math.floor(parsedBudget)
           : null;
-      const job = await apiPost<GenerationJob>(`/api/generation-jobs/${scope}/${targetId}`, {
-        checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
-        token_budget: budget,
+      const payload = buildAuthorizedStartPayload({
+        checkpointInterval,
+        tokenBudget: budget,
+        readiness,
+        acknowledgedCodes,
       });
+      const job = await apiPost<GenerationJob>(
+        `/api/generation-jobs/${scope}/${targetId}`,
+        payload,
+      );
       onSubmitted(job);
     } catch (err) {
-      // 409（已有在跑作业）/400（无可填章）原样展示后端 detail（设计 §4.3）。
       setError(err instanceof Error ? err.message : String(err));
+      await loadReadiness();
     } finally {
       setSubmitting(false);
     }
@@ -59,12 +149,12 @@ export default function StartJobDialog({
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/25 px-4 py-6">
-      <div className="flex w-full max-w-md flex-col rounded-md border border-border bg-surface shadow-lg">
+      <div className="flex max-h-full w-full max-w-2xl flex-col rounded-md border border-border bg-surface shadow-lg">
         <header className="border-b border-border px-5 py-4">
           <h3 className="text-base font-semibold text-foreground">{title}</h3>
         </header>
 
-        <div className="grid gap-4 px-5 py-4">
+        <div className="grid gap-4 overflow-y-auto px-5 py-4">
           <div className="grid gap-1 text-sm">
             <span className="text-xs font-medium text-muted">{targetHeading}</span>
             <div className="rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
@@ -99,8 +189,166 @@ export default function StartJobDialog({
             <span className="text-xs text-muted">{t("dialogTokenHint")}</span>
           </label>
 
+          <section aria-labelledby="generation-readiness-title" className="border-t border-border pt-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h4 id="generation-readiness-title" className="text-sm font-semibold text-foreground">
+                  {t("readinessTitle")}
+                </h4>
+                <p className="mt-1 text-xs leading-5 text-muted">{t("readinessDescription")}</p>
+              </div>
+              {!readinessLoading && (
+                <button
+                  type="button"
+                  onClick={() => void loadReadiness()}
+                  className="shrink-0 text-xs font-medium text-accent hover:underline"
+                >
+                  {t("readinessRefresh")}
+                </button>
+              )}
+            </div>
+
+            {readinessLoading && (
+              <p role="status" className="mt-3 text-sm text-muted">{t("readinessLoading")}</p>
+            )}
+
+            {readiness && !readinessLoading && (
+              <div className="mt-3 grid gap-3">
+                <div className="grid gap-3 rounded-md border border-border bg-background p-3 sm:grid-cols-3">
+                  {(["outline", "prose", "state"] as const).map((step) => (
+                    <div key={step}>
+                      <p className="text-xs font-medium text-foreground">
+                        {step === "outline"
+                          ? t("stepOutline")
+                          : step === "prose"
+                            ? t("stepProse")
+                            : t("stepState")}
+                      </p>
+                      <p className="mt-1 text-xs text-muted">
+                        {t("readinessWorkCounts", {
+                          generate: readiness.work.steps[step].generate,
+                          reuse: readiness.work.steps[step].reuse,
+                        })}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid gap-1 text-xs text-muted sm:grid-cols-2">
+                  <p>
+                    {t("readinessResources", {
+                      characters: readiness.resources.character,
+                      locations: readiness.resources.location,
+                      items: readiness.resources.item,
+                      rules: readiness.resources.rule,
+                    })}
+                  </p>
+                  <p>
+                    {t("readinessProviders", {
+                      providers: readiness.planning.providers.join(", ") || t("readinessNone"),
+                      attempts: readiness.planning.attempt_capacity,
+                    })}
+                  </p>
+                  {readiness.planning.prose_strategy && (
+                    <>
+                      <p className="sm:col-span-2">
+                        {t("readinessProseStrategy", {
+                          single: readiness.planning.prose_strategy.single_call_chapters,
+                          segmented: readiness.planning.prose_strategy.scene_segment_chapters,
+                          unknown: readiness.planning.prose_strategy.unknown_outline_chapters,
+                          calls: readiness.planning.prose_strategy.maximum_prose_calls,
+                        })}
+                      </p>
+                      {readiness.planning.prose_strategy.provider_alias && (
+                        <p className="sm:col-span-2">
+                          {t("readinessProseCapability", {
+                            provider: readiness.planning.prose_strategy.provider_alias,
+                            model: readiness.planning.prose_strategy.provider_model || "—",
+                            tokens: readiness.planning.prose_strategy.max_output_tokens ?? t("readinessUnknown"),
+                            words: readiness.planning.prose_strategy.safe_output_words ?? "—",
+                            source: readiness.planning.prose_strategy.output_limit_known
+                              ? t("readinessCapabilityKnown")
+                              : t("readinessCapabilityConservative"),
+                          })}
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                {readiness.issues.map((issue) => {
+                  const copy = issueCopy(issue);
+                  const requiresAck = issue.level === "warning_requires_ack";
+                  const blocked = issue.level === "blocked";
+                  return (
+                    <div
+                      key={issue.code}
+                      className={
+                        blocked
+                          ? "rounded-md border border-red-300 bg-red-50 px-3 py-2.5 dark:border-red-900 dark:bg-red-950/40"
+                          : "rounded-md border border-amber-300 bg-amber-50 px-3 py-2.5 dark:border-amber-900 dark:bg-amber-950/30"
+                      }
+                    >
+                      <p className={blocked
+                        ? "text-sm font-medium text-red-800 dark:text-red-200"
+                        : "text-sm font-medium text-amber-900 dark:text-amber-200"}
+                      >
+                        {copy.title}
+                      </p>
+                      <p className={blocked
+                        ? "mt-1 text-xs leading-5 text-red-700 dark:text-red-300"
+                        : "mt-1 text-xs leading-5 text-amber-800 dark:text-amber-300"}
+                      >
+                        {copy.body}
+                      </p>
+                      {requiresAck && (
+                        <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs leading-5 text-amber-900 dark:text-amber-200">
+                          <input
+                            type="checkbox"
+                            checked={acknowledgedCodes.has(issue.code)}
+                            onChange={(event) => {
+                              setAcknowledgedCodes((current) => {
+                                const next = new Set(current);
+                                if (event.target.checked) next.add(issue.code);
+                                else next.delete(issue.code);
+                                return next;
+                              });
+                            }}
+                            className="mt-0.5 size-4"
+                          />
+                          <span>{t("readinessAcknowledge")}</span>
+                        </label>
+                      )}
+                      {issue.action_codes.some((code) =>
+                        code === "curate_reference_cards"
+                        || code === "review_reference_card_proposal"
+                      ) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onNavigateToReferenceCards();
+                          }}
+                          className="mt-2 text-xs font-medium text-accent hover:underline"
+                        >
+                          {t("readinessOpenCards")}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {readiness.issues.length === 0 && (
+                  <p className="rounded-md border border-green-300 bg-green-50 px-3 py-2 text-sm text-green-800 dark:border-green-900 dark:bg-green-950/40 dark:text-green-200">
+                    {t("readinessReady")}
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
+
           {error && (
-            <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
+            <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
               {error}
             </div>
           )}
@@ -115,7 +363,12 @@ export default function StartJobDialog({
             size="sm"
             className="bg-accent text-white hover:bg-accent-hover"
             onPress={() => void submit()}
-            isDisabled={submitting || fillableCount === 0}
+            isDisabled={
+              submitting
+              || readinessLoading
+              || !readiness
+              || !readinessAllowsStart(readiness, acknowledgedCodes)
+            }
           >
             {submitting ? t("dialogStarting") : t("dialogStart")}
           </Button>

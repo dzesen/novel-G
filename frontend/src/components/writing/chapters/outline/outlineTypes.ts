@@ -84,6 +84,14 @@ export interface ContextReport {
 /** id_validation 帧（设计 §7.2）：字段名 → 被剔除的 id 列表。 */
 export type DroppedIds = Record<string, string[]>;
 
+/** id_remapping 帧：唯一名称/别名被确定性转换为正式角色 ID。 */
+export interface RemappedReference {
+  field: string;
+  from: string;
+  to: string;
+  matched_by: "name" | "alias";
+}
+
 export type ThreadStatus = "planted" | "developing" | "resolved" | "abandoned";
 
 export type ThreadSource = "outline" | "manual";

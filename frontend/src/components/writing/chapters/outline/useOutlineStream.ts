@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiPostSSE } from "@/lib/api";
-import type { ContextReport, DroppedIds } from "./outlineTypes";
+import type { ContextReport, DroppedIds, RemappedReference } from "./outlineTypes";
 
 export type OutlineStreamStatus = "idle" | "running" | "done" | "error";
 
@@ -16,14 +16,15 @@ interface UseOutlineStreamOptions {
 /**
  * 两条细纲链共用的 SSE 事件机。
  *
- * 处理 6 类帧：step running / step done / step error / done / context /
- * id_validation。keepalive 注释帧由 apiPostSSE 自动忽略（无 data: 行）。
+ * 处理 7 类帧：step running / step done / step error / done / context /
+ * id_remapping / id_validation。keepalive 注释帧由 apiPostSSE 自动忽略（无 data: 行）。
  */
 export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) {
   const [status, setStatus] = useState<OutlineStreamStatus>("idle");
   const [result, setResult] = useState<T | null>(null);
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
   const [droppedIds, setDroppedIds] = useState<DroppedIds | null>(null);
+  const [remappedReferences, setRemappedReferences] = useState<RemappedReference[]>([]);
   const [error, setError] = useState("");
   // 每当**流**送来一份新结果就 +1；调用方经 setResult 自己改内容时不动。
   // 消费方用它判断"手上这份是不是刚换的新货"——不能用"点了生成"来判断，
@@ -58,6 +59,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
     setResult(null);
     setContextReport(null);
     setDroppedIds(null);
+    setRemappedReferences([]);
     setError("");
   }, [cancel]);
 
@@ -72,6 +74,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
       setError("");
       setContextReport(null);
       setDroppedIds(null);
+      setRemappedReferences([]);
       // 刻意不清空 result：流中途失败时保留上一次的预览，
       // 清空等于让用户白等一场（设计 §8）。
 
@@ -98,6 +101,15 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
             if (event === "id_validation") {
               // 设计 §7.2：不上报的话，"AI 漏了个人物"会以"预览里少一行"无声通过。
               setDroppedIds((data.dropped as DroppedIds) ?? {});
+              return;
+            }
+
+            if (event === "id_remapping") {
+              setRemappedReferences(
+                Array.isArray(data.remapped)
+                  ? (data.remapped as RemappedReference[])
+                  : [],
+              );
               return;
             }
 
@@ -161,6 +173,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
     resultVersion,
     contextReport,
     droppedIds,
+    remappedReferences,
     error,
     start,
     cancel,

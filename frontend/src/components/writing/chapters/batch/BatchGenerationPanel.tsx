@@ -20,6 +20,7 @@ interface BatchGenerationPanelProps {
   onJumpToChapter: (chapterId: string) => void;
   onQuietRefresh: () => void;
   onNavigateToMemory: () => void;
+  onNavigateToReferenceCards: () => void;
 }
 
 export default function BatchGenerationPanel({
@@ -32,6 +33,7 @@ export default function BatchGenerationPanel({
   onJumpToChapter,
   onQuietRefresh,
   onNavigateToMemory,
+  onNavigateToReferenceCards,
 }: BatchGenerationPanelProps) {
   const t = useTranslations("writing.batch");
   const { job, error: pollError, setJob } = useGenerationJob({ onProgress: onQuietRefresh });
@@ -79,11 +81,12 @@ export default function BatchGenerationPanel({
     }
   };
 
-  // 启动对话框（分子/分母口径同进度条：word_count>0 && summary 视为已完整）。
+  // accepted state delta 不在章节列表响应里；真实工作量由 readiness 报告决定。
+  // 这里仅传范围内章节上限，避免再把 summary 误当作状态完成证明。
   const selectedVolume = volumes.find((v) => v._id === selectedVolumeId) ?? null;
   const selectedVolumeChapters = chapters.filter((c) => c.volume_id === selectedVolumeId);
-  const fillableCount = selectedVolumeChapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
-  const bookFillableCount = chapters.filter((c) => !(c.word_count > 0 && c.summary.trim())).length;
+  const fillableCount = selectedVolumeChapters.length;
+  const bookFillableCount = chapters.length;
 
   const dialog =
     startScope === "volume" && selectedVolumeId ? (
@@ -95,6 +98,7 @@ export default function BatchGenerationPanel({
         targetLabel={selectedVolume?.title ?? ""}
         fillableCount={fillableCount}
         onClose={onStartClose}
+        onNavigateToReferenceCards={onNavigateToReferenceCards}
         onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
       />
     ) : startScope === "book" ? (
@@ -106,6 +110,7 @@ export default function BatchGenerationPanel({
         targetLabel={t("dialogBookTarget")}
         fillableCount={bookFillableCount}
         onClose={onStartClose}
+        onNavigateToReferenceCards={onNavigateToReferenceCards}
         onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
       />
     ) : null;

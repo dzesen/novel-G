@@ -51,6 +51,10 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           mode={mode}
           novelId={novelId}
           onNavigateToMemory={() => setActiveItem("character-memory")}
+          onNavigateToReferenceCards={() => {
+            setOpenCardCuration(true);
+            setActiveItem("character-cards");
+          }}
           initialChapterId={evidenceReference?.chapter_id}
           initialSceneIndex={evidenceReference?.scene_index}
         />
