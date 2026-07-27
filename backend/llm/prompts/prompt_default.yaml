@@ -472,6 +472,40 @@ write_chapter_by_ai:
   chapter_content_prompt_without_schema_suffix: |
     直接输出正文纯文本，不要输出 JSON，不要用代码块包裹。
 
+# 章节正文相对细纲的语义符合度检查（批量生成门禁）
+review_chapter_outline_adherence_by_ai:
+  outline_adherence_prompt_base: |
+    你是一位严谨但不过度机械的长篇小说责任编辑。请检查第 {chapter_order} 章
+    《{chapter_title}》的正文是否在语义上落实了本章细纲，并仍然服务于当前卷大纲。
+
+    【已知上下文】
+    {context}
+
+    【待检查正文】
+    {chapter_content}
+
+    检查维度：
+    1. scenes 是否按合理顺序得到覆盖；允许合并、拆分、同义改写和必要的过渡。
+    2. core_conflict 是否真正发生并得到本章应有的推进。
+    3. ending_hook 是否以语义等价的方式落在章末。
+    4. 是否新增了会改变人物命运、主线方向、伏笔状态或世界状态的重大情节。
+    5. 是否偏离当前卷弧线，或提前完成后续阶段才应完成的目标。
+
+    判定规则：
+    - pass：关键场景、核心冲突和结尾钩子均已落实；措辞、对话和过渡差异不算偏离。
+    - warn：存在轻微压缩、顺序微调或局部落实不充分，但不会改变本章及本卷走向。
+    - fail：遗漏或替换关键场景、核心冲突没有发生、结尾钩子被不兼容情节取代、
+      新增细纲外重大事件，或明显违反卷弧线。
+    - 不做关键词匹配，不因正文比细纲更具体而判错，也不要为了凑问题而报告。
+    - 每个问题必须同时给出细纲要求和正文依据；没有可引用依据就不要报告。
+    - verdict 必须与 issues 一致：存在 error 即 fail；只有 warning 即 warn；无问题即 pass。
+    - scene_coverage 按细纲 scenes 的 1 起始顺序逐项返回。
+  outline_adherence_prompt_with_schema_suffix: |
+    请严格按提供的 JSON Schema 输出，不要输出额外解释。
+  outline_adherence_prompt_without_schema_suffix: |
+    只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
+    {"verdict":"pass|warn|fail","summary":"总体结论","scene_coverage":[{"scene_index":1,"status":"covered|partial|missing","evidence":"正文依据"}],"issues":[{"severity":"warning|error","category":"scene_coverage|scene_order|core_conflict|ending_hook|unplanned_major_event|volume_arc","outline_requirement":"细纲或卷纲要求","prose_evidence":"正文依据","explanation":"偏离原因"}]}
+
 extract_chapter_state_by_ai:
   chapter_state_prompt_base: |
     你是一位严谨的长篇小说编辑，负责在作者写完一章后回填记忆档案。

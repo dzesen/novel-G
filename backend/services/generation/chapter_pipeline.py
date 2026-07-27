@@ -12,10 +12,17 @@ from backend.services.generation.notices import (
     context_truncation_notice,
     partial_prose_blocks_state_notice,
     prose_incomplete_notice,
+    outline_adherence_notice,
     reference_drop_notice,
     reference_remap_notice,
     state_all_character_updates_dropped_notice,
     step_outcome,
+)
+from backend.services.generation.outline_adherence import (
+    ACCEPT_AND_CONTINUE,
+    PAUSE_FOR_REWRITE,
+    is_material_deviation,
+    validate_outline_deviation_policy,
 )
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
@@ -31,6 +38,8 @@ class ChapterOutcome:
     agents_used: List[str] = field(default_factory=list)
     tokens: int = 0
     consistency_issues: List[dict] = field(default_factory=list)
+    outline_adherence: Dict[str, Any] = field(default_factory=dict)
+    requires_outline_pause: bool = False
     facts_added: int = 0
     threads_advanced: int = 0
     summary_written: bool = False
@@ -67,6 +76,9 @@ class ChapterPipelineDeps:
     accept_outline: Callable[[str, dict], Awaitable[None]]
     write_prose: Callable[[str, str, dict[str, Any]], Awaitable[None]]
     accept_state: Callable[[str, dict], Awaitable[dict]]
+    review_outline_adherence: (
+        Callable[[str, dict], Awaitable[tuple]] | None
+    ) = None
 
 
 def _has(chapter: Dict[str, Any], key: str) -> bool:
@@ -128,10 +140,19 @@ def _capture_failure(outcome: ChapterOutcome, step: str, exc: Exception) -> Chap
     return ChapterPipelineFailed(step, outcome, exc)
 
 
-async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipelineDeps) -> ChapterOutcome:
+async def run_chapter(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    deps: ChapterPipelineDeps,
+    *,
+    outline_deviation_policy: str = PAUSE_FOR_REWRITE,
+) -> ChapterOutcome:
     """跑一章剩余的管线子步；skip-existing 决策用入口快照（生成函数内部读库看得到本轮先前写入）。"""
     chapter_id = str(chapter["_id"])
     outcome = ChapterOutcome(chapter_id=chapter_id, order_index=int(chapter.get("order_index") or 0))
+    deviation_policy = validate_outline_deviation_policy(
+        outline_deviation_policy
+    )
 
     # 1. 细纲
     if _has(chapter, "outline"):
@@ -189,10 +210,69 @@ async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipel
         degraded = _record_truncation(outcome, "prose", truncation)
         _record_completed_step(outcome, "prose", degraded=degraded)
 
-    # 3. 状态回填。摘要是作者文本，不再作为 accepted state delta 的替身。
     state_status = str(
         (chapter.get("state_completion") or {}).get("status") or "missing"
     )
+
+    # 3. 细纲符合度审查。正文已经保存，便于用户在暂停后直接查看和重写；
+    # 但在安全策略下，明显偏离不会进入状态回填，也不会影响下一章。
+    if (
+        state_status not in REUSABLE_STATE_COMPLETION_STATUSES
+        and deps.review_outline_adherence is not None
+    ):
+        try:
+            generated = await deps.review_outline_adherence(
+                novel_id,
+                chapter,
+            )
+            review, tokens, truncation = generated[:3]
+            attempts = generated[3] if len(generated) > 3 else []
+            _merge_attempts(outcome, attempts)
+            outcome.tokens += tokens
+            outcome.outline_adherence = dict(review)
+        except Exception as exc:
+            raise _capture_failure(
+                outcome,
+                "outline_adherence",
+                exc,
+            ) from exc
+        outcome.steps_done.append("outline_adherence")
+        if "continuity_editor" not in outcome.agents_used:
+            outcome.agents_used.append("continuity_editor")
+        degraded = _record_truncation(
+            outcome,
+            "outline_adherence",
+            truncation,
+        )
+        verdict = str(review.get("verdict") or "warn")
+        _record_completed_step(
+            outcome,
+            "outline_adherence",
+            degraded=degraded or verdict != "pass",
+        )
+        if verdict in {"warn", "fail"}:
+            requires_pause = (
+                is_material_deviation(review)
+                and deviation_policy != ACCEPT_AND_CONTINUE
+            )
+            outcome.notices.append(
+                outline_adherence_notice(
+                    review,
+                    requires_pause=requires_pause,
+                )
+            )
+            if requires_pause:
+                outcome.requires_outline_pause = True
+                outcome.step_outcomes.append(
+                    step_outcome(
+                        "state",
+                        "blocked",
+                        "outline_deviation",
+                    )
+                )
+                return outcome
+
+    # 4. 状态回填。摘要是作者文本，不再作为 accepted state delta 的替身。
     if state_status in REUSABLE_STATE_COMPLETION_STATUSES:
         outcome.steps_skipped.append("state")
         outcome.step_outcomes.append(step_outcome("state", "reused", "existing_current"))
@@ -253,7 +333,8 @@ async def run_chapter(novel_id: str, chapter: Dict[str, Any], deps: ChapterPipel
         except Exception as exc:
             raise _capture_failure(outcome, "state", exc) from exc
         outcome.steps_done.append("state")
-        outcome.agents_used.append("continuity_editor")
+        if "continuity_editor" not in outcome.agents_used:
+            outcome.agents_used.append("continuity_editor")
         outcome.facts_added += int(report.get("facts_appended", 0))
         outcome.threads_advanced += int(report.get("threads_updated", 0))
         outcome.summary_written = True

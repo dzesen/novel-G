@@ -1,7 +1,7 @@
 """批量生成作业的 HTTP 端点（轮询式，无 SSE）。设计 §9.2。"""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -38,6 +38,10 @@ class StartJobRequest(BaseModel):
     token_budget: Optional[int] = Field(default=None, ge=1)
     readiness_digest: Optional[str] = Field(default=None, min_length=1, max_length=128)
     acknowledged_warning_codes: list[str] = Field(default_factory=list, max_length=50)
+    outline_deviation_policy: Literal[
+        "pause_for_rewrite",
+        "accept_and_continue",
+    ] = "pause_for_rewrite"
 
 
 class ResumeJobRequest(BaseModel):
@@ -64,6 +68,7 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
             token_budget=req.token_budget,
             readiness_digest=req.readiness_digest,
             acknowledged_warning_codes=req.acknowledged_warning_codes,
+            outline_deviation_policy=req.outline_deviation_policy,
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -79,6 +84,7 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
             token_budget=req.token_budget,
             readiness_digest=req.readiness_digest,
             acknowledged_warning_codes=req.acknowledged_warning_codes,
+            outline_deviation_policy=req.outline_deviation_policy,
         )
     except Exception as exc:
         raise _handle(exc) from exc

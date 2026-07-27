@@ -1,10 +1,14 @@
-import type { GenerationReadiness } from "./batchTypes.ts";
+import type {
+  GenerationReadiness,
+  OutlineDeviationPolicy,
+} from "./batchTypes.ts";
 
 interface StartPayloadInput {
   checkpointInterval: number;
   tokenBudget: number | null;
   readiness: GenerationReadiness;
   acknowledgedCodes: Set<string>;
+  outlineDeviationPolicy?: OutlineDeviationPolicy;
 }
 
 export function readinessAllowsStart(
@@ -24,11 +28,13 @@ export function buildAuthorizedStartPayload({
   tokenBudget,
   readiness,
   acknowledgedCodes,
+  outlineDeviationPolicy = "pause_for_rewrite",
 }: StartPayloadInput) {
   return {
     checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
     token_budget: tokenBudget,
     readiness_digest: readiness.digest,
     acknowledged_warning_codes: [...acknowledgedCodes].sort(),
+    outline_deviation_policy: outlineDeviationPolicy,
   };
 }

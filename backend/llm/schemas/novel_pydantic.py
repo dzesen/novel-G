@@ -423,6 +423,60 @@ class ConsistencyIssueSchema(BaseModel):
     conflict: str = Field(..., min_length=1, max_length=1000, description="正文中与之冲突的内容")
 
 
+class OutlineAdherenceIssueSchema(BaseModel):
+    """正文相对章节细纲的单项语义偏离。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    severity: Literal["warning", "error"] = Field(
+        ..., description="warning 为轻微偏差；error 为会改变章节或卷走向的明显偏离"
+    )
+    category: Literal[
+        "scene_coverage",
+        "scene_order",
+        "core_conflict",
+        "ending_hook",
+        "unplanned_major_event",
+        "volume_arc",
+    ] = Field(..., description="偏离类别")
+    outline_requirement: str = Field(
+        ..., min_length=1, max_length=1000, description="细纲或卷纲中的对应要求"
+    )
+    prose_evidence: str = Field(
+        ..., min_length=1, max_length=1000, description="正文中的可定位依据"
+    )
+    explanation: str = Field(
+        ..., min_length=1, max_length=1000, description="为什么构成偏离"
+    )
+
+
+class OutlineSceneCoverageSchema(BaseModel):
+    """细纲单个场景在正文中的落实情况。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scene_index: int = Field(..., ge=1, le=100)
+    status: Literal["covered", "partial", "missing"]
+    evidence: str = Field(default="", max_length=1000)
+
+
+class ChapterOutlineAdherenceResultSchema(BaseModel):
+    """正文生成后的细纲符合度审查结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: Literal["pass", "warn", "fail"] = Field(
+        ..., description="pass 可继续；warn 仅提示；fail 表示明显偏离"
+    )
+    summary: str = Field(..., min_length=1, max_length=1000)
+    scene_coverage: List[OutlineSceneCoverageSchema] = Field(
+        default_factory=list, max_length=20
+    )
+    issues: List[OutlineAdherenceIssueSchema] = Field(
+        default_factory=list, max_length=20
+    )
+
+
 class ChapterStateResultSchema(BaseModel):
     """AI 状态回填结果（**LLM 输出 schema，非存储 schema**，见设计 §3）。"""
     model_config = ConfigDict(extra="forbid")

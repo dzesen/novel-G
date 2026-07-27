@@ -27,6 +27,7 @@ REFERENCE_CARDS_PROMPT_NAME = "create_reference_cards_by_ai"
 VOLUME_OUTLINE_PROMPT_NAME = "create_volume_outline_by_ai"
 CHAPTER_OUTLINE_PROMPT_NAME = "create_chapter_outline_by_ai"
 PROSE_PROMPT_NAME = "write_chapter_by_ai"
+OUTLINE_ADHERENCE_PROMPT_NAME = "review_chapter_outline_adherence_by_ai"
 CHAPTER_STATE_PROMPT_NAME = "extract_chapter_state_by_ai"
 LLM_PROVIDER_TEST_PROMPT_NAME = "llm_provider_test"
 
@@ -77,6 +78,12 @@ REQUIRED_PROSE_PROMPT_KEYS: tuple[str, ...] = (
     "chapter_content_prompt_without_schema_suffix",
 )
 
+REQUIRED_OUTLINE_ADHERENCE_PROMPT_KEYS: tuple[str, ...] = (
+    "outline_adherence_prompt_base",
+    "outline_adherence_prompt_with_schema_suffix",
+    "outline_adherence_prompt_without_schema_suffix",
+)
+
 REQUIRED_REFERENCE_CARDS_PROMPT_KEYS: tuple[str, ...] = (
     "reference_cards_prompt_base",
     "reference_cards_prompt_with_schema_suffix",
@@ -106,6 +113,7 @@ REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
     VOLUME_OUTLINE_PROMPT_NAME: REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS,
     CHAPTER_OUTLINE_PROMPT_NAME: REQUIRED_CHAPTER_OUTLINE_PROMPT_KEYS,
     PROSE_PROMPT_NAME: REQUIRED_PROSE_PROMPT_KEYS,
+    OUTLINE_ADHERENCE_PROMPT_NAME: REQUIRED_OUTLINE_ADHERENCE_PROMPT_KEYS,
     CHAPTER_STATE_PROMPT_NAME: REQUIRED_CHAPTER_STATE_PROMPT_KEYS,
 }
 
@@ -184,6 +192,12 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "chapter_order",
         "chapter_title",
         "words_per_chapter",
+    },
+    "outline_adherence_prompt_base": {
+        "context",
+        "chapter_order",
+        "chapter_title",
+        "chapter_content",
     },
     "chapter_state_prompt_base": {
         "context",
@@ -440,16 +454,20 @@ def resolve_prompt_selection(prompt_dir: Path | None = None, *, emit_warning: bo
     try:
         custom_data = _read_yaml_mapping(custom_path)
         # Older installations can have a valid custom prompt.yaml created before
-        # reference-card curation existed. Backfill only this newly introduced
-        # whole section so upgrading does not silently discard every established
-        # custom prompt. A present-but-invalid section still fails validation.
-        if (
-            REFERENCE_CARDS_PROMPT_NAME not in custom_data
-            and REFERENCE_CARDS_PROMPT_NAME in default_data
+        # newer whole prompt sections existed. Backfill only absent, explicitly
+        # compatible sections so upgrading does not discard established custom
+        # prompts. A present-but-invalid section still fails validation.
+        for backfilled_section in (
+            REFERENCE_CARDS_PROMPT_NAME,
+            OUTLINE_ADHERENCE_PROMPT_NAME,
         ):
-            custom_data[REFERENCE_CARDS_PROMPT_NAME] = deepcopy(
-                default_data[REFERENCE_CARDS_PROMPT_NAME]
-            )
+            if (
+                backfilled_section not in custom_data
+                and backfilled_section in default_data
+            ):
+                custom_data[backfilled_section] = deepcopy(
+                    default_data[backfilled_section]
+                )
         validate_prompt_data(custom_data, source_path=custom_path)
     except PromptConfigError as exc:
         reasons = (str(exc),)

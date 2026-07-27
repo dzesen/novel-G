@@ -37,13 +37,14 @@ function Banner({ job }: { job: GenerationJob }) {
     );
   }
   const key =
-    job.pause_reason === "conflict" ? "reasonConflict"
+    job.pause_reason === "outline_deviation" ? "reasonOutlineDeviation"
+      : job.pause_reason === "conflict" ? "reasonConflict"
       : job.pause_reason === "cost_cap" ? "reasonCostCap"
         : job.pause_reason === "attempt_capacity" ? "reasonAttemptCapacity"
         : job.pause_reason === "manual" ? "reasonManual"
           : "reasonCheckpoint";
   const tone =
-    job.pause_reason === "conflict"
+    job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
       : "border-border bg-background text-foreground";
   return <div className={`rounded-md border px-3 py-2 text-sm ${tone}`}>{t(key)}</div>;
@@ -53,7 +54,11 @@ function StepTags({ progress }: { progress: ChapterProgress }) {
   const t = useTranslations("writing.batch");
   const { stepBadges } = buildChapterPresentation(progress);
   const label = (s: string) =>
-    s === "outline" ? t("stepOutline") : s === "prose" ? t("stepProse") : s === "state" ? t("stepState") : s;
+    s === "outline" ? t("stepOutline")
+      : s === "prose" ? t("stepProse")
+        : s === "outline_adherence" ? t("stepOutlineAdherence")
+          : s === "state" ? t("stepState")
+            : s;
   const statusLabel = (status: string) =>
     status === "reused" ? t("reusedTag")
       : status === "skipped" ? t("skippedTag")
@@ -93,9 +98,11 @@ function ChapterCard({
 }) {
   const t = useTranslations("writing.batch");
   const hasConflict = progress.consistency_issues.length > 0;
+  const adherence = progress.outline_adherence;
+  const hasOutlineDeviation = adherence?.verdict === "fail";
   const presentation = buildChapterPresentation(progress);
   return (
-    <div className={`rounded-md border p-3 ${hasConflict ? "border-red-300 dark:border-red-900/70" : "border-border"} bg-surface`}>
+    <div className={`rounded-md border p-3 ${hasConflict || hasOutlineDeviation ? "border-red-300 dark:border-red-900/70" : "border-border"} bg-surface`}>
       <button type="button" onClick={onJump} title={t("jumpHint")} className="mb-2 block w-full text-left">
         <span className="text-sm font-medium text-foreground hover:text-accent">
           {t("chapterRowTitle", { order: progress.order_index, title })}
@@ -121,6 +128,33 @@ function ChapterCard({
           <button type="button" onClick={onNavigateToMemory} className="justify-self-start text-xs font-medium text-accent hover:underline">
             {t("conflictJumpMemory")}
           </button>
+        </div>
+      )}
+
+      {adherence && adherence.verdict !== "pass" && (
+        <div className={`mt-2 grid gap-2 rounded-md border p-2 ${
+          adherence.verdict === "fail"
+            ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300"
+            : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200"
+        }`}>
+          <span className="text-xs font-semibold">
+            {adherence.verdict === "fail"
+              ? t("outlineDeviationTitle")
+              : t("outlineDeviationWarningTitle")}
+          </span>
+          <p className="text-xs">{adherence.summary}</p>
+          {adherence.issues.map((issue, index) => (
+            <div key={`${issue.category}-${index}`} className="grid gap-0.5 text-xs">
+              <div>{t("outlineDeviationRequirement", { requirement: issue.outline_requirement })}</div>
+              <div>{t("outlineDeviationEvidence", { evidence: issue.prose_evidence })}</div>
+              <div>{t("outlineDeviationExplanation", { explanation: issue.explanation })}</div>
+            </div>
+          ))}
+          {hasOutlineDeviation && (
+            <button type="button" onClick={onJump} className="justify-self-start text-xs font-medium text-accent hover:underline">
+              {t("outlineDeviationAction")}
+            </button>
+          )}
         </div>
       )}
 
@@ -232,7 +266,11 @@ export default function CheckpointReview({
               onPress={onResume}
               isDisabled={busy}
             >
-              {busy ? t("resuming") : t("resume")}
+              {busy
+                ? t("resuming")
+                : job.pause_reason === "outline_deviation"
+                  ? t("resumeAfterRewrite")
+                  : t("resume")}
             </Button>
           )}
         </div>

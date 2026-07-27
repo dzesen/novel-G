@@ -173,3 +173,52 @@ def state_all_character_updates_dropped_notice(
         ],
         "requires_pause": True,
     }
+
+
+def outline_adherence_notice(
+    review: dict[str, Any],
+    *,
+    requires_pause: bool,
+) -> dict[str, Any]:
+    issues = []
+    for item in list(review.get("issues") or [])[:20]:
+        issues.append(
+            {
+                "severity": str(item.get("severity") or "warning")[
+                    :_MAX_VALUE_LENGTH
+                ],
+                "category": str(item.get("category") or "")[
+                    :_MAX_VALUE_LENGTH
+                ],
+                "outline_requirement": str(
+                    item.get("outline_requirement") or ""
+                )[:1000],
+                "prose_evidence": str(item.get("prose_evidence") or "")[:1000],
+                "explanation": str(item.get("explanation") or "")[:1000],
+            }
+        )
+    verdict = str(review.get("verdict") or "warn")
+    return {
+        "code": "outline_adherence_failed"
+        if verdict == "fail"
+        else "outline_adherence_warning",
+        "severity": "error" if verdict == "fail" else "warning",
+        "category": "outline_adherence",
+        "step": "outline_adherence",
+        "details": {
+            "verdict": verdict,
+            "summary": str(review.get("summary") or "")[:1000],
+            "issues": issues,
+        },
+        "impact": (
+            "state_backfill_and_following_chapters_blocked"
+            if requires_pause
+            else "actual_prose_accepted_as_narrative_state"
+        ),
+        "action_codes": (
+            ["review_chapter_prose", "rewrite_chapter_then_resume"]
+            if requires_pause
+            else ["review_chapter_prose"]
+        ),
+        "requires_pause": requires_pause,
+    }

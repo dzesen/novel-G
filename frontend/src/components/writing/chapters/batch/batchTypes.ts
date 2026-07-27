@@ -6,7 +6,7 @@ export type JobStatus =
   | "completed" | "aborted" | "failed" | "interrupted";
 
 export type PauseReason =
-  | "checkpoint" | "conflict" | "cost_cap" | "manual"
+  | "checkpoint" | "conflict" | "outline_deviation" | "cost_cap" | "manual"
   | "attempt_capacity" | "uncertain_attempt" | "uncertain_skipped" | "process_restart"
   | null;
 
@@ -20,6 +20,33 @@ export interface ConsistencyIssue {
   card_id: string | null;
   fact: string;
   conflict: string;
+}
+
+export type OutlineDeviationPolicy = "pause_for_rewrite" | "accept_and_continue";
+
+export interface OutlineAdherenceIssue {
+  severity: "warning" | "error";
+  category:
+    | "scene_coverage"
+    | "scene_order"
+    | "core_conflict"
+    | "ending_hook"
+    | "unplanned_major_event"
+    | "volume_arc";
+  outline_requirement: string;
+  prose_evidence: string;
+  explanation: string;
+}
+
+export interface OutlineAdherenceReview {
+  verdict: "pass" | "warn" | "fail";
+  summary: string;
+  scene_coverage: Array<{
+    scene_index: number;
+    status: "covered" | "partial" | "missing";
+    evidence: string;
+  }>;
+  issues: OutlineAdherenceIssue[];
 }
 
 export interface Truncation {
@@ -46,7 +73,7 @@ export interface StepOutcome {
 export interface GenerationNotice {
   code: string;
   severity: "info" | "warning" | "error";
-  category: "reuse" | "skip" | "context" | "reference" | "reference_remap" | "consistency" | "provider" | "completion" | "recovery";
+  category: "reuse" | "skip" | "context" | "reference" | "reference_remap" | "consistency" | "outline_adherence" | "provider" | "completion" | "recovery";
   step: string | null;
   details: Record<string, unknown>;
   impact: string;
@@ -109,6 +136,7 @@ export interface ChapterProgress {
   steps_skipped: string[];
   tokens: number;
   consistency_issues: ConsistencyIssue[];
+  outline_adherence?: OutlineAdherenceReview;
   facts_added: number;
   threads_advanced: number;
   summary_written: boolean;
@@ -134,6 +162,7 @@ export interface GenerationJob {
   status: JobStatus;
   pause_reason: PauseReason;
   checkpoint_interval: number;
+  outline_deviation_policy?: OutlineDeviationPolicy;
   token_budget: number | null;
   tokens_used: number;
   current_chapter_id: string | null;

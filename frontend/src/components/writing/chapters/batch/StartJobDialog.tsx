@@ -7,6 +7,7 @@ import { apiGet, apiPost } from "@/lib/api";
 import type {
   GenerationJob,
   GenerationReadiness,
+  OutlineDeviationPolicy,
   ReadinessIssue,
 } from "./batchTypes";
 import {
@@ -40,6 +41,8 @@ export default function StartJobDialog({
   const t = useTranslations("writing.batch");
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [tokenBudget, setTokenBudget] = useState("");
+  const [outlineDeviationPolicy, setOutlineDeviationPolicy] =
+    useState<OutlineDeviationPolicy>("pause_for_rewrite");
   const [submitting, setSubmitting] = useState(false);
   const [readiness, setReadiness] = useState<GenerationReadiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(true);
@@ -133,6 +136,7 @@ export default function StartJobDialog({
         tokenBudget: budget,
         readiness,
         acknowledgedCodes,
+        outlineDeviationPolicy,
       });
       const job = await apiPost<GenerationJob>(
         `/api/generation-jobs/${scope}/${targetId}`,
@@ -188,6 +192,51 @@ export default function StartJobDialog({
             />
             <span className="text-xs text-muted">{t("dialogTokenHint")}</span>
           </label>
+
+          <fieldset className="grid gap-2 rounded-md border border-border bg-background p-3">
+            <legend className="px-1 text-xs font-medium text-muted">
+              {t("dialogDeviationPolicyLabel")}
+            </legend>
+            <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <input
+                type="radio"
+                name="outline-deviation-policy"
+                value="pause_for_rewrite"
+                checked={outlineDeviationPolicy === "pause_for_rewrite"}
+                onChange={() => setOutlineDeviationPolicy("pause_for_rewrite")}
+                className="mt-0.5 size-4"
+              />
+              <span>
+                <span className="font-medium text-foreground">
+                  {t("dialogDeviationPauseTitle")}
+                </span>
+                <span className="mt-0.5 block text-xs leading-5 text-muted">
+                  {t("dialogDeviationPauseBody")}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <input
+                type="radio"
+                name="outline-deviation-policy"
+                value="accept_and_continue"
+                checked={outlineDeviationPolicy === "accept_and_continue"}
+                onChange={() => setOutlineDeviationPolicy("accept_and_continue")}
+                className="mt-0.5 size-4"
+              />
+              <span>
+                <span className="font-medium text-foreground">
+                  {t("dialogDeviationContinueTitle")}
+                </span>
+                <span className="mt-0.5 block text-xs leading-5 text-muted">
+                  {t("dialogDeviationContinueBody")}
+                </span>
+              </span>
+            </label>
+            <p className="border-t border-border pt-2 text-xs leading-5 text-muted">
+              {t("dialogDeviationCostHint")}
+            </p>
+          </fieldset>
 
           <section aria-labelledby="generation-readiness-title" className="border-t border-border pt-4">
             <div className="flex items-start justify-between gap-3">

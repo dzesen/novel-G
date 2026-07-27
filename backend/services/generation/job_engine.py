@@ -42,6 +42,7 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "steps_done": outcome.steps_done, "steps_skipped": outcome.steps_skipped,
         "agents_used": outcome.agents_used,
         "tokens": outcome.tokens, "consistency_issues": outcome.consistency_issues,
+        "outline_adherence": outcome.outline_adherence,
         "facts_added": outcome.facts_added, "threads_advanced": outcome.threads_advanced,
         "summary_written": outcome.summary_written, "dropped_ids": outcome.dropped_ids,
         "truncations": outcome.truncations,
@@ -135,7 +136,10 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 tokens_delta=0 if outcome.attempts else outcome.tokens,
             )
 
-            # 暂停判定（顺序：冲突 > 手动 > 计划检查点）。
+            # 暂停判定（顺序：细纲偏离 > 事实冲突 > 提醒 > 手动 > 计划检查点）。
+            if outcome.requires_outline_pause:
+                await _pause(repo, job_id, "outline_deviation")
+                return
             if outcome.consistency_issues:
                 await _pause(repo, job_id, "conflict")
                 return

@@ -127,6 +127,9 @@ export default function BatchGenerationPanel({
     ? t("progressBook")
     : t("progressVolume", { title: volumes.find((v) => v._id === job.volume_id)?.title ?? "" });
   const currentChapter = job.current_chapter_id ? chapterById.get(job.current_chapter_id) : undefined;
+  const processedChapterCount = new Set(
+    job.progress.map((entry) => entry.chapter_id),
+  ).size;
 
   return (
     <div className="shrink-0 border-b border-border">
@@ -194,8 +197,8 @@ export default function BatchGenerationPanel({
           <p className="text-sm text-foreground">
             {job.status === "completed"
               ? (job.scope === "book"
-                  ? t("resultCompletedBook", { count: job.progress.length, tokens: job.tokens_used })
-                  : t("resultCompleted", { count: job.progress.length, tokens: job.tokens_used }))
+                  ? t("resultCompletedBook", { count: processedChapterCount, tokens: job.tokens_used })
+                  : t("resultCompleted", { count: processedChapterCount, tokens: job.tokens_used }))
               : t("resultAborted")}
           </p>
           <button type="button" onClick={() => setDismissed(job._id)} className="shrink-0 text-xs font-medium text-accent hover:underline">

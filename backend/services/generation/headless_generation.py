@@ -6,11 +6,19 @@ outline_router / prose_router / state_router 的开流前设置——那几处�
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 from uuid import uuid4
 
 from backend.llm.prompts.prompt_selector import (
-    CHAPTER_OUTLINE_PROMPT_NAME, CHAPTER_STATE_PROMPT_NAME, PROSE_PROMPT_NAME, load_prompt_config,
+    CHAPTER_OUTLINE_PROMPT_NAME,
+    CHAPTER_STATE_PROMPT_NAME,
+    OUTLINE_ADHERENCE_PROMPT_NAME,
+    PROSE_PROMPT_NAME,
+    load_prompt_config,
+)
+from backend.llm.schemas.novel_pydantic import (
+    ChapterOutlineAdherenceResultSchema,
 )
 from backend.services.llm.context_builder import (
     assemble_context, assemble_outline_context, fetch_context_inputs,
@@ -22,6 +30,7 @@ from backend.services.llm.workflow_runner import (
 )
 from backend.services.llm.generation_runtime import (
     AttemptScope,
+    PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
 )
@@ -46,6 +55,9 @@ from backend.api.llm_routers.state_router import (
     CHAPTER_STATE_STEPS, STATE_STEP, STATE_WORKFLOW,
 )
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
+from backend.services.generation.outline_adherence import (
+    normalize_outline_adherence,
+)
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
@@ -104,6 +116,11 @@ def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
         )
         not in REUSABLE_STATE_COMPLETION_STATUSES
     ):
+        # 细纲符合度审查与状态回填共用 continuity Provider，但各自是一次
+        # 独立的结构化语义调用，容量必须分别预留。
+        slots += runtime.plan_structured(
+            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        ).max_semantic_attempts
         slots += runtime.plan_structured(
             WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
         ).max_semantic_attempts
@@ -111,8 +128,26 @@ def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
 
 
 def estimate_worklist_attempt_capacity(chapters: list[Dict[str, Any]]) -> int:
-    """固定总容量等于当前工作清单各章计划上限之和，最少保留一槽。"""
-    return max(1, sum(estimate_chapter_attempt_slots(chapter) for chapter in chapters))
+    """固定总容量包含首次运行和每章至多一次偏离修订后的重新检查。"""
+
+    runtime = create_generation_runtime()
+    adherence_recheck_slots = runtime.plan_structured(
+        WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+    ).max_semantic_attempts
+    capacity = sum(
+        estimate_chapter_attempt_slots(chapter)
+        + (
+            adherence_recheck_slots
+            if str(
+                (chapter.get("state_completion") or {}).get("status")
+                or "missing"
+            )
+            not in REUSABLE_STATE_COMPLETION_STATUSES
+            else 0
+        )
+        for chapter in chapters
+    )
+    return max(1, capacity)
 
 
 def _deps_for(workflow_name: str, attempt_scope: AttemptScope | None = None) -> WorkflowDeps:
@@ -410,6 +445,79 @@ async def generate_state(
         raise
 
 
+async def generate_outline_adherence(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    attempt_scope: AttemptScope | None = None,
+) -> tuple[dict, int, dict, list[dict[str, Any]]]:
+    """在状态回填前审查正文是否落实细纲与当前卷弧线。"""
+
+    chapter_id = str(chapter["_id"])
+    fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+    content = str(fresh_chapter.get("content") or "").strip()
+    if not content:
+        raise ValueError("本章尚无可供细纲符合度检查的正文")
+    if not fresh_chapter.get("outline"):
+        raise ValueError("本章尚无可供细纲符合度检查的章节细纲")
+
+    inputs = await fetch_context_inputs(novel_id, chapter_id)
+    context = assemble_context(inputs)
+    prompts = load_prompt_config().get(OUTLINE_ADHERENCE_PROMPT_NAME, {})
+    prompt_args = {
+        "context": context.to_prompt_text(),
+        "chapter_order": int(fresh_chapter.get("order_index") or 0),
+        "chapter_title": str(fresh_chapter.get("title") or ""),
+        "chapter_content": content,
+    }
+    prompt_base = prompts["outline_adherence_prompt_base"].format(
+        **prompt_args
+    )
+    native_prompt = apply_agent_profile(
+        "continuity_editor",
+        prompt_base
+        + "\n"
+        + prompts["outline_adherence_prompt_with_schema_suffix"],
+    )
+    prompt_json = apply_agent_profile(
+        "continuity_editor",
+        prompt_base
+        + "\n"
+        + prompts["outline_adherence_prompt_without_schema_suffix"],
+    )
+    runtime = create_generation_runtime(attempt_scope=attempt_scope)
+    plan = runtime.plan_structured(
+        WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+    )
+    try:
+        generated = await runtime.generate_structured(
+            plan,
+            ChapterOutlineAdherenceResultSchema,
+            PromptPlan(
+                native_schema_prompt=native_prompt,
+                prompt_json_prompt=prompt_json,
+            ),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise WorkflowFailed(
+            str(exc),
+            usage=runtime.usage.model_dump(),
+            attempts=_serialize_attempts(runtime),
+        ) from exc
+    result = normalize_outline_adherence(generated.value.model_dump())
+    truncation = {
+        "truncated_sections": list(context.truncated_sections),
+        "dropped_item_counts": dict(context.dropped_item_counts),
+    }
+    return (
+        result,
+        generated.usage.total_tokens,
+        truncation,
+        _serialize_attempts(runtime),
+    )
+
+
 def _serialize_attempts(runtime) -> list[dict[str, Any]]:
     if runtime is None:
         return []
@@ -477,6 +585,11 @@ def build_chapter_pipeline_deps(
             novel_id,
             chapter,
             scope("prose"),
+        ),
+        review_outline_adherence=lambda novel_id, chapter: generate_outline_adherence(
+            novel_id,
+            chapter,
+            scope("outline_adherence"),
         ),
         generate_state=lambda novel_id, chapter: generate_state(
             novel_id, chapter, scope("state")

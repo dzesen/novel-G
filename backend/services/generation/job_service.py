@@ -21,6 +21,10 @@ from backend.services.generation.headless_generation import (
 from backend.services.generation.job_engine import (
     JobControl, JobEngineDeps, run_job, _REGISTRY,
 )
+from backend.services.generation.outline_adherence import (
+    PAUSE_FOR_REWRITE,
+    validate_outline_deviation_policy,
+)
 from backend.services.novel.chapter_service import ChapterService
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -49,7 +53,7 @@ class ConflictError(Exception):
 
 def _new_job_doc(
     novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity,
-    readiness,
+    readiness, outline_deviation_policy,
 ) -> Dict[str, Any]:
     return {
         "novel_id": to_object_id(novel_id), "scope": scope,
@@ -68,6 +72,9 @@ def _new_job_doc(
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
         "confirm_uncertain_prose_retry": False,
+        "outline_deviation_policy": validate_outline_deviation_policy(
+            outline_deviation_policy
+        ),
         "readiness": readiness,
     }
 
@@ -110,6 +117,10 @@ class GenerationJobService:
             slots = estimate_chapter_attempt_slots(chapter)
             await generation_job_repo.reserve_attempts(job_id, chapter_id, slots)
             current_job = await generation_job_repo.get_job(job_id)
+            outline_deviation_policy = validate_outline_deviation_policy(
+                current_job.get("outline_deviation_policy")
+                or PAUSE_FOR_REWRITE
+            )
             confirm_prose_retry = bool(
                 current_job.get("confirm_uncertain_prose_retry")
             )
@@ -131,7 +142,12 @@ class GenerationJobService:
                 ),
             )
             try:
-                return await run_chapter(novel_id, chapter, deps)
+                return await run_chapter(
+                    novel_id,
+                    chapter,
+                    deps,
+                    outline_deviation_policy=outline_deviation_policy,
+                )
             finally:
                 await generation_job_repo.finish_attempt_reservation(job_id, chapter_id)
 
@@ -173,6 +189,7 @@ class GenerationJobService:
                                token_budget: Optional[int], *,
                                readiness_digest: str | None = None,
                                acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
+                               outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                                ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
@@ -207,6 +224,7 @@ class GenerationJobService:
                     _new_job_doc(
                         novel_id, "volume", volume_id, checkpoint_interval,
                         token_budget, capacity, authorization,
+                        outline_deviation_policy,
                     )
                 )
             except DuplicateKeyError as exc:
@@ -220,6 +238,7 @@ class GenerationJobService:
                              token_budget: Optional[int], *,
                              readiness_digest: str | None = None,
                              acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
+                             outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                              ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
         chapters = await get_book_worklist(novel_id, include_content=True)
@@ -248,6 +267,7 @@ class GenerationJobService:
                     _new_job_doc(
                         novel_id, "book", None, checkpoint_interval,
                         token_budget, capacity, authorization,
+                        outline_deviation_policy,
                     )
                 )
             except DuplicateKeyError as exc:
