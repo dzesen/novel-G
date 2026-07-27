@@ -10,6 +10,10 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.services.generation.job_service import ConflictError, GenerationJobService
 from backend.api.default_routers.auth_router import require_owned_path_resource
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+)
 
 router = APIRouter(
     prefix="/api/generation-jobs",
@@ -33,7 +37,7 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return out
 
 
-class StartJobRequest(BaseModel):
+class StartJobRequest(GenerationParamsMixin):
     checkpoint_interval: int = Field(default=5, ge=1, le=1000)
     token_budget: Optional[int] = Field(default=None, ge=1)
     readiness_digest: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -69,6 +73,10 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
             readiness_digest=req.readiness_digest,
             acknowledged_warning_codes=req.acknowledged_warning_codes,
             outline_deviation_policy=req.outline_deviation_policy,
+            generation_params={
+                **build_gen_kwargs(req),
+                "allow_failure_retry": req.allow_failure_retry,
+            },
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -85,6 +93,10 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
             readiness_digest=req.readiness_digest,
             acknowledged_warning_codes=req.acknowledged_warning_codes,
             outline_deviation_policy=req.outline_deviation_policy,
+            generation_params={
+                **build_gen_kwargs(req),
+                "allow_failure_retry": req.allow_failure_retry,
+            },
         )
     except Exception as exc:
         raise _handle(exc) from exc

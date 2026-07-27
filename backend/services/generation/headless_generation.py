@@ -7,6 +7,7 @@ outline_router / prose_router / state_router 的开流前设置——那几处�
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 from uuid import uuid4
 
@@ -77,9 +78,40 @@ from backend.db.utils import get_utc_now
 CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
 
 
-def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
+_GENERATION_OVERRIDE_KEYS = frozenset({
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "system_prompt",
+})
+
+
+def _generation_options(
+    generation_params: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    values = dict(generation_params or {})
+    overrides = {
+        key: value
+        for key, value in values.items()
+        if key in _GENERATION_OVERRIDE_KEYS and value is not None
+    }
+    runtime_kwargs = (
+        {}
+        if values.get("allow_failure_retry", True)
+        else {"max_provider_retries": 0}
+    )
+    return overrides, runtime_kwargs
+
+
+def estimate_chapter_attempt_slots(
+    chapter: Dict[str, Any],
+    generation_params: Mapping[str, Any] | None = None,
+) -> int:
     """按当前不可变 GenerationPlan 计算一章的最大语义调用数。"""
-    runtime = create_generation_runtime()
+    overrides, runtime_kwargs = _generation_options(generation_params)
+    runtime = create_generation_runtime(**runtime_kwargs)
     slots = 0
     if not chapter.get("outline"):
         slots += runtime.plan_structured(
@@ -102,7 +134,7 @@ def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
                     "max_output_tokens": text_plan.max_output_tokens,
                     "model": text_plan.provider_model,
                 },
-                request_overrides={},
+                request_overrides=overrides,
             )
             slots += prose_plan.call_count
         else:
@@ -127,15 +159,19 @@ def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
     return slots
 
 
-def estimate_worklist_attempt_capacity(chapters: list[Dict[str, Any]]) -> int:
+def estimate_worklist_attempt_capacity(
+    chapters: list[Dict[str, Any]],
+    generation_params: Mapping[str, Any] | None = None,
+) -> int:
     """固定总容量包含首次运行和每章至多一次偏离修订后的重新检查。"""
 
-    runtime = create_generation_runtime()
+    _overrides, runtime_kwargs = _generation_options(generation_params)
+    runtime = create_generation_runtime(**runtime_kwargs)
     adherence_recheck_slots = runtime.plan_structured(
         WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
     ).max_semantic_attempts
     capacity = sum(
-        estimate_chapter_attempt_slots(chapter)
+        estimate_chapter_attempt_slots(chapter, generation_params)
         + (
             adherence_recheck_slots
             if str(
@@ -150,10 +186,18 @@ def estimate_worklist_attempt_capacity(chapters: list[Dict[str, Any]]) -> int:
     return max(1, capacity)
 
 
-def _deps_for(workflow_name: str, attempt_scope: AttemptScope | None = None) -> WorkflowDeps:
+def _deps_for(
+    workflow_name: str,
+    attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
+) -> WorkflowDeps:
     del workflow_name
+    _overrides, runtime_kwargs = _generation_options(generation_params)
     return WorkflowDeps(
-        runtime=create_generation_runtime(attempt_scope=attempt_scope),
+        runtime=create_generation_runtime(
+            attempt_scope=attempt_scope,
+            **runtime_kwargs,
+        ),
     )
 
 
@@ -179,6 +223,7 @@ async def generate_outline(
     novel_id: str,
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_outline_context(inputs)
@@ -195,11 +240,16 @@ async def generate_outline(
         "chapter_title": str(chapter.get("title") or ""),
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
-    deps = _deps_for(CHAPTER_OUTLINE_WORKFLOW, attempt_scope)
+    gen_kwargs, _runtime_kwargs = _generation_options(generation_params)
+    deps = _deps_for(
+        CHAPTER_OUTLINE_WORKFLOW,
+        attempt_scope,
+        generation_params,
+    )
     frames = run_workflow(
         workflow_name=CHAPTER_OUTLINE_WORKFLOW, steps=CHAPTER_OUTLINE_STEPS,
         prompts=load_prompt_config().get(CHAPTER_OUTLINE_PROMPT_NAME, {}),
-        params=params, gen_kwargs={}, cached={}, deps=deps,
+        params=params, gen_kwargs=gen_kwargs, cached={}, deps=deps,
         request_id=uuid4().hex[:8],
     )
     result, tokens = await run_workflow_to_result(CHAPTER_OUTLINE_STEP, frames)
@@ -223,6 +273,7 @@ async def generate_prose(
     novel_id: str,
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[str, int, dict, list[dict[str, Any]]]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_context(inputs)
@@ -250,7 +301,11 @@ async def generate_prose(
         )
         + "\n" + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"]
     )
-    runtime = create_generation_runtime(attempt_scope=attempt_scope)
+    gen_kwargs, runtime_kwargs = _generation_options(generation_params)
+    runtime = create_generation_runtime(
+        attempt_scope=attempt_scope,
+        **runtime_kwargs,
+    )
     plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
     execution_plan = prose_completion_module.plan(
         outline=outline,
@@ -259,7 +314,7 @@ async def generate_prose(
             "max_output_tokens": plan.max_output_tokens,
             "model": plan.provider_model,
         },
-        request_overrides={},
+        request_overrides=gen_kwargs,
     )
     owner_id = str(novel.get("owner_id") or "")
     if not owner_id:
@@ -321,6 +376,7 @@ async def generate_prose(
             finish_reason_reader=finish_reason_reader,
             usage_reader=usage_reader,
             outline_revision=str(run_document["outline_revision"]),
+            gen_kwargs=gen_kwargs,
             existing_segments=list(run_document.get("segments") or []),
             confirm_uncertain_retry=bool(
                 getattr(attempt_scope, "confirm_uncertain_retry", False)
@@ -370,6 +426,7 @@ async def generate_state(
     novel_id: str,
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     chapter_id = str(chapter["_id"])
     fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
@@ -400,12 +457,17 @@ async def generate_state(
             "chapter_title": str(chapter.get("title") or ""),
             "chapter_content": str(fresh_chapter.get("content") or "").strip(),
         }
-        deps = _deps_for(STATE_WORKFLOW, attempt_scope)
+        gen_kwargs, _runtime_kwargs = _generation_options(generation_params)
+        deps = _deps_for(
+            STATE_WORKFLOW,
+            attempt_scope,
+            generation_params,
+        )
         await state_proposal_module.ensure_current(generation_snapshot)
         frames = run_workflow(
             workflow_name=STATE_WORKFLOW, steps=CHAPTER_STATE_STEPS,
             prompts=load_prompt_config().get(CHAPTER_STATE_PROMPT_NAME, {}),
-            params=params, gen_kwargs={}, cached={}, deps=deps,
+            params=params, gen_kwargs=gen_kwargs, cached={}, deps=deps,
             request_id=uuid4().hex[:8],
         )
         result, tokens = await run_workflow_to_result(STATE_STEP, frames)
@@ -449,6 +511,7 @@ async def generate_outline_adherence(
     novel_id: str,
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, int, dict, list[dict[str, Any]]]:
     """在状态回填前审查正文是否落实细纲与当前卷弧线。"""
 
@@ -484,7 +547,11 @@ async def generate_outline_adherence(
         + "\n"
         + prompts["outline_adherence_prompt_without_schema_suffix"],
     )
-    runtime = create_generation_runtime(attempt_scope=attempt_scope)
+    gen_kwargs, runtime_kwargs = _generation_options(generation_params)
+    runtime = create_generation_runtime(
+        attempt_scope=attempt_scope,
+        **runtime_kwargs,
+    )
     plan = runtime.plan_structured(
         WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
     )
@@ -496,6 +563,7 @@ async def generate_outline_adherence(
                 native_schema_prompt=native_prompt,
                 prompt_json_prompt=prompt_json,
             ),
+            **gen_kwargs,
         )
     except asyncio.CancelledError:
         raise
@@ -573,26 +641,36 @@ async def _accept_state(chapter_id: str, proposal: dict) -> dict:
 
 def build_chapter_pipeline_deps(
     attempt_scope_factory: Callable[[str], AttemptScope] | None = None,
+    *,
+    generation_params: Mapping[str, Any] | None = None,
 ) -> ChapterPipelineDeps:
     def scope(step: str) -> AttemptScope | None:
         return attempt_scope_factory(step) if attempt_scope_factory is not None else None
 
     return ChapterPipelineDeps(
         generate_outline=lambda novel_id, chapter: generate_outline(
-            novel_id, chapter, scope("outline")
+            novel_id,
+            chapter,
+            scope("outline"),
+            generation_params,
         ),
         generate_prose=lambda novel_id, chapter: generate_prose(
             novel_id,
             chapter,
             scope("prose"),
+            generation_params,
         ),
         review_outline_adherence=lambda novel_id, chapter: generate_outline_adherence(
             novel_id,
             chapter,
             scope("outline_adherence"),
+            generation_params,
         ),
         generate_state=lambda novel_id, chapter: generate_state(
-            novel_id, chapter, scope("state")
+            novel_id,
+            chapter,
+            scope("state"),
+            generation_params,
         ),
         accept_outline=_accept_outline, write_prose=_write_prose, accept_state=_accept_state,
     )

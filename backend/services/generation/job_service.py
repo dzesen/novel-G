@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from pymongo.errors import DuplicateKeyError
 
@@ -53,7 +53,7 @@ class ConflictError(Exception):
 
 def _new_job_doc(
     novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity,
-    readiness, outline_deviation_policy,
+    readiness, outline_deviation_policy, generation_params,
 ) -> Dict[str, Any]:
     return {
         "novel_id": to_object_id(novel_id), "scope": scope,
@@ -75,6 +75,9 @@ def _new_job_doc(
         "outline_deviation_policy": validate_outline_deviation_policy(
             outline_deviation_policy
         ),
+        # 请求级参数是作业快照的一部分。暂停/恢复只重读这份快照，不会被
+        # 后续页面操作覆盖；未设置的键仍由每次调用时选中的 Provider 默认值兜底。
+        "generation_params": dict(generation_params or {}),
         "readiness": readiness,
     }
 
@@ -114,9 +117,12 @@ class GenerationJobService:
 
         async def _run_chapter(novel_id: str, chapter: Dict[str, Any]):
             chapter_id = str(chapter["_id"])
-            slots = estimate_chapter_attempt_slots(chapter)
-            await generation_job_repo.reserve_attempts(job_id, chapter_id, slots)
             current_job = await generation_job_repo.get_job(job_id)
+            generation_params = dict(
+                current_job.get("generation_params") or {}
+            )
+            slots = estimate_chapter_attempt_slots(chapter, generation_params)
+            await generation_job_repo.reserve_attempts(job_id, chapter_id, slots)
             outline_deviation_policy = validate_outline_deviation_policy(
                 current_job.get("outline_deviation_policy")
                 or PAUSE_FOR_REWRITE
@@ -140,6 +146,7 @@ class GenerationJobService:
                         confirm_prose_retry and step == "prose"
                     ),
                 ),
+                generation_params=generation_params,
             )
             try:
                 return await run_chapter(
@@ -190,6 +197,7 @@ class GenerationJobService:
                                readiness_digest: str | None = None,
                                acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
                                outline_deviation_policy: str = PAUSE_FOR_REWRITE,
+                               generation_params: Mapping[str, Any] | None = None,
                                ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
@@ -215,9 +223,18 @@ class GenerationJobService:
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
-            capacity = int(
-                (authorization.get("planning") or {}).get("attempt_capacity")
-                or estimate_worklist_attempt_capacity(chapters)
+            generation_params_snapshot = dict(generation_params or {})
+            capacity = max(
+                int(
+                    (authorization.get("planning") or {}).get(
+                        "attempt_capacity"
+                    )
+                    or 0
+                ),
+                estimate_worklist_attempt_capacity(
+                    chapters,
+                    generation_params_snapshot,
+                ),
             )
             try:
                 job_id = await generation_job_repo.create_job(
@@ -225,6 +242,7 @@ class GenerationJobService:
                         novel_id, "volume", volume_id, checkpoint_interval,
                         token_budget, capacity, authorization,
                         outline_deviation_policy,
+                        generation_params_snapshot,
                     )
                 )
             except DuplicateKeyError as exc:
@@ -239,6 +257,7 @@ class GenerationJobService:
                              readiness_digest: str | None = None,
                              acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
                              outline_deviation_policy: str = PAUSE_FOR_REWRITE,
+                             generation_params: Mapping[str, Any] | None = None,
                              ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
         chapters = await get_book_worklist(novel_id, include_content=True)
@@ -258,9 +277,18 @@ class GenerationJobService:
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
-            capacity = int(
-                (authorization.get("planning") or {}).get("attempt_capacity")
-                or estimate_worklist_attempt_capacity(chapters)
+            generation_params_snapshot = dict(generation_params or {})
+            capacity = max(
+                int(
+                    (authorization.get("planning") or {}).get(
+                        "attempt_capacity"
+                    )
+                    or 0
+                ),
+                estimate_worklist_attempt_capacity(
+                    chapters,
+                    generation_params_snapshot,
+                ),
             )
             try:
                 job_id = await generation_job_repo.create_job(
@@ -268,6 +296,7 @@ class GenerationJobService:
                         novel_id, "book", None, checkpoint_interval,
                         token_budget, capacity, authorization,
                         outline_deviation_policy,
+                        generation_params_snapshot,
                     )
                 )
             except DuplicateKeyError as exc:

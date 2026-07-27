@@ -4,6 +4,11 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
+import OutlineGenerationParams, {
+  EMPTY_GENERATION_PARAMS,
+  toRequestParams,
+  type GenerationParams,
+} from "../outline/OutlineGenerationParams";
 import type {
   GenerationJob,
   GenerationReadiness,
@@ -43,6 +48,9 @@ export default function StartJobDialog({
   const [tokenBudget, setTokenBudget] = useState("");
   const [outlineDeviationPolicy, setOutlineDeviationPolicy] =
     useState<OutlineDeviationPolicy>("pause_for_rewrite");
+  const [generationParams, setGenerationParams] = useState<GenerationParams>(
+    () => ({ ...EMPTY_GENERATION_PARAMS }),
+  );
   const [submitting, setSubmitting] = useState(false);
   const [readiness, setReadiness] = useState<GenerationReadiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(true);
@@ -137,6 +145,7 @@ export default function StartJobDialog({
         readiness,
         acknowledgedCodes,
         outlineDeviationPolicy,
+        generationParams: toRequestParams(generationParams),
       });
       const job = await apiPost<GenerationJob>(
         `/api/generation-jobs/${scope}/${targetId}`,
@@ -192,6 +201,24 @@ export default function StartJobDialog({
             />
             <span className="text-xs text-muted">{t("dialogTokenHint")}</span>
           </label>
+
+          <section className="grid gap-2">
+            <OutlineGenerationParams
+              value={generationParams}
+              onChange={setGenerationParams}
+            />
+            <p className="px-1 text-xs leading-5 text-muted">
+              {t("dialogGenerationParamsHint")}
+            </p>
+            {generationParams.system_prompt !== null && (
+              <p
+                role="note"
+                className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300"
+              >
+                {t("dialogSystemPromptScopeHint")}
+              </p>
+            )}
+          </section>
 
           <fieldset className="grid gap-2 rounded-md border border-border bg-background p-3">
             <legend className="px-1 text-xs font-medium text-muted">

@@ -872,6 +872,8 @@
       "dialogTokenLabel": "token 预算（可选）",
       "dialogTokenPlaceholder": "留空 = 不限",
       "dialogTokenHint": "达到预算会在章边界暂停；粗略上限，非精确计费",
+      "dialogGenerationParamsHint": "未启用的参数继承各步骤 Provider 的默认值；已启用的参数会固定用于本次作业，暂停恢复后保持不变。最大 Token 数限制的是单次模型输出，不是整项作业预算。",
+      "dialogSystemPromptScopeHint": "系统提示词会覆盖本次作业的大纲、正文、偏离检查与状态回填等所有生成步骤，可能影响结构化输出。仅在确认各步骤都适用时启用。",
       "dialogDeviationPolicyLabel": "检测到正文明显偏离细纲时",
       "dialogDeviationPauseTitle": "暂停并重写（推荐）",
       "dialogDeviationPauseBody": "保留本章正文供你查看，但不做状态回填，也不生成下一章；修改或重新生成正文后再继续。",

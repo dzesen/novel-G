@@ -872,6 +872,8 @@
       "dialogTokenLabel": "Token budget (optional)",
       "dialogTokenPlaceholder": "Empty = unlimited",
       "dialogTokenHint": "Pauses at a chapter boundary once reached; a rough cap, not exact billing",
+      "dialogGenerationParamsHint": "Parameters left disabled inherit each step's Provider defaults. Enabled overrides are fixed for this job and remain unchanged after pause or resume. Max Tokens caps each model response, not the whole-job budget.",
+      "dialogSystemPromptScopeHint": "The system prompt overrides every generation step in this job, including outlines, prose, deviation checks, and state backfill, and may affect structured output. Enable it only when it fits every step.",
       "dialogDeviationPolicyLabel": "When prose materially deviates from its outline",
       "dialogDeviationPauseTitle": "Pause for rewrite (recommended)",
       "dialogDeviationPauseBody": "Keep the chapter prose for review, but do not backfill state or generate the next chapter until it is edited or regenerated.",

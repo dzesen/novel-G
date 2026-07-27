@@ -24,6 +24,16 @@ export interface ConsistencyIssue {
 
 export type OutlineDeviationPolicy = "pause_for_rewrite" | "accept_and_continue";
 
+export interface JobGenerationParams {
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  presence_penalty?: number;
+  frequency_penalty?: number;
+  system_prompt?: string;
+  allow_failure_retry?: boolean;
+}
+
 export interface OutlineAdherenceIssue {
   severity: "warning" | "error";
   category:
@@ -163,6 +173,7 @@ export interface GenerationJob {
   pause_reason: PauseReason;
   checkpoint_interval: number;
   outline_deviation_policy?: OutlineDeviationPolicy;
+  generation_params?: JobGenerationParams;
   token_budget: number | null;
   tokens_used: number;
   current_chapter_id: string | null;
