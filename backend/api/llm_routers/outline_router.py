@@ -18,6 +18,7 @@ from pydantic import Field
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
     build_gen_kwargs,
+    build_runtime_kwargs,
     safe_novel_text,
 )
 from backend.db.errors import InvalidIdError, NotFoundError
@@ -164,7 +165,7 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
 
     async def event_stream() -> AsyncGenerator[str, None]:
         deps = WorkflowDeps(
-            runtime=create_workflow_runtime(),
+            runtime=create_workflow_runtime(**build_runtime_kwargs(req)),
         )
         async for frame in run_workflow(
             workflow_name=VOLUME_OUTLINE_WORKFLOW,
@@ -239,7 +240,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             )
 
         deps = WorkflowDeps(
-            runtime=create_workflow_runtime(),
+            runtime=create_workflow_runtime(**build_runtime_kwargs(req)),
         )
         reported = False
         reported_remapped = False

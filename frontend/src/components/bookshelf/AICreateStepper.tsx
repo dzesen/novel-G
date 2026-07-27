@@ -13,7 +13,12 @@ import {
   trimCachedStepsToPrefix,
   type AICreateCacheInput,
 } from "@/lib/aiCreateCache";
-import { OptionalSliderParam, OptionalNumberParam, OptionalTextParam } from "@/components/shared/OptionalParamControls";
+import {
+  OptionalNumberParam,
+  OptionalSliderParam,
+  OptionalTextParam,
+  SwitchParam,
+} from "@/components/shared/OptionalParamControls";
 import type { AICreateCachedSteps, AICreateRequest, AICreateResponse, AICreateStepKey } from "@/types/novel";
 import type {
   AgentProfile,
@@ -128,6 +133,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
   const [presencePenalty, setPresencePenalty] = useState<number | null>(null);
   const [frequencyPenalty, setFrequencyPenalty] = useState<number | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
+  const [allowFailureRetry, setAllowFailureRetry] = useState(true);
   const [cachedSteps, setCachedSteps] = useState<AICreateCachedSteps>(initialSteps);
   const [steps, setSteps] = useState<StepState[]>(
     buildStepStates(initialSteps, initialCache?.failed_step),
@@ -276,6 +282,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
           ...(presencePenalty != null && { presence_penalty: presencePenalty }),
           ...(frequencyPenalty != null && { frequency_penalty: frequencyPenalty }),
           ...(systemPrompt != null && { system_prompt: systemPrompt }),
+          allow_failure_retry: allowFailureRetry,
         },
       );
       resetGenerationState();
@@ -361,6 +368,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
       ...(presencePenalty != null && { presence_penalty: presencePenalty }),
       ...(frequencyPenalty != null && { frequency_penalty: frequencyPenalty }),
       ...(systemPrompt != null && { system_prompt: systemPrompt }),
+      allow_failure_retry: allowFailureRetry,
     };
 
     try {
@@ -787,6 +795,12 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
               onToggle={(on) => setMaxTokens(on ? 4096 : null)}
               onValueChange={setMaxTokens}
               min={256} max={1000000} step={256}
+            />
+            <SwitchParam
+              label={t("genParams.allowFailureRetry")}
+              description={t("genParams.allowFailureRetryHint")}
+              value={allowFailureRetry}
+              onChange={setAllowFailureRetry}
             />
             <OptionalSliderParam
               label={t("genParams.presencePenalty")}

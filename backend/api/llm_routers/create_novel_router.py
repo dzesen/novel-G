@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
     build_gen_kwargs,
+    build_runtime_kwargs,
     safe_novel_text,
 )
 from backend.db.errors import InvalidIdError, NotFoundError
@@ -534,7 +535,7 @@ async def generate_core_factions(req: GenerateCoreFactionsRequest):
 
     step_name = CREATE_CORE_FACTIONS_STEP_NAME
     gen_kwargs = build_gen_kwargs(req)
-    runtime = create_generation_runtime()
+    runtime = create_generation_runtime(**build_runtime_kwargs(req))
     plan = runtime.plan_structured(WorkflowStepTarget(FACTIONS_WORKFLOW_NAME, step_name))
 
     logger.info(
@@ -643,7 +644,7 @@ async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
         # 依赖在此处装配而非模块级：这些名字在测试中会被 monkeypatch 到本模块上，
         # 调用时再取才能拿到替身。
         deps = WorkflowDeps(
-            runtime=create_workflow_runtime(),
+            runtime=create_workflow_runtime(**build_runtime_kwargs(req)),
         )
         async for frame in run_workflow(
             workflow_name=WORKFLOW_NAME,

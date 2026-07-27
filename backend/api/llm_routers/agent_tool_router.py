@@ -10,7 +10,11 @@ from pydantic import ConfigDict, Field
 
 from backend.api.default_routers.agent_router import get_agent_catalog
 from backend.api.default_routers.auth_router import require_authenticated_request
-from backend.api.llm_routers._common import GenerationParamsMixin, build_gen_kwargs
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    build_runtime_kwargs,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.services.auth.identity_service import Actor
 from backend.services.auth.novel_access_service import (
@@ -320,7 +324,7 @@ async def generate_creative_direction(
             agent_id=request.agent_id,
             capability="novel_direction",
         )
-        runtime = create_generation_runtime()
+        runtime = create_generation_runtime(**build_runtime_kwargs(request))
         generated = await AgentOrchestrator(runtime).generate_structured(
             profile=profile,
             target=WorkflowStepTarget(
@@ -403,7 +407,7 @@ async def generate_agent_inspiration(
             request=request.model_dump(),
             context=context,
         )
-        runtime = create_generation_runtime()
+        runtime = create_generation_runtime(**build_runtime_kwargs(request))
         orchestrator = AgentOrchestrator(runtime)
         generated = await orchestrator.generate_structured(
             profile=profile,
@@ -505,7 +509,7 @@ async def generate_agent_continuity_review(
             request=request.model_dump(),
             context=context,
         )
-        runtime = create_generation_runtime()
+        runtime = create_generation_runtime(**build_runtime_kwargs(request))
         orchestrator = AgentOrchestrator(runtime)
         generated = await orchestrator.generate_structured(
             profile=profile,

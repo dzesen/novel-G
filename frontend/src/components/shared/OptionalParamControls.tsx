@@ -8,6 +8,32 @@ import {
   TextArea,
 } from "@heroui/react";
 
+export function SwitchParam({
+  label,
+  description,
+  value,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  value: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  return (
+    <div className="space-y-1">
+      <Switch isSelected={value} onChange={onChange}>
+        <Switch.Control>
+          <Switch.Thumb />
+        </Switch.Control>
+        <Switch.Content className="text-sm">{label}</Switch.Content>
+      </Switch>
+      {description && (
+        <p className="max-w-2xl text-xs leading-5 text-muted">{description}</p>
+      )}
+    </div>
+  );
+}
+
 export function OptionalSliderParam({
   label,
   value,

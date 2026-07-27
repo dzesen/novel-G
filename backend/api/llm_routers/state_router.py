@@ -15,7 +15,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.api.llm_routers._common import GenerationParamsMixin, build_gen_kwargs
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    build_runtime_kwargs,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mutation import MutationConflictError
 from backend.db.repositories.chapter_repository import chapter_repo
@@ -190,7 +194,7 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             )
 
         deps = WorkflowDeps(
-            runtime=create_workflow_runtime(),
+            runtime=create_workflow_runtime(**build_runtime_kwargs(req)),
         )
         frames = run_workflow(
             workflow_name=STATE_WORKFLOW,

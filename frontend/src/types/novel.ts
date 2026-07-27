@@ -320,6 +320,7 @@ export interface GenerateCoreFactionsRequest {
   presence_penalty?: number | null;
   frequency_penalty?: number | null;
   system_prompt?: string | null;
+  allow_failure_retry?: boolean;
 }
 
 export interface BulkCreateCoreFactionsResponse {
@@ -340,6 +341,7 @@ export interface AICreateRequest {
   presence_penalty?: number | null;
   frequency_penalty?: number | null;
   system_prompt?: string | null;
+  allow_failure_retry?: boolean;
 }
 
 export interface AICreateStepResult {

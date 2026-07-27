@@ -19,7 +19,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import Field
 
-from backend.api.llm_routers._common import GenerationParamsMixin, build_gen_kwargs
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    build_runtime_kwargs,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -216,7 +220,7 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
             )
 
         try:
-            runtime = create_generation_runtime()
+            runtime = create_generation_runtime(**build_runtime_kwargs(req))
             try:
                 plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
                 service = None

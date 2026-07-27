@@ -6,9 +6,10 @@ import {
   OptionalNumberParam,
   OptionalSliderParam,
   OptionalTextParam,
+  SwitchParam,
 } from "@/components/shared/OptionalParamControls";
 
-/** 两个预览端点共同接受的可选生成参数。全部为 null 时不进请求体。 */
+/** 多个创作端点共用的请求级生成参数；采样参数为 null 时不进请求体。 */
 export interface GenerationParams {
   temperature: number | null;
   top_p: number | null;
@@ -16,6 +17,7 @@ export interface GenerationParams {
   presence_penalty: number | null;
   frequency_penalty: number | null;
   system_prompt: string | null;
+  allow_failure_retry: boolean;
 }
 
 export const EMPTY_GENERATION_PARAMS: GenerationParams = {
@@ -25,6 +27,7 @@ export const EMPTY_GENERATION_PARAMS: GenerationParams = {
   presence_penalty: null,
   frequency_penalty: null,
   system_prompt: null,
+  allow_failure_retry: true,
 };
 
 /** 把已启用的参数摊平进请求体；未启用的整个键都不出现，由后端用配置默认值。 */
@@ -87,6 +90,12 @@ export default function OutlineGenerationParams({
             step={256}
             onToggle={(enabled) => set("max_tokens", enabled ? 4096 : null)}
             onValueChange={(v) => set("max_tokens", v)}
+          />
+          <SwitchParam
+            label={t("paramAllowFailureRetry")}
+            description={t("paramAllowFailureRetryHint")}
+            value={value.allow_failure_retry}
+            onChange={(enabled) => set("allow_failure_retry", enabled)}
           />
           <OptionalSliderParam
             label={t("paramPresencePenalty")}

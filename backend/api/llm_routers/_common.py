@@ -28,6 +28,10 @@ class GenerationParamsMixin(BaseModel):
     presence_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
     system_prompt: Optional[str] = Field(default=None)
+    allow_failure_retry: bool = Field(
+        default=True,
+        description="是否允许沿用 Provider 配置进行传输层失败自动重试",
+    )
 
 
 def build_gen_kwargs(req: Any) -> dict:
@@ -45,6 +49,17 @@ def build_gen_kwargs(req: Any) -> dict:
         if val is not None:
             kwargs[key] = val
     return kwargs
+
+
+def build_runtime_kwargs(req: Any) -> dict[str, int]:
+    """根据请求决定是否禁用 Provider 传输层自动重试。
+
+    ``allow_failure_retry=True`` 保持既有行为，由 Provider 的 ``max_retries``
+    配置决定实际次数；显式关闭时只覆盖本次请求，不修改持久化配置。
+    """
+    if getattr(req, "allow_failure_retry", True):
+        return {}
+    return {"max_provider_retries": 0}
 
 
 def safe_novel_text(novel: dict, field: str, fallback: str = "未提供") -> str:

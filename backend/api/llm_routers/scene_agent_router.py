@@ -9,7 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.api.default_routers.agent_router import get_agent_catalog
 from backend.api.default_routers.auth_router import require_authenticated_request
-from backend.api.llm_routers._common import GenerationParamsMixin, build_gen_kwargs
+from backend.api.llm_routers._common import (
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    build_runtime_kwargs,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
@@ -169,7 +173,9 @@ async def rewrite_chapter_scene(
             json_only=True,
         )
 
-        orchestrator = AgentOrchestrator(create_generation_runtime())
+        orchestrator = AgentOrchestrator(
+            create_generation_runtime(**build_runtime_kwargs(req))
+        )
         generated = await orchestrator.generate_structured(
             profile=profile,
             target=WorkflowStepTarget(SCENE_AGENT_WORKFLOW, SCENE_AGENT_STEP),
