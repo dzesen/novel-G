@@ -46,6 +46,8 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "summary_written": outcome.summary_written, "dropped_ids": outcome.dropped_ids,
         "truncations": outcome.truncations,
         "attempts": outcome.attempts,
+        "step_outcomes": outcome.step_outcomes,
+        "notices": outcome.notices,
         "completed_at": get_utc_now(),
     }
 
@@ -136,6 +138,12 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             # 暂停判定（顺序：冲突 > 手动 > 计划检查点）。
             if outcome.consistency_issues:
                 await _pause(repo, job_id, "conflict")
+                return
+            if any(
+                bool(notice.get("requires_pause"))
+                for notice in outcome.notices
+            ):
+                await _pause(repo, job_id, "requires_attention")
                 return
             if control.pause_requested:
                 await _pause(repo, job_id, "manual")

@@ -570,6 +570,31 @@ class VolumeService:
             await record_chapter_tombstone(chapter, session=session)
             await mutation.receipt(receipt_key, {"chapter_id": str(chapter["_id"])})
 
+        deleted_runs = 0
+        if not mutation.was_received("prose_runs"):
+            chapter_ids = [
+                to_object_id(str(chapter["_id"]))
+                for chapter in command["chapters"]
+            ]
+            if chapter_ids:
+                deleted_runs = await BaseRepository(
+                    collections.PROSE_RUNS
+                ).hard_delete_many(
+                    {"chapter_id": {"$in": chapter_ids}},
+                    session=session,
+                )
+            await mutation.receipt(
+                "prose_runs",
+                {"deleted": deleted_runs},
+            )
+        else:
+            deleted_runs = int(
+                ((mutation.journal.get("receipts") or {}).get("prose_runs") or {}).get(
+                    "deleted"
+                )
+                or 0
+            )
+
         chapters_repo = BaseRepository(collections.CHAPTERS)
         await chapters_repo.hard_delete_many({"volume_id": obj_id}, session=session)
         await mutation.receipt(
@@ -584,6 +609,7 @@ class VolumeService:
         await VolumeService._refresh_narrative(session, mutation)
         return {
             "chapters_deleted": int(command["chapter_count"]),
+            "prose_runs_deleted": deleted_runs,
             "volume_deleted": 1,
         }
 

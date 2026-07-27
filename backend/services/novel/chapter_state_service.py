@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+from copy import deepcopy
 from typing import Any, Dict, List
 
 from pydantic import ValidationError
@@ -28,6 +29,10 @@ from backend.db.mutation import MutationCommand, commit_mutation
 from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.state_validation import validate_state_ids
+from backend.services.novel.state_completion import (
+    chapter_content_digest,
+    prose_acceptance_state,
+)
 from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.novel.state_timeline import record_acceptance
 from backend.services.novel.narrative_timeline import narrative_timeline
@@ -161,6 +166,9 @@ class ChapterStateService:
                 "skipped_duplicate_facts": skipped_duplicate_facts,
                 "timeline_revision": timeline_revision,
                 "projection_digest": projection_digest,
+                "state_completion": deepcopy(
+                    (acceptance_metadata or {}).get("state_completion") or {}
+                ),
             }
             if proposal_claim:
                 await state_proposal_module.mark_applied(
@@ -211,6 +219,61 @@ class ChapterStateService:
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
         novel_id = str(chapter["novel_id"])
         chapter_order = int(chapter.get("order_index") or 0)
+        metadata = deepcopy(acceptance_metadata or {})
+        completion_evidence = deepcopy(metadata.get("state_completion") or {})
+        resolution = deepcopy(
+            completion_evidence.get("reference_resolution") or {}
+        )
+        resolution.setdefault(
+            "proposed_character_update_count",
+            len(data.get("character_updates") or []),
+        )
+        resolution.setdefault(
+            "accepted_character_update_count",
+            len(data.get("character_updates") or []),
+        )
+        resolution.setdefault("dropped_character_update_count", 0)
+        resolution.setdefault(
+            "proposed_thread_update_count",
+            len(data.get("accepted_thread_updates") or []),
+        )
+        resolution.setdefault(
+            "accepted_thread_update_count",
+            len(data.get("accepted_thread_updates") or []),
+        )
+        resolution.setdefault("dropped_thread_update_count", 0)
+        proposed_characters = int(
+            resolution.get("proposed_character_update_count") or 0
+        )
+        accepted_characters = int(
+            resolution.get("accepted_character_update_count") or 0
+        )
+        dropped_characters = int(
+            resolution.get("dropped_character_update_count") or 0
+        )
+        if (
+            proposed_characters > 0
+            and accepted_characters == 0
+            and dropped_characters >= proposed_characters
+        ):
+            completion_reason = "all_character_updates_dropped"
+        elif data.get("character_updates") or data.get("accepted_thread_updates"):
+            completion_reason = "accepted_updates"
+        else:
+            completion_reason = "legitimate_empty"
+        metadata["state_completion"] = {
+            **completion_evidence,
+            "source_content_digest": completion_evidence.get(
+                "source_content_digest"
+            )
+            or chapter_content_digest(chapter.get("content") or ""),
+            "source_prose_acceptance_state": completion_evidence.get(
+                "source_prose_acceptance_state"
+            )
+            or prose_acceptance_state(chapter),
+            "completion_reason": completion_reason,
+            "reference_resolution": resolution,
+        }
 
         # 层 1b：id 存在性校验。这里 raise 而非 drop：accept 没有预览可上报，
         # 静默剔除会以"回填莫名其妙少了一半角色"的形式无声通过。
@@ -279,7 +342,7 @@ class ChapterStateService:
                 {
                     **data,
                     "character_updates": planned,
-                    "acceptance_metadata": acceptance_metadata or {},
+                    "acceptance_metadata": metadata,
                     "proposal_claim": proposal_claim,
                 },
                 ensure_ascii=False,
@@ -303,7 +366,7 @@ class ChapterStateService:
                     "chapter_order": chapter_order,
                     "state": {**data, "character_updates": planned},
                     "skipped_duplicate_facts": skipped_duplicate_facts,
-                    "acceptance_metadata": acceptance_metadata or {},
+                    "acceptance_metadata": metadata,
                     "proposal_claim": proposal_claim,
                 },
                 before_image={"chapter_summary": chapter.get("summary", "")},

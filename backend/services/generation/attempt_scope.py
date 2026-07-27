@@ -20,11 +20,13 @@ class JobAttemptScope:
         step_id: str,
         *,
         repo: GenerationJobRepository = generation_job_repo,
+        confirm_uncertain_retry: bool = False,
     ) -> None:
         self.job_id = str(job_id)
         self.chapter_id = str(chapter_id)
         self.step_id = str(step_id)
         self.repo = repo
+        self.confirm_uncertain_retry = bool(confirm_uncertain_retry)
         self._claims: dict[str, tuple[str, str]] = {}
         self._attempts: dict[str, AttemptUsage] = {}
         self._uncertain: set[str] = set()

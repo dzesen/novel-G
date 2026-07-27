@@ -499,6 +499,25 @@ async def init_generation_job_indexes():
         logger.error("初始化 generation_jobs 索引失败：%s", exc)
 
 
+async def init_prose_run_indexes():
+    """Initialize resumable prose-run ownership, lookup, and retention indexes."""
+    try:
+        collection = get_database()[collections.PROSE_RUNS]
+        await collection.create_indexes([
+            pymongo.IndexModel([
+                ("owner_id", 1),
+                ("chapter_id", 1),
+                ("status", 1),
+                ("updated_at", -1),
+            ]),
+            pymongo.IndexModel([("novel_id", 1), ("updated_at", -1)]),
+            pymongo.IndexModel([("lease.expires_at", 1)]),
+        ])
+        logger.info("Initialized prose_runs indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize prose_runs indexes: %s", exc)
+
+
 async def init_state_timeline_indexes():
     """初始化可回放状态时间线、预览与 standalone journal 索引。"""
     try:
@@ -567,5 +586,6 @@ async def init_all_indexes():
     await init_plot_thread_indexes()
     await init_character_state_indexes()
     await init_generation_job_indexes()
+    await init_prose_run_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

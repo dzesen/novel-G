@@ -4,6 +4,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 RESUMABLE_STATUSES = frozenset({"paused", "interrupted", "failed"})
+REUSABLE_STATE_COMPLETION_STATUSES = frozenset(
+    {"current", "degraded_partial_reference_drop", "unknown_legacy"}
+)
 
 
 def chapter_needs_work(chapter: Dict[str, Any]) -> bool:
@@ -12,8 +15,11 @@ def chapter_needs_work(chapter: Dict[str, Any]) -> bool:
     只看 content 是错的——有正文却没回填状态，其新事实没提交，会破坏后续章上下文。
     """
     has_content = bool(str(chapter.get("content") or "").strip())
-    has_summary = bool(str(chapter.get("summary") or "").strip())
-    return not (has_content and has_summary)
+    state_status = str(
+        (chapter.get("state_completion") or {}).get("status") or "missing"
+    )
+    has_current_state = state_status in REUSABLE_STATE_COMPLETION_STATUSES
+    return not (has_content and has_current_state)
 
 
 def first_needing_work(chapters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

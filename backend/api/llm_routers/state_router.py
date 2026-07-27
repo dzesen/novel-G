@@ -44,6 +44,7 @@ from backend.services.novel.state_proposal import (
     StaleStatePreview,
     state_proposal_module,
 )
+from backend.services.novel.state_completion import prose_acceptance_state
 
 from backend.api.default_routers.auth_router import require_owned_body_resource
 
@@ -99,6 +100,14 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
             # （设计 §4.1），走到这里说明确实还没写或还没保存。
             raise HTTPException(
                 status_code=400, detail="本章还没有已保存的正文，请先写好并保存正文"
+            )
+        if prose_acceptance_state(chapter) == "partial_manual_required":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "本章正文只接受了部分 AI 结果；请先补写并将章节状态设为完成，"
+                    "再执行状态回填"
+                ),
             )
         generation_snapshot = await state_proposal_module.capture(
             req.novel_id,

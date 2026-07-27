@@ -17,6 +17,7 @@ from backend.services.novel.novel_service import NovelService
 from backend.services.novel.reference_card_service import ReferenceCardService
 from backend.services.novel.reference_card_curation import ReferenceCardCurationService
 from backend.services.novel.volume_service import VolumeService
+from backend.services.generation.prose_runs import ProseRunModule
 
 
 MutationExecutor = Callable[[Any, Any], Awaitable[Any]]
@@ -27,6 +28,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
     callbacks: dict[tuple[str, int], MutationExecutor] = {
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
+        ("accept_prose_run", 1): ProseRunModule._execute_accept,
         ("create_chapter", 1): ChapterService._execute_create_chapter,
         ("create_chapter", 2): ChapterService._execute_create_chapter,
         ("update_chapter", 1): ChapterService._execute_update_chapter,
@@ -68,7 +70,10 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("apply_reference_card_plan", 1): ReferenceCardCurationService._execute_apply,
         ("apply_agent_revision_proposal", 1): AgentRevisionProposalService._execute_apply,
     }
-    non_narrative_operations = {"update_novel_metadata", "update_reference_card_metadata"}
+    non_narrative_operations = {
+        "update_novel_metadata",
+        "update_reference_card_metadata",
+    }
     return {
         key: MutationHandlerSpec(
             callback,

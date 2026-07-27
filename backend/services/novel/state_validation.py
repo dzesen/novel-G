@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any, Dict, List, Tuple
 
 from backend.services.novel.outline_validation import known_id_sets
@@ -24,6 +26,145 @@ _STATE_ID_FIELDS: Tuple[Tuple[str, str, str], ...] = (
     # accept 入参用的字段名与 LLM 输出不同，但校验规则相同。
     ("accepted_thread_updates", "thread_id", "threads"),
 )
+_PLACEHOLDER_CHARACTER_ID = re.compile(
+    r"^(?:character|char|role)[\s_-]*\d+$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_reference_label(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(normalized.split()).casefold()
+
+
+def _character_reference_index(
+    roster: Dict[str, Any],
+) -> Tuple[set[str], Dict[str, List[Tuple[str, str]]]]:
+    index: Dict[str, List[Tuple[str, str]]] = {}
+    known_ids = {
+        str(item.get("id") or "")
+        for item in roster.get("characters") or []
+        if str(item.get("id") or "")
+    }
+    for character in roster.get("characters") or []:
+        card_id = str(character.get("id") or "")
+        if not card_id:
+            continue
+        labels = [
+            ("name", character.get("name")),
+            *[("alias", alias) for alias in character.get("aliases") or []],
+        ]
+        for matched_by, label in labels:
+            normalized = _normalize_reference_label(label)
+            if normalized:
+                index.setdefault(normalized, []).append((card_id, matched_by))
+    return known_ids, index
+
+
+def _resolve_character_reference(
+    raw_value: Any,
+    *,
+    known_ids: set[str],
+    index: Dict[str, List[Tuple[str, str]]],
+) -> Tuple[str, str] | None:
+    raw = str(raw_value or "")
+    normalized = _normalize_reference_label(raw)
+    if raw in known_ids or _PLACEHOLDER_CHARACTER_ID.fullmatch(normalized):
+        return None
+    matches = index.get(normalized, [])
+    matched_ids = {card_id for card_id, _kind in matches}
+    if len(matched_ids) != 1:
+        return None
+    card_id = next(iter(matched_ids))
+    match_kinds = {
+        kind for candidate_id, kind in matches if candidate_id == card_id
+    }
+    return card_id, "name" if "name" in match_kinds else "alias"
+
+
+def resolve_state_character_references(
+    payload: Dict[str, Any],
+    roster: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Map only unique formal names/explicit aliases to stable character IDs.
+
+    Placeholder-like values and ambiguous labels deliberately remain unchanged so
+    the ordinary ID validator will report and remove them.
+    """
+
+    known_ids, index = _character_reference_index(roster)
+
+    resolved = dict(payload)
+    remapped: List[Dict[str, str]] = []
+    updates = [dict(item) for item in payload.get("character_updates") or []]
+    for update in updates:
+        raw = str(update.get("card_id") or "")
+        match = _resolve_character_reference(
+            raw,
+            known_ids=known_ids,
+            index=index,
+        )
+        if match is None:
+            continue
+        card_id, matched_by = match
+        update["card_id"] = card_id
+        remapped.append(
+            {
+                "field": "character_updates",
+                "from": raw,
+                "to": card_id,
+                "matched_by": matched_by,
+            }
+        )
+    if "character_updates" in payload:
+        resolved["character_updates"] = updates
+    return resolved, remapped
+
+
+def resolve_outline_character_references(
+    payload: Dict[str, Any],
+    roster: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    """Resolve character names/aliases in the flat chapter-outline ID fields."""
+
+    known_ids, index = _character_reference_index(roster)
+    resolved = dict(payload)
+    remapped: List[Dict[str, str]] = []
+    fields = (
+        ("pov_character_card_id", False),
+        ("present_character_card_ids", True),
+        ("mentioned_character_card_ids", True),
+    )
+    for field, is_list in fields:
+        if field not in payload:
+            continue
+        raw_values = (
+            list(payload.get(field) or [])
+            if is_list
+            else [payload.get(field)]
+        )
+        next_values = []
+        for raw_value in raw_values:
+            match = _resolve_character_reference(
+                raw_value,
+                known_ids=known_ids,
+                index=index,
+            )
+            if match is None:
+                next_values.append(raw_value)
+                continue
+            card_id, matched_by = match
+            next_values.append(card_id)
+            remapped.append(
+                {
+                    "field": field,
+                    "from": str(raw_value or ""),
+                    "to": card_id,
+                    "matched_by": matched_by,
+                }
+            )
+        resolved[field] = next_values if is_list else next_values[0]
+    return resolved, remapped
 
 
 def validate_state_ids(
@@ -60,3 +201,54 @@ def validate_state_ids(
             dropped[field] = bad
 
     return cleaned, dropped
+
+
+def state_reference_resolution(
+    original: Dict[str, Any],
+    cleaned: Dict[str, Any],
+    dropped: Dict[str, List[str]],
+    remapped: List[Dict[str, str]] | None = None,
+) -> Dict[str, Any]:
+    """Describe reference loss without relying on UI-only validation frames."""
+    proposed_characters = len(original.get("character_updates") or [])
+    accepted_characters = len(cleaned.get("character_updates") or [])
+    proposed_threads = len(original.get("thread_updates") or [])
+    accepted_threads = len(cleaned.get("thread_updates") or [])
+    accepted_character_ids = [
+        str(item.get("card_id") or "")
+        for item in cleaned.get("character_updates") or []
+        if str(item.get("card_id") or "")
+    ]
+    cleaned_threads = (
+        cleaned.get("thread_updates")
+        if "thread_updates" in cleaned
+        else cleaned.get("accepted_thread_updates")
+    ) or []
+    accepted_thread_ids = [
+        str(item.get("thread_id") or "")
+        for item in cleaned_threads
+        if str(item.get("thread_id") or "")
+    ]
+    return {
+        "proposed_character_update_count": proposed_characters,
+        "accepted_character_update_count": accepted_characters,
+        "dropped_character_update_count": max(
+            len(dropped.get("character_updates") or []),
+            proposed_characters - accepted_characters,
+        ),
+        "proposed_thread_update_count": proposed_threads,
+        "accepted_thread_update_count": accepted_threads,
+        "dropped_thread_update_count": max(
+            len(dropped.get("thread_updates") or []),
+            proposed_threads - accepted_threads,
+        ),
+        "dropped": {
+            str(field): [str(value) for value in values]
+            for field, values in dropped.items()
+        },
+        "accepted": {
+            "character_updates": accepted_character_ids,
+            "thread_updates": accepted_thread_ids,
+        },
+        "remapped": [dict(item) for item in remapped or []],
+    }

@@ -36,6 +36,8 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 class StartJobRequest(BaseModel):
     checkpoint_interval: int = Field(default=5, ge=1, le=1000)
     token_budget: Optional[int] = Field(default=None, ge=1)
+    readiness_digest: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    acknowledged_warning_codes: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ResumeJobRequest(BaseModel):
@@ -60,6 +62,8 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
             volume_id=volume_id,
             checkpoint_interval=req.checkpoint_interval,
             token_budget=req.token_budget,
+            readiness_digest=req.readiness_digest,
+            acknowledged_warning_codes=req.acknowledged_warning_codes,
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -73,10 +77,28 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
             novel_id=novel_id,
             checkpoint_interval=req.checkpoint_interval,
             token_budget=req.token_budget,
+            readiness_digest=req.readiness_digest,
+            acknowledged_warning_codes=req.acknowledged_warning_codes,
         )
     except Exception as exc:
         raise _handle(exc) from exc
     return _serialize_job(job)
+
+
+@router.get("/volume/{volume_id}/readiness")
+async def inspect_volume_readiness(volume_id: str):
+    try:
+        return await GenerationJobService.inspect_volume_readiness(volume_id)
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/book/{novel_id}/readiness")
+async def inspect_book_readiness(novel_id: str):
+    try:
+        return await GenerationJobService.inspect_book_readiness(novel_id)
+    except Exception as exc:
+        raise _handle(exc) from exc
 
 
 @router.get("/{job_id}")

@@ -11,6 +11,8 @@ from typing import Any, Dict, List
 from pydantic import ValidationError
 from bson import ObjectId
 
+from backend.db import collections
+from backend.db.base import BaseRepository
 from backend.db.errors import DuplicateKeyError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -30,6 +32,7 @@ from backend.services.novel.state_timeline import (
     record_chapter_tombstone,
     record_plot_thread_event,
 )
+from backend.services.novel.state_completion import chapter_content_digest
 
 
 _WORD_TOKEN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
@@ -195,7 +198,14 @@ class ChapterService:
         if "status" in update_data and update_data["status"] not in VALID_CHAPTER_STATUSES:
             raise ValueError(f"Invalid chapter status: {update_data['status']}")
         allowed = {
-            "title", "summary", "content", "status", "order_index", "word_count", "outline"
+            "title",
+            "summary",
+            "content",
+            "status",
+            "order_index",
+            "word_count",
+            "outline",
+            "prose_acceptance",
         }
         prepared = {key: value for key, value in update_data.items() if key in allowed}
         if not prepared:
@@ -218,6 +228,33 @@ class ChapterService:
         if "content" in prepared:
             prepared["content"] = str(prepared["content"])
             prepared["word_count"] = count_chapter_words(prepared["content"])
+        previous_content = str(chapter.get("content") or "")
+        next_content = str(prepared.get("content", previous_content))
+        content_changed = (
+            "content" in prepared and next_content != previous_content
+        )
+        acceptance = dict(chapter.get("prose_acceptance") or {})
+        acceptance_state = str(acceptance.get("state") or "")
+        explicitly_completed = prepared.get("status") == "completed"
+        if next_content.strip() and (
+            (acceptance_state == "partial_manual_required" and explicitly_completed)
+            or (
+                acceptance_state in {"ai_complete", "manual_complete"}
+                and content_changed
+            )
+        ):
+            prepared["prose_acceptance"] = {
+                **acceptance,
+                "state": "manual_complete",
+                "content_digest": chapter_content_digest(next_content),
+                "manually_completed_at": get_utc_now(),
+            }
+        elif acceptance_state == "partial_manual_required" and content_changed:
+            prepared["prose_acceptance"] = {
+                **acceptance,
+                "content_digest": chapter_content_digest(next_content),
+                "last_manual_edit_at": get_utc_now(),
+            }
         novel_id = str(chapter["novel_id"])
         digest = hashlib.sha256(
             json.dumps(prepared, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -712,6 +749,17 @@ class ChapterService:
             await mutation.advance_phase("timeline_writes")
             await record_chapter_tombstone(chapter, session=session)
             await mutation.receipt("tombstone", {"chapter_id": chapter_id})
+        if not mutation.was_received("prose_runs"):
+            deleted_runs = await BaseRepository(
+                collections.PROSE_RUNS
+            ).hard_delete_many(
+                {"chapter_id": to_object_id(chapter_id)},
+                session=session,
+            )
+            await mutation.receipt(
+                "prose_runs",
+                {"chapter_id": chapter_id, "deleted": deleted_runs},
+            )
         stored = await chapter_repo.find_one(
             {"_id": to_object_id(chapter_id)}, include_deleted=True, session=session
         )

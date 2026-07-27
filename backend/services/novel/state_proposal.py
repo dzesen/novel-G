@@ -30,7 +30,15 @@ from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
-from backend.services.novel.state_validation import validate_state_ids
+from backend.services.novel.state_completion import (
+    chapter_content_digest,
+    prose_acceptance_state,
+)
+from backend.services.novel.state_validation import (
+    resolve_state_character_references,
+    state_reference_resolution,
+    validate_state_ids,
+)
 
 
 PROPOSAL_TTL_SECONDS = 15 * 60
@@ -339,6 +347,7 @@ class StateProposalModule:
         proposal_payload: dict[str, Any] | None = None
         generation_audit: dict[str, Any] = {}
         reported_invalid_ids = False
+        reported_remapped_ids = False
         try:
             async for frame in frames:
                 parsed = parse_sse_event(frame)
@@ -368,7 +377,22 @@ class StateProposalModule:
                     yield frame
                     continue
 
-                cleaned, dropped = validate_state_ids(candidate, roster)
+                resolved, remapped = resolve_state_character_references(
+                    candidate,
+                    roster,
+                )
+                cleaned, dropped = validate_state_ids(resolved, roster)
+                generation_audit["reference_resolution"] = (
+                    state_reference_resolution(
+                        candidate,
+                        cleaned,
+                        dropped,
+                        remapped,
+                    )
+                )
+                if remapped and not reported_remapped_ids:
+                    yield sse_event("id_remapping", {"remapped": remapped})
+                    reported_remapped_ids = True
                 if dropped and not reported_invalid_ids:
                     yield sse_event("id_validation", {"dropped": dropped})
                     reported_invalid_ids = True
@@ -464,8 +488,8 @@ class StateProposalModule:
             acceptance_token=acceptance_token,
         )
         novel_id = str(proposal["novel_id"])
+        chapter = await chapter_repo.get_chapter_by_id(chapter_id)
         if proposal.get("status") == "proposed":
-            chapter = await chapter_repo.get_chapter_by_id(chapter_id)
             if _content_digest(chapter) != proposal.get("content_digest"):
                 await self.collection.update_one(
                     {"_id": proposal["_id"], "status": "proposed"},
@@ -580,6 +604,18 @@ class StateProposalModule:
             "confidence": (
                 "human_reviewed" if policy_name == "human_review" else "auto_accepted"
             ),
+            "state_completion": {
+                "source_content_digest": chapter_content_digest(
+                    chapter.get("content") or ""
+                ),
+                "source_prose_acceptance_state": prose_acceptance_state(chapter),
+                "reference_resolution": deepcopy(
+                    (proposal.get("generation_audit") or {}).get(
+                        "reference_resolution"
+                    )
+                    or {}
+                ),
+            },
         }
         decision_digest = _digest(
             {

@@ -28,6 +28,7 @@ AGENT_REVISION_PROPOSALS = "agent_revision_proposals"
 # 本集合有写入方（作业引擎），generation_tasks 无。级联 stats key 用规则名
 # generation_jobs_deleted，勿沿用 generation_tasks 那条不规则的 tasks_deleted。
 GENERATION_JOBS = "generation_jobs"
+PROSE_RUNS = "prose_runs"
 CHAPTER_STATE_DELTAS = "chapter_state_deltas"
 CHARACTER_STATE_SNAPSHOTS = "character_state_snapshots"
 PLOT_THREAD_EVENTS = "plot_thread_events"
@@ -51,6 +52,7 @@ ACTIVE_COLLECTIONS = frozenset({
     AGENT_RUNS,
     AGENT_REVISION_PROPOSALS,
     GENERATION_JOBS,
+    PROSE_RUNS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,
     PLOT_THREAD_EVENTS,

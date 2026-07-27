@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 from backend.db.repositories.volume_repository import volume_repo
 from backend.services.novel.chapter_service import ChapterService
 from backend.services.generation import job_planner
+from backend.services.novel.state_completion import state_completion_module
 
 
 async def get_book_worklist(novel_id: str, *, include_content: bool = True) -> List[Dict[str, Any]]:
@@ -22,4 +23,5 @@ async def get_book_worklist(novel_id: str, *, include_content: bool = True) -> L
     volumes = await volume_repo.get_volumes_by_novel(novel_id)
     chapters = await ChapterService.get_chapters_by_novel(novel_id, include_content=include_content)
     volume_order_map = {str(v["_id"]): int(v.get("order_index") or 0) for v in volumes}
-    return job_planner.order_book_chapters(chapters, volume_order_map)
+    ordered = job_planner.order_book_chapters(chapters, volume_order_map)
+    return await state_completion_module.attach_many(ordered)

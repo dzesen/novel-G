@@ -8,6 +8,10 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.api.default_routers.auth_router import require_owned_path_resource
+from backend.services.auth.identity_service import Actor
+from backend.services.novel.state_completeness_audit import (
+    state_completeness_audit,
+)
 
 
 router = APIRouter(
@@ -30,6 +34,25 @@ async def replay_plan(novel_id: str):
     try:
         await novel_repo.get_novel_by_id(novel_id)
         return await narrative_timeline.audit(novel_id)
+    except Exception as exc:
+        raise _client_error(exc) from exc
+
+
+@router.get("/novel/{novel_id}/completeness-audit")
+async def completeness_audit(
+    novel_id: str,
+    scope: str = "book",
+    volume_id: str | None = None,
+    actor: Actor = Depends(require_owned_path_resource),
+):
+    """Read-only coverage report; it never generates or accepts state."""
+    try:
+        return await state_completeness_audit.audit(
+            actor_id=actor.id,
+            novel_id=novel_id,
+            scope=scope,
+            volume_id=volume_id,
+        )
     except Exception as exc:
         raise _client_error(exc) from exc
 

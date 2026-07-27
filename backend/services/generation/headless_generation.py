@@ -25,7 +25,12 @@ from backend.services.llm.generation_runtime import (
     WorkflowStepTarget,
     create_generation_runtime,
 )
-from backend.services.novel.state_validation import validate_state_ids
+from backend.services.novel.state_validation import (
+    resolve_outline_character_references,
+    resolve_state_character_references,
+    state_reference_resolution,
+    validate_state_ids,
+)
 from backend.services.novel.outline_validation import validate_outline_ids
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.chapter_repository import chapter_repo
@@ -41,11 +46,21 @@ from backend.api.llm_routers.state_router import (
     CHAPTER_STATE_STEPS, STATE_STEP, STATE_WORKFLOW,
 )
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
+from backend.services.generation.job_planner import (
+    REUSABLE_STATE_COMPLETION_STATUSES,
+)
+from backend.services.generation.prose_completion import prose_completion_module
+from backend.services.generation.prose_generation import execute_prose_plan
+from backend.services.generation.prose_runs import prose_run_module
+from backend.db.repositories.prose_run_repository import prose_run_repo
 from backend.services.novel.chapter_service import ChapterService
 from backend.services.novel.state_proposal import (
     SelectAllPolicy,
     state_proposal_module,
 )
+from backend.services.novel.state_completion import prose_is_eligible_for_state
+from backend.services.novel.state_completion import chapter_content_digest
+from backend.db.utils import get_utc_now
 
 CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
 
@@ -59,10 +74,36 @@ def estimate_chapter_attempt_slots(chapter: Dict[str, Any]) -> int:
             WorkflowStepTarget(CHAPTER_OUTLINE_WORKFLOW, CHAPTER_OUTLINE_STEP)
         ).max_semantic_attempts
     if not str(chapter.get("content") or "").strip():
-        slots += runtime.plan_text(
+        text_plan = runtime.plan_text(
             WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
-        ).max_semantic_attempts
-    if not str(chapter.get("summary") or "").strip():
+        )
+        outline = chapter.get("outline") or {}
+        if outline:
+            prose_plan = prose_completion_module.plan(
+                outline=outline,
+                target_word_count=int(
+                    outline.get("target_word_count")
+                    or chapter.get("words_per_chapter")
+                    or 3_000
+                ),
+                provider_capability={
+                    "max_output_tokens": text_plan.max_output_tokens,
+                    "model": text_plan.provider_model,
+                },
+                request_overrides={},
+            )
+            slots += prose_plan.call_count
+        else:
+            # 细纲尚未生成，场景数和逐场景预算未知。预留有界的保守容量，
+            # 生成出细纲后实际调用仍受每章 reservation 约束，不可无限扩张。
+            slots += 32
+    if (
+        str(
+            (chapter.get("state_completion") or {}).get("status")
+            or "missing"
+        )
+        not in REUSABLE_STATE_COMPLETION_STATUSES
+    ):
         slots += runtime.plan_structured(
             WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
         ).max_semantic_attempts
@@ -127,12 +168,20 @@ async def generate_outline(
         request_id=uuid4().hex[:8],
     )
     result, tokens = await run_workflow_to_result(CHAPTER_OUTLINE_STEP, frames)
-    cleaned, dropped = validate_outline_ids(result, roster)
+    resolved, remapped = resolve_outline_character_references(result, roster)
+    cleaned, dropped = validate_outline_ids(resolved, roster)
     truncation = {
         "truncated_sections": list(context.truncated_sections),
         "dropped_item_counts": dict(context.dropped_item_counts),
     }
-    return cleaned, dropped, tokens, truncation, _serialize_attempts(deps.runtime)
+    return (
+        cleaned,
+        dropped,
+        tokens,
+        truncation,
+        _serialize_attempts(deps.runtime),
+        remapped,
+    )
 
 
 async def generate_prose(
@@ -168,17 +217,118 @@ async def generate_prose(
     )
     runtime = create_generation_runtime(attempt_scope=attempt_scope)
     plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
-    frames = stream_prose(
-        workflow_name=PROSE_WORKFLOW, step_key=PROSE_STEP, prompt=prompt,
-        service=None, gen_kwargs={}, request_id=uuid4().hex[:8],
-        runtime=runtime, generation_plan=plan,
+    execution_plan = prose_completion_module.plan(
+        outline=outline,
+        target_word_count=int(words),
+        provider_capability={
+            "max_output_tokens": plan.max_output_tokens,
+            "model": plan.provider_model,
+        },
+        request_overrides={},
     )
-    text, tokens = await _consume_prose_frames(frames)
+    owner_id = str(novel.get("owner_id") or "")
+    if not owner_id:
+        raise ValueError("小说缺少 owner_id，无法创建用户隔离的正文草稿")
+    active = await prose_run_module.inspect_active(
+        owner_id=owner_id,
+        chapter_id=str(chapter["_id"]),
+        outline=outline,
+        context_text=context.to_prompt_text(),
+    )
+    if active is not None and active.get("status") == "stale":
+        active = None
+    run_document = await prose_run_module.begin(
+        owner_id=owner_id,
+        novel_id=novel_id,
+        chapter_id=str(chapter["_id"]),
+        outline=outline,
+        context_text=context.to_prompt_text(),
+        plan=execution_plan,
+        provider_plan={
+            "provider_alias": plan.provider_alias,
+            "provider_model": plan.provider_model,
+            "config_revision": plan.config_revision,
+        },
+        run_id=str(active["_id"]) if active is not None else None,
+        expected_revision=int(active.get("revision") or 0) if active is not None else None,
+        confirm_uncertain_retry=bool(
+            getattr(attempt_scope, "confirm_uncertain_retry", False)
+        ),
+    )
+    latest_run = run_document
+
+    def stream_call(call_prompt: str, call_kwargs: dict):
+        return runtime.stream_text(plan, call_prompt, **call_kwargs)
+
+    def finish_reason_reader():
+        return runtime.last_finish_reason
+
+    def usage_reader():
+        attempts = runtime.attempts
+        return attempts[-1].usage if attempts else runtime.usage
+
+    async def on_segment(segment: dict) -> None:
+        nonlocal latest_run
+        lease = latest_run.get("lease") or {}
+        latest_run = await prose_run_repo.append_segment(
+            run_id=str(latest_run["_id"]),
+            owner_id=owner_id,
+            lease_token=str(lease.get("token") or ""),
+            segment=segment,
+        )
+
+    try:
+        generated = await execute_prose_plan(
+            plan=execution_plan,
+            outline=outline,
+            base_prompt=prompt,
+            stream_call=stream_call,
+            finish_reason_reader=finish_reason_reader,
+            usage_reader=usage_reader,
+            outline_revision=str(run_document["outline_revision"]),
+            existing_segments=list(run_document.get("segments") or []),
+            confirm_uncertain_retry=bool(
+                getattr(attempt_scope, "confirm_uncertain_retry", False)
+            ),
+            on_segment=on_segment,
+        )
+        lease = latest_run.get("lease") or {}
+        latest_run = await prose_run_repo.finish(
+            run_id=str(latest_run["_id"]),
+            owner_id=owner_id,
+            lease_token=str(lease.get("token") or ""),
+            status=(
+                "complete"
+                if generated.completion.can_write_formal_prose
+                else generated.completion.status
+            ),
+            completion=generated.completion.to_dict(),
+            assembled_text=generated.text,
+        )
+    except BaseException:
+        await prose_run_repo.mark_status(
+            run_id=str(latest_run["_id"]),
+            owner_id=owner_id,
+            status="incomplete",
+        )
+        raise
     truncation = {
         "truncated_sections": list(context.truncated_sections),
         "dropped_item_counts": dict(context.dropped_item_counts),
     }
-    return text, tokens, truncation, _serialize_attempts(runtime)
+    completion = {
+        **generated.completion.to_dict(),
+        "source_run_id": str(latest_run["_id"]),
+        "source_run_revision": int(latest_run.get("revision") or 0),
+        "source_run_digest": chapter_content_digest(generated.text),
+    }
+    return (
+        generated.text,
+        generated.usage.total_tokens,
+        truncation,
+        _serialize_attempts(runtime),
+        completion,
+    )
 
 
 async def generate_state(
@@ -188,6 +338,10 @@ async def generate_state(
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     chapter_id = str(chapter["_id"])
     fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+    if not prose_is_eligible_for_state(fresh_chapter):
+        raise ValueError(
+            "本章正文尚未完整接受；请先补写并标记完成，不能执行状态回填"
+        )
     generation_snapshot = await state_proposal_module.capture(
         novel_id,
         chapter_id,
@@ -221,14 +375,22 @@ async def generate_state(
         )
         result, tokens = await run_workflow_to_result(STATE_STEP, frames)
         await state_proposal_module.ensure_current(generation_snapshot)
-        cleaned, dropped = validate_state_ids(result, roster)
+        resolved, remapped = resolve_state_character_references(result, roster)
+        cleaned, dropped = validate_state_ids(resolved, roster)
         attempts = _serialize_attempts(deps.runtime)
+        reference_resolution = state_reference_resolution(
+            result,
+            cleaned,
+            dropped,
+            remapped,
+        )
         proposal = await state_proposal_module.publish(
             generation_lease,
             cleaned,
             audit={
                 "usage": {"total_tokens": tokens},
                 "attempts": attempts,
+                "reference_resolution": reference_resolution,
             },
         )
         truncation = {
@@ -267,8 +429,30 @@ async def _accept_outline(chapter_id: str, result: dict) -> None:
     await ChapterService.accept_chapter_outline(chapter_id, result)
 
 
-async def _write_prose(chapter_id: str, text: str) -> None:
-    await ChapterService.update_chapter(chapter_id, {"content": text})
+async def _write_prose(
+    chapter_id: str,
+    text: str,
+    completion: dict[str, Any],
+) -> None:
+    await ChapterService.update_chapter(
+        chapter_id,
+        {
+            "content": text,
+            "prose_acceptance": {
+                "state": "ai_complete",
+                "content_digest": chapter_content_digest(text),
+                "accepted_at": get_utc_now(),
+                "source": "batch_generation",
+                "source_run_id": completion.get("source_run_id"),
+                "source_run_revision": completion.get(
+                    "source_run_revision"
+                ),
+                "source_run_digest": completion.get("source_run_digest"),
+                "completion_status": completion.get("status"),
+                "finish_reason": completion.get("finish_reason"),
+            },
+        },
+    )
 
 
 async def _accept_state(chapter_id: str, proposal: dict) -> dict:
@@ -290,7 +474,9 @@ def build_chapter_pipeline_deps(
             novel_id, chapter, scope("outline")
         ),
         generate_prose=lambda novel_id, chapter: generate_prose(
-            novel_id, chapter, scope("prose")
+            novel_id,
+            chapter,
+            scope("prose"),
         ),
         generate_state=lambda novel_id, chapter: generate_state(
             novel_id, chapter, scope("state")

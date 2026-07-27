@@ -45,6 +45,9 @@ from backend.services.llm.workflow_runner import (
 )
 from backend.services.llm.generation_runtime import create_workflow_runtime
 from backend.services.novel.outline_validation import validate_outline_ids
+from backend.services.novel.state_validation import (
+    resolve_outline_character_references,
+)
 
 from backend.api.default_routers.auth_router import require_owned_body_resource
 
@@ -239,6 +242,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             runtime=create_workflow_runtime(),
         )
         reported = False
+        reported_remapped = False
         async for frame in run_workflow(
             workflow_name=CHAPTER_OUTLINE_WORKFLOW,
             steps=CHAPTER_OUTLINE_STEPS,
@@ -259,7 +263,14 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             # 设计 §5.3：AI 返回的每个 id 必须在 roster 内，不在则剔除并**明确上报**。
             # 不上报的话，"AI 漏了个人物"会以"预览里少一行"的形式无声通过，而
             # preview-then-accept 的全部意义就是让人拿最后一道关。
-            cleaned, dropped = validate_outline_ids(outline, roster)
+            resolved, remapped = resolve_outline_character_references(
+                outline,
+                roster,
+            )
+            cleaned, dropped = validate_outline_ids(resolved, roster)
+            if remapped and not reported_remapped:
+                yield sse_event("id_remapping", {"remapped": remapped})
+                reported_remapped = True
             if dropped and not reported:
                 yield sse_event("id_validation", {"dropped": dropped})
                 reported = True

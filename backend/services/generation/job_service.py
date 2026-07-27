@@ -25,6 +25,8 @@ from backend.services.novel.chapter_service import ChapterService
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
+from backend.services.generation.readiness import generation_readiness_module
+from backend.services.novel.state_completion import state_completion_module
 
 logger = logging.getLogger(__name__)
 _START_LOCK: asyncio.Lock | None = None
@@ -46,7 +48,8 @@ class ConflictError(Exception):
 
 
 def _new_job_doc(
-    novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity
+    novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity,
+    readiness,
 ) -> Dict[str, Any]:
     return {
         "novel_id": to_object_id(novel_id), "scope": scope,
@@ -64,6 +67,8 @@ def _new_job_doc(
         "attempt_reservation": None,
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
+        "confirm_uncertain_prose_retry": False,
+        "readiness": readiness,
     }
 
 
@@ -90,6 +95,7 @@ class GenerationJobService:
                 chapters = await ChapterService.get_chapters_by_volume(
                     str(job["volume_id"]), include_content=True
                 )
+                chapters = await state_completion_module.attach_many(chapters)
             logger.info(
                 "[job %s] worklist chapters=%d content_chars=%d elapsed_ms=%d",
                 job_id,
@@ -103,8 +109,26 @@ class GenerationJobService:
             chapter_id = str(chapter["_id"])
             slots = estimate_chapter_attempt_slots(chapter)
             await generation_job_repo.reserve_attempts(job_id, chapter_id, slots)
+            current_job = await generation_job_repo.get_job(job_id)
+            confirm_prose_retry = bool(
+                current_job.get("confirm_uncertain_prose_retry")
+            )
+            if confirm_prose_retry:
+                # Consume before any Provider work. A second crash requires a new
+                # user confirmation instead of inheriting a stale blanket grant.
+                await generation_job_repo.update_job_fields(
+                    job_id,
+                    {"confirm_uncertain_prose_retry": False},
+                )
             deps = build_chapter_pipeline_deps(
-                lambda step: JobAttemptScope(job_id, chapter_id, step)
+                lambda step: JobAttemptScope(
+                    job_id,
+                    chapter_id,
+                    step,
+                    confirm_uncertain_retry=(
+                        confirm_prose_retry and step == "prose"
+                    ),
+                ),
             )
             try:
                 return await run_chapter(novel_id, chapter, deps)
@@ -119,21 +143,70 @@ class GenerationJobService:
         _REGISTRY[job_id] = (task, control)
 
     @staticmethod
+    async def inspect_volume_readiness(volume_id: str) -> Dict[str, Any]:
+        volume = await volume_repo.get_volume_by_id(volume_id)
+        novel_id = str(volume["novel_id"])
+        chapters = await ChapterService.get_chapters_by_volume(
+            volume_id, include_content=True
+        )
+        chapters = await state_completion_module.attach_many(chapters)
+        return await generation_readiness_module.inspect(
+            novel_id=novel_id,
+            scope="volume",
+            volume_id=volume_id,
+            chapters=chapters,
+        )
+
+    @staticmethod
+    async def inspect_book_readiness(novel_id: str) -> Dict[str, Any]:
+        await novel_repo.get_novel_by_id(novel_id)
+        chapters = await get_book_worklist(novel_id, include_content=True)
+        return await generation_readiness_module.inspect(
+            novel_id=novel_id,
+            scope="book",
+            volume_id=None,
+            chapters=chapters,
+        )
+
+    @staticmethod
     async def start_volume_job(volume_id: str, checkpoint_interval: int,
-                               token_budget: Optional[int]) -> Dict[str, Any]:
+                               token_budget: Optional[int], *,
+                               readiness_digest: str | None = None,
+                               acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
+                               ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
         chapters = await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
+        chapters = await state_completion_module.attach_many(chapters)
         if job_planner.first_needing_work(chapters) is None:
             raise ValueError("本卷没有需要生成的章节（都已有正文与状态回填，或还没有章节存根）")
-        capacity = estimate_worklist_attempt_capacity(chapters)
         async with _get_start_lock():
             await GenerationJobService._guard_no_running()
+            # 在真正占用全局槽前重读全部输入并复算 digest，不能信任弹窗打开时的旧报告。
+            chapters = await ChapterService.get_chapters_by_volume(
+                volume_id, include_content=True
+            )
+            chapters = await state_completion_module.attach_many(chapters)
+            report = await generation_readiness_module.inspect(
+                novel_id=novel_id,
+                scope="volume",
+                volume_id=volume_id,
+                chapters=chapters,
+            )
+            authorization = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            capacity = int(
+                (authorization.get("planning") or {}).get("attempt_capacity")
+                or estimate_worklist_attempt_capacity(chapters)
+            )
             try:
                 job_id = await generation_job_repo.create_job(
                     _new_job_doc(
                         novel_id, "volume", volume_id, checkpoint_interval,
-                        token_budget, capacity,
+                        token_budget, capacity, authorization,
                     )
                 )
             except DuplicateKeyError as exc:
@@ -144,19 +217,37 @@ class GenerationJobService:
 
     @staticmethod
     async def start_book_job(novel_id: str, checkpoint_interval: int,
-                             token_budget: Optional[int]) -> Dict[str, Any]:
+                             token_budget: Optional[int], *,
+                             readiness_digest: str | None = None,
+                             acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
+                             ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
         chapters = await get_book_worklist(novel_id, include_content=True)
         if job_planner.first_needing_work(chapters) is None:
             raise ValueError("本书没有需要生成的章节（所有卷的章节都已有正文与状态回填，或还没有章节存根）")
-        capacity = estimate_worklist_attempt_capacity(chapters)
         async with _get_start_lock():
             await GenerationJobService._guard_no_running()
+            chapters = await get_book_worklist(novel_id, include_content=True)
+            report = await generation_readiness_module.inspect(
+                novel_id=novel_id,
+                scope="book",
+                volume_id=None,
+                chapters=chapters,
+            )
+            authorization = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            capacity = int(
+                (authorization.get("planning") or {}).get("attempt_capacity")
+                or estimate_worklist_attempt_capacity(chapters)
+            )
             try:
                 job_id = await generation_job_repo.create_job(
                     _new_job_doc(
                         novel_id, "book", None, checkpoint_interval,
-                        token_budget, capacity,
+                        token_budget, capacity, authorization,
                     )
                 )
             except DuplicateKeyError as exc:
@@ -201,6 +292,7 @@ class GenerationJobService:
                 "has_uncertain_attempts": False if confirm_uncertain_retry else bool(
                     job.get("has_uncertain_attempts")
                 ),
+                "confirm_uncertain_prose_retry": bool(confirm_uncertain_retry),
                 "last_checkpoint_index": len(job.get("progress", [])),
             })
         control = JobControl()
