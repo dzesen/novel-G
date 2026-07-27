@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from backend.llm.factory import create_llm_client
 from backend.llm.exceptions import LLMStructuredValidationError
 from backend.llm.models import LLMRequest, LLMResponse, TokenUsage
+from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 
 
 _limiter_lock = Lock()
@@ -76,6 +77,7 @@ class LLMService:
         self._max_concurrency = int(getattr(client_config, "max_concurrency", 0))
         self._last_usage = TokenUsage()
         self._total_usage = TokenUsage()
+        self._last_finish_reason: FinishReason = "unreported"
 
     @property
     def last_usage(self) -> TokenUsage:
@@ -90,6 +92,11 @@ class LLMService:
     def total_usage(self) -> TokenUsage:
         """本实例全部调用的累计 token 用量。"""
         return self._total_usage
+
+    @property
+    def last_finish_reason(self) -> FinishReason:
+        """最近一次流式文本调用的归一化结束原因。"""
+        return self._last_finish_reason
 
     def _record_usage(self, usage: TokenUsage) -> None:
         """记录单次用量并累加到总量。"""
@@ -179,6 +186,21 @@ class LLMService:
         中途 break 或 provider 不报用量时，它保持零值。
         """
         request = self._make_request(prompt, system_prompt, **kwargs)
-        async with _provider_request_slot(self._provider_name, self._max_concurrency):
-            async for chunk in self._client.stream_text(request, usage_sink=self._record_usage):
-                yield chunk
+        self._last_finish_reason = "unreported"
+        try:
+            async with _provider_request_slot(self._provider_name, self._max_concurrency):
+                async for chunk in self._client.stream_text(
+                    request,
+                    usage_sink=self._record_usage,
+                ):
+                    yield chunk
+        except asyncio.CancelledError:
+            self._last_finish_reason = "cancelled"
+            raise
+        except Exception:
+            self._last_finish_reason = "error"
+            raise
+        else:
+            self._last_finish_reason = normalize_finish_reason(
+                getattr(self._client, "last_finish_reason", None)
+            )

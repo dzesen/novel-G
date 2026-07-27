@@ -26,6 +26,7 @@ from backend.llm.exceptions import (
 )
 from backend.llm.logger import log_llm_error, log_llm_request, log_llm_response
 from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
+from backend.llm.stream_terminal import normalize_finish_reason
 
 
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)
@@ -261,6 +262,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         """流式调用 Chat Completions API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
+        self._last_finish_reason = "unreported"
         model = self._resolve_model(request)
         log_llm_request(request, self.provider_name)
 
@@ -282,8 +284,14 @@ class OpenAICompatibleClient(BaseLLMClient):
                     # 用量块的 choices 为空，与正文块互斥，必须先于 choices 判断取用。
                     if getattr(chunk, "usage", None) is not None:
                         latest_usage = self._extract_usage(chunk.usage)
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
+                    if chunk.choices:
+                        choice = chunk.choices[0]
+                        raw_reason = getattr(choice, "finish_reason", None)
+                        if raw_reason:
+                            self._last_finish_reason = normalize_finish_reason(raw_reason)
+                        content = getattr(getattr(choice, "delta", None), "content", None)
+                        if content:
+                            yield content
 
             async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
                 yield clean_chunk

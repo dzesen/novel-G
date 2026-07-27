@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, AsyncGenerator
 
 from backend.llm.models import TokenUsage
+from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.llm.workflow_runner import sse_event
 from backend.services.llm.generation_runtime import GenerationPlan, GenerationRuntime
 
@@ -147,6 +148,9 @@ async def stream_prose(
         )
     else:
         usage = getattr(service, "last_usage", None) or TokenUsage()
+    finish_reason = normalize_finish_reason(
+        getattr(runtime if runtime is not None else service, "last_finish_reason", None)
+    )
     logger.info(
         "[%s] request_id=%s step=%s status=done elapsed_ms=%d chars=%d total_tokens=%s",
         workflow_name,
@@ -156,4 +160,26 @@ async def stream_prose(
         len(text),
         usage.model_dump().get("total_tokens"),
     )
-    yield sse_event("done", {"success": True, "text": text, "usage": usage.model_dump()})
+    terminal_incomplete = finish_reason in {
+        "length",
+        "content_filter",
+        "tool_call",
+        "cancelled",
+        "error",
+    }
+    payload = {
+        "success": not terminal_incomplete,
+        "text": text,
+        "usage": usage.model_dump(),
+        "finish_reason": finish_reason,
+        "completion_status": (
+            "incomplete"
+            if terminal_incomplete
+            else "degraded"
+            if finish_reason == "unreported"
+            else "complete"
+        ),
+    }
+    if terminal_incomplete:
+        payload["error"] = f"正文生成未完整结束（{finish_reason}）"
+    yield sse_event("done", payload)

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from backend.llm.config import LLMProviderConfig
 from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
+from backend.llm.stream_terminal import FinishReason
 
 
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -107,6 +108,12 @@ class BaseLLMClient(ABC):
     def __init__(self, config: LLMProviderConfig, provider_name: str = "") -> None:
         self.config = config
         self.provider_name = provider_name
+        self._last_finish_reason: FinishReason = "unreported"
+
+    @property
+    def last_finish_reason(self) -> FinishReason:
+        """最近一次流式文本调用的归一化结束原因。"""
+        return self._last_finish_reason
 
     def _resolve_model(self, request: LLMRequest) -> str:
         """确定实际使用的模型名称，请求未指定时回退到服务商默认模型。"""

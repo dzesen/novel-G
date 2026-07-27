@@ -18,6 +18,7 @@ from backend.llm.exceptions import (
     LLMStructuredValidationError,
 )
 from backend.llm.models import TokenUsage
+from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 
 
 class StructuredOutputMode(str, Enum):
@@ -87,6 +88,8 @@ class GenerationPlan:
     config_revision: str
     capability_snapshot: str
     max_semantic_attempts: int
+    provider_model: str = ""
+    max_output_tokens: int | None = None
 
 
 class StaleGenerationPlan(RuntimeError):
@@ -259,6 +262,7 @@ class GenerationRuntime:
         self._config_supplier = config_supplier
         self._adapter_factory = adapter_factory
         self._attempt_scope = attempt_scope or InMemoryAttemptScope()
+        self._last_finish_reason: FinishReason = "unreported"
 
     @property
     def attempts(self) -> tuple[AttemptUsage, ...]:
@@ -281,6 +285,10 @@ class GenerationRuntime:
     def usage(self) -> TokenUsage:
         return _add_usage(self.attempts)
 
+    @property
+    def last_finish_reason(self) -> FinishReason:
+        return self._last_finish_reason
+
     @staticmethod
     def _revision(config: dict[str, Any]) -> str:
         explicit = str(config.get("revision") or "")
@@ -297,6 +305,8 @@ class GenerationRuntime:
             alias: {
                 "enabled": provider.get("enabled"),
                 "structured_output": provider.get("structured_output"),
+                "default_model": provider.get("default_model"),
+                "max_tokens": provider.get("max_tokens"),
                 "cached": provider.get("_capability_profile"),
             }
             for alias, provider in providers.items()
@@ -334,6 +344,8 @@ class GenerationRuntime:
             config_revision=self._revision(config),
             capability_snapshot=self._capability_snapshot(config),
             max_semantic_attempts=base_attempts + (1 if reviewer else 0),
+            provider_model=str(resolved.config.get("default_model") or ""),
+            max_output_tokens=_positive_int(resolved.config.get("max_tokens")),
         )
 
     def plan_text(self, target: GenerationTarget) -> GenerationPlan:
@@ -349,6 +361,8 @@ class GenerationRuntime:
             config_revision=self._revision(config),
             capability_snapshot=self._capability_snapshot(config),
             max_semantic_attempts=1,
+            provider_model=str(resolved.config.get("default_model") or ""),
+            max_output_tokens=_positive_int(resolved.config.get("max_tokens")),
         )
 
     def _validate_plan(self, plan: GenerationPlan) -> None:
@@ -470,14 +484,17 @@ class GenerationRuntime:
         """流式纯文本入口；取消直接传播，流耗尽后立即记账。"""
         self._validate_plan(plan)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
+        self._last_finish_reason = "unreported"
         attempt_id = await self._attempt_scope.claim(plan.provider_alias, "text")
         try:
             async for chunk in adapter.stream_text(prompt, **gen_kwargs):
                 yield chunk
         except asyncio.CancelledError:
+            self._last_finish_reason = "cancelled"
             await self._attempt_scope.mark_uncertain(attempt_id, "stream cancelled after dispatch")
             raise
         except Exception:
+            self._last_finish_reason = "error"
             usage = getattr(adapter, "last_usage", None) or TokenUsage()
             if usage.total_tokens or usage.input_tokens or usage.output_tokens:
                 await self._attempt_scope.account(attempt_id, usage)
@@ -486,6 +503,9 @@ class GenerationRuntime:
             raise
         usage = getattr(adapter, "last_usage", None) or TokenUsage()
         await self._attempt_scope.account(attempt_id, usage)
+        self._last_finish_reason = normalize_finish_reason(
+            getattr(adapter, "last_finish_reason", None)
+        )
 
 
 def create_generation_runtime(

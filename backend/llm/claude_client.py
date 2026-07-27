@@ -25,6 +25,7 @@ from backend.llm.exceptions import (
 )
 from backend.llm.logger import log_llm_error, log_llm_request, log_llm_response
 from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
+from backend.llm.stream_terminal import normalize_finish_reason
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,7 @@ class ClaudeClient(BaseLLMClient):
         """流式调用 Claude Messages API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
+        self._last_finish_reason = "unreported"
         model = self._resolve_model(request)
         log_llm_request(request, self.provider_name)
 
@@ -259,26 +261,31 @@ class ClaudeClient(BaseLLMClient):
                 async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
                     yield clean_chunk
 
-                # 流尽后 SDK 已聚合出完整消息，用量在其中；无需额外请求参数。
-                if usage_sink is not None:
-                    await self._emit_stream_usage(stream, usage_sink)
+                # 流尽后 SDK 已聚合出完整消息；终止原因和用量必须从同一终态读取。
+                final_message = await self._get_stream_terminal(stream)
+                if final_message is not None:
+                    self._last_finish_reason = normalize_finish_reason(
+                        getattr(final_message, "stop_reason", None)
+                    )
+                    if usage_sink is not None:
+                        usage_sink(
+                            self._extract_usage(getattr(final_message, "usage", None))
+                        )
         except Exception as exc:
             mapped = self._map_error(exc, model)
             log_llm_error(mapped, provider=self.provider_name, model=model)
             raise mapped from exc
 
-    async def _emit_stream_usage(
-        self,
-        stream: Any,
-        usage_sink: Callable[[TokenUsage], None],
-    ) -> None:
-        """尽力回报流式用量：拿不到就静默放弃，绝不让计量问题打断已成功的生成。"""
+    async def _get_stream_terminal(self, stream: Any) -> Any | None:
+        """尽力读取流式终态；失败不能打断已经收到的正文。"""
         try:
-            final_message = await stream.get_final_message()
+            return await stream.get_final_message()
         except Exception:
-            logger.warning("Claude 流式用量获取失败，本次调用按零用量计。", exc_info=True)
-            return
-        usage_sink(self._extract_usage(getattr(final_message, "usage", None)))
+            logger.warning(
+                "Claude 流式终态获取失败，本次结束原因与用量按未知处理。",
+                exc_info=True,
+            )
+            return None
 
     async def function_call_probe(
         self,
