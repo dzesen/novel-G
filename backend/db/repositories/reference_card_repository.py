@@ -71,6 +71,12 @@ class ReferenceCardRepository(BaseRepository):
             "importance": importance,
             "sort_order": int(data.get("sort_order") or await self._next_sort_order(obj_id, card_type, session)),
         }
+        if "character_profile" in data:
+            if card_type != "character":
+                raise ValueError(
+                    "Character profile is only supported for character cards"
+                )
+            prepared["character_profile"] = dict(data["character_profile"] or {})
         if card_id is not None:
             prepared["_id"] = to_object_id(card_id)
         return await self.insert_one(prepared, session=session)
@@ -126,7 +132,16 @@ class ReferenceCardRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> bool:
         current = await self.get_card(novel_id, card_type, card_id, session=session)
-        allowed_fields = {"name", "subtitle", "description", "details", "tags", "sort_order", "importance"}
+        allowed_fields = {
+            "name",
+            "subtitle",
+            "description",
+            "details",
+            "tags",
+            "sort_order",
+            "importance",
+            "character_profile",
+        }
         prepared = {key: value for key, value in data.items() if key in allowed_fields}
         if "name" in prepared:
             prepared["name"] = str(prepared["name"]).strip()
@@ -140,6 +155,14 @@ class ReferenceCardRepository(BaseRepository):
             prepared["importance"] = str(prepared["importance"])
             if prepared["importance"] not in CARD_IMPORTANCE_VALUES:
                 raise ValueError(f"Unsupported card importance: {prepared['importance']}")
+        if "character_profile" in prepared:
+            if card_type != "character":
+                raise ValueError(
+                    "Character profile is only supported for character cards"
+                )
+            prepared["character_profile"] = dict(
+                prepared["character_profile"] or {}
+            )
         if not prepared:
             return False
         return await self.update_one({"_id": current["_id"]}, prepared, session=session)

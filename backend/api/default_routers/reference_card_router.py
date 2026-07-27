@@ -15,6 +15,7 @@ from backend.services.novel.reference_card_curation import (
     reference_card_curation_service,
 )
 from backend.services.novel.reference_card_service import ReferenceCardService
+from backend.services.novel.character_profile import CharacterProfileSchema
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.services.auth.identity_service import Actor
 
@@ -36,6 +37,7 @@ class ReferenceCardCreateRequest(BaseModel):
     # 用 Optional[str] 而非 Literal["main","sub"]：非法值要落到仓储层的
     # ValueError，经 _translate_error 转成 400 + 可读消息，而不是 FastAPI 的 422。
     importance: Optional[str] = None
+    character_profile: Optional[CharacterProfileSchema] = None
 
 
 class ReferenceCardUpdateRequest(BaseModel):
@@ -46,6 +48,7 @@ class ReferenceCardUpdateRequest(BaseModel):
     tags: Optional[List[str]] = None
     sort_order: Optional[int] = None
     importance: Optional[str] = None
+    character_profile: Optional[CharacterProfileSchema] = None
 
 
 class ReferenceCardCurationDecision(BaseModel):

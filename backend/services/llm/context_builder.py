@@ -37,6 +37,10 @@ DEFAULT_CONTEXT_TOKEN_BUDGET = 8000
 # 最近 K 章摘要。K=5，硬编码；配置项留到有真实数据之后（设计已确认决策）。
 RECENT_CHAPTER_COUNT = 5
 
+# A profile may retain more examples for editing/export, while prose generation only
+# receives a small sample. The remaining examples are reference material, not facts.
+DIALOGUE_EXAMPLES_PER_CHARACTER = 4
+
 # other_threads 中 due 为空的 drop_rank：无截止期即无紧迫性，视作无限远，最先丢。
 _NO_DUE_DROP_RANK = -(10 ** 9)
 
@@ -218,6 +222,9 @@ SECTION_PRIORITY = {
     "threads_to_resolve": 100, # 永不截断
     "permanent_facts": 100,    # 永不截断——防止"死人复活"的唯一屏障
     "present_cards": 50,
+    "present_states": 90,
+    "portrayal_context": 15,
+    "dialogue_examples": 5,
     "volume": 100,             # 永不截断——整卷/整本生成的结构契约
     "recent_chapters": 30,
     "other_threads": 20,
@@ -353,23 +360,73 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     if outline:
         sections.append(_blob("chapter_outline", f"本章细纲：{outline}"))
 
-    # 出场人物：完整卡片 + current_state
+    # 出场人物的基本介绍和塑造约束：中优先级，可在极端预算下显式截断。
     present_blocks = []
+    state_blocks = []
+    portrayal_context_items: list[ContextItem] = []
+    dialogue_items: list[ContextItem] = []
     for card_id in present_ids:
         card = cards.get(card_id)
         if not card:
             continue
         state = states.get(card_id) or {}
-        block = f"{card['name']}：{card.get('description', '')}"
+        profile = card.get("character_profile") or {}
+        details = card.get("details") or {}
+        block_lines = [f"{card['name']}：{card.get('description', '')}"]
+        if details.get("personality"):
+            block_lines.append(f"性格：{details['personality']}")
+        if profile.get("portrayal_notes"):
+            block_lines.append(f"人物塑造约束：{profile['portrayal_notes']}")
+        present_blocks.append("\n".join(block_lines))
+
         state_ordinal = state.get("_as_of_book_ordinal")
         if state.get("current_state") and (
             book_ordinal is None
             or (isinstance(state_ordinal, int) and state_ordinal <= book_ordinal)
         ):
-            block += f"\n当下状态（截至第 {state.get('as_of_chapter_order', chapter_order)} 章）：{state['current_state']}"
-        present_blocks.append(block)
+            state_blocks.append(
+                f"{card['name']}的当下状态"
+                f"（截至第 {state.get('as_of_chapter_order', chapter_order)} 章）："
+                f"{state['current_state']}"
+            )
+        if profile.get("portrayal_context"):
+            portrayal_context_items.append(
+                ContextItem(
+                    text=f"{card['name']}的表现场景参考：{profile['portrayal_context']}"
+                )
+            )
+        for index, example in enumerate(
+            (profile.get("dialogue_examples") or [])[
+                :DIALOGUE_EXAMPLES_PER_CHARACTER
+            ]
+        ):
+            dialogue_items.append(
+                ContextItem(
+                    text=f"{card['name']}的对白风格示例：{example}",
+                    # Keep the earliest examples when only part of the section fits.
+                    drop_rank=-index,
+                )
+            )
     if present_blocks:
         sections.append(_blob("present_cards", "\n\n".join(present_blocks)))
+    if state_blocks:
+        sections.append(_blob("present_states", "\n\n".join(state_blocks)))
+    if portrayal_context_items:
+        sections.append(
+            ContextSection(
+                name="portrayal_context",
+                header="人物表现场景参考（不是已经发生的剧情）：",
+                items=portrayal_context_items,
+            )
+        )
+    if dialogue_items:
+        sections.append(
+            ContextSection(
+                name="dialogue_examples",
+                header="对白风格示例（只模仿语气，不视为剧情事实）：",
+                items=dialogue_items,
+            )
+        )
 
     # permanent_facts 装配范围（设计 §5.2）分三档：
     # 1）本章出场人物（present_ids）；
@@ -485,7 +542,14 @@ def build_roster(cards: dict, worldbook_cards: dict, threads: list) -> dict:
     """
     return {
         "characters": [
-            {"id": cid, "name": card["name"], "brief": card.get("description", "")}
+            {
+                "id": cid,
+                "name": card["name"],
+                "aliases": list(
+                    (card.get("character_profile") or {}).get("aliases") or []
+                ),
+                "brief": card.get("description", ""),
+            }
             for cid, card in cards.items()
         ],
         "worldbook": [
@@ -508,7 +572,11 @@ async def fetch_roster(novel_id: str) -> dict:
     """
     card_docs = await character_repo.list_cards(novel_id, "character")
     cards = {
-        str(card["_id"]): {"name": card.get("name", ""), "description": card.get("description", "")}
+        str(card["_id"]): {
+            "name": card.get("name", ""),
+            "description": card.get("description", ""),
+            "character_profile": dict(card.get("character_profile") or {}),
+        }
         for card in card_docs
     }
 
@@ -542,7 +610,11 @@ def _roster_section(roster: dict) -> ContextSection:
             continue
         lines.append(f"【{label}】可用 id 名单：")
         for e in entries:
-            lines.append(f"- id={e['id']} {e['name']}：{e.get('brief', '')}")
+            aliases = " / ".join(e.get("aliases") or [])
+            alias_text = f"（别名：{aliases}）" if aliases else ""
+            lines.append(
+                f"- id={e['id']} {e['name']}{alias_text}：{e.get('brief', '')}"
+            )
     return _blob("roster", "\n".join(lines))
 
 
@@ -672,6 +744,8 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             "name": card.get("name", ""),
             "importance": card.get("importance", "sub"),
             "description": card.get("description", ""),
+            "details": dict(card.get("details") or {}),
+            "character_profile": dict(card.get("character_profile") or {}),
             "card_type": card.get("card_type", "character"),
         }
         for card in card_docs

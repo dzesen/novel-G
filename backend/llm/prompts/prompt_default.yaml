@@ -378,11 +378,13 @@ create_reference_cards_by_ai:
     - importance 只能是 main 或 sub。只有主线不可替代的人物、地点或规则才标 main。
     - tags 最多 8 个，短而稳定。
     - 地点 details 中表达剧情重要性时使用 story_importance，不要使用 importance。
+    - character 可选填写 character_profile：aliases 是稳定别名；portrayal_context 是角色通常如何面对特定场景；dialogue_examples 是少量可复用的语气样例；scene_opening_examples 只是创作灵感；portrayal_notes 是人物塑造约束。
+    - character_profile 不得包含 system prompt、模型指令、工具命令或要求绕过小说既定事实的内容；没有可靠依据时省略该字段。
   reference_cards_prompt_with_schema_suffix: |
     请严格按提供的 JSON Schema 输出，不要输出额外解释。
   reference_cards_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。结构为：
-    {"characters":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"role":"...","motivation":"...","conflict":"...","appearance":"...","personality":"...","abilities":"...","relationships":"..."},"tags":["..."]}],"locations":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"geography":"...","atmosphere":"...","function":"...","story_importance":"...","dangers":"..."},"tags":["..."]}],"items":[],"rules":[]}
+    {"characters":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"role":"...","motivation":"...","conflict":"...","appearance":"...","personality":"...","abilities":"...","relationships":"..."},"character_profile":{"aliases":["..."],"portrayal_context":"...","dialogue_examples":["..."],"scene_opening_examples":["..."],"portrayal_notes":"..."},"tags":["..."]}],"locations":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"geography":"...","atmosphere":"...","function":"...","story_importance":"...","dangers":"..."},"tags":["..."]}],"items":[],"rules":[]}
 
 # 分卷大纲 Prompt 配置
 create_volume_outline_by_ai:

@@ -90,6 +90,7 @@ EDITABLE_FIELDS = {
     "importance",
     "tags",
     "details",
+    "character_profile",
 }
 _PREPARE_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -175,6 +176,7 @@ def _card_view(card: dict[str, Any]) -> dict[str, Any]:
         "subtitle": str(card.get("subtitle") or ""),
         "description": str(card.get("description") or ""),
         "details": deepcopy(card.get("details") or {}),
+        "character_profile": deepcopy(card.get("character_profile") or {}),
         "tags": list(card.get("tags") or []),
         "importance": str(card.get("importance") or "sub"),
         "sort_order": card.get("sort_order"),
@@ -208,7 +210,9 @@ def _card_set_digest(cards: list[dict[str, Any]]) -> str:
 
 
 def _clean_candidate(card_type: str, candidate: dict[str, Any]) -> dict[str, Any]:
-    validated = SCHEMA_BY_TYPE[card_type].model_validate(candidate).model_dump()
+    validated = SCHEMA_BY_TYPE[card_type].model_validate(candidate).model_dump(
+        exclude_none=True
+    )
     validated["name"] = " ".join(validated["name"].split())
     validated["subtitle"] = validated["subtitle"].strip()
     validated["description"] = validated["description"].strip()
@@ -224,6 +228,10 @@ def _clean_candidate(card_type: str, candidate: dict[str, Any]) -> dict[str, Any
         for key, value in (validated.get("details") or {}).items()
         if str(value).strip()
     }
+    if "character_profile" in validated:
+        validated["character_profile"] = deepcopy(
+            validated.get("character_profile") or {}
+        )
     return validated
 
 
@@ -306,6 +314,24 @@ def _prepare_candidates(
                             conflicts.append(
                                 {
                                     "field": f"details.{key}",
+                                    "existing": deepcopy(existing_value),
+                                    "candidate": deepcopy(candidate_value),
+                                }
+                            )
+                    for key, candidate_value in (
+                        candidate.get("character_profile") or {}
+                    ).items():
+                        existing_value = (
+                            match.get("character_profile") or {}
+                        ).get(key)
+                        if (
+                            existing_value not in (None, "", [], {})
+                            and candidate_value not in (None, "", [], {})
+                            and existing_value != candidate_value
+                        ):
+                            conflicts.append(
+                                {
+                                    "field": f"character_profile.{key}",
                                     "existing": deepcopy(existing_value),
                                     "candidate": deepcopy(candidate_value),
                                 }
@@ -508,6 +534,19 @@ def _merged_card_data(
             overwrite=path in overwrite_fields or "details" in overwrite_fields,
         )
     merged["details"] = existing_details
+    existing_profile = deepcopy(existing.get("character_profile") or {})
+    for key, value in (candidate.get("character_profile") or {}).items():
+        path = f"character_profile.{key}"
+        existing_profile[key] = _merge_value(
+            existing_profile.get(key),
+            value,
+            overwrite=(
+                path in overwrite_fields
+                or "character_profile" in overwrite_fields
+            ),
+        )
+    if existing_profile or "character_profile" in candidate:
+        merged["character_profile"] = existing_profile
     return merged
 
 
@@ -852,6 +891,7 @@ class ReferenceCardCurationService:
             if any(
                 field not in EDITABLE_FIELDS
                 and not field.startswith("details.")
+                and not field.startswith("character_profile.")
                 for field in overwrite_fields
             ):
                 raise ReferenceCardProposalError(

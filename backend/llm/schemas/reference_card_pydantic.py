@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from backend.services.novel.character_profile import CharacterProfileSchema
 
 
 class _StrictModel(BaseModel):
@@ -53,6 +54,7 @@ class _CardCandidateBase(_StrictModel):
 
 class CharacterCandidateSchema(_CardCandidateBase):
     details: CharacterDetailsSchema = Field(default_factory=CharacterDetailsSchema)
+    character_profile: CharacterProfileSchema | None = None
 
 
 class LocationCandidateSchema(_CardCandidateBase):

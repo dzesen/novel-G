@@ -14,6 +14,7 @@ from backend.db.repositories.character_repository import character_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.reference_card_repository import ReferenceCardRepository
 from backend.db.repositories.worldbook_repository import worldbook_repo
+from backend.services.novel.character_profile import normalize_character_profile
 
 
 CARD_TYPES = {"character", "location", "item", "rule"}
@@ -32,7 +33,9 @@ def get_card_repository(card_type: str) -> ReferenceCardRepository:
 
 
 class ReferenceCardService:
-    CONTEXT_FIELDS = frozenset({"name", "description", "importance", "sort_order"})
+    CONTEXT_FIELDS = frozenset(
+        {"name", "description", "importance", "sort_order", "character_profile"}
+    )
 
     @staticmethod
     async def _execute_mutation(session, mutation):
@@ -135,6 +138,15 @@ class ReferenceCardService:
         importance = str(data.get("importance") or "sub")
         if importance not in {"main", "sub"}:
             raise ValueError(f"Unsupported card importance: {importance}")
+        prepared = dict(data)
+        if "character_profile" in prepared:
+            if normalized != "character":
+                raise ValueError(
+                    "Character profile is only supported for character cards"
+                )
+            prepared["character_profile"] = normalize_character_profile(
+                prepared["character_profile"]
+            )
         card_id = str(ObjectId())
         return await commit_mutation(
             MutationCommand(
@@ -144,7 +156,7 @@ class ReferenceCardService:
                 payload={
                     "card_type": normalized,
                     "card_id": card_id,
-                    "data": dict(data),
+                    "data": prepared,
                 },
                 child_ids={"card": card_id},
             ),
@@ -186,6 +198,7 @@ class ReferenceCardService:
             "tags",
             "sort_order",
             "importance",
+            "character_profile",
         }
         prepared = {key: value for key, value in data.items() if key in allowed_fields}
         if "name" in prepared:
@@ -200,6 +213,14 @@ class ReferenceCardService:
             prepared["tags"] = list(prepared["tags"] or [])
         if "importance" in prepared:
             prepared["importance"] = str(prepared["importance"])
+        if "character_profile" in prepared:
+            if normalized != "character":
+                raise ValueError(
+                    "Character profile is only supported for character cards"
+                )
+            prepared["character_profile"] = normalize_character_profile(
+                prepared["character_profile"]
+            )
         changes = {
             key: value for key, value in prepared.items() if current.get(key) != value
         }
@@ -210,7 +231,16 @@ class ReferenceCardService:
             raise ValueError("Card name cannot be empty")
         if "importance" in changes and str(changes["importance"]) not in {"main", "sub"}:
             raise ValueError(f"Unsupported card importance: {changes['importance']}")
-        affects_context = bool(set(changes) & ReferenceCardService.CONTEXT_FIELDS)
+        personality_changed = (
+            normalized == "character"
+            and "details" in changes
+            and str((current.get("details") or {}).get("personality") or "")
+            != str((changes.get("details") or {}).get("personality") or "")
+        )
+        affects_context = (
+            bool(set(changes) & ReferenceCardService.CONTEXT_FIELDS)
+            or personality_changed
+        )
         operation = (
             "update_reference_card_context"
             if affects_context
