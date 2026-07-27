@@ -39,7 +39,23 @@ function initializeDecisions(
       candidate.candidate_id,
       {
         action: candidate.recommended_action,
-        candidate: { ...candidate, details: { ...candidate.details }, tags: [...candidate.tags] },
+        candidate: {
+          ...candidate,
+          details: { ...candidate.details },
+          tags: [...candidate.tags],
+          character_profile: candidate.character_profile
+            ? {
+                ...candidate.character_profile,
+                aliases: [...candidate.character_profile.aliases],
+                dialogue_examples: [
+                  ...candidate.character_profile.dialogue_examples,
+                ],
+                scene_opening_examples: [
+                  ...candidate.character_profile.scene_opening_examples,
+                ],
+              }
+            : undefined,
+        },
         overwriteFields: [],
       },
     ]),
@@ -165,6 +181,7 @@ export default function ReferenceCardCurationDialog({
                 details: decision.candidate.details,
                 tags: decision.candidate.tags,
                 importance: decision.candidate.importance,
+                character_profile: decision.candidate.character_profile,
               },
               overwrite_fields: decision.overwriteFields,
             };
@@ -470,6 +487,14 @@ export default function ReferenceCardCurationDialog({
                               importance: t("fields.importance"),
                               tags: t("fields.tags"),
                               details: t("fields.details"),
+                              characterProfile: t("fields.characterProfile"),
+                              aliases: t("fields.aliases"),
+                              portrayalContext: t("fields.portrayalContext"),
+                              portrayalNotes: t("fields.portrayalNotes"),
+                              dialogueExamples: t("fields.dialogueExamples"),
+                              sceneOpeningExamples: t("fields.sceneOpeningExamples"),
+                              addExample: t("fields.addExample"),
+                              removeExample: t("fields.removeExample"),
                               main: t("importanceMain"),
                               sub: t("importanceSub"),
                             }}
@@ -547,7 +572,22 @@ function CandidateEditor({
   candidate: ReferenceCardCandidate;
   onChange: (patch: Partial<ReferenceCardCandidate>) => void;
   labels: Record<
-    "name" | "subtitle" | "description" | "importance" | "tags" | "details" | "main" | "sub",
+    | "name"
+    | "subtitle"
+    | "description"
+    | "importance"
+    | "tags"
+    | "details"
+    | "characterProfile"
+    | "aliases"
+    | "portrayalContext"
+    | "portrayalNotes"
+    | "dialogueExamples"
+    | "sceneOpeningExamples"
+    | "addExample"
+    | "removeExample"
+    | "main"
+    | "sub",
     string
   >;
 }) {
@@ -616,7 +656,172 @@ function CandidateEditor({
           ))}
         </div>
       </div>
+      {candidate.character_profile && (
+        <div className="border-t border-border pt-4 sm:col-span-2">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-[0.12em] text-muted">
+            {labels.characterProfile}
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DialogField
+              label={labels.aliases}
+              value={candidate.character_profile.aliases.join(", ")}
+              onChange={(value) =>
+                onChange({
+                  character_profile: {
+                    ...candidate.character_profile!,
+                    aliases: value
+                      .split(/[,，、;\n]/)
+                      .map((item) => item.trim())
+                      .filter(Boolean),
+                  },
+                })
+              }
+            />
+            <DialogTextArea
+              label={labels.portrayalNotes}
+              value={candidate.character_profile.portrayal_notes}
+              onChange={(portrayal_notes) =>
+                onChange({
+                  character_profile: {
+                    ...candidate.character_profile!,
+                    portrayal_notes,
+                  },
+                })
+              }
+            />
+            <DialogTextArea
+              className="sm:col-span-2"
+              label={labels.portrayalContext}
+              value={candidate.character_profile.portrayal_context}
+              onChange={(portrayal_context) =>
+                onChange({
+                  character_profile: {
+                    ...candidate.character_profile!,
+                    portrayal_context,
+                  },
+                })
+              }
+            />
+            <CandidateExampleEditor
+              className="sm:col-span-2"
+              label={labels.dialogueExamples}
+              values={candidate.character_profile.dialogue_examples}
+              maxItems={12}
+              addLabel={labels.addExample}
+              removeLabel={labels.removeExample}
+              onChange={(dialogue_examples) =>
+                onChange({
+                  character_profile: {
+                    ...candidate.character_profile!,
+                    dialogue_examples,
+                  },
+                })
+              }
+            />
+            <CandidateExampleEditor
+              className="sm:col-span-2"
+              label={labels.sceneOpeningExamples}
+              values={candidate.character_profile.scene_opening_examples}
+              maxItems={8}
+              addLabel={labels.addExample}
+              removeLabel={labels.removeExample}
+              onChange={(scene_opening_examples) =>
+                onChange({
+                  character_profile: {
+                    ...candidate.character_profile!,
+                    scene_opening_examples,
+                  },
+                })
+              }
+            />
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function DialogTextArea({
+  label,
+  value,
+  onChange,
+  className = "",
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  className?: string;
+}) {
+  return (
+    <label className={`block ${className}`}>
+      <span className="mb-1.5 block text-xs font-medium text-foreground">{label}</span>
+      <textarea
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        rows={3}
+        className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm leading-6 text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+      />
+    </label>
+  );
+}
+
+function CandidateExampleEditor({
+  label,
+  values,
+  maxItems,
+  addLabel,
+  removeLabel,
+  onChange,
+  className = "",
+}: {
+  label: string;
+  values: string[];
+  maxItems: number;
+  addLabel: string;
+  removeLabel: string;
+  onChange: (values: string[]) => void;
+  className?: string;
+}) {
+  return (
+    <fieldset className={className}>
+      <legend className="text-xs font-medium text-foreground">{label}</legend>
+      <div className="mt-2 space-y-2">
+        {values.map((value, index) => (
+          <div key={index} className="flex items-start gap-2">
+            <textarea
+              value={value}
+              onChange={(event) =>
+                onChange(
+                  values.map((item, itemIndex) =>
+                    itemIndex === index ? event.target.value : item,
+                  ),
+                )
+              }
+              rows={2}
+              className="min-w-0 flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm leading-6 text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+            />
+            <button
+              type="button"
+              aria-label={removeLabel}
+              onClick={() =>
+                onChange(values.filter((_, itemIndex) => itemIndex !== index))
+              }
+              className="px-2 py-1 text-lg leading-none text-red-600 hover:text-red-700"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+      <button
+        type="button"
+        disabled={values.length >= maxItems}
+        onClick={() => onChange([...values, ""])}
+        className="mt-2 text-xs font-semibold text-accent hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        + {addLabel}
+      </button>
+    </fieldset>
   );
 }
 

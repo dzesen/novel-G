@@ -108,6 +108,14 @@ export interface ChapterDraft {
 
 export type ReferenceCardType = "character" | "location" | "item" | "rule";
 
+export interface CharacterProfile {
+  aliases: string[];
+  portrayal_context: string;
+  dialogue_examples: string[];
+  scene_opening_examples: string[];
+  portrayal_notes: string;
+}
+
 export interface ReferenceCard {
   _id: string;
   novel_id: string;
@@ -119,6 +127,7 @@ export interface ReferenceCard {
   tags: string[];
   sort_order: number;
   importance: "main" | "sub";
+  character_profile?: CharacterProfile;
   is_deleted: boolean;
   deleted_at?: string | null;
   created_at: string;
@@ -140,6 +149,7 @@ export interface ReferenceCardCandidate {
   details: Record<string, string>;
   tags: string[];
   importance: "main" | "sub";
+  character_profile?: CharacterProfile;
   recommended_action: ReferenceCardCurationAction;
   recommended_target_card_id?: string | null;
   recommended_target?: Partial<ReferenceCard> | null;

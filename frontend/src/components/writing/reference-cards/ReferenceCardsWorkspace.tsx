@@ -4,7 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiDelete, apiGet, apiPost, apiPut } from "@/lib/api";
-import type { ReferenceCard, ReferenceCardType } from "@/types/novel";
+import type {
+  CharacterProfile,
+  ReferenceCard,
+  ReferenceCardType,
+} from "@/types/novel";
 import ReferenceCardCurationDialog from "./ReferenceCardCurationDialog";
 
 interface ReferenceCardsWorkspaceProps {
@@ -22,6 +26,7 @@ interface CardDraft {
   details: Record<string, string>;
   tags: string[];
   importance: "main" | "sub";
+  character_profile: CharacterProfile;
 }
 
 const DETAIL_FIELDS: Record<ReferenceCardType, string[]> = {
@@ -39,6 +44,17 @@ function createDraft(card?: ReferenceCard): CardDraft {
     details: { ...(card?.details ?? {}) },
     tags: [...(card?.tags ?? [])],
     importance: card?.importance ?? "sub",
+    character_profile: {
+      aliases: [...(card?.character_profile?.aliases ?? [])],
+      portrayal_context: card?.character_profile?.portrayal_context ?? "",
+      dialogue_examples: [
+        ...(card?.character_profile?.dialogue_examples ?? []),
+      ],
+      scene_opening_examples: [
+        ...(card?.character_profile?.scene_opening_examples ?? []),
+      ],
+      portrayal_notes: card?.character_profile?.portrayal_notes ?? "",
+    },
   };
 }
 
@@ -75,7 +91,13 @@ export default function ReferenceCardsWorkspace({
     const needle = search.trim().toLocaleLowerCase();
     if (!needle) return cards;
     return cards.filter((card) =>
-      [card.name, card.subtitle, card.description, ...card.tags]
+      [
+        card.name,
+        card.subtitle,
+        card.description,
+        ...card.tags,
+        ...(card.character_profile?.aliases ?? []),
+      ]
         .join(" ")
         .toLocaleLowerCase()
         .includes(needle),
@@ -143,7 +165,17 @@ export default function ReferenceCardsWorkspace({
     setSaving(true);
     setError(null);
     try {
-      const payload = { ...draft, name: draft.name.trim(), subtitle: draft.subtitle.trim() };
+      const payload = {
+        name: draft.name.trim(),
+        subtitle: draft.subtitle.trim(),
+        description: draft.description,
+        details: draft.details,
+        tags: draft.tags,
+        importance: draft.importance,
+        ...(cardType === "character"
+          ? { character_profile: draft.character_profile }
+          : {}),
+      };
       const saved = creating
         ? await apiPost<ReferenceCard>(`/api/reference-cards/novel/${novelId}/${cardType}`, payload)
         : await apiPut<ReferenceCard>(`/api/reference-cards/novel/${novelId}/${cardType}/${selectedId}`, payload);
@@ -327,6 +359,98 @@ export default function ReferenceCardsWorkspace({
                   onChange={(value) => setDraft((current) => ({ ...current, details: { ...current.details, [field]: value } }))}
                 />
               ))}
+              {cardType === "character" && (
+                <section className="border-t border-border pt-6 md:col-span-2">
+                  <div className="max-w-2xl">
+                    <h3 className="text-base font-semibold text-foreground">
+                      {t("profileTitle")}
+                    </h3>
+                    <p className="mt-1 text-sm leading-6 text-muted">
+                      {t("profileDescription")}
+                    </p>
+                  </div>
+                  <div className="mt-5 grid gap-5 md:grid-cols-2">
+                    <Field
+                      label={t("fields.aliases")}
+                      value={draft.character_profile.aliases.join("，")}
+                      onChange={(value) =>
+                        setDraft((current) => ({
+                          ...current,
+                          character_profile: {
+                            ...current.character_profile,
+                            aliases: splitTags(value),
+                          },
+                        }))
+                      }
+                    />
+                    <TextArea
+                      label={t("fields.portrayalNotes")}
+                      value={draft.character_profile.portrayal_notes}
+                      onChange={(value) =>
+                        setDraft((current) => ({
+                          ...current,
+                          character_profile: {
+                            ...current.character_profile,
+                            portrayal_notes: value,
+                          },
+                        }))
+                      }
+                      hint={t("profilePromptHint")}
+                    />
+                    <TextArea
+                      className="md:col-span-2"
+                      label={t("fields.portrayalContext")}
+                      value={draft.character_profile.portrayal_context}
+                      onChange={(value) =>
+                        setDraft((current) => ({
+                          ...current,
+                          character_profile: {
+                            ...current.character_profile,
+                            portrayal_context: value,
+                          },
+                        }))
+                      }
+                      hint={t("profileContextHint")}
+                    />
+                    <ExampleListEditor
+                      className="md:col-span-2"
+                      label={t("fields.dialogueExamples")}
+                      values={draft.character_profile.dialogue_examples}
+                      maxItems={12}
+                      addLabel={t("addDialogueExample")}
+                      removeLabel={t("removeExample")}
+                      hint={t("dialogueExamplesHint")}
+                      onChange={(dialogueExamples) =>
+                        setDraft((current) => ({
+                          ...current,
+                          character_profile: {
+                            ...current.character_profile,
+                            dialogue_examples: dialogueExamples,
+                          },
+                        }))
+                      }
+                    />
+                    <ExampleListEditor
+                      className="md:col-span-2"
+                      label={t("fields.sceneOpeningExamples")}
+                      values={draft.character_profile.scene_opening_examples}
+                      maxItems={8}
+                      addLabel={t("addOpeningExample")}
+                      removeLabel={t("removeExample")}
+                      hint={t("sceneOpeningHint")}
+                      onChange={(sceneOpeningExamples) =>
+                        setDraft((current) => ({
+                          ...current,
+                          character_profile: {
+                            ...current.character_profile,
+                            scene_opening_examples: sceneOpeningExamples,
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                </section>
+              )}
               <TextArea className="md:col-span-2" label={t("fields.tags")} value={draft.tags.join("，")} onChange={(value) => setDraft((current) => ({ ...current, tags: splitTags(value) }))} hint={t("tagsHint")} />
             </div>
           </div>
@@ -366,5 +490,71 @@ function TextArea({ label, value, onChange, hint, className = "" }: { label: str
       <textarea value={value} onChange={(event) => onChange(event.target.value)} rows={4} className="w-full resize-y rounded-lg border border-border bg-surface px-3 py-2.5 text-sm leading-6 text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15" />
       {hint && <span className="mt-1 block text-xs text-muted">{hint}</span>}
     </label>
+  );
+}
+
+function ExampleListEditor({
+  label,
+  values,
+  maxItems,
+  addLabel,
+  removeLabel,
+  hint,
+  onChange,
+  className = "",
+}: {
+  label: string;
+  values: string[];
+  maxItems: number;
+  addLabel: string;
+  removeLabel: string;
+  hint: string;
+  onChange: (values: string[]) => void;
+  className?: string;
+}) {
+  return (
+    <fieldset className={className}>
+      <legend className="text-sm font-medium text-foreground">{label}</legend>
+      <p className="mt-1 text-xs leading-5 text-muted">{hint}</p>
+      <div className="mt-3 space-y-3">
+        {values.map((value, index) => (
+          <div
+            // Entries are append/remove only; the index is stable while text is edited.
+            key={index}
+            className="rounded-lg border border-border bg-surface-secondary p-3"
+          >
+            <textarea
+              value={value}
+              onChange={(event) =>
+                onChange(
+                  values.map((item, itemIndex) =>
+                    itemIndex === index ? event.target.value : item,
+                  ),
+                )
+              }
+              rows={3}
+              className="w-full resize-y bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted"
+            />
+            <button
+              type="button"
+              onClick={() =>
+                onChange(values.filter((_, itemIndex) => itemIndex !== index))
+              }
+              className="mt-2 text-xs font-medium text-red-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              {removeLabel}
+            </button>
+          </div>
+        ))}
+      </div>
+      <button
+        type="button"
+        disabled={values.length >= maxItems}
+        onClick={() => onChange([...values, ""])}
+        className="mt-3 text-sm font-semibold text-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        + {addLabel}
+      </button>
+    </fieldset>
   );
 }
