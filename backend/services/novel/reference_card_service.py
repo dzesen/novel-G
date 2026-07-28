@@ -306,9 +306,18 @@ class ReferenceCardService:
             and str((current.get("details") or {}).get("personality") or "")
             != str((changes.get("details") or {}).get("personality") or "")
         )
+        # 世界资料卡的 interop.display_metadata 已参与章细纲紧凑索引
+        # （keys/constant/insertion_order/正则隔离标记）。API 当前不直接开放该字段，
+        # 但导入合并和内部服务可更新它；把 worldbook interop 视为上下文字段能守住
+        # “索引变化必须让缓存失效”的不变量。宁可对 raw_entry 等少量元数据更新
+        # 过度失效，也不能漏掉关键词索引变化后继续使用旧上下文。
+        world_entry_index_metadata_changed = (
+            normalized != "character" and "interop" in changes
+        )
         affects_context = (
             bool(set(changes) & ReferenceCardService.CONTEXT_FIELDS)
             or personality_changed
+            or world_entry_index_metadata_changed
         )
         operation = (
             "update_reference_card_context"

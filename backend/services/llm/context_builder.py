@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import unicodedata
 from typing import Dict, List, Optional
 
@@ -40,6 +42,19 @@ RECENT_CHAPTER_COUNT = 5
 # A profile may retain more examples for editing/export, while prose generation only
 # receives a small sample. The remaining examples are reference material, not facts.
 DIALOGUE_EXAMPLES_PER_CHARACTER = 4
+
+# 世界书可以有数百条，细纲阶段只给 Agent 一份有界目录，不给条目正文。
+# 这里按 Python 字符数计数而不是 UTF-8 字节数；中文也严格是一字符，避免同一份
+# 目录仅因语言不同产生三倍容量偏差。完整条目正文仍只由 assemble_context 按细纲
+# referenced_worldbook_card_ids 装配。
+WORLD_ENTRY_INDEX_MAX_CHARACTERS = 12_000
+WORLD_ENTRY_INDEX_SUMMARY_MAX_CHARACTERS = 160
+WORLD_ENTRY_INDEX_SECTION = "world_entry_index"
+_WORLD_ENTRY_INDEX_HEADER = (
+    "【世界条目紧凑索引（仅用于细纲选择，不含条目正文）】\n"
+    "关键词只是检索信号，不会自动激活条目。需要使用某条设定时，必须把其 card_id "
+    "显式写入 referenced_worldbook_card_ids；完整正文只会在声明后由系统按正式 ID 装配。"
+)
 
 # other_threads 中 due 为空的 drop_rank：无截止期即无紧迫性，视作无限远，最先丢。
 _NO_DUE_DROP_RANK = -(10 ** 9)
@@ -75,6 +90,10 @@ class ContextItem(BaseModel):
 
     text: str = Field(description="条目正文")
     drop_rank: int = Field(default=0, description="截断排序键：同段落内越小越先丢")
+    selection_id: Optional[str] = Field(
+        default=None,
+        description="细纲选择目录对应的正式 card_id；普通上下文条目为空",
+    )
 
 
 class ContextSection(BaseModel):
@@ -200,6 +219,10 @@ class ChapterContext(BaseModel):
         default_factory=dict,
         description="部分被丢（段落未清空）的段落 -> 丢弃条目数；与 truncated_sections 互补",
     )
+    selectable_worldbook_card_ids: List[str] = Field(
+        default_factory=list,
+        description="本次实际展示给细纲 Agent 的世界资料卡正式 ID，按索引呈现顺序排列",
+    )
 
     @property
     def total_tokens(self) -> int:
@@ -238,15 +261,18 @@ class ContextBudgetError(Exception):
 
 
 # 细纲模式的截断优先级：与正文模式不同。roster 永不截断——截了它 AI 就吐不出
-# 合法 id，是失败而非降级。没有 chapter_outline/present_cards/threads_to_resolve
-# 三段（它们是本工作流的输出）。
+# 合法人物/伏笔 id，是失败而非降级。世界卡不再塞进 roster，而由有独立字符
+# 上限的 world_entry_index 承载；该目录允许显式截断并复用 context_truncated
+# 通知。没有 chapter_outline/present_cards/threads_to_resolve 三段（它们是本
+# 工作流的输出）。
 OUTLINE_SECTION_PRIORITY = {
     "core_settings": 100,     # 永不截断
     "permanent_facts": 100,   # 永不截断——死人复活屏障
-    "roster": 100,            # 永不截断——AI 选人/选物/选伏笔的唯一来源
+    "roster": 100,            # 永不截断——AI 选人物/伏笔的唯一来源
     "volume": 100,            # 永不截断——章节细纲必须服从本卷结构
     "recent_chapters": 30,
     "other_threads": 20,
+    WORLD_ENTRY_INDEX_SECTION: 10,
 }
 OUTLINE_NEVER_TRUNCATE = {name for name, weight in OUTLINE_SECTION_PRIORITY.items() if weight >= 100}
 
@@ -621,9 +647,14 @@ async def fetch_roster(novel_id: str) -> dict:
 
 
 def _roster_section(roster: dict) -> ContextSection:
-    """把 roster 装成一个永不截断的段落，条目携带 id 供 AI 选中。"""
+    """把人物/伏笔 roster 装成永不截断段落。
+
+    世界资料卡刻意不在这里呈现：其完整 description 可能是数千字条目正文，数百
+    条会把 roster 撑爆。它们由 _world_entry_index_section 以关键词 + 一句话摘要
+    的形式单独、有界呈现。
+    """
     lines: list = []
-    for label, key in (("人物", "characters"), ("世界设定", "worldbook"), ("伏笔", "threads")):
+    for label, key in (("人物", "characters"), ("伏笔", "threads")):
         entries = roster.get(key) or []
         if not entries:
             continue
@@ -637,11 +668,197 @@ def _roster_section(roster: dict) -> ContextSection:
     return _blob("roster", "\n".join(lines))
 
 
+def _normalized_inline_text(value: object) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _one_sentence_summary(value: object) -> str:
+    """从正式卡描述派生有界的一句话摘要，不把完整条目正文复制进索引。"""
+    text = _normalized_inline_text(value)
+    if not text:
+        return ""
+    sentence_end = len(text)
+    for index, char in enumerate(text):
+        if char in "。！？!?；;.":
+            sentence_end = index + 1
+            break
+    summary = text[:sentence_end]
+    if len(summary) <= WORLD_ENTRY_INDEX_SUMMARY_MAX_CHARACTERS:
+        return summary
+    return summary[: WORLD_ENTRY_INDEX_SUMMARY_MAX_CHARACTERS - 1] + "…"
+
+
+def _world_entry_metadata(card: dict) -> tuple[list[str], bool, float]:
+    interop = card.get("interop")
+    display = (
+        interop.get("display_metadata")
+        if isinstance(interop, dict)
+        else None
+    )
+    display = display if isinstance(display, dict) else {}
+    raw_keys = display.get("keys")
+    keys = (
+        [str(item) for item in raw_keys if isinstance(item, str)]
+        if isinstance(raw_keys, list)
+        else []
+    )
+    regex_indexes: set[int] = set()
+    raw_regex_fields = display.get("regex_fields")
+    if isinstance(raw_regex_fields, list):
+        for raw_field in raw_regex_fields:
+            field = str(raw_field)
+            if field.startswith("key[") and field.endswith("]"):
+                try:
+                    regex_indexes.add(int(field[4:-1]))
+                except ValueError:
+                    continue
+    preview_notices = display.get("preview_notices")
+    entry_level_regex = (
+        isinstance(preview_notices, list)
+        and any(
+            isinstance(item, dict) and item.get("code") == "regex_present"
+            for item in preview_notices
+        )
+        and not regex_indexes
+    )
+    if entry_level_regex:
+        # V3 use_regex=true 是条目级开关；安全投影固定关闭，因此这些 keys 不得
+        # 伪装成普通关键词影响细纲选择。其存在仍留在导入预览。
+        keys = []
+    elif regex_indexes:
+        # 独立 World Info 可在同一 keys 数组混合普通词和 /.../flags；只保留
+        # 普通词，正则字面量不执行、也不作为普通关键词送给 Agent。
+        keys = [key for index, key in enumerate(keys) if index not in regex_indexes]
+    constant = display.get("constant") is True
+    raw_order = display.get("insertion_order")
+    insertion_order = (
+        float(raw_order)
+        if isinstance(raw_order, (int, float))
+        and not isinstance(raw_order, bool)
+        and math.isfinite(float(raw_order))
+        else 0.0
+    )
+    return keys, constant, insertion_order
+
+
+def _world_entry_interop_projection(card: dict) -> dict:
+    """取索引所需白名单元数据，隔离 raw_entry/脚本/decorators 等其余内容。"""
+    raw_interop = card.get("interop")
+    raw_display = (
+        raw_interop.get("display_metadata")
+        if isinstance(raw_interop, dict)
+        else None
+    )
+    raw_display = raw_display if isinstance(raw_display, dict) else {}
+    display: dict = {}
+    for key in (
+        "keys",
+        "constant",
+        "insertion_order",
+        "regex_fields",
+        "preview_notices",
+    ):
+        value = raw_display.get(key)
+        if isinstance(value, list):
+            display[key] = [
+                dict(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        elif value is not None:
+            display[key] = value
+    return {"display_metadata": display}
+
+
+def _world_entry_index_section(
+    worldbook_cards: dict,
+) -> tuple[Optional[ContextSection], int]:
+    """构造硬字符上限内的世界条目目录。
+
+    保留优先级严格为 constant=true → importance=main → insertion_order 较高；
+    card_id 只作完全相同优先级下的稳定 tie-breaker。条目必须整行进入，不切断
+    card_id 或 keys；放不下就明确计入截断数。
+    """
+    ranked: list[tuple[bool, bool, float, str, dict]] = []
+    for raw_card_id, raw_card in worldbook_cards.items():
+        if not isinstance(raw_card, dict):
+            continue
+        card_id = str(raw_card_id)
+        _keys, constant, insertion_order = _world_entry_metadata(raw_card)
+        ranked.append(
+            (
+                constant,
+                str(raw_card.get("importance") or "sub") == "main",
+                insertion_order,
+                card_id,
+                raw_card,
+            )
+        )
+    ranked.sort(key=lambda item: (-int(item[0]), -int(item[1]), -item[2], item[3]))
+
+    items: list[ContextItem] = []
+    used_characters = len(_WORLD_ENTRY_INDEX_HEADER)
+    dropped = 0
+    for priority_index, (_constant, _main, _order, card_id, card) in enumerate(ranked):
+        keys, _constant_value, _order_value = _world_entry_metadata(card)
+        line = (
+            f"- card_id={card_id} | name={_normalized_inline_text(card.get('name'))}"
+            f" | keys={json.dumps(keys, ensure_ascii=False, separators=(',', ':'))}"
+            f" | summary={_one_sentence_summary(card.get('description'))}"
+        )
+        added_characters = len(line) + 1  # ContextSection.content 中 header/item 间的换行
+        if used_characters + added_characters > WORLD_ENTRY_INDEX_MAX_CHARACTERS:
+            # 严格保留排序后的前缀；不能因为后面的低优先级条目更短，就越过一个
+            # 放不下的高优先级条目把它塞进来，否则实际截断顺序不再是规格声明的
+            # constant → importance → insertion_order。
+            dropped += len(ranked) - priority_index
+            break
+        items.append(
+            ContextItem(
+                text=line,
+                # ranked 最前的是最高保留优先级；预算截断时反向从末尾开始丢。
+                drop_rank=-priority_index,
+                selection_id=card_id,
+            )
+        )
+        used_characters += added_characters
+
+    if not items:
+        return None, dropped
+    return (
+        ContextSection(
+            name=WORLD_ENTRY_INDEX_SECTION,
+            header=_WORLD_ENTRY_INDEX_HEADER,
+            items=items,
+        ),
+        dropped,
+    )
+
+
+def outline_selection_roster(
+    roster: dict,
+    selectable_worldbook_card_ids: list[str],
+) -> dict:
+    """把 AI 结果校验的世界卡名单收窄为本次索引实际展示过的正式 ID。"""
+    allowed = set(selectable_worldbook_card_ids)
+    return {
+        **roster,
+        "characters": list(roster.get("characters") or []),
+        "worldbook": [
+            dict(item)
+            for item in (roster.get("worldbook") or [])
+            if str(item.get("id") or "") in allowed
+        ],
+        "threads": list(roster.get("threads") or []),
+    }
+
+
 def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -> ChapterContext:
     """细纲模式装配。纯函数，不碰数据库。
 
     与 assemble_context（正文模式）的差异（设计 §4.2）：
-    - 加 roster（AI 选人/选物/选伏笔的名单，带 id），进永不截断档；
+    - 加人物/伏笔 roster（带 id），进永不截断档；
+    - 加世界条目紧凑索引（card_id/name/keys/一句话摘要），先过字符硬上限，
+      再服从总 token 预算；
     - 去掉 chapter_outline / present_cards / threads_to_resolve 三段——它们是本
       工作流的输出，生成细纲时尚不存在。
 
@@ -665,6 +882,12 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
     sections.append(_core_settings_section(novel))
 
     sections.append(_roster_section(roster))
+
+    world_entry_index, hard_index_dropped = _world_entry_index_section(
+        inputs.get("worldbook_cards") or {}
+    )
+    if world_entry_index is not None:
+        sections.append(world_entry_index)
 
     # 主要角色的 permanent_facts 无条件装配（死人复活屏障，细纲阶段同样需要）。
     # 这一段与正文模式的三档装配逻辑不同（这里只取主要角色），故不共用 helper。
@@ -702,7 +925,22 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
             f"很可能是 roster 过大（卡片/伏笔过多）。请精简后重试。"
         )
 
-    kept, dropped, partial = _truncate_to_budget(sections, budget, OUTLINE_SECTION_PRIORITY)
+    kept, dropped, partial = _truncate_to_budget(
+        sections,
+        budget,
+        OUTLINE_SECTION_PRIORITY,
+    )
+    if hard_index_dropped and WORLD_ENTRY_INDEX_SECTION not in dropped:
+        partial[WORLD_ENTRY_INDEX_SECTION] = (
+            partial.get(WORLD_ENTRY_INDEX_SECTION, 0) + hard_index_dropped
+        )
+    selectable_worldbook_card_ids = [
+        str(item.selection_id)
+        for section in kept
+        if section.name == WORLD_ENTRY_INDEX_SECTION
+        for item in section.items
+        if item.selection_id
+    ]
     if dropped or partial:
         logger.warning(
             "细纲上下文超预算，整段丢弃 %s，部分丢弃 %s（预算 %s tokens）。",
@@ -710,7 +948,12 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
             partial,
             budget,
         )
-    return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
+    return ChapterContext(
+        sections=kept,
+        truncated_sections=dropped,
+        dropped_item_counts=partial,
+        selectable_worldbook_card_ids=selectable_worldbook_card_ids,
+    )
 
 
 async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
@@ -777,6 +1020,11 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
                 "name": card.get("name", ""),
                 "description": card.get("description", ""),
                 "card_type": card.get("card_type", card_type),
+                "importance": card.get("importance", "sub"),
+                "sort_order": card.get("sort_order", 0),
+                # 严格白名单投影；raw_entry、decorators、regex_scripts 与其他隔离
+                # 内容连取数结果都不进入，更不会意外出现在 Prompt。
+                "interop": _world_entry_interop_projection(card),
             }
 
     projection = await narrative_timeline.context_before(novel_id, chapter_id)

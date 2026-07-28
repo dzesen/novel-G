@@ -22,7 +22,10 @@ from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineAdherenceResultSchema,
 )
 from backend.services.llm.context_builder import (
-    assemble_context, assemble_outline_context, fetch_context_inputs,
+    assemble_context,
+    assemble_outline_context,
+    fetch_context_inputs,
+    outline_selection_roster,
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.prose_runner import stream_prose
@@ -227,7 +230,10 @@ async def generate_outline(
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
     context = assemble_outline_context(inputs)
-    roster = inputs["roster"]
+    roster = outline_selection_roster(
+        inputs["roster"],
+        context.selectable_worldbook_card_ids,
+    )
     # words_per_chapter 是小说级字段（chapter 文档上不存在这一字段，见
     # backend/api/default_routers/novel_router.py 的 NovelBase），故须另取 novel
     # 文档；与 outline_router.create_chapter_outline_by_ai 的取值方式一致

@@ -434,12 +434,15 @@ create_chapter_outline_by_ai:
     - core_conflict：本章的核心冲突，一句话。
     - ending_hook：章末钩子，让读者想读下一章。
     - target_word_count：本章目标字数，接近 {words_per_chapter}。
-    - 凡指向人物、世界设定、伏笔的字段，**只能填上文【可用 id 名单】里出现过的 id 原文**：
+    - 凡指向人物、伏笔的字段，**只能填上文【可用 id 名单】里出现过的 id 原文**：
       pov_character_card_id（视角人物，可为 null）、
       present_character_card_ids（本章出场人物）、
       mentioned_character_card_ids（本章被提及但不出场的人物）、
-      referenced_worldbook_card_ids（本章涉及的地点/物品/规则）、
       threads_resolved（本章回收的伏笔）。
+    - 【世界条目紧凑索引】中的关键词只帮助你检索，不会自动激活条目，摘要也不是条目正文。
+      本章需要某条地点、物品、规则或通用世界设定时，必须把索引里的 card_id 原文
+      **显式写入 referenced_worldbook_card_ids**。完整正文只会在你声明其 card_id 后
+      由系统按正式 ID 装配；没有声明的条目绝不能仅因关键词出现在前文而引用。
       **不要自己编造 id**：名单之外的 id 会被系统剔除并报告给用户。
     - new_threads：本章新埋下的伏笔，每条给 name、description、due_target、
       importance（main 或 sub）。due_target 已有目标章节时用

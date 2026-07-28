@@ -338,7 +338,11 @@ class ChapterOutlineAuthoredSchema(BaseModel):
         default_factory=list, description="本章被提及但不出场的人物卡 id"
     )
     referenced_worldbook_card_ids: List[str] = Field(
-        default_factory=list, description="本章引用的地点/物品/规则卡 id（worldbook 集合，非 characters）"
+        default_factory=list,
+        description=(
+            "本章从世界条目紧凑索引中显式声明的地点/物品/规则/通用世界设定卡 id"
+            "（worldbook 集合，非 characters）"
+        ),
     )
     scenes: List[SceneSchema] = Field(..., min_length=1, max_length=20, description="本章场景序列")
     core_conflict: str = Field(..., min_length=1, max_length=500, description="本章核心冲突")

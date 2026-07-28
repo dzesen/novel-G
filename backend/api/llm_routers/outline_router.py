@@ -36,6 +36,7 @@ from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_outline_context,
     fetch_context_inputs,
+    outline_selection_roster,
 )
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
@@ -223,7 +224,10 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
 
-    roster = inputs["roster"]
+    roster = outline_selection_roster(
+        inputs["roster"],
+        context.selectable_worldbook_card_ids,
+    )
 
     async def event_stream() -> AsyncGenerator[str, None]:
         if context.truncated_sections or context.dropped_item_counts:
