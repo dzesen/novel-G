@@ -568,10 +568,26 @@ async def init_prose_run_indexes():
             ]),
             pymongo.IndexModel([("novel_id", 1), ("updated_at", -1)]),
             pymongo.IndexModel([("lease.expires_at", 1)]),
+            # Status is included in the partial filter so legacy runs created
+            # before this index are protected without a schema backfill.
+            pymongo.IndexModel(
+                [("owner_id", 1), ("chapter_id", 1)],
+                unique=True,
+                partialFilterExpression={
+                    "status": {
+                        "$in": ["active", "incomplete", "complete"],
+                    },
+                    "is_deleted": False,
+                },
+                name="prose_runs_single_current",
+            ),
         ])
         logger.info("Initialized prose_runs indexes.")
     except Exception as exc:
         logger.error("Failed to initialize prose_runs indexes: %s", exc)
+        # Run replacement relies on this unique constraint to close the
+        # CAS-to-insert race. Continuing without it can duplicate paid work.
+        raise
 
 
 async def init_state_timeline_indexes():

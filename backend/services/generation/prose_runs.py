@@ -60,6 +60,18 @@ def serialize_prose_run(document: dict[str, Any] | None) -> dict[str, Any] | Non
     return result
 
 
+def _has_exhausted_segment(
+    document: dict[str, Any],
+    plan: ProseExecutionPlan,
+) -> bool:
+    return any(
+        segment.get("status") != "completed"
+        and int(segment.get("continuation_count") or 0)
+        >= plan.max_continuations
+        for segment in document.get("segments") or []
+    )
+
+
 class ProseRunModule:
     async def begin(
         self,
@@ -74,9 +86,12 @@ class ProseRunModule:
         run_id: str | None = None,
         expected_revision: int | None = None,
         confirm_uncertain_retry: bool = False,
+        replace_exhausted: bool = False,
     ) -> dict[str, Any]:
         outline_revision = prose_revision(outline)
         context_revision = prose_revision(context_text)
+        replace_run_id: str | None = None
+        replace_revision: int | None = None
         if run_id:
             existing = await prose_run_repo.get_run(run_id, owner_id)
             if (
@@ -128,32 +143,44 @@ class ProseRunModule:
                     "存在已派发但未确认结果的正文请求，可能已经计费；"
                     "请明确确认可能重复计费后再继续"
                 )
+            # Replacement is a new explicit headless attempt, but it must never
+            # bypass the uncertain-call billing acknowledgement above.
             revision = (
                 int(expected_revision)
                 if expected_revision is not None
                 else int(existing.get("revision") or 0)
             )
-            return await prose_run_repo.claim(
-                run_id=run_id,
-                owner_id=owner_id,
-                expected_revision=revision,
-            )
+            if not (
+                replace_exhausted
+                and _has_exhausted_segment(existing, plan)
+            ):
+                return await prose_run_repo.claim(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    expected_revision=revision,
+                )
+            replace_run_id = run_id
+            replace_revision = revision
 
-        created = await prose_run_repo.create_run({
-            "owner_id": owner_id,
-            "novel_id": novel_id,
-            "chapter_id": chapter_id,
-            "outline_revision": outline_revision,
-            "context_revision": context_revision,
-            "plan": plan.to_dict(),
-            "provider_plan": dict(provider_plan),
-            "narrative_revision": await narrative_revision_store.current(
-                novel_id
-            ),
-            "completion": None,
-            "assembled_text": "",
-            "acceptance_state": None,
-        })
+        created = await prose_run_repo.create_run(
+            {
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "chapter_id": chapter_id,
+                "outline_revision": outline_revision,
+                "context_revision": context_revision,
+                "plan": plan.to_dict(),
+                "provider_plan": dict(provider_plan),
+                "narrative_revision": (
+                    await narrative_revision_store.current(novel_id)
+                ),
+                "completion": None,
+                "assembled_text": "",
+                "acceptance_state": None,
+            },
+            replace_run_id=replace_run_id,
+            expected_revision=replace_revision,
+        )
         return await prose_run_repo.claim(
             run_id=str(created["_id"]),
             owner_id=owner_id,

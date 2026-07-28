@@ -353,6 +353,7 @@ async def generate_prose(
         confirm_uncertain_retry=bool(
             getattr(attempt_scope, "confirm_uncertain_retry", False)
         ),
+        replace_exhausted=True,
     )
     latest_run = run_document
 

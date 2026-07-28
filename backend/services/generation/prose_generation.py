@@ -199,8 +199,9 @@ async def execute_prose_plan(
             >= plan.max_continuations
         ):
             raise ProseContinuationLimit(
-                "正文分段已达到继续生成次数上限；请人工补写、接受部分正文，"
-                "或放弃草稿后重新生成"
+                "正文分段已达到继续生成次数上限；"
+                "请在本章「AI 写正文」面板中接受部分正文，"
+                "或点击「丢弃」后重新生成"
             )
         prior_text = "\n\n".join(
             str(by_sequence[index].get("text") or "").strip()
