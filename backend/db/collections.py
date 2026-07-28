@@ -35,6 +35,7 @@ PLOT_THREAD_EVENTS = "plot_thread_events"
 MANUAL_CORRECTIONS = "manual_corrections"
 STATE_PREVIEWS = "state_previews"
 REFERENCE_CARD_PROPOSALS = "reference_card_proposals"
+CARD_IMPORT_PROPOSALS = "card_import_proposals"
 MUTATION_JOURNALS = "mutation_journals"
 
 ACTIVE_COLLECTIONS = frozenset({
@@ -59,6 +60,7 @@ ACTIVE_COLLECTIONS = frozenset({
     MANUAL_CORRECTIONS,
     STATE_PREVIEWS,
     REFERENCE_CARD_PROPOSALS,
+    CARD_IMPORT_PROPOSALS,
     MUTATION_JOURNALS,
 })
 
@@ -88,9 +90,10 @@ LEGACY_COLLECTIONS = frozenset({
 ALL_COLLECTIONS = ACTIVE_COLLECTIONS | LEGACY_COLLECTIONS
 REGISTERED_COLLECTIONS = ALL_COLLECTIONS | EPHEMERAL_COLLECTIONS
 
-# 小说作用域集合：除 NOVELS（被删除的根记录，按 _id 删）外，其余每个集合
-# 的每条记录都挂着 novel_id，novel_service.hard_delete_novel 的级联清理
-# 必须覆盖到这里的每一个，一个不落——包括上面三个遗留幽灵集合。
+# 小说作用域集合：除 NOVELS（被删除的根记录，按 _id 删）外，其余集合
+# 的记录都带 novel_id。唯一允许为空的是建书前的 CARD_IMPORT_PROPOSALS；
+# hard_delete_novel 只清理其中已绑定当前小说的记录，不能误删 null 提案。
+# 级联清理仍必须覆盖这里的每一个集合，包括上面三个遗留幽灵集合。
 # tests/test_novel_service.py 拿它核对级联的完整性，用法与
 # BACKUP_COLLECTIONS 的覆盖测试同源。
 NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS, USERS, AGENT_DEFINITIONS}

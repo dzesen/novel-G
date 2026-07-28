@@ -375,6 +375,39 @@ async def init_reference_card_proposal_indexes():
         logger.error("Failed to initialize reference-card proposal indexes: %s", exc)
 
 
+async def init_card_import_proposal_indexes():
+    """Initialize owner-scoped import lookup, duplicate, and retention indexes."""
+    try:
+        collection = get_database()[collections.CARD_IMPORT_PROPOSALS]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("status", pymongo.ASCENDING),
+                    ("updated_at", pymongo.DESCENDING),
+                ],
+                name="card_import_proposals_owner_novel_status",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("source_hash", pymongo.ASCENDING),
+                    ("imported_at", pymongo.DESCENDING),
+                ],
+                name="card_import_proposals_owner_source_hash",
+            ),
+            pymongo.IndexModel(
+                [("purge_after", pymongo.ASCENDING)],
+                expireAfterSeconds=0,
+                name="card_import_proposals_retention_ttl",
+            ),
+        ])
+        logger.info("Initialized card-import proposal indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize card-import proposal indexes: %s", exc)
+
+
 async def init_faction_relation_indexes():
     """初始化faction_relations集合的索引。"""
     try:
@@ -581,6 +614,7 @@ async def init_all_indexes():
     await init_chapter_indexes()
     await init_reference_card_indexes()
     await init_reference_card_proposal_indexes()
+    await init_card_import_proposal_indexes()
     await init_faction_indexes()
     await init_faction_relation_indexes()
     await init_plot_thread_indexes()
