@@ -9,6 +9,7 @@ import type {
   ReferenceCard,
   ReferenceCardType,
 } from "@/types/novel";
+import CardImportDialog from "./CardImportDialog";
 import ReferenceCardCurationDialog from "./ReferenceCardCurationDialog";
 
 interface ReferenceCardsWorkspaceProps {
@@ -82,6 +83,7 @@ export default function ReferenceCardsWorkspace({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showCuration, setShowCuration] = useState(false);
+  const [showCardImport, setShowCardImport] = useState(false);
 
   const selectedCard = useMemo(
     () => cards.find((card) => card._id === selectedId) ?? null,
@@ -252,13 +254,20 @@ export default function ReferenceCardsWorkspace({
               <h1 className="text-lg font-semibold text-foreground">{t(`types.${cardType}`)}</h1>
               <p className="mt-1 text-xs text-muted">{t(`typeDescriptions.${cardType}`)}</p>
             </div>
-            <div className="flex shrink-0 gap-2">
+            <div className="flex shrink-0 flex-wrap justify-end gap-2">
               <button
                 type="button"
                 onClick={() => setShowCuration(true)}
                 className="inline-flex h-9 items-center justify-center rounded-lg border border-accent/30 bg-accent/10 px-3 text-xs font-semibold text-accent transition-colors hover:bg-accent/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               >
                 {t("aiCuration")}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowCardImport(true)}
+                className="inline-flex h-9 items-center justify-center rounded-lg border border-accent/30 bg-background px-3 text-xs font-semibold text-accent transition-colors hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {t("importCards")}
               </button>
               <button
                 type="button"
@@ -482,6 +491,12 @@ export default function ReferenceCardsWorkspace({
         novelId={novelId}
         isOpen={showCuration}
         onClose={() => setShowCuration(false)}
+        onApplied={loadCards}
+      />
+      <CardImportDialog
+        novelId={novelId}
+        isOpen={showCardImport}
+        onClose={() => setShowCardImport(false)}
         onApplied={loadCards}
       />
     </div>

@@ -1099,6 +1099,7 @@
       "createModeUnavailable": "请先保存小说，再建立与小说绑定的资料卡。",
       "newCard": "新建资料卡",
       "aiCuration": "AI 建卡",
+      "importCards": "导入酒馆卡",
       "editing": "编辑资料卡",
       "search": "搜索名称、描述或标签",
       "active": "资料卡 {count}",
@@ -1136,6 +1137,121 @@
       "addDialogueExample": "添加对白示例",
       "addOpeningExample": "添加开场灵感",
       "removeExample": "移除此条",
+      "import": {
+        "eyebrow": "外部资料 · 人工确认",
+        "title": "导入酒馆角色卡与世界卡",
+        "description": "上传 JSON、PNG 或独立世界书，先查看安全映射与冲突，再逐项决定如何写入这本小说。",
+        "close": "关闭导入",
+        "upload": {
+          "label": "选择角色卡或世界书文件",
+          "hint": "可一次选择多份 Character Card V1/V2/V3 JSON、带 chara/ccv3 元数据的 PNG，或 SillyTavern 独立 World Info JSON。",
+          "fileSize": "{bytes} bytes",
+          "remove": "移除",
+          "formatsTitle": "同一条受控导入链路",
+          "formatsDetail": "每个文件都调用已有小说的 Card Import Proposal 预览 API；预览只建立待审核提案，不会改动正式资料卡。",
+          "safetyTitle": "外部指令不会自动启用",
+          "safetyDetail": "system_prompt、post_history_instructions、depth_prompt、regex_scripts、decorators、正则与未知 extensions 会被隔离；远程素材不会下载。",
+          "parsing": "正在解析 {current}/{total}…",
+          "preview": "解析并查看映射"
+        },
+        "review": {
+          "title": "映射预览与逐项决策",
+          "description": "已建立 {files} 份提案，共 {candidates} 个资料卡候选。合并时，已有非空字段默认保留，只有你勾选的字段才会被覆盖。",
+          "bulkCreate": "全部改为新建",
+          "bulkSkip": "全部改为跳过",
+          "previousPage": "上一页",
+          "nextPage": "下一页",
+          "page": "第 {current} / {total} 页",
+          "chooseAgain": "重新选择文件",
+          "applying": "正在应用 {current}/{total}…"
+        },
+        "source": {
+          "unnamed": "未命名来源",
+          "format": "{format} · {container} · {count} 个候选",
+          "pending": "待应用",
+          "applied": "已应用",
+          "pngTitle": "PNG 元数据来源",
+          "pngChunk": "采用的文本块",
+          "pngJudgement": "内容判定",
+          "notAvailable": "无",
+          "imageDiscarded": "PNG 图像数据已丢弃且未落盘；本版只读取角色卡元数据。",
+          "pngClassification": {
+            "v1": "V1 内容",
+            "v2": "V2 内容",
+            "v3": "真 V3",
+            "pseudoV3": "伪 V3：ccv3 仅改写 spec，实际按 V2 解析",
+            "other": "其他判定：{value}"
+          },
+          "worldbookTitle": "世界书来源",
+          "worldbookDetail": "{kind} · {format} · {count} 个条目",
+          "unrecognizedTopFields": "未识别的顶层字段",
+          "riskTitle": "风险字段与不执行能力",
+          "riskDetail": "以下内容已保留供查阅或往返，但处于隔离状态，不会执行、下载或进入模型上下文。",
+          "isolatedDisabled": "已隔离 · 未启用",
+          "decorator": "decorator：{name}",
+          "asset": "素材：{type}",
+          "notDownloaded": "已隔离 · 未下载",
+          "duplicate": "相同来源文件曾被预览或正式导入；系统可能默认建议跳过，请确认是否确实要再次导入。",
+          "warnings": "兼容与来源提示",
+          "applyError": "此来源尚未应用：{message}"
+        },
+        "candidate": {
+          "type": {
+            "character": "角色卡",
+            "lore": "世界设定卡"
+          },
+          "applied": "已落卡",
+          "mappingTarget": "将映射为 novel-G {type}",
+          "mappedFields": "正式资料卡字段预览",
+          "participation": {
+            "active": "导入后可参与写作",
+            "activeHint": "安全投影字段：{fields}",
+            "notParticipating": "已导入但未参与写作",
+            "notParticipatingHint": "当前候选没有可安全投影到正文上下文的字段；被隔离的外部指令不会因此自动启用。"
+          },
+          "regexTitle": "此世界书条目包含正则",
+          "regexDetail": "正则原文已保留，但安全投影固定为 use_regex=false；不会编译、扫描或触发上下文注入。",
+          "unrecognizedFields": "未识别字段清单",
+          "unsupportedFeatures": "已识别但不执行的世界书行为",
+          "disabled": "未启用",
+          "notices": "条目解析提示",
+          "notice": {
+            "regex": "检测到正则，保持禁用",
+            "decorator": "检测到 V3 decorator，保持禁用",
+            "unrecognized": "未识别字段已原样保留",
+            "unsupported": "已知高级行为未启用",
+            "unknownPosition": "未知位置已保留，未猜测映射",
+            "other": "解析提示：{code}"
+          }
+        },
+        "merge": {
+          "target": "{match} 命中 · 资料卡 {id}",
+          "inTrash": "目标在回收站",
+          "tagsCombined": "自动合并标签",
+          "emptyFilled": "自动补齐空值",
+          "overwrite": "改用导入值",
+          "keepExistingHint": "未勾选：应用时保留现有非空值。",
+          "emptyValue": "空值",
+          "showFullValue": "查看完整值",
+          "collapseValue": "收起完整值"
+        },
+        "complete": {
+          "title": "酒馆卡已按决策落入资料卡",
+          "refreshHint": "当前资料卡列表已刷新；其他类型的候选可在对应资料卡工作台查看。"
+        },
+        "errors": {
+          "previewFailed": "文件解析或映射预览失败。",
+          "applyFailed": "提案应用失败，请检查是否已过期或目标资料卡已变化。",
+          "tooManyFiles": "一次最多选择 {max} 份文件。",
+          "rejectedTitle": "{count} 份文件被拒绝",
+          "item": "具体项",
+          "currentValue": "当前值",
+          "maximumValue": "上限",
+          "unknownItem": "未返回具体项",
+          "valueUnavailable": "API 未返回当前值",
+          "seeServerMessage": "见服务端错误说明"
+        }
+      },
       "curation": {
         "eyebrow": "人工审核后写入",
         "title": "AI 资料卡整理",

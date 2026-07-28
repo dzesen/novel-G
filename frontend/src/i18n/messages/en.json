@@ -1099,6 +1099,7 @@
       "createModeUnavailable": "Save the novel before creating reference cards tied to it.",
       "newCard": "New card",
       "aiCuration": "AI cards",
+      "importCards": "Import Tavern cards",
       "editing": "Editing card",
       "search": "Search names, descriptions, or tags",
       "active": "Cards {count}",
@@ -1136,6 +1137,121 @@
       "addDialogueExample": "Add dialogue example",
       "addOpeningExample": "Add opening inspiration",
       "removeExample": "Remove",
+      "import": {
+        "eyebrow": "External material · human review",
+        "title": "Import Tavern character and world cards",
+        "description": "Upload JSON, PNG, or a standalone world book, review its safe mapping and conflicts, then decide how every item enters this novel.",
+        "close": "Close import",
+        "upload": {
+          "label": "Choose character-card or world-book files",
+          "hint": "Select one or more Character Card V1/V2/V3 JSON files, PNG cards with chara/ccv3 metadata, or standalone SillyTavern World Info JSON files.",
+          "fileSize": "{bytes} bytes",
+          "remove": "Remove",
+          "formatsTitle": "One controlled import path",
+          "formatsDetail": "Every file uses the existing-novel Card Import Proposal preview API. Preview only stages a review proposal; it does not change formal reference cards.",
+          "safetyTitle": "External instructions stay disabled",
+          "safetyDetail": "system_prompt, post_history_instructions, depth_prompt, regex_scripts, decorators, regex behavior, and unknown extensions remain isolated. Remote assets are not downloaded.",
+          "parsing": "Parsing {current}/{total}…",
+          "preview": "Parse and review mapping"
+        },
+        "review": {
+          "title": "Mapping preview and item-by-item decisions",
+          "description": "{files} proposals contain {candidates} reference-card candidates. On merge, existing non-empty fields stay unchanged unless you explicitly select an imported value.",
+          "bulkCreate": "Set all to create",
+          "bulkSkip": "Set all to skip",
+          "previousPage": "Previous page",
+          "nextPage": "Next page",
+          "page": "Page {current} / {total}",
+          "chooseAgain": "Choose files again",
+          "applying": "Applying {current}/{total}…"
+        },
+        "source": {
+          "unnamed": "Unnamed source",
+          "format": "{format} · {container} · {count} candidates",
+          "pending": "Pending",
+          "applied": "Applied",
+          "pngTitle": "PNG metadata source",
+          "pngChunk": "Selected text chunk",
+          "pngJudgement": "Content classification",
+          "notAvailable": "None",
+          "imageDiscarded": "PNG image data was discarded and never stored. This version reads card metadata only.",
+          "pngClassification": {
+            "v1": "V1 content",
+            "v2": "V2 content",
+            "v3": "True V3",
+            "pseudoV3": "Pseudo V3: ccv3 only rewrites the spec and is parsed as V2",
+            "other": "Other classification: {value}"
+          },
+          "worldbookTitle": "World-book source",
+          "worldbookDetail": "{kind} · {format} · {count} entries",
+          "unrecognizedTopFields": "Unrecognized top-level fields",
+          "riskTitle": "Risk fields and inert capabilities",
+          "riskDetail": "These values are retained for inspection or round trips, but remain isolated: they do not execute, download, or enter model context.",
+          "isolatedDisabled": "Isolated · disabled",
+          "decorator": "Decorator: {name}",
+          "asset": "Asset: {type}",
+          "notDownloaded": "Isolated · not downloaded",
+          "duplicate": "The same source file was previously previewed or formally imported. The default may be skip; confirm whether you intend to import it again.",
+          "warnings": "Compatibility and source notices",
+          "applyError": "This source was not applied: {message}"
+        },
+        "candidate": {
+          "type": {
+            "character": "Character card",
+            "lore": "World lore card"
+          },
+          "applied": "Written",
+          "mappingTarget": "Maps to a novel-G {type}",
+          "mappedFields": "Formal reference-card field preview",
+          "participation": {
+            "active": "Will participate in writing",
+            "activeHint": "Safe projected fields: {fields}",
+            "notParticipating": "Imported but not participating in writing",
+            "notParticipatingHint": "This candidate currently has no field that can be safely projected into prose context. Isolated external instructions will not be enabled as a substitute."
+          },
+          "regexTitle": "This world-book entry contains regex behavior",
+          "regexDetail": "The original regex is retained, but the safe projection forces use_regex=false. It is not compiled, scanned, or allowed to trigger context injection.",
+          "unrecognizedFields": "Unrecognized fields",
+          "unsupportedFeatures": "Recognized but inactive world-book behavior",
+          "disabled": "Disabled",
+          "notices": "Entry parsing notices",
+          "notice": {
+            "regex": "Regex detected and kept disabled",
+            "decorator": "V3 decorator detected and kept disabled",
+            "unrecognized": "Unrecognized field retained unchanged",
+            "unsupported": "Known advanced behavior kept disabled",
+            "unknownPosition": "Unknown position retained without guessing",
+            "other": "Parsing notice: {code}"
+          }
+        },
+        "merge": {
+          "target": "{match} match · card {id}",
+          "inTrash": "Target is in trash",
+          "tagsCombined": "Tags merge automatically",
+          "emptyFilled": "Empty value fills automatically",
+          "overwrite": "Use imported value",
+          "keepExistingHint": "Not selected: the existing non-empty value will be kept.",
+          "emptyValue": "Empty",
+          "showFullValue": "Show full value",
+          "collapseValue": "Collapse full value"
+        },
+        "complete": {
+          "title": "Tavern cards were written according to your decisions",
+          "refreshHint": "The current card list has refreshed. Candidates of other types are available in their corresponding reference-card workspaces."
+        },
+        "errors": {
+          "previewFailed": "The file could not be parsed or mapped for preview.",
+          "applyFailed": "The proposal could not be applied. Check whether it expired or its target card changed.",
+          "tooManyFiles": "Select no more than {max} files at once.",
+          "rejectedTitle": "{count} files were rejected",
+          "item": "Limit item",
+          "currentValue": "Current value",
+          "maximumValue": "Maximum",
+          "unknownItem": "No item returned",
+          "valueUnavailable": "The API did not return the current value",
+          "seeServerMessage": "See the server error message"
+        }
+      },
       "curation": {
         "eyebrow": "Writes only after review",
         "title": "AI reference-card curation",

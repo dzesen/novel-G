@@ -12,11 +12,13 @@ let authHooks: ApiAuthHooks = {
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly detail: unknown;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, detail?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -83,8 +85,13 @@ async function responseError(response: Response): Promise<ApiError> {
       })
       .filter(Boolean);
     if (validationMessages.length) message = validationMessages.join("；");
+  } else if (detail && typeof detail === "object") {
+    const structuredMessage = (detail as { message?: unknown }).message;
+    if (typeof structuredMessage === "string" && structuredMessage.trim()) {
+      message = structuredMessage;
+    }
   }
-  return new ApiError(message, response.status);
+  return new ApiError(message, response.status, detail);
 }
 
 export async function apiRequest<T = unknown>(

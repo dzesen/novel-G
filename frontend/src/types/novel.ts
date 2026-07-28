@@ -208,20 +208,27 @@ export interface CardImportCandidate {
     };
   };
   interop_preview?: {
+    name?: string;
     keys?: string[];
+    secondary_keys?: string[];
     enabled?: boolean;
     constant?: boolean;
     insertion_order?: number;
+    position?: string | number;
+    use_regex?: false;
+    external_uid?: string | number | null;
     source_locator?: string;
     regex_fields?: string[];
     unrecognized_fields?: string[];
     unsupported_features?: Array<{
-      kind?: string;
-      enabled?: boolean;
+      field: string;
+      category: string;
+      enabled: false;
     }>;
     preview_notices?: Array<{
-      code?: string;
-      message?: string;
+      code: string;
+      path: string;
+      message: string;
     }>;
   };
   conflicts: CardImportConflict[];
@@ -230,7 +237,7 @@ export interface CardImportCandidate {
 
 export interface CardImportProposal {
   proposal_id: string;
-  novel_id: null;
+  novel_id: string | null;
   source_format: "v1" | "v2" | "v3" | "worldbook_standalone";
   source_container: "json" | "png";
   source_name?: string | null;
@@ -239,11 +246,27 @@ export interface CardImportProposal {
   detected_warnings: string[];
   prompt_risk_fields: Array<{
     kind: string;
-    path?: string;
+    path: string;
+    value?: unknown;
     enabled: false;
   }>;
-  decorators: Array<{ kind?: string; enabled?: false }>;
-  assets: Array<{ type?: string; retrieval_enabled?: false }>;
+  decorators: Array<{
+    path: string;
+    name: string;
+    value: string;
+    raw: string;
+    fallback: boolean;
+    known: boolean;
+    enabled: false;
+  }>;
+  assets: Array<{
+    path: string;
+    type: string;
+    uri: string;
+    name: string;
+    ext: string;
+    retrieval_enabled: false;
+  }>;
   container_preview: {
     selected_png_chunk?: string | null;
     png_chunk_classification?: string | null;
@@ -258,6 +281,7 @@ export interface CardImportProposal {
     unrecognized_top_level_fields: string[];
   } | null;
   proposed_cards: CardImportCandidate[];
+  apply_result?: ReferenceCardCurationResult;
   duplicate_source?: {
     proposal_id?: string;
     card_id?: string;
