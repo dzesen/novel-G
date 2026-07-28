@@ -1,17 +1,20 @@
-"""Strict, side-effect-free Character Card JSON parsing.
+"""Strict, side-effect-free Character Card JSON and PNG parsing.
 
 This module deliberately stops at a bounded preview representation.  It does
 not write to MongoDB, fetch assets, execute regular expressions/decorators, or
-send any imported value to an LLM.
+send any imported value to an LLM. PNG image data is never decoded or stored.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
 import re
+import zlib
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -23,6 +26,13 @@ MAX_ARRAY_ITEMS = 1_000
 MAX_OBJECT_FIELDS = 2_000
 MAX_NESTING_DEPTH = 32
 MAX_TOTAL_VALUES = 20_000
+MAX_PNG_BYTES = 10 * 1024 * 1024
+MAX_PNG_CHUNKS = 128
+MAX_PNG_CHUNK_JSON_BYTES = MAX_JSON_BYTES
+MAX_PNG_DECODED_BYTES = 2 * MAX_PNG_CHUNK_JSON_BYTES
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_CARD_KEYWORDS = frozenset({"chara", "ccv3"})
 
 _V1_REQUIRED_STRINGS = (
     "name",
@@ -139,7 +149,7 @@ class ParsedCharacterCard:
     """Bounded Character Card preview with untrusted parts kept separate."""
 
     source_format: Literal["v1", "v2", "v3"]
-    source_container: Literal["json"]
+    source_container: Literal["json", "png"]
     spec_version: str
     fields: dict[str, Any]
     raw_card: dict[str, Any]
@@ -147,6 +157,12 @@ class ParsedCharacterCard:
     prompt_risk_fields: tuple[CharacterCardRiskField, ...]
     decorators: tuple[CharacterCardDecorator, ...]
     assets: tuple[CharacterCardAsset, ...]
+    selected_png_chunk: Literal["chara", "ccv3"] | None = None
+    png_chunk_classification: (
+        Literal["v1", "v2", "v3", "pseudo_v3"] | None
+    ) = None
+    png_preview_label: str | None = None
+    image_data_discarded: bool = False
 
     @property
     def risk_fields(self) -> tuple[CharacterCardRiskField, ...]:
@@ -180,6 +196,31 @@ def _reject_json_constant(value: str) -> None:
 
 def _fail(code: str, path: str, message: str) -> None:
     raise CharacterCardValidationError(code, path, message)
+
+
+def _decode_json_document(payload: bytes, *, path: str) -> Any:
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CharacterCardValidationError(
+            "invalid_encoding", path, "JSON 必须使用 UTF-8 编码"
+        ) from exc
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except _DuplicateKeyError as exc:
+        raise CharacterCardValidationError(
+            "duplicate_key", path, f"JSON 含重复字段：{exc}"
+        ) from exc
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise CharacterCardValidationError(
+            "malformed_json", path, "不是有效的 JSON"
+        ) from exc
+    _validate_resource_limits(value)
+    return value
 
 
 def _validate_resource_limits(value: Any) -> None:
@@ -442,7 +483,7 @@ def _isolated_extensions(
 
 
 def _parse_v2(
-    card: dict[str, Any], source_container: Literal["json"]
+    card: dict[str, Any], source_container: Literal["json", "png"]
 ) -> ParsedCharacterCard:
     version = _require_string(card, "spec_version", "$")
     if version != "2.0":
@@ -653,7 +694,7 @@ def _extract_v3_decorators(
 
 
 def _parse_v3(
-    card: dict[str, Any], source_container: Literal["json"]
+    card: dict[str, Any], source_container: Literal["json", "png"]
 ) -> ParsedCharacterCard:
     version = _require_string(card, "spec_version", "$")
     parsed_version = _parse_version(version, "$.spec_version")
@@ -800,8 +841,189 @@ def _parse_version(value: str, path: str) -> Decimal:
         _fail("invalid_version", path, "不是有效版本")
 
 
+def _extract_png_card_chunks(payload: bytes) -> dict[str, bytes]:
+    if len(payload) > MAX_PNG_BYTES:
+        _fail(
+            "file_too_large",
+            "$",
+            f"PNG 文件不得超过 {MAX_PNG_BYTES} bytes",
+        )
+    if not payload.startswith(_PNG_SIGNATURE):
+        _fail("invalid_png_signature", "$", "不是有效的 PNG 文件")
+
+    chunks: dict[str, bytes] = {}
+    chunk_count = 0
+    offset = len(_PNG_SIGNATURE)
+    saw_ihdr = False
+    saw_iend = False
+
+    while offset < len(payload):
+        if len(payload) - offset < 12:
+            _fail("truncated_png", "$", "PNG chunk 头或校验值不完整")
+        chunk_count += 1
+        if chunk_count > MAX_PNG_CHUNKS:
+            _fail(
+                "too_many_png_chunks",
+                "$",
+                f"PNG chunk 数量不得超过 {MAX_PNG_CHUNKS}",
+            )
+
+        data_length = int.from_bytes(payload[offset : offset + 4], "big")
+        chunk_type = payload[offset + 4 : offset + 8]
+        if len(chunk_type) != 4 or not all(
+            (65 <= byte <= 90) or (97 <= byte <= 122) for byte in chunk_type
+        ):
+            _fail("invalid_png_chunk_type", "$", "PNG chunk 类型无效")
+        data_start = offset + 8
+        data_end = data_start + data_length
+        crc_end = data_end + 4
+        if data_end < data_start or crc_end > len(payload):
+            _fail("truncated_png", "$", "PNG chunk 声明长度超出文件边界")
+
+        data_view = memoryview(payload)[data_start:data_end]
+        expected_crc = int.from_bytes(payload[data_end:crc_end], "big")
+        actual_crc = zlib.crc32(data_view, zlib.crc32(chunk_type)) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            _fail("invalid_png_crc", "$", "PNG chunk CRC 校验失败")
+
+        if chunk_count == 1:
+            if chunk_type != b"IHDR" or data_length != 13:
+                _fail("invalid_png_structure", "$", "PNG 首个 chunk 必须是 IHDR")
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            _fail("invalid_png_structure", "$", "PNG 只能包含一个首位 IHDR")
+
+        if chunk_type == b"tEXt":
+            separator = data_view.tobytes().find(b"\x00")
+            if separator < 1 or separator > 79:
+                _fail("malformed_png_text", "$", "PNG tEXt keyword 无效")
+            keyword = data_view[:separator].tobytes().decode("latin-1").lower()
+            if keyword in _PNG_CARD_KEYWORDS:
+                if keyword in chunks:
+                    _fail(
+                        "duplicate_png_card_chunk",
+                        f"$.png.tEXt.{keyword}",
+                        f"PNG 含多个 {keyword} 角色卡块",
+                    )
+                chunks[keyword] = data_view[separator + 1 :].tobytes()
+
+        offset = crc_end
+        if chunk_type == b"IEND":
+            if data_length != 0:
+                _fail("invalid_png_structure", "$", "IEND chunk 必须为空")
+            saw_iend = True
+            if offset != len(payload):
+                _fail("invalid_png_structure", "$", "IEND 后不得有额外数据")
+            break
+
+    if not saw_ihdr or not saw_iend:
+        _fail("truncated_png", "$", "PNG 缺少 IHDR 或 IEND")
+    if not chunks:
+        _fail("missing_character_metadata", "$", "PNG 不含 chara 或 ccv3 tEXt 块")
+
+    total_decoded_upper_bound = 0
+    for keyword, encoded in chunks.items():
+        # Base64 padding means this upper bound can exceed the actual size by
+        # at most two bytes per candidate chunk.
+        decoded_upper_bound = ((len(encoded) + 3) // 4) * 3
+        if decoded_upper_bound > MAX_PNG_CHUNK_JSON_BYTES + 2:
+            _fail(
+                "decoded_metadata_too_large",
+                f"$.png.tEXt.{keyword}",
+                f"单个 PNG 角色卡块解码后不得超过 {MAX_PNG_CHUNK_JSON_BYTES} bytes",
+            )
+        total_decoded_upper_bound += decoded_upper_bound
+    if total_decoded_upper_bound > MAX_PNG_DECODED_BYTES + 4:
+        _fail(
+            "decoded_metadata_too_large",
+            "$.png.tEXt",
+            f"PNG 角色卡块解码后合计不得超过 {MAX_PNG_DECODED_BYTES} bytes",
+        )
+    return chunks
+
+
+def _decode_png_card_chunk(encoded: bytes, *, keyword: str) -> Any:
+    path = f"$.png.tEXt.{keyword}"
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CharacterCardValidationError(
+            "invalid_base64", path, f"{keyword} 不是有效的 Base64"
+        ) from exc
+    if len(decoded) > MAX_PNG_CHUNK_JSON_BYTES:
+        _fail(
+            "decoded_metadata_too_large",
+            path,
+            f"单个 PNG 角色卡块解码后不得超过 {MAX_PNG_CHUNK_JSON_BYTES} bytes",
+        )
+    return _decode_json_document(decoded, path=path)
+
+
+def _equal_except_card_spec(left: Any, right: Any) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    ignored = {"spec", "spec_version"}
+    left_content = {
+        key: value for key, value in left.items() if key not in ignored
+    }
+    right_content = {
+        key: value for key, value in right.items() if key not in ignored
+    }
+    return _json_values_equal(left_content, right_content)
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        return (
+            isinstance(left, (int, float))
+            and not isinstance(left, bool)
+            and isinstance(right, (int, float))
+            and not isinstance(right, bool)
+            and left == right
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        return left.keys() == right.keys() and all(
+            _json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list):
+            return False
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return type(left) is type(right) and left == right
+
+
+def _with_png_preview(
+    parsed: ParsedCharacterCard,
+    *,
+    selected_chunk: Literal["chara", "ccv3"],
+    classification: Literal["v1", "v2", "v3", "pseudo_v3"],
+    label: str,
+    raw_card: dict[str, Any] | None = None,
+) -> ParsedCharacterCard:
+    image_warning = "PNG 图像数据已丢弃，本版不导入头像"
+    warnings = parsed.compatibility_warnings
+    if image_warning not in warnings:
+        warnings += (image_warning,)
+    return replace(
+        parsed,
+        raw_card=deepcopy(raw_card) if raw_card is not None else parsed.raw_card,
+        compatibility_warnings=warnings,
+        selected_png_chunk=selected_chunk,
+        png_chunk_classification=classification,
+        png_preview_label=label,
+        image_data_discarded=True,
+    )
+
+
 class CharacterCardAdapter:
-    """Public in-memory parsing seam for Character Card JSON files."""
+    """Public in-memory parsing seam for Character Card JSON and PNG files."""
 
     @classmethod
     def parse_json(
@@ -824,38 +1046,105 @@ class CharacterCardAdapter:
             _fail("mime_mismatch", "$", "声明的 MIME 必须是 application/json")
         if filename is not None and not filename.lower().endswith(".json"):
             _fail("extension_mismatch", "$", "JSON 角色卡文件名必须以 .json 结尾")
-        try:
-            text = payload.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise CharacterCardValidationError(
-                "invalid_encoding", "$", "JSON 必须使用 UTF-8 编码"
-            ) from exc
-        try:
-            value = json.loads(
-                text,
-                object_pairs_hook=_object_without_duplicate_keys,
-                parse_constant=_reject_json_constant,
-            )
-        except _DuplicateKeyError as exc:
-            raise CharacterCardValidationError(
-                "duplicate_key", "$", f"JSON 含重复字段：{exc}"
-            ) from exc
-        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-            raise CharacterCardValidationError(
-                "malformed_json", "$", "不是有效的 JSON"
-            ) from exc
-        _validate_resource_limits(value)
+        value = _decode_json_document(payload, path="$")
         return cls.parse(value, source_container="json")
+
+    @classmethod
+    def parse_png(
+        cls,
+        payload: bytes,
+        *,
+        declared_mime: str,
+        filename: str | None = None,
+    ) -> ParsedCharacterCard:
+        if not isinstance(payload, bytes):
+            _fail("invalid_payload", "$", "PNG 文件内容必须是 bytes")
+        mime = declared_mime.partition(";")[0].strip().lower()
+        if mime != "image/png":
+            _fail("mime_mismatch", "$", "声明的 MIME 必须是 image/png")
+        if filename is not None and not filename.lower().endswith(".png"):
+            _fail("extension_mismatch", "$", "PNG 角色卡文件名必须以 .png 结尾")
+
+        chunks = _extract_png_card_chunks(payload)
+        if "ccv3" not in chunks:
+            chara = _decode_png_card_chunk(chunks["chara"], keyword="chara")
+            parsed = cls.parse(chara, source_container="png")
+            format_label = parsed.source_format.upper()
+            return _with_png_preview(
+                parsed,
+                selected_chunk="chara",
+                classification=parsed.source_format,
+                label=f"采用 chara（{format_label}）",
+            )
+
+        ccv3 = _decode_png_card_chunk(chunks["ccv3"], keyword="ccv3")
+        try:
+            parsed_v3 = cls.parse(ccv3, source_container="png")
+            if parsed_v3.source_format != "v3":
+                _fail(
+                    "invalid_ccv3_spec",
+                    "$.png.tEXt.ccv3.spec",
+                    "ccv3 必须声明 chara_card_v3",
+                )
+        except CharacterCardValidationError as v3_error:
+            if "chara" not in chunks:
+                raise CharacterCardValidationError(
+                    "malformed_v3_chunk",
+                    "$.png.tEXt.ccv3",
+                    f"ccv3 未通过 V3 严格校验且没有 chara 可核对：{v3_error.message}",
+                ) from v3_error
+
+            chara = _decode_png_card_chunk(chunks["chara"], keyword="chara")
+            if not _equal_except_card_spec(ccv3, chara):
+                raise CharacterCardValidationError(
+                    "malformed_v3_chunk",
+                    "$.png.tEXt.ccv3",
+                    f"ccv3 未通过 V3 严格校验且与 chara 有实质差异：{v3_error.message}",
+                ) from v3_error
+
+            try:
+                parsed_chara = cls.parse(chara, source_container="png")
+                if parsed_chara.source_format != "v2":
+                    _fail(
+                        "invalid_chara_spec",
+                        "$.png.tEXt.chara.spec",
+                        "伪 V3 的 chara 对照块必须是 V2",
+                    )
+                v2_content = deepcopy(_require_object(ccv3, "$.png.tEXt.ccv3"))
+                v2_content["spec"] = "chara_card_v2"
+                v2_content["spec_version"] = "2.0"
+                parsed_v2 = cls.parse(v2_content, source_container="png")
+            except CharacterCardValidationError as v2_error:
+                raise CharacterCardValidationError(
+                    "malformed_v3_chunk",
+                    "$.png.tEXt.ccv3",
+                    f"spec 改写块的内容也不是有效 V2：{v2_error.message}",
+                ) from v2_error
+
+            return _with_png_preview(
+                parsed_v2,
+                selected_chunk="ccv3",
+                classification="pseudo_v3",
+                label="采用 ccv3，但内容实为 V2（酒馆导出的 spec 改写块）",
+                raw_card=_require_object(ccv3, "$.png.tEXt.ccv3"),
+            )
+
+        return _with_png_preview(
+            parsed_v3,
+            selected_chunk="ccv3",
+            classification="v3",
+            label="采用 ccv3（V3）",
+        )
 
     @classmethod
     def parse(
         cls,
         card: Any,
         *,
-        source_container: Literal["json"],
+        source_container: Literal["json", "png"],
     ) -> ParsedCharacterCard:
-        if source_container != "json":
-            _fail("unsupported_container", "$", "当前切片只接受 JSON 容器")
+        if source_container not in {"json", "png"}:
+            _fail("unsupported_container", "$", "只接受 JSON 或 PNG 容器")
         _validate_resource_limits(card)
         raw_card = deepcopy(_require_object(card, "$"))
         if "spec" in raw_card:
