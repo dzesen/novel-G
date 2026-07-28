@@ -499,6 +499,7 @@
       "loreCards": "通用世界设定",
       "relationshipMap": "关系图谱",
       "plotThreads": "伏笔管理",
+      "storyHealth": "故事健康",
       "characterMemory": "人物记忆",
       "agentStudio": "Agent 工作台"
     },
@@ -1512,6 +1513,88 @@
     "loading": "加载中...",
     "loadFailed": "加载失败",
     "backToCreate": "返回书架创建"
+  },
+  "storyHealth": {
+    "title": "故事健康面板",
+    "offlineBadge": "确定性 · 零模型调用",
+    "description": "直接读取伏笔、章节细纲与字数统计，提示值得作者复核的结构信号。结果不会自动修改正文、伏笔或人物资料。",
+    "refresh": "重新计算",
+    "loading": "正在计算…",
+    "loadError": "故事健康数据加载失败",
+    "needNovel": "请先保存小说，再查看故事健康信号。",
+    "errorWithRecovery": "{error}。请重新计算；本次失败不会修改任何数据。",
+    "unmappedPosition": "无法映射到稳定章节",
+    "unavailable": "暂无可靠数据",
+    "chapterPosition": "第{volume}卷·第{chapter}章 {title}",
+    "readOnlyNote": "本面板只做确定性查询与提示，不会发起 LLM 调用，也不会自动写入或修复任何数据。",
+    "summary": {
+      "dueThreads": "到期伏笔 {count}",
+      "absentCharacters": "当前缺席角色 {count}",
+      "wordDeviations": "字数偏离项 {count}",
+      "asOf": "叙事进度截止：{position}",
+      "noProgress": "尚无可计算的细纲或正文进度"
+    },
+    "plotThreads": {
+      "title": "伏笔到期",
+      "description": "跨度按稳定章节 ID 的全书时间线计算；卷内章号不会被当成全书位置。",
+      "activeCount": "未回收 {count} 条",
+      "empty": "当前没有未回收伏笔。",
+      "importanceMain": "主线",
+      "importanceSub": "支线",
+      "ageChapters": "已跨 {count} 章",
+      "columns": {
+        "name": "伏笔",
+        "planted": "埋设位置",
+        "age": "未回收跨度",
+        "due": "到期状态"
+      },
+      "states": {
+        "overdue": "已逾期 {count} 章",
+        "due": "本章到期",
+        "upcoming": "距到期 {count} 章",
+        "unscheduled": "未设置回收目标",
+        "unmapped": "历史位置待映射",
+        "not_started": "尚无叙事进度"
+      }
+    },
+    "characters": {
+      "title": "角色缺席",
+      "description": "仅统计已有细纲的 {count} 章，并且只认 present_character_card_ids 的正式角色 ID。",
+      "empty": "当前没有正式角色卡。",
+      "columns": {
+        "name": "角色",
+        "absence": "连续缺席",
+        "lastPresent": "最近出场"
+      },
+      "absentChapters": "连续 {count} 章未出场",
+      "presentLatest": "最新细纲有出场",
+      "neverPresent": "尚未在任何细纲中出场"
+    },
+    "wordCounts": {
+      "title": "字数偏离",
+      "description": "目标优先取章细纲，其次取小说默认值；偏离超过 ±{threshold}% 时标记为关注项。",
+      "volumes": "卷级汇总",
+      "writtenChapters": "已写章节",
+      "emptyVolumes": "当前没有卷。",
+      "emptyChapters": "当前还没有已写正文。",
+      "columns": {
+        "scope": "范围",
+        "actualTarget": "实际 / 目标",
+        "deviation": "偏离"
+      },
+      "volumeLabel": "第{volume}卷 {title}",
+      "chapterLabel": "第{volume}卷·第{chapter}章 {title}",
+      "volumeCoverage": "已有正文 {written} / {total} 章",
+      "actualTarget": "{actual} / {target} 字",
+      "deviationValue": "偏离 {percent}",
+      "states": {
+        "under": "低于目标",
+        "within_target": "目标范围内",
+        "over": "高于目标",
+        "no_content": "尚无正文",
+        "no_chapters": "尚无章节"
+      }
+    }
   },
   "plotThreads": {
     "title": "伏笔管理",

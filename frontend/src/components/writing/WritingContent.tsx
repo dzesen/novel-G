@@ -12,6 +12,7 @@ import ReferenceCardsWorkspace from "./reference-cards/ReferenceCardsWorkspace";
 import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
 import PlotThreadWorkspace from "./plot-threads/PlotThreadWorkspace";
 import CharacterMemoryWorkspace from "./character-memory/CharacterMemoryWorkspace";
+import StoryHealthWorkspace from "./story-health/StoryHealthWorkspace";
 import AgentStudioWorkspace from "./agents/AgentStudioWorkspace";
 
 interface WritingContentProps {
@@ -113,6 +114,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           initialThreadId={evidenceReference?.thread_id}
         />
       );
+    }
+    if (activeItem === "story-health") {
+      return <StoryHealthWorkspace mode={mode} novelId={novelId} />;
     }
     if (activeItem === "character-memory") {
       return (

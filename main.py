@@ -37,6 +37,7 @@ from backend.services.novel.mutation_recovery import recover_pending_mutations
 from backend.api.default_routers.backup_router import router as backup_router
 from backend.api.default_routers.reference_card_router import router as reference_card_router
 from backend.api.default_routers.plot_thread_router import router as plot_thread_router
+from backend.api.default_routers.story_health_router import router as story_health_router
 from backend.api.default_routers.character_state_router import router as character_state_router
 from backend.api.default_routers.generation_job_router import (
     router as generation_job_router,
@@ -138,6 +139,7 @@ app.include_router(upload_router)
 app.include_router(backup_router)
 app.include_router(reference_card_router)
 app.include_router(plot_thread_router)
+app.include_router(story_health_router)
 app.include_router(character_state_router)
 app.include_router(generation_job_router)
 app.include_router(state_timeline_router)

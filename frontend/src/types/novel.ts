@@ -554,4 +554,5 @@ export type WritingSidebarItem =
   | "lore-cards"
   | "relationship-map"
   | "plot-threads"
+  | "story-health"
   | "character-memory";

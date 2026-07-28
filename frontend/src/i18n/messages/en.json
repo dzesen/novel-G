@@ -499,6 +499,7 @@
       "loreCards": "Lore",
       "relationshipMap": "Relationship Map",
       "plotThreads": "Plot Threads",
+      "storyHealth": "Story Health",
       "characterMemory": "Character Memory",
       "agentStudio": "Agent Studio"
     },
@@ -1512,6 +1513,88 @@
     "loading": "Loading...",
     "loadFailed": "Failed to load",
     "backToCreate": "Back to Bookshelf"
+  },
+  "storyHealth": {
+    "title": "Story Health",
+    "offlineBadge": "Deterministic · No model calls",
+    "description": "Reads plot threads, chapter outlines, and word counts directly to surface structural signals worth an author review. It never edits prose, threads, or character data.",
+    "refresh": "Recalculate",
+    "loading": "Calculating…",
+    "loadError": "Failed to load story health data",
+    "needNovel": "Save the novel before viewing story health signals.",
+    "errorWithRecovery": "{error}. Recalculate to try again; this failure did not modify any data.",
+    "unmappedPosition": "No stable chapter mapping",
+    "unavailable": "No reliable data",
+    "chapterPosition": "Vol. {volume} · Ch. {chapter} {title}",
+    "readOnlyNote": "This panel only runs deterministic queries and surfaces reminders. It makes no LLM calls and never writes or repairs data automatically.",
+    "summary": {
+      "dueThreads": "Due threads {count}",
+      "absentCharacters": "Characters currently absent {count}",
+      "wordDeviations": "Word-count deviations {count}",
+      "asOf": "Narrative progress through {position}",
+      "noProgress": "No outline or prose progress to measure yet"
+    },
+    "plotThreads": {
+      "title": "Plot-thread due dates",
+      "description": "Spans use stable chapter IDs on the book-wide timeline; volume-local chapter numbers are never treated as book positions.",
+      "activeCount": "{count} unresolved",
+      "empty": "There are no unresolved plot threads.",
+      "importanceMain": "Main",
+      "importanceSub": "Sub",
+      "ageChapters": "{count} chapters elapsed",
+      "columns": {
+        "name": "Plot thread",
+        "planted": "Planted at",
+        "age": "Unresolved span",
+        "due": "Due state"
+      },
+      "states": {
+        "overdue": "{count} chapters overdue",
+        "due": "Due this chapter",
+        "upcoming": "Due in {count} chapters",
+        "unscheduled": "No due target",
+        "unmapped": "Legacy position needs mapping",
+        "not_started": "No narrative progress yet"
+      }
+    },
+    "characters": {
+      "title": "Character absence",
+      "description": "Counts only the {count} outlined chapters and only formal character IDs in present_character_card_ids.",
+      "empty": "There are no formal character cards.",
+      "columns": {
+        "name": "Character",
+        "absence": "Consecutive absence",
+        "lastPresent": "Last present"
+      },
+      "absentChapters": "Absent for {count} consecutive chapters",
+      "presentLatest": "Present in the latest outline",
+      "neverPresent": "Not present in any outline yet"
+    },
+    "wordCounts": {
+      "title": "Word-count deviation",
+      "description": "Targets come from the chapter outline first, then the novel default. Deviations beyond ±{threshold}% are marked for attention.",
+      "volumes": "Volume totals",
+      "writtenChapters": "Written chapters",
+      "emptyVolumes": "There are no volumes yet.",
+      "emptyChapters": "There is no written prose yet.",
+      "columns": {
+        "scope": "Scope",
+        "actualTarget": "Actual / target",
+        "deviation": "Deviation"
+      },
+      "volumeLabel": "Volume {volume} {title}",
+      "chapterLabel": "Vol. {volume} · Ch. {chapter} {title}",
+      "volumeCoverage": "{written} of {total} chapters have prose",
+      "actualTarget": "{actual} / {target} words",
+      "deviationValue": "Deviation {percent}",
+      "states": {
+        "under": "Below target",
+        "within_target": "Within target",
+        "over": "Above target",
+        "no_content": "No prose yet",
+        "no_chapters": "No chapters yet"
+      }
+    }
   },
   "plotThreads": {
     "title": "Plot Threads",
