@@ -1,6 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
@@ -17,15 +23,18 @@ import { ContextNotices, Notice } from "../outline/outlineUi";
 import { countChapterWords } from "../chapterUtils";
 import {
   buildProseAcceptPayload,
+  proseReasonTranslationKey,
   proseRequiresPartialAcknowledgement,
 } from "./prosePresentation";
 
 interface ProsePanelProps {
   novelId: string;
   chapterId: string;
+  initialRun?: ProseRunSnapshot | null;
   /** 编辑器里当前正文是否非空。为真时接受需要二次确认（设计 §2）。 */
   hasExistingContent: boolean;
   onClose: () => void;
+  onRunStateChanged?: () => void;
   onAccepted: (
     text: string,
     acceptanceState: "ai_complete" | "partial_manual_required",
@@ -35,8 +44,10 @@ interface ProsePanelProps {
 export default function ProsePanel({
   novelId,
   chapterId,
+  initialRun = null,
   hasExistingContent,
   onClose,
+  onRunStateChanged,
   onAccepted,
 }: ProsePanelProps) {
   const t = useTranslations("writing.prose");
@@ -49,6 +60,8 @@ export default function ProsePanel({
   const [restoreLoading, setRestoreLoading] = useState(true);
   const [accepting, setAccepting] = useState(false);
   const [actionError, setActionError] = useState("");
+  const [initialRunResolved, setInitialRunResolved] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   const running = stream.status === "running";
   const hasText = stream.text.length > 0;
@@ -63,6 +76,36 @@ export default function ProsePanel({
       ? proseRequiresPartialAcknowledgement(stream.completion)
       : incomplete,
   );
+  const selectedInitialRun = initialRunResolved ? null : initialRun;
+  const resumableDraft = Boolean(
+    stream.runId
+    && stream.runRevision != null
+    && (selectedInitialRun ? selectedInitialRun.can_resume : incomplete),
+  );
+  const reasonCodes = (
+    selectedInitialRun?.reason_codes?.length
+      ? selectedInitialRun.reason_codes
+      : stream.completion?.reason_codes
+  ) ?? [];
+
+  useEffect(() => {
+    setInitialRunResolved(false);
+  }, [initialRun?.run_id, initialRun?._id]);
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const firstFocusable = dialogRef.current?.querySelector<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    firstFocusable?.focus();
+    return () => {
+      if (previouslyFocused && document.contains(previouslyFocused)) {
+        previouslyFocused.focus();
+      }
+    };
+  }, []);
 
   const restoreActive = useCallback(async () => {
     setRestoreLoading(true);
@@ -79,8 +122,13 @@ export default function ProsePanel({
   }, [chapterId, hydrateRun]);
 
   useEffect(() => {
+    if (initialRun) {
+      hydrateRun(initialRun);
+      setRestoreLoading(false);
+      return;
+    }
     void restoreActive();
-  }, [restoreActive]);
+  }, [hydrateRun, initialRun, restoreActive]);
 
   useEffect(() => {
     if (stream.status === "cancelled") void restoreActive();
@@ -89,6 +137,10 @@ export default function ProsePanel({
   const accept = async () => {
     if (!hasText || running) return;
     setActionError("");
+    if (selectedInitialRun?.can_accept_partial === false) {
+      setActionError(t("leftoverAcceptUnavailable"));
+      return;
+    }
     if (partialAcceptance && !partialArmed) {
       setPartialArmed(true);
       return;
@@ -120,7 +172,11 @@ export default function ProsePanel({
       onClose();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
-      await restoreActive();
+      if (selectedInitialRun) {
+        onRunStateChanged?.();
+      } else {
+        await restoreActive();
+      }
     } finally {
       setAccepting(false);
     }
@@ -131,9 +187,11 @@ export default function ProsePanel({
     // 针对它的确认不该延续到下一份（2a Task 7 就栽在栓不复位上）。
     setOverwriteArmed(false);
     setPartialArmed(false);
-    const resuming = Boolean(
-      incomplete && stream.runId && stream.runRevision != null,
-    );
+    if (selectedInitialRun?.can_resume === false) {
+      setActionError(t("leftoverResumeUnavailable"));
+      return;
+    }
+    const resuming = resumableDraft;
     if (resuming && stream.hasUncertainAttempt && !uncertainRetryArmed) {
       setUncertainRetryArmed(true);
       return;
@@ -143,6 +201,7 @@ export default function ProsePanel({
     );
     setUncertainRetryArmed(false);
     setActionError("");
+    if (selectedInitialRun) setInitialRunResolved(true);
     void stream.start({
       novel_id: novelId,
       chapter_id: chapterId,
@@ -159,11 +218,16 @@ export default function ProsePanel({
 
   const discard = async () => {
     setActionError("");
+    if (stream.runId && stream.runRevision == null) {
+      setActionError(t("runMissing"));
+      return;
+    }
     if (stream.runId) {
       try {
         await apiPost(`/api/llm/prose-runs/${stream.runId}/discard`, {
           novel_id: novelId,
           chapter_id: chapterId,
+          expected_run_revision: stream.runRevision,
         });
       } catch (error) {
         setActionError(error instanceof Error ? error.message : String(error));
@@ -176,14 +240,74 @@ export default function ProsePanel({
     setOverwriteArmed(false);
     setPartialArmed(false);
     setUncertainRetryArmed(false);
+    setInitialRunResolved(true);
+    onRunStateChanged?.();
+  };
+
+  const reasonLabel = (reasonCode: string) => {
+    const key = proseReasonTranslationKey(reasonCode);
+    return key
+      ? t(`reasons.${key}`)
+      : t("reasons.unknown", { code: reasonCode });
+  };
+
+  const resumeUnavailableMessage = selectedInitialRun?.status === "stale"
+    ? t("leftoverResumeStale")
+    : selectedInitialRun?.continuation_exhausted
+      ? t("leftoverResumeExhausted")
+      : selectedInitialRun?.status === "superseded"
+        ? t("leftoverResumeSuperseded")
+        : t("leftoverResumeUnavailable");
+
+  const handleDialogKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    ).filter((element) => (
+      element.getAttribute("aria-hidden") !== "true"
+      && element.getClientRects().length > 0
+    ));
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialogRef.current?.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
   };
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/25 px-4 py-6">
-      <div className="flex max-h-full w-full max-w-5xl flex-col rounded-md border border-border bg-surface shadow-lg">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="prose-panel-title"
+        onKeyDown={handleDialogKeyDown}
+        className="flex max-h-full w-full max-w-5xl flex-col rounded-md border border-border bg-surface shadow-lg"
+      >
         <header className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0">
-            <h3 className="text-base font-semibold text-foreground">{t("title")}</h3>
+            <h3
+              id="prose-panel-title"
+              className="text-base font-semibold text-foreground"
+            >
+              {t("title")}
+            </h3>
             <p className="mt-1 text-xs leading-5 text-muted">{t("description")}</p>
           </div>
           <div className="flex shrink-0 gap-2">
@@ -197,9 +321,19 @@ export default function ProsePanel({
                 size="sm"
                 className="bg-accent text-white hover:bg-accent-hover"
                 onPress={startGeneration}
-                isDisabled={restoreLoading || accepting}
+                isDisabled={
+                  restoreLoading
+                  || accepting
+                  || selectedInitialRun?.can_resume === false
+                }
               >
-                {incomplete && stream.runId ? t("resume") : hasText ? t("regenerate") : t("generate")}
+                {selectedInitialRun?.can_resume === false
+                  ? t("resumeUnavailable")
+                  : resumableDraft
+                    ? t("resume")
+                    : hasText
+                      ? t("regenerate")
+                      : t("generate")}
               </Button>
             )}
             <Button variant="ghost" size="sm" onPress={onClose}>
@@ -216,7 +350,28 @@ export default function ProsePanel({
           <ContextNotices report={stream.contextReport} />
           {stream.error && <Notice tone="error">{stream.error}</Notice>}
           {actionError && <Notice tone="error">{actionError}</Notice>}
-          {incomplete && <Notice tone="warning">{t("incomplete")}</Notice>}
+          {incomplete && !selectedInitialRun && (
+            <Notice tone="warning">{t("incomplete")}</Notice>
+          )}
+          {selectedInitialRun?.can_resume && (
+            <Notice tone="warning">{t("leftoverResumeAvailable")}</Notice>
+          )}
+          {reasonCodes.length > 0 && (
+            <Notice tone="warning">
+              <span className="font-medium">{t("reasonTitle")}</span>
+              <ul className="mt-1 list-disc space-y-1 ps-5">
+                {reasonCodes.map((reasonCode) => (
+                  <li key={reasonCode}>{reasonLabel(reasonCode)}</li>
+                ))}
+              </ul>
+            </Notice>
+          )}
+          {selectedInitialRun?.can_resume === false && (
+            <Notice tone="warning">{resumeUnavailableMessage}</Notice>
+          )}
+          {selectedInitialRun?.can_accept_partial === false && (
+            <Notice tone="warning">{t("leftoverAcceptUnavailable")}</Notice>
+          )}
           {partialArmed && <Notice tone="warning">{t("partialConfirm")}</Notice>}
           {uncertainRetryArmed && (
             <Notice tone="warning">{t("uncertainRetryConfirm")}</Notice>
@@ -292,7 +447,13 @@ export default function ProsePanel({
             variant="ghost"
             size="sm"
             onPress={() => void discard()}
-            isDisabled={!hasText || running || accepting}
+            isDisabled={
+              (!hasText && !stream.runId)
+              || (Boolean(stream.runId) && stream.runRevision == null)
+              || running
+              || accepting
+              || selectedInitialRun?.can_discard === false
+            }
           >
             {t("discard")}
           </Button>
@@ -301,7 +462,13 @@ export default function ProsePanel({
             size="sm"
             className="bg-accent text-white hover:bg-accent-hover"
             onPress={() => void accept()}
-            isDisabled={!hasText || running || accepting || restoreLoading}
+            isDisabled={
+              !hasText
+              || running
+              || accepting
+              || restoreLoading
+              || selectedInitialRun?.can_accept_partial === false
+            }
           >
             {accepting
               ? t("accepting")

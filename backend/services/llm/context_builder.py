@@ -956,6 +956,32 @@ def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_B
     )
 
 
+def normalize_outline_references(raw_outline: dict | None) -> dict | None:
+    """Copy an outline while normalizing BSON reference IDs for generation."""
+    if not raw_outline:
+        return None
+    outline = dict(raw_outline)
+    outline["present_character_card_ids"] = [
+        str(cid) for cid in (raw_outline.get("present_character_card_ids") or [])
+    ]
+    outline["mentioned_character_card_ids"] = [
+        str(cid)
+        for cid in (raw_outline.get("mentioned_character_card_ids") or [])
+    ]
+    outline["threads_resolved"] = [
+        str(tid) for tid in (raw_outline.get("threads_resolved") or [])
+    ]
+    outline["referenced_worldbook_card_ids"] = [
+        str(cid)
+        for cid in (raw_outline.get("referenced_worldbook_card_ids") or [])
+    ]
+    pov_id = raw_outline.get("pov_character_card_id")
+    outline["pov_character_card_id"] = (
+        str(pov_id) if pov_id is not None else None
+    )
+    return outline
+
+
 async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     """取出装配上下文所需的全部数据。唯一碰数据库的一层，不含逻辑。
 
@@ -1093,28 +1119,11 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     # 阶段 2 之前没有代码会写 chapter.outline，所以这里必须兜住 None；
     # 复制成新 dict 再改，不动 chapter 里读出来的原始子文档。
     raw_outline = chapter.get("outline")
-    outline = None
-    if raw_outline:
-        outline = dict(raw_outline)
-        outline["present_character_card_ids"] = [
-            str(cid) for cid in (raw_outline.get("present_character_card_ids") or [])
-        ]
-        outline["mentioned_character_card_ids"] = [
-            str(cid) for cid in (raw_outline.get("mentioned_character_card_ids") or [])
-        ]
-        outline["threads_resolved"] = [
-            str(tid) for tid in (raw_outline.get("threads_resolved") or [])
-        ]
-        outline["referenced_worldbook_card_ids"] = [
-            str(cid) for cid in (raw_outline.get("referenced_worldbook_card_ids") or [])
-        ]
-        pov_id = raw_outline.get("pov_character_card_id")
-        outline["pov_character_card_id"] = str(pov_id) if pov_id is not None else None
-        # threads_planted（设计 §4.1，同为 [ObjectId]）故意不在此处 str() 化：
-        # assemble_context 目前不读这个字段，转换了也是死代码。但它和上面三个
-        # 字段是同一种 BSON ObjectId，将来谁把它接进装配逻辑，必须照此处的写法
-        # 先 str() 化，否则就是重新引入这段注释本身要防的那个 bug——
-        # ObjectId != str，匹配不上任何东西，不报错，只是悄悄地永远装不进上下文。
+    outline = normalize_outline_references(raw_outline)
+    # threads_planted（设计 §4.1，同为 [ObjectId]）故意不在 helper 里 str() 化：
+    # assemble_context 目前不读这个字段，转换了也是死代码。但它和上面几个字段
+    # 是同一种 BSON ObjectId，将来谁把它接进装配逻辑，必须先 str() 化，否则
+    # ObjectId != str，匹配不上任何东西，不报错，只是悄悄地永远装不进上下文。
 
     # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
     # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。

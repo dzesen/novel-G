@@ -5,10 +5,18 @@ import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
-import { type GenerationJob, isActive, isResumable, isTerminal, jobChapters } from "./batchTypes";
+import {
+  type GenerationJob,
+  type LeftoverProseRun,
+  isActive,
+  isResumable,
+  isTerminal,
+  jobChapters,
+} from "./batchTypes";
 import { useGenerationJob } from "./useGenerationJob";
 import StartJobDialog from "./StartJobDialog";
 import CheckpointReview from "./CheckpointReview";
+import LeftoverProseRuns from "./LeftoverProseRuns";
 
 interface BatchGenerationPanelProps {
   novelId: string;
@@ -21,6 +29,9 @@ interface BatchGenerationPanelProps {
   onQuietRefresh: () => void;
   onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
+  proseRunsRevision: number;
+  onOpenProseRun: (run: LeftoverProseRun) => void;
+  onStartFreshProse: (chapterId: string) => void;
 }
 
 export default function BatchGenerationPanel({
@@ -34,6 +45,9 @@ export default function BatchGenerationPanel({
   onQuietRefresh,
   onNavigateToMemory,
   onNavigateToReferenceCards,
+  proseRunsRevision,
+  onOpenProseRun,
+  onStartFreshProse,
 }: BatchGenerationPanelProps) {
   const t = useTranslations("writing.batch");
   const { job, error: pollError, setJob } = useGenerationJob({ onProgress: onQuietRefresh });
@@ -115,9 +129,29 @@ export default function BatchGenerationPanel({
       />
     ) : null;
 
-  // 无作业，或终态已关闭：只渲染可能的启动对话框，不留常驻条。
+  const leftoverPanel = (
+    <LeftoverProseRuns
+      key={novelId}
+      novelId={novelId}
+      chapters={chapters}
+      refreshKey={[
+        proseRunsRevision,
+        job?.status ?? "none",
+        job?.error?.chapter_id ?? "none",
+      ].join(":")}
+      onOpenRun={onOpenProseRun}
+      onStartFresh={onStartFreshProse}
+    />
+  );
+
+  // 残留草稿是小说级状态，即使没有作业或终态条已关闭也必须常驻发现。
   if (!job || (isTerminal(job.status) && dismissed === job._id)) {
-    return dialog;
+    return (
+      <>
+        {dialog}
+        {leftoverPanel}
+      </>
+    );
   }
 
   const volumeChapters = jobChapters(job, chapters);
@@ -132,11 +166,13 @@ export default function BatchGenerationPanel({
   ).size;
 
   return (
-    <div className="shrink-0 border-b border-border">
+    <>
       {dialog}
+      {leftoverPanel}
 
-      {isActive(job.status) && (
-        <div className="grid gap-2 bg-surface px-4 py-3">
+      <div className="shrink-0 border-b border-border">
+        {isActive(job.status) && (
+          <div className="grid gap-2 bg-surface px-4 py-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <h3 className="truncate text-sm font-semibold text-foreground">
@@ -174,60 +210,61 @@ export default function BatchGenerationPanel({
           {controlError && (
             <p className="text-[11px] text-red-600 dark:text-red-400">{t("controlError", { message: controlError })}</p>
           )}
-        </div>
-      )}
+          </div>
+        )}
 
-      {isResumable(job.status) && (
-        <CheckpointReview
-          job={job}
-          titleForChapter={titleForChapter}
-          onJumpToChapter={onJumpToChapter}
-          onNavigateToMemory={onNavigateToMemory}
-          onResume={() => void control("resume")}
-          onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
-          onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
-          onAbort={() => setAbortConfirm(true)}
-          busy={controlBusy}
-          controlError={controlError}
-        />
-      )}
+        {isResumable(job.status) && (
+          <CheckpointReview
+            job={job}
+            titleForChapter={titleForChapter}
+            onJumpToChapter={onJumpToChapter}
+            onNavigateToMemory={onNavigateToMemory}
+            onResume={() => void control("resume")}
+            onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
+            onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
+            onAbort={() => setAbortConfirm(true)}
+            busy={controlBusy}
+            controlError={controlError}
+          />
+        )}
 
-      {isTerminal(job.status) && (
-        <div className="flex items-center justify-between gap-3 bg-surface px-4 py-3">
-          <p className="text-sm text-foreground">
-            {job.status === "completed"
-              ? (job.scope === "book"
-                  ? t("resultCompletedBook", { count: processedChapterCount, tokens: job.tokens_used })
-                  : t("resultCompleted", { count: processedChapterCount, tokens: job.tokens_used }))
-              : t("resultAborted")}
-          </p>
-          <button type="button" onClick={() => setDismissed(job._id)} className="shrink-0 text-xs font-medium text-accent hover:underline">
-            {t("resultDismiss")}
-          </button>
-        </div>
-      )}
+        {isTerminal(job.status) && (
+          <div className="flex items-center justify-between gap-3 bg-surface px-4 py-3">
+            <p className="text-sm text-foreground">
+              {job.status === "completed"
+                ? (job.scope === "book"
+                    ? t("resultCompletedBook", { count: processedChapterCount, tokens: job.tokens_used })
+                    : t("resultCompleted", { count: processedChapterCount, tokens: job.tokens_used }))
+                : t("resultAborted")}
+            </p>
+            <button type="button" onClick={() => setDismissed(job._id)} className="shrink-0 text-xs font-medium text-accent hover:underline">
+              {t("resultDismiss")}
+            </button>
+          </div>
+        )}
 
-      {abortConfirm && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/25 px-4 py-6">
-          <div className="w-full max-w-sm rounded-md border border-border bg-surface p-5 shadow-lg">
-            <h4 className="text-sm font-semibold text-foreground">{t("abortConfirmTitle")}</h4>
-            <p className="mt-2 text-xs leading-5 text-muted">{t("abortConfirmBody")}</p>
-            <div className="mt-4 flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onPress={() => setAbortConfirm(false)} isDisabled={controlBusy}>
-                {t("abortConfirmNo")}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onPress={() => { void control("abort").then(() => setAbortConfirm(false)); }}
-                isDisabled={controlBusy}
-              >
-                {t("abortConfirmYes")}
-              </Button>
+        {abortConfirm && (
+          <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/25 px-4 py-6">
+            <div className="w-full max-w-sm rounded-md border border-border bg-surface p-5 shadow-lg">
+              <h4 className="text-sm font-semibold text-foreground">{t("abortConfirmTitle")}</h4>
+              <p className="mt-2 text-xs leading-5 text-muted">{t("abortConfirmBody")}</p>
+              <div className="mt-4 flex justify-end gap-2">
+                <Button variant="ghost" size="sm" onPress={() => setAbortConfirm(false)} isDisabled={controlBusy}>
+                  {t("abortConfirmNo")}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onPress={() => { void control("abort").then(() => setAbortConfirm(false)); }}
+                  isDisabled={controlBusy}
+                >
+                  {t("abortConfirmYes")}
+                </Button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+    </>
   );
 }

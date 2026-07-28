@@ -86,6 +86,27 @@ class AcceptProseRunRequest(ProseRequest):
     partial_acknowledgement: bool = False
 
 
+class DiscardProseRunRequest(ProseRequest):
+    expected_run_revision: int = Field(ge=1)
+
+
+@router.get(
+    "/prose-runs/novel/{novel_id}/leftovers",
+    dependencies=[Depends(require_owned_path_resource)],
+)
+async def list_leftover_prose_runs(novel_id: str, request: Request):
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await prose_run_module.list_leftovers(
+            owner_id=str(actor.id),
+            novel_id=novel_id,
+        )
+    except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get(
     "/prose-runs/chapter/{chapter_id}",
     dependencies=[Depends(require_owned_path_resource)],
@@ -140,14 +161,20 @@ async def accept_prose_run(
 @router.post("/prose-runs/{run_id}/discard")
 async def discard_prose_run(
     run_id: str,
-    req: ProseRequest,
+    req: DiscardProseRunRequest,
     request: Request,
 ):
     actor = getattr(request.state, "actor", None)
     if actor is None:
         raise HTTPException(status_code=401, detail="需要登录")
     try:
-        await prose_run_module.discard(owner_id=str(actor.id), run_id=run_id)
+        await prose_run_module.discard(
+            owner_id=str(actor.id),
+            novel_id=req.novel_id,
+            chapter_id=req.chapter_id,
+            run_id=run_id,
+            expected_revision=req.expected_run_revision,
+        )
         return {"discarded": True}
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

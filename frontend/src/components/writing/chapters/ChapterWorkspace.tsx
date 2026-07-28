@@ -24,6 +24,7 @@ import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
 import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
 import type { StoredChapterOutline } from "./outline/outlineTypes";
 import ProsePanel from "./prose/ProsePanel";
+import type { ProseRunSnapshot } from "./prose/useProseStream";
 import { StateBackfillPanel } from "./state/StateBackfillPanel";
 import StateCompletenessAuditPanel from "./state/StateCompletenessAuditPanel";
 
@@ -75,6 +76,13 @@ export default function ChapterWorkspace({
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
   const [proseOpen, setProseOpen] = useState(false);
+  const [initialProseRun, setInitialProseRun] =
+    useState<ProseRunSnapshot | null>(null);
+  const [pendingProseOpen, setPendingProseOpen] = useState<{
+    chapterId: string;
+    run: ProseRunSnapshot | null;
+  } | null>(null);
+  const [proseRunsRevision, setProseRunsRevision] = useState(0);
   const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
   const [stateAuditOpen, setStateAuditOpen] = useState(false);
   const [pendingStateRepairChapterId, setPendingStateRepairChapterId] =
@@ -376,12 +384,38 @@ export default function ChapterWorkspace({
     // 三个面板都持有 chapterId、以整容器覆盖的方式渲染：换章后若不关，
     // 面板会挂着上一章的 id 继续渲染（deleteChapter 已修过同一个坑）。
     setProseOpen(false);
+    setInitialProseRun(null);
+    setPendingProseOpen(null);
     setChapterOutlineOpen(false);
     setStateBackfillOpen(false);
     setStateBackfillBlocked("");
     selectedChapterIdRef.current = chapterId;
     setSelectedChapterId(chapterId);
   };
+
+  const queueProsePanel = (
+    chapterId: string,
+    run: ProseRunSnapshot | null,
+  ) => {
+    if (selectedChapterIdRef.current !== chapterId) {
+      selectChapter(chapterId);
+    }
+    setPendingProseOpen({ chapterId, run });
+  };
+
+  useEffect(() => {
+    if (
+      !pendingProseOpen
+      || pendingProseOpen.chapterId !== selectedChapterId
+      || chapterLoading
+      || !draft
+    ) {
+      return;
+    }
+    setInitialProseRun(pendingProseOpen.run);
+    setProseOpen(true);
+    setPendingProseOpen(null);
+  }, [chapterLoading, draft, pendingProseOpen, selectedChapterId]);
 
   const createVolume = async (title: string) => {
     if (!novelId) return;
@@ -593,6 +627,9 @@ export default function ChapterWorkspace({
           onQuietRefresh={() => void loadStructure({ silent: true })}
           onNavigateToMemory={onNavigateToMemory}
           onNavigateToReferenceCards={onNavigateToReferenceCards}
+          proseRunsRevision={proseRunsRevision}
+          onOpenProseRun={(run) => queueProsePanel(run.chapter_id, run)}
+          onStartFreshProse={(chapterId) => queueProsePanel(chapterId, null)}
         />
         <ChapterEditorPane
           chapterId={selectedChapterId}
@@ -609,7 +646,11 @@ export default function ChapterWorkspace({
           onExport={exportChapter}
           onExportNovel={() => void exportNovel()}
           onOpenChapterOutline={() => setChapterOutlineOpen(true)}
-          onOpenProse={() => setProseOpen(true)}
+          onOpenProse={() => {
+            setPendingProseOpen(null);
+            setInitialProseRun(null);
+            setProseOpen(true);
+          }}
           canGenerateProse={Boolean(chapterOutline)}
           onOpenStateBackfill={() => void openStateBackfill()}
           hasContent={Boolean(draft?.content?.trim())}
@@ -649,8 +690,17 @@ export default function ChapterWorkspace({
         <ProsePanel
           novelId={novelId}
           chapterId={selectedChapterId}
+          initialRun={initialProseRun}
           hasExistingContent={Boolean(draft?.content?.trim())}
-          onClose={() => setProseOpen(false)}
+          onClose={() => {
+            setProseOpen(false);
+            setPendingProseOpen(null);
+            setInitialProseRun(null);
+            setProseRunsRevision((current) => current + 1);
+          }}
+          onRunStateChanged={() => {
+            setProseRunsRevision((current) => current + 1);
+          }}
           onAccepted={(text, acceptanceState) => {
             // ProseRun accept 已以 mutation 原子写入正式正文；这里同步当前编辑器
             // 草稿，后续自动保存只会幂等写回同一份内容。不能立刻用 loadChapter

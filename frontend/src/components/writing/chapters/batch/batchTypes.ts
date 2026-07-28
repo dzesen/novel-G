@@ -1,4 +1,5 @@
 import type { ChapterSummary } from "@/types/novel";
+import type { ProseRunSnapshot } from "../prose/useProseStream";
 
 // 镜像后端 generation_job_router._serialize_job 后的 JSON 形状（设计 §8）。
 export type JobStatus =
@@ -184,6 +185,22 @@ export interface GenerationJob {
   usage_attempt_claimed: number;
   usage_attempt_summaries: AttemptSummary[];
   has_uncertain_attempts: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LeftoverProseRun extends ProseRunSnapshot {
+  run_id: string;
+  novel_id: string;
+  chapter_id: string;
+  status: "incomplete" | "superseded" | "stale";
+  draft_word_count: number;
+  reason_codes: string[];
+  continuation_exhausted: boolean;
+  has_uncertain_attempt: boolean;
+  can_resume: boolean;
+  can_accept_partial: boolean;
+  can_discard: boolean;
   created_at: string;
   updated_at: string;
 }

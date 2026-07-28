@@ -10,10 +10,14 @@ from backend.db.mongo import get_database
 from backend.db.mutation import MutationCommand, commit_mutation
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
-from backend.db.repositories.prose_run_repository import prose_run_repo
+from backend.db.repositories.prose_run_repository import (
+    CURRENT_PROSE_RUN_STATUSES,
+    prose_run_repo,
+)
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation.prose_completion import ProseExecutionPlan
 from backend.services.generation.prose_generation import UncertainProseAttempt
+from backend.services.llm.context_builder import normalize_outline_references
 from backend.services.novel.chapter_service import count_chapter_words
 from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.state_completion import chapter_content_digest
@@ -70,6 +74,71 @@ def _has_exhausted_segment(
         >= plan.max_continuations
         for segment in document.get("segments") or []
     )
+
+
+def _stored_run_has_exhausted_segment(document: dict[str, Any]) -> bool:
+    max_continuations = int(
+        (document.get("plan") or {}).get("max_continuations") or 0
+    )
+    if max_continuations <= 0:
+        return False
+    return any(
+        segment.get("status") != "completed"
+        and int(segment.get("continuation_count") or 0)
+        >= max_continuations
+        for segment in document.get("segments") or []
+    )
+
+
+def _run_has_uncertain_attempt(document: dict[str, Any]) -> bool:
+    return any(
+        segment.get("status") == "uncertain"
+        for segment in document.get("segments") or []
+    )
+
+
+def _leftover_reason_codes(document: dict[str, Any]) -> list[str]:
+    codes = [
+        str(code)
+        for code in (document.get("completion") or {}).get("reason_codes") or []
+        if str(code).strip()
+    ]
+    if _run_has_uncertain_attempt(document):
+        codes.append("uncertain_provider_attempt")
+    if _stored_run_has_exhausted_segment(document):
+        codes.append("continuation_limit_reached")
+    if not codes:
+        finish_reasons = {
+            str(segment.get("finish_reason") or "")
+            for segment in document.get("segments") or []
+            if segment.get("status") != "completed"
+        }
+        for finish_reason in (
+            "length",
+            "content_filter",
+            "tool_call",
+            "cancelled",
+            "error",
+        ):
+            if finish_reason in finish_reasons:
+                codes.append(f"finish_reason_{finish_reason}")
+    return list(dict.fromkeys(codes))
+
+
+def _run_has_live_lease(document: dict[str, Any]) -> bool:
+    expires_at = (document.get("lease") or {}).get("expires_at")
+    return bool(expires_at and expires_at > get_utc_now())
+
+
+def _outline_revision_is_current(
+    stored_revision: Any,
+    outline: dict[str, Any],
+) -> bool:
+    normalized = normalize_outline_references(outline) or {}
+    return stored_revision in {
+        prose_revision(outline),
+        prose_revision(normalized),
+    }
 
 
 class ProseRunModule:
@@ -213,6 +282,80 @@ class ProseRunModule:
             active["status"] = "stale"
         return active
 
+    async def list_leftovers(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return read-only recovery summaries for unresolved prose drafts."""
+        runs = await prose_run_repo.list_leftovers(
+            novel_id=novel_id,
+            owner_id=owner_id,
+        )
+        chapters = {
+            str(chapter["_id"]): chapter
+            for chapter in await chapter_repo.get_chapters_by_novel(novel_id)
+        }
+        narrative_revision = await narrative_revision_store.current(novel_id)
+        summaries: list[dict[str, Any]] = []
+        for run in runs:
+            text = prose_run_draft_text(run)
+            chapter = chapters.get(str(run.get("chapter_id")))
+            narrative_current = bool(
+                run.get("status") != "stale"
+                and run.get("narrative_revision") is not None
+                and int(run["narrative_revision"]) == narrative_revision
+            )
+            outline_current = bool(
+                chapter is not None
+                and _outline_revision_is_current(
+                    run.get("outline_revision"),
+                    chapter.get("outline") or {},
+                )
+            )
+            continuation_exhausted = _stored_run_has_exhausted_segment(run)
+            has_uncertain_attempt = _run_has_uncertain_attempt(run)
+            has_live_lease = _run_has_live_lease(run)
+            status = str(run.get("status") or "")
+            summaries.append(
+                {
+                    "run_id": str(run["_id"]),
+                    "novel_id": str(run["novel_id"]),
+                    "chapter_id": str(run["chapter_id"]),
+                    "revision": int(run.get("revision") or 0),
+                    "status": status,
+                    "assembled_text": text,
+                    "draft_word_count": count_chapter_words(text),
+                    "completion": (
+                        dict(run["completion"])
+                        if run.get("completion") is not None
+                        else None
+                    ),
+                    "reason_codes": _leftover_reason_codes(run),
+                    "continuation_exhausted": continuation_exhausted,
+                    "has_uncertain_attempt": has_uncertain_attempt,
+                    "can_resume": bool(
+                        status in CURRENT_PROSE_RUN_STATUSES
+                        and status == "incomplete"
+                        and narrative_current
+                        and outline_current
+                        and not continuation_exhausted
+                        and not has_live_lease
+                    ),
+                    "can_accept_partial": bool(
+                        text.strip()
+                        and narrative_current
+                        and outline_current
+                        and not has_live_lease
+                    ),
+                    "can_discard": not has_live_lease,
+                    "created_at": run.get("created_at"),
+                    "updated_at": run.get("updated_at"),
+                }
+            )
+        return summaries
+
     async def accept(
         self,
         *,
@@ -246,7 +389,10 @@ class ProseRunModule:
                 "正文草稿生成后的小说上下文已经变化，旧稿只能查看或复制"
             )
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-        if prose_revision(chapter.get("outline") or {}) != run.get("outline_revision"):
+        if not _outline_revision_is_current(
+            run.get("outline_revision"),
+            chapter.get("outline") or {},
+        ):
             raise ValueError("章节细纲已经变化，旧正文草稿不能写入")
         completion = dict(run.get("completion") or {})
         can_write = bool(completion.get("can_write_formal_prose"))
@@ -287,15 +433,23 @@ class ProseRunModule:
             advances_narrative_revision=True,
         )
 
-    async def discard(self, *, owner_id: str, run_id: str) -> None:
+    async def discard(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        run_id: str,
+        expected_revision: int,
+    ) -> None:
         await prose_run_repo.get_run(run_id, owner_id)
-        changed = await prose_run_repo.mark_status(
+        await prose_run_repo.discard(
             run_id=run_id,
             owner_id=owner_id,
-            status="discarded",
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            expected_revision=expected_revision,
         )
-        if not changed:
-            raise ValueError("正文草稿已经变化，请刷新后再放弃")
 
     @staticmethod
     async def _execute_accept(session, mutation) -> dict[str, Any]:

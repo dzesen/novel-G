@@ -19,6 +19,14 @@ class StaleProseRun(ValueError):
 
 
 CURRENT_PROSE_RUN_STATUSES = ("active", "incomplete", "complete")
+LEFTOVER_PROSE_RUN_STATUSES = ("incomplete", "superseded", "stale")
+DISCARDABLE_PROSE_RUN_STATUSES = (
+    "active",
+    "incomplete",
+    "complete",
+    "superseded",
+    "stale",
+)
 
 
 class ProseRunRepository(BaseRepository):
@@ -128,6 +136,64 @@ class ProseRunRepository(BaseRepository):
             sort=[("updated_at", -1)],
         )
         return documents[0] if documents else None
+
+    async def list_leftovers(
+        self,
+        *,
+        novel_id: str,
+        owner_id: str,
+    ) -> list[dict[str, Any]]:
+        """List unresolved, user-owned prose drafts without mutating them."""
+        return await self.find_many(
+            {
+                "novel_id": to_object_id(novel_id),
+                "owner_id": to_object_id(owner_id),
+                "status": {"$in": list(LEFTOVER_PROSE_RUN_STATUSES)},
+                "completion.can_write_formal_prose": {"$ne": True},
+            },
+            sort=[("updated_at", -1), ("_id", -1)],
+        )
+
+    async def discard(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Discard a stable, idle snapshot without deleting its recovery data."""
+        now = get_utc_now()
+        document = await self.collection.find_one_and_update(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "chapter_id": to_object_id(chapter_id),
+                "is_deleted": False,
+                "revision": int(expected_revision),
+                "status": {"$in": list(DISCARDABLE_PROSE_RUN_STATUSES)},
+                "$or": [
+                    {"lease": None},
+                    {"lease.expires_at": {"$lte": now}},
+                ],
+            },
+            {
+                "$set": {
+                    "status": "discarded",
+                    "lease": None,
+                    "updated_at": now,
+                },
+                "$inc": {"revision": 1},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is None:
+            raise StaleProseRun(
+                "正文草稿已被其他页面继续、写入或丢弃，请刷新后重试"
+            )
+        return document
 
     async def claim(
         self,

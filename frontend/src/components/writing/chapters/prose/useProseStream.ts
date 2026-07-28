@@ -39,12 +39,19 @@ export interface ProseCompletionInfo {
 }
 
 export interface ProseRunSnapshot {
-  _id: string;
+  _id?: string;
+  run_id?: string;
   revision: number;
-  status: "active" | "incomplete" | "complete" | "stale";
+  status: "active" | "incomplete" | "complete" | "superseded" | "stale";
   assembled_text: string;
   completion: ProseCompletionInfo | null;
   segments?: Array<{ status?: string }>;
+  reason_codes?: string[];
+  continuation_exhausted?: boolean;
+  has_uncertain_attempt?: boolean;
+  can_resume?: boolean;
+  can_accept_partial?: boolean;
+  can_discard?: boolean;
 }
 
 export interface ProseExecutionPlanInfo {
@@ -135,9 +142,11 @@ export function useProseStream() {
     setUsage(null);
     setCompletion(run.completion);
     setExecutionPlan(null);
-    setRunId(run._id);
+    setRunId(run.run_id ?? run._id ?? null);
     setRunRevision(run.revision);
-    setHasUncertainAttempt(proseRunHasUncertainAttempt(run));
+    setHasUncertainAttempt(
+      run.has_uncertain_attempt ?? proseRunHasUncertainAttempt(run),
+    );
     setStatus(
       run.status === "complete" && run.completion?.can_write_formal_prose
         ? "done"
