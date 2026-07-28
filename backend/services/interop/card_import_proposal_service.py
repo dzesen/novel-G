@@ -34,7 +34,15 @@ from backend.db.narrative_revision import narrative_revision_store
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.interop.character_card_adapter import (
     MAX_JSON_BYTES,
+    MAX_STRING_CHARS,
     ParsedCharacterCard,
+)
+from backend.services.interop.world_book_adapter import (
+    MAX_WORLD_BOOK_ENTRIES,
+    MAX_WORLD_BOOK_JSON_BYTES,
+    LorebookEntry,
+    ParsedWorldBook,
+    WorldBookAdapter,
 )
 from backend.services.novel.character_profile import normalize_character_profile
 from backend.services.novel.reference_card_curation import (
@@ -49,6 +57,8 @@ from backend.services.novel.reference_card_service import (
 
 
 MAX_RAW_PAYLOAD_BYTES = MAX_JSON_BYTES
+MAX_WORLD_BOOK_RAW_PAYLOAD_BYTES = MAX_WORLD_BOOK_JSON_BYTES
+MAX_CARD_IMPORT_CANDIDATES = MAX_WORLD_BOOK_ENTRIES + 1
 PROPOSAL_LIFETIME = timedelta(days=7)
 PROPOSAL_RETENTION = timedelta(days=30)
 _SOURCE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -129,6 +139,17 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
+def _datetime_order(value: Any) -> float:
+    if not isinstance(value, datetime):
+        return float("-inf")
+    normalized = (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    )
+    return normalized.timestamp()
+
+
 def _proposal_digest(
     *,
     source_hash: str,
@@ -174,8 +195,12 @@ def _default_config_snapshot() -> dict[str, Any]:
     configured = get_config_value("card_import", {})
     return {
         "implementation": {
-            "mapping_version": 1,
+            "mapping_version": 2,
             "raw_payload_max_bytes": MAX_RAW_PAYLOAD_BYTES,
+            "worldbook_raw_payload_max_bytes": (
+                MAX_WORLD_BOOK_RAW_PAYLOAD_BYTES
+            ),
+            "worldbook_max_entries": MAX_WORLD_BOOK_ENTRIES,
             "proposal_lifetime_seconds": int(PROPOSAL_LIFETIME.total_seconds()),
             "proposal_retention_seconds": int(PROPOSAL_RETENTION.total_seconds()),
         },
@@ -244,6 +269,85 @@ def _bounded_profile_projection(
         except ValueError:
             isolated.append("personality")
     return profile, isolated
+
+
+def _validate_worldbook_import_candidate(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a lore import without applying the AI-curation 800-char cap."""
+
+    name = candidate.get("name", "")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Imported lore card name cannot be empty")
+    name = " ".join(name.split())
+    if len(name) > 120:
+        raise ValueError("Imported lore card name cannot exceed 120 characters")
+    subtitle = candidate.get("subtitle", "")
+    if not isinstance(subtitle, str) or len(subtitle) > 200:
+        raise ValueError(
+            "Imported lore card subtitle must be a string of at most 200 characters"
+        )
+    description = candidate.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError("Imported lore card description must be a string")
+    if len(description) > MAX_STRING_CHARS:
+        raise ValueError(
+            "Imported lore card description exceeds the retained string limit: "
+            f"current_chars={len(description)}, max_chars={MAX_STRING_CHARS}"
+        )
+    importance = candidate.get("importance", "sub")
+    if importance not in {"main", "sub"}:
+        raise ValueError("Imported lore card importance must be main or sub")
+    tags = candidate.get("tags", [])
+    if not isinstance(tags, list) or len(tags) > 8:
+        raise ValueError("Imported lore card tags must contain at most 8 items")
+    normalized_tags: list[str] = []
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValueError("Imported lore card tags must be strings")
+        normalized = tag.strip()
+        if normalized and normalized not in normalized_tags:
+            normalized_tags.append(normalized)
+    details = candidate.get("details", {})
+    if not isinstance(details, dict):
+        raise ValueError("Imported lore card details must be an object")
+    normalized_details: dict[str, str] = {}
+    for key, value in details.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("Imported lore card details must contain strings")
+        if value.strip():
+            normalized_details[key] = value.strip()
+    return {
+        "name": name,
+        "subtitle": subtitle.strip(),
+        "description": description.strip(),
+        "importance": importance,
+        "tags": normalized_tags,
+        "details": normalized_details,
+    }
+
+
+def _worldbook_entry_preview(entry: LorebookEntry) -> dict[str, Any]:
+    return {
+        "name": entry.name,
+        "keys": list(entry.keys),
+        "secondary_keys": list(entry.secondary_keys),
+        "enabled": entry.enabled,
+        "constant": entry.constant,
+        "insertion_order": entry.insertion_order,
+        "position": entry.position,
+        "use_regex": entry.use_regex,
+        "external_uid": deepcopy(entry.external_uid),
+        "source_locator": entry.source_locator,
+        "regex_fields": list(entry.regex_fields),
+        "unrecognized_fields": list(entry.unrecognized_fields),
+        "unsupported_features": [
+            asdict(item) for item in entry.unsupported_features
+        ],
+        "preview_notices": [
+            asdict(item) for item in entry.preview_notices
+        ],
+    }
 
 
 class CardImportProposalService:
@@ -319,15 +423,30 @@ class CardImportProposalService:
         ]
         if not novel_ids:
             return None
-        card = await self.db[collections.CHARACTERS].find_one(
-            {
-                "novel_id": {"$in": novel_ids},
-                "interop.source.source_hash": source_hash,
-            },
-            sort=[("interop.source.imported_at", DESCENDING)],
-        )
-        if card is None:
+        imported_cards: list[dict[str, Any]] = []
+        for collection_name in (
+            collections.CHARACTERS,
+            collections.WORLDBOOK,
+        ):
+            card = await self.db[collection_name].find_one(
+                {
+                    "novel_id": {"$in": novel_ids},
+                    "interop.source.source_hash": source_hash,
+                },
+                sort=[("interop.source.imported_at", DESCENDING)],
+            )
+            if card is not None:
+                imported_cards.append(card)
+        if not imported_cards:
             return None
+        card = max(
+            imported_cards,
+            key=lambda item: _datetime_order(
+                (item.get("interop") or {}).get("source", {}).get(
+                    "imported_at"
+                )
+            ),
+        )
         return {
             "card_id": str(card["_id"]),
             "novel_id": str(card["novel_id"]),
@@ -371,41 +490,57 @@ class CardImportProposalService:
         )
         return draft
 
-    async def _character_conflicts(
+    async def _candidate_conflicts(
         self,
         *,
         novel_id: ObjectId | None,
+        target_type: str,
         draft: dict[str, Any],
         session: Any = None,
     ) -> list[dict[str, Any]]:
         if novel_id is None:
             return []
         imported_name = draft["name"]
-        cursor = self.db[collections.CHARACTERS].find(
-            {
-                "novel_id": novel_id,
-                "card_type": "character",
-                "$or": [
-                    {"name": imported_name},
-                    {"character_profile.aliases": imported_name},
-                ],
-            },
+        collection_name = (
+            collections.CHARACTERS
+            if target_type == "character"
+            else collections.WORLDBOOK
+        )
+        query: dict[str, Any] = {
+            "novel_id": novel_id,
+            "card_type": target_type,
+        }
+        if target_type == "character":
+            query["$or"] = [
+                {"name": imported_name},
+                {"character_profile.aliases": imported_name},
+            ]
+        else:
+            query["name"] = imported_name
+        cursor = self.db[collection_name].find(
+            query,
             session=session,
         )
         existing_cards = await cursor.to_list(length=None)
         conflicts: list[dict[str, Any]] = []
         for card in existing_cards:
-            match_kind = (
-                "exact_name"
-                if card.get("name") == imported_name
-                else "confirmed_alias"
-            )
+            match_kind = "exact_name"
+            if (
+                target_type == "character"
+                and card.get("name") != imported_name
+            ):
+                match_kind = "confirmed_alias"
             field_diffs: dict[str, dict[str, Any]] = {}
             for field, default in (
                 ("name", ""),
                 ("description", ""),
                 ("tags", []),
-                ("character_profile", {}),
+                ("details", {}),
+                *(
+                    (("character_profile", {}),)
+                    if target_type == "character"
+                    else ()
+                ),
             ):
                 existing_value = deepcopy(card.get(field, default))
                 imported_value = deepcopy(draft.get(field, default))
@@ -427,7 +562,7 @@ class CardImportProposalService:
         return conflicts
 
     @staticmethod
-    def _proposed_cards(
+    def _proposed_character(
         draft: dict[str, Any],
         *,
         duplicate: bool,
@@ -451,9 +586,49 @@ class CardImportProposalService:
             }
         ]
 
+    @staticmethod
+    def _proposed_worldbook_entries(
+        parsed: ParsedWorldBook,
+        *,
+        duplicate: bool,
+        conflicts_by_locator: dict[str, list[dict[str, Any]]],
+        candidate_offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        proposed: list[dict[str, Any]] = []
+        for index, entry in enumerate(parsed.entries):
+            conflicts = conflicts_by_locator.get(entry.source_locator, [])
+            if duplicate or len(conflicts) > 1:
+                recommended_action = "skip"
+            elif conflicts:
+                recommended_action = (
+                    "restore_merge"
+                    if conflicts[0]["is_deleted"]
+                    else "merge"
+                )
+            else:
+                recommended_action = "create"
+            proposed.append(
+                {
+                    "candidate_id": f"lore:{candidate_offset + index}",
+                    "target_type": "lore",
+                    "fields": {
+                        "name": entry.name,
+                        "subtitle": "",
+                        "description": entry.content,
+                        "importance": "sub",
+                        "tags": [],
+                        "details": {},
+                    },
+                    "interop_preview": _worldbook_entry_preview(entry),
+                    "conflicts": conflicts,
+                    "recommended_action": recommended_action,
+                }
+            )
+        return proposed
+
     async def stage(
         self,
-        parsed: ParsedCharacterCard,
+        parsed: ParsedCharacterCard | ParsedWorldBook,
         *,
         owner_id: str | ObjectId,
         novel_id: str | ObjectId | None,
@@ -461,8 +636,10 @@ class CardImportProposalService:
         source_name: str | None = None,
     ) -> dict[str, Any]:
         """Persist one review proposal without touching formal card collections."""
-        if not isinstance(parsed, ParsedCharacterCard):
-            raise TypeError("parsed must be a ParsedCharacterCard")
+        if not isinstance(parsed, (ParsedCharacterCard, ParsedWorldBook)):
+            raise TypeError(
+                "parsed must be a ParsedCharacterCard or ParsedWorldBook"
+            )
         owner_object_id = to_object_id(owner_id)
         # Deliberately guard None before to_object_id: ObjectId(None) creates an ID.
         novel_object_id = (
@@ -476,12 +653,19 @@ class CardImportProposalService:
             if not isinstance(source_name, str) or len(source_name) > 255:
                 raise ValueError("source_name must be a string of at most 255 characters")
 
-        raw_payload = deepcopy(parsed.raw_card)
+        if isinstance(parsed, ParsedCharacterCard):
+            raw_payload = deepcopy(parsed.raw_card)
+            raw_payload_limit = MAX_RAW_PAYLOAD_BYTES
+            embedded_worldbook = WorldBookAdapter.from_character_card(parsed)
+        else:
+            raw_payload = deepcopy(parsed.raw_book)
+            raw_payload_limit = MAX_WORLD_BOOK_RAW_PAYLOAD_BYTES
+            embedded_worldbook = None
         raw_payload_bytes = len(_canonical_json_bytes(raw_payload))
-        if raw_payload_bytes > MAX_RAW_PAYLOAD_BYTES:
+        if raw_payload_bytes > raw_payload_limit:
             raise RawPayloadTooLargeError(
                 current_bytes=raw_payload_bytes,
-                max_bytes=MAX_RAW_PAYLOAD_BYTES,
+                max_bytes=raw_payload_limit,
             )
 
         novel_snapshot = await self._novel_snapshot(
@@ -497,17 +681,62 @@ class CardImportProposalService:
             owner_id=owner_object_id,
             source_hash=source_hash,
         )
-        draft = self._character_draft(parsed)
-        conflicts = await self._character_conflicts(
-            novel_id=novel_object_id,
-            draft=draft,
-        )
-        proposed_cards = self._proposed_cards(
-            draft,
-            duplicate=duplicate_source is not None,
-            conflicts=conflicts,
-        )
-        target_cards_digest = _digest(conflicts)
+        conflict_sets: list[dict[str, Any]] = []
+        proposed_cards: list[dict[str, Any]] = []
+        parsed_worldbook: ParsedWorldBook | None
+        if isinstance(parsed, ParsedCharacterCard):
+            draft = self._character_draft(parsed)
+            character_conflicts = await self._candidate_conflicts(
+                novel_id=novel_object_id,
+                target_type="character",
+                draft=draft,
+            )
+            proposed_cards.extend(
+                self._proposed_character(
+                    draft,
+                    duplicate=duplicate_source is not None,
+                    conflicts=character_conflicts,
+                )
+            )
+            conflict_sets.append(
+                {
+                    "candidate_id": "character:0",
+                    "conflicts": character_conflicts,
+                }
+            )
+            parsed_worldbook = embedded_worldbook
+        else:
+            parsed_worldbook = parsed
+
+        if parsed_worldbook is not None:
+            conflicts_by_locator: dict[str, list[dict[str, Any]]] = {}
+            for entry_index, entry in enumerate(parsed_worldbook.entries):
+                entry_conflicts = await self._candidate_conflicts(
+                    novel_id=novel_object_id,
+                    target_type="lore",
+                    draft={
+                        "name": entry.name,
+                        "description": entry.content,
+                        "tags": [],
+                        "details": {},
+                    },
+                )
+                conflicts_by_locator[entry.source_locator] = entry_conflicts
+                conflict_sets.append(
+                    {
+                        "candidate_id": f"lore:{entry_index}",
+                        "source_locator": entry.source_locator,
+                        "conflicts": entry_conflicts,
+                    }
+                )
+            proposed_cards.extend(
+                self._proposed_worldbook_entries(
+                    parsed_worldbook,
+                    duplicate=duplicate_source is not None,
+                    conflicts_by_locator=conflicts_by_locator,
+                )
+            )
+        target_cards_digest = _digest(conflict_sets)
         candidate_digest = _digest(proposed_cards)
         combined_digest = _proposal_digest(
             source_hash=source_hash,
@@ -524,23 +753,71 @@ class CardImportProposalService:
             "owner_id": owner_object_id,
             "source_format": parsed.source_format,
             "source_container": parsed.source_container,
-            "spec_version": parsed.spec_version,
+            "spec_version": (
+                parsed.spec_version
+                if isinstance(parsed, ParsedCharacterCard)
+                else None
+            ),
             "source_name": source_name,
             "source_hash": source_hash,
             "raw_payload": raw_payload,
             "raw_payload_bytes": raw_payload_bytes,
             "detected_warnings": list(parsed.detected_warnings),
-            "prompt_risk_fields": [
-                asdict(item) for item in parsed.prompt_risk_fields
-            ],
-            "decorators": [asdict(item) for item in parsed.decorators],
-            "assets": [asdict(item) for item in parsed.assets],
+            "prompt_risk_fields": (
+                [
+                    asdict(item)
+                    for item in parsed.prompt_risk_fields
+                ]
+                if isinstance(parsed, ParsedCharacterCard)
+                else []
+            ),
+            "decorators": (
+                [asdict(item) for item in parsed.decorators]
+                if isinstance(parsed, ParsedCharacterCard)
+                else []
+            ),
+            "assets": (
+                [asdict(item) for item in parsed.assets]
+                if isinstance(parsed, ParsedCharacterCard)
+                else []
+            ),
             "container_preview": {
-                "selected_png_chunk": parsed.selected_png_chunk,
-                "png_chunk_classification": parsed.png_chunk_classification,
-                "png_preview_label": parsed.png_preview_label,
-                "image_data_discarded": parsed.image_data_discarded,
+                "selected_png_chunk": (
+                    parsed.selected_png_chunk
+                    if isinstance(parsed, ParsedCharacterCard)
+                    else None
+                ),
+                "png_chunk_classification": (
+                    parsed.png_chunk_classification
+                    if isinstance(parsed, ParsedCharacterCard)
+                    else None
+                ),
+                "png_preview_label": (
+                    parsed.png_preview_label
+                    if isinstance(parsed, ParsedCharacterCard)
+                    else None
+                ),
+                "image_data_discarded": (
+                    parsed.image_data_discarded
+                    if isinstance(parsed, ParsedCharacterCard)
+                    else False
+                ),
             },
+            "worldbook_preview": (
+                {
+                    "source_kind": parsed_worldbook.source_kind,
+                    "source_format": parsed_worldbook.source_format,
+                    "entry_count": len(parsed_worldbook.entries),
+                    "detected_warnings": list(
+                        parsed_worldbook.detected_warnings
+                    ),
+                    "unrecognized_top_level_fields": list(
+                        parsed_worldbook.unrecognized_top_level_fields
+                    ),
+                }
+                if parsed_worldbook is not None
+                else None
+            ),
             "proposed_cards": proposed_cards,
             "decisions": [],
             "duplicate_source": duplicate_source,
@@ -592,17 +869,36 @@ class CardImportProposalService:
 
         proposed_cards = proposal.get("proposed_cards")
         if isinstance(proposed_cards, list) and proposed_cards:
-            draft = proposed_cards[0].get("fields")
-            if isinstance(draft, dict):
-                current_conflicts = await self._character_conflicts(
+            current_conflict_sets: list[dict[str, Any]] = []
+            for candidate in proposed_cards:
+                draft = candidate.get("fields")
+                target_type = str(candidate.get("target_type") or "")
+                if not isinstance(draft, dict) or target_type not in {
+                    "character",
+                    "lore",
+                }:
+                    stale_reasons.append("candidate_shape_changed")
+                    continue
+                current_conflicts = await self._candidate_conflicts(
                     novel_id=novel_id,
+                    target_type=target_type,
                     draft=draft,
                     session=session,
                 )
-                if _digest(current_conflicts) != proposal.get(
-                    "target_cards_digest"
-                ):
-                    stale_reasons.append("target_cards_changed")
+                conflict_set = {
+                    "candidate_id": str(candidate.get("candidate_id") or ""),
+                    "conflicts": current_conflicts,
+                }
+                interop_preview = candidate.get("interop_preview")
+                if isinstance(interop_preview, dict):
+                    conflict_set["source_locator"] = str(
+                        interop_preview.get("source_locator") or ""
+                    )
+                current_conflict_sets.append(conflict_set)
+            if _digest(current_conflict_sets) != proposal.get(
+                "target_cards_digest"
+            ):
+                stale_reasons.append("target_cards_changed")
 
         expires_at = proposal.get("expires_at")
         if isinstance(expires_at, datetime):
@@ -727,7 +1023,7 @@ class CardImportProposalService:
                     f"Unsupported card-import decision: {action}"
                 )
             target_type = str(candidate.get("target_type") or "")
-            if target_type != "character":
+            if target_type not in {"character", "lore"}:
                 raise CardImportProposalError(
                     f"Unsupported card-import target type: {target_type}"
                 )
@@ -741,6 +1037,10 @@ class CardImportProposalService:
                 raise CardImportProposalError(
                     f"Unsupported candidate override fields: {sorted(unknown)}"
                 )
+            if target_type == "lore" and "character_profile" in overrides:
+                raise CardImportProposalError(
+                    "character_profile is only supported for character imports"
+                )
             fields = candidate.get("fields")
             if not isinstance(fields, dict):
                 raise CardImportProposalError(
@@ -752,7 +1052,11 @@ class CardImportProposalService:
                 if key in REFERENCE_CARD_EDITABLE_FIELDS
             }
             edited.update(deepcopy(overrides))
-            edited = validate_reference_card_candidate(target_type, edited)
+            edited = (
+                validate_reference_card_candidate(target_type, edited)
+                if target_type == "character"
+                else _validate_worldbook_import_candidate(edited)
+            )
 
             overwrite_fields = sorted(
                 {
@@ -769,6 +1073,14 @@ class CardImportProposalService:
             ):
                 raise CardImportProposalError(
                     "Unsupported merge overwrite field"
+                )
+            if target_type == "lore" and any(
+                field == "character_profile"
+                or field.startswith("character_profile.")
+                for field in overwrite_fields
+            ):
+                raise CardImportProposalError(
+                    "character_profile overwrite is only supported for characters"
                 )
 
             target_card_id = raw_decision.get("target_card_id")
@@ -824,6 +1136,7 @@ class CardImportProposalService:
     @staticmethod
     def _formal_interop(
         proposal: dict[str, Any],
+        candidate_meta: dict[str, Any],
         card: dict[str, Any],
     ) -> dict[str, Any]:
         risk_fields = deepcopy(proposal.get("prompt_risk_fields") or [])
@@ -832,9 +1145,9 @@ class CardImportProposalService:
             for item in risk_fields
             if isinstance(item, dict) and item.get("kind")
         ]
-        proposed_cards = proposal.get("proposed_cards") or []
-        if proposed_cards:
-            preview_fields = proposed_cards[0].get("fields") or {}
+        target_type = str(candidate_meta.get("target_type") or "")
+        preview_fields = candidate_meta.get("fields") or {}
+        if target_type == "character":
             preview_interop = preview_fields.get("interop") or {}
             preview_participation = preview_interop.get(
                 "writing_participation"
@@ -849,9 +1162,11 @@ class CardImportProposalService:
                 if key not in {"writing_participation", "source_format"}
             }
         else:
-            display_metadata = {}
+            display_metadata = deepcopy(
+                candidate_meta.get("interop_preview") or {}
+            )
         raw_payload = deepcopy(proposal.get("raw_payload") or {})
-        return {
+        result = {
             "source": {
                 "format": proposal.get("source_format"),
                 "spec_version": proposal.get("spec_version"),
@@ -860,8 +1175,6 @@ class CardImportProposalService:
                 "source_hash": proposal.get("source_hash"),
                 "imported_at": proposal.get("imported_at"),
             },
-            "provenance": _external_provenance(raw_payload),
-            "raw_spec": raw_payload,
             "display_metadata": display_metadata,
             "untrusted_instructions": risk_fields,
             "decorators": deepcopy(proposal.get("decorators") or []),
@@ -871,6 +1184,51 @@ class CardImportProposalService:
                 isolated_fields=isolated_fields,
             ),
         }
+        if target_type == "character":
+            result["provenance"] = _external_provenance(raw_payload)
+            result["raw_spec"] = raw_payload
+            return result
+
+        locator = str(display_metadata.get("source_locator") or "")
+        raw_entry: dict[str, Any] = {}
+        raw_entry_found = False
+        if proposal.get("source_format") == "worldbook_standalone":
+            entries = raw_payload.get("entries")
+            if isinstance(entries, dict):
+                value = entries.get(locator)
+                if isinstance(value, dict):
+                    raw_entry = deepcopy(value)
+                    raw_entry_found = True
+        else:
+            data = raw_payload.get("data")
+            book = data.get("character_book") if isinstance(data, dict) else None
+            entries = book.get("entries") if isinstance(book, dict) else None
+            try:
+                index = int(locator)
+            except (TypeError, ValueError):
+                index = -1
+            if (
+                isinstance(entries, list)
+                and 0 <= index < len(entries)
+                and isinstance(entries[index], dict)
+            ):
+                raw_entry = deepcopy(entries[index])
+                raw_entry_found = True
+        if not raw_entry_found:
+            raise MutationConflictError(
+                "Reviewed world-book raw_entry is missing from the proposal"
+            )
+        result["provenance"] = {
+            "external_uid": deepcopy(display_metadata.get("external_uid")),
+            "source_locator": locator,
+        }
+        result["raw_entry"] = raw_entry
+        result["untrusted_instructions"] = deepcopy(
+            display_metadata.get("unsupported_features") or []
+        )
+        result["decorators"] = []
+        result["assets"] = []
+        return result
 
     @staticmethod
     async def _execute_apply(session: Any, mutation: Any) -> dict[str, Any]:
@@ -1012,6 +1370,10 @@ class CardImportProposalService:
             else:
                 action = decision["action"]
                 repository = get_card_repository(decision["card_type"])
+                candidate_meta = CardImportProposalService._find_candidate(
+                    proposal,
+                    decision["candidate_id"],
+                )
                 if action == "skip":
                     card_id = None
                 elif action == "create":
@@ -1022,6 +1384,7 @@ class CardImportProposalService:
                     candidate["interop"] = (
                         CardImportProposalService._formal_interop(
                             proposal,
+                            candidate_meta,
                             candidate,
                         )
                     )
@@ -1076,6 +1439,7 @@ class CardImportProposalService:
                     merged["interop"] = (
                         CardImportProposalService._formal_interop(
                             proposal,
+                            candidate_meta,
                             merged,
                         )
                     )

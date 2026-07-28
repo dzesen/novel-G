@@ -1,4 +1,4 @@
-"""Authenticated Character Card import preview endpoints."""
+"""Authenticated Character Card and world-book import endpoints."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mutation import MutationConflictError
 from backend.services.auth.identity_service import Actor
 from backend.services.interop.card_import_proposal_service import (
+    MAX_CARD_IMPORT_CANDIDATES,
     CardImportProposalError,
     RawPayloadTooLargeError,
     StaleCardImportProposal,
@@ -29,6 +30,11 @@ from backend.services.interop.character_card_adapter import (
     MAX_PNG_BYTES,
     CharacterCardAdapter,
     CharacterCardValidationError,
+)
+from backend.services.interop.world_book_adapter import (
+    MAX_WORLD_BOOK_JSON_BYTES,
+    WorldBookAdapter,
+    WorldBookValidationError,
 )
 
 
@@ -45,20 +51,29 @@ class CardImportApplyRequest(BaseModel):
     digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     decisions: List[ReferenceCardCurationDecision] = Field(
         min_length=1,
-        max_length=30,
+        max_length=MAX_CARD_IMPORT_CANDIDATES,
     )
 
 
 def _validation_http_error(
-    exc: CharacterCardValidationError,
+    exc: CharacterCardValidationError | WorldBookValidationError,
 ) -> HTTPException:
+    detail = {
+        "code": exc.code,
+        "path": exc.path,
+        "message": exc.message,
+    }
+    if isinstance(exc, WorldBookValidationError) and exc.limit_name:
+        detail.update(
+            {
+                "limit_name": exc.limit_name,
+                "current_value": exc.current_value,
+                "max_value": exc.max_value,
+            }
+        )
     return HTTPException(
         status_code=413 if exc.code in _PAYLOAD_TOO_LARGE_CODES else 400,
-        detail={
-            "code": exc.code,
-            "path": exc.path,
-            "message": exc.message,
-        },
+        detail=detail,
     )
 
 
@@ -71,12 +86,33 @@ async def _stage_upload(
     declared_mime = (file.content_type or "").partition(";")[0].strip().lower()
     try:
         if declared_mime == "application/json":
-            payload = await file.read(MAX_JSON_BYTES + 1)
-            parsed = CharacterCardAdapter.parse_json(
-                payload,
-                declared_mime=file.content_type or "",
-                filename=file.filename,
-            )
+            payload = await file.read(MAX_WORLD_BOOK_JSON_BYTES + 1)
+            try:
+                parsed = WorldBookAdapter.parse_json(
+                    payload,
+                    declared_mime=file.content_type or "",
+                    filename=file.filename,
+                )
+            except WorldBookValidationError as worldbook_error:
+                fallback_to_character = (
+                    worldbook_error.code == "not_standalone_worldbook"
+                    or (
+                        len(payload) > MAX_JSON_BYTES
+                        and worldbook_error.code
+                        in {
+                            "malformed_json",
+                            "duplicate_key",
+                            "invalid_encoding",
+                        }
+                    )
+                )
+                if not fallback_to_character:
+                    raise
+                parsed = CharacterCardAdapter.parse_json(
+                    payload,
+                    declared_mime=file.content_type or "",
+                    filename=file.filename,
+                )
         elif declared_mime == "image/png":
             payload = await file.read(MAX_PNG_BYTES + 1)
             parsed = CharacterCardAdapter.parse_png(
@@ -101,7 +137,7 @@ async def _stage_upload(
             source_hash=hashlib.sha256(payload).hexdigest(),
             source_name=file.filename,
         )
-    except CharacterCardValidationError as exc:
+    except (CharacterCardValidationError, WorldBookValidationError) as exc:
         raise _validation_http_error(exc) from exc
     except RawPayloadTooLargeError as exc:
         raise HTTPException(
