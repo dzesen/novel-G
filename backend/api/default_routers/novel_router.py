@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import List, Literal, Optional
 
 from backend.db.repositories.novel_repository import novel_repo
@@ -12,9 +12,35 @@ from backend.services.auth.novel_access_service import (
     get_novel_access_service,
 )
 from backend.api.default_routers.auth_router import require_actor, require_csrf_actor
+from backend.api.default_routers.reference_card_router import (
+    ReferenceCardCurationDecision,
+)
+from backend.db.mutation import MutationConflictError
+from backend.services.interop.card_import_proposal_service import (
+    DIRECTION_CONTEXT_MAX_PROPOSALS,
+    MAX_CARD_IMPORT_CANDIDATES,
+    CardImportProposalError,
+    StaleCardImportProposal,
+)
 from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
+from backend.services.novel.card_driven_creation_service import (
+    CardDrivenCreationConflict,
+    card_driven_creation_service,
+)
 
 router = APIRouter(prefix="/api/novels", tags=["novels"])
+
+
+class CardImportCreationSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_id: str = Field(min_length=1, max_length=64)
+    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    decisions: List[ReferenceCardCurationDecision] = Field(
+        min_length=1,
+        max_length=MAX_CARD_IMPORT_CANDIDATES,
+    )
+
 
 class CreateNovelRequest(BaseModel):
     title: str
@@ -37,6 +63,16 @@ class CreateNovelRequest(BaseModel):
     words_per_chapter: Optional[int] = None
     creation_mode: Literal["manual", "ai"] = "manual"
     creative_direction: CreativeDirectionSelection | None = None
+    card_creation_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    card_imports: List[CardImportCreationSelection] = Field(
+        default_factory=list,
+        max_length=DIRECTION_CONTEXT_MAX_PROPOSALS,
+    )
 
     @model_validator(mode="after")
     def validate_creation_provenance(self):
@@ -44,7 +80,25 @@ class CreateNovelRequest(BaseModel):
             raise ValueError(
                 "creative_direction requires creation_mode='ai'"
             )
+        if self.card_imports:
+            if self.creation_mode != "ai" or self.creative_direction is None:
+                raise ValueError(
+                    "card_imports require an author-confirmed AI creative direction"
+                )
+            if not self.card_creation_id:
+                raise ValueError(
+                    "card_creation_id is required with card_imports"
+                )
+            if not self.creative_direction.card_context_digest:
+                raise ValueError(
+                    "card_imports require a direction bound to the reviewed card context"
+                )
+        elif self.card_creation_id is not None:
+            raise ValueError(
+                "card_creation_id cannot be used without card_imports"
+            )
         return self
+
 
 class UpdateNovelRequest(BaseModel):
     title: Optional[str] = None
@@ -66,8 +120,10 @@ class UpdateNovelRequest(BaseModel):
     number_of_chapters: Optional[int] = None
     words_per_chapter: Optional[int] = None
 
+
 class StatusUpdate(BaseModel):
     status: str
+
 
 @router.post("/create")
 async def create_novel(
@@ -78,6 +134,8 @@ async def create_novel(
     data = req.model_dump(exclude_unset=True)
     creation_mode = data.pop("creation_mode", req.creation_mode)
     creative_direction = data.pop("creative_direction", None)
+    card_creation_id = data.pop("card_creation_id", None)
+    card_imports = data.pop("card_imports", [])
     owner_id = to_object_id(actor.id)
     data.update(
         {
@@ -91,10 +149,25 @@ async def create_novel(
             "creative_director": creative_direction,
         }
     try:
+        if card_imports:
+            return await card_driven_creation_service.create_or_resume(
+                data,
+                owner_id=actor.id,
+                creation_id=str(card_creation_id),
+                card_imports=card_imports,
+            )
         novel_id = await novel_repo.create_novel(data)
         return {"id": novel_id, "message": "Novel created"}
+    except (
+        CardDrivenCreationConflict,
+        StaleCardImportProposal,
+        MutationConflictError,
+    ) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except CardImportProposalError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 @router.get("/list")
 async def get_all_novels(actor: Actor = Depends(require_actor)):

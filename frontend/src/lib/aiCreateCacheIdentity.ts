@@ -1,10 +1,12 @@
 import type { CreativeDirectionSelection } from "@/types/agent";
+import type { CardImportDirectionReference } from "@/types/novel";
 
 export interface AICreateCacheInput {
   user_idea: string;
   number_of_chapters: number;
   words_per_chapter: number;
   creative_direction: CreativeDirectionSelection | null;
+  card_imports: CardImportDirectionReference[];
 }
 
 export interface AICreateCacheIdentityRecord {
@@ -24,6 +26,8 @@ export function isSameAICreateInput(
     record.input.number_of_chapters === input.number_of_chapters &&
     record.input.words_per_chapter === input.words_per_chapter &&
     JSON.stringify(record.input.creative_direction) ===
-      JSON.stringify(input.creative_direction)
+      JSON.stringify(input.creative_direction) &&
+    JSON.stringify(record.input.card_imports) ===
+      JSON.stringify(input.card_imports)
   );
 }

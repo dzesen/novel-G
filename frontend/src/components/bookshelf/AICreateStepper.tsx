@@ -19,7 +19,13 @@ import {
   OptionalTextParam,
   SwitchParam,
 } from "@/components/shared/OptionalParamControls";
-import type { AICreateCachedSteps, AICreateRequest, AICreateResponse, AICreateStepKey } from "@/types/novel";
+import type {
+  AICreateCachedSteps,
+  AICreateRequest,
+  AICreateResponse,
+  AICreateStepKey,
+  CardImportDirectionReference,
+} from "@/types/novel";
 import type {
   AgentProfile,
   CreativeDirection,
@@ -34,6 +40,9 @@ interface AICreateStepperProps {
     wordsPerChapter: number,
     creativeDirection: CreativeDirectionSelection | null,
   ) => void;
+  cardImports?: CardImportDirectionReference[];
+  requireDirector?: boolean;
+  initialIdea?: string;
 }
 
 type StepStatus = "pending" | "running" | "done" | "error";
@@ -95,17 +104,26 @@ function mergePartialResult(current: AICreateCachedSteps, data: unknown): AICrea
   });
 }
 
-export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
+export default function AICreateStepper({
+  onComplete,
+  cardImports = [],
+  requireDirector = false,
+  initialIdea = "",
+}: AICreateStepperProps) {
   const t = useTranslations("create");
-  const [initialCache] = useState(() => loadAICreateCache());
+  const [initialCache] = useState(() =>
+    cardImports.length > 0 ? null : loadAICreateCache(),
+  );
   const initialSteps = initialCache?.steps ?? {};
   const initialCreativeDirection =
     initialCache?.input.creative_direction ?? null;
-  const [idea, setIdea] = useState(initialCache?.input.user_idea ?? "");
+  const [idea, setIdea] = useState(
+    initialCache?.input.user_idea ?? initialIdea,
+  );
   const [chapters, setChapters] = useState(initialCache?.input.number_of_chapters ?? 600);
   const [wordsPerChapter, setWordsPerChapter] = useState(initialCache?.input.words_per_chapter ?? 3000);
   const [directorEnabled, setDirectorEnabled] = useState(
-    initialCreativeDirection !== null,
+    requireDirector || initialCreativeDirection !== null,
   );
   const [directorAgents, setDirectorAgents] = useState<AgentProfile[]>([]);
   const [selectedDirectorId, setSelectedDirectorId] = useState(
@@ -191,6 +209,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
     number_of_chapters: nextChapters,
     words_per_chapter: nextWordsPerChapter,
     creative_direction: nextCreativeDirection,
+    card_imports: cardImports,
   });
 
   const setCachedStepsState = (nextSteps: AICreateCachedSteps) => {
@@ -238,6 +257,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
   };
 
   const handleDirectorToggle = (enabled: boolean) => {
+    if (requireDirector) return;
     if (enabled === directorEnabled) return;
     resetGenerationState();
     resetDirectorPreview();
@@ -261,7 +281,9 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
 
   const startCreativeDirector = async () => {
     const originalIdea = idea.trim();
-    if (!originalIdea || !selectedDirectorId) return;
+    if ((!originalIdea && cardImports.length === 0) || !selectedDirectorId) {
+      return;
+    }
 
     setDirectorError("");
     setIsDirecting(true);
@@ -276,6 +298,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
           agent_id: selectedDirectorId,
           direction_count: 3,
           instruction: directorInstruction.trim(),
+          ...(cardImports.length > 0 && { card_imports: cardImports }),
           ...(temperature != null && { temperature }),
           ...(topP != null && { top_p: topP }),
           ...(maxTokens != null && { max_tokens: maxTokens }),
@@ -311,6 +334,9 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
       provider_alias: directorPreview.provider_alias || null,
       direction,
       user_adjustments: "",
+      ...(directorPreview.card_context_digest && {
+        card_context_digest: directorPreview.card_context_digest,
+      }),
     };
     setSelectedDirectionIndex(index);
     setConfirmedDirection(selection);
@@ -519,7 +545,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
           <Switch
             aria-label={t("director.toggle")}
             isSelected={directorEnabled}
-            isDisabled={directorLocked}
+            isDisabled={directorLocked || requireDirector}
             onChange={handleDirectorToggle}
             className="shrink-0"
           >
@@ -594,7 +620,7 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
                 variant="secondary"
                 isDisabled={
                   directorLocked ||
-                  !idea.trim() ||
+                  (!idea.trim() && cardImports.length === 0) ||
                   !selectedDirectorId ||
                   directorAgents.length === 0
                 }
@@ -631,6 +657,22 @@ export default function AICreateStepper({ onComplete }: AICreateStepperProps) {
                     tokens: directorPreview.usage.total_tokens ?? 0,
                   })}
                 </p>
+                {directorPreview.card_context_report &&
+                  (directorPreview.card_context_report.truncated_fields.length >
+                    0 ||
+                    directorPreview.card_context_report
+                      .dropped_world_entries > 0) && (
+                    <p className="text-xs leading-5 text-warning">
+                      {t("director.cardContextTruncated", {
+                        fields:
+                          directorPreview.card_context_report.truncated_fields
+                            .length,
+                        entries:
+                          directorPreview.card_context_report
+                            .dropped_world_entries,
+                      })}
+                    </p>
+                  )}
               </div>
             )}
 

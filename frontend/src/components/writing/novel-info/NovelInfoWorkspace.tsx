@@ -141,6 +141,8 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         creation_mode:
           sourceDraft.creation_mode === "ai" ? "ai" : "manual",
         creative_direction: sourceDraft.creative_direction,
+        card_creation_id: sourceDraft.card_creation_id,
+        card_imports: sourceDraft.card_imports,
       };
       const res = await apiPost<{ id: string }>("/api/novels/create", payload);
       clearWritingDraft(draftId);

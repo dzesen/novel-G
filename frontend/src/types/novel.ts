@@ -61,6 +61,8 @@ export interface CreateNovelRequest {
   words_per_chapter?: number;
   creation_mode?: "manual" | "ai";
   creative_direction?: CreativeDirectionSelection;
+  card_creation_id?: string;
+  card_imports?: CardImportCreationSelection[];
 }
 
 export type ChapterStatus = "draft" | "writing" | "completed";
@@ -154,6 +156,115 @@ export type ReferenceCardCurationAction =
   | "merge"
   | "restore_merge"
   | "skip";
+
+export interface CardImportDirectionReference {
+  proposal_id: string;
+  digest: string;
+}
+
+export interface CardImportDecision {
+  candidate_id: string;
+  action: ReferenceCardCurationAction;
+  target_card_id?: string;
+  overrides?: Record<string, unknown>;
+  overwrite_fields?: string[];
+}
+
+export interface CardImportCreationSelection
+  extends CardImportDirectionReference {
+  decisions: CardImportDecision[];
+}
+
+export interface CardImportConflict {
+  target_card_id: string;
+  match_kind: string;
+  is_deleted: boolean;
+  field_diffs: Record<
+    string,
+    {
+      existing: unknown;
+      imported: unknown;
+    }
+  >;
+}
+
+export interface CardImportCandidate {
+  candidate_id: string;
+  target_type: "character" | "lore";
+  fields: {
+    name: string;
+    subtitle?: string;
+    description?: string;
+    tags?: string[];
+    importance?: "main" | "sub";
+    details?: Record<string, string>;
+    character_profile?: CharacterProfile;
+    interop?: {
+      scenario?: string;
+      first_mes?: string;
+      mes_example?: string;
+      creator_notes?: string;
+      writing_participation?: ReferenceCardInterop["writing_participation"];
+    };
+  };
+  interop_preview?: {
+    keys?: string[];
+    enabled?: boolean;
+    constant?: boolean;
+    insertion_order?: number;
+    source_locator?: string;
+    regex_fields?: string[];
+    unrecognized_fields?: string[];
+    unsupported_features?: Array<{
+      kind?: string;
+      enabled?: boolean;
+    }>;
+    preview_notices?: Array<{
+      code?: string;
+      message?: string;
+    }>;
+  };
+  conflicts: CardImportConflict[];
+  recommended_action: ReferenceCardCurationAction;
+}
+
+export interface CardImportProposal {
+  proposal_id: string;
+  novel_id: null;
+  source_format: "v1" | "v2" | "v3" | "worldbook_standalone";
+  source_container: "json" | "png";
+  source_name?: string | null;
+  digest: string;
+  status: "pending_review" | "stale" | "applying" | "applied";
+  detected_warnings: string[];
+  prompt_risk_fields: Array<{
+    kind: string;
+    path?: string;
+    enabled: false;
+  }>;
+  decorators: Array<{ kind?: string; enabled?: false }>;
+  assets: Array<{ type?: string; retrieval_enabled?: false }>;
+  container_preview: {
+    selected_png_chunk?: string | null;
+    png_chunk_classification?: string | null;
+    png_preview_label?: string | null;
+    image_data_discarded: boolean;
+  };
+  worldbook_preview?: {
+    source_kind: string;
+    source_format: string;
+    entry_count: number;
+    detected_warnings: string[];
+    unrecognized_top_level_fields: string[];
+  } | null;
+  proposed_cards: CardImportCandidate[];
+  duplicate_source?: {
+    proposal_id?: string;
+    card_id?: string;
+    novel_id?: string;
+    imported_at?: string;
+  } | null;
+}
 
 export interface ReferenceCardCandidate {
   candidate_id: string;

@@ -6,9 +6,10 @@ import type { NovelSummary, NovelDetail } from "@/types/novel";
 import NovelList from "./NovelList";
 import NovelDetailPanel from "./NovelDetail";
 import NewNovelPanel from "./NewNovelPanel";
+import CardDrivenCreatePanel from "./CardDrivenCreatePanel";
 import TrashBin from "./TrashBin";
 
-type RightPanel = "detail" | "new";
+type RightPanel = "detail" | "new" | "card-new";
 
 export default function BookshelfContent() {
   const [novels, setNovels] = useState<NovelSummary[]>([]);
@@ -51,6 +52,12 @@ export default function BookshelfContent() {
     setRightPanel("new");
   };
 
+  const handleCardDrivenNovel = () => {
+    setSelectedId(null);
+    setSelectedNovel(null);
+    setRightPanel("card-new");
+  };
+
   const handleDelete = async (id: string) => {
     try {
       await apiDelete(`/api/novels/${id}`);
@@ -79,6 +86,7 @@ export default function BookshelfContent() {
           loading={loading}
           onSelect={handleSelect}
           onNewNovel={handleNewNovel}
+          onCardDrivenNovel={handleCardDrivenNovel}
           onOpenTrash={() => setTrashOpen(true)}
         />
       </div>
@@ -88,6 +96,10 @@ export default function BookshelfContent() {
         {rightPanel === "new" ? (
           <NewNovelPanel
             onCreated={handleNovelCreated}
+            onCancel={() => setRightPanel("detail")}
+          />
+        ) : rightPanel === "card-new" ? (
+          <CardDrivenCreatePanel
             onCancel={() => setRightPanel("detail")}
           />
         ) : (

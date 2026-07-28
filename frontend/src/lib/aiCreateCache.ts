@@ -61,6 +61,7 @@ function normalizeCreativeDirection(
 
   const providerAlias = value.provider_alias;
   const userAdjustments = value.user_adjustments;
+  const cardContextDigest = value.card_context_digest;
   if (
     providerAlias !== null &&
     providerAlias !== undefined &&
@@ -71,6 +72,14 @@ function normalizeCreativeDirection(
   if (
     userAdjustments !== undefined &&
     typeof userAdjustments !== "string"
+  ) {
+    return null;
+  }
+  if (
+    cardContextDigest !== undefined &&
+    cardContextDigest !== null &&
+    (typeof cardContextDigest !== "string" ||
+      !/^[0-9a-f]{64}$/.test(cardContextDigest))
   ) {
     return null;
   }
@@ -91,6 +100,9 @@ function normalizeCreativeDirection(
       risks: [...direction.risks],
     },
     user_adjustments: userAdjustments || "",
+    ...(cardContextDigest && {
+      card_context_digest: cardContextDigest as string,
+    }),
   };
 }
 
@@ -118,12 +130,38 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   ) {
     return null;
   }
+  const rawCardImports = value.card_imports;
+  const cardImports =
+    rawCardImports === undefined
+      ? []
+      : Array.isArray(rawCardImports)
+        ? rawCardImports
+            .filter(
+              (item) =>
+                isObject(item) &&
+                isString(item.proposal_id) &&
+                typeof item.digest === "string" &&
+                /^[0-9a-f]{64}$/.test(item.digest),
+            )
+            .map((item) => ({
+              proposal_id: item.proposal_id as string,
+              digest: item.digest as string,
+            }))
+        : null;
+  if (
+    cardImports === null ||
+    (Array.isArray(rawCardImports) &&
+      cardImports.length !== rawCardImports.length)
+  ) {
+    return null;
+  }
 
   return {
     user_idea: userIdea,
     number_of_chapters: chapters,
     words_per_chapter: wordsPerChapter,
     creative_direction: normalizedCreativeDirection,
+    card_imports: cardImports,
   };
 }
 

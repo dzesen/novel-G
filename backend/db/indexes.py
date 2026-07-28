@@ -71,6 +71,22 @@ async def init_novel_indexes():
                 ("is_deleted", pymongo.ASCENDING),
                 ("title", pymongo.ASCENDING)
             ]),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    (
+                        "creation_provenance.card_imports.creation_id",
+                        pymongo.ASCENDING,
+                    ),
+                ],
+                unique=True,
+                partialFilterExpression={
+                    "creation_provenance.card_imports.creation_id": {
+                        "$type": "string"
+                    }
+                },
+                name="novels_owner_card_creation_id_unique",
+            ),
         ]
         
         await novels_collection.create_indexes(indexes)

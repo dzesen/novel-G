@@ -12,6 +12,7 @@ interface NovelListProps {
   loading: boolean;
   onSelect: (id: string) => void;
   onNewNovel: () => void;
+  onCardDrivenNovel: () => void;
   onOpenTrash: () => void;
 }
 
@@ -21,6 +22,7 @@ export default function NovelList({
   loading,
   onSelect,
   onNewNovel,
+  onCardDrivenNovel,
   onOpenTrash,
 }: NovelListProps) {
   const t = useTranslations("bookshelf");
@@ -61,6 +63,28 @@ export default function NovelList({
           </svg>
         </Button>
       </div>
+      <Button
+        variant="secondary"
+        className="w-full shrink-0"
+        onPress={onCardDrivenNovel}
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H18" />
+          <path d="M8 5h11v14H8z" />
+          <path d="m12 9 3 3-3 3" />
+        </svg>
+        {t("newFromTavernCards")}
+      </Button>
 
       {/* Novel Count */}
       {!loading && novels.length > 0 && (
@@ -103,6 +127,8 @@ function NovelCard({
   isSelected: boolean;
   onSelect: (id: string) => void;
 }) {
+  const t = useTranslations("bookshelf");
+
   return (
     <Card
       className={`cursor-pointer transition-all hover:shadow-md ${
@@ -154,10 +180,16 @@ function NovelCard({
               </p>
               <div className="flex items-center gap-2 mt-1">
                 <span className="text-xs text-muted">
-                  {novel.stats?.chapter_count ?? 0}章
+                  {t("chapterCount", {
+                    count: novel.stats?.chapter_count ?? 0,
+                  })}
                 </span>
                 <span className="text-xs text-muted">
-                  {(novel.stats?.total_word_count ?? 0).toLocaleString()}字
+                  {t("wordCount", {
+                    count: (
+                      novel.stats?.total_word_count ?? 0
+                    ).toLocaleString(),
+                  })}
                 </span>
               </div>
             </div>

@@ -67,6 +67,7 @@ export interface CreativeDirectionSelection {
   provider_alias: string | null;
   direction: CreativeDirection;
   user_adjustments: string;
+  card_context_digest?: string | null;
 }
 
 export interface CreativeDirectorResponse {
@@ -81,6 +82,14 @@ export interface CreativeDirectorResponse {
   };
   attempts: AgentRunAttempt[];
   write_policy: "preview_only";
+  card_context_digest?: string | null;
+  card_context_report?: {
+    character_count: number;
+    world_entry_count: number;
+    truncated_fields: string[];
+    dropped_world_entries: number;
+    max_characters: number;
+  } | null;
 }
 
 export interface AgentProviderOption {

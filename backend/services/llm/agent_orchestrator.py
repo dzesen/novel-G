@@ -193,6 +193,12 @@ class CreativeDirectionSelection(BaseModel):
     provider_alias: str | None = Field(default=None, max_length=120)
     direction: CreativeDirection
     user_adjustments: str = Field(default="", max_length=2000)
+    card_context_digest: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class CreativeIdea(BaseModel):
