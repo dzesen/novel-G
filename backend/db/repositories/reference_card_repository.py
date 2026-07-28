@@ -71,6 +71,10 @@ class ReferenceCardRepository(BaseRepository):
             "importance": importance,
             "sort_order": int(data.get("sort_order") or await self._next_sort_order(obj_id, card_type, session)),
         }
+        if card_type == "character":
+            # Novel-G 的收藏是本地组织状态。外部导入即使携带同名字段也不能
+            # 继承该状态；新角色卡一律从未收藏开始。
+            prepared["is_favorite"] = False
         if "character_profile" in data:
             if card_type != "character":
                 raise ValueError(
@@ -171,6 +175,41 @@ class ReferenceCardRepository(BaseRepository):
         if not prepared:
             return False
         return await self.update_one({"_id": current["_id"]}, prepared, session=session)
+
+    async def set_favorite(
+        self,
+        novel_id: str,
+        card_type: str,
+        card_id: str,
+        is_favorite: bool,
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        """Update character-card organization state without touching content audit order.
+
+        ``updated_at`` participates in the default card-list tie breaker. Changing it
+        for a UI-only favorite would be an indirect route into roster/context ordering
+        when two cards share ``sort_order``, so this metadata has a deliberately
+        separate write path.
+        """
+
+        self._validate_type(card_type)
+        if card_type != "character":
+            raise ValueError("Favorites are only supported for character cards")
+        if type(is_favorite) is not bool:
+            raise ValueError("is_favorite must be a boolean")
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(card_id),
+                "novel_id": to_object_id(novel_id),
+                "card_type": card_type,
+                "is_deleted": False,
+            },
+            {"$set": {"is_favorite": is_favorite}},
+            session=session,
+        )
+        if result.matched_count == 0:
+            raise NotFoundError(f"Reference card '{card_id}' was not found")
+        return result.modified_count > 0
 
     async def soft_delete_card(
         self,

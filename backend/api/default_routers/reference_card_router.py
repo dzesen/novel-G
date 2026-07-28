@@ -51,6 +51,10 @@ class ReferenceCardUpdateRequest(BaseModel):
     character_profile: Optional[CharacterProfileSchema] = None
 
 
+class ReferenceCardFavoriteRequest(BaseModel):
+    is_favorite: bool
+
+
 class ReferenceCardCurationDecision(BaseModel):
     candidate_id: str = Field(min_length=1)
     action: Literal["create", "merge", "restore_merge", "skip"]
@@ -70,6 +74,8 @@ class ReferenceCardCurationPrepareRequest(BaseModel):
 
 def _serialize_card(card: dict) -> dict:
     result = dict(card)
+    if result.get("card_type") == "character":
+        result["is_favorite"] = bool(result.get("is_favorite", False))
     for key in ("_id", "novel_id"):
         if key in result:
             result[key] = str(result[key])
@@ -198,6 +204,26 @@ async def update_card(novel_id: str, card_type: str, card_id: str, req: Referenc
             card_type,
             card_id,
             req.model_dump(exclude_unset=True),
+        )
+        card = await ReferenceCardService.get(novel_id, card_type, card_id)
+        return _serialize_card(card)
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.patch("/novel/{novel_id}/{card_type}/{card_id}/favorite")
+async def set_card_favorite(
+    novel_id: str,
+    card_type: str,
+    card_id: str,
+    req: ReferenceCardFavoriteRequest,
+):
+    try:
+        await ReferenceCardService.set_favorite(
+            novel_id,
+            card_type,
+            card_id,
+            req.is_favorite,
         )
         card = await ReferenceCardService.get(novel_id, card_type, card_id)
         return _serialize_card(card)

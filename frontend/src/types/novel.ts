@@ -155,6 +155,7 @@ export interface ReferenceCard {
   tags: string[];
   sort_order: number;
   importance: "main" | "sub";
+  is_favorite?: boolean;
   character_profile?: CharacterProfile;
   interop?: ReferenceCardInterop;
   is_deleted: boolean;

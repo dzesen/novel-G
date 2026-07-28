@@ -232,6 +232,32 @@ class ReferenceCardService:
         )
 
     @staticmethod
+    async def set_favorite(
+        novel_id: str,
+        card_type: str,
+        card_id: str,
+        is_favorite: bool,
+    ) -> bool:
+        """Atomically set UI-only metadata without a replayable narrative mutation."""
+
+        normalized = validate_card_type(card_type)
+        if normalized != "character":
+            raise ValueError("Favorites are only supported for character cards")
+        if type(is_favorite) is not bool:
+            raise ValueError("is_favorite must be a boolean")
+        await novel_repo.get_novel_by_id(novel_id)
+        # This is one atomic document update with an explicit target state. It
+        # deliberately has no recoverable journal: an old failed journal could
+        # otherwise replay after a newer toggle and overwrite the user's final
+        # choice. Retrying the same target state is already safe.
+        return await get_card_repository(normalized).set_favorite(
+            novel_id,
+            normalized,
+            card_id,
+            is_favorite,
+        )
+
+    @staticmethod
     async def update(novel_id: str, card_type: str, card_id: str, data: Dict[str, Any]) -> bool:
         normalized = validate_card_type(card_type)
         await novel_repo.get_novel_by_id(novel_id)

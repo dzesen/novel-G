@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
-import { apiDelete, apiGet, apiPost, apiPut } from "@/lib/api";
+import { apiDelete, apiGet, apiPatch, apiPost, apiPut } from "@/lib/api";
+import { organizeReferenceCards } from "@/lib/referenceCardFavorites";
 import type {
   CharacterProfile,
   ReferenceCard,
@@ -82,6 +83,15 @@ export default function ReferenceCardsWorkspace({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [favoriteCardIds, setFavoriteCardIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  const [favoritesFirst, setFavoritesFirst] = useState(false);
+  const [favoritePendingIds, setFavoritePendingIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [favoriteError, setFavoriteError] = useState<string | null>(null);
   const [showCuration, setShowCuration] = useState(false);
   const [showCardImport, setShowCardImport] = useState(false);
 
@@ -91,26 +101,25 @@ export default function ReferenceCardsWorkspace({
   );
 
   const filteredCards = useMemo(() => {
-    const needle = search.trim().toLocaleLowerCase();
-    if (!needle) return cards;
-    return cards.filter((card) =>
-      [
-        card.name,
-        card.subtitle,
-        card.description,
-        ...card.tags,
-        ...(card.character_profile?.aliases ?? []),
-      ]
-        .join(" ")
-        .toLocaleLowerCase()
-        .includes(needle),
-    );
-  }, [cards, search]);
+    return organizeReferenceCards(cards, {
+      search,
+      favoriteCardIds,
+      favoritesOnly,
+      favoritesFirst,
+    });
+  }, [
+    cards,
+    favoriteCardIds,
+    favoritesFirst,
+    favoritesOnly,
+    search,
+  ]);
 
   const loadCards = useCallback(async () => {
     if (!novelId || mode !== "edit") return;
     setLoading(true);
     setError(null);
+    setFavoriteError(null);
     try {
       const [activeResponse, trashResponse] = await Promise.all([
         apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/${cardType}`),
@@ -118,6 +127,14 @@ export default function ReferenceCardsWorkspace({
       ]);
       setCards(activeResponse.data);
       setTrash(trashResponse.data);
+      setFavoriteCardIds(
+        new Set(
+          activeResponse.data
+            .filter((card) => card.is_favorite)
+            .map((card) => card._id),
+        ),
+      );
+      setFavoritePendingIds(new Set());
       setSelectedId((current) => {
         if (current && activeResponse.data.some((card) => card._id === current)) return current;
         return activeResponse.data[0]?._id ?? null;
@@ -196,6 +213,39 @@ export default function ReferenceCardsWorkspace({
     }
   };
 
+  const setCardFavorite = async (card: ReferenceCard) => {
+    if (!novelId || favoritePendingIds.has(card._id)) return;
+    const nextValue = !favoriteCardIds.has(card._id);
+    setFavoriteError(null);
+    setFavoritePendingIds((current) => {
+      const next = new Set(current);
+      next.add(card._id);
+      return next;
+    });
+    try {
+      const updated = await apiPatch<ReferenceCard>(
+        `/api/reference-cards/novel/${novelId}/${cardType}/${card._id}/favorite`,
+        { is_favorite: nextValue },
+      );
+      setFavoriteCardIds((current) => {
+        const next = new Set(current);
+        if (updated.is_favorite) next.add(card._id);
+        else next.delete(card._id);
+        return next;
+      });
+    } catch (reason) {
+      setFavoriteError(
+        reason instanceof Error ? reason.message : t("favoriteUpdateFailed"),
+      );
+    } finally {
+      setFavoritePendingIds((current) => {
+        const next = new Set(current);
+        next.delete(card._id);
+        return next;
+      });
+    }
+  };
+
   const moveToTrash = async () => {
     if (!novelId || !selectedCard || !window.confirm(t("deleteConfirm", { name: selectedCard.name }))) return;
     try {
@@ -203,6 +253,11 @@ export default function ReferenceCardsWorkspace({
       const remaining = cards.filter((card) => card._id !== selectedCard._id);
       setCards(remaining);
       setTrash((current) => [{ ...selectedCard, is_deleted: true }, ...current]);
+      setFavoriteCardIds((current) => {
+        const next = new Set(current);
+        next.delete(selectedCard._id);
+        return next;
+      });
       setSelectedId(remaining[0]?._id ?? null);
       setCreating(false);
     } catch (reason) {
@@ -219,6 +274,9 @@ export default function ReferenceCardsWorkspace({
       );
       setTrash((current) => current.filter((item) => item._id !== card._id));
       setCards((current) => [...current, restored]);
+      if (restored.is_favorite) {
+        setFavoriteCardIds((current) => new Set(current).add(restored._id));
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("restoreFailed"));
     }
@@ -293,6 +351,46 @@ export default function ReferenceCardsWorkspace({
               {t("trash", { count: trash.length })}
             </button>
           </div>
+          {cardType === "character" && !showTrash && (
+            <div
+              className="mt-3 grid grid-cols-2 gap-2"
+              role="group"
+              aria-label={t("favoriteControls")}
+            >
+              <button
+                type="button"
+                aria-pressed={favoritesOnly}
+                onClick={() => setFavoritesOnly((current) => !current)}
+                className={`min-h-11 rounded-lg border px-2 py-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                  favoritesOnly
+                    ? "border-accent/40 bg-accent/10 text-accent"
+                    : "border-border bg-background text-muted hover:text-foreground"
+                }`}
+              >
+                {t("favoritesOnly")}
+              </button>
+              <button
+                type="button"
+                aria-pressed={favoritesFirst}
+                onClick={() => setFavoritesFirst((current) => !current)}
+                className={`min-h-11 rounded-lg border px-2 py-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                  favoritesFirst
+                    ? "border-accent/40 bg-accent/10 text-accent"
+                    : "border-border bg-background text-muted hover:text-foreground"
+                }`}
+              >
+                {t("favoritesFirst")}
+              </button>
+            </div>
+          )}
+          {cardType === "character" && !showTrash && favoriteError && (
+            <p
+              role="alert"
+              className="mt-3 rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+            >
+              {favoriteError}
+            </p>
+          )}
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -309,27 +407,67 @@ export default function ReferenceCardsWorkspace({
                 </div>
               </div>
             )) : <p className="px-3 py-8 text-center text-sm text-muted">{t("trashEmpty")}</p>
-          ) : filteredCards.length ? filteredCards.map((card) => (
-            <button
-              key={card._id}
-              type="button"
-              onClick={() => selectCard(card)}
-              className={`mb-1 w-full rounded-lg px-3 py-3 text-left transition-colors ${selectedId === card._id && !creating ? "bg-accent/10" : "hover:bg-surface-secondary"}`}
-            >
-              <div className="flex items-center gap-3">
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent/10 text-sm font-semibold text-accent">{card.name.slice(0, 1).toLocaleUpperCase()}</span>
-                <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium text-foreground">{card.name}</span>
-                  <span className="mt-0.5 block truncate text-xs text-muted">{card.subtitle || card.description || t("noDescription")}</span>
-                  {card.interop?.writing_participation?.status === "not_participating" && (
-                    <span className="mt-1.5 inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-200">
-                      {t("importedNotParticipating")}
+          ) : filteredCards.length ? filteredCards.map((card) => {
+            const isFavorite = favoriteCardIds.has(card._id);
+            const favoritePending = favoritePendingIds.has(card._id);
+            const selected = selectedId === card._id && !creating;
+            return (
+              <div
+                key={card._id}
+                className={`mb-1 flex w-full items-stretch rounded-lg transition-colors ${
+                  selected ? "bg-accent/10" : "hover:bg-surface-secondary"
+                }`}
+              >
+                <button
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => selectCard(card)}
+                  className="min-w-0 flex-1 rounded-l-lg px-3 py-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+                >
+                  <span className="flex items-center gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent/10 text-sm font-semibold text-accent">{card.name.slice(0, 1).toLocaleUpperCase()}</span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium text-foreground">{card.name}</span>
+                      <span className="mt-0.5 block truncate text-xs text-muted">{card.subtitle || card.description || t("noDescription")}</span>
+                      {card.interop?.writing_participation?.status === "not_participating" && (
+                        <span className="mt-1.5 inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+                          {t("importedNotParticipating")}
+                        </span>
+                      )}
                     </span>
-                  )}
-                </span>
+                  </span>
+                </button>
+                {cardType === "character" && (
+                  <button
+                    type="button"
+                    aria-label={t(
+                      isFavorite ? "unfavoriteCard" : "favoriteCard",
+                      { name: card.name },
+                    )}
+                    aria-pressed={isFavorite}
+                    aria-busy={favoritePending}
+                    disabled={favoritePending}
+                    onClick={() => void setCardFavorite(card)}
+                    className={`m-1 min-h-11 min-w-11 self-center rounded-lg text-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-wait disabled:opacity-50 ${
+                      isFavorite
+                        ? "text-accent hover:bg-accent/10"
+                        : "text-muted hover:bg-background hover:text-accent"
+                    }`}
+                  >
+                    <span aria-hidden="true">{isFavorite ? "★" : "☆"}</span>
+                  </button>
+                )}
               </div>
-            </button>
-          )) : <p className="px-3 py-8 text-center text-sm text-muted">{search ? t("noSearchResults") : t("empty")}</p>}
+            );
+          }) : (
+            <p className="px-3 py-8 text-center text-sm text-muted">
+              {favoritesOnly
+                ? t("noFavoriteResults")
+                : search
+                  ? t("noSearchResults")
+                  : t("empty")}
+            </p>
+          )}
         </div>
       </aside>
 
