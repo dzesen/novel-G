@@ -33,6 +33,7 @@ from backend.db.mutation import (
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.interop.character_card_adapter import (
+    MAX_ARRAY_ITEMS,
     MAX_JSON_BYTES,
     MAX_STRING_CHARS,
     ParsedCharacterCard,
@@ -48,7 +49,6 @@ from backend.services.novel.character_profile import normalize_character_profile
 from backend.services.novel.reference_card_curation import (
     REFERENCE_CARD_EDITABLE_FIELDS,
     merge_reference_card_data,
-    validate_reference_card_candidate,
 )
 from backend.services.novel.reference_card_service import (
     get_card_repository,
@@ -331,6 +331,75 @@ def _validate_worldbook_import_candidate(
         "importance": importance,
         "tags": normalized_tags,
         "details": normalized_details,
+    }
+
+
+def _validate_character_import_candidate(
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a character import without applying AI-curation size caps."""
+
+    name = candidate.get("name", "")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Imported character card name cannot be empty")
+    name = " ".join(name.split())
+    if len(name) > 120:
+        raise ValueError("Imported character card name cannot exceed 120 characters")
+
+    subtitle = candidate.get("subtitle", "")
+    if not isinstance(subtitle, str) or len(subtitle) > 200:
+        raise ValueError(
+            "Imported character card subtitle must be a string of at most "
+            "200 characters"
+        )
+    description = candidate.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError("Imported character card description must be a string")
+    if len(description) > MAX_STRING_CHARS:
+        raise ValueError(
+            "Imported character card description exceeds the retained string "
+            f"limit: current_chars={len(description)}, "
+            f"max_chars={MAX_STRING_CHARS}"
+        )
+
+    importance = candidate.get("importance", "sub")
+    if importance not in {"main", "sub"}:
+        raise ValueError("Imported character card importance must be main or sub")
+
+    tags = candidate.get("tags", [])
+    if not isinstance(tags, list) or len(tags) > MAX_ARRAY_ITEMS:
+        raise ValueError(
+            "Imported character card tags exceed the retained array limit: "
+            f"max_items={MAX_ARRAY_ITEMS}"
+        )
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValueError("Imported character card tags must be strings")
+        if len(tag) > MAX_STRING_CHARS:
+            raise ValueError("Imported character card tag exceeds string limit")
+
+    details = candidate.get("details", {})
+    if not isinstance(details, dict):
+        raise ValueError("Imported character card details must be an object")
+    for key, value in details.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                "Imported character card details must contain strings"
+            )
+        if len(value) > MAX_STRING_CHARS:
+            raise ValueError("Imported character card detail exceeds string limit")
+
+    character_profile = normalize_character_profile(
+        candidate.get("character_profile") or {}
+    )
+    return {
+        "name": name,
+        "subtitle": subtitle.strip(),
+        "description": description.strip(),
+        "importance": importance,
+        "tags": deepcopy(tags),
+        "details": deepcopy(details),
+        "character_profile": character_profile,
     }
 
 
@@ -1566,7 +1635,7 @@ class CardImportProposalService:
             }
             edited.update(deepcopy(overrides))
             edited = (
-                validate_reference_card_candidate(target_type, edited)
+                _validate_character_import_candidate(edited)
                 if target_type == "character"
                 else _validate_worldbook_import_candidate(edited)
             )
