@@ -27,7 +27,17 @@ MAX_OBJECT_FIELDS = 2_000
 MAX_NESTING_DEPTH = 32
 MAX_TOTAL_VALUES = 20_000
 MAX_PNG_BYTES = 10 * 1024 * 1024
-MAX_PNG_CHUNKS = 128
+# PNG 规范对 chunk 数量没有上限，图像数据本身就是切成多个 IDAT chunk 存的，
+# 切多细取决于编码器。因此这个值【不能】按“正常图片没几个 chunk”来定：
+# 基于 libpng 的工具按压缩缓冲区大小切 IDAT，一张压缩后 1 MB 的立绘就可能
+# 超过一百个 IDAT，而这与文件是否可疑毫无关系。
+#
+# 真正的 DoS 防线是上面的 MAX_PNG_BYTES，它在 chunk 循环【之前】检查：
+# 每个 chunk 至少 12 字节开销，10 MiB 文件最多约 87 万个 chunk，而循环体
+# 只做几次切片和整数解析，构不成 DoS。本值只用于挡住病态输入，
+# 取值必须高到不可能误杀合法文件——10 MiB 即使按 1 KB/IDAT 这种极端细的
+# 切法也只有约 10,240 个 chunk。
+MAX_PNG_CHUNKS = 16_384
 MAX_PNG_CHUNK_JSON_BYTES = MAX_JSON_BYTES
 MAX_PNG_DECODED_BYTES = 2 * MAX_PNG_CHUNK_JSON_BYTES
 
