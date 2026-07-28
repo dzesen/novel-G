@@ -495,12 +495,8 @@
       "novelInfo": "Novel Info",
       "chapterEditor": "Chapter Editor",
       "entityGroup": "Entity Management",
-      "characterCards": "Characters",
-      "locationCards": "Locations",
+      "referenceCards": "Reference Cards",
       "factionCards": "Factions",
-      "itemCards": "Items",
-      "ruleCards": "Rules & Settings",
-      "loreCards": "Lore",
       "relationshipMap": "Relationship Map",
       "plotThreads": "Plot Threads",
       "storyHealth": "Story Health",
@@ -1235,6 +1231,7 @@
       }
     },
     "referenceCards": {
+      "typeSwitcherLabel": "Reference card type",
       "types": {
         "character": "Characters",
         "location": "Locations",

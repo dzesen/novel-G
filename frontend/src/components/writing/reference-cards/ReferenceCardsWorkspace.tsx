@@ -307,8 +307,8 @@ export default function ReferenceCardsWorkspace({
     <div className="flex h-full min-h-0 flex-col bg-background lg:flex-row">
       <aside className="flex max-h-[45vh] w-full shrink-0 flex-col border-b border-border bg-surface lg:max-h-none lg:w-80 lg:border-b-0 lg:border-r">
         <div className="border-b border-border px-4 py-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
               <h1 className="text-lg font-semibold text-foreground">{t(`types.${cardType}`)}</h1>
               <p className="mt-1 text-xs text-muted">{t(`typeDescriptions.${cardType}`)}</p>
             </div>

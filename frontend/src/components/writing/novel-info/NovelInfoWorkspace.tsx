@@ -150,8 +150,20 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       };
       const res = await apiPost<{ id: string }>("/api/novels/create", payload);
       clearWritingDraft(draftId);
-      const curationQuery = openCardCuration ? "?curateCards=1" : "";
-      router.push(`/${locale}/writing/${res.id}${curationQuery}`);
+      const destinationParams = new URLSearchParams(searchParams.toString());
+      destinationParams.delete("draft");
+      destinationParams.delete("cardType");
+      destinationParams.delete("curateCards");
+      if (openCardCuration) {
+        destinationParams.set("cardType", "character");
+        destinationParams.set("curateCards", "1");
+      }
+      const destinationSearch = destinationParams.toString();
+      router.push(
+        `/${locale}/writing/${res.id}${
+          destinationSearch ? `?${destinationSearch}` : ""
+        }`,
+      );
     } catch {
       alert(tw("createFailed"));
     } finally {

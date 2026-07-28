@@ -1,14 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
 import type { ContinuityEvidenceReference } from "@/types/agent";
-import type { WritingSidebarItem } from "@/types/novel";
+import type { ReferenceCardType, WritingSidebarItem } from "@/types/novel";
 import WritingSidebar from "./WritingSidebar";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
 import FactionCardsWorkspace from "./factions/FactionCardsWorkspace";
 import ChapterWorkspace from "./chapters/ChapterWorkspace";
-import ReferenceCardsWorkspace from "./reference-cards/ReferenceCardsWorkspace";
+import ReferenceCardsDestination from "./reference-cards/ReferenceCardsDestination";
 import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
 import PlotThreadWorkspace from "./plot-threads/PlotThreadWorkspace";
 import CharacterMemoryWorkspace from "./character-memory/CharacterMemoryWorkspace";
@@ -20,93 +20,151 @@ interface WritingContentProps {
   novelId?: string;
 }
 
+type NonReferenceSidebarItem = Exclude<
+  WritingSidebarItem,
+  "reference-cards"
+>;
+
+const REFERENCE_CARD_TYPES: ReferenceCardType[] = [
+  "character",
+  "location",
+  "item",
+  "rule",
+  "lore",
+];
+
+function parseReferenceCardType(value: string | null): ReferenceCardType | null {
+  return REFERENCE_CARD_TYPES.find((cardType) => cardType === value) ?? null;
+}
+
 export default function WritingContent({ mode, novelId }: WritingContentProps) {
-  const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
+  const requestedCardType =
+    mode === "edit"
+      ? parseReferenceCardType(searchParams.get("cardType"))
+      : null;
   const requestedCardCuration =
     mode === "edit" && searchParams.get("curateCards") === "1";
   const [openCardCuration, setOpenCardCuration] = useState(requestedCardCuration);
-  const [activeItem, setActiveItem] = useState<WritingSidebarItem>(
-    requestedCardCuration ? "character-cards" : "novel-info",
-  );
+  const [activeItem, setActiveItem] =
+    useState<NonReferenceSidebarItem>("novel-info");
   const [evidenceReference, setEvidenceReference] =
     useState<ContinuityEvidenceReference | null>(null);
+  const referenceCardType = requestedCardType ?? "character";
+  const resolvedActiveItem: WritingSidebarItem =
+    requestedCardCuration || requestedCardType
+      ? "reference-cards"
+      : activeItem;
+
+  const replaceCardTypeQuery = useCallback(
+    (cardType: ReferenceCardType | null) => {
+      const currentSearch = window.location.search.replace(/^\?/, "");
+      const next = new URLSearchParams(currentSearch);
+      next.delete("curateCards");
+      if (cardType) next.set("cardType", cardType);
+      else next.delete("cardType");
+
+      const nextSearch = next.toString();
+      const nextHref = nextSearch ? `${pathname}?${nextSearch}` : pathname;
+      const currentHref = currentSearch
+        ? `${pathname}?${currentSearch}`
+        : pathname;
+      if (nextHref !== currentHref) {
+        window.history.replaceState(null, "", nextHref);
+      }
+    },
+    [pathname],
+  );
+
+  const navigateToWorkspace = useCallback(
+    (item: NonReferenceSidebarItem) => {
+      setEvidenceReference(null);
+      setOpenCardCuration(false);
+      setActiveItem(item);
+      replaceCardTypeQuery(null);
+    },
+    [replaceCardTypeQuery],
+  );
+
+  const navigateToReferenceCards = useCallback(
+    (cardType: ReferenceCardType, openCuration = false) => {
+      setEvidenceReference(null);
+      setOpenCardCuration(openCuration);
+      replaceCardTypeQuery(cardType);
+    },
+    [replaceCardTypeQuery],
+  );
 
   useEffect(() => {
-    if (requestedCardCuration) {
-      router.replace(pathname);
-    }
-  }, [pathname, requestedCardCuration, router]);
+    if (!requestedCardCuration) return;
+    const cardType = requestedCardType ?? "character";
+    replaceCardTypeQuery(cardType);
+  }, [
+    replaceCardTypeQuery,
+    requestedCardCuration,
+    requestedCardType,
+  ]);
 
   const renderMainArea = () => {
-    if (activeItem === "novel-info") {
+    if (resolvedActiveItem === "novel-info") {
       return <NovelInfoWorkspace mode={mode} novelId={novelId} />;
     }
-    if (activeItem === "faction-cards") {
+    if (resolvedActiveItem === "faction-cards") {
       return <FactionCardsWorkspace mode={mode} novelId={novelId} />;
     }
-    if (activeItem === "chapter-editor") {
+    if (resolvedActiveItem === "chapter-editor") {
       return (
         <ChapterWorkspace
           mode={mode}
           novelId={novelId}
-          onNavigateToMemory={() => setActiveItem("character-memory")}
-          onNavigateToReferenceCards={() => {
-            setOpenCardCuration(true);
-            setActiveItem("character-cards");
-          }}
+          onNavigateToMemory={() => navigateToWorkspace("character-memory")}
+          onNavigateToReferenceCards={() =>
+            navigateToReferenceCards("character", true)
+          }
           initialChapterId={evidenceReference?.chapter_id}
           initialSceneIndex={evidenceReference?.scene_index}
         />
       );
     }
-    if (activeItem === "agent-studio") {
+    if (resolvedActiveItem === "agent-studio") {
       return (
         <AgentStudioWorkspace
           mode={mode}
           novelId={novelId}
           onNavigateReference={(reference) => {
-            setEvidenceReference(reference);
             if (reference.kind === "fact") {
-              setActiveItem("character-memory");
+              navigateToWorkspace("character-memory");
             } else if (reference.kind === "thread") {
-              setActiveItem("plot-threads");
+              navigateToWorkspace("plot-threads");
             } else {
-              setActiveItem("chapter-editor");
+              navigateToWorkspace("chapter-editor");
             }
+            setEvidenceReference(reference);
           }}
         />
       );
     }
-    if (activeItem === "character-cards") {
+    if (resolvedActiveItem === "reference-cards") {
       return (
-        <ReferenceCardsWorkspace
-          key="character"
+        <ReferenceCardsDestination
           mode={mode}
           novelId={novelId}
-          cardType="character"
-          openCurationOnMount={openCardCuration}
+          cardType={referenceCardType}
+          onCardTypeChange={(cardType) =>
+            navigateToReferenceCards(cardType)
+          }
+          openCurationOnMount={
+            openCardCuration || requestedCardCuration
+          }
           onCurationOpened={() => setOpenCardCuration(false)}
         />
       );
     }
-    if (activeItem === "location-cards") {
-      return <ReferenceCardsWorkspace key="location" mode={mode} novelId={novelId} cardType="location" />;
-    }
-    if (activeItem === "item-cards") {
-      return <ReferenceCardsWorkspace key="item" mode={mode} novelId={novelId} cardType="item" />;
-    }
-    if (activeItem === "rule-cards") {
-      return <ReferenceCardsWorkspace key="rule" mode={mode} novelId={novelId} cardType="rule" />;
-    }
-    if (activeItem === "lore-cards") {
-      return <ReferenceCardsWorkspace key="lore" mode={mode} novelId={novelId} cardType="lore" />;
-    }
-    if (activeItem === "relationship-map") {
+    if (resolvedActiveItem === "relationship-map") {
       return <RelationshipWorkspace mode={mode} novelId={novelId} />;
     }
-    if (activeItem === "plot-threads") {
+    if (resolvedActiveItem === "plot-threads") {
       return (
         <PlotThreadWorkspace
           mode={mode}
@@ -115,10 +173,10 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         />
       );
     }
-    if (activeItem === "story-health") {
+    if (resolvedActiveItem === "story-health") {
       return <StoryHealthWorkspace mode={mode} novelId={novelId} />;
     }
-    if (activeItem === "character-memory") {
+    if (resolvedActiveItem === "character-memory") {
       return (
         <CharacterMemoryWorkspace
           mode={mode}
@@ -127,17 +185,20 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         />
       );
     }
-    const unreachable: never = activeItem;
+    const unreachable: never = resolvedActiveItem;
     return unreachable;
   };
 
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col md:flex-row">
       <WritingSidebar
-        activeItem={activeItem}
+        activeItem={resolvedActiveItem}
         onSelect={(item) => {
-          setEvidenceReference(null);
-          setActiveItem(item);
+          if (item === "reference-cards") {
+            navigateToReferenceCards(referenceCardType);
+          } else {
+            navigateToWorkspace(item);
+          }
         }}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">

@@ -495,12 +495,8 @@
       "novelInfo": "小说信息",
       "chapterEditor": "章节编辑",
       "entityGroup": "实体管理",
-      "characterCards": "角色卡",
-      "locationCards": "地点卡",
+      "referenceCards": "资料卡",
       "factionCards": "势力卡",
-      "itemCards": "物品卡",
-      "ruleCards": "设定规则卡",
-      "loreCards": "通用世界设定",
       "relationshipMap": "关系图谱",
       "plotThreads": "伏笔管理",
       "storyHealth": "故事健康",
@@ -1235,6 +1231,7 @@
       }
     },
     "referenceCards": {
+      "typeSwitcherLabel": "资料卡类型",
       "types": {
         "character": "角色卡",
         "location": "地点卡",
