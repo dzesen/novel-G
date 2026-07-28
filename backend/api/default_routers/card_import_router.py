@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+from typing import List
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 
 from backend.api.default_routers.auth_router import (
     require_authenticated_request,
     require_owned_path_resource,
 )
+from backend.api.default_routers.reference_card_router import (
+    ReferenceCardCurationDecision,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
+from backend.db.mutation import MutationConflictError
 from backend.services.auth.identity_service import Actor
 from backend.services.interop.card_import_proposal_service import (
+    CardImportProposalError,
     RawPayloadTooLargeError,
+    StaleCardImportProposal,
     card_import_proposal_service,
 )
 from backend.services.interop.character_card_adapter import (
@@ -31,6 +39,14 @@ _PAYLOAD_TOO_LARGE_CODES = frozenset(
         "decoded_metadata_too_large",
     }
 )
+
+
+class CardImportApplyRequest(BaseModel):
+    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    decisions: List[ReferenceCardCurationDecision] = Field(
+        min_length=1,
+        max_length=30,
+    )
 
 
 def _validation_http_error(
@@ -141,4 +157,27 @@ async def inspect_card_import_proposal(
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/proposals/{import_proposal_id}/apply")
+async def apply_card_import_proposal(
+    import_proposal_id: str,
+    req: CardImportApplyRequest,
+    actor: Actor = Depends(require_authenticated_request),
+):
+    try:
+        return await card_import_proposal_service.apply(
+            import_proposal_id,
+            owner_id=actor.id,
+            digest=req.digest,
+            decisions=[
+                item.model_dump(exclude_none=True) for item in req.decisions
+            ],
+        )
+    except (StaleCardImportProposal, MutationConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (CardImportProposalError, InvalidIdError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -336,6 +336,13 @@ async def init_reference_card_indexes():
                     ("name", pymongo.ASCENDING),
                 ]),
                 pymongo.IndexModel([("tags", pymongo.ASCENDING)]),
+                pymongo.IndexModel(
+                    [
+                        ("novel_id", pymongo.ASCENDING),
+                        ("interop.source.source_hash", pymongo.ASCENDING),
+                    ],
+                    name=f"{collection_name}_novel_interop_source_hash",
+                ),
                 pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
             ])
         logger.info("成功初始化人物与世界资料卡索引。")

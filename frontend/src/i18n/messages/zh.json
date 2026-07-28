@@ -1062,6 +1062,8 @@
       "noSearchResults": "没有匹配的资料卡",
       "noDescription": "暂无描述",
       "untitled": "未命名资料卡",
+      "importedNotParticipating": "已导入但未参与写作",
+      "importedNotParticipatingHint": "这张导入卡目前没有可安全投影到正文上下文的角色描述或创作档案；被隔离的外部指令不会自动启用。",
       "tagsHint": "使用逗号、顿号或换行分隔多个标签。",
       "profileTitle": "角色创作档案",
       "profileDescription": "补充角色如何说话、如何被描写。当前状态与既定事实仍拥有更高优先级。",

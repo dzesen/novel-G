@@ -92,6 +92,7 @@ EDITABLE_FIELDS = {
     "details",
     "character_profile",
 }
+REFERENCE_CARD_EDITABLE_FIELDS = frozenset(EDITABLE_FIELDS)
 _PREPARE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -233,6 +234,15 @@ def _clean_candidate(card_type: str, candidate: dict[str, Any]) -> dict[str, Any
             validated.get("character_profile") or {}
         )
     return validated
+
+
+def validate_reference_card_candidate(
+    card_type: str,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply the same bounded schema used by the existing four-decision UI."""
+
+    return _clean_candidate(card_type, candidate)
 
 
 def _prepare_candidates(
@@ -548,6 +558,16 @@ def _merged_card_data(
     if existing_profile or "character_profile" in candidate:
         merged["character_profile"] = existing_profile
     return merged
+
+
+def merge_reference_card_data(
+    existing: dict[str, Any],
+    candidate: dict[str, Any],
+    overwrite_fields: set[str],
+) -> dict[str, Any]:
+    """Apply the existing fill-empty/explicit-overwrite merge semantics."""
+
+    return _merged_card_data(existing, candidate, overwrite_fields)
 
 
 class ReferenceCardCurationService:

@@ -18,6 +18,9 @@ from backend.services.novel.reference_card_service import ReferenceCardService
 from backend.services.novel.reference_card_curation import ReferenceCardCurationService
 from backend.services.novel.volume_service import VolumeService
 from backend.services.generation.prose_runs import ProseRunModule
+from backend.services.interop.card_import_proposal_service import (
+    CardImportProposalService,
+)
 
 
 MutationExecutor = Callable[[Any, Any], Awaitable[Any]]
@@ -68,11 +71,15 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("restore_reference_card", 1): ReferenceCardService._execute_mutation,
         ("hard_delete_reference_card", 1): ReferenceCardService._execute_mutation,
         ("apply_reference_card_plan", 1): ReferenceCardCurationService._execute_apply,
+        ("apply_card_import_proposal", 1): CardImportProposalService._execute_apply,
         ("apply_agent_revision_proposal", 1): AgentRevisionProposalService._execute_apply,
     }
     non_narrative_operations = {
         "update_novel_metadata",
         "update_reference_card_metadata",
+        # This handler advances only after its stale check, inside the same
+        # recoverable command, so a rejected old digest cannot bump revision.
+        "apply_card_import_proposal",
     }
     return {
         key: MutationHandlerSpec(
@@ -95,6 +102,11 @@ async def _sync_quarantined_proposals(
             proposals = get_database()[collections.REFERENCE_CARD_PROPOSALS]
             proposal_id = command.get("proposal_id")
             expected_status = "claimed"
+            quarantined_status = "quarantined"
+        elif operation == "apply_card_import_proposal":
+            proposals = get_database()[collections.CARD_IMPORT_PROPOSALS]
+            proposal_id = command.get("proposal_id")
+            expected_status = "applying"
             quarantined_status = "quarantined"
         elif operation == "apply_agent_revision_proposal":
             proposals = get_database()[collections.AGENT_REVISION_PROPOSALS]

@@ -1062,6 +1062,8 @@
       "noSearchResults": "No matching cards",
       "noDescription": "No description yet",
       "untitled": "Untitled card",
+      "importedNotParticipating": "Imported but not used in writing",
+      "importedNotParticipatingHint": "This imported card currently has no character description or portrayal profile that can be projected safely into prose context. Isolated external instructions remain disabled.",
       "tagsHint": "Separate tags with commas, semicolons, or new lines.",
       "profileTitle": "Portrayal profile",
       "profileDescription": "Describe how this character speaks and should be portrayed. Current state and established facts still take priority.",

@@ -1,12 +1,14 @@
-"""Persist bounded Character Card previews for explicit human review.
+"""Stage and explicitly apply bounded Character Card import proposals.
 
-This layer only writes ``card_import_proposals``. It never creates or mutates
-formal reference cards, executes imported behavior, or downloads assets.
+Preview only writes ``card_import_proposals``. Formal cards are created or
+merged only by :meth:`CardImportProposalService.apply`, through the existing
+recoverable mutation journal.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 from copy import deepcopy
@@ -22,10 +24,27 @@ from backend.config.config import get_config_value
 from backend.db import collections
 from backend.db.errors import NotFoundError
 from backend.db.mongo import get_database
+from backend.db.mutation import (
+    MutationCommand,
+    MutationConflictError,
+    commit_mutation,
+    resume_persisted_mutation,
+)
+from backend.db.narrative_revision import narrative_revision_store
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.interop.character_card_adapter import (
     MAX_JSON_BYTES,
     ParsedCharacterCard,
+)
+from backend.services.novel.character_profile import normalize_character_profile
+from backend.services.novel.reference_card_curation import (
+    REFERENCE_CARD_EDITABLE_FIELDS,
+    merge_reference_card_data,
+    validate_reference_card_candidate,
+)
+from backend.services.novel.reference_card_service import (
+    get_card_repository,
+    reference_card_writing_participation,
 )
 
 
@@ -69,6 +88,14 @@ class RawPayloadTooLargeError(ValueError):
         )
 
 
+class CardImportProposalError(ValueError):
+    """The reviewed decision cannot be applied to this proposal."""
+
+
+class StaleCardImportProposal(CardImportProposalError):
+    """The proposal no longer describes the current novel/card snapshot."""
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -102,6 +129,47 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
+def _proposal_digest(
+    *,
+    source_hash: str,
+    novel_snapshot_digest: str,
+    config_digest: str,
+    target_cards_digest: str,
+    candidate_digest: str,
+) -> str:
+    return _digest(
+        {
+            "source_hash": source_hash,
+            "novel_snapshot_digest": novel_snapshot_digest,
+            "config_digest": config_digest,
+            "target_cards_digest": target_cards_digest,
+            "candidate_digest": candidate_digest,
+        }
+    )
+
+
+def _proposal_integrity_matches(proposal: dict[str, Any]) -> bool:
+    candidate_digest = _digest(proposal.get("proposed_cards") or [])
+    if not hmac.compare_digest(
+        candidate_digest,
+        str(proposal.get("candidate_digest") or ""),
+    ):
+        return False
+    expected = _proposal_digest(
+        source_hash=str(proposal.get("source_hash") or ""),
+        novel_snapshot_digest=str(
+            proposal.get("novel_snapshot_digest") or ""
+        ),
+        config_digest=str(proposal.get("config_digest") or ""),
+        target_cards_digest=str(proposal.get("target_cards_digest") or ""),
+        candidate_digest=candidate_digest,
+    )
+    return hmac.compare_digest(
+        expected,
+        str(proposal.get("digest") or ""),
+    )
+
+
 def _default_config_snapshot() -> dict[str, Any]:
     configured = get_config_value("card_import", {})
     return {
@@ -119,6 +187,63 @@ def _serialize_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
     result = _jsonable(deepcopy(proposal))
     result["proposal_id"] = result.pop("_id")
     return result
+
+
+def _raw_card_data(raw_card: dict[str, Any]) -> dict[str, Any]:
+    data = raw_card.get("data")
+    return data if isinstance(data, dict) else raw_card
+
+
+def _external_provenance(raw_card: dict[str, Any]) -> dict[str, Any]:
+    data = _raw_card_data(raw_card)
+    provenance: dict[str, Any] = {
+        "external_name": deepcopy(data.get("name")),
+    }
+    if "nickname" in data:
+        provenance["external_nickname"] = deepcopy(data.get("nickname"))
+    book = data.get("character_book")
+    entries = book.get("entries") if isinstance(book, dict) else None
+    external_entries: list[dict[str, Any]] = []
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            identity = {
+                key: deepcopy(entry[key])
+                for key in ("id", "uid")
+                if key in entry
+            }
+            if identity:
+                external_entries.append(identity)
+    if external_entries:
+        provenance["external_entries"] = external_entries
+    return provenance
+
+
+def _bounded_profile_projection(
+    fields: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Project profile fields independently so one oversized field is isolated."""
+
+    profile = normalize_character_profile({})
+    isolated: list[str] = []
+    nickname = fields.get("nickname")
+    if isinstance(nickname, str) and nickname:
+        try:
+            profile["aliases"] = normalize_character_profile(
+                {"aliases": [nickname]}
+            )["aliases"]
+        except ValueError:
+            isolated.append("nickname")
+    personality = fields.get("personality")
+    if isinstance(personality, str) and personality:
+        try:
+            profile["portrayal_context"] = normalize_character_profile(
+                {"portrayal_context": personality}
+            )["portrayal_context"]
+        except ValueError:
+            isolated.append("personality")
+    return profile, isolated
 
 
 class CardImportProposalService:
@@ -142,6 +267,7 @@ class CardImportProposalService:
         novel_id: ObjectId | None,
         *,
         owner_id: ObjectId,
+        session: Any = None,
     ) -> dict[str, Any] | None:
         if novel_id is None:
             return None
@@ -149,7 +275,8 @@ class CardImportProposalService:
             {
                 "_id": novel_id,
                 "owner_id": owner_id,
-            }
+            },
+            session=session,
         )
         if novel is None:
             raise NotFoundError(f"Novel with id {novel_id} not found")
@@ -164,24 +291,66 @@ class CardImportProposalService:
             raise ValueError("card import configuration snapshot must be an object")
         return deepcopy(value)
 
+    async def _find_duplicate_source(
+        self,
+        *,
+        owner_id: ObjectId,
+        source_hash: str,
+    ) -> dict[str, Any] | None:
+        proposal = await self.db[collections.CARD_IMPORT_PROPOSALS].find_one(
+            {
+                "owner_id": owner_id,
+                "source_hash": source_hash,
+            },
+            sort=[("imported_at", DESCENDING)],
+        )
+        if proposal is not None:
+            return {
+                "proposal_id": str(proposal["_id"]),
+                "imported_at": proposal.get("imported_at"),
+            }
+
+        novel_cursor = self.db[collections.NOVELS].find(
+            {"owner_id": owner_id},
+            projection={"_id": 1},
+        )
+        novel_ids = [
+            item["_id"] for item in await novel_cursor.to_list(length=None)
+        ]
+        if not novel_ids:
+            return None
+        card = await self.db[collections.CHARACTERS].find_one(
+            {
+                "novel_id": {"$in": novel_ids},
+                "interop.source.source_hash": source_hash,
+            },
+            sort=[("interop.source.imported_at", DESCENDING)],
+        )
+        if card is None:
+            return None
+        return {
+            "card_id": str(card["_id"]),
+            "novel_id": str(card["novel_id"]),
+            "imported_at": (card.get("interop") or {}).get("source", {}).get(
+                "imported_at"
+            ),
+        }
+
     @staticmethod
     def _character_draft(
         parsed: ParsedCharacterCard,
     ) -> dict[str, Any]:
         fields = parsed.fields
-        nickname = fields.get("nickname")
-        aliases = [nickname] if isinstance(nickname, str) and nickname else []
-        return {
+        profile, projection_isolated = _bounded_profile_projection(fields)
+        isolated_fields = [
+            *(item.kind for item in parsed.prompt_risk_fields),
+            *projection_isolated,
+        ]
+        draft = {
             "name": fields.get("name", ""),
             "description": fields.get("description", ""),
             "tags": deepcopy(fields.get("tags", [])),
-            "character_profile": {
-                "aliases": aliases,
-                "portrayal_context": fields.get("personality", ""),
-                "dialogue_examples": [],
-                "scene_opening_examples": [],
-                "portrayal_notes": "",
-            },
+            "character_profile": profile,
             "interop": {
                 "source_format": parsed.source_format,
                 "scenario": fields.get("scenario", ""),
@@ -191,14 +360,23 @@ class CardImportProposalService:
                 "alternate_greetings": deepcopy(
                     fields.get("alternate_greetings", [])
                 ),
+                "writing_participation": {},
             },
         }
+        draft["interop"]["writing_participation"] = (
+            reference_card_writing_participation(
+                draft,
+                isolated_fields=isolated_fields,
+            )
+        )
+        return draft
 
     async def _character_conflicts(
         self,
         *,
         novel_id: ObjectId | None,
         draft: dict[str, Any],
+        session: Any = None,
     ) -> list[dict[str, Any]]:
         if novel_id is None:
             return []
@@ -211,7 +389,8 @@ class CardImportProposalService:
                     {"name": imported_name},
                     {"character_profile.aliases": imported_name},
                 ],
-            }
+            },
+            session=session,
         )
         existing_cards = await cursor.to_list(length=None)
         conflicts: list[dict[str, Any]] = []
@@ -241,6 +420,7 @@ class CardImportProposalService:
                     "match_kind": match_kind,
                     "is_deleted": bool(card.get("is_deleted")),
                     "field_diffs": field_diffs,
+                    "target_snapshot_digest": _digest(card),
                 }
             )
         conflicts.sort(key=lambda item: item["target_card_id"])
@@ -313,31 +493,28 @@ class CardImportProposalService:
         config_digest = _digest(config_snapshot)
 
         collection = self.db[collections.CARD_IMPORT_PROPOSALS]
-        duplicate = await collection.find_one(
-            {
-                "owner_id": owner_object_id,
-                "source_hash": source_hash,
-            },
-            sort=[("imported_at", DESCENDING)],
+        duplicate_source = await self._find_duplicate_source(
+            owner_id=owner_object_id,
+            source_hash=source_hash,
         )
-        duplicate_source = None
-        if duplicate is not None:
-            duplicate_source = {
-                "proposal_id": str(duplicate["_id"]),
-                "imported_at": duplicate.get("imported_at"),
-            }
         draft = self._character_draft(parsed)
         conflicts = await self._character_conflicts(
             novel_id=novel_object_id,
             draft=draft,
         )
+        proposed_cards = self._proposed_cards(
+            draft,
+            duplicate=duplicate_source is not None,
+            conflicts=conflicts,
+        )
         target_cards_digest = _digest(conflicts)
-        combined_digest = _digest(
-            {
-                "novel_snapshot_digest": novel_snapshot_digest,
-                "config_digest": config_digest,
-                "target_cards_digest": target_cards_digest,
-            }
+        candidate_digest = _digest(proposed_cards)
+        combined_digest = _proposal_digest(
+            source_hash=source_hash,
+            novel_snapshot_digest=novel_snapshot_digest,
+            config_digest=config_digest,
+            target_cards_digest=target_cards_digest,
+            candidate_digest=candidate_digest,
         )
 
         now = get_utc_now()
@@ -347,6 +524,7 @@ class CardImportProposalService:
             "owner_id": owner_object_id,
             "source_format": parsed.source_format,
             "source_container": parsed.source_container,
+            "spec_version": parsed.spec_version,
             "source_name": source_name,
             "source_hash": source_hash,
             "raw_payload": raw_payload,
@@ -363,16 +541,13 @@ class CardImportProposalService:
                 "png_preview_label": parsed.png_preview_label,
                 "image_data_discarded": parsed.image_data_discarded,
             },
-            "proposed_cards": self._proposed_cards(
-                draft,
-                duplicate=duplicate is not None,
-                conflicts=conflicts,
-            ),
+            "proposed_cards": proposed_cards,
             "decisions": [],
             "duplicate_source": duplicate_source,
             "novel_snapshot_digest": novel_snapshot_digest,
             "config_digest": config_digest,
             "target_cards_digest": target_cards_digest,
+            "candidate_digest": candidate_digest,
             "digest": combined_digest,
             "status": "pending_review",
             "stale_reasons": [],
@@ -386,6 +561,59 @@ class CardImportProposalService:
         inserted = await collection.insert_one(proposal)
         proposal["_id"] = inserted.inserted_id
         return _serialize_proposal(proposal)
+
+    async def _current_stale_reasons(
+        self,
+        proposal: dict[str, Any],
+        *,
+        owner_id: ObjectId,
+        session: Any = None,
+    ) -> list[str]:
+        stale_reasons: list[str] = []
+        current_config_digest = _digest(self._configuration_snapshot())
+        if current_config_digest != proposal.get("config_digest"):
+            stale_reasons.append("configuration_changed")
+
+        novel_id = proposal.get("novel_id")
+        try:
+            current_novel_snapshot = await self._novel_snapshot(
+                novel_id,
+                owner_id=owner_id,
+                session=session,
+            )
+        except NotFoundError:
+            current_novel_snapshot = None
+            stale_reasons.append("novel_missing_or_reassigned")
+        else:
+            if _digest(current_novel_snapshot) != proposal.get(
+                "novel_snapshot_digest"
+            ):
+                stale_reasons.append("novel_snapshot_changed")
+
+        proposed_cards = proposal.get("proposed_cards")
+        if isinstance(proposed_cards, list) and proposed_cards:
+            draft = proposed_cards[0].get("fields")
+            if isinstance(draft, dict):
+                current_conflicts = await self._character_conflicts(
+                    novel_id=novel_id,
+                    draft=draft,
+                    session=session,
+                )
+                if _digest(current_conflicts) != proposal.get(
+                    "target_cards_digest"
+                ):
+                    stale_reasons.append("target_cards_changed")
+
+        expires_at = proposal.get("expires_at")
+        if isinstance(expires_at, datetime):
+            normalized_expiry = (
+                expires_at.replace(tzinfo=timezone.utc)
+                if expires_at.tzinfo is None
+                else expires_at.astimezone(timezone.utc)
+            )
+            if normalized_expiry <= datetime.now(timezone.utc):
+                stale_reasons.append("proposal_expired")
+        return stale_reasons
 
     async def inspect(
         self,
@@ -408,48 +636,15 @@ class CardImportProposalService:
                 f"Card import proposal with id {proposal_id} not found"
             )
 
-        stale_reasons: list[str] = []
-        current_config_digest = _digest(self._configuration_snapshot())
-        if current_config_digest != proposal.get("config_digest"):
-            stale_reasons.append("configuration_changed")
+        if proposal.get("status") in {"applying", "applied", "stale"}:
+            result = _serialize_proposal(proposal)
+            result["is_stale"] = result.get("status") == "stale"
+            return result
 
-        novel_id = proposal.get("novel_id")
-        try:
-            current_novel_snapshot = await self._novel_snapshot(
-                novel_id,
-                owner_id=owner_object_id,
-            )
-        except NotFoundError:
-            current_novel_snapshot = None
-            stale_reasons.append("novel_missing_or_reassigned")
-        else:
-            if _digest(current_novel_snapshot) != proposal.get(
-                "novel_snapshot_digest"
-            ):
-                stale_reasons.append("novel_snapshot_changed")
-
-        proposed_cards = proposal.get("proposed_cards")
-        if isinstance(proposed_cards, list) and proposed_cards:
-            draft = proposed_cards[0].get("fields")
-            if isinstance(draft, dict):
-                current_conflicts = await self._character_conflicts(
-                    novel_id=novel_id,
-                    draft=draft,
-                )
-                if _digest(current_conflicts) != proposal.get(
-                    "target_cards_digest"
-                ):
-                    stale_reasons.append("target_cards_changed")
-
-        expires_at = proposal.get("expires_at")
-        if isinstance(expires_at, datetime):
-            normalized_expiry = (
-                expires_at.replace(tzinfo=timezone.utc)
-                if expires_at.tzinfo is None
-                else expires_at.astimezone(timezone.utc)
-            )
-            if normalized_expiry <= datetime.now(timezone.utc):
-                stale_reasons.append("proposal_expired")
+        stale_reasons = await self._current_stale_reasons(
+            proposal,
+            owner_id=owner_object_id,
+        )
 
         if stale_reasons:
             now = get_utc_now()
@@ -457,6 +652,7 @@ class CardImportProposalService:
                 {
                     "_id": proposal_object_id,
                     "owner_id": owner_object_id,
+                    "status": {"$nin": ["applied"]},
                 },
                 {
                     "$set": {
@@ -475,6 +671,677 @@ class CardImportProposalService:
         result = _serialize_proposal(proposal)
         result["is_stale"] = result.get("status") == "stale"
         return result
+
+    @staticmethod
+    def _find_candidate(
+        proposal: dict[str, Any],
+        candidate_id: str,
+    ) -> dict[str, Any]:
+        for candidate in proposal.get("proposed_cards") or []:
+            if candidate.get("candidate_id") == candidate_id:
+                return candidate
+        raise CardImportProposalError(
+            f"Unknown card-import candidate: {candidate_id}"
+        )
+
+    @staticmethod
+    def _decision_summary(decision: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "candidate_id": decision["candidate_id"],
+            "action": decision["action"],
+            "target_card_id": decision.get("target_card_id"),
+            "overrides": deepcopy(decision.get("overrides") or {}),
+            "overwrite_fields": list(decision.get("overwrite_fields") or []),
+        }
+
+    def _prepare_decisions(
+        self,
+        proposal: dict[str, Any],
+        decisions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        candidates = proposal.get("proposed_cards") or []
+        candidate_ids = {
+            str(candidate.get("candidate_id") or "") for candidate in candidates
+        }
+        received_ids = [
+            str(decision.get("candidate_id") or "") for decision in decisions
+        ]
+        if len(received_ids) != len(set(received_ids)):
+            raise CardImportProposalError(
+                "Each card-import candidate must be decided exactly once"
+            )
+        if set(received_ids) != candidate_ids:
+            raise CardImportProposalError(
+                "Decisions must cover every card-import candidate exactly once"
+            )
+
+        normalized: list[dict[str, Any]] = []
+        for raw_decision in decisions:
+            candidate = self._find_candidate(
+                proposal,
+                str(raw_decision.get("candidate_id") or ""),
+            )
+            action = str(raw_decision.get("action") or "")
+            if action not in {"create", "merge", "restore_merge", "skip"}:
+                raise CardImportProposalError(
+                    f"Unsupported card-import decision: {action}"
+                )
+            target_type = str(candidate.get("target_type") or "")
+            if target_type != "character":
+                raise CardImportProposalError(
+                    f"Unsupported card-import target type: {target_type}"
+                )
+            overrides = raw_decision.get("overrides") or {}
+            if not isinstance(overrides, dict):
+                raise CardImportProposalError(
+                    "Candidate overrides must be an object"
+                )
+            unknown = set(overrides) - REFERENCE_CARD_EDITABLE_FIELDS
+            if unknown:
+                raise CardImportProposalError(
+                    f"Unsupported candidate override fields: {sorted(unknown)}"
+                )
+            fields = candidate.get("fields")
+            if not isinstance(fields, dict):
+                raise CardImportProposalError(
+                    "Card-import candidate fields are missing"
+                )
+            edited = {
+                key: deepcopy(value)
+                for key, value in fields.items()
+                if key in REFERENCE_CARD_EDITABLE_FIELDS
+            }
+            edited.update(deepcopy(overrides))
+            edited = validate_reference_card_candidate(target_type, edited)
+
+            overwrite_fields = sorted(
+                {
+                    str(item)
+                    for item in raw_decision.get("overwrite_fields") or []
+                    if str(item)
+                }
+            )
+            if any(
+                field not in REFERENCE_CARD_EDITABLE_FIELDS
+                and not field.startswith("details.")
+                and not field.startswith("character_profile.")
+                for field in overwrite_fields
+            ):
+                raise CardImportProposalError(
+                    "Unsupported merge overwrite field"
+                )
+
+            target_card_id = raw_decision.get("target_card_id")
+            conflicts = {
+                str(item.get("target_card_id")): item
+                for item in candidate.get("conflicts") or []
+                if item.get("target_card_id")
+            }
+            if action in {"merge", "restore_merge"}:
+                if not target_card_id:
+                    raise CardImportProposalError(
+                        f"{action} requires target_card_id"
+                    )
+                target_card_id = str(target_card_id)
+                conflict = conflicts.get(target_card_id)
+                if conflict is None:
+                    raise CardImportProposalError(
+                        "Merge target was not included in the reviewed field diff"
+                    )
+                if action == "merge" and conflict.get("is_deleted"):
+                    raise StaleCardImportProposal(
+                        "Merge target was in trash during preview"
+                    )
+                if action == "restore_merge" and not conflict.get("is_deleted"):
+                    raise StaleCardImportProposal(
+                        "Restore-and-merge target was active during preview"
+                    )
+            else:
+                target_card_id = None
+
+            normalized.append(
+                {
+                    "candidate_id": str(candidate["candidate_id"]),
+                    "card_type": target_type,
+                    "action": action,
+                    "target_card_id": target_card_id,
+                    "candidate": edited,
+                    "overrides": deepcopy(overrides),
+                    "overwrite_fields": overwrite_fields,
+                }
+            )
+        normalized.sort(key=lambda item: item["candidate_id"])
+        digest_view = [
+            {
+                key: deepcopy(value)
+                for key, value in item.items()
+                if key != "reserved_card_id"
+            }
+            for item in normalized
+        ]
+        return normalized, _digest(digest_view)
+
+    @staticmethod
+    def _formal_interop(
+        proposal: dict[str, Any],
+        card: dict[str, Any],
+    ) -> dict[str, Any]:
+        risk_fields = deepcopy(proposal.get("prompt_risk_fields") or [])
+        isolated_fields = [
+            str(item.get("kind"))
+            for item in risk_fields
+            if isinstance(item, dict) and item.get("kind")
+        ]
+        proposed_cards = proposal.get("proposed_cards") or []
+        if proposed_cards:
+            preview_fields = proposed_cards[0].get("fields") or {}
+            preview_interop = preview_fields.get("interop") or {}
+            preview_participation = preview_interop.get(
+                "writing_participation"
+            ) or {}
+            isolated_fields.extend(
+                str(item)
+                for item in preview_participation.get("isolated_fields") or []
+            )
+            display_metadata = {
+                key: deepcopy(value)
+                for key, value in preview_interop.items()
+                if key not in {"writing_participation", "source_format"}
+            }
+        else:
+            display_metadata = {}
+        raw_payload = deepcopy(proposal.get("raw_payload") or {})
+        return {
+            "source": {
+                "format": proposal.get("source_format"),
+                "spec_version": proposal.get("spec_version"),
+                "container": proposal.get("source_container"),
+                "source_name": proposal.get("source_name"),
+                "source_hash": proposal.get("source_hash"),
+                "imported_at": proposal.get("imported_at"),
+            },
+            "provenance": _external_provenance(raw_payload),
+            "raw_spec": raw_payload,
+            "display_metadata": display_metadata,
+            "untrusted_instructions": risk_fields,
+            "decorators": deepcopy(proposal.get("decorators") or []),
+            "assets": deepcopy(proposal.get("assets") or []),
+            "writing_participation": reference_card_writing_participation(
+                card,
+                isolated_fields=isolated_fields,
+            ),
+        }
+
+    @staticmethod
+    async def _execute_apply(session: Any, mutation: Any) -> dict[str, Any]:
+        command = mutation.journal["command"]["payload"]
+        proposal_id = to_object_id(command["proposal_id"])
+        owner_id = to_object_id(command["owner_id"])
+        decision_digest = str(command["decision_digest"])
+        proposals = get_database()[collections.CARD_IMPORT_PROPOSALS]
+        proposal = await proposals.find_one(
+            {
+                "_id": proposal_id,
+                "owner_id": owner_id,
+            },
+            session=session,
+        )
+        if proposal is None:
+            raise MutationConflictError(
+                "Card-import proposal disappeared before application"
+            )
+        claim = proposal.get("claim") or {}
+        if proposal.get("status") == "applied":
+            if claim.get("decision_digest") != decision_digest:
+                raise MutationConflictError(
+                    "Card-import proposal was applied with another decision"
+                )
+            return deepcopy(proposal.get("apply_result") or {})
+        if not _proposal_integrity_matches(proposal):
+            raise StaleCardImportProposal(
+                "Card-import proposal contents no longer match its digest"
+            )
+        if not hmac.compare_digest(
+            str(proposal.get("digest") or ""),
+            str(command["proposal_digest"]),
+        ):
+            raise StaleCardImportProposal(
+                "Card-import proposal digest changed before application"
+            )
+
+        if proposal.get("status") == "pending_review":
+            checker = CardImportProposalService(get_database())
+            stale_reasons = await checker._current_stale_reasons(
+                proposal,
+                owner_id=owner_id,
+                session=session,
+            )
+            if stale_reasons:
+                await proposals.update_one(
+                    {
+                        "_id": proposal_id,
+                        "owner_id": owner_id,
+                        "status": "pending_review",
+                    },
+                    {
+                        "$set": {
+                            "status": "stale",
+                            "stale_reasons": stale_reasons,
+                            "stale_at": get_utc_now(),
+                            "updated_at": get_utc_now(),
+                        }
+                    },
+                    session=session,
+                )
+                raise StaleCardImportProposal(
+                    "Card-import proposal is stale: "
+                    + ", ".join(stale_reasons)
+                )
+            claimed = await proposals.update_one(
+                {
+                    "_id": proposal_id,
+                    "owner_id": owner_id,
+                    "status": "pending_review",
+                },
+                {
+                    "$set": {
+                        "status": "applying",
+                        "claim": {
+                            "decision_digest": decision_digest,
+                            "idempotency_key": mutation.journal[
+                                "idempotency_key"
+                            ],
+                            "reserved_card_ids": deepcopy(
+                                command["reserved_card_ids"]
+                            ),
+                        },
+                        "claimed_at": get_utc_now(),
+                        "updated_at": get_utc_now(),
+                    }
+                },
+                session=session,
+            )
+            if claimed.modified_count != 1:
+                proposal = await proposals.find_one(
+                    {"_id": proposal_id, "owner_id": owner_id},
+                    session=session,
+                )
+                claim = (proposal or {}).get("claim") or {}
+                if (
+                    proposal is None
+                    or proposal.get("status") != "applying"
+                    or claim.get("decision_digest") != decision_digest
+                ):
+                    raise MutationConflictError(
+                        "Card-import proposal was claimed by another decision"
+                    )
+        elif (
+            proposal.get("status") != "applying"
+            or claim.get("decision_digest") != decision_digest
+        ):
+            raise MutationConflictError(
+                "Card-import proposal is not available for this decision"
+            )
+
+        if not mutation.was_received("narrative_revision"):
+            revision = await narrative_revision_store.advance(
+                str(command["novel_id"]),
+                (
+                    f"apply_card_import_proposal@1:"
+                    f"{mutation.journal['idempotency_key']}:"
+                    f"{mutation.journal['command_digest']}"
+                ),
+                session=session,
+            )
+            await mutation.receipt(
+                "narrative_revision",
+                {"revision": revision},
+            )
+
+        counts = {
+            "created": 0,
+            "merged": 0,
+            "restored_merged": 0,
+            "skipped": 0,
+        }
+        mappings: list[dict[str, Any]] = []
+        for decision in command["decisions"]:
+            receipt_key = f"candidate_{decision['candidate_id']}"
+            if mutation.was_received(receipt_key):
+                receipt = deepcopy(mutation.journal["receipts"][receipt_key])
+            else:
+                action = decision["action"]
+                repository = get_card_repository(decision["card_type"])
+                if action == "skip":
+                    card_id = None
+                elif action == "create":
+                    card_id = command["reserved_card_ids"][
+                        decision["candidate_id"]
+                    ]
+                    candidate = deepcopy(decision["candidate"])
+                    candidate["interop"] = (
+                        CardImportProposalService._formal_interop(
+                            proposal,
+                            candidate,
+                        )
+                    )
+                    try:
+                        await repository.get_card(
+                            command["novel_id"],
+                            decision["card_type"],
+                            card_id,
+                            include_deleted=True,
+                            session=session,
+                        )
+                    except NotFoundError:
+                        await repository.create_card(
+                            command["novel_id"],
+                            decision["card_type"],
+                            candidate,
+                            session=session,
+                            card_id=card_id,
+                        )
+                else:
+                    card_id = decision["target_card_id"]
+                    current = await repository.get_card(
+                        command["novel_id"],
+                        decision["card_type"],
+                        card_id,
+                        include_deleted=True,
+                        session=session,
+                    )
+                    if action == "restore_merge":
+                        if current.get("is_deleted"):
+                            await repository.restore_card(
+                                command["novel_id"],
+                                decision["card_type"],
+                                card_id,
+                                session=session,
+                            )
+                            current = await repository.get_card(
+                                command["novel_id"],
+                                decision["card_type"],
+                                card_id,
+                                session=session,
+                            )
+                    elif current.get("is_deleted"):
+                        raise MutationConflictError(
+                            "Card-import merge target is in trash"
+                        )
+                    merged = merge_reference_card_data(
+                        current,
+                        decision["candidate"],
+                        set(decision["overwrite_fields"]),
+                    )
+                    merged["interop"] = (
+                        CardImportProposalService._formal_interop(
+                            proposal,
+                            merged,
+                        )
+                    )
+                    await repository.update_card(
+                        command["novel_id"],
+                        decision["card_type"],
+                        card_id,
+                        merged,
+                        session=session,
+                    )
+                receipt = {
+                    "candidate_id": decision["candidate_id"],
+                    "action": action,
+                    "card_id": card_id,
+                }
+                await mutation.receipt(receipt_key, receipt)
+            mappings.append(receipt)
+            count_key = {
+                "create": "created",
+                "merge": "merged",
+                "restore_merge": "restored_merged",
+                "skip": "skipped",
+            }[receipt["action"]]
+            counts[count_key] += 1
+
+        result = {
+            "proposal_id": str(proposal_id),
+            "counts": counts,
+            "mappings": mappings,
+        }
+        updated = await proposals.update_one(
+            {
+                "_id": proposal_id,
+                "owner_id": owner_id,
+                "status": {"$in": ["applying", "applied"]},
+                "claim.decision_digest": decision_digest,
+            },
+            {
+                "$set": {
+                    "status": "applied",
+                    "decisions": deepcopy(command["decision_summaries"]),
+                    "apply_result": deepcopy(result),
+                    "applied_by": owner_id,
+                    "applied_at": get_utc_now(),
+                    "updated_at": get_utc_now(),
+                }
+            },
+            session=session,
+        )
+        if updated.modified_count != 1:
+            latest = await proposals.find_one(
+                {"_id": proposal_id, "owner_id": owner_id},
+                session=session,
+            )
+            if (
+                latest is None
+                or latest.get("status") != "applied"
+                or (latest.get("claim") or {}).get("decision_digest")
+                != decision_digest
+            ):
+                raise MutationConflictError(
+                    "Card-import proposal changed during application"
+                )
+        return result
+
+    async def apply(
+        self,
+        proposal_id: str | ObjectId,
+        *,
+        owner_id: str | ObjectId,
+        digest: str,
+        decisions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply one complete reviewed decision set through the mutation journal."""
+
+        proposal_object_id = to_object_id(proposal_id)
+        owner_object_id = to_object_id(owner_id)
+        proposal = await self.db[collections.CARD_IMPORT_PROPOSALS].find_one(
+            {
+                "_id": proposal_object_id,
+                "owner_id": owner_object_id,
+            }
+        )
+        if proposal is None:
+            raise NotFoundError(
+                f"Card import proposal with id {proposal_id} not found"
+            )
+        if proposal.get("novel_id") is None:
+            raise CardImportProposalError(
+                "建书前提案必须先绑定到小说，才能接受并创建正式资料卡"
+            )
+        if not _proposal_integrity_matches(proposal):
+            raise StaleCardImportProposal(
+                "Card-import proposal contents no longer match its digest"
+            )
+        if (
+            not isinstance(digest, str)
+            or not _SOURCE_HASH_RE.fullmatch(digest)
+            or not hmac.compare_digest(
+                digest,
+                str(proposal.get("digest") or ""),
+            )
+        ):
+            raise StaleCardImportProposal(
+                "Card-import proposal digest does not match the reviewed preview"
+            )
+        if proposal.get("status") == "stale":
+            raise StaleCardImportProposal(
+                "Card-import proposal is stale: "
+                + ", ".join(proposal.get("stale_reasons") or [])
+            )
+
+        normalized, decision_digest = self._prepare_decisions(
+            proposal,
+            decisions,
+        )
+        claim = proposal.get("claim") or {}
+        if proposal.get("status") == "applied":
+            if claim.get("decision_digest") != decision_digest:
+                raise MutationConflictError(
+                    "Card-import proposal was applied with another decision"
+                )
+            return deepcopy(proposal.get("apply_result") or {})
+
+        novel_id = str(proposal["novel_id"])
+        idempotency_key = (
+            f"card-import-proposal:{proposal_id}:{decision_digest}"
+        )
+        if proposal.get("status") == "applying":
+            journal = await self.db[collections.MUTATION_JOURNALS].find_one(
+                {
+                    "novel_id": proposal["novel_id"],
+                    "idempotency_key": idempotency_key,
+                }
+            )
+            if journal is None:
+                raise MutationConflictError(
+                    "Claimed card-import proposal has no recoverable mutation"
+                )
+            return await resume_persisted_mutation(
+                journal,
+                CardImportProposalService._execute_apply,
+            )
+
+        stale_reasons = await self._current_stale_reasons(
+            proposal,
+            owner_id=owner_object_id,
+        )
+        if stale_reasons:
+            await self.db[collections.CARD_IMPORT_PROPOSALS].update_one(
+                {
+                    "_id": proposal_object_id,
+                    "owner_id": owner_object_id,
+                    "status": {"$ne": "applied"},
+                },
+                {
+                    "$set": {
+                        "status": "stale",
+                        "stale_reasons": stale_reasons,
+                        "stale_at": get_utc_now(),
+                        "updated_at": get_utc_now(),
+                    }
+                },
+            )
+            raise StaleCardImportProposal(
+                "Card-import proposal is stale: "
+                + ", ".join(stale_reasons)
+            )
+
+        decision_summaries = [
+            self._decision_summary(item) for item in normalized
+        ]
+        if all(item["action"] == "skip" for item in normalized):
+            result = {
+                "proposal_id": str(proposal_object_id),
+                "counts": {
+                    "created": 0,
+                    "merged": 0,
+                    "restored_merged": 0,
+                    "skipped": len(normalized),
+                },
+                "mappings": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "action": "skip",
+                        "card_id": None,
+                    }
+                    for item in normalized
+                ],
+            }
+            updated = await self.db[
+                collections.CARD_IMPORT_PROPOSALS
+            ].update_one(
+                {
+                    "_id": proposal_object_id,
+                    "owner_id": owner_object_id,
+                    "status": "pending_review",
+                    "digest": digest,
+                },
+                {
+                    "$set": {
+                        "status": "applied",
+                        "claim": {
+                            "decision_digest": decision_digest,
+                            "idempotency_key": None,
+                            "reserved_card_ids": {},
+                        },
+                        "decisions": deepcopy(decision_summaries),
+                        "apply_result": deepcopy(result),
+                        "applied_by": owner_object_id,
+                        "applied_at": get_utc_now(),
+                        "updated_at": get_utc_now(),
+                    }
+                },
+            )
+            if updated.modified_count != 1:
+                raise MutationConflictError(
+                    "Card-import proposal was claimed concurrently"
+                )
+            return result
+
+        journal = await self.db[collections.MUTATION_JOURNALS].find_one(
+            {
+                "novel_id": proposal["novel_id"],
+                "idempotency_key": idempotency_key,
+            }
+        )
+        if journal is not None:
+            return await resume_persisted_mutation(
+                journal,
+                CardImportProposalService._execute_apply,
+            )
+        reserved_card_ids = {
+            item["candidate_id"]: str(ObjectId())
+            for item in normalized
+            if item["action"] == "create"
+        }
+        command = MutationCommand(
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+            operation="apply_card_import_proposal",
+            version=1,
+            payload={
+                "novel_id": novel_id,
+                "proposal_id": str(proposal_object_id),
+                "owner_id": str(owner_object_id),
+                "proposal_digest": digest,
+                "decision_digest": decision_digest,
+                "decision_summaries": decision_summaries,
+                "decisions": normalized,
+                "reserved_card_ids": reserved_card_ids,
+            },
+            before_image={
+                "proposal_digest": digest,
+                "novel_snapshot_digest": proposal.get(
+                    "novel_snapshot_digest"
+                ),
+                "target_cards_digest": proposal.get("target_cards_digest"),
+            },
+            child_ids=reserved_card_ids,
+        )
+        return await commit_mutation(
+            command,
+            CardImportProposalService._execute_apply,
+            advances_narrative_revision=False,
+        )
 
 
 card_import_proposal_service = CardImportProposalService()

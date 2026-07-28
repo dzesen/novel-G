@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from typing import Any, Dict, List
 
 from bson import ObjectId
@@ -30,6 +31,39 @@ def validate_card_type(card_type: str) -> str:
 def get_card_repository(card_type: str) -> ReferenceCardRepository:
     normalized = validate_card_type(card_type)
     return character_repo if normalized == "character" else worldbook_repo
+
+
+def reference_card_writing_participation(
+    card: dict[str, Any],
+    *,
+    isolated_fields: list[str],
+) -> dict[str, Any]:
+    """Derive the user-facing status from fields that prose can actually read."""
+
+    profile = card.get("character_profile") or {}
+    details = card.get("details") or {}
+    projected_fields: list[str] = []
+    if str(card.get("description") or "").strip():
+        projected_fields.append("description")
+    if str(details.get("personality") or "").strip():
+        projected_fields.append("details.personality")
+    if str(profile.get("portrayal_context") or "").strip():
+        projected_fields.append("character_profile.portrayal_context")
+    if str(profile.get("portrayal_notes") or "").strip():
+        projected_fields.append("character_profile.portrayal_notes")
+    if profile.get("dialogue_examples"):
+        projected_fields.append("character_profile.dialogue_examples")
+    status = "active" if projected_fields else "not_participating"
+    return {
+        "status": status,
+        "label": (
+            "已参与写作"
+            if status == "active"
+            else "已导入但未参与写作"
+        ),
+        "projected_fields": projected_fields,
+        "isolated_fields": sorted(set(isolated_fields)),
+    }
 
 
 class ReferenceCardService:
@@ -147,6 +181,19 @@ class ReferenceCardService:
             prepared["character_profile"] = normalize_character_profile(
                 prepared["character_profile"]
             )
+        if "interop" in prepared:
+            prepared["interop"] = dict(prepared["interop"] or {})
+            participation = prepared["interop"].get(
+                "writing_participation"
+            ) or {}
+            prepared["interop"]["writing_participation"] = (
+                reference_card_writing_participation(
+                    prepared,
+                    isolated_fields=list(
+                        participation.get("isolated_fields") or []
+                    ),
+                )
+            )
         card_id = str(ObjectId())
         return await commit_mutation(
             MutationCommand(
@@ -199,6 +246,7 @@ class ReferenceCardService:
             "sort_order",
             "importance",
             "character_profile",
+            "interop",
         }
         prepared = {key: value for key, value in data.items() if key in allowed_fields}
         if "name" in prepared:
@@ -221,6 +269,27 @@ class ReferenceCardService:
             prepared["character_profile"] = normalize_character_profile(
                 prepared["character_profile"]
             )
+        if "interop" in prepared:
+            prepared["interop"] = dict(prepared["interop"] or {})
+        if (
+            current.get("interop") is not None
+            and set(prepared) & {"description", "details", "character_profile"}
+        ):
+            interop = deepcopy(
+                prepared.get("interop")
+                if "interop" in prepared
+                else current.get("interop") or {}
+            )
+            participation = interop.get("writing_participation") or {}
+            interop["writing_participation"] = (
+                reference_card_writing_participation(
+                    {**current, **prepared},
+                    isolated_fields=list(
+                        participation.get("isolated_fields") or []
+                    ),
+                )
+            )
+            prepared["interop"] = interop
         changes = {
             key: value for key, value in prepared.items() if current.get(key) != value
         }

@@ -77,6 +77,8 @@ class ReferenceCardRepository(BaseRepository):
                     "Character profile is only supported for character cards"
                 )
             prepared["character_profile"] = dict(data["character_profile"] or {})
+        if "interop" in data:
+            prepared["interop"] = dict(data["interop"] or {})
         if card_id is not None:
             prepared["_id"] = to_object_id(card_id)
         return await self.insert_one(prepared, session=session)
@@ -141,6 +143,7 @@ class ReferenceCardRepository(BaseRepository):
             "sort_order",
             "importance",
             "character_profile",
+            "interop",
         }
         prepared = {key: value for key, value in data.items() if key in allowed_fields}
         if "name" in prepared:
@@ -163,6 +166,8 @@ class ReferenceCardRepository(BaseRepository):
             prepared["character_profile"] = dict(
                 prepared["character_profile"] or {}
             )
+        if "interop" in prepared:
+            prepared["interop"] = dict(prepared["interop"] or {})
         if not prepared:
             return False
         return await self.update_one({"_id": current["_id"]}, prepared, session=session)

@@ -116,6 +116,15 @@ export interface CharacterProfile {
   portrayal_notes: string;
 }
 
+export interface ReferenceCardInterop {
+  writing_participation?: {
+    status: "active" | "not_participating";
+    label: string;
+    projected_fields: string[];
+    isolated_fields: string[];
+  };
+}
+
 export interface ReferenceCard {
   _id: string;
   novel_id: string;
@@ -128,6 +137,7 @@ export interface ReferenceCard {
   sort_order: number;
   importance: "main" | "sub";
   character_profile?: CharacterProfile;
+  interop?: ReferenceCardInterop;
   is_deleted: boolean;
   deleted_at?: string | null;
   created_at: string;

@@ -311,6 +311,11 @@ export default function ReferenceCardsWorkspace({
                 <span className="min-w-0">
                   <span className="block truncate text-sm font-medium text-foreground">{card.name}</span>
                   <span className="mt-0.5 block truncate text-xs text-muted">{card.subtitle || card.description || t("noDescription")}</span>
+                  {card.interop?.writing_participation?.status === "not_participating" && (
+                    <span className="mt-1.5 inline-flex rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+                      {t("importedNotParticipating")}
+                    </span>
+                  )}
                 </span>
               </div>
             </button>
@@ -335,6 +340,14 @@ export default function ReferenceCardsWorkspace({
             </div>
 
             {error && <div role="alert" className="mt-5 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{error}</div>}
+            {!creating && selectedCard?.interop?.writing_participation?.status === "not_participating" && (
+              <div role="status" className="mt-5 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+                <p className="font-semibold">{t("importedNotParticipating")}</p>
+                <p className="mt-1 leading-6 text-amber-800 dark:text-amber-200">
+                  {t("importedNotParticipatingHint")}
+                </p>
+              </div>
+            )}
 
             <div className="mt-6 grid gap-5 md:grid-cols-2">
               <Field label={t("fields.name")} value={draft.name} onChange={(value) => setDraft((current) => ({ ...current, name: value }))} />
