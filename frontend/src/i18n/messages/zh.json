@@ -788,7 +788,57 @@
       },
       "expand": "展开",
       "collapse": "收起",
-      "noContent": "暂无内容"
+      "noContent": "暂无内容",
+      "styleControls": {
+        "title": "受限风格旋钮",
+        "description": "这些偏好只调节章纲与正文的表达方式，不会改变结构化输出、正式 ID 声明或正文完成闸门。",
+        "inherit": "沿用小说既有设定",
+        "boundedHint": "补充只能描述文风；覆盖格式、Schema、ID 或系统要求的指令会被拒绝。",
+        "validationError": "未能保存风格旋钮。请检查字符上限，并删除试图覆盖格式、Schema、ID 或系统要求的措辞后重试。",
+        "notePlaceholder": "例如：短句为主，动作描写准确克制。",
+        "characterCount": "{count}/{limit}",
+        "empty": "尚未设置受限风格偏好。",
+        "fields": {
+          "narrative_person": "叙述人称",
+          "narrative_distance": "叙述距离",
+          "pacing": "节奏偏好",
+          "prose_density": "描写密度",
+          "dialogue_ratio": "对白比重",
+          "content_rating": "内容尺度上限",
+          "custom_style_note": "自由文风补充"
+        },
+        "options": {
+          "narrative_person": {
+            "first": "第一人称",
+            "third": "第三人称"
+          },
+          "narrative_distance": {
+            "close": "贴身",
+            "medium": "中距",
+            "omniscient": "全知"
+          },
+          "pacing": {
+            "tight": "紧凑",
+            "balanced": "均衡",
+            "relaxed": "舒缓"
+          },
+          "prose_density": {
+            "sparse": "白描",
+            "balanced": "均衡",
+            "rich": "浓墨"
+          },
+          "dialogue_ratio": {
+            "low": "低",
+            "medium": "中",
+            "high": "高"
+          },
+          "content_rating": {
+            "general": "大众：无血腥细节或情色描写",
+            "moderate": "适度：克制暴力细节与亲密暗示",
+            "mature": "成熟：较强暴力与成人情色内容"
+          }
+        }
+      }
     },
     "chapterEditor": {
       "structureTitle": "卷章目录",

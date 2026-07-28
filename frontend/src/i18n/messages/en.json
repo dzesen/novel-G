@@ -788,7 +788,57 @@
       },
       "expand": "Expand",
       "collapse": "Collapse",
-      "noContent": "No content yet"
+      "noContent": "No content yet",
+      "styleControls": {
+        "title": "Bounded style controls",
+        "description": "These preferences only shape chapter-outline and prose expression. They cannot alter structured output, formal ID declarations, or the prose completion gate.",
+        "inherit": "Use existing novel settings",
+        "boundedHint": "The note may only describe style. Attempts to override formats, schemas, IDs, or system requirements are rejected.",
+        "validationError": "The style controls could not be saved. Check the character limits, remove language that overrides formats, schemas, IDs, or system requirements, and try again.",
+        "notePlaceholder": "For example: favor short sentences and restrained, precise action.",
+        "characterCount": "{count}/{limit}",
+        "empty": "No bounded style preferences have been set.",
+        "fields": {
+          "narrative_person": "Narrative person",
+          "narrative_distance": "Narrative distance",
+          "pacing": "Pacing",
+          "prose_density": "Prose density",
+          "dialogue_ratio": "Dialogue ratio",
+          "content_rating": "Content ceiling",
+          "custom_style_note": "Custom style note"
+        },
+        "options": {
+          "narrative_person": {
+            "first": "First person",
+            "third": "Third person"
+          },
+          "narrative_distance": {
+            "close": "Close",
+            "medium": "Medium",
+            "omniscient": "Omniscient"
+          },
+          "pacing": {
+            "tight": "Tight",
+            "balanced": "Balanced",
+            "relaxed": "Relaxed"
+          },
+          "prose_density": {
+            "sparse": "Spare",
+            "balanced": "Balanced",
+            "rich": "Rich"
+          },
+          "dialogue_ratio": {
+            "low": "Low",
+            "medium": "Medium",
+            "high": "High"
+          },
+          "content_rating": {
+            "general": "General: no graphic violence or sexual detail",
+            "moderate": "Moderate: restrained violence and intimacy",
+            "mature": "Mature: stronger violence and adult sexual content"
+          }
+        }
+      }
     },
     "chapterEditor": {
       "structureTitle": "Volumes & Chapters",

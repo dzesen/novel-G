@@ -429,6 +429,8 @@ create_chapter_outline_by_ai:
     【已知上下文】
     {context}
 
+    {style_controls}
+
     要求：
     - scenes：拆成 2-6 个场景，每场给出 summary（这一场发生了什么）与 purpose（这一场在全局的作用）。
     - core_conflict：本章的核心冲突，一句话。
@@ -464,6 +466,8 @@ write_chapter_by_ai:
 
     【已知上下文】
     {context}
+
+    {style_controls}
 
     要求：
     - 严格按上文【本章细纲】的场景顺序推进，不要新增细纲之外的重大情节。

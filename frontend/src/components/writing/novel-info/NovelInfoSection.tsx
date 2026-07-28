@@ -4,8 +4,9 @@ import { useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Chip } from "@heroui/react";
 import AutoResizeTextarea from "./AutoResizeTextarea";
+import BoundedStyleControls from "./BoundedStyleControls";
 import CollapsibleField from "./CollapsibleField";
-import { apiPut, apiPostForm, getImageUrl } from "@/lib/api";
+import { ApiError, apiPut, apiPostForm, getImageUrl } from "@/lib/api";
 import {
   DANGEROUS_FIELDS,
   FIELD_LABEL_MAP,
@@ -14,6 +15,7 @@ import {
   type NovelInfoFieldDef,
   type SectionKey,
 } from "@/lib/novelFields";
+import { normalizeStyleControls } from "@/lib/styleControls";
 
 export type { SectionKey } from "@/lib/novelFields";
 
@@ -52,6 +54,7 @@ export default function NovelInfoSection({
 
   const [editData, setEditData] = useState<Record<string, unknown>>({});
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [tagInput, setTagInput] = useState("");
 
   const startEdit = () => {
@@ -59,18 +62,30 @@ export default function NovelInfoSection({
     for (const f of fields) {
       snapshot[f.key] = data[f.key] ?? (f.type === "tags" ? [] : f.type === "number" ? 0 : "");
     }
+    if (sectionKey === "style") {
+      snapshot.style_controls = normalizeStyleControls(data.style_controls);
+    }
+    setSaveError("");
     setEditData(snapshot);
     onStartEdit();
   };
 
   const cancelEdit = () => {
     setEditData({});
+    setSaveError("");
     setTagInput("");
     onCancelEdit();
   };
 
   const hasDangerousChanges = (): boolean => {
     if (!hasChapters) return false;
+    if (
+      sectionKey === "style" &&
+      JSON.stringify(normalizeStyleControls(data.style_controls)) !==
+        JSON.stringify(normalizeStyleControls(editData.style_controls))
+    ) {
+      return true;
+    }
     return fields.some((f) => {
       if (!DANGEROUS_FIELDS.has(f.key)) return false;
       const orig = String(data[f.key] ?? "");
@@ -87,13 +102,21 @@ export default function NovelInfoSection({
       }
       try {
         setSaving(true);
+        setSaveError("");
         await apiPut(`/api/novels/${novelId}`, editData);
         onSaved();
-      } catch {
-        // error handled upstream
+      } catch (cause) {
+        setSaveError(
+          sectionKey === "style"
+            ? tw("styleControls.validationError")
+            : cause instanceof ApiError
+              ? cause.message
+              : tw("saveFailed"),
+        );
       } finally {
         setSaving(false);
       }
+      return;
     }
     onCancelEdit();
   };
@@ -378,6 +401,18 @@ export default function NovelInfoSection({
         {(isEditing || isCreateMode)
           ? fields.map(renderEditField)
           : fields.map(renderReadField)}
+        {sectionKey === "style" ? (
+          <BoundedStyleControls
+            value={normalizeStyleControls(getValue("style_controls"))}
+            isEditing={isEditing || isCreateMode}
+            onChange={(value) => updateField("style_controls", value)}
+          />
+        ) : null}
+        {saveError ? (
+          <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+            {saveError}
+          </p>
+        ) : null}
       </div>
     </div>
   );

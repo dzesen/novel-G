@@ -138,6 +138,10 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         core_idea: data.core_idea ? String(data.core_idea) : undefined,
         number_of_chapters: data.number_of_chapters ? Number(data.number_of_chapters) : undefined,
         words_per_chapter: data.words_per_chapter ? Number(data.words_per_chapter) : undefined,
+        style_controls:
+          typeof data.style_controls === "object" && data.style_controls !== null
+            ? data.style_controls as CreateNovelRequest["style_controls"]
+            : undefined,
         creation_mode:
           sourceDraft.creation_mode === "ai" ? "ai" : "manual",
         creative_direction: sourceDraft.creative_direction,

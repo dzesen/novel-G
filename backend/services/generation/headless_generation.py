@@ -76,6 +76,7 @@ from backend.services.novel.state_proposal import (
 )
 from backend.services.novel.state_completion import prose_is_eligible_for_state
 from backend.services.novel.state_completion import chapter_content_digest
+from backend.services.novel.style_controls import render_style_controls
 from backend.db.utils import get_utc_now
 
 CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
@@ -244,6 +245,7 @@ async def generate_outline(
         "context": context.to_prompt_text(),
         "chapter_order": int(chapter.get("order_index") or 0),
         "chapter_title": str(chapter.get("title") or ""),
+        "style_controls": render_style_controls(novel.get("style_controls")),
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
     gen_kwargs, _runtime_kwargs = _generation_options(generation_params)
@@ -303,6 +305,7 @@ async def generate_prose(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),
             chapter_title=str(chapter.get("title") or ""),
+            style_controls=render_style_controls(novel.get("style_controls")),
             words_per_chapter=words,
         )
         + "\n" + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"]

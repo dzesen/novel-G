@@ -9,6 +9,7 @@ from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import to_object_id
+from backend.services.novel.style_controls import normalize_style_controls
 
 class NovelService:
     CONTEXT_FIELDS = frozenset(
@@ -19,6 +20,7 @@ class NovelService:
             "narrative_pov",
             "tone",
             "era_background",
+            "style_controls",
         }
     )
 
@@ -35,6 +37,11 @@ class NovelService:
     @staticmethod
     async def update_novel_info(novel_id: str, update_data: Dict[str, Any]) -> bool:
         current = await novel_repo.get_novel_by_id(novel_id)
+        normalized_update_data = dict(update_data)
+        if "style_controls" in normalized_update_data:
+            normalized_update_data["style_controls"] = normalize_style_controls(
+                normalized_update_data["style_controls"]
+            )
         protected = {
             "_id",
             "created_at",
@@ -48,7 +55,7 @@ class NovelService:
         }
         changes = {
             key: value
-            for key, value in update_data.items()
+            for key, value in normalized_update_data.items()
             if key not in protected and current.get(key) != value
         }
         if not changes:

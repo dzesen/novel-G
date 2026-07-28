@@ -4,6 +4,16 @@ import type { CreativeDirectionSelection } from "@/types/agent";
 
 export type { NovelRewriteFieldKey } from "@/lib/novelFields";
 
+export interface StyleControls {
+  narrative_person?: "first" | "third";
+  narrative_distance?: "close" | "medium" | "omniscient";
+  pacing?: "tight" | "balanced" | "relaxed";
+  prose_density?: "sparse" | "balanced" | "rich";
+  dialogue_ratio?: "low" | "medium" | "high";
+  content_rating?: "general" | "moderate" | "mature";
+  custom_style_note?: string;
+}
+
 export interface NovelSummary {
   _id: string;
   title: string;
@@ -34,6 +44,7 @@ export interface NovelDetail extends NovelSummary {
   core_idea?: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
+  style_controls?: StyleControls;
   creation_source?: "manual" | "ai";
   creation_provenance?: {
     creative_director?: CreativeDirectionSelection;
@@ -59,6 +70,7 @@ export interface CreateNovelRequest {
   core_idea?: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
+  style_controls?: StyleControls;
   creation_mode?: "manual" | "ai";
   creative_direction?: CreativeDirectionSelection;
   card_creation_id?: string;

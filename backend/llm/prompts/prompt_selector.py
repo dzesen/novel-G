@@ -185,12 +185,14 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "context",
         "chapter_order",
         "chapter_title",
+        "style_controls",
         "words_per_chapter",
     },
     "chapter_content_prompt_base": {
         "context",
         "chapter_order",
         "chapter_title",
+        "style_controls",
         "words_per_chapter",
     },
     "outline_adherence_prompt_base": {

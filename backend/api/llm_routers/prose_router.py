@@ -49,6 +49,7 @@ from backend.services.generation.prose_runs import (
     prose_run_module,
     serialize_prose_run,
 )
+from backend.services.novel.style_controls import render_style_controls
 from backend.db.repositories.prose_run_repository import prose_run_repo
 
 from backend.api.default_routers.auth_router import (
@@ -199,6 +200,7 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),
             chapter_title=str(chapter.get("title") or ""),
+            style_controls=render_style_controls(novel.get("style_controls")),
             words_per_chapter=words_per_chapter,
         )
         + "\n"

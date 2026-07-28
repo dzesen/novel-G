@@ -50,6 +50,7 @@ from backend.services.novel.outline_validation import validate_outline_ids
 from backend.services.novel.state_validation import (
     resolve_outline_character_references,
 )
+from backend.services.novel.style_controls import render_style_controls
 
 from backend.api.default_routers.auth_router import require_owned_body_resource
 
@@ -95,6 +96,7 @@ CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
             "context": ctx.params["context"],
             "chapter_order": ctx.params["chapter_order"],
             "chapter_title": ctx.params["chapter_title"],
+            "style_controls": ctx.params["style_controls"],
             "words_per_chapter": ctx.params["words_per_chapter"],
         },
     ),
@@ -221,6 +223,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
         "context": context.to_prompt_text(),
         "chapter_order": int(chapter.get("order_index") or 0),
         "chapter_title": str(chapter.get("title") or ""),
+        "style_controls": render_style_controls(novel.get("style_controls")),
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
 

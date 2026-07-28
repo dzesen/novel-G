@@ -27,6 +27,10 @@ from backend.services.novel.card_driven_creation_service import (
     CardDrivenCreationConflict,
     card_driven_creation_service,
 )
+from backend.services.novel.style_controls import (
+    StyleControlsSchema,
+    normalize_style_controls,
+)
 
 router = APIRouter(prefix="/api/novels", tags=["novels"])
 
@@ -61,6 +65,7 @@ class CreateNovelRequest(BaseModel):
     core_idea: Optional[str] = None
     number_of_chapters: Optional[int] = None
     words_per_chapter: Optional[int] = None
+    style_controls: StyleControlsSchema | None = None
     creation_mode: Literal["manual", "ai"] = "manual"
     creative_direction: CreativeDirectionSelection | None = None
     card_creation_id: str | None = Field(
@@ -119,6 +124,7 @@ class UpdateNovelRequest(BaseModel):
     core_idea: Optional[str] = None
     number_of_chapters: Optional[int] = None
     words_per_chapter: Optional[int] = None
+    style_controls: StyleControlsSchema | None = None
 
 
 class StatusUpdate(BaseModel):
@@ -136,6 +142,8 @@ async def create_novel(
     creative_direction = data.pop("creative_direction", None)
     card_creation_id = data.pop("card_creation_id", None)
     card_imports = data.pop("card_imports", [])
+    if "style_controls" in data:
+        data["style_controls"] = normalize_style_controls(data["style_controls"])
     owner_id = to_object_id(actor.id)
     data.update(
         {
