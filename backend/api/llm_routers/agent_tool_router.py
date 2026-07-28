@@ -1,7 +1,8 @@
-"""Preview-only creative, continuity, and style review Agent endpoints."""
+"""Preview-only creative, continuity, style, and volume review Agents."""
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Literal
 
@@ -27,9 +28,11 @@ from backend.services.llm.agent_context import (
     StaleAgentContext,
     build_agent_context,
     build_style_consistency_context,
+    build_volume_retrospective_context,
     ensure_agent_context_current,
     is_valid_evidence_reference,
     is_valid_style_evidence_reference,
+    is_valid_volume_retrospective_evidence_reference,
 )
 from backend.services.llm.agent_orchestrator import (
     AgentOrchestrator,
@@ -38,6 +41,8 @@ from backend.services.llm.agent_orchestrator import (
     CreativeInspirationResult,
     StyleConsistencyEvidenceReference,
     StyleConsistencyResult,
+    VolumeRetrospectiveEvidenceReference,
+    VolumeRetrospectiveResult,
 )
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
 from backend.services.llm.generation_runtime import (
@@ -67,6 +72,8 @@ CONTINUITY_WORKFLOW = "continuity_review_by_agent"
 CONTINUITY_STEP = "review"
 STYLE_CONSISTENCY_WORKFLOW = "style_consistency_by_agent"
 STYLE_CONSISTENCY_STEP = "review"
+VOLUME_RETROSPECTIVE_WORKFLOW = "volume_retrospective_by_agent"
+VOLUME_RETROSPECTIVE_STEP = "review"
 logger = logging.getLogger(__name__)
 
 
@@ -125,6 +132,13 @@ class ContinuityReviewRequest(AgentScopeRequest):
 
 class StyleConsistencyRequest(AgentScopeRequest):
     scope: Literal["chapter", "volume"]
+    focus: str = Field(default="", max_length=2000)
+
+
+class VolumeRetrospectiveRequest(AgentScopeRequest):
+    scope: Literal["volume"] = "volume"
+    volume_id: str = Field(min_length=1)
+    chapter_id: None = None
     focus: str = Field(default="", max_length=2000)
 
 
@@ -314,6 +328,73 @@ def _style_consistency_prompt(
 {suffix}""".strip()
 
 
+def _volume_retrospective_prompt(
+    *,
+    context: str,
+    target_label: str,
+    coverage: str,
+    focus: str,
+    instruction: str,
+    json_only: bool,
+) -> str:
+    suffix = (
+        "只输出合法 JSON 对象，不要使用 Markdown 代码块。"
+        if json_only
+        else "严格按照提供的 JSON Schema 输出。"
+    )
+    schema_hint = (
+        "\n\n【必须遵循的 JSON Schema】\n"
+        + json.dumps(
+            VolumeRetrospectiveResult.model_json_schema(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if json_only
+        else ""
+    )
+    return f"""复盘“{target_label}”是否真正兑现卷纲承诺，只报告有证据支持的问题。
+
+【证据覆盖范围】
+{coverage}
+
+【有界证据包】
+{context}
+
+【用户关注点】
+{focus or "全面检查卷纲转折兑现、到期伏笔回收与卷内节奏"}
+
+【本次补充指令】
+{instruction or "无"}
+
+要求：
+- 故事健康记录来自 StoryHealthModule.inspect 的结构化结果，是伏笔状态、人物缺席和
+  卷/章字数的唯一权威输入。不得重新查询、重新计数、从正文猜测数量，或用自己的
+  统计覆盖 story_health 字段。
+- 模型只负责语义判断：卷纲承诺的关键转折是否在正文中真正发生，以及结合确定性
+  字数记录和正文样本判断节奏是否失衡。
+- 每个 references 条目只需原样返回 evidence_id、role、kind；稳定坐标与原文由系统
+  根据 evidence_id 确定性回填。不得猜测、改写或创建证据 ID。
+- category 只能是 promise_delivery、plot_thread_payoff、pacing；
+  severity 只能是 high、medium、low。
+- promise_delivery 必须同时引用 role=promise 的 volume_outline 和 role=outcome 的
+  chapter_prose。没有两类证据时不得断言转折未兑现。
+- plot_thread_payoff 必须引用 story_health_plot_thread；伏笔是否未回收、到期或逾期
+  只能复述该记录，不得从正文重新统计。模型可以判断它对本卷承诺的叙事影响。
+- pacing 必须同时引用 story_health_volume_word_count 或
+  story_health_chapter_word_count，以及 chapter_prose；字数偏离是输入，不是模型结论。
+- location 指向具体承诺、伏笔或节奏区段；evidence 逐条概括引用如何支持问题。
+- problem 说明未兑现或失衡之处；suggestion 只给人工可执行的处理建议，不得直接
+  改写正文、自动调用其他 Agent 或声称已修改数据库。
+- confidence 是 0 到 1 的数字；证据不足时不创建 issue，并在 summary 中说明。
+- coverage 必须如实概括 StoryHealth 全量事实与语义抽样的实际覆盖、截断情况。
+- 顶层 JSON 固定为 summary、coverage、issues；每个 issue 固定包含 severity、
+  category、location、evidence（字符串数组）、references（证据指针数组）、
+  problem、suggestion、confidence。references 的单项只填写 evidence_id、role、
+  kind 三个键，三个值都必须从同一条证据记录逐字复制。
+{schema_hint}
+{suffix}""".strip()
+
+
 async def _resolve_context_and_agent(
     *,
     request: AgentScopeRequest,
@@ -355,6 +436,26 @@ async def _resolve_style_context_and_agent(
         scope=request.scope,
         volume_id=request.volume_id,
         chapter_id=request.chapter_id,
+    )
+    return context, profile
+
+
+async def _resolve_volume_retrospective_context_and_agent(
+    *,
+    request: VolumeRetrospectiveRequest,
+    actor: Actor,
+    access: NovelAccessService,
+    catalog: AgentCatalog,
+):
+    await access.require_owned_novel(actor, request.novel_id)
+    profile = await catalog.resolve_profile(
+        actor,
+        agent_id=request.agent_id,
+        capability="volume_retrospective",
+    )
+    context = await build_volume_retrospective_context(
+        novel_id=request.novel_id,
+        volume_id=request.volume_id,
     )
     return context, profile
 
@@ -464,6 +565,59 @@ def _canonicalize_style_references(
                 )
             references.append(
                 StyleConsistencyEvidenceReference.model_validate(
+                    item.prompt_view()
+                )
+            )
+        canonical_issues.append(
+            issue.model_copy(update={"references": references})
+        )
+    return result.model_copy(update={"issues": canonical_issues})
+
+
+def _validate_volume_retrospective_references(
+    result: VolumeRetrospectiveResult,
+    context: Any,
+) -> None:
+    for issue_index, issue in enumerate(result.issues):
+        invalid = [
+            reference.model_dump(exclude_none=True)
+            for reference in issue.references
+            if not is_valid_volume_retrospective_evidence_reference(
+                context,
+                reference.model_dump(exclude_none=True),
+            )
+        ]
+        if invalid:
+            raise ValueError(
+                f"卷级复盘 issue[{issue_index}] 返回了不属于本次上下文的证据引用"
+            )
+
+
+def _canonicalize_volume_retrospective_references(
+    result: VolumeRetrospectiveResult,
+    context: Any,
+) -> VolumeRetrospectiveResult:
+    """Replace all model-copied metadata with context-owned evidence."""
+
+    evidence_by_id = {
+        item.evidence_id: item
+        for item in context.volume_retrospective_evidence
+    }
+    canonical_issues = []
+    for issue_index, issue in enumerate(result.issues):
+        references = []
+        for reference in issue.references:
+            item = evidence_by_id.get(reference.evidence_id)
+            if item is None:
+                raise ValueError(
+                    f"卷级复盘 issue[{issue_index}] 返回了未知 evidence_id"
+                )
+            if reference.role != item.role or reference.kind != item.kind:
+                raise ValueError(
+                    f"卷级复盘 issue[{issue_index}] 篡改了证据角色或类型"
+                )
+            references.append(
+                VolumeRetrospectiveEvidenceReference.model_validate(
                     item.prompt_view()
                 )
             )
@@ -859,6 +1013,121 @@ async def generate_agent_style_consistency(
             context,
         )
         _validate_style_references(canonical_result, context)
+        result = canonical_result.model_dump()
+        await runs.complete(run_id, generated=generated, result=result)
+        return {
+            "result": result,
+            **_response_metadata(
+                generated=generated,
+                profile=profile,
+                context=context,
+                run_id=run_id,
+            ),
+        }
+    except StaleAgentContext as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+            stale=True,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-volume-retrospective")
+async def generate_agent_volume_retrospective(
+    request: VolumeRetrospectiveRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    """Return a read-only, evidence-backed review of one completed volume."""
+
+    run_id: str | None = None
+    runtime: Any | None = None
+    try:
+        context, profile = (
+            await _resolve_volume_retrospective_context_and_agent(
+                request=request,
+                actor=actor,
+                access=access,
+                catalog=catalog,
+            )
+        )
+        run_id = await runs.begin(
+            actor_id=actor.id,
+            novel_id=request.novel_id,
+            capability="volume_retrospective",
+            agent_id=profile.agent_id,
+            agent_version=profile.version,
+            request=request.model_dump(),
+            context=context,
+        )
+        runtime = create_generation_runtime(**build_runtime_kwargs(request))
+        generated = await AgentOrchestrator(runtime).generate_structured(
+            profile=profile,
+            target=WorkflowStepTarget(
+                VOLUME_RETROSPECTIVE_WORKFLOW,
+                VOLUME_RETROSPECTIVE_STEP,
+            ),
+            schema=VolumeRetrospectiveResult,
+            prompts=PromptPlan(
+                native_schema_prompt=_volume_retrospective_prompt(
+                    context=context.text,
+                    target_label=context.target_label,
+                    coverage=context.coverage,
+                    focus=request.focus.strip(),
+                    instruction=request.instruction.strip(),
+                    json_only=False,
+                ),
+                prompt_json_prompt=_volume_retrospective_prompt(
+                    context=context.text,
+                    target_label=context.target_label,
+                    coverage=context.coverage,
+                    focus=request.focus.strip(),
+                    instruction=request.instruction.strip(),
+                    json_only=True,
+                ),
+            ),
+            **build_gen_kwargs(request),
+        )
+        await ensure_agent_context_current(context)
+        canonical_result = (
+            _canonicalize_volume_retrospective_references(
+                generated.value,
+                context,
+            )
+        )
+        _validate_volume_retrospective_references(
+            canonical_result,
+            context,
+        )
         result = canonical_result.model_dump()
         await runs.complete(run_id, generated=generated, result=result)
         return {

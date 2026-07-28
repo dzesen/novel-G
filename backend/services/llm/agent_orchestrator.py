@@ -158,6 +158,18 @@ _AGENT_PROFILES: tuple[AgentProfile, ...] = (
         ),
         capabilities=("style_consistency",),
     ),
+    AgentProfile(
+        agent_id="volume_retrospective_reviewer",
+        label="卷级复盘 Agent",
+        description="结合卷纲、卷内正文与确定性故事健康报告，复核卷纲兑现和节奏质量。",
+        instruction=(
+            "你是卷级复盘 Agent。伏笔状态、人物缺席和字数事实只能采用系统提供的"
+            "故事健康记录，不得自行计数或从正文反推；你只判断卷纲承诺是否真正兑现、"
+            "关键转折是否发生以及节奏是否失衡。每个问题必须引用本次证据包，"
+            "不得直接改写正文或声称已经修改。"
+        ),
+        capabilities=("volume_retrospective",),
+    ),
 )
 _AGENT_BY_ID = {profile.agent_id: profile for profile in _AGENT_PROFILES}
 
@@ -392,6 +404,97 @@ class StyleConsistencyResult(BaseModel):
     summary: str = Field(min_length=5, max_length=1200)
     coverage: str = Field(min_length=5, max_length=800)
     issues: list[StyleConsistencyIssue] = Field(
+        default_factory=list,
+        max_length=40,
+    )
+
+
+class VolumeRetrospectiveEvidenceReference(BaseModel):
+    """A pointer into the exact bounded retrospective evidence packet."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Exact evidence_id copied from the supplied evidence packet.",
+    )
+    role: str = Field(
+        pattern="^(promise|outcome|deterministic)$",
+        description="Exact role copied from the same evidence record.",
+    )
+    kind: str = Field(
+        pattern=(
+            "^(volume_outline|chapter_outline|chapter_prose|"
+            "story_health_plot_thread|story_health_character_absence|"
+            "story_health_volume_word_count|story_health_chapter_word_count)$"
+        ),
+        description="Exact kind copied from the same evidence record.",
+    )
+    label: str = Field(default="", max_length=240)
+    excerpt: str = Field(default="", max_length=2000)
+    volume_id: str | None = Field(default=None, min_length=1, max_length=64)
+    chapter_id: str | None = Field(default=None, min_length=1, max_length=64)
+    paragraph_index: int | None = Field(default=None, ge=0)
+    thread_id: str | None = Field(default=None, min_length=1, max_length=64)
+    card_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class VolumeRetrospectiveIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    severity: str = Field(pattern="^(high|medium|low)$")
+    category: str = Field(
+        pattern="^(promise_delivery|plot_thread_payoff|pacing)$"
+    )
+    location: str = Field(min_length=1, max_length=240)
+    evidence: list[str] = Field(min_length=1, max_length=8)
+    references: list[VolumeRetrospectiveEvidenceReference] = Field(
+        min_length=1,
+        max_length=10,
+    )
+    problem: str = Field(min_length=5, max_length=1200)
+    suggestion: str = Field(min_length=5, max_length=1200)
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_evidence_shape(self):
+        kinds = {reference.kind for reference in self.references}
+        roles = {reference.role for reference in self.references}
+        if self.category == "promise_delivery":
+            if "volume_outline" not in kinds or "chapter_prose" not in kinds:
+                raise ValueError(
+                    "promise delivery issue requires volume outline and prose evidence"
+                )
+            if not {"promise", "outcome"}.issubset(roles):
+                raise ValueError(
+                    "promise delivery issue requires promise and outcome roles"
+                )
+        elif self.category == "plot_thread_payoff":
+            if "story_health_plot_thread" not in kinds:
+                raise ValueError(
+                    "plot thread issue requires deterministic story health evidence"
+                )
+        else:
+            word_count_kinds = {
+                "story_health_volume_word_count",
+                "story_health_chapter_word_count",
+            }
+            if not kinds.intersection(word_count_kinds):
+                raise ValueError(
+                    "pacing issue requires deterministic word-count evidence"
+                )
+            if "chapter_prose" not in kinds:
+                raise ValueError("pacing issue requires sampled prose evidence")
+        return self
+
+
+class VolumeRetrospectiveResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=5, max_length=1200)
+    coverage: str = Field(min_length=5, max_length=1000)
+    issues: list[VolumeRetrospectiveIssue] = Field(
         default_factory=list,
         max_length=40,
     )

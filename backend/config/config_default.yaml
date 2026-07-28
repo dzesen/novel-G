@@ -183,3 +183,9 @@ llm:
         review:
           provider: ""
           timeout_seconds: null
+    volume_retrospective_by_agent:
+      default_provider: ""
+      steps:
+        review:
+          provider: ""
+          timeout_seconds: null

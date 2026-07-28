@@ -1,4 +1,4 @@
-"""Bounded evidence packets for creative, continuity, and style Agents."""
+"""Bounded evidence packets for creative, continuity, and review Agents."""
 
 from __future__ import annotations
 
@@ -18,12 +18,27 @@ from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.worldbook_repository import worldbook_repo
 from backend.services.novel.chapter_timeline import ChapterPosition, ChapterTimeline
+from backend.services.novel.story_health import StoryHealthReport, story_health
 
 
 AgentScope = Literal["novel", "volume", "chapter"]
 StyleAgentScope = Literal["volume", "chapter"]
 StyleEvidenceKind = Literal["chapter_paragraph", "character_profile"]
 StyleEvidenceRole = Literal["target", "baseline"]
+VolumeRetrospectiveEvidenceKind = Literal[
+    "volume_outline",
+    "chapter_outline",
+    "chapter_prose",
+    "story_health_plot_thread",
+    "story_health_character_absence",
+    "story_health_volume_word_count",
+    "story_health_chapter_word_count",
+]
+VolumeRetrospectiveEvidenceRole = Literal[
+    "promise",
+    "outcome",
+    "deterministic",
+]
 MAX_CONTEXT_CHARACTERS = 36_000
 STYLE_EVIDENCE_EXCERPT_CHARACTERS = 700
 STYLE_BASELINE_CHAPTER_LIMIT = 4
@@ -32,6 +47,10 @@ STYLE_TARGET_CHAPTER_PARAGRAPH_LIMIT = 18
 STYLE_TARGET_VOLUME_CHAPTER_LIMIT = 12
 STYLE_TARGET_VOLUME_PARAGRAPHS_PER_CHAPTER = 2
 STYLE_CONTEXT_MIN_CHARACTERS = 4_000
+RETROSPECTIVE_CONTEXT_MIN_CHARACTERS = 8_000
+RETROSPECTIVE_CHAPTER_SAMPLE_LIMIT = 18
+RETROSPECTIVE_PROSE_PARAGRAPHS_PER_CHAPTER = 2
+RETROSPECTIVE_EVIDENCE_EXCERPT_CHARACTERS = 700
 
 
 @dataclass(frozen=True)
@@ -78,6 +97,49 @@ class AgentStyleEvidence:
 
 
 @dataclass(frozen=True)
+class AgentVolumeRetrospectiveEvidence:
+    """One exact record authorized for volume-retrospective references."""
+
+    evidence_id: str
+    role: VolumeRetrospectiveEvidenceRole
+    kind: VolumeRetrospectiveEvidenceKind
+    label: str
+    excerpt: str
+    volume_id: str | None = None
+    chapter_id: str | None = None
+    paragraph_index: int | None = None
+    thread_id: str | None = None
+    card_id: str | None = None
+
+    def prompt_view(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "evidence_id": self.evidence_id,
+                "role": self.role,
+                "kind": self.kind,
+                "label": self.label,
+                "excerpt": self.excerpt,
+                "volume_id": self.volume_id,
+                "chapter_id": self.chapter_id,
+                "paragraph_index": self.paragraph_index,
+                "thread_id": self.thread_id,
+                "card_id": self.card_id,
+            }.items()
+            if value is not None
+        }
+
+    def snapshot_view(self) -> dict[str, Any]:
+        """Persist stable coordinates without duplicating evidence text."""
+
+        return {
+            key: value
+            for key, value in self.prompt_view().items()
+            if key != "excerpt"
+        }
+
+
+@dataclass(frozen=True)
 class AgentContextBundle:
     text: str
     coverage: str
@@ -89,10 +151,15 @@ class AgentContextBundle:
     chapter_id: str | None = None
     narrative_revision: int = 0
     context_digest: str = ""
+    story_health_schema_version: str | None = None
     chapter_scene_counts: tuple[tuple[str, int], ...] = ()
     fact_ids: tuple[str, ...] = ()
     thread_ids: tuple[str, ...] = ()
     style_evidence: tuple[AgentStyleEvidence, ...] = ()
+    volume_retrospective_evidence: tuple[
+        AgentVolumeRetrospectiveEvidence,
+        ...,
+    ] = ()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -102,6 +169,7 @@ class AgentContextBundle:
             "chapter_id": self.chapter_id,
             "narrative_revision": self.narrative_revision,
             "context_digest": self.context_digest,
+            "story_health_schema_version": self.story_health_schema_version,
             "chapter_scene_counts": [
                 {
                     "chapter_id": chapter_id,
@@ -113,6 +181,10 @@ class AgentContextBundle:
             "thread_ids": list(self.thread_ids),
             "style_evidence": [
                 item.snapshot_view() for item in self.style_evidence
+            ],
+            "volume_retrospective_evidence": [
+                item.snapshot_view()
+                for item in self.volume_retrospective_evidence
             ],
         }
 
@@ -224,6 +296,43 @@ def is_valid_style_evidence_reference(
         str(reference.get("card_id") or "") == item.card_id
         and str(reference.get("profile_field") or "") == item.profile_field
         and reference.get("example_index") == item.example_index
+    )
+
+
+def is_valid_volume_retrospective_evidence_reference(
+    context: AgentContextBundle,
+    reference: dict[str, Any],
+) -> bool:
+    """Validate a retrospective citation against its captured evidence."""
+
+    evidence_id = str(reference.get("evidence_id") or "")
+    item = next(
+        (
+            candidate
+            for candidate in context.volume_retrospective_evidence
+            if candidate.evidence_id == evidence_id
+        ),
+        None,
+    )
+    if item is None:
+        return False
+    return (
+        str(reference.get("role") or "") == item.role
+        and str(reference.get("kind") or "") == item.kind
+        and (
+            str(reference.get("volume_id") or "")
+            == str(item.volume_id or "")
+        )
+        and (
+            str(reference.get("chapter_id") or "")
+            == str(item.chapter_id or "")
+        )
+        and reference.get("paragraph_index") == item.paragraph_index
+        and (
+            str(reference.get("thread_id") or "")
+            == str(item.thread_id or "")
+        )
+        and str(reference.get("card_id") or "") == str(item.card_id or "")
     )
 
 
@@ -978,4 +1087,422 @@ async def build_style_consistency_context(
         narrative_revision=captured_revision,
         context_digest=context_digest,
         style_evidence=selected_evidence,
+    )
+
+
+def _retrospective_health_evidence(
+    report: StoryHealthReport,
+) -> list[AgentVolumeRetrospectiveEvidence]:
+    """Project every required StoryHealth field without recomputing it."""
+
+    evidence: list[AgentVolumeRetrospectiveEvidence] = []
+
+    def append_record(
+        *,
+        evidence_id: str,
+        kind: VolumeRetrospectiveEvidenceKind,
+        label: str,
+        payload: dict[str, Any],
+        volume_id: str | None = None,
+        chapter_id: str | None = None,
+        thread_id: str | None = None,
+        card_id: str | None = None,
+    ) -> None:
+        excerpt = _json(payload)
+        if len(excerpt) > 2_000:
+            raise ValueError(
+                f"确定性故事健康记录超过单条证据上限: {evidence_id}"
+            )
+        evidence.append(
+            AgentVolumeRetrospectiveEvidence(
+                evidence_id=evidence_id,
+                role="deterministic",
+                kind=kind,
+                label=label,
+                excerpt=excerpt,
+                volume_id=volume_id,
+                chapter_id=chapter_id,
+                thread_id=thread_id,
+                card_id=card_id,
+            )
+        )
+
+    for item in report.plot_threads:
+        append_record(
+            evidence_id=f"story_health:plot_thread:{item.thread_id}",
+            kind="story_health_plot_thread",
+            label=f"伏笔健康记录 · {item.name or item.thread_id}",
+            payload=item.model_dump(mode="json"),
+            thread_id=item.thread_id,
+        )
+    for item in report.character_absences:
+        append_record(
+            evidence_id=f"story_health:character_absence:{item.card_id}",
+            kind="story_health_character_absence",
+            label=f"角色缺席记录 · {item.name or item.card_id}",
+            payload=item.model_dump(mode="json"),
+            card_id=item.card_id,
+        )
+    for item in report.word_counts.volumes:
+        append_record(
+            evidence_id=f"story_health:volume_word_count:{item.volume_id}",
+            kind="story_health_volume_word_count",
+            label=f"卷字数记录 · {item.volume_title or item.volume_id}",
+            payload=item.model_dump(mode="json"),
+            volume_id=item.volume_id,
+        )
+    for item in report.word_counts.chapters:
+        append_record(
+            evidence_id=f"story_health:chapter_word_count:{item.chapter_id}",
+            kind="story_health_chapter_word_count",
+            label=(
+                f"章节字数记录 · 第{item.volume_order}卷"
+                f"第{item.chapter_order}章《{item.chapter_title}》"
+            ),
+            payload=item.model_dump(mode="json"),
+            volume_id=item.volume_id,
+            chapter_id=item.chapter_id,
+        )
+    return evidence
+
+
+def _fit_retrospective_evidence(
+    evidence: list[AgentVolumeRetrospectiveEvidence],
+    budget: int,
+) -> tuple[list[AgentVolumeRetrospectiveEvidence], str]:
+    selected: list[AgentVolumeRetrospectiveEvidence] = []
+    rendered = "[]"
+    for item in evidence:
+        candidate = [*selected, item]
+        candidate_rendered = _json(
+            [record.prompt_view() for record in candidate]
+        )
+        if len(candidate_rendered) > budget:
+            continue
+        selected = candidate
+        rendered = candidate_rendered
+    return selected, rendered
+
+
+def _retrospective_chapter_outline_evidence(
+    *,
+    positions: list[ChapterPosition],
+    chapters_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[AgentVolumeRetrospectiveEvidence], bool]:
+    evidence: list[AgentVolumeRetrospectiveEvidence] = []
+    clipped_any = False
+    for position in positions:
+        chapter = chapters_by_id[position.chapter_id]
+        outline = _outline_view(chapter.get("outline"))
+        if outline is None:
+            continue
+        target_word_count = (chapter.get("outline") or {}).get(
+            "target_word_count"
+        )
+        if target_word_count is not None:
+            outline["target_word_count"] = target_word_count
+        excerpt, clipped = _clip(_json(outline), 1_800)
+        clipped_any = clipped_any or clipped
+        evidence.append(
+            AgentVolumeRetrospectiveEvidence(
+                evidence_id=f"promise:chapter_outline:{position.chapter_id}",
+                role="promise",
+                kind="chapter_outline",
+                label=(
+                    f"第{position.volume_order}卷·"
+                    f"第{position.chapter_order}章《"
+                    f"{chapter.get('title') or ''}》细纲"
+                ),
+                excerpt=excerpt,
+                volume_id=position.volume_id,
+                chapter_id=position.chapter_id,
+            )
+        )
+    return evidence, clipped_any
+
+
+def _retrospective_prose_evidence(
+    *,
+    positions: list[ChapterPosition],
+    chapters_by_id: dict[str, dict[str, Any]],
+) -> list[AgentVolumeRetrospectiveEvidence]:
+    evidence: list[AgentVolumeRetrospectiveEvidence] = []
+    for position in positions:
+        chapter = chapters_by_id[position.chapter_id]
+        paragraphs = _sample_evenly(
+            _paragraphs_with_indexes(chapter.get("content")),
+            RETROSPECTIVE_PROSE_PARAGRAPHS_PER_CHAPTER,
+        )
+        for paragraph_index, paragraph in paragraphs:
+            excerpt, _ = _clip(
+                paragraph,
+                RETROSPECTIVE_EVIDENCE_EXCERPT_CHARACTERS,
+            )
+            evidence.append(
+                AgentVolumeRetrospectiveEvidence(
+                    evidence_id=(
+                        f"outcome:chapter:{position.chapter_id}:"
+                        f"paragraph:{paragraph_index}"
+                    ),
+                    role="outcome",
+                    kind="chapter_prose",
+                    label=(
+                        f"第{position.volume_order}卷·"
+                        f"第{position.chapter_order}章《"
+                        f"{chapter.get('title') or ''}》"
+                        f"第{paragraph_index + 1}段"
+                    ),
+                    excerpt=excerpt,
+                    volume_id=position.volume_id,
+                    chapter_id=position.chapter_id,
+                    paragraph_index=paragraph_index,
+                )
+            )
+    return evidence
+
+
+async def build_volume_retrospective_context(
+    *,
+    novel_id: str,
+    volume_id: str,
+    max_characters: int = MAX_CONTEXT_CHARACTERS,
+) -> AgentContextBundle:
+    """Build a volume review packet around authoritative StoryHealth facts."""
+
+    if max_characters < RETROSPECTIVE_CONTEXT_MIN_CHARACTERS:
+        raise ValueError(
+            "卷级复盘上下文预算不能低于 "
+            f"{RETROSPECTIVE_CONTEXT_MIN_CHARACTERS} 字符"
+        )
+    normalized_volume_id = str(volume_id or "").strip()
+    if not normalized_volume_id:
+        raise ValueError("卷级复盘必须指定 volume_id")
+
+    captured_revision = await narrative_revision_store.current(novel_id)
+    health_report = await story_health.inspect(
+        novel_id,
+        volume_id=normalized_volume_id,
+    )
+    if (
+        health_report.schema_version != "story_health.v1"
+        or health_report.scope.kind != "volume"
+        or health_report.scope.volume_id != normalized_volume_id
+    ):
+        raise ValueError("故事健康报告版本或卷范围与复盘请求不一致")
+
+    volumes = await volume_repo.get_volumes_by_novel(novel_id)
+    chapters = await chapter_repo.get_chapters_by_novel(
+        novel_id,
+        include_content=True,
+    )
+    timeline = ChapterTimeline(volumes, chapters)
+    volumes_by_id = {
+        str(volume["_id"]): volume
+        for volume in volumes
+        if not volume.get("is_deleted")
+    }
+    target_volume = volumes_by_id.get(normalized_volume_id)
+    if target_volume is None:
+        raise ValueError("指定卷不属于当前小说")
+    chapters_by_id = {
+        str(chapter["_id"]): chapter
+        for chapter in chapters
+        if not chapter.get("is_deleted")
+    }
+    target_positions = [
+        position
+        for position in timeline.positions
+        if position.volume_id == normalized_volume_id
+    ]
+    written_positions = [
+        position
+        for position in target_positions
+        if str(chapters_by_id[position.chapter_id].get("content") or "").strip()
+    ]
+    if not written_positions:
+        raise ValueError("目标卷没有可复盘的正文")
+
+    volume_outline = {
+        "title": str(target_volume.get("title") or ""),
+        "summary": str(target_volume.get("summary") or ""),
+        "arc": str(target_volume.get("arc") or ""),
+        "chapter_range": target_volume.get("chapter_range"),
+    }
+    if not volume_outline["summary"] and not volume_outline["arc"]:
+        raise ValueError("目标卷没有可核对的卷纲摘要或卷内弧线")
+    volume_outline_excerpt, volume_outline_clipped = _clip(
+        _json(volume_outline),
+        2_000,
+    )
+    volume_outline_evidence = AgentVolumeRetrospectiveEvidence(
+        evidence_id=f"promise:volume_outline:{normalized_volume_id}",
+        role="promise",
+        kind="volume_outline",
+        label=f"卷纲承诺 · {target_volume.get('title') or normalized_volume_id}",
+        excerpt=volume_outline_excerpt,
+        volume_id=normalized_volume_id,
+    )
+
+    health_evidence = _retrospective_health_evidence(health_report)
+    sampled_positions = _sample_evenly(
+        target_positions,
+        RETROSPECTIVE_CHAPTER_SAMPLE_LIMIT,
+    )
+    sampled_written_positions = _sample_evenly(
+        written_positions,
+        RETROSPECTIVE_CHAPTER_SAMPLE_LIMIT,
+    )
+    outline_candidates, outline_clipped = (
+        _retrospective_chapter_outline_evidence(
+            positions=sampled_positions,
+            chapters_by_id=chapters_by_id,
+        )
+    )
+    prose_candidates = _retrospective_prose_evidence(
+        positions=sampled_written_positions,
+        chapters_by_id=chapters_by_id,
+    )
+
+    metadata = _json(
+        {
+            "story_health_schema_version": health_report.schema_version,
+            "story_health_scope": health_report.scope.model_dump(mode="json"),
+            "story_health_observation": health_report.observation.model_dump(
+                mode="json"
+            ),
+            "story_health_summary": health_report.summary.model_dump(
+                mode="json"
+            ),
+            "story_health_policies": health_report.policies.model_dump(
+                mode="json"
+            ),
+            "semantic_sampling_policy": {
+                "chapters": (
+                    "目标卷按稳定章节顺序均匀抽取最多 18 章，"
+                    "保留首章与末章"
+                ),
+                "prose": "每个抽样有正文章节均匀抽取最多 2 段",
+                "deterministic_story_health": (
+                    "plot_threads、character_absences、"
+                    "word_counts.volumes、word_counts.chapters 全量装入；"
+                    "不允许模型重新统计"
+                ),
+            },
+        }
+    )
+    health_rendered = _json(
+        [item.prompt_view() for item in health_evidence]
+    )
+    volume_outline_rendered = _json([volume_outline_evidence.prompt_view()])
+    empty_sections = [
+        f"【故事健康报告元数据】\n{metadata}",
+        f"【确定性故事健康证据（全量，不得重算）】\n{health_rendered}",
+        f"【卷纲承诺】\n{volume_outline_rendered}",
+        "【抽样章细纲承诺】\n[]",
+        "【抽样正文结果】\n[]",
+    ]
+    empty_text = "\n\n".join(empty_sections)
+    if len(empty_text) > max_characters:
+        raise ValueError(
+            "目标卷的确定性故事健康证据超过复盘上下文硬上限；"
+            "系统不会静默裁剪后让模型重新统计"
+        )
+
+    available = max_characters - len(empty_text)
+    outline_budget = 2 + available * 40 // 100
+    prose_budget = 2 + available - (outline_budget - 2)
+    selected_outlines, outlines_rendered = _fit_retrospective_evidence(
+        outline_candidates,
+        outline_budget,
+    )
+    selected_prose, prose_rendered = _fit_retrospective_evidence(
+        prose_candidates,
+        prose_budget,
+    )
+    if not selected_prose:
+        raise ValueError("卷级复盘上下文预算不足以容纳正文结果证据")
+
+    text = "\n\n".join(
+        [
+            f"【故事健康报告元数据】\n{metadata}",
+            f"【确定性故事健康证据（全量，不得重算）】\n{health_rendered}",
+            f"【卷纲承诺】\n{volume_outline_rendered}",
+            f"【抽样章细纲承诺】\n{outlines_rendered}",
+            f"【抽样正文结果】\n{prose_rendered}",
+        ]
+    )
+    if len(text) > max_characters:
+        raise ValueError("卷级复盘上下文超过硬预算")
+
+    truncated: list[str] = []
+    if volume_outline_clipped:
+        truncated.append("卷纲承诺")
+    if (
+        len(sampled_positions) < len(target_positions)
+        or len(selected_outlines) < len(outline_candidates)
+        or outline_clipped
+    ):
+        truncated.append("抽样章细纲承诺")
+    if (
+        len(sampled_written_positions) < len(written_positions)
+        or len(selected_prose) < len(prose_candidates)
+    ):
+        truncated.append("抽样正文结果")
+
+    target_label = (
+        f"卷：{target_volume.get('title') or normalized_volume_id}"
+    )
+    coverage = (
+        f"直接消费 {health_report.schema_version}："
+        f"伏笔 {len(health_report.plot_threads)} 条、"
+        f"角色缺席 {len(health_report.character_absences)} 条、"
+        f"卷字数 {len(health_report.word_counts.volumes)} 条、"
+        f"章字数 {len(health_report.word_counts.chapters)} 条；"
+        f"语义证据抽样 {len(selected_outlines)}/"
+        f"{len([position for position in target_positions if chapters_by_id[position.chapter_id].get('outline')])}"
+        f" 份章细纲与 {len(selected_prose)} 段正文，覆盖 "
+        f"{len({item.chapter_id for item in selected_prose})}/"
+        f"{len(written_positions)} 个有正文章节。"
+    )
+    if truncated:
+        coverage += f" 截断段落：{', '.join(truncated)}。"
+
+    if await narrative_revision_store.current(novel_id) != captured_revision:
+        raise StaleAgentContext(
+            "小说内容在卷级复盘上下文装配期间发生变化，请重试"
+        )
+    context_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "novel_id": novel_id,
+                "scope": "volume",
+                "volume_id": normalized_volume_id,
+                "narrative_revision": captured_revision,
+                "text": text,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    selected_evidence = (
+        *health_evidence,
+        volume_outline_evidence,
+        *selected_outlines,
+        *selected_prose,
+    )
+    return AgentContextBundle(
+        text=text,
+        coverage=coverage,
+        truncated_sections=tuple(truncated),
+        target_label=target_label,
+        novel_id=novel_id,
+        scope="volume",
+        volume_id=normalized_volume_id,
+        chapter_id=None,
+        narrative_revision=captured_revision,
+        context_digest=context_digest,
+        story_health_schema_version=health_report.schema_version,
+        thread_ids=tuple(item.thread_id for item in health_report.plot_threads),
+        volume_retrospective_evidence=tuple(selected_evidence),
     )

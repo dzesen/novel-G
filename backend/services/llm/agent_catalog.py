@@ -159,6 +159,19 @@ _CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         side_effect_policy="preview_only",
         handler_id="router:generate_agent_style_consistency",
     ),
+    CapabilityDefinition(
+        capability="volume_retrospective",
+        version=1,
+        label="卷级复盘",
+        description="结合卷纲、卷内正文与确定性故事健康报告，复核承诺兑现、伏笔回收与节奏。",
+        customizable=True,
+        scope_options=("volume",),
+        input_contract="VolumeRetrospectiveRequest",
+        output_contract="VolumeRetrospectiveResult",
+        context_policy="agent_context:bounded_evidence",
+        side_effect_policy="preview_only",
+        handler_id="router:generate_agent_volume_retrospective",
+    ),
 )
 _CAPABILITY_BY_ID = {item.capability: item for item in _CAPABILITIES}
 _GENERATION_PARAM_KEYS = {"temperature", "top_p", "max_tokens"}

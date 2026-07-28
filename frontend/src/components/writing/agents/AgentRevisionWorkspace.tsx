@@ -665,7 +665,9 @@ export default function AgentRevisionWorkspace({
                       ? t("creativeRun")
                       : run.capability === "continuity_review"
                         ? t("continuityRun")
-                        : t("styleRun")}
+                        : run.capability === "style_consistency"
+                          ? t("styleRun")
+                          : t("retrospectiveRun")}
                   </p>
                   <p className="mt-1 text-xs text-muted">
                     {t("runMeta", {

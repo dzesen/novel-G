@@ -16,6 +16,7 @@ import type {
   ContinuityReviewResult,
   CreativeInspirationResult,
   StyleConsistencyResult,
+  VolumeRetrospectiveResult,
 } from "@/types/agent";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import AgentRevisionWorkspace, {
@@ -32,6 +33,7 @@ type StudioTab =
   | "creative"
   | "continuity"
   | "style"
+  | "retrospective"
   | "history"
   | "management";
 
@@ -141,6 +143,9 @@ export default function AgentStudioWorkspace({
   const [styleResult, setStyleResult] =
     useState<StyleConsistencyResult | null>(null);
   const [styleFocus, setStyleFocus] = useState("");
+  const [retrospectiveResult, setRetrospectiveResult] =
+    useState<VolumeRetrospectiveResult | null>(null);
+  const [retrospectiveFocus, setRetrospectiveFocus] = useState("");
   const [toolMetadata, setToolMetadata] =
     useState<AgentToolMetadata | null>(null);
   const [revisionSource, setRevisionSource] =
@@ -206,11 +211,13 @@ export default function AgentStudioWorkspace({
   }, [novelId, t]);
 
   const activeCapability =
-    tab === "style"
-      ? "style_consistency"
-      : tab === "continuity"
-        ? "continuity_review"
-        : "creative_inspiration";
+    tab === "retrospective"
+      ? "volume_retrospective"
+      : tab === "style"
+        ? "style_consistency"
+        : tab === "continuity"
+          ? "continuity_review"
+          : "creative_inspiration";
   const toolAgents = useMemo(
     () =>
       agents.filter(
@@ -400,6 +407,7 @@ export default function AgentStudioWorkspace({
         setCreativeResult(response.result);
         setContinuityResult(null);
         setStyleResult(null);
+        setRetrospectiveResult(null);
         setToolMetadata(response);
       } else if (tab === "continuity") {
         const response = await apiPost<
@@ -411,8 +419,9 @@ export default function AgentStudioWorkspace({
         setContinuityResult(response.result);
         setCreativeResult(null);
         setStyleResult(null);
+        setRetrospectiveResult(null);
         setToolMetadata(response);
-      } else {
+      } else if (tab === "style") {
         const response = await apiPost<
           { result: StyleConsistencyResult } & AgentToolMetadata
         >("/api/llm/agent-style-consistency", {
@@ -422,6 +431,19 @@ export default function AgentStudioWorkspace({
         setStyleResult(response.result);
         setCreativeResult(null);
         setContinuityResult(null);
+        setRetrospectiveResult(null);
+        setToolMetadata(response);
+      } else {
+        const response = await apiPost<
+          { result: VolumeRetrospectiveResult } & AgentToolMetadata
+        >("/api/llm/agent-volume-retrospective", {
+          ...base,
+          focus: retrospectiveFocus.trim(),
+        });
+        setRetrospectiveResult(response.result);
+        setCreativeResult(null);
+        setContinuityResult(null);
+        setStyleResult(null);
         setToolMetadata(response);
       }
     } catch (caught) {
@@ -437,7 +459,9 @@ export default function AgentStudioWorkspace({
         ? creativeResult
         : tab === "continuity"
           ? continuityResult
-          : styleResult;
+          : tab === "style"
+            ? styleResult
+            : retrospectiveResult;
     if (!result) return;
     await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
     setNotice(t("copied"));
@@ -470,11 +494,13 @@ export default function AgentStudioWorkspace({
           value={scope}
           onChange={(event) => setScope(event.target.value as AgentScope)}
         >
-          {tab !== "style" && (
+          {tab !== "style" && tab !== "retrospective" && (
             <option value="novel">{t("tool.scopeNovel")}</option>
           )}
           <option value="volume">{t("tool.scopeVolume")}</option>
-          <option value="chapter">{t("tool.scopeChapter")}</option>
+          {tab !== "retrospective" && (
+            <option value="chapter">{t("tool.scopeChapter")}</option>
+          )}
         </select>
       </label>
       {scope === "volume" && (
@@ -580,21 +606,27 @@ export default function AgentStudioWorkspace({
                 ? t("creative.eyebrow")
                 : tab === "continuity"
                   ? t("continuity.eyebrow")
-                  : t("style.eyebrow")}
+                  : tab === "style"
+                    ? t("style.eyebrow")
+                    : t("retrospective.eyebrow")}
             </p>
             <h2 className="mt-1 text-xl font-semibold text-foreground">
               {tab === "creative"
                 ? t("creative.title")
                 : tab === "continuity"
                   ? t("continuity.title")
-                  : t("style.title")}
+                  : tab === "style"
+                    ? t("style.title")
+                    : t("retrospective.title")}
             </h2>
             <p className="mt-2 text-sm leading-6 text-muted">
               {tab === "creative"
                 ? t("creative.description")
                 : tab === "continuity"
                   ? t("continuity.description")
-                  : t("style.description")}
+                  : tab === "style"
+                    ? t("style.description")
+                    : t("retrospective.description")}
             </p>
           </div>
 
@@ -662,7 +694,7 @@ export default function AgentStudioWorkspace({
                   placeholder={t("continuity.focusPlaceholder")}
                 />
               </label>
-            ) : (
+            ) : tab === "style" ? (
               <label className="block space-y-1.5 text-sm">
                 <span className="text-muted">{t("style.focus")}</span>
                 <textarea
@@ -670,6 +702,20 @@ export default function AgentStudioWorkspace({
                   value={styleFocus}
                   onChange={(event) => setStyleFocus(event.target.value)}
                   placeholder={t("style.focusPlaceholder")}
+                />
+              </label>
+            ) : (
+              <label className="block space-y-1.5 text-sm">
+                <span className="text-muted">
+                  {t("retrospective.focus")}
+                </span>
+                <textarea
+                  className={`${fieldClass} min-h-28 resize-y`}
+                  value={retrospectiveFocus}
+                  onChange={(event) =>
+                    setRetrospectiveFocus(event.target.value)
+                  }
+                  placeholder={t("retrospective.focusPlaceholder")}
                 />
               </label>
             )}
@@ -698,7 +744,9 @@ export default function AgentStudioWorkspace({
             <p className="text-xs leading-5 text-muted">
               {tab === "style"
                 ? t("style.previewOnlyHint")
-                : t("previewOnlyHint")}
+                : tab === "retrospective"
+                  ? t("retrospective.previewOnlyHint")
+                  : t("previewOnlyHint")}
             </p>
           </div>
         </section>
@@ -1030,6 +1078,99 @@ export default function AgentStudioWorkspace({
                           </dd>
                         </div>
                       </dl>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          ) : tab === "retrospective" && retrospectiveResult ? (
+            <div className="space-y-5">
+              {resultHeader(t("retrospective.resultTitle"))}
+              <div>
+                <p className="text-sm leading-6 text-foreground">
+                  {retrospectiveResult.summary}
+                </p>
+                <p className="mt-2 text-xs leading-5 text-muted">
+                  {retrospectiveResult.coverage}
+                </p>
+              </div>
+              {retrospectiveResult.issues.length === 0 ? (
+                <div className="rounded-lg bg-surface-secondary p-4 text-sm text-muted">
+                  {t("retrospective.noIssues")}
+                </div>
+              ) : (
+                <ol className="divide-y divide-border">
+                  {retrospectiveResult.issues.map((issue, index) => (
+                    <li
+                      key={`${issue.location}-${index}`}
+                      className="py-5 first:pt-0 last:pb-0"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`rounded px-2 py-0.5 text-xs font-semibold ${
+                            issue.severity === "high"
+                              ? "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300"
+                              : issue.severity === "medium"
+                                ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+                                : "bg-surface-secondary text-muted"
+                          }`}
+                        >
+                          {t(`continuity.severity.${issue.severity}`)}
+                        </span>
+                        <span className="text-xs text-muted">
+                          {t(
+                            `retrospective.category.${issue.category}`,
+                          )}
+                        </span>
+                        <span className="text-xs tabular-nums text-muted">
+                          {Math.round(issue.confidence * 100)}%
+                        </span>
+                      </div>
+                      <h4 className="mt-2 text-sm font-semibold text-foreground">
+                        {issue.location}
+                      </h4>
+                      <p className="mt-2 text-sm leading-6 text-foreground">
+                        {issue.problem}
+                      </p>
+                      <div className="mt-3">
+                        <p className="text-xs font-semibold text-muted">
+                          {t("retrospective.evidence")}
+                        </p>
+                        <ul className="mt-1 list-disc space-y-1 pl-5 text-sm leading-6 text-muted">
+                          {issue.evidence.map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div className="mt-4 space-y-3">
+                        <p className="text-xs font-semibold text-muted">
+                          {t("retrospective.references")}
+                        </p>
+                        {issue.references.map((reference) => (
+                          <div
+                            key={reference.evidence_id}
+                            className="border-l-2 border-accent/30 bg-surface-secondary px-3 py-3"
+                          >
+                            <p className="text-xs font-medium text-muted">
+                              {t(
+                                `retrospective.referenceKind.${reference.kind}`,
+                              )}
+                              {" · "}
+                              {reference.label}
+                            </p>
+                            <p className="mt-1 break-words text-sm leading-6 text-foreground">
+                              {reference.excerpt}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="mt-4 text-sm leading-6 text-muted">
+                        <span className="font-medium text-foreground">
+                          {t("retrospective.suggestion")}
+                          {t("retrospective.labelSeparator")}
+                        </span>
+                        {issue.suggestion}
+                      </p>
                     </li>
                   ))}
                 </ol>
@@ -1498,6 +1639,7 @@ export default function AgentStudioWorkspace({
               "creative",
               "continuity",
               "style",
+              "retrospective",
               "history",
               "management",
             ] as StudioTab[]
@@ -1512,6 +1654,9 @@ export default function AgentStudioWorkspace({
                   setTab(item);
                   if (item === "style" && scope === "novel") {
                     setScope("chapter");
+                  }
+                  if (item === "retrospective") {
+                    setScope("volume");
                   }
                   setError(null);
                   setNotice(null);

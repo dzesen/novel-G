@@ -280,7 +280,8 @@
         "creative_direction_by_agent": "Agent New-Novel Direction",
         "creative_inspiration_by_agent": "Agent Creative Inspiration",
         "continuity_review_by_agent": "Agent Continuity Review",
-        "style_consistency_by_agent": "Agent Style & Character Voice Consistency"
+        "style_consistency_by_agent": "Agent Style & Character Voice Consistency",
+        "volume_retrospective_by_agent": "Agent Volume Retrospective"
       },
       "steps": {
         "expand_idea_to_full_novel_story": "Expand the user idea into a full compressed long-form plot",
@@ -297,7 +298,8 @@
         "direction": "Generate comparable long-form directions before creating a novel",
         "inspiration": "Preview creative directions constrained by the current story",
         "review": "Preview evidence-backed continuity issues",
-        "style_consistency_review": "Review style drift against sampled prose and character voice baselines"
+        "style_consistency_review": "Review style drift against sampled prose and character voice baselines",
+        "volume_retrospective_review": "Review volume promises and pacing with deterministic story-health evidence"
       },
       "stepLabel": "Step",
       "providerNotExist": "Selected Provider does not exist",
@@ -508,13 +510,14 @@
     "agentStudio": {
       "eyebrow": "Controlled intelligence",
       "title": "Agent Studio",
-      "description": "Explore creative directions, evidence-backed continuity issues, and style drift, then configure reusable Agents of your own. Every result begins as a preview.",
+      "description": "Explore creative directions, evidence-backed continuity issues, style drift, and volume retrospectives, then configure reusable Agents of your own. Every result begins as a preview.",
       "skillBoundary": "Code-owned capabilities · Manageable Agent profiles",
       "tabsLabel": "Agent Studio tools",
       "tabs": {
         "creative": "Creative Inspiration",
         "continuity": "Continuity Review",
         "style": "Style & Character Voice",
+        "retrospective": "Volume Retrospective",
         "history": "Runs & Revisions",
         "management": "Agent Management"
       },
@@ -527,7 +530,7 @@
       "previewBadge": "Read-only preview",
       "previewOnlyHint": "Generation only creates a preview. Copy it, or create a revision proposal with stale checks before accepting any write.",
       "needNovelTitle": "Save the novel before running an Agent",
-      "needNovelDescription": "Agent management remains available. Inspiration, continuity, and style review need a saved novel as their evidence source.",
+      "needNovelDescription": "Agent management remains available. Inspiration, continuity, style review, and volume retrospectives need a saved novel as their evidence source.",
       "emptyResultTitle": "Results will unfold here",
       "emptyResultDescription": "Choose a scope and Agent, then describe the goal. The response also reports actual context coverage and truncation.",
       "copy": "Copy JSON",
@@ -620,6 +623,34 @@
           "character_voice": "Character voice"
         }
       },
+      "retrospective": {
+        "eyebrow": "Review a volume with deterministic facts",
+        "title": "Volume Retrospective",
+        "description": "Consume plot-thread, character-absence, and volume/chapter word-count facts directly from Story Health, then use bounded outline and prose evidence to judge promise delivery and pacing.",
+        "focus": "What should receive extra attention?",
+        "focusPlaceholder": "Optional; for example: did the promised end-of-volume cost actually happen, and did the middle lose momentum?",
+        "resultTitle": "Volume retrospective findings",
+        "noIssues": "No sufficiently supported volume-level issue was found in the complete deterministic facts and bounded semantic evidence.",
+        "previewOnlyHint": "This capability only returns an evidence preview. It creates no revision proposal, edits no outline or prose, and never invokes another Agent automatically.",
+        "evidence": "Evidence summary",
+        "references": "Deterministically validated references",
+        "suggestion": "Suggested next step",
+        "labelSeparator": ": ",
+        "category": {
+          "promise_delivery": "Volume promise delivery",
+          "plot_thread_payoff": "Plot-thread payoff",
+          "pacing": "Volume pacing"
+        },
+        "referenceKind": {
+          "volume_outline": "Volume-outline promise",
+          "chapter_outline": "Chapter-outline promise",
+          "chapter_prose": "Prose outcome",
+          "story_health_plot_thread": "Story Health · Plot thread",
+          "story_health_character_absence": "Story Health · Character absence",
+          "story_health_volume_word_count": "Story Health · Volume word count",
+          "story_health_chapter_word_count": "Story Health · Chapter word count"
+        }
+      },
       "revisions": {
         "createFromResult": "Create revision proposal",
         "composerEyebrow": "Author-controlled write checkpoint",
@@ -680,6 +711,7 @@
         "creativeRun": "Creative inspiration",
         "continuityRun": "Continuity review",
         "styleRun": "Style & character voice consistency",
+        "retrospectiveRun": "Volume retrospective",
         "runMeta": "Agent {agent} v{version} · Provider {provider} · context revision {revision}",
         "runStatus": {
           "running": "Running",

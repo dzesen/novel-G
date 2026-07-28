@@ -118,6 +118,16 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
             ),
         ),
     ),
+    WorkflowDefinition(
+        name="volume_retrospective_by_agent",
+        label_key="settings.workflow.catalog.volume_retrospective_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="review",
+                label_key="settings.workflow.steps.volume_retrospective_review",
+            ),
+        ),
+    ),
 )
 
 

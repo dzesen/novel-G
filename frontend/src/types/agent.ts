@@ -6,7 +6,8 @@ export type AgentCapabilityId =
   | "novel_direction"
   | "creative_inspiration"
   | "continuity_review"
-  | "style_consistency";
+  | "style_consistency"
+  | "volume_retrospective";
 
 export type AgentScope = "novel" | "volume" | "chapter";
 
@@ -183,6 +184,43 @@ export interface StyleConsistencyResult {
   issues: StyleConsistencyIssue[];
 }
 
+export interface VolumeRetrospectiveEvidenceReference {
+  evidence_id: string;
+  role: "promise" | "outcome" | "deterministic";
+  kind:
+    | "volume_outline"
+    | "chapter_outline"
+    | "chapter_prose"
+    | "story_health_plot_thread"
+    | "story_health_character_absence"
+    | "story_health_volume_word_count"
+    | "story_health_chapter_word_count";
+  label: string;
+  excerpt: string;
+  volume_id?: string;
+  chapter_id?: string;
+  paragraph_index?: number;
+  thread_id?: string;
+  card_id?: string;
+}
+
+export interface VolumeRetrospectiveIssue {
+  severity: ContinuitySeverity;
+  category: "promise_delivery" | "plot_thread_payoff" | "pacing";
+  location: string;
+  evidence: string[];
+  references: VolumeRetrospectiveEvidenceReference[];
+  problem: string;
+  suggestion: string;
+  confidence: number;
+}
+
+export interface VolumeRetrospectiveResult {
+  summary: string;
+  coverage: string;
+  issues: VolumeRetrospectiveIssue[];
+}
+
 export interface AgentToolMetadata {
   run_id: string;
   agent_id: string;
@@ -221,7 +259,8 @@ export interface AgentRun {
   capability:
     | "creative_inspiration"
     | "continuity_review"
-    | "style_consistency";
+    | "style_consistency"
+    | "volume_retrospective";
   status: "running" | "completed" | "failed" | "stale";
   agent_id: string;
   agent_version: number;
@@ -241,6 +280,7 @@ export interface AgentRun {
     chapter_id?: string | null;
     narrative_revision: number;
     context_digest: string;
+    story_health_schema_version?: string | null;
     chapter_scene_counts: Array<{
       chapter_id: string;
       scene_count: number;
@@ -250,13 +290,20 @@ export interface AgentRun {
     style_evidence?: Array<
       Omit<StyleConsistencyEvidenceReference, "excerpt">
     >;
+    volume_retrospective_evidence?: Array<
+      Omit<VolumeRetrospectiveEvidenceReference, "excerpt">
+    >;
   };
   result?: {
     framing?: string;
     ideas?: CreativeIdea[];
     summary?: string;
     coverage?: string;
-    issues?: Array<ContinuityIssue | StyleConsistencyIssue>;
+    issues?: Array<
+      | ContinuityIssue
+      | StyleConsistencyIssue
+      | VolumeRetrospectiveIssue
+    >;
   } | null;
   usage: {
     input_tokens?: number;
