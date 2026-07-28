@@ -18,7 +18,7 @@ from backend.db.repositories.worldbook_repository import worldbook_repo
 from backend.services.novel.character_profile import normalize_character_profile
 
 
-CARD_TYPES = {"character", "location", "item", "rule"}
+CARD_TYPES = {"character", "location", "item", "rule", "lore"}
 
 
 def validate_card_type(card_type: str) -> str:

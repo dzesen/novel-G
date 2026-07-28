@@ -205,6 +205,7 @@ async def build_agent_context(
         ("location", worldbook_repo),
         ("item", worldbook_repo),
         ("rule", worldbook_repo),
+        ("lore", worldbook_repo),
     ):
         for card in await repository.list_cards(novel_id, card_type):
             cards.append({

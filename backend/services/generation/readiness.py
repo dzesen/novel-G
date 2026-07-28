@@ -196,7 +196,10 @@ class GenerationReadinessModule:
                 )
             )
 
-        world_count = sum(int(resources.get(kind) or 0) for kind in ("location", "item", "rule"))
+        world_count = sum(
+            int(resources.get(kind) or 0)
+            for kind in ("location", "item", "rule", "lore")
+        )
         if has_work and world_count == 0:
             issues.append(
                 _issue(
@@ -261,7 +264,7 @@ class GenerationReadinessModule:
             "resources": {
                 **{
                     kind: int(resources.get(kind) or 0)
-                    for kind in ("character", "location", "item", "rule")
+                    for kind in ("character", "location", "item", "rule", "lore")
                 },
                 "narrative_revision": int(
                     resources.get("narrative_revision") or 0
@@ -342,7 +345,7 @@ async def _load_resource_counts(novel_id: str) -> dict[str, int]:
         "character": len(await character_repo.list_cards(novel_id, "character")),
         "narrative_revision": await narrative_revision_store.current(novel_id),
     }
-    for card_type in ("location", "item", "rule"):
+    for card_type in ("location", "item", "rule", "lore"):
         result[card_type] = len(await worldbook_repo.list_cards(novel_id, card_type))
     return result
 

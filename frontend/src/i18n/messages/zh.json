@@ -287,7 +287,7 @@
         "core_seed": "基于故事要素生成故事核心种子",
         "novel_meta": "整合参数并生成完整小说初始化信息",
         "create_core_factions": "基于已保存小说信息生成全书核心阵营与阵营关系预览",
-        "reference_cards": "根据已保存小说信息生成角色、地点、物品与规则卡候选",
+        "reference_cards": "根据已保存小说信息生成角色、地点、物品、规则与通用世界设定卡候选",
         "volume_outline": "生成卷纲结构",
         "chapter_outline": "生成章节细纲",
         "chapter_content": "流式生成章节正文",
@@ -443,6 +443,7 @@
       "factionCards": "势力卡",
       "itemCards": "物品卡",
       "ruleCards": "设定规则卡",
+      "loreCards": "通用世界设定",
       "relationshipMap": "关系图谱",
       "plotThreads": "伏笔管理",
       "characterMemory": "人物记忆",
@@ -800,7 +801,7 @@
       "fieldPov": "视角人物",
       "fieldPresent": "出场人物",
       "fieldMentioned": "被提及人物",
-      "fieldWorldbook": "引用的地点/物品/规则",
+      "fieldWorldbook": "引用的地点/物品/规则/通用世界设定",
       "fieldThreadsResolved": "本章回收的伏笔",
       "fieldScenes": "场景序列",
       "fieldSceneSummary": "这一场发生了什么",
@@ -821,6 +822,12 @@
       "rosterEmpty": "本书还没有可选项。",
       "unknownId": "未知 id：{id}",
       "threadHintWithDue": "{status} · 预计第 {chapter} 章回收",
+      "worldbookTypes": {
+        "location": "地点",
+        "item": "物品",
+        "rule": "规则",
+        "lore": "世界设定"
+      },
       "threadStatus": {
         "planted": "已埋",
         "developing": "发展中",
@@ -888,7 +895,7 @@
       "readinessLoading": "正在检查章节、资料卡与 Provider…",
       "readinessRefresh": "重新检查",
       "readinessWorkCounts": "生成 {generate} · 复用 {reuse}",
-      "readinessResources": "资料卡：角色 {characters} · 地点 {locations} · 物品 {items} · 规则 {rules}",
+      "readinessResources": "资料卡：角色 {characters} · 地点 {locations} · 物品 {items} · 规则 {rules} · 世界设定 {lores}",
       "readinessProviders": "Provider：{providers} · 最多 {attempts} 次尝试",
       "readinessProseStrategy": "正文策略：单次 {single} 章 · 逐场景 {segmented} 章 · 细纲未定 {unknown} 章 · 最多 {calls} 次正文调用",
       "readinessProseCapability": "正文 Provider：{provider} / {model} · 最大输出 {tokens} tokens · 安全分段约 {words} 字（{source}）",
@@ -901,7 +908,7 @@
       "readinessOpenCards": "去生成或检查资料卡",
       "readinessIssueCharacterCardsMissingTitle": "没有角色卡，需要明确确认",
       "readinessIssueCharacterCardsMissingBody": "本次会生成细纲或状态回填，但当前没有角色卡。AI 只能依据小说设定和正文推断人物。",
-      "readinessIssueWorldCardsMissingTitle": "没有地点、物品或规则卡",
+      "readinessIssueWorldCardsMissingTitle": "没有地点、物品、规则或通用世界设定卡",
       "readinessIssueWorldCardsMissingBody": "可以继续，但世界细节只能来自小说设定、细纲和现有正文。",
       "readinessIssueProposalPendingTitle": "有尚未处理的资料卡候选",
       "readinessIssueProposalPendingBody": "请先审查、应用或放弃候选，避免生成时读取到与候选不一致的正式资料卡。",
@@ -1022,13 +1029,15 @@
         "character": "角色卡",
         "location": "地点卡",
         "item": "物品卡",
-        "rule": "设定规则卡"
+        "rule": "设定规则卡",
+        "lore": "世界设定卡"
       },
       "typeDescriptions": {
         "character": "集中记录人物弧光、动机与关系线索",
         "location": "整理场景氛围、历史与剧情作用",
         "item": "追踪关键物品的来源、能力与限制",
-        "rule": "维护世界运行规则、代价与例外"
+        "rule": "维护世界运行规则、代价与例外",
+        "lore": "记录历史、组织、术语与习俗等，不预设为地点、物品或规则"
       },
       "importanceMain": "主要角色",
       "importanceSub": "次要角色",
@@ -1058,7 +1067,7 @@
       "trashHint": "从左侧选择要恢复或彻底删除的资料卡。",
       "empty": "还没有资料卡",
       "emptyTitle": "建立第一张资料卡",
-      "emptyDescription": "把容易遗忘的人物、地点与设定集中记录，写作时随时查阅。",
+      "emptyDescription": "把容易遗忘的人物、地点、物品、规则与通用世界设定集中记录，写作时随时查阅。",
       "noSearchResults": "没有匹配的资料卡",
       "noDescription": "暂无描述",
       "untitled": "未命名资料卡",
@@ -1087,7 +1096,7 @@
         "generateFailed": "资料卡候选生成失败",
         "applyFailed": "资料卡应用失败",
         "emptyTitle": "从小说设定提取资料卡",
-        "emptyDetail": "一次模型请求会同时生成角色、地点、物品和规则候选。已有同名卡片会在审核中建议合并。",
+        "emptyDetail": "一次模型请求会同时生成角色、地点、物品、规则和通用世界设定候选，候选总量不会因此扩大。已有同名卡片会在审核中建议合并。",
         "generate": "生成候选",
         "regenerate": "重新生成",
         "regenerateConfirm": "重新生成会再次调用模型并产生新的用量，当前未应用候选将被替换。是否继续？",
@@ -1097,7 +1106,8 @@
           "characters": "角色",
           "locations": "地点",
           "items": "物品",
-          "rules": "规则"
+          "rules": "规则",
+          "lores": "世界设定"
         },
         "importanceMain": "主要",
         "importanceSub": "次要",
@@ -1173,7 +1183,12 @@
         "scope": "生效范围",
         "cost": "代价",
         "exceptions": "例外情况",
-        "examples": "示例"
+        "examples": "示例",
+        "era": "时代与时期",
+        "background": "背景与来由",
+        "story_relevance": "剧情关联",
+        "related_entities": "相关人物与设定",
+        "uncertainties": "未确定之处"
       }
     },
     "relationshipMap": {

@@ -99,6 +99,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     if (activeItem === "rule-cards") {
       return <ReferenceCardsWorkspace key="rule" mode={mode} novelId={novelId} cardType="rule" />;
     }
+    if (activeItem === "lore-cards") {
+      return <ReferenceCardsWorkspace key="lore" mode={mode} novelId={novelId} cardType="lore" />;
+    }
     if (activeItem === "relationship-map") {
       return <RelationshipWorkspace mode={mode} novelId={novelId} />;
     }

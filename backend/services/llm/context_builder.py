@@ -275,6 +275,25 @@ def _format_facts(name: str, facts: list) -> str:
     return f"{name} 的既定事实：\n" + "\n".join(lines)
 
 
+def _format_worldbook_card(card: dict) -> str:
+    name = str(card.get("name") or "")
+    description = str(card.get("description") or "")
+    card_type = str(card.get("card_type") or "")
+    if card_type == "location":
+        return f"地点「{name}」：{description}"
+    if card_type == "item":
+        return f"物品「{name}」：{description}"
+    if card_type == "rule":
+        return f"世界规则「{name}」：{description}"
+    if card_type == "lore":
+        return (
+            f"世界设定条目「{name}」"
+            f"（按一条世界设定使用，不预设为地点、物品或世界规则）："
+            f"{description}"
+        )
+    return f"设定资料「{name}」：{description}"
+
+
 def _truncate_to_budget(sections: list, budget: int, priority: dict) -> tuple:
     """超预算时按 (段落优先级, item.drop_rank) 一次全局排序，逐条丢弃。
 
@@ -494,7 +513,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
         card = worldbook_cards.get(card_id)
         if not card:
             continue
-        minor_blocks.append(f"{card['name']}：{card.get('description', '')}")
+        minor_blocks.append(_format_worldbook_card(card))
     if minor_blocks:
         sections.append(_blob("minor_cards", "相关设定：\n" + "\n".join(minor_blocks)))
 
@@ -534,7 +553,7 @@ def build_roster(cards: dict, worldbook_cards: dict, threads: list) -> dict:
 
     Args:
         cards: {id 字符串: {"name", "description", ...}} 人物卡。
-        worldbook_cards: 同上，世界卡（地点/物品/规则）。
+        worldbook_cards: 同上，世界卡（地点/物品/规则/通用世界设定）。
         threads: [{"_id" 字符串, "name", "description", ...}] 活跃伏笔。
 
     Returns:

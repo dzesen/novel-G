@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.services.novel.character_profile import CharacterProfileSchema
 
 
@@ -44,6 +44,15 @@ class RuleDetailsSchema(_StrictModel):
     exceptions: str = Field(default="", max_length=300)
 
 
+class LoreDetailsSchema(_StrictModel):
+    category: str = Field(default="", max_length=120)
+    era: str = Field(default="", max_length=200)
+    background: str = Field(default="", max_length=500)
+    story_relevance: str = Field(default="", max_length=300)
+    related_entities: str = Field(default="", max_length=300)
+    uncertainties: str = Field(default="", max_length=300)
+
+
 class _CardCandidateBase(_StrictModel):
     name: str = Field(min_length=1, max_length=120)
     subtitle: str = Field(default="", max_length=200)
@@ -69,8 +78,21 @@ class RuleCandidateSchema(_CardCandidateBase):
     details: RuleDetailsSchema = Field(default_factory=RuleDetailsSchema)
 
 
+class LoreCandidateSchema(_CardCandidateBase):
+    details: LoreDetailsSchema = Field(default_factory=LoreDetailsSchema)
+
+
 class ReferenceCardCandidatesSchema(_StrictModel):
     characters: list[CharacterCandidateSchema] = Field(min_length=2, max_length=10)
     locations: list[LocationCandidateSchema] = Field(min_length=1, max_length=8)
     items: list[ItemCandidateSchema] = Field(default_factory=list, max_length=6)
     rules: list[RuleCandidateSchema] = Field(default_factory=list, max_length=6)
+    lores: list[LoreCandidateSchema] = Field(default_factory=list, max_length=6)
+
+    @model_validator(mode="after")
+    def keep_existing_optional_candidate_budget(self):
+        if len(self.items) + len(self.rules) + len(self.lores) > 12:
+            raise ValueError(
+                "items, rules and lores may contain at most 12 candidates combined"
+            )
+        return self

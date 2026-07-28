@@ -11,7 +11,7 @@ import type {
   ReferenceCardCurationResult,
 } from "@/types/novel";
 
-const GROUPS = ["characters", "locations", "items", "rules"] as const;
+const GROUPS = ["characters", "locations", "items", "rules", "lores"] as const;
 type CandidateGroup = (typeof GROUPS)[number];
 
 interface DecisionDraft {

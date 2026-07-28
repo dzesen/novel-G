@@ -287,7 +287,7 @@
         "core_seed": "Generate story core seed from elements",
         "novel_meta": "Generate complete novel initialization info",
         "create_core_factions": "Generate full-book core factions and faction relations from saved novel info",
-        "reference_cards": "Generate character, location, item, and rule candidates from saved novel info",
+        "reference_cards": "Generate character, location, item, rule, and neutral lore candidates from saved novel info",
         "volume_outline": "Generate the volume outline",
         "chapter_outline": "Generate the chapter outline",
         "chapter_content": "Stream the chapter prose",
@@ -443,6 +443,7 @@
       "factionCards": "Factions",
       "itemCards": "Items",
       "ruleCards": "Rules & Settings",
+      "loreCards": "Lore",
       "relationshipMap": "Relationship Map",
       "plotThreads": "Plot Threads",
       "characterMemory": "Character Memory",
@@ -800,7 +801,7 @@
       "fieldPov": "POV character",
       "fieldPresent": "Characters present",
       "fieldMentioned": "Characters mentioned",
-      "fieldWorldbook": "Referenced locations / items / rules",
+      "fieldWorldbook": "Referenced locations / items / rules / lore",
       "fieldThreadsResolved": "Plot threads resolved here",
       "fieldScenes": "Scenes",
       "fieldSceneSummary": "What happens",
@@ -821,6 +822,12 @@
       "rosterEmpty": "Nothing to choose from yet.",
       "unknownId": "Unknown id: {id}",
       "threadHintWithDue": "{status} · expected to resolve in chapter {chapter}",
+      "worldbookTypes": {
+        "location": "Location",
+        "item": "Item",
+        "rule": "Rule",
+        "lore": "Lore"
+      },
       "threadStatus": {
         "planted": "Planted",
         "developing": "Developing",
@@ -888,7 +895,7 @@
       "readinessLoading": "Checking chapters, reference cards, and Providers…",
       "readinessRefresh": "Check again",
       "readinessWorkCounts": "Generate {generate} · reuse {reuse}",
-      "readinessResources": "Cards: {characters} characters · {locations} locations · {items} items · {rules} rules",
+      "readinessResources": "Cards: {characters} characters · {locations} locations · {items} items · {rules} rules · {lores} lore",
       "readinessProviders": "Providers: {providers} · up to {attempts} attempts",
       "readinessProseStrategy": "Prose: {single} single-call chapters · {segmented} scene-segmented · {unknown} awaiting outlines · up to {calls} prose calls",
       "readinessProseCapability": "Prose provider: {provider} / {model} · max output {tokens} tokens · safe segment about {words} words ({source})",
@@ -901,7 +908,7 @@
       "readinessOpenCards": "Generate or review reference cards",
       "readinessIssueCharacterCardsMissingTitle": "No character cards — acknowledgement required",
       "readinessIssueCharacterCardsMissingBody": "This run generates outlines or state backfill, but no character cards exist. The model can only infer characters from settings and prose.",
-      "readinessIssueWorldCardsMissingTitle": "No location, item, or rule cards",
+      "readinessIssueWorldCardsMissingTitle": "No location, item, rule, or lore cards",
       "readinessIssueWorldCardsMissingBody": "You can continue, but world details can only come from novel settings, outlines, and existing prose.",
       "readinessIssueProposalPendingTitle": "A reference-card proposal still needs review",
       "readinessIssueProposalPendingBody": "Review, apply, or reject the proposal first so generation does not read formal cards that conflict with pending candidates.",
@@ -1022,13 +1029,15 @@
         "character": "Characters",
         "location": "Locations",
         "item": "Items",
-        "rule": "Rules & Settings"
+        "rule": "Rules & Settings",
+        "lore": "Lore"
       },
       "typeDescriptions": {
         "character": "Keep character arcs, motives, and relationship notes together",
         "location": "Capture atmosphere, history, and each place's story function",
         "item": "Track the origin, powers, and limits of important objects",
-        "rule": "Maintain world rules, their costs, and their exceptions"
+        "rule": "Maintain world rules, their costs, and their exceptions",
+        "lore": "Capture history, organizations, terms, customs, and other world facts without treating them as rules"
       },
       "importanceMain": "Main Character",
       "importanceSub": "Supporting Character",
@@ -1058,7 +1067,7 @@
       "trashHint": "Choose a card on the left to restore or permanently delete it.",
       "empty": "No reference cards yet",
       "emptyTitle": "Create the first reference card",
-      "emptyDescription": "Keep easy-to-forget people, places, and rules close at hand while writing.",
+      "emptyDescription": "Keep easy-to-forget people, places, objects, rules, and neutral lore close at hand while writing.",
       "noSearchResults": "No matching cards",
       "noDescription": "No description yet",
       "untitled": "Untitled card",
@@ -1087,7 +1096,7 @@
         "generateFailed": "Could not generate reference-card candidates",
         "applyFailed": "Could not apply reference-card changes",
         "emptyTitle": "Extract cards from the novel settings",
-        "emptyDetail": "One model request generates character, location, item, and rule candidates. Existing same-name cards are proposed as merges.",
+        "emptyDetail": "One model request generates character, location, item, rule, and neutral lore candidates without increasing the total candidate budget. Existing same-name cards are proposed as merges.",
         "generate": "Generate candidates",
         "regenerate": "Regenerate",
         "regenerateConfirm": "Regenerating makes another model call and replaces the unapplied candidates. Continue?",
@@ -1097,7 +1106,8 @@
           "characters": "Characters",
           "locations": "Locations",
           "items": "Items",
-          "rules": "Rules"
+          "rules": "Rules",
+          "lores": "Lore"
         },
         "importanceMain": "Main",
         "importanceSub": "Supporting",
@@ -1173,7 +1183,12 @@
         "scope": "Scope",
         "cost": "Cost",
         "exceptions": "Exceptions",
-        "examples": "Examples"
+        "examples": "Examples",
+        "era": "Era or period",
+        "background": "Background and origin",
+        "story_relevance": "Story relevance",
+        "related_entities": "Related people and setting",
+        "uncertainties": "Open questions"
       }
     },
     "relationshipMap": {

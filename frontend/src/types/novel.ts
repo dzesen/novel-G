@@ -106,7 +106,12 @@ export interface ChapterDraft {
   status: ChapterStatus;
 }
 
-export type ReferenceCardType = "character" | "location" | "item" | "rule";
+export type ReferenceCardType =
+  | "character"
+  | "location"
+  | "item"
+  | "rule"
+  | "lore";
 
 export interface CharacterProfile {
   aliases: string[];
@@ -198,7 +203,7 @@ export interface ReferenceCardCurationProposal {
   novel_id: string;
   status: "proposed" | "claimed" | "applied";
   candidates: Record<
-    "characters" | "locations" | "items" | "rules",
+    "characters" | "locations" | "items" | "rules" | "lores",
     ReferenceCardCandidate[]
   >;
   generation_audit: {
@@ -411,6 +416,7 @@ export type WritingSidebarItem =
   | "faction-cards"
   | "item-cards"
   | "rule-cards"
+  | "lore-cards"
   | "relationship-map"
   | "plot-threads"
   | "character-memory";

@@ -34,6 +34,7 @@ const DETAIL_FIELDS: Record<ReferenceCardType, string[]> = {
   location: ["category", "atmosphere", "geography", "history", "story_importance", "dangers"],
   item: ["category", "appearance", "origin", "abilities", "limitations", "owner"],
   rule: ["category", "principle", "scope", "cost", "exceptions", "examples"],
+  lore: ["category", "era", "background", "story_relevance", "related_entities", "uncertainties"],
 };
 
 function createDraft(card?: ReferenceCard): CardDraft {

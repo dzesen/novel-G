@@ -117,7 +117,7 @@ export interface GenerationReadiness {
     chapter_count: number;
     steps: Record<"outline" | "prose" | "state", ReadinessStepCounts>;
   };
-  resources: Record<"character" | "location" | "item" | "rule", number> & {
+  resources: Record<"character" | "location" | "item" | "rule" | "lore", number> & {
     narrative_revision: number;
   };
   planning: {

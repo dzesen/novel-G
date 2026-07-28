@@ -13,7 +13,7 @@ export interface RosterEntry {
   hint: string;
 }
 
-const WORLDBOOK_TYPES = ["location", "item", "rule"] as const;
+const WORLDBOOK_TYPES = ["location", "item", "rule", "lore"] as const;
 
 /**
  * 拉取本书的人物卡、世界卡与伏笔，建 id→名 映射。
@@ -34,7 +34,7 @@ export function useRoster(novelId: string | null) {
     setLoading(true);
     setError("");
     try {
-      // 五个请求彼此独立，必须一并发出：把伏笔那条单独 await 会白白多一个往返，
+      // 六个请求彼此独立，必须一并发出：把伏笔那条单独 await 会白白多一个往返，
       // 面板每次打开都慢一拍。
       const [characterRes, threadRes, ...worldbookRes] = await Promise.all([
         apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/character`),
@@ -56,7 +56,9 @@ export function useRoster(novelId: string | null) {
           res.data.map((card) => ({
             id: card._id,
             name: card.name,
-            hint: `${WORLDBOOK_TYPES[index]}· ${card.subtitle || card.description.slice(0, 30)}`,
+            hint: `${t(`worldbookTypes.${WORLDBOOK_TYPES[index]}`)} · ${
+              card.subtitle || card.description.slice(0, 30)
+            }`,
           }))
         )
       );

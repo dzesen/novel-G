@@ -317,6 +317,7 @@ export default function StartJobDialog({
                       locations: readiness.resources.location,
                       items: readiness.resources.item,
                       rules: readiness.resources.rule,
+                      lores: readiness.resources.lore,
                     })}
                   </p>
                   <p>

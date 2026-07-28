@@ -370,12 +370,13 @@ create_reference_cards_by_ai:
     {existing_cards_json}
 
     要求：
-    - 一次返回 characters、locations、items、rules 四类候选。
-    - characters 生成 2-10 个，locations 生成 1-8 个，items 和 rules 各生成 0-6 个。
+    - 一次返回 characters、locations、items、rules、lores 五类候选。
+    - characters 生成 2-10 个，locations 生成 1-8 个；items、rules、lores 各生成 0-6 个，三类合计不超过 12 个，默认候选总量不得因新增 lores 扩大。
     - 只提取能从小说设定合理推出、会影响后续写作一致性的内容；不要为了凑数编造。
+    - lore 表示一条不预设为地点、物品或世界规则的世界设定；历史事件、组织、术语、习俗等无法诚实归入前三类时放入 lores，不要硬塞进 rules。
     - 不要生成数据库 id，也不要假装已经写入系统。
     - 避免与已有同类型卡片重复；若确实是同一实体，沿用相同名称，系统会在审核阶段建议合并。
-    - importance 只能是 main 或 sub。只有主线不可替代的人物、地点或规则才标 main。
+    - importance 只能是 main 或 sub。只有主线不可替代的人物、地点、物品、规则或 lore 才标 main。
     - tags 最多 8 个，短而稳定。
     - 地点 details 中表达剧情重要性时使用 story_importance，不要使用 importance。
     - character 可选填写 character_profile：aliases 是稳定别名；portrayal_context 是角色通常如何面对特定场景；dialogue_examples 是少量可复用的语气样例；scene_opening_examples 只是创作灵感；portrayal_notes 是人物塑造约束。
@@ -384,7 +385,7 @@ create_reference_cards_by_ai:
     请严格按提供的 JSON Schema 输出，不要输出额外解释。
   reference_cards_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。结构为：
-    {"characters":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"role":"...","motivation":"...","conflict":"...","appearance":"...","personality":"...","abilities":"...","relationships":"..."},"character_profile":{"aliases":["..."],"portrayal_context":"...","dialogue_examples":["..."],"scene_opening_examples":["..."],"portrayal_notes":"..."},"tags":["..."]}],"locations":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"geography":"...","atmosphere":"...","function":"...","story_importance":"...","dangers":"..."},"tags":["..."]}],"items":[],"rules":[]}
+    {"characters":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"role":"...","motivation":"...","conflict":"...","appearance":"...","personality":"...","abilities":"...","relationships":"..."},"character_profile":{"aliases":["..."],"portrayal_context":"...","dialogue_examples":["..."],"scene_opening_examples":["..."],"portrayal_notes":"..."},"tags":["..."]}],"locations":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"geography":"...","atmosphere":"...","function":"...","story_importance":"...","dangers":"..."},"tags":["..."]}],"items":[],"rules":[],"lores":[{"name":"...","subtitle":"...","description":"...","importance":"main|sub","details":{"category":"...","era":"...","background":"...","story_relevance":"...","related_entities":"...","uncertainties":"..."},"tags":["..."]}]}
 
 # 分卷大纲 Prompt 配置
 create_volume_outline_by_ai:

@@ -34,6 +34,7 @@ from backend.llm.prompts.prompt_selector import load_prompt_config
 from backend.llm.schemas.reference_card_pydantic import (
     CharacterCandidateSchema,
     ItemCandidateSchema,
+    LoreCandidateSchema,
     LocationCandidateSchema,
     ReferenceCardCandidatesSchema,
     RuleCandidateSchema,
@@ -75,6 +76,7 @@ TYPE_TO_GROUP = {
     "location": "locations",
     "item": "items",
     "rule": "rules",
+    "lore": "lores",
 }
 GROUP_TO_TYPE = {value: key for key, value in TYPE_TO_GROUP.items()}
 SCHEMA_BY_TYPE = {
@@ -82,6 +84,7 @@ SCHEMA_BY_TYPE = {
     "location": LocationCandidateSchema,
     "item": ItemCandidateSchema,
     "rule": RuleCandidateSchema,
+    "lore": LoreCandidateSchema,
 }
 EDITABLE_FIELDS = {
     "name",

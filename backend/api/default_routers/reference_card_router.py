@@ -1,4 +1,4 @@
-"""CRUD API for character, location, item and world-rule cards."""
+"""CRUD API for character, location, item, world-rule and lore cards."""
 
 from __future__ import annotations
 
