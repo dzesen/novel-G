@@ -279,7 +279,8 @@
         "rewrite_chapter_scene_by_agent": "Agent 场景改写",
         "creative_direction_by_agent": "Agent 新书创意定向",
         "creative_inspiration_by_agent": "Agent 创意启发",
-        "continuity_review_by_agent": "Agent 前后一致性检查"
+        "continuity_review_by_agent": "Agent 前后一致性检查",
+        "style_consistency_by_agent": "Agent 文风与人物声音一致性"
       },
       "steps": {
         "expand_idea_to_full_novel_story": "先把用户创意扩写成完整长篇剧情压缩稿",
@@ -295,7 +296,8 @@
         "scene_rewrite": "使用指定场景 Agent 改写单个场景描述",
         "direction": "在正式建书前生成可比较的长篇创作方向",
         "inspiration": "生成受现有设定约束的创意方向预览",
-        "review": "按证据检查前后一致性并生成问题预览"
+        "review": "按证据检查前后一致性并生成问题预览",
+        "style_consistency_review": "按抽样正文与角色声音基准检查风格漂移"
       },
       "stepLabel": "步骤",
       "providerNotExist": "所选 Provider 不存在",
@@ -506,12 +508,13 @@
     "agentStudio": {
       "eyebrow": "受控智能协作",
       "title": "Agent 工作台",
-      "description": "在小说证据范围内获取创意方向和一致性问题，也可以为自己配置可复用的 Agent。结果先形成预览；只有作者创建并接受修订提案后才会写入。",
+      "description": "在小说证据范围内获取创意方向、一致性问题和风格漂移证据，也可以为自己配置可复用的 Agent。所有结果先形成预览。",
       "skillBoundary": "能力由代码定义 · Agent 配置可管理",
       "tabsLabel": "Agent 工作台功能",
       "tabs": {
         "creative": "创意启发",
         "continuity": "一致性检查",
+        "style": "文风与人物声音",
         "history": "运行与修订",
         "management": "Agent 管理"
       },
@@ -524,7 +527,7 @@
       "previewBadge": "只读预览",
       "previewOnlyHint": "生成本身只产生预览。可以复制结果，也可以创建带版本校验的修订提案后再接受。",
       "needNovelTitle": "先保存小说，再运行 Agent",
-      "needNovelDescription": "Agent 管理仍可使用；创意启发和一致性检查需要一部已保存的小说作为证据来源。",
+      "needNovelDescription": "Agent 管理仍可使用；创意启发、一致性检查和文风审查需要一部已保存的小说作为证据来源。",
       "emptyResultTitle": "结果将在这里展开",
       "emptyResultDescription": "选择检查范围和 Agent，填写目标后生成。系统会同时标明实际上下文覆盖与截断情况。",
       "copy": "复制 JSON",
@@ -594,7 +597,27 @@
           "plot_thread": "伏笔",
           "volume_outline": "卷纲",
           "faction": "势力",
+          "lore": "通用世界设定",
           "other": "其他"
+        }
+      },
+      "style": {
+        "eyebrow": "用基准校准慢性漂移",
+        "title": "文风与人物声音一致性",
+        "description": "用目标范围之前的早期正文抽样校准整体文风，并用细纲已声明角色的对白样例与人物塑造备注校准人物声音。",
+        "focus": "重点检查什么",
+        "focusPlaceholder": "可选；例如：重点检查林岚在本卷后半段的对白是否仍然克制、短促",
+        "resultTitle": "文风与人物声音审查结果",
+        "noIssues": "在本次实际抽样和角色声音基准中，没有发现具备双向证据的偏离。",
+        "previewOnlyHint": "本能力只生成证据预览，不创建修订提案，也不修改正文。确认问题后可由作者另行使用场景改写。",
+        "evidence": "证据摘要",
+        "targetEvidence": "目标正文段落",
+        "baselineEvidence": "对照基准",
+        "baseline": "基准特征",
+        "suggestion": "处理建议",
+        "category": {
+          "prose_style": "整体文风",
+          "character_voice": "人物声音"
         }
       },
       "revisions": {
@@ -656,6 +679,7 @@
         "runEmpty": "还没有 Agent 运行记录。",
         "creativeRun": "创意启发",
         "continuityRun": "一致性检查",
+        "styleRun": "文风与人物声音一致性",
         "runMeta": "Agent {agent} v{version} · Provider {provider} · 上下文 revision {revision}",
         "runStatus": {
           "running": "运行中",

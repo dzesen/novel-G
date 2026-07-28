@@ -15,6 +15,7 @@ import type {
   ContinuityEvidenceReference,
   ContinuityReviewResult,
   CreativeInspirationResult,
+  StyleConsistencyResult,
 } from "@/types/agent";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import AgentRevisionWorkspace, {
@@ -27,7 +28,12 @@ interface Props {
   onNavigateReference?: (reference: ContinuityEvidenceReference) => void;
 }
 
-type StudioTab = "creative" | "continuity" | "history" | "management";
+type StudioTab =
+  | "creative"
+  | "continuity"
+  | "style"
+  | "history"
+  | "management";
 
 interface AgentDraft {
   label: string;
@@ -132,6 +138,9 @@ export default function AgentStudioWorkspace({
     useState<CreativeInspirationResult | null>(null);
   const [continuityResult, setContinuityResult] =
     useState<ContinuityReviewResult | null>(null);
+  const [styleResult, setStyleResult] =
+    useState<StyleConsistencyResult | null>(null);
+  const [styleFocus, setStyleFocus] = useState("");
   const [toolMetadata, setToolMetadata] =
     useState<AgentToolMetadata | null>(null);
   const [revisionSource, setRevisionSource] =
@@ -197,7 +206,11 @@ export default function AgentStudioWorkspace({
   }, [novelId, t]);
 
   const activeCapability =
-    tab === "continuity" ? "continuity_review" : "creative_inspiration";
+    tab === "style"
+      ? "style_consistency"
+      : tab === "continuity"
+        ? "continuity_review"
+        : "creative_inspiration";
   const toolAgents = useMemo(
     () =>
       agents.filter(
@@ -386,8 +399,9 @@ export default function AgentStudioWorkspace({
         });
         setCreativeResult(response.result);
         setContinuityResult(null);
+        setStyleResult(null);
         setToolMetadata(response);
-      } else {
+      } else if (tab === "continuity") {
         const response = await apiPost<
           { result: ContinuityReviewResult } & AgentToolMetadata
         >("/api/llm/agent-continuity-review", {
@@ -396,6 +410,18 @@ export default function AgentStudioWorkspace({
         });
         setContinuityResult(response.result);
         setCreativeResult(null);
+        setStyleResult(null);
+        setToolMetadata(response);
+      } else {
+        const response = await apiPost<
+          { result: StyleConsistencyResult } & AgentToolMetadata
+        >("/api/llm/agent-style-consistency", {
+          ...base,
+          focus: styleFocus.trim(),
+        });
+        setStyleResult(response.result);
+        setCreativeResult(null);
+        setContinuityResult(null);
         setToolMetadata(response);
       }
     } catch (caught) {
@@ -406,7 +432,12 @@ export default function AgentStudioWorkspace({
   };
 
   const copyResult = async () => {
-    const result = tab === "creative" ? creativeResult : continuityResult;
+    const result =
+      tab === "creative"
+        ? creativeResult
+        : tab === "continuity"
+          ? continuityResult
+          : styleResult;
     if (!result) return;
     await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
     setNotice(t("copied"));
@@ -439,7 +470,9 @@ export default function AgentStudioWorkspace({
           value={scope}
           onChange={(event) => setScope(event.target.value as AgentScope)}
         >
-          <option value="novel">{t("tool.scopeNovel")}</option>
+          {tab !== "style" && (
+            <option value="novel">{t("tool.scopeNovel")}</option>
+          )}
           <option value="volume">{t("tool.scopeVolume")}</option>
           <option value="chapter">{t("tool.scopeChapter")}</option>
         </select>
@@ -545,15 +578,23 @@ export default function AgentStudioWorkspace({
             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">
               {tab === "creative"
                 ? t("creative.eyebrow")
-                : t("continuity.eyebrow")}
+                : tab === "continuity"
+                  ? t("continuity.eyebrow")
+                  : t("style.eyebrow")}
             </p>
             <h2 className="mt-1 text-xl font-semibold text-foreground">
-              {tab === "creative" ? t("creative.title") : t("continuity.title")}
+              {tab === "creative"
+                ? t("creative.title")
+                : tab === "continuity"
+                  ? t("continuity.title")
+                  : t("style.title")}
             </h2>
             <p className="mt-2 text-sm leading-6 text-muted">
               {tab === "creative"
                 ? t("creative.description")
-                : t("continuity.description")}
+                : tab === "continuity"
+                  ? t("continuity.description")
+                  : t("style.description")}
             </p>
           </div>
 
@@ -611,7 +652,7 @@ export default function AgentStudioWorkspace({
                   />
                 </label>
               </>
-            ) : (
+            ) : tab === "continuity" ? (
               <label className="block space-y-1.5 text-sm">
                 <span className="text-muted">{t("continuity.focus")}</span>
                 <textarea
@@ -619,6 +660,16 @@ export default function AgentStudioWorkspace({
                   value={focus}
                   onChange={(event) => setFocus(event.target.value)}
                   placeholder={t("continuity.focusPlaceholder")}
+                />
+              </label>
+            ) : (
+              <label className="block space-y-1.5 text-sm">
+                <span className="text-muted">{t("style.focus")}</span>
+                <textarea
+                  className={`${fieldClass} min-h-28 resize-y`}
+                  value={styleFocus}
+                  onChange={(event) => setStyleFocus(event.target.value)}
+                  placeholder={t("style.focusPlaceholder")}
                 />
               </label>
             )}
@@ -645,7 +696,9 @@ export default function AgentStudioWorkspace({
               {running ? t("running") : t("run")}
             </button>
             <p className="text-xs leading-5 text-muted">
-              {t("previewOnlyHint")}
+              {tab === "style"
+                ? t("style.previewOnlyHint")
+                : t("previewOnlyHint")}
             </p>
           </div>
         </section>
@@ -843,6 +896,140 @@ export default function AgentStudioWorkspace({
                           {t("revisions.createFromResult")}
                         </button>
                       )}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          ) : tab === "style" && styleResult ? (
+            <div className="space-y-5">
+              {resultHeader(t("style.resultTitle"))}
+              <div>
+                <p className="text-sm leading-6 text-foreground">
+                  {styleResult.summary}
+                </p>
+                <p className="mt-2 text-xs leading-5 text-muted">
+                  {styleResult.coverage}
+                </p>
+              </div>
+              {styleResult.issues.length === 0 ? (
+                <div className="rounded-lg bg-surface-secondary p-4 text-sm text-muted">
+                  {t("style.noIssues")}
+                </div>
+              ) : (
+                <ol className="divide-y divide-border">
+                  {styleResult.issues.map((issue, index) => (
+                    <li
+                      key={`${issue.location}-${index}`}
+                      className="py-5 first:pt-0 last:pb-0"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`rounded px-2 py-0.5 text-xs font-semibold ${
+                            issue.severity === "high"
+                              ? "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300"
+                              : issue.severity === "medium"
+                                ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+                                : "bg-surface-secondary text-muted"
+                          }`}
+                        >
+                          {t(`continuity.severity.${issue.severity}`)}
+                        </span>
+                        <span className="text-xs text-muted">
+                          {t(`style.category.${issue.category}`)}
+                        </span>
+                        <span className="text-xs tabular-nums text-muted">
+                          {Math.round(issue.confidence * 100)}%
+                        </span>
+                      </div>
+                      <h4 className="mt-2 text-sm font-semibold text-foreground">
+                        {issue.location}
+                      </h4>
+                      <p className="mt-2 text-sm leading-6 text-foreground">
+                        {issue.deviation}
+                      </p>
+                      <div className="mt-3">
+                        <p className="text-xs font-semibold text-muted">
+                          {t("style.evidence")}
+                        </p>
+                        <ul className="mt-1 list-disc space-y-1 pl-5 text-sm leading-6 text-muted">
+                          {issue.evidence.map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        <div className="bg-surface-secondary px-3 py-3">
+                          <p className="text-xs font-semibold text-muted">
+                            {t("style.targetEvidence")}
+                          </p>
+                          <div className="mt-2 space-y-3">
+                            {issue.references
+                              .filter(
+                                (reference) =>
+                                  reference.role === "target",
+                              )
+                              .map((reference) => (
+                                <blockquote
+                                  key={reference.evidence_id}
+                                  className="text-sm leading-6 text-foreground"
+                                >
+                                  <p className="text-xs text-muted">
+                                    {reference.label}
+                                  </p>
+                                  <p className="mt-1">
+                                    {reference.excerpt}
+                                  </p>
+                                </blockquote>
+                              ))}
+                          </div>
+                        </div>
+                        <div className="bg-surface-secondary px-3 py-3">
+                          <p className="text-xs font-semibold text-muted">
+                            {t("style.baselineEvidence")}
+                          </p>
+                          <div className="mt-2 space-y-3">
+                            {issue.references
+                              .filter(
+                                (reference) =>
+                                  reference.role === "baseline",
+                              )
+                              .map((reference) => (
+                                <blockquote
+                                  key={reference.evidence_id}
+                                  className="text-sm leading-6 text-foreground"
+                                >
+                                  <p className="text-xs text-muted">
+                                    {reference.label}
+                                  </p>
+                                  <p className="mt-1">
+                                    {reference.excerpt}
+                                  </p>
+                                </blockquote>
+                              ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      <dl className="mt-4 grid gap-3 text-sm md:grid-cols-2">
+                        <div>
+                          <dt className="font-medium text-foreground">
+                            {t("style.baseline")}
+                          </dt>
+                          <dd className="mt-1 leading-6 text-muted">
+                            {issue.baseline}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="font-medium text-foreground">
+                            {t("style.suggestion")}
+                          </dt>
+                          <dd className="mt-1 leading-6 text-muted">
+                            {issue.suggestion}
+                          </dd>
+                        </div>
+                      </dl>
                     </li>
                   ))}
                 </ol>
@@ -1302,12 +1489,18 @@ export default function AgentStudioWorkspace({
         </header>
 
         <div
-          className="mb-5 flex w-fit gap-1 rounded-lg border border-border bg-surface p-1"
+          className="mb-5 flex w-fit max-w-full gap-1 overflow-x-auto rounded-lg border border-border bg-surface p-1"
           role="tablist"
           aria-label={t("tabsLabel")}
         >
           {(
-            ["creative", "continuity", "history", "management"] as StudioTab[]
+            [
+              "creative",
+              "continuity",
+              "style",
+              "history",
+              "management",
+            ] as StudioTab[]
           ).map(
             (item) => (
               <button
@@ -1317,10 +1510,13 @@ export default function AgentStudioWorkspace({
                 aria-selected={tab === item}
                 onClick={() => {
                   setTab(item);
+                  if (item === "style" && scope === "novel") {
+                    setScope("chapter");
+                  }
                   setError(null);
                   setNotice(null);
                 }}
-                className={`rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                className={`shrink-0 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
                   tab === item
                     ? "bg-accent text-white"
                     : "text-muted hover:bg-surface-secondary hover:text-foreground"

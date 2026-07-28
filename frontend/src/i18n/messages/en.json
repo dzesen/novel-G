@@ -279,7 +279,8 @@
         "rewrite_chapter_scene_by_agent": "Agent Scene Rewrite",
         "creative_direction_by_agent": "Agent New-Novel Direction",
         "creative_inspiration_by_agent": "Agent Creative Inspiration",
-        "continuity_review_by_agent": "Agent Continuity Review"
+        "continuity_review_by_agent": "Agent Continuity Review",
+        "style_consistency_by_agent": "Agent Style & Character Voice Consistency"
       },
       "steps": {
         "expand_idea_to_full_novel_story": "Expand the user idea into a full compressed long-form plot",
@@ -295,7 +296,8 @@
         "scene_rewrite": "Rewrite one scene description with a selected scene agent",
         "direction": "Generate comparable long-form directions before creating a novel",
         "inspiration": "Preview creative directions constrained by the current story",
-        "review": "Preview evidence-backed continuity issues"
+        "review": "Preview evidence-backed continuity issues",
+        "style_consistency_review": "Review style drift against sampled prose and character voice baselines"
       },
       "stepLabel": "Step",
       "providerNotExist": "Selected Provider does not exist",
@@ -506,12 +508,13 @@
     "agentStudio": {
       "eyebrow": "Controlled intelligence",
       "title": "Agent Studio",
-      "description": "Explore creative directions and evidence-backed continuity issues, then configure reusable Agents of your own. Results begin as previews and are written only after the author creates and accepts a revision proposal.",
+      "description": "Explore creative directions, evidence-backed continuity issues, and style drift, then configure reusable Agents of your own. Every result begins as a preview.",
       "skillBoundary": "Code-owned capabilities · Manageable Agent profiles",
       "tabsLabel": "Agent Studio tools",
       "tabs": {
         "creative": "Creative Inspiration",
         "continuity": "Continuity Review",
+        "style": "Style & Character Voice",
         "history": "Runs & Revisions",
         "management": "Agent Management"
       },
@@ -524,7 +527,7 @@
       "previewBadge": "Read-only preview",
       "previewOnlyHint": "Generation only creates a preview. Copy it, or create a revision proposal with stale checks before accepting any write.",
       "needNovelTitle": "Save the novel before running an Agent",
-      "needNovelDescription": "Agent management is still available. Inspiration and continuity review need a saved novel as their evidence source.",
+      "needNovelDescription": "Agent management remains available. Inspiration, continuity, and style review need a saved novel as their evidence source.",
       "emptyResultTitle": "Results will unfold here",
       "emptyResultDescription": "Choose a scope and Agent, then describe the goal. The response also reports actual context coverage and truncation.",
       "copy": "Copy JSON",
@@ -594,7 +597,27 @@
           "plot_thread": "Plot thread",
           "volume_outline": "Volume outline",
           "faction": "Faction",
+          "lore": "Lore",
           "other": "Other"
+        }
+      },
+      "style": {
+        "eyebrow": "Calibrate slow drift against evidence",
+        "title": "Style & Character Voice Consistency",
+        "description": "Compare the target against bounded samples from earlier prose, then calibrate declared characters against their dialogue examples and portrayal notes.",
+        "focus": "What should receive extra attention?",
+        "focusPlaceholder": "Optional; for example: check whether Lin Lan's dialogue stays restrained and concise in the latter half of this volume",
+        "resultTitle": "Style and character voice findings",
+        "noIssues": "No drift with both target and baseline evidence was found in the material actually sampled.",
+        "previewOnlyHint": "This capability only returns an evidence preview. It does not create revision proposals or edit prose; use Scene Rewrite separately after reviewing a finding.",
+        "evidence": "Evidence summary",
+        "targetEvidence": "Target prose paragraph",
+        "baselineEvidence": "Comparison baseline",
+        "baseline": "Baseline traits",
+        "suggestion": "Suggested next step",
+        "category": {
+          "prose_style": "Overall prose style",
+          "character_voice": "Character voice"
         }
       },
       "revisions": {
@@ -656,6 +679,7 @@
         "runEmpty": "No Agent runs yet.",
         "creativeRun": "Creative inspiration",
         "continuityRun": "Continuity review",
+        "styleRun": "Style & character voice consistency",
         "runMeta": "Agent {agent} v{version} · Provider {provider} · context revision {revision}",
         "runStatus": {
           "running": "Running",

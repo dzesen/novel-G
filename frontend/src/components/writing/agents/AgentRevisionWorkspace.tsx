@@ -663,7 +663,9 @@ export default function AgentRevisionWorkspace({
                   <p className="text-sm font-medium text-foreground">
                     {run.capability === "creative_inspiration"
                       ? t("creativeRun")
-                      : t("continuityRun")}
+                      : run.capability === "continuity_review"
+                        ? t("continuityRun")
+                        : t("styleRun")}
                   </p>
                   <p className="mt-1 text-xs text-muted">
                     {t("runMeta", {

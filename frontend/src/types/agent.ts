@@ -5,7 +5,8 @@ export type AgentCapabilityId =
   | "scene_rewrite"
   | "novel_direction"
   | "creative_inspiration"
-  | "continuity_review";
+  | "continuity_review"
+  | "style_consistency";
 
 export type AgentScope = "novel" | "volume" | "chapter";
 
@@ -134,6 +135,7 @@ export interface ContinuityIssue {
     | "plot_thread"
     | "volume_outline"
     | "faction"
+    | "lore"
     | "other";
   location: string;
   evidence: string[];
@@ -147,6 +149,38 @@ export interface ContinuityReviewResult {
   summary: string;
   coverage: string;
   issues: ContinuityIssue[];
+}
+
+export interface StyleConsistencyEvidenceReference {
+  evidence_id: string;
+  role: "target" | "baseline";
+  kind: "chapter_paragraph" | "character_profile";
+  label: string;
+  excerpt: string;
+  chapter_id?: string;
+  paragraph_index?: number;
+  card_id?: string;
+  profile_field?: "dialogue_examples" | "portrayal_notes";
+  example_index?: number;
+}
+
+export interface StyleConsistencyIssue {
+  severity: ContinuitySeverity;
+  category: "prose_style" | "character_voice";
+  location: string;
+  character_card_id?: string | null;
+  evidence: string[];
+  references: StyleConsistencyEvidenceReference[];
+  baseline: string;
+  deviation: string;
+  suggestion: string;
+  confidence: number;
+}
+
+export interface StyleConsistencyResult {
+  summary: string;
+  coverage: string;
+  issues: StyleConsistencyIssue[];
 }
 
 export interface AgentToolMetadata {
@@ -184,7 +218,10 @@ export interface AgentRun {
   run_id: string;
   novel_id: string;
   actor_id: string;
-  capability: "creative_inspiration" | "continuity_review";
+  capability:
+    | "creative_inspiration"
+    | "continuity_review"
+    | "style_consistency";
   status: "running" | "completed" | "failed" | "stale";
   agent_id: string;
   agent_version: number;
@@ -210,13 +247,16 @@ export interface AgentRun {
     }>;
     fact_ids: string[];
     thread_ids: string[];
+    style_evidence?: Array<
+      Omit<StyleConsistencyEvidenceReference, "excerpt">
+    >;
   };
   result?: {
     framing?: string;
     ideas?: CreativeIdea[];
     summary?: string;
     coverage?: string;
-    issues?: ContinuityIssue[];
+    issues?: Array<ContinuityIssue | StyleConsistencyIssue>;
   } | null;
   usage: {
     input_tokens?: number;

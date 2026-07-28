@@ -146,6 +146,19 @@ _CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         side_effect_policy="preview_only",
         handler_id="router:generate_agent_continuity_review",
     ),
+    CapabilityDefinition(
+        capability="style_consistency",
+        version=1,
+        label="文风与人物声音一致性",
+        description="以早期正文抽样和角色卡声音字段为基准，逐条定位可举证的风格漂移。",
+        customizable=True,
+        scope_options=("chapter", "volume"),
+        input_contract="StyleConsistencyRequest",
+        output_contract="StyleConsistencyResult",
+        context_policy="agent_context:bounded_evidence",
+        side_effect_policy="preview_only",
+        handler_id="router:generate_agent_style_consistency",
+    ),
 )
 _CAPABILITY_BY_ID = {item.capability: item for item in _CAPABILITIES}
 _GENERATION_PARAM_KEYS = {"temperature", "top_p", "max_tokens"}

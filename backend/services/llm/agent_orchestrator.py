@@ -147,6 +147,17 @@ _AGENT_PROFILES: tuple[AgentProfile, ...] = (
         ),
         capabilities=("continuity_review",),
     ),
+    AgentProfile(
+        agent_id="style_consistency_reviewer",
+        label="文风与人物声音一致性 Agent",
+        description="以早期正文抽样和角色卡声音字段为基准，定位文风与人物声音漂移。",
+        instruction=(
+            "你是文风与人物声音一致性 Agent。只报告能够同时给出目标段落与基准证据的"
+            "偏离，区分整体文风漂移与具体人物声音漂移；证据不足时不得下结论，"
+            "不得直接改写正文。"
+        ),
+        capabilities=("style_consistency",),
+    ),
 )
 _AGENT_BY_ID = {profile.agent_id: profile for profile in _AGENT_PROFILES}
 
@@ -254,7 +265,7 @@ class ContinuityIssue(BaseModel):
     category: str = Field(
         pattern=(
             "^(character_state|timeline|location|world_rule|plot_thread|"
-            "volume_outline|faction|other)$"
+            "volume_outline|faction|lore|other)$"
         )
     )
     location: str = Field(min_length=1, max_length=240)
@@ -274,6 +285,116 @@ class ContinuityReviewResult(BaseModel):
     summary: str = Field(min_length=5, max_length=1200)
     coverage: str = Field(min_length=5, max_length=800)
     issues: list[ContinuityIssue] = Field(default_factory=list, max_length=40)
+
+
+class StyleConsistencyEvidenceReference(BaseModel):
+    """A style evidence pointer, canonically hydrated after generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str = Field(min_length=1, max_length=200)
+    role: str = Field(pattern="^(target|baseline)$")
+    kind: str = Field(pattern="^(chapter_paragraph|character_profile)$")
+    label: str = Field(default="", max_length=240)
+    excerpt: str = Field(default="", max_length=800)
+    chapter_id: str | None = Field(default=None, min_length=1, max_length=64)
+    paragraph_index: int | None = Field(default=None, ge=0)
+    card_id: str | None = Field(default=None, min_length=1, max_length=64)
+    profile_field: str | None = Field(
+        default=None,
+        pattern="^(dialogue_examples|portrayal_notes)$",
+    )
+    example_index: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_reference_shape(self):
+        if self.kind == "character_profile" and self.role != "baseline":
+            raise ValueError(
+                "character profile evidence can only be a baseline"
+            )
+        return self
+
+
+class StyleConsistencyIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    severity: str = Field(pattern="^(high|medium|low)$")
+    category: str = Field(pattern="^(prose_style|character_voice)$")
+    location: str = Field(min_length=1, max_length=240)
+    character_card_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+    )
+    evidence: list[str] = Field(min_length=2, max_length=8)
+    references: list[StyleConsistencyEvidenceReference] = Field(
+        min_length=2,
+        max_length=8,
+    )
+    baseline: str = Field(min_length=5, max_length=1200)
+    deviation: str = Field(min_length=5, max_length=1200)
+    suggestion: str = Field(min_length=5, max_length=1200)
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_evidence_roles(self):
+        target_references = [
+            reference
+            for reference in self.references
+            if reference.role == "target"
+        ]
+        baseline_references = [
+            reference
+            for reference in self.references
+            if reference.role == "baseline"
+        ]
+        if not target_references or not baseline_references:
+            raise ValueError(
+                "style issue requires target and baseline references"
+            )
+        if any(
+            reference.kind != "chapter_paragraph"
+            for reference in target_references
+        ):
+            raise ValueError(
+                "style issue targets must be chapter paragraphs"
+            )
+        if self.category == "prose_style":
+            if self.character_card_id is not None:
+                raise ValueError(
+                    "prose style issue cannot include character_card_id"
+                )
+            if not any(
+                reference.kind == "chapter_paragraph"
+                for reference in baseline_references
+            ):
+                raise ValueError(
+                    "prose style issue requires an early chapter baseline"
+                )
+        else:
+            if self.character_card_id is None:
+                raise ValueError(
+                    "character voice issue requires character_card_id"
+                )
+            if not any(
+                reference.kind == "character_profile"
+                for reference in baseline_references
+            ):
+                raise ValueError(
+                    "character voice issue requires a profile baseline"
+                )
+        return self
+
+
+class StyleConsistencyResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=5, max_length=1200)
+    coverage: str = Field(min_length=5, max_length=800)
+    issues: list[StyleConsistencyIssue] = Field(
+        default_factory=list,
+        max_length=40,
+    )
 
 
 def get_agent_profile(agent_id: str) -> AgentProfile:

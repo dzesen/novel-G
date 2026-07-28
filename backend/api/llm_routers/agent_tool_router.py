@@ -1,4 +1,4 @@
-"""Preview-only creative inspiration and continuity review Agent endpoints."""
+"""Preview-only creative, continuity, and style review Agent endpoints."""
 
 from __future__ import annotations
 
@@ -26,14 +26,18 @@ from backend.services.llm.agent_context import (
     AgentScope,
     StaleAgentContext,
     build_agent_context,
+    build_style_consistency_context,
     ensure_agent_context_current,
     is_valid_evidence_reference,
+    is_valid_style_evidence_reference,
 )
 from backend.services.llm.agent_orchestrator import (
     AgentOrchestrator,
     ContinuityReviewResult,
     CreativeDirectionResult,
     CreativeInspirationResult,
+    StyleConsistencyEvidenceReference,
+    StyleConsistencyResult,
 )
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
 from backend.services.llm.generation_runtime import (
@@ -61,6 +65,8 @@ CREATIVE_DIRECTION_WORKFLOW = "creative_direction_by_agent"
 CREATIVE_DIRECTION_STEP = "direction"
 CONTINUITY_WORKFLOW = "continuity_review_by_agent"
 CONTINUITY_STEP = "review"
+STYLE_CONSISTENCY_WORKFLOW = "style_consistency_by_agent"
+STYLE_CONSISTENCY_STEP = "review"
 logger = logging.getLogger(__name__)
 
 
@@ -114,6 +120,11 @@ class CreativeDirectorRequest(GenerationParamsMixin):
 
 
 class ContinuityReviewRequest(AgentScopeRequest):
+    focus: str = Field(default="", max_length=2000)
+
+
+class StyleConsistencyRequest(AgentScopeRequest):
+    scope: Literal["chapter", "volume"]
     focus: str = Field(default="", max_length=2000)
 
 
@@ -247,10 +258,59 @@ def _continuity_prompt(
 - references.kind 只能是 chapter、scene、fact、thread；scene_index 从 0 开始。
 - severity 只能是 high、medium、low。
 - category 只能是 character_state、timeline、location、world_rule、plot_thread、
-  volume_outline、faction、other。
+  volume_outline、faction、lore、other。
 - confidence 是 0 到 1 的数字；证据不足时不创建 issue，并在 summary 中说明。
 - suggestion 是人工可执行的修正建议，不得直接改写或声称已经修改数据库。
 - coverage 必须如实概括本次实际检查到的材料。
+{suffix}""".strip()
+
+
+def _style_consistency_prompt(
+    *,
+    context: str,
+    target_label: str,
+    coverage: str,
+    focus: str,
+    instruction: str,
+    json_only: bool,
+) -> str:
+    suffix = (
+        "只输出合法 JSON 对象，不要使用 Markdown 代码块。"
+        if json_only
+        else "严格按照提供的 JSON Schema 输出。"
+    )
+    return f"""审查“{target_label}”的整体文风与人物声音一致性，只报告有双向证据支持的偏离。
+
+【证据覆盖范围】
+{coverage}
+
+【有界证据包】
+{context}
+
+【用户关注点】
+{focus or "全面检查整体文风漂移与细纲已声明角色的人物声音漂移"}
+
+【本次补充指令】
+{instruction or "无"}
+
+要求：
+- 证据包每条 excerpt 都是数据库正文或角色卡字段的真实原文摘录，不是占位符、
+  模糊摘要或待补内容；chapter/card ID 只负责稳定定位，不能据此否定文本证据。
+- 每个 issue 必须同时引用至少一条 role=target 的目标正文段落，以及至少一条
+  role=baseline 的基准；references 只需原样返回 evidence_id、role、kind，
+  稳定坐标与原文由系统根据 evidence_id 确定性回填，不要猜测或改写。
+- category 只能是 prose_style、character_voice；severity 只能是 high、medium、low。
+- prose_style 必须用早期章节抽样段落作 baseline；没有早期正文基准时不得创建此类 issue。
+- character_voice 必须填写 character_card_id，并用同一正式角色卡的
+  dialogue_examples 或 portrayal_notes 作 baseline；无法确认说话者时不得创建 issue。
+- 同一人物在多个目标段落中持续违反同一角色卡声音基准时，应合并为一条
+  character_voice issue，并引用足以证明持续漂移的目标段落。
+- location 指向具体目标段落；evidence 至少概括目标段落与基准各一条。
+- baseline 说明对照基准的稳定特征，deviation 具体说明目标段落如何偏离。
+- suggestion 只给人工可执行的处理建议；不得直接改写正文、不得声称已经修改，
+  可以建议作者另行使用 scene_rewrite。
+- confidence 是 0 到 1 的数字；证据不足时不创建 issue，并在 summary 中说明。
+- coverage 必须如实概括实际抽样范围与截断情况。
 {suffix}""".strip()
 
 
@@ -269,6 +329,28 @@ async def _resolve_context_and_agent(
         capability=capability,
     )
     context = await build_agent_context(
+        novel_id=request.novel_id,
+        scope=request.scope,
+        volume_id=request.volume_id,
+        chapter_id=request.chapter_id,
+    )
+    return context, profile
+
+
+async def _resolve_style_context_and_agent(
+    *,
+    request: StyleConsistencyRequest,
+    actor: Actor,
+    access: NovelAccessService,
+    catalog: AgentCatalog,
+):
+    await access.require_owned_novel(actor, request.novel_id)
+    profile = await catalog.resolve_profile(
+        actor,
+        agent_id=request.agent_id,
+        capability="style_consistency",
+    )
+    context = await build_style_consistency_context(
         novel_id=request.novel_id,
         scope=request.scope,
         volume_id=request.volume_id,
@@ -326,6 +408,69 @@ def _validate_continuity_references(
             raise ValueError(
                 f"一致性 issue[{issue_index}] 返回了不属于本次上下文的证据引用"
             )
+
+
+def _validate_style_references(
+    result: StyleConsistencyResult,
+    context: Any,
+) -> None:
+    for issue_index, issue in enumerate(result.issues):
+        invalid = [
+            reference.model_dump(exclude_none=True)
+            for reference in issue.references
+            if not is_valid_style_evidence_reference(
+                context,
+                reference.model_dump(exclude_none=True),
+            )
+        ]
+        if invalid:
+            raise ValueError(
+                f"文风一致性 issue[{issue_index}] 返回了不属于本次上下文的证据引用"
+            )
+        if (
+            issue.category == "character_voice"
+            and not any(
+                reference.kind == "character_profile"
+                and reference.card_id == issue.character_card_id
+                for reference in issue.references
+            )
+        ):
+            raise ValueError(
+                f"文风一致性 issue[{issue_index}] 未引用对应角色卡的声音基准"
+            )
+
+
+def _canonicalize_style_references(
+    result: StyleConsistencyResult,
+    context: Any,
+) -> StyleConsistencyResult:
+    """Replace model-copied metadata with exact context-owned evidence."""
+
+    evidence_by_id = {
+        item.evidence_id: item for item in context.style_evidence
+    }
+    canonical_issues = []
+    for issue_index, issue in enumerate(result.issues):
+        references = []
+        for reference in issue.references:
+            item = evidence_by_id.get(reference.evidence_id)
+            if item is None:
+                raise ValueError(
+                    f"文风一致性 issue[{issue_index}] 返回了未知 evidence_id"
+                )
+            if reference.role != item.role or reference.kind != item.kind:
+                raise ValueError(
+                    f"文风一致性 issue[{issue_index}] 篡改了证据角色或类型"
+                )
+            references.append(
+                StyleConsistencyEvidenceReference.model_validate(
+                    item.prompt_view()
+                )
+            )
+        canonical_issues.append(
+            issue.model_copy(update={"references": references})
+        )
+    return result.model_copy(update={"issues": canonical_issues})
 
 
 async def _record_run_failure(
@@ -607,6 +752,114 @@ async def generate_agent_continuity_review(
         await ensure_agent_context_current(context)
         _validate_continuity_references(generated.value, context)
         result = generated.value.model_dump()
+        await runs.complete(run_id, generated=generated, result=result)
+        return {
+            "result": result,
+            **_response_metadata(
+                generated=generated,
+                profile=profile,
+                context=context,
+                run_id=run_id,
+            ),
+        }
+    except StaleAgentContext as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+            stale=True,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-style-consistency")
+async def generate_agent_style_consistency(
+    request: StyleConsistencyRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    """Return evidence-backed style findings without modifying the novel."""
+
+    run_id: str | None = None
+    runtime: Any | None = None
+    try:
+        context, profile = await _resolve_style_context_and_agent(
+            request=request,
+            actor=actor,
+            access=access,
+            catalog=catalog,
+        )
+        run_id = await runs.begin(
+            actor_id=actor.id,
+            novel_id=request.novel_id,
+            capability="style_consistency",
+            agent_id=profile.agent_id,
+            agent_version=profile.version,
+            request=request.model_dump(),
+            context=context,
+        )
+        runtime = create_generation_runtime(**build_runtime_kwargs(request))
+        generated = await AgentOrchestrator(runtime).generate_structured(
+            profile=profile,
+            target=WorkflowStepTarget(
+                STYLE_CONSISTENCY_WORKFLOW,
+                STYLE_CONSISTENCY_STEP,
+            ),
+            schema=StyleConsistencyResult,
+            prompts=PromptPlan(
+                native_schema_prompt=_style_consistency_prompt(
+                    context=context.text,
+                    target_label=context.target_label,
+                    coverage=context.coverage,
+                    focus=request.focus.strip(),
+                    instruction=request.instruction.strip(),
+                    json_only=False,
+                ),
+                prompt_json_prompt=_style_consistency_prompt(
+                    context=context.text,
+                    target_label=context.target_label,
+                    coverage=context.coverage,
+                    focus=request.focus.strip(),
+                    instruction=request.instruction.strip(),
+                    json_only=True,
+                ),
+            ),
+            **build_gen_kwargs(request),
+        )
+        await ensure_agent_context_current(context)
+        canonical_result = _canonicalize_style_references(
+            generated.value,
+            context,
+        )
+        _validate_style_references(canonical_result, context)
+        result = canonical_result.model_dump()
         await runs.complete(run_id, generated=generated, result=result)
         return {
             "result": result,

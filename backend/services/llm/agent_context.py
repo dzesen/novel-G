@@ -1,10 +1,11 @@
-"""Bounded evidence packets for creative and continuity Agents."""
+"""Bounded evidence packets for creative, continuity, and style Agents."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 from typing import Any, Literal
 
 from backend.db.narrative_revision import narrative_revision_store
@@ -16,10 +17,64 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.worldbook_repository import worldbook_repo
+from backend.services.novel.chapter_timeline import ChapterPosition, ChapterTimeline
 
 
 AgentScope = Literal["novel", "volume", "chapter"]
+StyleAgentScope = Literal["volume", "chapter"]
+StyleEvidenceKind = Literal["chapter_paragraph", "character_profile"]
+StyleEvidenceRole = Literal["target", "baseline"]
 MAX_CONTEXT_CHARACTERS = 36_000
+STYLE_EVIDENCE_EXCERPT_CHARACTERS = 700
+STYLE_BASELINE_CHAPTER_LIMIT = 4
+STYLE_BASELINE_PARAGRAPHS_PER_CHAPTER = 3
+STYLE_TARGET_CHAPTER_PARAGRAPH_LIMIT = 18
+STYLE_TARGET_VOLUME_CHAPTER_LIMIT = 12
+STYLE_TARGET_VOLUME_PARAGRAPHS_PER_CHAPTER = 2
+STYLE_CONTEXT_MIN_CHARACTERS = 4_000
+
+
+@dataclass(frozen=True)
+class AgentStyleEvidence:
+    """One exact style-evidence item authorized for model references."""
+
+    evidence_id: str
+    role: StyleEvidenceRole
+    kind: StyleEvidenceKind
+    label: str
+    excerpt: str
+    chapter_id: str | None = None
+    paragraph_index: int | None = None
+    card_id: str | None = None
+    profile_field: str | None = None
+    example_index: int | None = None
+
+    def prompt_view(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "evidence_id": self.evidence_id,
+                "role": self.role,
+                "kind": self.kind,
+                "label": self.label,
+                "excerpt": self.excerpt,
+                "chapter_id": self.chapter_id,
+                "paragraph_index": self.paragraph_index,
+                "card_id": self.card_id,
+                "profile_field": self.profile_field,
+                "example_index": self.example_index,
+            }.items()
+            if value is not None
+        }
+
+    def snapshot_view(self) -> dict[str, Any]:
+        """Persist stable coordinates without duplicating prose in run metadata."""
+
+        return {
+            key: value
+            for key, value in self.prompt_view().items()
+            if key != "excerpt"
+        }
 
 
 @dataclass(frozen=True)
@@ -37,6 +92,7 @@ class AgentContextBundle:
     chapter_scene_counts: tuple[tuple[str, int], ...] = ()
     fact_ids: tuple[str, ...] = ()
     thread_ids: tuple[str, ...] = ()
+    style_evidence: tuple[AgentStyleEvidence, ...] = ()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -55,6 +111,9 @@ class AgentContextBundle:
             ],
             "fact_ids": list(self.fact_ids),
             "thread_ids": list(self.thread_ids),
+            "style_evidence": [
+                item.snapshot_view() for item in self.style_evidence
+            ],
         }
 
 
@@ -133,6 +192,39 @@ def is_valid_evidence_reference(
     if kind == "thread":
         return str(reference.get("thread_id") or "") in set(context.thread_ids)
     return False
+
+
+def is_valid_style_evidence_reference(
+    context: AgentContextBundle,
+    reference: dict[str, Any],
+) -> bool:
+    """Validate a style finding against the exact bounded evidence packet."""
+
+    evidence_id = str(reference.get("evidence_id") or "")
+    item = next(
+        (
+            candidate
+            for candidate in context.style_evidence
+            if candidate.evidence_id == evidence_id
+        ),
+        None,
+    )
+    if item is None:
+        return False
+    if str(reference.get("role") or "") != item.role:
+        return False
+    if str(reference.get("kind") or "") != item.kind:
+        return False
+    if item.kind == "chapter_paragraph":
+        return (
+            str(reference.get("chapter_id") or "") == item.chapter_id
+            and reference.get("paragraph_index") == item.paragraph_index
+        )
+    return (
+        str(reference.get("card_id") or "") == item.card_id
+        and str(reference.get("profile_field") or "") == item.profile_field
+        and reference.get("example_index") == item.example_index
+    )
 
 
 async def build_agent_context(
@@ -450,4 +542,440 @@ async def build_agent_context(
                 if item.get("_id") and str(item["_id"]) in text
             )
         ),
+    )
+
+
+def _paragraphs_with_indexes(content: Any) -> list[tuple[int, str]]:
+    """Split persisted prose into stable, zero-based paragraph coordinates."""
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(
+            r"(?:\r?\n[ \t]*)+",
+            str(content or ""),
+        )
+        if paragraph.strip()
+    ]
+    return list(enumerate(paragraphs))
+
+
+def _sample_evenly(values: list[Any], limit: int) -> list[Any]:
+    """Select deterministic head-to-tail coverage without random sampling."""
+
+    if limit <= 0 or not values:
+        return []
+    if len(values) <= limit:
+        return list(values)
+    if limit == 1:
+        return [values[0]]
+    indexes = [
+        round(index * (len(values) - 1) / (limit - 1))
+        for index in range(limit)
+    ]
+    return [values[index] for index in dict.fromkeys(indexes)]
+
+
+def _chapter_paragraph_evidence(
+    *,
+    positions: list[ChapterPosition],
+    chapters_by_id: dict[str, dict[str, Any]],
+    role: StyleEvidenceRole,
+    paragraphs_per_chapter: int,
+) -> list[AgentStyleEvidence]:
+    evidence: list[AgentStyleEvidence] = []
+    for position in positions:
+        chapter = chapters_by_id[position.chapter_id]
+        paragraphs = _sample_evenly(
+            _paragraphs_with_indexes(chapter.get("content")),
+            paragraphs_per_chapter,
+        )
+        for paragraph_index, paragraph in paragraphs:
+            excerpt, _ = _clip(
+                paragraph,
+                STYLE_EVIDENCE_EXCERPT_CHARACTERS,
+            )
+            chapter_title = str(chapter.get("title") or "")
+            evidence.append(
+                AgentStyleEvidence(
+                    evidence_id=(
+                        f"{role}:chapter:{position.chapter_id}:"
+                        f"paragraph:{paragraph_index}"
+                    ),
+                    role=role,
+                    kind="chapter_paragraph",
+                    label=(
+                        f"第{position.volume_order}卷·"
+                        f"第{position.chapter_order}章《{chapter_title}》"
+                        f"第{paragraph_index + 1}段"
+                    ),
+                    excerpt=excerpt,
+                    chapter_id=position.chapter_id,
+                    paragraph_index=paragraph_index,
+                )
+            )
+    return evidence
+
+
+def _character_profile_evidence(
+    *,
+    cards: list[dict[str, Any]],
+    declared_card_ids: set[str],
+) -> list[AgentStyleEvidence]:
+    """Project only declared formal character IDs and only voice fields."""
+
+    evidence: list[AgentStyleEvidence] = []
+    selected_cards = sorted(
+        (
+            card
+            for card in cards
+            if str(card.get("_id") or "") in declared_card_ids
+        ),
+        key=lambda card: (
+            str(card.get("importance") or "") != "main",
+            str(card.get("name") or ""),
+            str(card.get("_id") or ""),
+        ),
+    )
+    for card in selected_cards:
+        card_id = str(card.get("_id") or "")
+        name = str(card.get("name") or card_id)
+        profile = (
+            card.get("character_profile")
+            if isinstance(card.get("character_profile"), dict)
+            else {}
+        )
+        portrayal_notes = str(profile.get("portrayal_notes") or "").strip()
+        if portrayal_notes:
+            excerpt, _ = _clip(
+                portrayal_notes,
+                STYLE_EVIDENCE_EXCERPT_CHARACTERS,
+            )
+            evidence.append(
+                AgentStyleEvidence(
+                    evidence_id=(
+                        f"baseline:card:{card_id}:portrayal_notes"
+                    ),
+                    role="baseline",
+                    kind="character_profile",
+                    label=f"{name} · 人物塑造备注",
+                    excerpt=excerpt,
+                    card_id=card_id,
+                    profile_field="portrayal_notes",
+                )
+            )
+        for example_index, example in enumerate(
+            profile.get("dialogue_examples") or []
+        ):
+            normalized = str(example or "").strip()
+            if not normalized:
+                continue
+            excerpt, _ = _clip(
+                normalized,
+                STYLE_EVIDENCE_EXCERPT_CHARACTERS,
+            )
+            evidence.append(
+                AgentStyleEvidence(
+                    evidence_id=(
+                        f"baseline:card:{card_id}:dialogue_examples:"
+                        f"{example_index}"
+                    ),
+                    role="baseline",
+                    kind="character_profile",
+                    label=f"{name} · 对白样例 {example_index + 1}",
+                    excerpt=excerpt,
+                    card_id=card_id,
+                    profile_field="dialogue_examples",
+                    example_index=example_index,
+                )
+            )
+    return evidence
+
+
+def _fit_style_evidence(
+    evidence: list[AgentStyleEvidence],
+    budget: int,
+) -> tuple[list[AgentStyleEvidence], str]:
+    """Keep complete JSON evidence records within one section allocation."""
+
+    selected: list[AgentStyleEvidence] = []
+    rendered = "[]"
+    for item in evidence:
+        candidate = [*selected, item]
+        candidate_rendered = _json(
+            [record.prompt_view() for record in candidate]
+        )
+        if len(candidate_rendered) > budget:
+            continue
+        selected = candidate
+        rendered = candidate_rendered
+    return selected, rendered
+
+
+async def build_style_consistency_context(
+    *,
+    novel_id: str,
+    scope: StyleAgentScope,
+    volume_id: str | None = None,
+    chapter_id: str | None = None,
+    max_characters: int = MAX_CONTEXT_CHARACTERS,
+) -> AgentContextBundle:
+    """Build style baselines and target prose as one hard-bounded packet.
+
+    Character voice evidence is deny-by-default: only formal character card
+    IDs explicitly declared by target chapter outlines are projected.
+    """
+
+    if max_characters < STYLE_CONTEXT_MIN_CHARACTERS:
+        raise ValueError(
+            f"文风一致性上下文预算不能低于 {STYLE_CONTEXT_MIN_CHARACTERS} 字符"
+        )
+    if scope not in {"volume", "chapter"}:
+        raise ValueError("文风与人物声音一致性仅支持卷或章节范围")
+    if scope == "volume" and (not volume_id or chapter_id):
+        raise ValueError("卷级文风检查必须且只能指定 volume_id")
+    if scope == "chapter" and (not chapter_id or volume_id):
+        raise ValueError("章节级文风检查必须且只能指定 chapter_id")
+
+    captured_revision = await narrative_revision_store.current(novel_id)
+    novel = await novel_repo.get_novel_by_id(novel_id)
+    volumes = await volume_repo.get_volumes_by_novel(novel_id)
+    chapters = await chapter_repo.get_chapters_by_novel(
+        novel_id,
+        include_content=True,
+    )
+    timeline = ChapterTimeline(volumes, chapters)
+    volumes_by_id = {
+        str(item["_id"]): item
+        for item in volumes
+        if not item.get("is_deleted")
+    }
+    chapters_by_id = {
+        str(item["_id"]): item
+        for item in chapters
+        if not item.get("is_deleted")
+    }
+
+    if scope == "volume":
+        normalized_volume_id = str(volume_id)
+        selected_volume = volumes_by_id.get(normalized_volume_id)
+        if selected_volume is None:
+            raise ValueError("指定卷不属于当前小说")
+        target_positions = [
+            position
+            for position in timeline.positions
+            if position.volume_id == normalized_volume_id
+        ]
+        target_label = (
+            f"卷：{selected_volume.get('title') or normalized_volume_id}"
+        )
+        normalized_chapter_id = None
+    else:
+        normalized_chapter_id = str(chapter_id)
+        try:
+            target_position = timeline.position(normalized_chapter_id)
+        except ValueError as exc:
+            raise ValueError("指定章节不属于当前小说") from exc
+        target_positions = [target_position]
+        target_chapter = chapters_by_id[target_position.chapter_id]
+        target_label = (
+            f"章节：{target_chapter.get('title') or normalized_chapter_id}"
+        )
+        normalized_volume_id = None
+
+    written_target_positions = [
+        position
+        for position in target_positions
+        if str(
+            chapters_by_id[position.chapter_id].get("content") or ""
+        ).strip()
+    ]
+    if not written_target_positions:
+        raise ValueError("目标范围没有可检查的正文")
+
+    first_target_ordinal = min(
+        position.book_ordinal for position in target_positions
+    )
+    early_positions = [
+        position
+        for position in timeline.positions
+        if position.book_ordinal < first_target_ordinal
+        and str(
+            chapters_by_id[position.chapter_id].get("content") or ""
+        ).strip()
+    ][:STYLE_BASELINE_CHAPTER_LIMIT]
+    baseline_candidates = _chapter_paragraph_evidence(
+        positions=early_positions,
+        chapters_by_id=chapters_by_id,
+        role="baseline",
+        paragraphs_per_chapter=STYLE_BASELINE_PARAGRAPHS_PER_CHAPTER,
+    )
+
+    if scope == "chapter":
+        sampled_target_positions = written_target_positions
+        target_paragraph_limit = STYLE_TARGET_CHAPTER_PARAGRAPH_LIMIT
+    else:
+        sampled_target_positions = _sample_evenly(
+            written_target_positions,
+            STYLE_TARGET_VOLUME_CHAPTER_LIMIT,
+        )
+        target_paragraph_limit = STYLE_TARGET_VOLUME_PARAGRAPHS_PER_CHAPTER
+    target_candidates = _chapter_paragraph_evidence(
+        positions=sampled_target_positions,
+        chapters_by_id=chapters_by_id,
+        role="target",
+        paragraphs_per_chapter=target_paragraph_limit,
+    )
+
+    declared_card_ids: set[str] = set()
+    for position in target_positions:
+        outline = chapters_by_id[position.chapter_id].get("outline")
+        if not isinstance(outline, dict):
+            continue
+        declared_card_ids.update(
+            str(card_id)
+            for card_id in (
+                outline.get("present_character_card_ids") or []
+            )
+            if card_id
+        )
+    profile_candidates = _character_profile_evidence(
+        cards=await character_repo.list_cards(novel_id, "character"),
+        declared_card_ids=declared_card_ids,
+    )
+
+    metadata = _json(
+        {
+            "scope": scope,
+            "target": target_label,
+            "novel_title": novel.get("title", ""),
+            "sampling_policy": {
+                "overall_style_baseline": (
+                    "小说开头、且位于目标范围之前的最多 4 个有正文章节；"
+                    "每章均匀抽取最多 3 段"
+                ),
+                "target_chapter": "目标章均匀抽取最多 18 段",
+                "target_volume": (
+                    "目标卷均匀抽取最多 12 个有正文章节；"
+                    "每章均匀抽取最多 2 段"
+                ),
+                "character_voice": (
+                    "仅目标细纲 present_character_card_ids 声明的正式角色卡；"
+                    "只投影 dialogue_examples 与 portrayal_notes"
+                ),
+            },
+        }
+    )
+    section_specs = [
+        ("整体文风基准（早期章节抽样）", baseline_candidates, 25),
+        ("人物声音基准（细纲 ID 白名单）", profile_candidates, 25),
+        ("待检查正文（有界段落抽样）", target_candidates, 50),
+    ]
+    metadata_header = "【检查范围与抽样策略】\n"
+    evidence_headers = [
+        f"【{name}】\n" for name, _, _ in section_specs
+    ]
+    separator_cost = 2 * len(section_specs)
+    fixed_cost = (
+        len(metadata_header)
+        + len(metadata)
+        + sum(len(header) for header in evidence_headers)
+        + separator_cost
+    )
+    evidence_budget = max_characters - fixed_cost
+    if evidence_budget <= 0:
+        raise ValueError("文风一致性上下文预算不足以容纳抽样策略")
+
+    active_weight = sum(
+        weight for _, candidates, weight in section_specs if candidates
+    )
+    selected_sections: list[
+        tuple[str, list[AgentStyleEvidence], str]
+    ] = []
+    truncated: list[str] = []
+    for name, candidates, weight in section_specs:
+        allocation = (
+            evidence_budget * weight // active_weight
+            if candidates and active_weight
+            else 2
+        )
+        selected, rendered = _fit_style_evidence(
+            candidates,
+            max(2, allocation),
+        )
+        selected_sections.append((name, selected, rendered))
+        if len(selected) < len(candidates):
+            truncated.append(name)
+
+    selected_target = selected_sections[2][1]
+    if not selected_target:
+        raise ValueError("文风一致性上下文预算不足以容纳目标正文证据")
+
+    rendered_sections = [metadata_header + metadata]
+    for name, _, rendered in selected_sections:
+        rendered_sections.append(f"【{name}】\n{rendered}")
+    text = "\n\n".join(rendered_sections)
+    if len(text) > max_characters:
+        raise ValueError("文风一致性上下文超过硬预算")
+
+    selected_evidence = tuple(
+        item
+        for _, selected, _ in selected_sections
+        for item in selected
+    )
+    baseline_selected = selected_sections[0][1]
+    profile_selected = selected_sections[1][1]
+    profile_card_count = len(
+        {
+            item.card_id
+            for item in profile_selected
+            if item.card_id is not None
+        }
+    )
+    coverage = (
+        f"目标正文抽样 {len(selected_target)} 段，覆盖 "
+        f"{len({item.chapter_id for item in selected_target})}/"
+        f"{len(written_target_positions)} 个有正文章节；"
+        f"整体文风早期基准 {len(baseline_selected)} 段，来自 "
+        f"{len({item.chapter_id for item in baseline_selected})} 章；"
+        f"人物声音基准 {len(profile_selected)} 条，来自 "
+        f"{profile_card_count} 张细纲已声明角色卡。"
+    )
+    if not baseline_selected:
+        coverage += " 目标范围之前没有可用的早期正文基准。"
+    if not profile_selected:
+        coverage += " 目标细纲没有可用的对白样例或人物塑造备注。"
+    if truncated:
+        coverage += f" 截断段落：{', '.join(truncated)}。"
+
+    if await narrative_revision_store.current(novel_id) != captured_revision:
+        raise StaleAgentContext(
+            "小说内容在 Agent 上下文装配期间发生变化，请重试"
+        )
+    context_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "novel_id": novel_id,
+                "scope": scope,
+                "volume_id": normalized_volume_id,
+                "chapter_id": normalized_chapter_id,
+                "narrative_revision": captured_revision,
+                "text": text,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return AgentContextBundle(
+        text=text,
+        coverage=coverage,
+        truncated_sections=tuple(truncated),
+        target_label=target_label,
+        novel_id=novel_id,
+        scope=scope,
+        volume_id=normalized_volume_id,
+        chapter_id=normalized_chapter_id,
+        narrative_revision=captured_revision,
+        context_digest=context_digest,
+        style_evidence=selected_evidence,
     )

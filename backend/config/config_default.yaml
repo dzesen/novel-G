@@ -177,3 +177,9 @@ llm:
         review:
           provider: ""
           timeout_seconds: null
+    style_consistency_by_agent:
+      default_provider: ""
+      steps:
+        review:
+          provider: ""
+          timeout_seconds: null
