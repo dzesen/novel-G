@@ -33,14 +33,22 @@ interface OrphanImageFile {
   byte_size: number;
 }
 
+interface UnmanagedImageFile {
+  relative_path: string;
+  byte_size: number;
+}
+
 interface ImageAssetReconciliationReport {
   checked_at: string;
   missing_asset_count: number;
   orphan_file_count: number;
+  unmanaged_file_count: number;
   missing_assets: MissingImageAsset[];
   orphan_files: OrphanImageFile[];
+  unmanaged_files: UnmanagedImageFile[];
   missing_assets_truncated: boolean;
   orphan_files_truncated: boolean;
+  unmanaged_files_truncated: boolean;
 }
 
 interface RestoreResponse {
@@ -150,10 +158,15 @@ export function BackupCard() {
     }
   };
 
-  const reconciliationHasIssues =
+  const reconciliationHasDefects =
     reconciliationReport !== null &&
     (reconciliationReport.missing_asset_count > 0 ||
       reconciliationReport.orphan_file_count > 0);
+  const reconciliationHasOtherFiles =
+    reconciliationReport !== null &&
+    reconciliationReport.unmanaged_file_count > 0;
+  const reconciliationHasFindings =
+    reconciliationHasDefects || reconciliationHasOtherFiles;
 
   return (
     <div className="space-y-6">
@@ -303,22 +316,26 @@ export function BackupCard() {
           <div className="mt-4 space-y-4">
             <div
               className={`rounded-lg border px-3 py-3 ${
-                reconciliationHasIssues
+                reconciliationHasDefects
                   ? "border-amber-200 bg-amber-50/70 dark:border-amber-900 dark:bg-amber-950/25"
+                  : reconciliationHasOtherFiles
+                    ? "border-blue-200 bg-blue-50/70 dark:border-blue-900 dark:bg-blue-950/25"
                   : "border-green-200 bg-green-50/70 dark:border-green-900 dark:bg-green-950/25"
               }`}
             >
               <p className="text-sm font-medium text-foreground">
-                {reconciliationHasIssues
+                {reconciliationHasFindings
                   ? t("reconciliation.summary", {
                       missing:
                         reconciliationReport.missing_asset_count,
                       orphan: reconciliationReport.orphan_file_count,
+                      unmanaged:
+                        reconciliationReport.unmanaged_file_count,
                     })
                   : t("reconciliation.cleanTitle")}
               </p>
               <p className="mt-1 text-xs leading-5 text-muted">
-                {reconciliationHasIssues
+                {reconciliationHasFindings
                   ? t("reconciliation.reportOnly")
                   : t("reconciliation.cleanDescription")}
               </p>
@@ -463,6 +480,55 @@ export function BackupCard() {
                   <p className="mt-2 text-xs text-muted">
                     {t("reconciliation.truncated", {
                       count: reconciliationReport.orphan_files.length,
+                    })}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {reconciliationReport.unmanaged_file_count > 0 && (
+              <div>
+                <h4 className="text-sm font-semibold text-foreground">
+                  {t("reconciliation.unmanagedTitle")}
+                </h4>
+                <p className="mt-1 text-xs leading-5 text-muted">
+                  {t("reconciliation.unmanagedDescription")}
+                </p>
+                <ul className="mt-2 space-y-2">
+                  {reconciliationReport.unmanaged_files.map((file) => (
+                    <li
+                      key={file.relative_path}
+                      className="min-w-0 rounded-lg border border-border bg-surface p-3"
+                    >
+                      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <span className="w-fit rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-900 dark:bg-blue-950 dark:text-blue-200">
+                          {t("reconciliation.unmanagedBadge")}
+                        </span>
+                        <span className="text-xs text-muted">
+                          {formatSize(file.byte_size)}
+                        </span>
+                      </div>
+                      <dl className="mt-3 min-w-0 text-xs">
+                        <div className="min-w-0">
+                          <dt className="text-muted">
+                            {t("reconciliation.path")}
+                          </dt>
+                          <dd
+                            data-testid="reconciliation-unmanaged-path"
+                            className="mt-0.5 block max-w-full truncate font-mono text-foreground"
+                            title={file.relative_path}
+                          >
+                            {file.relative_path}
+                          </dd>
+                        </div>
+                      </dl>
+                    </li>
+                  ))}
+                </ul>
+                {reconciliationReport.unmanaged_files_truncated && (
+                  <p className="mt-2 text-xs text-muted">
+                    {t("reconciliation.truncated", {
+                      count: reconciliationReport.unmanaged_files.length,
                     })}
                   </p>
                 )}

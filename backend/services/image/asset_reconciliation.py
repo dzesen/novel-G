@@ -16,6 +16,7 @@ from backend.db.repositories.image_asset_repository import ImageAssetRepository
 from backend.db.utils import to_object_id
 from backend.services.image.managed_assets import (
     MANAGED_IMAGE_ASSET_ROOT,
+    _ASSET_FILENAME_PATTERN,
     ImageAssetNotFoundError,
     InvalidImageAssetError,
     ManagedImageAssetService,
@@ -48,16 +49,26 @@ class OrphanImageFile(BaseModel):
     byte_size: int
 
 
+class UnmanagedImageFile(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    relative_path: str
+    byte_size: int
+
+
 class ImageAssetReconciliationReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     checked_at: datetime
     missing_asset_count: int
     orphan_file_count: int
+    unmanaged_file_count: int
     missing_assets: tuple[MissingImageAsset, ...]
     orphan_files: tuple[OrphanImageFile, ...]
+    unmanaged_files: tuple[UnmanagedImageFile, ...]
     missing_assets_truncated: bool
     orphan_files_truncated: bool
+    unmanaged_files_truncated: bool
 
 
 class ImageAssetReconciliationRepository(Protocol):
@@ -80,6 +91,7 @@ class _DiscoveredFile(BaseModel):
 
     relative_path: str
     byte_size: int
+    has_managed_filename: bool
     novel_id: str | None
     content_hash: str | None
 
@@ -227,22 +239,33 @@ def _iter_owned_files(
                             continue
                         relative_path = path.relative_to(root).as_posix()
                         novel_id: str | None = None
-                        content_hash: str | None = None
-                        try:
-                            novel_id, content_hash = (
-                                ManagedImageAssetService
-                                ._parse_owned_relative_path(
-                                    owner_id=owner_id,
-                                    relative_path=relative_path,
+                        filename_match = _ASSET_FILENAME_PATTERN.fullmatch(
+                            path.name
+                        )
+                        content_hash = (
+                            filename_match.group("content_hash")
+                            if filename_match is not None
+                            else None
+                        )
+                        if filename_match is not None:
+                            try:
+                                novel_id, content_hash = (
+                                    ManagedImageAssetService
+                                    ._parse_owned_relative_path(
+                                        owner_id=owner_id,
+                                        relative_path=relative_path,
+                                    )
                                 )
-                            )
-                        except ImageAssetNotFoundError:
-                            pass
+                            except ImageAssetNotFoundError:
+                                pass
                         yield _DiscoveredFile(
                             relative_path=relative_path,
                             byte_size=entry.stat(
                                 follow_symlinks=False
                             ).st_size,
+                            has_managed_filename=(
+                                filename_match is not None
+                            ),
                             novel_id=novel_id,
                             content_hash=content_hash,
                         )
@@ -324,6 +347,8 @@ class ManagedImageAssetReconciler:
 
         orphan_file_count = 0
         orphan_files: list[OrphanImageFile] = []
+        unmanaged_file_count = 0
+        unmanaged_files: list[UnmanagedImageFile] = []
         file_iterator = _iter_owned_files(
             root=self.root,
             owner_id=canonical_owner_id,
@@ -336,13 +361,30 @@ class ManagedImageAssetReconciler:
             )
             if not batch:
                 break
-            referenced = await self.repository.find_owned_referenced_paths(
-                owner_id=owner_object_id,
-                relative_paths=[
-                    discovered.relative_path for discovered in batch
-                ],
+            managed_relative_paths = [
+                discovered.relative_path
+                for discovered in batch
+                if discovered.has_managed_filename
+            ]
+            referenced = (
+                await self.repository.find_owned_referenced_paths(
+                    owner_id=owner_object_id,
+                    relative_paths=managed_relative_paths,
+                )
+                if managed_relative_paths
+                else set()
             )
             for discovered in batch:
+                if not discovered.has_managed_filename:
+                    unmanaged_file_count += 1
+                    if len(unmanaged_files) < self.detail_limit:
+                        unmanaged_files.append(
+                            UnmanagedImageFile(
+                                relative_path=discovered.relative_path,
+                                byte_size=discovered.byte_size,
+                            )
+                        )
+                    continue
                 if discovered.relative_path in referenced:
                     continue
                 orphan_file_count += 1
@@ -361,13 +403,18 @@ class ManagedImageAssetReconciler:
             checked_at=datetime.now(timezone.utc),
             missing_asset_count=missing_asset_count,
             orphan_file_count=orphan_file_count,
+            unmanaged_file_count=unmanaged_file_count,
             missing_assets=tuple(missing_assets),
             orphan_files=tuple(orphan_files),
+            unmanaged_files=tuple(unmanaged_files),
             missing_assets_truncated=(
                 missing_asset_count > len(missing_assets)
             ),
             orphan_files_truncated=(
                 orphan_file_count > len(orphan_files)
+            ),
+            unmanaged_files_truncated=(
+                unmanaged_file_count > len(unmanaged_files)
             ),
         )
 
