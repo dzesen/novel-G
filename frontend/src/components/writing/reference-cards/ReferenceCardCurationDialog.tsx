@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
+import { OptionalNumberParam } from "@/components/shared/OptionalParamControls";
+import { buildReferenceCardCurationPrepareRequest } from "./curationRequest";
 import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type {
   ReferenceCardCandidate,
@@ -84,6 +86,7 @@ export default function ReferenceCardCurationDialog({
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReferenceCardCurationResult | null>(null);
+  const [maxTokens, setMaxTokens] = useState<number | null>(null);
 
   const adoptProposal = useCallback((next: ReferenceCardCurationProposal) => {
     setProposal(next);
@@ -146,7 +149,10 @@ export default function ReferenceCardCurationDialog({
     try {
       const next = await apiPost<ReferenceCardCurationProposal>(
         `/api/reference-cards/novel/${novelId}/curation/prepare`,
-        { force_regenerate: forceRegenerate },
+        buildReferenceCardCurationPrepareRequest(
+          forceRegenerate,
+          maxTokens,
+        ),
       );
       adoptProposal(next);
     } catch (reason) {
@@ -263,6 +269,24 @@ export default function ReferenceCardCurationDialog({
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
+          {!loading && !generating && !result && (
+            <div className="border-b border-border bg-surface px-5 py-4 sm:px-7">
+              <div className="max-w-3xl space-y-2">
+                <OptionalNumberParam
+                  label={t("maxTokens")}
+                  value={maxTokens}
+                  onToggle={(enabled) => setMaxTokens(enabled ? 6000 : null)}
+                  onValueChange={setMaxTokens}
+                  min={1}
+                  max={Number.MAX_SAFE_INTEGER}
+                  step={1}
+                />
+                <p className="text-xs leading-5 text-muted">
+                  {t("maxTokensHint")}
+                </p>
+              </div>
+            </div>
+          )}
           {loading ? (
             <CenteredState title={t("loading")} detail={t("loadingDetail")} />
           ) : generating ? (

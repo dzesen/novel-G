@@ -70,6 +70,7 @@ class ReferenceCardCurationApplyRequest(BaseModel):
 
 class ReferenceCardCurationPrepareRequest(BaseModel):
     force_regenerate: bool = False
+    max_tokens: Optional[int] = Field(default=None, gt=0)
 
 
 def _serialize_card(card: dict) -> dict:
@@ -102,6 +103,7 @@ async def prepare_reference_card_curation(
             novel_id,
             actor_id=actor.id,
             force_regenerate=req.force_regenerate,
+            max_tokens=req.max_tokens,
         )
     except (InvalidIdError, NotFoundError) as exc:
         raise _translate_error(exc) from exc

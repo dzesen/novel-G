@@ -1916,6 +1916,8 @@
         "eyebrow": "Writes only after review",
         "title": "AI reference-card curation",
         "description": "The model only creates candidates and never edits formal cards directly. Review each item and choose create, merge, restore and merge, or skip.",
+        "maxTokens": "Maximum tokens (optional)",
+        "maxTokensHint": "No token-limit override is applied by default. When disabled, the Provider setting and model limit still apply; enabling it overrides only this generation.",
         "close": "Close",
         "loading": "Looking for unfinished review",
         "loadingDetail": "If you closed this window earlier, the same proposal is restored without another model call.",

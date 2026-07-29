@@ -104,12 +104,16 @@ export function OptionalNumberParam({
 }) {
   const enabled = value != null;
   return (
-    <div className="flex items-center gap-4">
-      <Switch isSelected={enabled} onChange={(v) => onToggle(v)} className="shrink-0">
+    <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:gap-4">
+      <Switch
+        isSelected={enabled}
+        onChange={(v) => onToggle(v)}
+        className="min-h-11 w-full shrink-0 sm:w-auto"
+      >
         <Switch.Control>
           <Switch.Thumb />
         </Switch.Control>
-        <Switch.Content className="text-sm w-40">{label}</Switch.Content>
+        <Switch.Content className="w-auto min-w-0 text-sm sm:w-40">{label}</Switch.Content>
       </Switch>
       {enabled && (
         <NumberField
@@ -119,7 +123,7 @@ export function OptionalNumberParam({
           minValue={min}
           maxValue={max}
           step={step}
-          className="max-w-[180px]"
+          className="w-full sm:max-w-[180px]"
         >
           <NumberField.Group>
             <NumberField.DecrementButton />

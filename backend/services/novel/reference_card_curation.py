@@ -596,6 +596,7 @@ class ReferenceCardCurationService:
         *,
         actor_id: str,
         force_regenerate: bool = False,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         lock = _PREPARE_LOCKS.setdefault(str(novel_id), asyncio.Lock())
         async with lock:
@@ -689,12 +690,14 @@ class ReferenceCardCurationService:
                 plan = runtime.plan_structured(
                     WorkflowStepTarget(WORKFLOW_NAME, WORKFLOW_STEP)
                 )
+                generation_kwargs: dict[str, Any] = {"temperature": 0.35}
+                if max_tokens is not None:
+                    generation_kwargs["max_tokens"] = max_tokens
                 generated = await runtime.generate_structured(
                     plan,
                     ReferenceCardCandidatesSchema,
                     _build_prompts(novel, cards),
-                    temperature=0.35,
-                    max_tokens=6000,
+                    **generation_kwargs,
                 )
                 parsed = ReferenceCardCandidatesSchema.model_validate(
                     generated.value.model_dump()
