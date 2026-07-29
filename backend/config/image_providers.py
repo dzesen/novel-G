@@ -92,6 +92,16 @@ class ComfyUIWorkflowConfig(_StrictConfigModel):
     def validate_semantic_slot_names(self) -> "ComfyUIWorkflowConfig":
         if any(not str(slot).strip() for slot in self.bindings):
             raise ValueError("workflow semantic slot names must not be empty")
+        targets: dict[tuple[str, str], str] = {}
+        for slot, binding in self.bindings.items():
+            target = (binding.node_id, binding.input)
+            previous_slot = targets.get(target)
+            if previous_slot is not None:
+                raise ValueError(
+                    f"语义槽位 {previous_slot} 与 {slot} 冲突："
+                    f"都绑定到节点 {binding.node_id}.{binding.input}"
+                )
+            targets[target] = slot
         return self
 
 

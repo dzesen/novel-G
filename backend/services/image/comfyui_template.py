@@ -63,16 +63,27 @@ def _resolve_template_path(template_root: Path, configured_path: str) -> Path:
         )
     root = Path(template_root).resolve()
     candidate = Path(configured_path)
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    resolved = candidate.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError as error:
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (root / candidate).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise _template_failure(
+                "ComfyUI workflow 模板的相对路径越出配置目录",
+                "改用配置目录内的相对路径，或直接填写模板的绝对路径",
+            ) from error
+    if not resolved.exists():
         raise _template_failure(
-            "ComfyUI workflow 模板不在允许的配置目录内",
-            "把模板移入配置目录后重新选择",
-        ) from error
+            "ComfyUI workflow 模板不存在",
+            "确认模板路径正确，并重新选择 API-format workflow JSON 文件",
+        )
+    if not resolved.is_file():
+        raise _template_failure(
+            "ComfyUI workflow 模板路径不是常规文件",
+            "选择一份可读的 API-format workflow JSON 文件，而不是目录",
+        )
     return resolved
 
 
