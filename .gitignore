@@ -2,6 +2,7 @@
 /static/
 /Developer_Documentation/
 /logs/
+/managed-assets/
 /backups/
 /reports/
 .venv/

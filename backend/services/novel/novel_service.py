@@ -198,6 +198,7 @@ class NovelService:
                 collections.AGENT_REVISION_PROPOSALS
             )
             mutation_journals_repo = BaseRepository(collections.MUTATION_JOURNALS)
+            image_assets_repo = BaseRepository(collections.IMAGE_ASSETS)
 
             stats = {}
 
@@ -225,6 +226,12 @@ class NovelService:
             stats["agent_runs_deleted"] = await agent_runs_repo.hard_delete_many(query, session=session)
             stats["agent_revision_proposals_deleted"] = await agent_revision_proposals_repo.hard_delete_many(query, session=session)
             stats["mutation_journals_deleted"] = await mutation_journals_repo.hard_delete_many(query, session=session)
+            # Deliberately retain content-addressed files. A later backup restore
+            # can bring this metadata back; slice 4 reports the resulting orphans.
+            stats["image_assets_deleted"] = await image_assets_repo.hard_delete_many(
+                query,
+                session=session,
+            )
 
             novel_deleted = await novel_repo.hard_delete_one({"_id": obj_id}, session=session)
             stats["novel_deleted"] = 1 if novel_deleted else 0

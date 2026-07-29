@@ -169,6 +169,25 @@ class ImagePollResult(_ContractModel):
             )
         return self
 
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the provider job itself is finished.
+
+        A retryable ``failed`` result means only that this poll attempt could
+        not reach the provider. The original handle remains live and must be
+        polled again without another submit.
+        """
+
+        if self.status in {"pending", "queued", "running"}:
+            return False
+        if (
+            self.status == "failed"
+            and self.failure is not None
+            and self.failure.retryable
+        ):
+            return False
+        return True
+
 
 ImageCancelStatus = Literal["cancelled", "already_finished", "failed"]
 

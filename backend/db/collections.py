@@ -37,6 +37,7 @@ STATE_PREVIEWS = "state_previews"
 REFERENCE_CARD_PROPOSALS = "reference_card_proposals"
 CARD_IMPORT_PROPOSALS = "card_import_proposals"
 MUTATION_JOURNALS = "mutation_journals"
+IMAGE_ASSETS = "image_assets"
 
 ACTIVE_COLLECTIONS = frozenset({
     NOVELS,
@@ -62,6 +63,7 @@ ACTIVE_COLLECTIONS = frozenset({
     REFERENCE_CARD_PROPOSALS,
     CARD_IMPORT_PROPOSALS,
     MUTATION_JOURNALS,
+    IMAGE_ASSETS,
 })
 
 # 运行时集合不会进入备份。会话在恢复后必须重新建立，避免把可用凭据材料

@@ -590,6 +590,63 @@ async def init_prose_run_indexes():
         raise
 
 
+async def init_image_asset_indexes():
+    """Initialize owner isolation, idempotency, and listing indexes."""
+    try:
+        collection = get_database()[collections.IMAGE_ASSETS]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                name="image_assets_owner_novel_created",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("relative_path", pymongo.ASCENDING),
+                ],
+                name="image_assets_owner_relative_path",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("content_hash", pymongo.ASCENDING),
+                ],
+                name="image_assets_owner_novel_content",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("subject_kind", pymongo.ASCENDING),
+                    ("subject_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                name="image_assets_owner_novel_subject",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("metadata_fingerprint", pymongo.ASCENDING),
+                ],
+                unique=True,
+                partialFilterExpression={"is_deleted": False},
+                name="image_assets_active_metadata_idempotent",
+            ),
+        ])
+        logger.info("Initialized image_assets indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize image_assets indexes: %s", exc)
+        # Idempotent metadata registration relies on this constraint to close
+        # concurrent upsert races. Continuing without it can duplicate records.
+        raise
+
+
 async def init_state_timeline_indexes():
     """初始化可回放状态时间线、预览与 standalone journal 索引。"""
     try:
@@ -660,5 +717,6 @@ async def init_all_indexes():
     await init_character_state_indexes()
     await init_generation_job_indexes()
     await init_prose_run_indexes()
+    await init_image_asset_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化
