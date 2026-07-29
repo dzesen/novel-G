@@ -118,6 +118,8 @@ def probe_image(payload: bytes | bytearray | memoryview) -> ProbedImage:
         SyntaxError,
         ValueError,
     ) as exc:
-        raise _invalid(f"image decode failed: {exc}") from exc
+        raise _invalid(
+            "image decode failed: invalid or corrupt supported image data"
+        ) from exc
 
     return probed

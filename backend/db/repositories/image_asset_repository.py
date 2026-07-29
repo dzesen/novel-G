@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from bson import ObjectId
@@ -101,6 +102,52 @@ class ImageAssetRepository(BaseRepository):
                 "is_deleted": False,
             }
         )
+
+    def iter_owned_metadata(
+        self,
+        *,
+        owner_id: ObjectId,
+    ) -> AsyncIterator[dict[str, Any]]:
+        return (
+            self.collection.find(
+                {
+                    "owner_id": owner_id,
+                    "is_deleted": False,
+                },
+                projection={
+                    "_id": 1,
+                    "novel_id": 1,
+                    "subject_kind": 1,
+                    "subject_id": 1,
+                    "content_hash": 1,
+                    "relative_path": 1,
+                },
+            )
+            .sort("_id", 1)
+            .batch_size(256)
+        )
+
+    async def find_owned_referenced_paths(
+        self,
+        *,
+        owner_id: ObjectId,
+        relative_paths: Sequence[str],
+    ) -> set[str]:
+        if not relative_paths:
+            return set()
+        paths = await self.collection.distinct(
+            "relative_path",
+            filter={
+                "owner_id": owner_id,
+                "relative_path": {"$in": list(relative_paths)},
+                "is_deleted": False,
+            },
+        )
+        return {
+            str(relative_path)
+            for relative_path in paths
+            if isinstance(relative_path, str)
+        }
 
 
 image_asset_repo = ImageAssetRepository()

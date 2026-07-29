@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -23,9 +24,14 @@ from backend.api.default_routers.auth_router import (
     require_admin_request,
     require_owned_path_resource,
 )
+from backend.services.auth.identity_service import Actor
+from backend.services.image.asset_reconciliation import (
+    reconcile_managed_image_assets,
+)
 
 
 router = APIRouter(prefix="/api/backup", tags=["backup"])
+logger = logging.getLogger(__name__)
 
 
 def _attachment_headers(filename: str) -> dict[str, str]:
@@ -55,17 +61,51 @@ async def export_backup():
     )
 
 
-@router.post("/restore", dependencies=[Depends(require_admin_request)])
-async def import_backup(file: UploadFile = File(...)):
+@router.post("/restore")
+async def import_backup(
+    file: UploadFile = File(...),
+    actor: Actor = Depends(require_admin_request),
+):
     content = await file.read(MAX_BACKUP_BYTES + 1)
     try:
         payload = parse_backup(content)
         stats = await restore_backup(payload)
-        return {"message": "Backup restored", "stats": stats}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Backup restore failed: {exc}") from exc
+    try:
+        report = await reconcile_managed_image_assets(owner_id=actor.id)
+    except Exception:
+        logger.exception(
+            "Managed image asset reconciliation failed after a successful restore."
+        )
+        return {
+            "message": "Backup restored",
+            "stats": stats,
+            "asset_reconciliation_status": "unavailable",
+            "asset_reconciliation": None,
+        }
+    return {
+        "message": "Backup restored",
+        "stats": stats,
+        "asset_reconciliation_status": "completed",
+        "asset_reconciliation": report,
+    }
+
+
+@router.post("/image-assets/reconcile")
+async def reconcile_image_assets(
+    actor: Actor = Depends(require_admin_request),
+):
+    try:
+        return await reconcile_managed_image_assets(owner_id=actor.id)
+    except Exception as exc:
+        logger.exception("Managed image asset reconciliation failed.")
+        raise HTTPException(
+            status_code=500,
+            detail="Managed image asset reconciliation is currently unavailable",
+        ) from exc
 
 
 @router.get(
