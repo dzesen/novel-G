@@ -1,4 +1,4 @@
-export type CharacterPortraitJobStatus =
+export type ImageJobStatus =
   | "pending"
   | "submitting"
   | "queued"
@@ -12,6 +12,8 @@ export type CharacterPortraitJobStatus =
   | "rejected"
   | "cancelled"
   | "cancel_failed";
+
+export type CharacterPortraitJobStatus = ImageJobStatus;
 
 export interface ImageJobFailure {
   code: string;
@@ -34,7 +36,7 @@ export interface AppearanceAnchor {
   runtime_fingerprint: Record<string, unknown>;
 }
 
-export interface CharacterPortraitAsset {
+export interface ImageAsset {
   asset_id: string;
   content_hash: string;
   mime: string;
@@ -44,7 +46,9 @@ export interface CharacterPortraitAsset {
   height: number;
 }
 
-export interface CharacterPortraitProvider {
+export type CharacterPortraitAsset = ImageAsset;
+
+export interface ImageProviderState {
   alias: string;
   model: string;
   workflow_revision: string;
@@ -55,10 +59,13 @@ export interface CharacterPortraitProvider {
   warnings: string[];
 }
 
-export interface CharacterPortraitJob {
+export type CharacterPortraitProvider = ImageProviderState;
+
+export interface ImageJob {
   job_id: string;
-  status: CharacterPortraitJobStatus;
+  status: ImageJobStatus;
   terminal: boolean;
+  selected_as_current?: boolean | null;
   cleanup_pending: boolean;
   abandonable: boolean;
   queue_position: number | null;
@@ -68,10 +75,13 @@ export interface CharacterPortraitJob {
   submit_count: number;
   ignored_slots: string[];
   failure: ImageJobFailure | null;
-  asset: CharacterPortraitAsset | null;
-  anchor: AppearanceAnchor | null;
-  provider?: CharacterPortraitProvider | null;
+  asset: ImageAsset | null;
+  provider?: ImageProviderState | null;
   warnings?: string[];
+}
+
+export interface CharacterPortraitJob extends ImageJob {
+  anchor: AppearanceAnchor | null;
 }
 
 export interface CharacterPortraitState {
@@ -80,5 +90,16 @@ export interface CharacterPortraitState {
   active_job: CharacterPortraitJob | null;
   cleanup_job: CharacterPortraitJob | null;
   provider: CharacterPortraitProvider;
+  warnings?: string[];
+}
+
+export type NovelCoverJob = ImageJob;
+
+export interface NovelCoverState {
+  current_asset: ImageAsset | null;
+  assets: ImageAsset[];
+  active_job: NovelCoverJob | null;
+  cleanup_job: NovelCoverJob | null;
+  provider: ImageProviderState;
   warnings?: string[];
 }

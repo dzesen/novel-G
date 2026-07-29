@@ -1,6 +1,7 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
+import { useState } from "react";
 import { useTranslations } from "next-intl";
 import { Card, Button } from "@heroui/react";
 import { getImageUrl } from "@/lib/api";
@@ -128,6 +129,19 @@ function NovelCard({
   onSelect: (id: string) => void;
 }) {
   const t = useTranslations("bookshelf");
+  const [failedManagedCoverId, setFailedManagedCoverId] = useState<
+    string | null
+  >(null);
+  const managedCoverId = novel.cover_asset_id
+    ? String(novel.cover_asset_id)
+    : "";
+  const coverUrl = managedCoverId
+    ? `/api/image-assets/${encodeURIComponent(managedCoverId)}/content`
+    : novel.cover_image;
+
+  const managedCoverFailed =
+    Boolean(managedCoverId) &&
+    failedManagedCoverId === managedCoverId;
 
   return (
     <Card
@@ -144,12 +158,24 @@ function NovelCard({
         <Card.Header>
           <div className="flex items-start gap-3 w-full">
             {/* Cover Thumbnail */}
-            {novel.cover_image ? (
+            {coverUrl && !(managedCoverId && managedCoverFailed) ? (
               <img
-                src={getImageUrl(novel.cover_image)}
+                src={getImageUrl(coverUrl)}
                 alt={novel.title}
                 className="w-12 h-16 rounded object-cover shrink-0"
+                onError={() => {
+                  if (managedCoverId) {
+                    setFailedManagedCoverId(managedCoverId);
+                  }
+                }}
               />
+            ) : managedCoverId ? (
+              <div
+                role="status"
+                className="flex h-16 w-12 shrink-0 items-center justify-center rounded bg-muted/50 px-1 text-center text-[10px] leading-3 text-muted"
+              >
+                {t("coverAssetMissing")}
+              </div>
             ) : (
               <div className="w-12 h-16 rounded bg-muted/50 shrink-0 flex items-center justify-center">
                 <svg

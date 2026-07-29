@@ -662,6 +662,16 @@ async def init_image_job_indexes():
             "is_terminal": False,
             "is_deleted": False,
         }
+        desired_subject_active_filter = {
+            "subject_id": {"$type": "objectId"},
+            "is_terminal": False,
+            "is_deleted": False,
+        }
+        desired_subject_cleanup_filter = {
+            "subject_id": {"$type": "objectId"},
+            "cleanup_pending": True,
+            "is_deleted": False,
+        }
         active_index = existing.get("image_jobs_owner_character_active")
         desired_active_key = [
             ("owner_id", pymongo.ASCENDING),
@@ -711,6 +721,17 @@ async def init_image_job_indexes():
             pymongo.IndexModel(
                 [
                     ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("usage", pymongo.ASCENDING),
+                    ("subject_id", pymongo.ASCENDING),
+                ],
+                unique=True,
+                partialFilterExpression=desired_subject_active_filter,
+                name="image_jobs_owner_subject_active",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
                     ("idempotency_key", pymongo.ASCENDING),
                 ],
                 unique=True,
@@ -738,6 +759,17 @@ async def init_image_job_indexes():
                     "is_deleted": False,
                 },
                 name="image_jobs_owner_character_cleanup",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("usage", pymongo.ASCENDING),
+                    ("subject_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression=desired_subject_cleanup_filter,
+                name="image_jobs_owner_subject_cleanup",
             ),
             pymongo.IndexModel(
                 [

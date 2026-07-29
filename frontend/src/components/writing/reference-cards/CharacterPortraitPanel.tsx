@@ -7,7 +7,6 @@ import { useEffect, useMemo, useState } from "react";
 import { apiGet, apiPost, getImageUrl } from "@/lib/api";
 import {
   constrainIllustrationPromptEdit,
-  illustrationPromptCharacterCount,
 } from "@/lib/illustrationPrompt";
 import type {
   AgentProfile,
@@ -19,15 +18,9 @@ import type {
   CharacterPortraitJob,
   CharacterPortraitState,
 } from "@/types/image";
+import IllustrationPromptEditor from "@/components/image/IllustrationPromptEditor";
+import ImageJobStatusPanel from "@/components/image/ImageJobStatusPanel";
 import { useCharacterPortraitJob } from "./useCharacterPortraitJob";
-
-const PROMPT_FIELDS: Array<keyof IllustrationPromptResult> = [
-  "subject",
-  "appearance",
-  "scene",
-  "style",
-  "negative",
-];
 
 interface CharacterPortraitPanelProps {
   novelId: string;
@@ -177,32 +170,6 @@ export default function CharacterPortraitPanel({
   const activeJob = Boolean(
     (job && !job.terminal) || cleanupJob,
   );
-  const cancelAvailable = Boolean(
-    job &&
-      !job.terminal &&
-      job.status !== "cancelling" &&
-      job.status !== "storing_asset" &&
-      job.status !== "finalizing" &&
-      (
-        !job.cleanup_pending ||
-        job.abandonable ||
-        (job.failure !== null && !job.failure.retryable)
-      ),
-  );
-  const cleanupActionAvailable = Boolean(
-    cleanupJob &&
-      (
-        cleanupJob.abandonable ||
-        (
-          cleanupJob.failure !== null &&
-          !cleanupJob.failure.retryable
-        )
-      ),
-  );
-  const abandonLostJob = Boolean(job?.abandonable);
-  const promptCount = prompt
-    ? illustrationPromptCharacterCount(prompt)
-    : 0;
   const formatDuration = (seconds: number): string => {
     const rounded = Math.max(0, Math.round(seconds));
     if (rounded < 60) return t("durationSeconds", { count: rounded });
@@ -461,191 +428,52 @@ export default function CharacterPortraitPanel({
           </div>
 
           {prompt && (
-            <div className="mt-5 grid min-w-0 gap-4 md:grid-cols-2">
-              {PROMPT_FIELDS.map((field) => (
-                <label
-                  key={field}
-                  className={`min-w-0 text-sm ${
-                    field === "scene" ? "md:col-span-2" : ""
-                  }`}
-                >
-                  <span className="mb-1.5 block font-medium text-foreground">
-                    {t(`fields.${field}`)}
-                  </span>
-                  <textarea
-                    aria-label={t(`fields.${field}`)}
-                    value={prompt[field]}
-                    onChange={(event) =>
-                      updatePrompt(field, event.target.value)
-                    }
-                    rows={field === "scene" ? 4 : 3}
-                    className="w-full min-w-0 resize-y rounded-lg border border-border bg-surface px-3 py-2.5 text-sm leading-6 text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
-                  />
-                </label>
-              ))}
-              <p className="text-xs text-muted md:col-span-2">
-                {t("promptCount", { count: promptCount })}
-              </p>
-            </div>
+            <IllustrationPromptEditor
+              prompt={prompt}
+              labels={{
+                subject: t("fields.subject"),
+                appearance: t("fields.appearance"),
+                scene: t("fields.scene"),
+                style: t("fields.style"),
+                negative: t("fields.negative"),
+              }}
+              totalLabel={(count) => t("promptCount", { count })}
+              onChange={updatePrompt}
+            />
           )}
 
-          {cleanupJob && (
-            <div
-              role="status"
-              className="mt-5 min-w-0 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/30"
-            >
-              <p className="font-medium text-foreground">
-                {t("olderCleanupTitle")}
-              </p>
-              <p className="mt-1 text-muted">
-                {t("olderCleanupDescription")}
-              </p>
-              <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
-                <span className="font-medium text-foreground">
-                  {t(`status.${cleanupJob.status}`)}
-                </span>
-                {cleanupJob.elapsed_seconds > 0 && (
-                  <span className="text-muted">
-                    {t("elapsed", {
-                      duration: formatDuration(
-                        cleanupJob.elapsed_seconds,
-                      ),
-                    })}
-                  </span>
-                )}
-                {cleanupJob.completed_images > 0 && (
-                  <span className="text-muted">
-                    {t("completedImages", {
-                      count: cleanupJob.completed_images,
-                    })}
-                  </span>
-                )}
-              </div>
-              <p className="mt-2 text-amber-700 dark:text-amber-300">
-                {t("cleanupPending")}
-              </p>
-              {cleanupJob.failure && (
-                <div
-                  className={`mt-2 ${
-                    cleanupJob.failure.retryable
-                      ? "text-amber-700 dark:text-amber-300"
-                      : "text-red-700 dark:text-red-300"
-                  }`}
-                >
-                  <p>{cleanupJob.failure.message}</p>
-                  <p>{cleanupJob.failure.action}</p>
-                </div>
-              )}
-              {cleanupPollError && (
-                <p className="mt-2 text-amber-700 dark:text-amber-300">
-                  {t("pollUnavailable")}
-                </p>
-              )}
-              {cleanupActionAvailable && (
-                <div className="mt-3 flex min-w-0 flex-wrap gap-2">
-                  <Button
-                    variant="outline"
-                    isDisabled={cleanupCancelling}
-                    onPress={() => {
-                      if (
-                        cleanupJob.abandonable &&
-                        !window.confirm(t("abandonWarning"))
-                      ) {
-                        return;
-                      }
-                      void retryCleanup();
-                    }}
-                  >
-                    {cleanupCancelling
-                      ? cleanupJob.abandonable
-                        ? t("abandoning")
-                        : t("retryingCleanup")
-                      : cleanupJob.abandonable
-                        ? t("abandon")
-                        : t("retryCleanup")}
-                  </Button>
-                </div>
-              )}
-            </div>
-          )}
-
-          {job && (
-            <div
-              role="status"
-              className="mt-5 min-w-0 rounded-xl border border-border bg-surface-secondary px-4 py-3 text-sm"
-            >
-              <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
-                <span className="font-medium text-foreground">
-                  {t(`status.${job.status}`)}
-                </span>
-                {job.queue_position !== null && (
-                  <span className="text-muted">
-                    {t("queuePosition", { count: job.queue_position })}
-                  </span>
-                )}
-                {job.estimated_seconds !== null && (
-                  <span className="text-muted">
-                    {t("estimated", {
-                      duration: formatDuration(job.estimated_seconds),
-                    })}
-                  </span>
-                )}
-                {job.elapsed_seconds > 0 && (
-                  <span className="text-muted">
-                    {t("elapsed", {
-                      duration: formatDuration(job.elapsed_seconds),
-                    })}
-                  </span>
-                )}
-                {job.completed_images > 0 && (
-                  <span className="text-muted">
-                    {t("completedImages", {
-                      count: job.completed_images,
-                    })}
-                  </span>
-                )}
-              </div>
-              {job.cleanup_pending && (
-                <p className="mt-2 text-amber-700 dark:text-amber-300">
-                  {t("cleanupPending")}
-                </p>
-              )}
-              {job.status === "failed" &&
-                job.failure?.retryable &&
-                !job.terminal && (
-                  <p className="mt-2 text-amber-700 dark:text-amber-300">
-                    {t("pollRetrying")}
-                  </p>
-                )}
-              {job.failure && job.status !== "cancelled" && (
-                  <div
-                    className={`mt-2 ${
-                      !job.terminal && job.failure.retryable
-                        ? "text-amber-700 dark:text-amber-300"
-                        : "text-red-700 dark:text-red-300"
-                    }`}
-                  >
-                    <p>{job.failure.message}</p>
-                    <p>{job.failure.action}</p>
-                  </div>
-              )}
-              {job.ignored_slots.length > 0 && (
-                <p className="mt-2 break-words text-amber-700 dark:text-amber-300">
-                  {t("ignoredSlots", {
-                    slots: job.ignored_slots.join(", "),
-                  })}
-                </p>
-              )}
-              {pollError && (
-                <p className="mt-2 text-amber-700 dark:text-amber-300">
-                  {t("pollUnavailable")}
-                </p>
-              )}
-            </div>
-          )}
-
-          <div className="mt-5 flex min-w-0 flex-wrap gap-2">
-            <Button
+          <ImageJobStatusPanel
+            job={job}
+            cleanupJob={cleanupJob}
+            pollError={pollError}
+            cleanupPollError={cleanupPollError}
+            cancelling={cancelling}
+            cleanupCancelling={cleanupCancelling}
+            formatDuration={formatDuration}
+            labels={{
+              status: (status) => t(`status.${status}`),
+              queuePosition: (count) => t("queuePosition", { count }),
+              estimated: (duration) => t("estimated", { duration }),
+              elapsed: (duration) => t("elapsed", { duration }),
+              completedImages: (count) =>
+                t("completedImages", { count }),
+              pollRetrying: t("pollRetrying"),
+              cleanupPending: t("cleanupPending"),
+              olderCleanupTitle: t("olderCleanupTitle"),
+              olderCleanupDescription: t("olderCleanupDescription"),
+              retryCleanup: t("retryCleanup"),
+              retryingCleanup: t("retryingCleanup"),
+              abandon: t("abandon"),
+              abandoning: t("abandoning"),
+              abandonWarning: t("abandonWarning"),
+              ignoredDimensions: t("ignoredDimensions"),
+              ignoredSlots: (slots) => t("ignoredSlots", { slots }),
+              pollUnavailable: t("pollUnavailable"),
+              cancel: t("cancel"),
+              cancelling: t("cancelling"),
+            }}
+            primaryAction={(
+              <Button
               variant="primary"
               className="bg-accent text-white hover:bg-accent-hover"
               isDisabled={
@@ -662,35 +490,11 @@ export default function CharacterPortraitPanel({
                 : anchor
                   ? t("resetAndGenerate")
                   : t("generate")}
-            </Button>
-            {cancelAvailable && (
-              <Button
-                variant="outline"
-                isDisabled={cancelling}
-                onPress={() => {
-                  if (
-                    abandonLostJob &&
-                    !window.confirm(t("abandonWarning"))
-                  ) {
-                    return;
-                  }
-                  void cancel();
-                }}
-              >
-                {cancelling
-                  ? abandonLostJob
-                    ? t("abandoning")
-                    : job?.cleanup_pending
-                    ? t("retryingCleanup")
-                    : t("cancelling")
-                  : abandonLostJob
-                    ? t("abandon")
-                    : job?.cleanup_pending
-                    ? t("retryCleanup")
-                    : t("cancel")}
               </Button>
             )}
-          </div>
+            onCancel={() => void cancel()}
+            onRetryCleanup={() => void retryCleanup()}
+          />
         </div>
       </div>
     </section>

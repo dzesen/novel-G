@@ -184,6 +184,8 @@ async def get_all_novels(actor: Actor = Depends(require_actor)):
     for novel in novels:
         if "_id" in novel:
             novel["_id"] = str(novel["_id"])
+        if novel.get("cover_asset_id") is not None:
+            novel["cover_asset_id"] = str(novel["cover_asset_id"])
         novel["stats"] = {
             "chapter_count": novel.get("current_chapter_count", 0),
             "total_word_count": novel.get("current_word_count", 0)
@@ -197,6 +199,8 @@ async def get_deleted_novels(actor: Actor = Depends(require_actor)):
     for novel in novels:
         if "_id" in novel:
             novel["_id"] = str(novel["_id"])
+        if novel.get("cover_asset_id") is not None:
+            novel["cover_asset_id"] = str(novel["cover_asset_id"])
         novel["stats"] = {
             "chapter_count": novel.get("current_chapter_count", 0),
             "total_word_count": novel.get("current_word_count", 0)
@@ -215,6 +219,8 @@ async def get_novel(
         novel["_id"] = str(novel["_id"])
         novel["owner_id"] = str(novel["owner_id"])
         novel["created_by"] = str(novel["created_by"])
+        if novel.get("cover_asset_id") is not None:
+            novel["cover_asset_id"] = str(novel["cover_asset_id"])
         novel.pop("narrative_revision", None)
         novel.pop("narrative_revision_operations", None)
         novel["stats"] = {

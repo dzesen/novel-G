@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from pymongo.asynchronous.client_session import AsyncClientSession
+from pymongo import ReturnDocument
 
 from backend.db.base import BaseRepository
 from backend.db.collections import NOVELS
@@ -27,6 +28,9 @@ class NovelRepository(BaseRepository):
             raise ValueError("Novel title cannot be empty")
 
         prepared = dict(data)
+        # Managed cover references are owner-scoped foreign keys and may only
+        # be written through the dedicated validated cover-reference seam.
+        prepared.pop("cover_asset_id", None)
         prepared.setdefault("genre", "unclassified")
         if "tags" not in prepared or not isinstance(prepared["tags"], list):
             prepared["tags"] = []
@@ -47,7 +51,8 @@ class NovelRepository(BaseRepository):
             {"owner_id": to_object_id(owner_id), "is_deleted": False},
             projection={"_id": 1, "title": 1, "subtitle": 1, 
                         "genre": 1, "status": 1, "tags": 1, 
-                        "cover_image": 1, "current_chapter_count": 1, "current_word_count": 1
+                        "cover_image": 1, "cover_asset_id": 1,
+                        "current_chapter_count": 1, "current_word_count": 1
                     }
         )
         return await cursor.to_list(length=None)
@@ -58,7 +63,8 @@ class NovelRepository(BaseRepository):
             {"owner_id": to_object_id(owner_id), "is_deleted": True},
             projection={"_id": 1, "title": 1, "subtitle": 1,
                         "genre": 1, "status": 1, "tags": 1,
-                        "cover_image": 1, "current_chapter_count": 1, "current_word_count": 1,
+                        "cover_image": 1, "cover_asset_id": 1,
+                        "current_chapter_count": 1, "current_word_count": 1,
                         "deleted_at": 1
                     }
         )
@@ -113,6 +119,7 @@ class NovelRepository(BaseRepository):
             "created_by",
             "creation_source",
             "creation_provenance",
+            "cover_asset_id",
         }
         filtered_data = {k: v for k, v in update_data.items() if k not in protected_fields}
         
@@ -121,6 +128,57 @@ class NovelRepository(BaseRepository):
             
         obj_id = to_object_id(novel_id)
         return await self.update_one({"_id": obj_id}, filtered_data, session=session)
+
+    async def get_owned_cover_asset_id(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+    ) -> str | None:
+        document = await self.collection.find_one(
+            {
+                "_id": to_object_id(novel_id),
+                "owner_id": to_object_id(owner_id),
+                "is_deleted": False,
+            },
+            projection={"cover_asset_id": 1},
+        )
+        if document is None:
+            raise NotFoundError(f"Novel with id {novel_id} not found")
+        value = document.get("cover_asset_id")
+        return str(value) if value is not None else None
+
+    async def compare_and_set_cover_asset_id(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        expected_asset_id: str | None,
+        asset_id: str | None,
+    ) -> bool:
+        query: dict[str, Any] = {
+            "_id": to_object_id(novel_id),
+            "owner_id": to_object_id(owner_id),
+            "is_deleted": False,
+        }
+        if expected_asset_id is None:
+            query["$or"] = [
+                {"cover_asset_id": {"$exists": False}},
+                {"cover_asset_id": None},
+            ]
+        else:
+            query["cover_asset_id"] = to_object_id(expected_asset_id)
+        update = (
+            {"$set": {"cover_asset_id": to_object_id(asset_id)}}
+            if asset_id is not None
+            else {"$unset": {"cover_asset_id": ""}}
+        )
+        updated = await self.collection.find_one_and_update(
+            query,
+            update,
+            return_document=ReturnDocument.AFTER,
+        )
+        return updated is not None
 
     async def update_novel_status(
         self,

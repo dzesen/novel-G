@@ -22,29 +22,62 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        raw_subject_id = subject_id if subject_id is not None else card_id
+        if raw_subject_id is None:
+            raise ValueError("subject_id is required")
+        canonical_subject_id = to_object_id(raw_subject_id)
+        scope: dict[str, Any] = {
             "owner_id": to_object_id(owner_id),
             "novel_id": to_object_id(novel_id),
-            "character_card_id": to_object_id(card_id),
-            "usage": "character_portrait",
+            "usage": str(usage),
             "is_deleted": False,
         }
+        if usage == "character_portrait" and subject_id is None:
+            # Slice 6 persisted only character_card_id. New jobs also carry the
+            # generic subject_id, while this fallback keeps in-flight legacy
+            # handles resumable across the schema transition.
+            scope["$or"] = [
+                {"subject_id": canonical_subject_id},
+                {
+                    "subject_id": {"$exists": False},
+                    "character_card_id": canonical_subject_id,
+                },
+            ]
+        else:
+            scope["subject_id"] = canonical_subject_id
+        return scope
 
     async def create_job(self, document: dict[str, Any]) -> dict[str, Any]:
+        usage = str(document.get("usage") or "")
+        raw_subject_id = document.get("subject_id")
+        if raw_subject_id is None:
+            raw_subject_id = document.get("character_card_id")
+        if not usage or raw_subject_id is None:
+            raise ValueError("usage and subject_id are required")
+        subject_id = to_object_id(raw_subject_id)
         prepared = self._prepare_audit_fields_for_insert(document)
         prepared.update(
             {
                 "owner_id": to_object_id(document["owner_id"]),
                 "novel_id": to_object_id(document["novel_id"]),
-                "character_card_id": to_object_id(
-                    document["character_card_id"]
-                ),
+                "usage": usage,
+                "subject_id": subject_id,
                 "is_deleted": False,
                 "deleted_at": None,
             }
         )
+        if usage == "character_portrait":
+            # Keep the old field during the compatibility window so both the
+            # legacy and generic active-job indexes guard new portrait jobs.
+            prepared["character_card_id"] = to_object_id(
+                document.get("character_card_id") or subject_id
+            )
+        else:
+            prepared.pop("character_card_id", None)
         try:
             result = await self.collection.insert_one(prepared)
             stored = await self.collection.find_one({"_id": result.inserted_id})
@@ -54,7 +87,7 @@ class ImageJobRepository(BaseRepository):
                 {
                     "owner_id": prepared["owner_id"],
                     "idempotency_key": prepared.get("idempotency_key"),
-                    "usage": "character_portrait",
+                    "usage": usage,
                     "is_terminal": False,
                     "is_deleted": False,
                 }
@@ -62,14 +95,13 @@ class ImageJobRepository(BaseRepository):
             if stored is None:
                 stored = await self.collection.find_one(
                     {
-                        "owner_id": prepared["owner_id"],
-                        "novel_id": prepared["novel_id"],
-                        "character_card_id": prepared[
-                            "character_card_id"
-                        ],
-                        "usage": "character_portrait",
+                        **self._scope(
+                            owner_id=str(prepared["owner_id"]),
+                            novel_id=str(prepared["novel_id"]),
+                            usage=usage,
+                            subject_id=str(subject_id),
+                        ),
                         "is_terminal": False,
-                        "is_deleted": False,
                     }
                 )
             was_created = False
@@ -82,7 +114,9 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
         job_id: str,
     ) -> dict[str, Any] | None:
         return await self.collection.find_one(
@@ -91,6 +125,8 @@ class ImageJobRepository(BaseRepository):
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
             }
@@ -101,7 +137,9 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
         job_id: str,
         fields: dict[str, Any],
     ) -> dict[str, Any] | None:
@@ -111,6 +149,8 @@ class ImageJobRepository(BaseRepository):
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
             },
@@ -128,7 +168,9 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
         job_id: str,
         expected_revision: int,
         fields: dict[str, Any],
@@ -139,6 +181,8 @@ class ImageJobRepository(BaseRepository):
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
                 "is_terminal": False,
@@ -159,7 +203,9 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
         job_id: str,
         fields: dict[str, Any],
     ) -> dict[str, Any] | None:
@@ -178,6 +224,8 @@ class ImageJobRepository(BaseRepository):
                     **self._scope(
                         owner_id=owner_id,
                         novel_id=novel_id,
+                        usage=usage,
+                        subject_id=subject_id,
                         card_id=card_id,
                     ),
                     "is_terminal": True,
@@ -205,7 +253,9 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
         job_id: str,
         fields: dict[str, Any],
     ) -> dict[str, Any] | None:
@@ -217,6 +267,8 @@ class ImageJobRepository(BaseRepository):
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
                 "is_terminal": True,
@@ -242,7 +294,9 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
         job_id: str,
         expected_revision: int,
         fields: dict[str, Any],
@@ -253,6 +307,8 @@ class ImageJobRepository(BaseRepository):
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
                 "is_terminal": True,
@@ -274,13 +330,17 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
     ) -> dict[str, Any] | None:
         return await self.collection.find_one(
             {
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
                 "is_terminal": False,
@@ -293,13 +353,17 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
     ) -> dict[str, Any] | None:
         return await self.collection.find_one(
             {
                 **self._scope(
                     owner_id=owner_id,
                     novel_id=novel_id,
+                    usage=usage,
+                    subject_id=subject_id,
                     card_id=card_id,
                 ),
                 "cleanup_pending": True,
@@ -312,12 +376,16 @@ class ImageJobRepository(BaseRepository):
         *,
         owner_id: str,
         novel_id: str,
-        card_id: str,
+        usage: str = "character_portrait",
+        subject_id: str | None = None,
+        card_id: str | None = None,
     ) -> dict[str, Any] | None:
         return await self.collection.find_one(
             self._scope(
                 owner_id=owner_id,
                 novel_id=novel_id,
+                usage=usage,
+                subject_id=subject_id,
                 card_id=card_id,
             ),
             sort=[("created_at", DESCENDING)],
@@ -327,12 +395,13 @@ class ImageJobRepository(BaseRepository):
         self,
         *,
         provider_alias: str,
+        usage: str = "character_portrait",
     ) -> int | None:
         cursor = (
             self.collection.find(
                 {
                     "provider_alias": provider_alias,
-                    "usage": "character_portrait",
+                    "usage": usage,
                     "status": "succeeded",
                     "is_terminal": True,
                     "elapsed_seconds": {"$gt": 0},

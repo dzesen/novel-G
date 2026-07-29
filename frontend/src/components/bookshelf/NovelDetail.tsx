@@ -1,6 +1,7 @@
 ﻿/* eslint-disable @next/next/no-img-element */
 "use client";
 
+import { useState } from "react";
 import { useTranslations } from "next-intl";
 import { useRouter, usePathname } from "next/navigation";
 import { Card, Button, Chip } from "@heroui/react";
@@ -41,6 +42,19 @@ export default function NovelDetailPanel({
   const router = useRouter();
   const pathname = usePathname();
   const locale = pathname.startsWith("/en") ? "en" : "zh";
+  const [failedManagedCoverId, setFailedManagedCoverId] = useState<
+    string | null
+  >(null);
+  const managedCoverId = novel?.cover_asset_id
+    ? String(novel.cover_asset_id)
+    : "";
+  const coverUrl = managedCoverId
+    ? `/api/image-assets/${encodeURIComponent(managedCoverId)}/content`
+    : novel?.cover_image;
+
+  const managedCoverFailed =
+    Boolean(managedCoverId) &&
+    failedManagedCoverId === managedCoverId;
 
   if (!novel) {
     return (
@@ -88,12 +102,24 @@ export default function NovelDetailPanel({
         <Card.Header>
           <div className="flex items-start justify-between w-full">
             <div className="flex items-start gap-4 flex-1 min-w-0">
-              {novel.cover_image ? (
+              {coverUrl && !(managedCoverId && managedCoverFailed) ? (
                 <img
-                  src={getImageUrl(novel.cover_image)}
+                  src={getImageUrl(coverUrl)}
                   alt={novel.title}
                   className="w-24 h-32 rounded-lg object-cover shrink-0 shadow-sm"
+                  onError={() => {
+                    if (managedCoverId) {
+                      setFailedManagedCoverId(managedCoverId);
+                    }
+                  }}
                 />
+              ) : managedCoverId ? (
+                <div
+                  role="status"
+                  className="flex h-32 w-24 shrink-0 items-center justify-center rounded-lg bg-muted/30 px-2 text-center text-xs text-muted"
+                >
+                  {tb("coverAssetMissing")}
+                </div>
               ) : (
                 <div className="w-24 h-32 rounded-lg bg-muted/30 shrink-0 flex items-center justify-center">
                   <svg

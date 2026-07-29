@@ -1,4 +1,4 @@
-"""Owner-scoped character portrait jobs and managed image delivery."""
+"""Owner-scoped single-image jobs and managed image delivery."""
 
 from __future__ import annotations
 
@@ -29,6 +29,14 @@ from backend.services.image.managed_assets import (
     ImageAssetNotFoundError,
     ManagedImageAssetService,
 )
+from backend.services.image.novel_cover_service import (
+    CoverAssetNotFoundError,
+    CoverReferenceConflictError,
+    NovelCoverService,
+    NovelCoverStateProjection,
+    novel_cover_service,
+)
+from backend.services.image.single_image_job_service import ImageJobProjection
 from backend.services.llm.agent_orchestrator import IllustrationPromptResult
 from backend.services.novel.appearance_anchor import (
     AppearanceAnchorConflictError,
@@ -77,8 +85,50 @@ class CharacterPortraitJobRequest(BaseModel):
         return normalized or None
 
 
+class NovelCoverJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: IllustrationPromptResult
+    seed: int | None = None
+    provider_alias: str | None = Field(default=None, max_length=200)
+    width: int = Field(default=512, ge=64, le=4096)
+    height: int = Field(default=768, ge=64, le=4096)
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def validate_seed(cls, value: Any) -> int | None:
+        return CharacterPortraitJobRequest.validate_seed(value)
+
+    @field_validator("provider_alias", mode="before")
+    @classmethod
+    def normalize_provider_alias(cls, value: Any) -> str | None:
+        return CharacterPortraitJobRequest.normalize_provider_alias(value)
+
+
+class NovelCoverCurrentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str | None
+
+    @field_validator("asset_id", mode="before")
+    @classmethod
+    def validate_asset_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(to_object_id(str(value).strip()))
+        except InvalidIdError as error:
+            raise ValueError(
+                "asset_id must be a valid image asset id"
+            ) from error
+
+
 def get_character_portrait_service() -> CharacterPortraitService:
     return character_portrait_service
+
+
+def get_novel_cover_service() -> NovelCoverService:
+    return novel_cover_service
 
 
 def _translate_portrait_error(error: Exception) -> HTTPException:
@@ -100,6 +150,18 @@ def _translate_portrait_error(error: Exception) -> HTTPException:
     if isinstance(error, (PortraitConfigurationError, ValueError)):
         return HTTPException(status_code=400, detail=str(error))
     return HTTPException(status_code=500, detail="角色立绘任务处理失败")
+
+
+def _translate_cover_error(error: Exception) -> HTTPException:
+    if isinstance(error, (PortraitJobNotFoundError, CoverAssetNotFoundError)):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, NotFoundError):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, CoverReferenceConflictError):
+        return HTTPException(status_code=409, detail=str(error))
+    if isinstance(error, (InvalidIdError, ValueError)):
+        return HTTPException(status_code=400, detail=str(error))
+    return HTTPException(status_code=500, detail="封面任务处理失败")
 
 
 @router.get(
@@ -197,6 +259,108 @@ async def cancel_character_portrait_job(
         )
     except Exception as error:
         raise _translate_portrait_error(error) from error
+
+
+@router.get(
+    "/api/novels/{novel_id}/cover",
+    response_model=NovelCoverStateProjection,
+)
+async def get_novel_cover_state(
+    novel_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: NovelCoverService = Depends(get_novel_cover_service),
+) -> NovelCoverStateProjection:
+    try:
+        return await service.get_state(
+            owner_id=actor.id,
+            novel_id=novel_id,
+        )
+    except Exception as error:
+        raise _translate_cover_error(error) from error
+
+
+@router.post(
+    "/api/novels/{novel_id}/cover/jobs",
+    response_model=ImageJobProjection,
+)
+async def start_novel_cover_job(
+    novel_id: str,
+    request: NovelCoverJobRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: NovelCoverService = Depends(get_novel_cover_service),
+) -> ImageJobProjection:
+    try:
+        return await service.start(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            prompt=request.prompt,
+            width=request.width,
+            height=request.height,
+            seed=request.seed,
+            provider_alias=request.provider_alias,
+        )
+    except Exception as error:
+        raise _translate_cover_error(error) from error
+
+
+@router.get(
+    "/api/novels/{novel_id}/cover/jobs/{job_id}",
+    response_model=ImageJobProjection,
+)
+async def poll_novel_cover_job(
+    novel_id: str,
+    job_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: NovelCoverService = Depends(get_novel_cover_service),
+) -> ImageJobProjection:
+    try:
+        return await service.poll(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            job_id=job_id,
+        )
+    except Exception as error:
+        raise _translate_cover_error(error) from error
+
+
+@router.post(
+    "/api/novels/{novel_id}/cover/jobs/{job_id}/cancel",
+    response_model=ImageJobProjection,
+)
+async def cancel_novel_cover_job(
+    novel_id: str,
+    job_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: NovelCoverService = Depends(get_novel_cover_service),
+) -> ImageJobProjection:
+    try:
+        return await service.cancel(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            job_id=job_id,
+        )
+    except Exception as error:
+        raise _translate_cover_error(error) from error
+
+
+@router.put(
+    "/api/novels/{novel_id}/cover/current",
+    response_model=NovelCoverStateProjection,
+)
+async def select_novel_cover(
+    novel_id: str,
+    request: NovelCoverCurrentRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: NovelCoverService = Depends(get_novel_cover_service),
+) -> NovelCoverStateProjection:
+    try:
+        return await service.select_current(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            asset_id=request.asset_id,
+        )
+    except Exception as error:
+        raise _translate_cover_error(error) from error
 
 
 @router.get("/api/image-assets/{asset_id}/content")

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Chip } from "@heroui/react";
 import AutoResizeTextarea from "./AutoResizeTextarea";
@@ -56,6 +56,13 @@ export default function NovelInfoSection({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [tagInput, setTagInput] = useState("");
+  const [coverPreviewFailed, setCoverPreviewFailed] = useState(false);
+  const [clearManagedCoverOnSave, setClearManagedCoverOnSave] =
+    useState(false);
+
+  useEffect(() => {
+    setCoverPreviewFailed(false);
+  }, [data.cover_asset_id, data.cover_image]);
 
   const startEdit = () => {
     const snapshot: Record<string, unknown> = {};
@@ -65,6 +72,7 @@ export default function NovelInfoSection({
     if (sectionKey === "style") {
       snapshot.style_controls = normalizeStyleControls(data.style_controls);
     }
+    setClearManagedCoverOnSave(false);
     setSaveError("");
     setEditData(snapshot);
     onStartEdit();
@@ -74,6 +82,7 @@ export default function NovelInfoSection({
     setEditData({});
     setSaveError("");
     setTagInput("");
+    setClearManagedCoverOnSave(false);
     onCancelEdit();
   };
 
@@ -104,6 +113,16 @@ export default function NovelInfoSection({
         setSaving(true);
         setSaveError("");
         await apiPut(`/api/novels/${novelId}`, editData);
+        if (
+          sectionKey === "basic" &&
+          clearManagedCoverOnSave &&
+          data.cover_asset_id
+        ) {
+          await apiPut(`/api/novels/${novelId}/cover/current`, {
+            asset_id: null,
+          });
+        }
+        setClearManagedCoverOnSave(false);
         onSaved();
       } catch (cause) {
         setSaveError(
@@ -159,6 +178,8 @@ export default function NovelInfoSection({
     try {
       const res = await apiPostForm<{ url: string }>("/api/upload/cover", fd);
       updateField("cover_image", res.url);
+      setClearManagedCoverOnSave(true);
+      setCoverPreviewFailed(false);
     } catch {
       // silently handle
     }
@@ -171,13 +192,31 @@ export default function NovelInfoSection({
     const label = t(FIELD_LABEL_MAP[f.key] || f.key);
 
     if (f.type === "cover") {
-      const url = val as string | undefined;
+      const assetId = data.cover_asset_id
+        ? String(data.cover_asset_id)
+        : "";
+      const url = assetId
+        ? `/api/image-assets/${encodeURIComponent(assetId)}/content`
+        : val as string | undefined;
+      const missing = Boolean(assetId && coverPreviewFailed);
       return (
         <div key={f.key} className="flex items-center gap-3">
           <span className="text-sm text-muted w-20 shrink-0">{label}</span>
-          {url ? (
+          {url && !missing ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={getImageUrl(url)} alt="cover" className="w-16 h-20 rounded object-cover" />
+            <img
+              src={getImageUrl(url)}
+              alt={t("coverPreviewAlt")}
+              className="w-16 h-20 rounded object-cover"
+              onError={() => setCoverPreviewFailed(true)}
+            />
+          ) : missing ? (
+            <span
+              role="status"
+              className="flex h-20 w-16 items-center justify-center rounded border border-border bg-surface-secondary px-1 text-center text-xs text-muted"
+            >
+              {t("coverAssetMissing")}
+            </span>
           ) : (
             <span className="text-sm text-muted/50">—</span>
           )}
@@ -237,16 +276,56 @@ export default function NovelInfoSection({
     const label = t(FIELD_LABEL_MAP[f.key] || f.key);
 
     if (f.type === "cover") {
-      const url = val as string | undefined;
+      const assetId =
+        !clearManagedCoverOnSave && data.cover_asset_id
+          ? String(data.cover_asset_id)
+          : "";
+      const url = assetId
+        ? `/api/image-assets/${encodeURIComponent(assetId)}/content`
+        : val as string | undefined;
+      const missing = Boolean(assetId && coverPreviewFailed);
       return (
         <div key={f.key} className="space-y-2">
           <label className="text-sm font-medium text-foreground">{label}</label>
           <div className="flex items-center gap-3">
-            {url ? (
+            {url && !missing ? (
               <>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={getImageUrl(url)} alt="cover" className="w-16 h-20 rounded object-cover" />
-                <Button variant="ghost" size="sm" onPress={() => updateField("cover_image", "")}>
+                <img
+                  src={getImageUrl(url)}
+                  alt={t("coverPreviewAlt")}
+                  className="w-16 h-20 rounded object-cover"
+                  onError={() => setCoverPreviewFailed(true)}
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onPress={() => {
+                    updateField("cover_image", "");
+                    setClearManagedCoverOnSave(true);
+                    setCoverPreviewFailed(false);
+                  }}
+                >
+                  {t("removeCover")}
+                </Button>
+              </>
+            ) : missing ? (
+              <>
+                <span
+                  role="status"
+                  className="flex h-20 w-16 items-center justify-center rounded border border-border bg-surface-secondary px-1 text-center text-xs text-muted"
+                >
+                  {t("coverAssetMissing")}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onPress={() => {
+                    updateField("cover_image", "");
+                    setClearManagedCoverOnSave(true);
+                    setCoverPreviewFailed(false);
+                  }}
+                >
                   {t("removeCover")}
                 </Button>
               </>

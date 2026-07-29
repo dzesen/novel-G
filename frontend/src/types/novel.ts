@@ -20,6 +20,7 @@ export interface NovelSummary {
   subtitle?: string;
   genre: string;
   tags: string[];
+  cover_asset_id?: string | null;
   cover_image?: string;
   status: string;
   stats: {

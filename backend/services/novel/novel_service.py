@@ -52,6 +52,7 @@ class NovelService:
             "created_by",
             "creation_source",
             "creation_provenance",
+            "cover_asset_id",
         }
         changes = {
             key: value

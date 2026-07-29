@@ -1,6 +1,12 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  Fragment,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+} from "react";
 import { useTranslations } from "next-intl";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
@@ -17,6 +23,7 @@ import { normalizeRewriteState } from "@/lib/rewriteDraftState";
 import NovelInfoSection, { type SectionKey } from "./NovelInfoSection";
 import NovelRewriteAssistant from "./NovelRewriteAssistant";
 import StickyActionBar from "./StickyActionBar";
+import NovelCoverPanel from "./NovelCoverPanel";
 
 const SECTIONS: SectionKey[] = ["basic", "creative", "scale", "content", "style"];
 
@@ -286,23 +293,40 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       {/* Sections */}
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
         {SECTIONS.map((sk) => (
-          <NovelInfoSection
-            key={sk}
-            sectionKey={sk}
-            data={data}
-            novelId={novelId}
-            isCreateMode={mode === "create"}
-            isEditing={mode === "create" || editingSection === sk}
-            onStartEdit={() => setEditingSection(sk)}
-            onCancelEdit={() => setEditingSection(null)}
-            onSaved={() => {
-              setEditingSection(null);
-              loadNovel();
-            }}
-            onChange={mode === "create" ? handleFieldChange : undefined}
-            hasChapters={hasChapters}
-            onDangerConfirm={requestDangerConfirm}
-          />
+          <Fragment key={sk}>
+            <NovelInfoSection
+              sectionKey={sk}
+              data={data}
+              novelId={novelId}
+              isCreateMode={mode === "create"}
+              isEditing={mode === "create" || editingSection === sk}
+              onStartEdit={() => setEditingSection(sk)}
+              onCancelEdit={() => setEditingSection(null)}
+              onSaved={() => {
+                setEditingSection(null);
+                loadNovel();
+              }}
+              onChange={mode === "create" ? handleFieldChange : undefined}
+              hasChapters={hasChapters}
+              onDangerConfirm={requestDangerConfirm}
+            />
+            {sk === "basic" && mode === "edit" && novelId && (
+              <NovelCoverPanel
+                novelId={novelId}
+                novelTitle={String(data.title || "")}
+                coverAssetId={
+                  data.cover_asset_id
+                    ? String(data.cover_asset_id)
+                    : null
+                }
+                coverImage={
+                  data.cover_image ? String(data.cover_image) : null
+                }
+                hasUnsavedChanges={editingSection !== null}
+                onCoverChanged={loadNovel}
+              />
+            )}
+          </Fragment>
         ))}
       </div>
 

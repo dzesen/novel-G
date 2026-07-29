@@ -124,6 +124,25 @@ class ImageAssetRepository(BaseRepository):
             sort=[("created_at", -1)],
         )
 
+    async def list_owned_subject(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        subject_kind: str,
+        subject_id: str,
+    ) -> list[dict[str, Any]]:
+        cursor = self.collection.find(
+            {
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "is_deleted": False,
+            }
+        ).sort([("created_at", -1), ("_id", -1)])
+        return await cursor.to_list(length=None)
+
     def iter_owned_metadata(
         self,
         *,
