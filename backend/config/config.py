@@ -32,10 +32,30 @@ _FALLBACK_DEFAULT_CONFIG: Dict[str, Any] = {
 _config_lock = RLock()
 _cached_config: Dict[str, Any] | None = None
 _cached_mtimes: tuple[float | None, float | None] | None = None
-_REPLACE_DICT_PATHS: set[tuple[str, ...]] = {
-    ("image_providers", "providers"),
-    ("llm", "providers"),
+_REPLACE_DICT_PATHS: dict[tuple[str, ...], frozenset[str]] = {
+    ("image_providers", "providers"): frozenset({"load"}),
+    ("llm", "providers"): frozenset({"load"}),
+    (
+        "image_providers", "providers", "*", "workflow", "bindings"
+    ): frozenset({"load", "patch"}),
 }
+
+
+def _should_replace_dict_path(
+    path: tuple[str, ...],
+    *,
+    phase: str,
+) -> bool:
+    for pattern, phases in _REPLACE_DICT_PATHS.items():
+        if phase not in phases:
+            continue
+        if len(pattern) != len(path):
+            continue
+        if all(expected == "*" or expected == actual for expected, actual in zip(pattern, path)):
+            return True
+    return False
+
+
 _KNOWN_WORKFLOW_STEPS = WORKFLOW_STEPS
 _PROVIDER_RENAMES_KEY = "_provider_renames"
 _DEPRECATED_DEFAULT_REVIEWERS = {"openai_gpt5_4_nano"}
@@ -640,7 +660,10 @@ def _merge_dicts(base: Dict[str, Any], updates: Dict[str, Any], path: tuple[str,
     merged = deepcopy(base)
     for key, value in updates.items():
         current_path = (*path, key)
-        if current_path in _REPLACE_DICT_PATHS and isinstance(value, dict):
+        if (
+            isinstance(value, dict)
+            and _should_replace_dict_path(current_path, phase="load")
+        ):
             merged[key] = deepcopy(value)
             continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):

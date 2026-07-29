@@ -24,6 +24,7 @@ from backend.config.config import (
     _merge_dicts,
     _migrate_config_tree,
     _normalize_config_tree,
+    _should_replace_dict_path,
 )
 from backend.config.image_providers import ImageProvidersConfig
 from backend.config.workflow_catalog import WORKFLOW_STEPS
@@ -68,14 +69,19 @@ class SecretPatch(BaseModel):
         return self
 
 
+ProviderCommandTarget = Literal["llm", "image"]
+
+
 class RenameProviderCommand(BaseModel):
     kind: Literal["rename"] = "rename"
+    target: ProviderCommandTarget = "llm"
     from_alias: str
     to_alias: str
 
 
 class DeleteProviderCommand(BaseModel):
     kind: Literal["delete"] = "delete"
+    target: ProviderCommandTarget = "llm"
     alias: str
     replacement_default_alias: str | None = None
 
@@ -159,6 +165,12 @@ class YamlConfigStore:
 class SecretVersionStore(Protocol):
     def sync(self, raw_config: dict[str, Any]) -> dict[str, int]: ...
 
+    def rename(
+        self,
+        target: ProviderCommandTarget,
+        from_alias: str,
+        to_alias: str,
+    ) -> None: ...
     def snapshot_state(self) -> Any: ...
 
     def restore_state(self, snapshot: Any) -> None: ...
@@ -169,6 +181,14 @@ class SecretVersionStore(Protocol):
 _SECRET_STORE_VERSION = 2
 _LLM_SECRET_PREFIX = "llm:"
 _IMAGE_SECRET_PREFIX = "image:"
+
+
+def _secret_record_key(
+    target: ProviderCommandTarget,
+    alias: str,
+) -> str:
+    prefix = _LLM_SECRET_PREFIX if target == "llm" else _IMAGE_SECRET_PREFIX
+    return f"{prefix}{alias}"
 
 
 def _secret_values(raw_config: dict[str, Any]) -> dict[str, str]:
@@ -217,11 +237,16 @@ class MemorySecretVersionStore:
             del self._records[record_key]
         return {key: record[1] for key, record in self._records.items()}
 
-    def rename(self, from_alias: str, to_alias: str) -> None:
-        source = f"{_LLM_SECRET_PREFIX}{from_alias}"
-        target = f"{_LLM_SECRET_PREFIX}{to_alias}"
+    def rename(
+        self,
+        target: ProviderCommandTarget,
+        from_alias: str,
+        to_alias: str,
+    ) -> None:
+        source = _secret_record_key(target, from_alias)
+        destination = _secret_record_key(target, to_alias)
         if source in self._records:
-            self._records[target] = self._records.pop(source)
+            self._records[destination] = self._records.pop(source)
 
     def snapshot_state(self) -> Any:
         return deepcopy(self._records)
@@ -311,13 +336,18 @@ class FileSecretVersionStore:
                 for record_key, record in records.items()
             }
 
-    def rename(self, from_alias: str, to_alias: str) -> None:
+    def rename(
+        self,
+        target: ProviderCommandTarget,
+        from_alias: str,
+        to_alias: str,
+    ) -> None:
         with self._lock:
             records = self._state["records"]
-            source = f"{_LLM_SECRET_PREFIX}{from_alias}"
-            target = f"{_LLM_SECRET_PREFIX}{to_alias}"
+            source = _secret_record_key(target, from_alias)
+            destination = _secret_record_key(target, to_alias)
             if source in records:
-                records[target] = records.pop(source)
+                records[destination] = records.pop(source)
                 self._write_atomic(self._state)
 
     def snapshot_state(self) -> Any:
@@ -470,14 +500,56 @@ def _redact_config(raw_config: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
-def _merge_patch(base: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+def _merge_patch(
+    base: dict[str, Any],
+    changes: dict[str, Any],
+    path: tuple[str, ...] = (),
+) -> dict[str, Any]:
     merged = deepcopy(base)
     for key, value in changes.items():
+        current_path = (*path, key)
+        if (
+            isinstance(value, dict)
+            and _should_replace_dict_path(current_path, phase="patch")
+        ):
+            merged[key] = deepcopy(value)
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge_patch(merged[key], value)
+            merged[key] = _merge_patch(
+                merged[key],
+                value,
+                current_path,
+            )
         else:
             merged[key] = deepcopy(value)
     return merged
+
+
+def _validate_image_provider_mapping_patch(
+    current: dict[str, Any],
+    changes: dict[str, Any],
+) -> None:
+    image_changes = changes.get("image_providers")
+    if not isinstance(image_changes, dict) or "providers" not in image_changes:
+        return
+    submitted = image_changes.get("providers")
+    if not isinstance(submitted, dict):
+        return
+    current_image = current.get("image_providers")
+    current_providers = (
+        current_image.get("providers")
+        if isinstance(current_image, dict)
+        else {}
+    )
+    if not isinstance(current_providers, dict):
+        return
+    omitted = sorted(set(current_providers) - set(submitted))
+    if omitted:
+        raise ValueError(
+            "Image Provider aliases cannot be removed through config changes; "
+            "use provider_commands with target=image: "
+            + ", ".join(omitted)
+        )
 
 
 def _contains_forbidden_secret_field(value: Any) -> bool:
@@ -514,6 +586,21 @@ def _rename_provider_references(llm_config: dict[str, Any], from_alias: str, to_
                     step["provider"] = to_alias
 
 
+def _rename_image_provider_references(
+    image_config: dict[str, Any],
+    from_alias: str,
+    to_alias: str,
+) -> None:
+    if image_config.get("default_provider") == from_alias:
+        image_config["default_provider"] = to_alias
+    usages = image_config.get("usages")
+    if not isinstance(usages, dict):
+        return
+    for usage, alias in usages.items():
+        if alias == from_alias:
+            usages[usage] = to_alias
+
+
 def _clear_provider_references(llm_config: dict[str, Any], alias: str) -> None:
     review = llm_config.get("format_review")
     if isinstance(review, dict) and review.get("provider_alias") == alias:
@@ -533,6 +620,18 @@ def _clear_provider_references(llm_config: dict[str, Any], alias: str) -> None:
         for step in steps.values():
             if isinstance(step, dict) and step.get("provider") == alias:
                 step["provider"] = ""
+
+
+def _clear_image_provider_references(
+    image_config: dict[str, Any],
+    alias: str,
+) -> None:
+    usages = image_config.get("usages")
+    if not isinstance(usages, dict):
+        return
+    for usage, configured_alias in usages.items():
+        if configured_alias == alias:
+            usages[usage] = ""
 
 
 def _provider_reference_map(raw_config: dict[str, Any]) -> dict[str, Any]:
@@ -644,14 +743,20 @@ def _apply_provider_commands(
     secret_store: SecretVersionStore,
 ) -> dict[str, Any]:
     candidate = deepcopy(raw_config)
-    llm_config = candidate.get("llm")
-    if not isinstance(llm_config, dict):
-        raise ValueError("llm must be a mapping")
-    providers = llm_config.get("providers")
-    if not isinstance(providers, dict):
-        raise ValueError("llm.providers must be a mapping")
 
     for command in commands:
+        config_key = (
+            "llm"
+            if command.target == "llm"
+            else "image_providers"
+        )
+        provider_config = candidate.get(config_key)
+        if not isinstance(provider_config, dict):
+            raise ValueError(f"{config_key} must be a mapping")
+        providers = provider_config.get("providers")
+        if not isinstance(providers, dict):
+            raise ValueError(f"{config_key}.providers must be a mapping")
+
         if isinstance(command, RenameProviderCommand):
             source = command.from_alias.strip()
             target = command.to_alias.strip()
@@ -662,13 +767,20 @@ def _apply_provider_commands(
             if target in providers and target != source:
                 raise ValueError(f"Provider rename target already exists: {target}")
             if source == target:
-                continue
+                raise ValueError("Provider rename source and target must differ")
             renamed: dict[str, Any] = {}
             for alias, provider in providers.items():
                 renamed[target if alias == source else alias] = provider
             providers = renamed
-            llm_config["providers"] = providers
-            _rename_provider_references(llm_config, source, target)
+            provider_config["providers"] = providers
+            if command.target == "llm":
+                _rename_provider_references(provider_config, source, target)
+            else:
+                _rename_image_provider_references(
+                    provider_config,
+                    source,
+                    target,
+                )
             continue
 
         if isinstance(command, DeleteProviderCommand):
@@ -678,7 +790,7 @@ def _apply_provider_commands(
                 raise ValueError("Provider delete alias must not be empty")
             if alias not in providers:
                 raise ValueError(f"Provider delete target does not exist: {alias}")
-            if llm_config.get("default_provider") == alias:
+            if provider_config.get("default_provider") == alias:
                 if not replacement or replacement == alias or replacement not in providers:
                     raise ValueError(
                         "Deleting the default provider requires a valid replacement default alias"
@@ -692,35 +804,114 @@ def _apply_provider_commands(
                         "Deleting the default provider requires an enabled "
                         "replacement default alias"
                     )
-                llm_config["default_provider"] = replacement
+                provider_config["default_provider"] = replacement
             del providers[alias]
-            _clear_provider_references(llm_config, alias)
+            if command.target == "llm":
+                _clear_provider_references(provider_config, alias)
+            else:
+                _clear_image_provider_references(provider_config, alias)
             continue
 
         raise ValueError(f"Unsupported Provider command: {command.kind}")
     return candidate
 
 
-def _delete_commands_replace_default(
+def _delete_command_replacement_defaults(
     raw_config: dict[str, Any],
     commands: list[ProviderCommand],
-) -> bool:
-    llm_config = raw_config.get("llm")
-    if not isinstance(llm_config, dict):
-        return False
-    current_default = str(llm_config.get("default_provider") or "").strip()
-    replaced = False
+) -> dict[ProviderCommandTarget, str]:
+    current_defaults: dict[ProviderCommandTarget, str] = {}
+    for target, config_key in (
+        ("llm", "llm"),
+        ("image", "image_providers"),
+    ):
+        provider_config = raw_config.get(config_key)
+        current_defaults[target] = (
+            str(provider_config.get("default_provider") or "").strip()
+            if isinstance(provider_config, dict)
+            else ""
+        )
+
+    replacements: dict[ProviderCommandTarget, str] = {}
     for command in commands:
+        target = command.target
         if isinstance(command, RenameProviderCommand):
-            if current_default == command.from_alias.strip():
-                current_default = command.to_alias.strip()
+            if current_defaults[target] == command.from_alias.strip():
+                current_defaults[target] = command.to_alias.strip()
+                if target in replacements:
+                    replacements[target] = current_defaults[target]
         elif isinstance(command, DeleteProviderCommand):
-            if current_default == command.alias.strip():
-                current_default = (
+            if current_defaults[target] == command.alias.strip():
+                current_defaults[target] = (
                     command.replacement_default_alias or ""
                 ).strip()
-                replaced = True
-    return replaced
+                replacements[target] = current_defaults[target]
+    return replacements
+
+
+def _validate_confirmed_default_replacements(
+    candidate: dict[str, Any],
+    replacements: dict[ProviderCommandTarget, str],
+) -> None:
+    for target, expected_alias in replacements.items():
+        config_key = "llm" if target == "llm" else "image_providers"
+        provider_config = candidate.get(config_key)
+        actual_alias = (
+            provider_config.get("default_provider")
+            if isinstance(provider_config, dict)
+            else None
+        )
+        if actual_alias != expected_alias:
+            raise ValueError(
+                "Provider delete changes must preserve the confirmed "
+                "replacement default alias"
+            )
+
+
+def _validate_provider_command_outcomes(
+    command_candidate: dict[str, Any],
+    candidate: dict[str, Any],
+    commands: list[ProviderCommand],
+) -> None:
+    for target, config_key in (
+        ("llm", "llm"),
+        ("image", "image_providers"),
+    ):
+        retired_aliases: set[str] = set()
+        for command in commands:
+            if command.target != target:
+                continue
+            if isinstance(command, RenameProviderCommand):
+                retired_aliases.add(command.from_alias.strip())
+            else:
+                retired_aliases.add(command.alias.strip())
+        expected_config = command_candidate.get(config_key)
+        actual_config = candidate.get(config_key)
+        expected_providers = (
+            expected_config.get("providers")
+            if isinstance(expected_config, dict)
+            else {}
+        )
+        actual_providers = (
+            actual_config.get("providers")
+            if isinstance(actual_config, dict)
+            else {}
+        )
+        if not isinstance(expected_providers, dict) or not isinstance(
+            actual_providers,
+            dict,
+        ):
+            continue
+        resurrected = sorted(
+            alias
+            for alias in retired_aliases
+            if alias not in expected_providers and alias in actual_providers
+        )
+        if resurrected:
+            raise ValueError(
+                f"Provider command changes reintroduced target={target} aliases: "
+                + ", ".join(resurrected)
+            )
 
 
 def _apply_image_provider_secrets(
@@ -841,10 +1032,21 @@ class ConfigLifecycle:
                 request.provider_commands,
                 self._secret_store,
             )
-            command_default = command_candidate.get("llm", {}).get(
-                "default_provider"
+            _validate_image_provider_mapping_patch(
+                command_candidate,
+                request.changes,
+            )
+            replacements = _delete_command_replacement_defaults(
+                before,
+                request.provider_commands,
             )
             candidate = _merge_patch(command_candidate, request.changes)
+            _validate_provider_command_outcomes(
+                command_candidate,
+                candidate,
+                request.provider_commands,
+            )
+            _validate_confirmed_default_replacements(candidate, replacements)
             ImageProvidersConfig.model_validate(
                 candidate.get("image_providers") or {}
             )
@@ -855,18 +1057,6 @@ class ConfigLifecycle:
             ImageProvidersConfig.model_validate(
                 candidate.get("image_providers") or {}
             )
-            if (
-                _delete_commands_replace_default(
-                    before,
-                    request.provider_commands,
-                )
-                and candidate.get("llm", {}).get("default_provider")
-                != command_default
-            ):
-                raise ValueError(
-                    "Provider delete changes must preserve the confirmed "
-                    "replacement default alias"
-                )
             before_references = _provider_reference_map(before)
             after_references = _provider_reference_map(candidate)
             reference_changes = [
@@ -962,22 +1152,21 @@ class ConfigLifecycle:
                 request.provider_commands,
                 self._secret_store,
             )
-            command_default = command_candidate.get("llm", {}).get(
-                "default_provider"
+            _validate_image_provider_mapping_patch(
+                command_candidate,
+                request.changes,
+            )
+            replacements = _delete_command_replacement_defaults(
+                before,
+                request.provider_commands,
             )
             candidate = _merge_patch(command_candidate, request.changes)
-            if (
-                _delete_commands_replace_default(
-                    before,
-                    request.provider_commands,
-                )
-                and candidate.get("llm", {}).get("default_provider")
-                != command_default
-            ):
-                raise ValueError(
-                    "Provider delete changes must preserve the confirmed "
-                    "replacement default alias"
-                )
+            _validate_provider_command_outcomes(
+                command_candidate,
+                candidate,
+                request.provider_commands,
+            )
+            _validate_confirmed_default_replacements(candidate, replacements)
             providers = candidate.get("llm", {}).get("providers", {})
             if not isinstance(providers, dict):
                 raise ValueError("llm.providers must be a mapping")
@@ -1018,9 +1207,11 @@ class ConfigLifecycle:
                 self._store.write_atomic(candidate)
                 for command in request.provider_commands:
                     if isinstance(command, RenameProviderCommand):
-                        rename_secret = getattr(self._secret_store, "rename", None)
-                        if callable(rename_secret):
-                            rename_secret(command.from_alias.strip(), command.to_alias.strip())
+                        self._secret_store.rename(
+                            command.target,
+                            command.from_alias.strip(),
+                            command.to_alias.strip(),
+                        )
                 self._secret_store.sync(candidate)
             except Exception:
                 self._store.write_atomic(before)
