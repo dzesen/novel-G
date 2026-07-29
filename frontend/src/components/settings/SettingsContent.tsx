@@ -6,6 +6,7 @@ import { Button } from "@heroui/react";
 import { useConfig } from "@/hooks/useConfig";
 import { DatabaseCard } from "@/components/settings/DatabaseCard";
 import { ProviderCard } from "@/components/settings/ProviderCard";
+import { ImageProviderCard } from "@/components/settings/ImageProviderCard";
 import { WorkflowCard } from "@/components/settings/WorkflowCard";
 import { ThemeCard } from "@/components/settings/ThemeCard";
 import { BackupCard } from "@/components/settings/BackupCard";
@@ -15,6 +16,7 @@ import type { AppConfig } from "@/types/config";
 import { useRouter, usePathname } from "next/navigation";
 
 type SettingsSection = "theme" | "users" | "database" | "backup" | "provider" | "workflow";
+type ProviderSettingsTab = "llm" | "image";
 
 const NAV_ITEMS: { key: SettingsSection; icon: React.ReactNode }[] = [
   {
@@ -92,6 +94,7 @@ export default function SettingsContent({
   const currentLocale = pathname.startsWith("/en") ? "en" : "zh";
   const isModal = presentation === "modal";
   const [activeSection, setActiveSection] = useState<SettingsSection>("theme");
+  const [providerSettingsTab, setProviderSettingsTab] = useState<ProviderSettingsTab>("llm");
   const showConfigActions = ["database", "provider", "workflow"].includes(activeSection);
   const {
     config,
@@ -103,6 +106,7 @@ export default function SettingsContent({
     saveConfig,
     queueProviderRename,
     queueProviderDelete,
+    imageProvidersDirty,
     workflowCatalog,
     setConfig,
     clearMessages,
@@ -146,7 +150,15 @@ export default function SettingsContent({
     const hasMongo =
       config.mongodb_url !== undefined || config.mongo_database_name !== undefined;
     const msg = hasMongo ? t("saveSuccessMongo") : t("saveSuccess");
-    await saveConfig(config, msg);
+    await saveConfig(config, msg, {
+      confirmProviderDeletion: (preview) => {
+        const paths = preview.reference_changes.map((change) => change.path).join("\n");
+        return window.confirm(t("providerDeleteConfirm", {
+          paths: paths || t("providerDeleteNoReferences"),
+        }));
+      },
+      missingConfirmationTokenMessage: t("providerDeleteMissingToken"),
+    });
   };
 
   const handleReload = async () => {
@@ -172,8 +184,8 @@ export default function SettingsContent({
   };
 
   const header = (
-    <div className={isModal ? "flex items-center justify-between gap-4 border-b border-border px-4 py-3" : "mb-8 flex items-start justify-between gap-4"}>
-      <div className="flex items-center gap-3">
+    <div className={isModal ? "flex flex-wrap items-center justify-between gap-3 border-b border-border px-3 py-3 sm:px-4" : "mb-8 flex flex-wrap items-start justify-between gap-4"}>
+      <div className="flex min-w-0 items-center gap-3">
         <button
           onClick={closeSettings}
           className="flex h-9 w-9 items-center justify-center rounded-lg text-muted transition-colors hover:bg-surface-secondary hover:text-foreground"
@@ -195,24 +207,24 @@ export default function SettingsContent({
             <path d="m12 19-7-7 7-7" />
           </svg>
         </button>
-        <div>
+        <div className="min-w-0">
           <h1 id="settings-title" className="text-2xl font-bold text-foreground">{t("title")}</h1>
           {!isModal && <p className="mt-1 text-sm text-muted">{t("description")}</p>}
         </div>
       </div>
-      {showConfigActions && <div className="flex shrink-0 gap-2">
+      {showConfigActions && <div className="flex w-full flex-wrap gap-2 sm:w-auto sm:shrink-0">
         <Button
           variant="outline"
           onPress={handleReload}
           isDisabled={saving}
-          className="border-border text-foreground hover:bg-surface-secondary"
+          className="flex-1 border-border text-foreground hover:bg-surface-secondary sm:flex-none"
         >
           {t("reload")}
         </Button>
         <Button
           onPress={handleSave}
           isDisabled={saving || !config}
-          className="bg-accent text-white hover:bg-accent-hover"
+          className="flex-1 bg-accent text-white hover:bg-accent-hover sm:flex-none"
         >
           {saving ? t("saving") : t("save")}
         </Button>
@@ -231,20 +243,66 @@ export default function SettingsContent({
         return <DatabaseCard config={config} onChange={updateConfig} />;
       case "provider":
         return (
-          <ProviderCard
-            config={config}
-            onChange={setConfig}
-            onProviderRename={(from, to) => queueProviderRename({
-              kind: "rename",
-              from_alias: from,
-              to_alias: to,
-            })}
-            onProviderDelete={(alias, replacementDefaultAlias) => queueProviderDelete({
-              kind: "delete",
-              alias,
-              replacement_default_alias: replacementDefaultAlias || null,
-            })}
-          />
+          <div className="space-y-4">
+            <div
+              role="tablist"
+              aria-label={t("provider.title")}
+              className="flex max-w-full gap-1 overflow-x-auto rounded-lg border border-border bg-surface-secondary/40 p-1"
+            >
+              {(["llm", "image"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={providerSettingsTab === tab}
+                  onClick={() => setProviderSettingsTab(tab)}
+                  className={`min-w-max flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+                    providerSettingsTab === tab
+                      ? "bg-surface text-accent shadow-sm"
+                      : "text-muted hover:text-foreground"
+                  }`}
+                >
+                  {tab === "llm" ? t("provider.title") : t("imageProvider.title")}
+                </button>
+              ))}
+            </div>
+            {providerSettingsTab === "llm" ? (
+              <ProviderCard
+                config={config}
+                onChange={setConfig}
+                onProviderRename={(from, to) => queueProviderRename({
+                  kind: "rename",
+                  target: "llm",
+                  from_alias: from,
+                  to_alias: to,
+                })}
+                onProviderDelete={(alias, replacementDefaultAlias) => queueProviderDelete({
+                  kind: "delete",
+                  target: "llm",
+                  alias,
+                  replacement_default_alias: replacementDefaultAlias || null,
+                })}
+              />
+            ) : (
+              <ImageProviderCard
+                config={config}
+                onChange={setConfig}
+                hasUnsavedChanges={imageProvidersDirty}
+                onProviderRename={(from, to) => queueProviderRename({
+                  kind: "rename",
+                  target: "image",
+                  from_alias: from,
+                  to_alias: to,
+                })}
+                onProviderDelete={(alias, replacementDefaultAlias) => queueProviderDelete({
+                  kind: "delete",
+                  target: "image",
+                  alias,
+                  replacement_default_alias: replacementDefaultAlias || null,
+                })}
+              />
+            )}
+          </div>
         );
       case "workflow":
         return <WorkflowCard config={config} catalog={workflowCatalog} onChange={setConfig} />;
@@ -253,7 +311,7 @@ export default function SettingsContent({
 
   const sidebar = (
     <nav className={isModal
-      ? "flex w-52 shrink-0 flex-col gap-1 border-r border-border bg-surface-secondary/40 px-2 py-3"
+      ? "flex w-full shrink-0 gap-1 overflow-x-auto border-b border-border bg-surface-secondary/40 px-2 py-2 md:w-52 md:flex-col md:overflow-y-auto md:border-b-0 md:border-r md:py-3"
       : "flex w-full shrink-0 gap-1 overflow-x-auto rounded-lg border border-border bg-surface p-2 md:w-56 md:flex-col md:p-3"
     }>
       {NAV_ITEMS.map((item) => (
@@ -297,9 +355,9 @@ export default function SettingsContent({
       <div className="text-muted">{error || "Failed to load"}</div>
     </div>
   ) : (
-    <div className="flex flex-1 flex-col gap-4 overflow-hidden md:flex-row md:gap-0">
+    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden md:flex-row md:gap-0">
       {sidebar}
-      <div className={isModal ? "flex-1 overflow-y-auto px-4 py-3" : "flex-1 overflow-y-auto md:pl-6"}>
+      <div className={isModal ? "min-w-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4" : "min-w-0 flex-1 overflow-y-auto md:pl-6"}>
         {messages}
         {renderSectionContent()}
       </div>
@@ -309,7 +367,7 @@ export default function SettingsContent({
   if (isModal) {
     return (
       <div
-        className="fixed inset-0 z-[60] bg-black/40 px-3 py-4 backdrop-blur-sm"
+        className="fixed inset-0 z-[60] bg-black/40 px-2 py-2 backdrop-blur-sm sm:px-3 sm:py-4"
         onMouseDown={closeSettings}
       >
         <div className="mx-auto flex h-full max-w-7xl items-center justify-center">
@@ -317,7 +375,7 @@ export default function SettingsContent({
             role="dialog"
             aria-modal="true"
             aria-labelledby="settings-title"
-            className="flex h-[88vh] w-full flex-col overflow-hidden rounded-lg border border-border bg-background shadow-2xl"
+            className="flex h-[94vh] w-full flex-col overflow-hidden rounded-lg border border-border bg-background shadow-2xl sm:h-[88vh]"
             onMouseDown={(event) => event.stopPropagation()}
           >
             {header}

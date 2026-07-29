@@ -14,20 +14,31 @@ import {
   type WorkflowDefinition,
 } from "@/types/config";
 
+function fingerprintImageProviders(config: AppConfig): string {
+  return JSON.stringify(config.image_providers);
+}
+
 interface ConfigState {
   config: AppConfig | null;
   workflowCatalog: WorkflowDefinition[];
   revision: string;
+  savedImageProvidersFingerprint: string;
   loading: boolean;
   saving: boolean;
   error: string | null;
   success: string | null;
 }
 
+interface SaveConfigOptions {
+  confirmProviderDeletion: (preview: ConfigChangePreview) => boolean | Promise<boolean>;
+  missingConfirmationTokenMessage: string;
+}
+
 export function useConfig() {
   const [pendingProviderCommands, setPendingProviderCommands] = useState<ProviderCommand[]>([]);
   const [state, setState] = useState<ConfigState>({
     config: null, workflowCatalog: [], revision: "", loading: true, saving: false,
+    savedImageProvidersFingerprint: "",
     error: null, success: null,
   });
 
@@ -46,6 +57,7 @@ export function useConfig() {
       setState((current) => ({
         ...current, config: normalized, workflowCatalog: catalog,
         revision: view.revision, loading: false,
+        savedImageProvidersFingerprint: fingerprintImageProviders(normalized),
       }));
       return normalized;
     } catch (error) {
@@ -57,21 +69,22 @@ export function useConfig() {
     }
   }, []);
 
-  const saveConfig = useCallback(async (data: AppConfig, successMsg: string) => {
+  const saveConfig = useCallback(async (
+    data: AppConfig,
+    successMsg: string,
+    options: SaveConfigOptions,
+  ) => {
     setState((current) => ({ ...current, saving: true, error: null, success: null }));
     try {
       const payload = buildConfigPatch(data, state.revision, pendingProviderCommands);
       if (pendingProviderCommands.some((command) => command.kind === "delete")) {
         const preview = await apiPost<ConfigChangePreview>("/api/config/preview", payload);
-        const paths = preview.reference_changes.map((change) => change.path).join("\n");
-        const confirmed = window.confirm(
-          `删除 Provider 将同步更新以下引用：\n${paths || "（无引用）"}\n\n确认继续？`,
-        );
+        const confirmed = await options.confirmProviderDeletion(preview);
         if (!confirmed) {
           setState((current) => ({ ...current, saving: false }));
           return false;
         }
-        if (!preview.confirmation_token) throw new Error("配置预览未返回确认令牌");
+        if (!preview.confirmation_token) throw new Error(options.missingConfirmationTokenMessage);
         payload.confirmation_token = preview.confirmation_token;
       }
 
@@ -80,6 +93,7 @@ export function useConfig() {
       setPendingProviderCommands([]);
       setState((current) => ({
         ...current, config: normalized, revision: view.revision,
+        savedImageProvidersFingerprint: fingerprintImageProviders(normalized),
         saving: false, success: successMsg,
       }));
       return true;
@@ -96,6 +110,9 @@ export function useConfig() {
 
   return {
     ...state,
+    imageProvidersDirty: state.config !== null && (
+      fingerprintImageProviders(state.config) !== state.savedImageProvidersFingerprint
+    ),
     fetchConfig,
     saveConfig,
     queueProviderRename: (rename: RenameProviderCommand) =>

@@ -151,6 +151,90 @@ export interface ImageProvidersConfig {
   };
 }
 
+export type ImageProviderDependencyKind = "node_types" | "checkpoints" | "loras";
+export interface ImageProviderDependencyCheck {
+  kind: ImageProviderDependencyKind;
+  required: string[];
+  available: string[];
+  missing: string[];
+  status: "passed" | "failed";
+}
+
+export interface ImageProviderTestFailure {
+  code: string;
+  message: string;
+  action: string;
+  retryable: boolean;
+}
+
+export interface ImageProviderTestResponse {
+  alias: string;
+  provider_type: string;
+  status: "passed" | "failed";
+  summary: string;
+  comfyui_version: string;
+  template_revision: string;
+  queue_running: number;
+  queue_pending: number;
+  checkpoint_names: string[];
+  lora_names: string[];
+  dependency_checks: ImageProviderDependencyCheck[];
+  failure: ImageProviderTestFailure | null;
+}
+
+export function newComfyUIImageProviderConfig(): ComfyUIImageProviderConfig {
+  return {
+    type: "comfyui",
+    base_url: "http://127.0.0.1:8188",
+    enabled: false,
+    timeout_seconds: 600,
+    max_concurrency: 1,
+    workflow: {
+      template_path: "",
+      template_revision: "",
+      reference_mode: "none",
+      bindings: {},
+      outputs: [],
+      dependencies: {
+        node_types: [],
+        checkpoints: [],
+        loras: [],
+      },
+    },
+  };
+}
+
+export function newOpenAICompatibleImageProviderConfig(): OpenAICompatibleImageProviderConfig {
+  return {
+    type: "openai_compatible",
+    base_url: "",
+    default_model: "",
+    enabled: false,
+    timeout_seconds: 120,
+    max_retries: 2,
+    max_concurrency: 1,
+    parameters: {},
+    result: {
+      items_path: "data",
+      url_field: "url",
+      base64_field: "b64_json",
+      mime_type_field: "mime_type",
+      revised_prompt_field: "revised_prompt",
+    },
+    has_api_key: false,
+    api_key: "",
+    api_key_mode: "keep",
+  };
+}
+
+export function newImageProviderConfig(
+  type: ImageProviderConfig["type"] = "comfyui",
+): ImageProviderConfig {
+  return type === "comfyui"
+    ? newComfyUIImageProviderConfig()
+    : newOpenAICompatibleImageProviderConfig();
+}
+
 export interface AppConfig {
   config_version?: number;
   mongodb_url: string;
@@ -168,13 +252,16 @@ export interface ConfigView {
   issues: ConfigIssue[];
 }
 
+export type ProviderCommandTarget = "llm" | "image";
 export interface RenameProviderCommand {
   kind: "rename";
+  target: ProviderCommandTarget;
   from_alias: string;
   to_alias: string;
 }
 export interface DeleteProviderCommand {
   kind: "delete";
+  target: ProviderCommandTarget;
   alias: string;
   replacement_default_alias?: string | null;
 }
@@ -310,6 +397,94 @@ export function getReplacementDefaultProviderAlias(
   return getProviderAliasesForSelection(providers).find(
     (alias) => alias !== aliasToRemove,
   ) || "";
+}
+
+export function isImageProviderSelectable(
+  providers: Record<string, ImageProviderConfig>,
+  alias: string,
+): boolean {
+  const provider = providers[alias];
+  return provider?.enabled === true && provider.type === "comfyui";
+}
+
+export function getImageProviderAliasesForSelection(
+  providers: Record<string, ImageProviderConfig>,
+  currentAlias = "",
+): string[] {
+  const aliases = Object.keys(providers).filter((alias) =>
+    isImageProviderSelectable(providers, alias),
+  );
+  return currentAlias && currentAlias in providers && !aliases.includes(currentAlias)
+    ? [currentAlias, ...aliases]
+    : aliases;
+}
+
+export function getReplacementDefaultImageProviderAlias(
+  providers: Record<string, ImageProviderConfig>,
+  aliasToRemove: string,
+): string {
+  return getImageProviderAliasesForSelection(providers).find(
+    (alias) => alias !== aliasToRemove,
+  ) || "";
+}
+
+export function renameImageProviderAlias(
+  config: AppConfig,
+  currentAlias: string,
+  nextAlias: string,
+): AppConfig {
+  const imageConfig = config.image_providers;
+  if (
+    !(currentAlias in imageConfig.providers)
+    || currentAlias === nextAlias
+    || nextAlias in imageConfig.providers
+  ) return config;
+  const mapAlias = (alias: string) => alias === currentAlias ? nextAlias : alias;
+  const providers = Object.fromEntries(
+    Object.entries(imageConfig.providers).map(([alias, provider]) => [
+      mapAlias(alias),
+      provider,
+    ]),
+  );
+  return {
+    ...config,
+    image_providers: {
+      ...imageConfig,
+      providers,
+      default_provider: mapAlias(imageConfig.default_provider),
+      usages: Object.fromEntries(
+        Object.entries(imageConfig.usages).map(([usage, alias]) => [usage, mapAlias(alias)]),
+      ) as ImageProvidersConfig["usages"],
+    },
+  };
+}
+
+export function removeImageProviderAlias(
+  config: AppConfig,
+  aliasToRemove: string,
+  replacementDefaultAlias = "",
+): AppConfig {
+  const imageConfig = config.image_providers;
+  if (!(aliasToRemove in imageConfig.providers)) return config;
+  const providers = { ...imageConfig.providers };
+  delete providers[aliasToRemove];
+  const replacement = isImageProviderSelectable(providers, replacementDefaultAlias)
+    ? replacementDefaultAlias
+    : "";
+  const clearAlias = (alias: string) => alias === aliasToRemove ? "" : alias;
+  return {
+    ...config,
+    image_providers: {
+      ...imageConfig,
+      providers,
+      default_provider: imageConfig.default_provider === aliasToRemove
+        ? replacement
+        : imageConfig.default_provider,
+      usages: Object.fromEntries(
+        Object.entries(imageConfig.usages).map(([usage, alias]) => [usage, clearAlias(alias)]),
+      ) as ImageProvidersConfig["usages"],
+    },
+  };
 }
 
 export function normalizeAppConfig(config: AppConfig, catalog: WorkflowDefinition[] = []): AppConfig {

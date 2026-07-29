@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -92,6 +92,26 @@ class ComfyUIClient:
             )
         return payload
 
+    @staticmethod
+    def _json_string_list(
+        response: httpx.Response,
+        *,
+        endpoint: str,
+    ) -> tuple[str, ...]:
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ComfyUIProtocolError(
+                f"ComfyUI {endpoint} did not return a JSON string list"
+            ) from error
+        if not isinstance(payload, list) or any(
+            not isinstance(item, str) for item in payload
+        ):
+            raise ComfyUIProtocolError(
+                f"ComfyUI {endpoint} did not return a JSON string list"
+            )
+        return tuple(payload)
+
     async def get_queue(self) -> QueueSnapshot:
         response = await self._request("GET", "/queue")
         if response.status_code != 200:
@@ -117,6 +137,30 @@ class ComfyUIClient:
         if response.status_code != 200:
             raise ComfyUIProtocolError("ComfyUI /system_stats request failed")
         return self._json_object(response, endpoint="/system_stats")
+
+    async def get_object_info(self) -> tuple[str, ...]:
+        response = await self._request("GET", "/object_info")
+        if response.status_code != 200:
+            raise ComfyUIProtocolError("ComfyUI /object_info request failed")
+        payload = self._json_object(response, endpoint="/object_info")
+        return tuple(payload)
+
+    async def get_model_names(
+        self,
+        model_kind: Literal["checkpoints", "loras"],
+    ) -> tuple[str, ...]:
+        if model_kind not in {"checkpoints", "loras"}:
+            raise ValueError(f"Unsupported ComfyUI model kind: {model_kind}")
+        endpoint = f"/models/{model_kind}"
+        response = await self._request("GET", endpoint)
+        if response.status_code != 200:
+            raise ComfyUIProtocolError(
+                f"ComfyUI {endpoint} request failed"
+            )
+        return self._json_string_list(
+            response,
+            endpoint=endpoint,
+        )
 
     async def submit_prompt(
         self,
