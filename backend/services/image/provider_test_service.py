@@ -54,7 +54,7 @@ def resolve_image_provider_for_test(
     if provider is None:
         raise ValueError(f"图像 Provider 不存在：{alias}")
     if provider.type == "openai_compatible":
-        raise ValueError("openai_compatible 图像适配器将在切片 10 接入")
+        raise ValueError("当前版本只支持 ComfyUI 图像后端")
     return alias, provider
 
 

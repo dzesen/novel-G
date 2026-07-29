@@ -746,7 +746,6 @@ function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
                     metadataStripped: tm("metadataStripped"),
                     otherTextMetadata: (keywords) =>
                       tm("otherTextMetadata", { keywords }),
-                    portraitDestination: tm("portraitDestination"),
                   },
                 )}
               </p>

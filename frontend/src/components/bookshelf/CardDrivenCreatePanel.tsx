@@ -206,7 +206,6 @@ export default function CardDrivenCreatePanel({
           metadataStripped: tm("metadataStripped"),
           otherTextMetadata: (keywords) =>
             tm("otherTextMetadata", { keywords }),
-          portraitDestination: tm("portraitDestination"),
         }),
       );
     } finally {

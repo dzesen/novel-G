@@ -2,7 +2,6 @@ export interface MissingCharacterMetadataMessages {
   aiGeneratedIllustration: string;
   metadataStripped: string;
   otherTextMetadata: (keywords: string) => string;
-  portraitDestination: string;
 }
 
 type MissingCharacterMetadataKind =
@@ -57,5 +56,5 @@ export function cardImportErrorMessage(
     return fallback;
   }
 
-  return `${reason} ${messages.portraitDestination}`;
+  return reason;
 }

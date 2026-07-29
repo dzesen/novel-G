@@ -1049,16 +1049,11 @@ def _raise_missing_character_metadata(
     text_keywords: tuple[str, ...],
     diagnostic_text: dict[str, list[bytes]],
 ) -> None:
-    destination = (
-        "如果它本来就是插图，请不要尝试让角色卡导入接受普通图片；"
-        "图形线切片 3 完成后，请从受管素材或角色立绘入口使用。"
-    )
     lowered_keywords = frozenset(keyword.lower() for keyword in text_keywords)
     if not text_keywords:
         message = (
             "PNG 完全没有文本块，元数据多半在转存或压缩时被剥离。"
             "请从卡站重新下载原始文件，不要使用截图或社交平台转发的版本。"
-            f"{destination}"
         )
         kind: Literal[
             "ai_generation_metadata",
@@ -1071,7 +1066,7 @@ def _raise_missing_character_metadata(
     ):
         message = (
             "这是 AI 生成的插图；PNG 携带的是 prompt、seed、sampler、steps、"
-            f"scale 等生成参数，不是角色数据。{destination}"
+            "scale 等生成参数，不是角色数据。"
         )
         kind = "ai_generation_metadata"
     else:
@@ -1080,7 +1075,6 @@ def _raise_missing_character_metadata(
             "PNG 不含 chara 或 ccv3 角色卡文本块。"
             f"实际存在的文本关键字：{keywords}。"
             "请据此确认是否下载了正确的原始角色卡。"
-            f"{destination}"
         )
         kind = "other_text_chunks"
     raise CharacterCardValidationError(
