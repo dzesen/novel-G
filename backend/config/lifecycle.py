@@ -25,6 +25,7 @@ from backend.config.config import (
     _migrate_config_tree,
     _normalize_config_tree,
 )
+from backend.config.image_providers import ImageProvidersConfig
 from backend.config.workflow_catalog import WORKFLOW_STEPS
 
 
@@ -86,6 +87,7 @@ class ConfigPatch(BaseModel):
     changes: dict[str, Any] = Field(default_factory=dict)
     provider_commands: list[ProviderCommand] = Field(default_factory=list)
     provider_secrets: dict[str, SecretPatch] = Field(default_factory=dict)
+    image_provider_secrets: dict[str, SecretPatch] = Field(default_factory=dict)
     expected_revision: str
     confirmation_token: str | None = None
 
@@ -164,6 +166,37 @@ class SecretVersionStore(Protocol):
     def revision_state(self) -> dict[str, Any]: ...
 
 
+_SECRET_STORE_VERSION = 2
+_LLM_SECRET_PREFIX = "llm:"
+_IMAGE_SECRET_PREFIX = "image:"
+
+
+def _secret_values(raw_config: dict[str, Any]) -> dict[str, str]:
+    """返回需要跟踪的密钥；key 带命名空间，避免两类 Provider 别名碰撞。"""
+    values: dict[str, str] = {}
+
+    llm_providers = raw_config.get("llm", {}).get("providers", {})
+    if isinstance(llm_providers, dict):
+        for alias, provider in llm_providers.items():
+            if isinstance(provider, dict):
+                values[f"{_LLM_SECRET_PREFIX}{alias}"] = str(
+                    provider.get("api_key") or ""
+                )
+
+    image_providers = raw_config.get("image_providers", {}).get("providers", {})
+    if isinstance(image_providers, dict):
+        for alias, provider in image_providers.items():
+            if (
+                isinstance(provider, dict)
+                and provider.get("type") == "openai_compatible"
+            ):
+                values[f"{_IMAGE_SECRET_PREFIX}{alias}"] = str(
+                    provider.get("api_key") or ""
+                )
+
+    return values
+
+
 class MemorySecretVersionStore:
     """用 keyed digest 检测密钥变化，不保存或暴露密钥本身。"""
 
@@ -173,28 +206,22 @@ class MemorySecretVersionStore:
         self._store_id = hashlib.sha256(seed).hexdigest()
 
     def sync(self, raw_config: dict[str, Any]) -> dict[str, int]:
-        providers = raw_config.get("llm", {}).get("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-
-        current_aliases: set[str] = set()
-        for alias, provider in providers.items():
-            if not isinstance(provider, dict):
-                continue
-            current_aliases.add(alias)
-            secret = str(provider.get("api_key") or "")
+        values = _secret_values(raw_config)
+        for record_key, secret in values.items():
             digest = hmac.new(self._seed, secret.encode("utf-8"), hashlib.sha256).hexdigest()
-            old = self._records.get(alias)
+            old = self._records.get(record_key)
             generation = 1 if old is None else old[1] + int(old[0] != digest)
-            self._records[alias] = (digest, generation)
+            self._records[record_key] = (digest, generation)
 
-        for alias in set(self._records) - current_aliases:
-            del self._records[alias]
-        return {alias: record[1] for alias, record in self._records.items()}
+        for record_key in set(self._records) - set(values):
+            del self._records[record_key]
+        return {key: record[1] for key, record in self._records.items()}
 
     def rename(self, from_alias: str, to_alias: str) -> None:
-        if from_alias in self._records:
-            self._records[to_alias] = self._records.pop(from_alias)
+        source = f"{_LLM_SECRET_PREFIX}{from_alias}"
+        target = f"{_LLM_SECRET_PREFIX}{to_alias}"
+        if source in self._records:
+            self._records[target] = self._records.pop(source)
 
     def snapshot_state(self) -> Any:
         return deepcopy(self._records)
@@ -219,7 +246,7 @@ class FileSecretVersionStore:
 
     def _new_state(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": _SECRET_STORE_VERSION,
             "store_id": secrets.token_hex(16),
             "seed": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"),
             "records": {},
@@ -231,6 +258,16 @@ class FileSecretVersionStore:
             if not isinstance(state, dict) or not isinstance(state.get("records"), dict):
                 raise ValueError("invalid secret version state")
             base64.urlsafe_b64decode(str(state["seed"]).encode("ascii"))
+            version = int(state.get("version", 1))
+            if version == 1:
+                state["records"] = {
+                    f"{_LLM_SECRET_PREFIX}{alias}": record
+                    for alias, record in state["records"].items()
+                }
+                state["version"] = _SECRET_STORE_VERSION
+                self._write_atomic(state)
+            elif version != _SECRET_STORE_VERSION:
+                raise ValueError("unsupported secret version state")
             return state
         except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
             state = self._new_state()
@@ -254,35 +291,33 @@ class FileSecretVersionStore:
         with self._lock:
             seed = base64.urlsafe_b64decode(self._state["seed"].encode("ascii"))
             records = self._state["records"]
-            providers = raw_config.get("llm", {}).get("providers", {})
-            if not isinstance(providers, dict):
-                providers = {}
             changed = False
-            current_aliases: set[str] = set()
-            for alias, provider in providers.items():
-                if not isinstance(provider, dict):
-                    continue
-                current_aliases.add(alias)
-                secret = str(provider.get("api_key") or "")
+            values = _secret_values(raw_config)
+            for record_key, secret in values.items():
                 digest = hmac.new(seed, secret.encode("utf-8"), hashlib.sha256).hexdigest()
-                old = records.get(alias)
+                old = records.get(record_key)
                 generation = 1 if not isinstance(old, dict) else int(old["generation"]) + int(old["digest"] != digest)
                 next_record = {"digest": digest, "generation": generation}
                 if old != next_record:
-                    records[alias] = next_record
+                    records[record_key] = next_record
                     changed = True
-            for alias in set(records) - current_aliases:
-                del records[alias]
+            for record_key in set(records) - set(values):
+                del records[record_key]
                 changed = True
             if changed:
                 self._write_atomic(self._state)
-            return {alias: int(record["generation"]) for alias, record in records.items()}
+            return {
+                record_key: int(record["generation"])
+                for record_key, record in records.items()
+            }
 
     def rename(self, from_alias: str, to_alias: str) -> None:
         with self._lock:
             records = self._state["records"]
-            if from_alias in records:
-                records[to_alias] = records.pop(from_alias)
+            source = f"{_LLM_SECRET_PREFIX}{from_alias}"
+            target = f"{_LLM_SECRET_PREFIX}{to_alias}"
+            if source in records:
+                records[target] = records.pop(source)
                 self._write_atomic(self._state)
 
     def snapshot_state(self) -> Any:
@@ -313,13 +348,14 @@ class FileSecretVersionStore:
 
 def _provider_issues(raw_config: dict[str, Any]) -> list[ConfigIssue]:
     llm_config = raw_config.get("llm")
-    if not isinstance(llm_config, dict):
-        return []
-    providers = llm_config.get("providers")
-    provider_aliases = set(providers) if isinstance(providers, dict) else set()
     issues: list[ConfigIssue] = []
 
-    def check(path: str, value: Any) -> None:
+    def check(
+        path: str,
+        value: Any,
+        providers: dict[str, Any],
+        provider_aliases: set[str],
+    ) -> None:
         alias = str(value or "").strip()
         if alias and alias not in provider_aliases:
             issues.append(
@@ -343,42 +379,94 @@ def _provider_issues(raw_config: dict[str, Any]) -> list[ConfigIssue]:
                     )
                 )
 
-    check("llm.default_provider", llm_config.get("default_provider"))
-    review = llm_config.get("format_review")
-    if isinstance(review, dict) and review.get("mode") == "provider":
-        check("llm.format_review.provider_alias", review.get("provider_alias"))
+    if isinstance(llm_config, dict):
+        llm_providers = llm_config.get("providers")
+        llm_providers = llm_providers if isinstance(llm_providers, dict) else {}
+        llm_aliases = set(llm_providers)
 
-    workflows = llm_config.get("workflows")
-    if isinstance(workflows, dict):
-        for workflow_name, workflow in workflows.items():
-            if not isinstance(workflow, dict):
-                continue
+        check(
+            "llm.default_provider",
+            llm_config.get("default_provider"),
+            llm_providers,
+            llm_aliases,
+        )
+        review = llm_config.get("format_review")
+        if isinstance(review, dict) and review.get("mode") == "provider":
             check(
-                f"llm.workflows.{workflow_name}.default_provider",
-                workflow.get("default_provider"),
+                "llm.format_review.provider_alias",
+                review.get("provider_alias"),
+                llm_providers,
+                llm_aliases,
             )
-            steps = workflow.get("steps")
-            if not isinstance(steps, dict):
-                continue
-            for step_name, step in steps.items():
-                if isinstance(step, dict):
-                    check(
-                        f"llm.workflows.{workflow_name}.steps.{step_name}.provider",
-                        step.get("provider"),
-                    )
+
+        workflows = llm_config.get("workflows")
+        if isinstance(workflows, dict):
+            for workflow_name, workflow in workflows.items():
+                if not isinstance(workflow, dict):
+                    continue
+                check(
+                    f"llm.workflows.{workflow_name}.default_provider",
+                    workflow.get("default_provider"),
+                    llm_providers,
+                    llm_aliases,
+                )
+                steps = workflow.get("steps")
+                if not isinstance(steps, dict):
+                    continue
+                for step_name, step in steps.items():
+                    if isinstance(step, dict):
+                        check(
+                            f"llm.workflows.{workflow_name}.steps.{step_name}.provider",
+                            step.get("provider"),
+                            llm_providers,
+                            llm_aliases,
+                        )
+
+    image_config = raw_config.get("image_providers")
+    if isinstance(image_config, dict):
+        image_providers = image_config.get("providers")
+        image_providers = (
+            image_providers if isinstance(image_providers, dict) else {}
+        )
+        image_aliases = set(image_providers)
+        check(
+            "image_providers.default_provider",
+            image_config.get("default_provider"),
+            image_providers,
+            image_aliases,
+        )
+        usages = image_config.get("usages")
+        if isinstance(usages, dict):
+            for usage, alias in usages.items():
+                check(
+                    f"image_providers.usages.{usage}",
+                    alias,
+                    image_providers,
+                    image_aliases,
+                )
     return issues
 
 
 def _redact_config(raw_config: dict[str, Any]) -> dict[str, Any]:
     redacted = deepcopy(raw_config)
     providers = redacted.get("llm", {}).get("providers", {})
-    if not isinstance(providers, dict):
-        return redacted
-    for provider in providers.values():
-        if not isinstance(provider, dict):
-            continue
-        secret = str(provider.pop("api_key", "") or "")
-        provider["has_api_key"] = bool(secret)
+    if isinstance(providers, dict):
+        for provider in providers.values():
+            if not isinstance(provider, dict):
+                continue
+            secret = str(provider.pop("api_key", "") or "")
+            provider["has_api_key"] = bool(secret)
+
+    image_providers = redacted.get("image_providers", {}).get("providers", {})
+    if isinstance(image_providers, dict):
+        for provider in image_providers.values():
+            if not isinstance(provider, dict):
+                continue
+            secret = str(provider.pop("api_key", "") or "")
+            if provider.get("type") == "openai_compatible":
+                provider["has_api_key"] = bool(secret)
+            else:
+                provider.pop("has_api_key", None)
     return redacted
 
 
@@ -449,32 +537,39 @@ def _clear_provider_references(llm_config: dict[str, Any], alias: str) -> None:
 
 def _provider_reference_map(raw_config: dict[str, Any]) -> dict[str, Any]:
     llm_config = raw_config.get("llm")
-    if not isinstance(llm_config, dict):
-        return {}
-    references: dict[str, Any] = {
-        "llm.default_provider": llm_config.get("default_provider"),
-    }
-    review = llm_config.get("format_review")
-    if isinstance(review, dict):
-        references["llm.format_review"] = deepcopy(review)
+    references: dict[str, Any] = {}
+    if isinstance(llm_config, dict):
+        references["llm.default_provider"] = llm_config.get("default_provider")
+        review = llm_config.get("format_review")
+        if isinstance(review, dict):
+            references["llm.format_review"] = deepcopy(review)
 
-    workflows = llm_config.get("workflows")
-    if not isinstance(workflows, dict):
-        return references
-    for workflow_name, workflow in workflows.items():
-        if not isinstance(workflow, dict):
-            continue
-        references[f"llm.workflows.{workflow_name}.default_provider"] = workflow.get(
+        workflows = llm_config.get("workflows")
+        if isinstance(workflows, dict):
+            for workflow_name, workflow in workflows.items():
+                if not isinstance(workflow, dict):
+                    continue
+                references[
+                    f"llm.workflows.{workflow_name}.default_provider"
+                ] = workflow.get("default_provider")
+                steps = workflow.get("steps")
+                if not isinstance(steps, dict):
+                    continue
+                for step_name, step in steps.items():
+                    if isinstance(step, dict):
+                        references[
+                            f"llm.workflows.{workflow_name}.steps.{step_name}.provider"
+                        ] = step.get("provider")
+
+    image_config = raw_config.get("image_providers")
+    if isinstance(image_config, dict):
+        references["image_providers.default_provider"] = image_config.get(
             "default_provider"
         )
-        steps = workflow.get("steps")
-        if not isinstance(steps, dict):
-            continue
-        for step_name, step in steps.items():
-            if isinstance(step, dict):
-                references[
-                    f"llm.workflows.{workflow_name}.steps.{step_name}.provider"
-                ] = step.get("provider")
+        usages = image_config.get("usages")
+        if isinstance(usages, dict):
+            for usage, alias in usages.items():
+                references[f"image_providers.usages.{usage}"] = alias
     return references
 
 
@@ -510,6 +605,36 @@ def _provider_resolutions(raw_config: dict[str, Any]) -> dict[str, Any]:
                     provider.get("timeout_seconds") if isinstance(provider, dict) else None
                 ),
             }
+
+    image_config = (
+        raw_config.get("image_providers")
+        if isinstance(raw_config.get("image_providers"), dict)
+        else {}
+    )
+    image_providers = (
+        image_config.get("providers")
+        if isinstance(image_config.get("providers"), dict)
+        else {}
+    )
+    image_default = str(image_config.get("default_provider") or "").strip()
+    image_usages = (
+        image_config.get("usages")
+        if isinstance(image_config.get("usages"), dict)
+        else {}
+    )
+    for usage, configured_alias in image_usages.items():
+        usage_alias = str(configured_alias or "").strip()
+        alias = usage_alias or image_default
+        provider = image_providers.get(alias) if alias else None
+        resolutions[f"image_providers.usages.{usage}"] = {
+            "provider_alias": alias or None,
+            "source": "usage" if usage_alias else "global",
+            "exists": isinstance(provider, dict),
+            "enabled": bool(
+                isinstance(provider, dict) and provider.get("enabled")
+            ),
+            "type": provider.get("type") if isinstance(provider, dict) else None,
+        }
     return resolutions
 
 
@@ -598,6 +723,35 @@ def _delete_commands_replace_default(
     return replaced
 
 
+def _apply_image_provider_secrets(
+    raw_config: dict[str, Any],
+    secret_patches: dict[str, SecretPatch],
+) -> None:
+    if not secret_patches:
+        return
+    image_config = raw_config.get("image_providers")
+    if not isinstance(image_config, dict):
+        raise ValueError("image_providers must be a mapping")
+    providers = image_config.get("providers")
+    if not isinstance(providers, dict):
+        raise ValueError("image_providers.providers must be a mapping")
+
+    for alias, secret_patch in secret_patches.items():
+        provider = providers.get(alias)
+        if not isinstance(provider, dict):
+            raise ValueError(
+                f"Image Provider does not exist for secret patch: {alias}"
+            )
+        if provider.get("type") != "openai_compatible":
+            raise ValueError(
+                f"Image Provider does not accept an API key: {alias}"
+            )
+        if secret_patch.mode == "replace":
+            provider["api_key"] = secret_patch.value
+        elif secret_patch.mode == "clear":
+            provider["api_key"] = ""
+
+
 class ConfigLifecycle:
     """统一提供脱敏查看、并发 revision 与后续补丁保存能力。"""
 
@@ -619,10 +773,13 @@ class ConfigLifecycle:
     @staticmethod
     def _request_digest(request: ConfigPatch) -> str:
         request_data = request.model_dump(exclude={"confirmation_token"})
-        for secret_patch in request_data.get("provider_secrets", {}).values():
-            value = secret_patch.get("value")
-            if value is not None:
-                secret_patch["value"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        for secret_group in ("provider_secrets", "image_provider_secrets"):
+            for secret_patch in request_data.get(secret_group, {}).values():
+                value = secret_patch.get("value")
+                if value is not None:
+                    secret_patch["value"] = hashlib.sha256(
+                        value.encode("utf-8")
+                    ).hexdigest()
         canonical = json.dumps(
             request_data,
             ensure_ascii=False,
@@ -688,6 +845,16 @@ class ConfigLifecycle:
                 "default_provider"
             )
             candidate = _merge_patch(command_candidate, request.changes)
+            ImageProvidersConfig.model_validate(
+                candidate.get("image_providers") or {}
+            )
+            _apply_image_provider_secrets(
+                candidate,
+                request.image_provider_secrets,
+            )
+            ImageProvidersConfig.model_validate(
+                candidate.get("image_providers") or {}
+            )
             if (
                 _delete_commands_replace_default(
                     before,
@@ -823,6 +990,17 @@ class ConfigLifecycle:
                     provider["api_key"] = secret_patch.value
                 elif secret_patch.mode == "clear":
                     provider["api_key"] = ""
+
+            ImageProvidersConfig.model_validate(
+                candidate.get("image_providers") or {}
+            )
+            _apply_image_provider_secrets(
+                candidate,
+                request.image_provider_secrets,
+            )
+            ImageProvidersConfig.model_validate(
+                candidate.get("image_providers") or {}
+            )
 
             if candidate.get("config_version") != CURRENT_CONFIG_VERSION:
                 raise ValueError(

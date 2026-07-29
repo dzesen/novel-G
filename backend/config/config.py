@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
+from backend.config.image_providers import normalize_image_providers_config
 from backend.config.workflow_catalog import WORKFLOW_STEPS
 
 CONFIG_DIR = Path(__file__).resolve().parent
@@ -32,12 +33,13 @@ _config_lock = RLock()
 _cached_config: Dict[str, Any] | None = None
 _cached_mtimes: tuple[float | None, float | None] | None = None
 _REPLACE_DICT_PATHS: set[tuple[str, ...]] = {
+    ("image_providers", "providers"),
     ("llm", "providers"),
 }
 _KNOWN_WORKFLOW_STEPS = WORKFLOW_STEPS
 _PROVIDER_RENAMES_KEY = "_provider_renames"
 _DEPRECATED_DEFAULT_REVIEWERS = {"openai_gpt5_4_nano"}
-CURRENT_CONFIG_VERSION = 4
+CURRENT_CONFIG_VERSION = 5
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)
 _OPENAI_ENDPOINT_SUFFIXES: tuple[tuple[str, ...], ...] = (
     ("chat", "completions"),
@@ -369,6 +371,9 @@ def _normalize_config_tree(config_data: Dict[str, Any]) -> Dict[str, Any]:
     """统一清洗配置结构，确保返回给前后端的配置可直接使用。"""
     normalized = deepcopy(config_data)
     normalized.pop(_PROVIDER_RENAMES_KEY, None)
+    normalized["image_providers"] = normalize_image_providers_config(
+        normalized.get("image_providers")
+    )
 
     llm_config = normalized.get("llm")
     if not isinstance(llm_config, dict):
@@ -473,6 +478,22 @@ def _migrate_config_tree(config_data: Dict[str, Any]) -> Dict[str, Any]:
         version = 4
         migrated["config_version"] = version
 
+    if version == 4:
+        migrated.setdefault(
+            "image_providers",
+            {
+                "default_provider": "",
+                "providers": {},
+                "usages": {
+                    "character_portrait": "",
+                    "cover": "",
+                    "scene_illustration": "",
+                },
+            },
+        )
+        version = 5
+        migrated["config_version"] = version
+
     return migrated
 
 
@@ -510,6 +531,27 @@ def _provider_references(config: Dict[str, Any]) -> Dict[str, str]:
     return references
 
 
+def _image_provider_references(config: Dict[str, Any]) -> Dict[str, str]:
+    """收集图像用途引用，命名空间与 LLM Provider 完全分离。"""
+    image_config = config.get("image_providers")
+    if not isinstance(image_config, dict):
+        return {}
+
+    references: Dict[str, str] = {}
+
+    def add(path: str, value: Any) -> None:
+        alias = str(value or "").strip()
+        if alias:
+            references[path] = alias
+
+    add("image_providers.default_provider", image_config.get("default_provider"))
+    usages = image_config.get("usages")
+    if isinstance(usages, dict):
+        for usage in ("character_portrait", "cover", "scene_illustration"):
+            add(f"image_providers.usages.{usage}", usages.get(usage))
+    return references
+
+
 def _validate_provider_reference_changes(current: Dict[str, Any], candidate: Dict[str, Any]) -> None:
     """允许保留历史坏引用，但拒绝本次新增或由删除 Provider 造成的坏引用。"""
     current_llm = current.get("llm") if isinstance(current.get("llm"), dict) else {}
@@ -525,6 +567,40 @@ def _validate_provider_reference_changes(current: Dict[str, Any], candidate: Dic
         was_historically_invalid = old_alias == alias and alias not in current_providers
         if not was_historically_invalid:
             raise ValueError(f"Invalid Provider reference at {path}: {alias}")
+
+    current_image = (
+        current.get("image_providers")
+        if isinstance(current.get("image_providers"), dict)
+        else {}
+    )
+    candidate_image = (
+        candidate.get("image_providers")
+        if isinstance(candidate.get("image_providers"), dict)
+        else {}
+    )
+    current_image_provider_map = current_image.get("providers")
+    candidate_image_provider_map = candidate_image.get("providers")
+    current_image_providers = (
+        set(current_image_provider_map)
+        if isinstance(current_image_provider_map, dict)
+        else set()
+    )
+    candidate_image_providers = (
+        set(candidate_image_provider_map)
+        if isinstance(candidate_image_provider_map, dict)
+        else set()
+    )
+    current_image_references = _image_provider_references(current)
+
+    for path, alias in _image_provider_references(candidate).items():
+        if alias in candidate_image_providers:
+            continue
+        old_alias = current_image_references.get(path)
+        was_historically_invalid = (
+            old_alias == alias and alias not in current_image_providers
+        )
+        if not was_historically_invalid:
+            raise ValueError(f"Invalid image Provider reference at {path}: {alias}")
 
 
 def _get_mtime(path: Path) -> float | None:

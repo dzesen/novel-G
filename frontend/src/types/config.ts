@@ -69,12 +69,95 @@ export interface LLMConfig {
   providers: Record<string, ProviderConfig>;
   workflows: Record<string, WorkflowConfig>;
 }
+
+export type ImageConfigScalar = string | number | boolean;
+export interface ImageFieldParameterMapping {
+  kind: "field";
+  field: string;
+  minimum?: number | null;
+  maximum?: number | null;
+  allowed_values?: ImageConfigScalar[] | null;
+  default?: ImageConfigScalar | null;
+}
+export interface ImageValueMapParameterMapping {
+  kind: "value_map";
+  values: Record<string, Record<string, ImageConfigScalar>>;
+}
+export type ImageParameterMapping =
+  | ImageFieldParameterMapping
+  | ImageValueMapParameterMapping;
+
+export interface ComfyUIWorkflowInputBinding {
+  node_id: string;
+  input: string;
+  required: boolean;
+  upload: boolean;
+}
+export interface ComfyUIWorkflowOutputBinding {
+  node_id: string;
+  field: string;
+}
+export interface ComfyUIWorkflowConfig {
+  template_path: string;
+  template_revision: string;
+  reference_mode: "none" | "img2img" | "controlnet" | "style_reference" | "edit_model";
+  bindings: Record<string, ComfyUIWorkflowInputBinding>;
+  outputs: ComfyUIWorkflowOutputBinding[];
+  dependencies: {
+    node_types: string[];
+    checkpoints: string[];
+    loras: string[];
+  };
+}
+export interface ComfyUIImageProviderConfig {
+  type: "comfyui";
+  base_url: string;
+  enabled: boolean;
+  timeout_seconds: number;
+  max_concurrency: number;
+  workflow: ComfyUIWorkflowConfig;
+}
+export interface OpenAICompatibleImageProviderConfig {
+  type: "openai_compatible";
+  base_url: string;
+  default_model: string;
+  enabled: boolean;
+  timeout_seconds: number;
+  max_retries: number;
+  max_concurrency: number;
+  parameters: Record<string, ImageParameterMapping | null>;
+  result: {
+    items_path: string;
+    url_field: string;
+    base64_field: string;
+    mime_type_field: string;
+    revised_prompt_field: string;
+  };
+  has_api_key: boolean;
+  /** 只存在于浏览器草稿，永不放进 changes。 */
+  api_key?: string;
+  api_key_mode?: SecretPatchMode;
+}
+export type ImageProviderConfig =
+  | ComfyUIImageProviderConfig
+  | OpenAICompatibleImageProviderConfig;
+export interface ImageProvidersConfig {
+  default_provider: string;
+  providers: Record<string, ImageProviderConfig>;
+  usages: {
+    character_portrait: string;
+    cover: string;
+    scene_illustration: string;
+  };
+}
+
 export interface AppConfig {
   config_version?: number;
   mongodb_url: string;
   mongo_database_name: string;
   mongo_timeout_ms: number;
   llm: LLMConfig;
+  image_providers: ImageProvidersConfig;
   [key: string]: unknown;
 }
 export interface ConfigIssue { path: string; code: string; message: string; severity: string; }
@@ -101,6 +184,7 @@ export interface ConfigPatchPayload {
   changes: Record<string, unknown>;
   provider_commands: ProviderCommand[];
   provider_secrets: Record<string, SecretPatch>;
+  image_provider_secrets: Record<string, SecretPatch>;
   expected_revision: string;
   confirmation_token?: string;
 }
@@ -244,11 +328,41 @@ export function normalizeAppConfig(config: AppConfig, catalog: WorkflowDefinitio
     name,
     newWorkflowConfig(name, "", config.llm?.workflows?.[name], definitions.get(name)),
   ]));
+  const imageConfig = config.image_providers || {
+    default_provider: "",
+    providers: {},
+    usages: { character_portrait: "", cover: "", scene_illustration: "" },
+  };
+  const imageProviders: Record<string, ImageProviderConfig> = Object.fromEntries(
+    Object.entries(imageConfig.providers || {}).map(([alias, provider]) => {
+      const editable = { ...provider } as Record<string, unknown>;
+      delete editable.api_key;
+      delete editable.api_key_mode;
+      if (provider.type === "openai_compatible") {
+        return [alias, {
+          ...editable,
+          has_api_key: Boolean(provider.has_api_key),
+          api_key: "",
+          api_key_mode: "keep" as const,
+        } as OpenAICompatibleImageProviderConfig];
+      }
+      delete editable.has_api_key;
+      return [alias, editable as unknown as ComfyUIImageProviderConfig];
+    }),
+  );
   return { ...config, llm: {
     ...config.llm,
     format_review: config.llm?.format_review || { mode: "disabled", provider_alias: null },
     providers,
     workflows,
+  }, image_providers: {
+    ...imageConfig,
+    providers: imageProviders,
+    usages: {
+      character_portrait: imageConfig.usages?.character_portrait || "",
+      cover: imageConfig.usages?.cover || "",
+      scene_illustration: imageConfig.usages?.scene_illustration || "",
+    },
   }};
 }
 
@@ -280,10 +394,31 @@ export function buildConfigPatch(
     delete editable.has_api_key;
     return [alias, editable];
   }));
+  const imageProviderSecrets: Record<string, SecretPatch> = {};
+  const imageProviders = Object.fromEntries(
+    Object.entries(config.image_providers.providers).map(([alias, provider]) => {
+      const editable = { ...provider } as Record<string, unknown>;
+      delete editable.api_key;
+      delete editable.api_key_mode;
+      delete editable.has_api_key;
+      if (provider.type === "openai_compatible") {
+        const mode = provider.api_key_mode || "keep";
+        imageProviderSecrets[alias] = mode === "replace"
+          ? { mode, value: provider.api_key || "" }
+          : { mode };
+      }
+      return [alias, editable];
+    }),
+  );
   return {
-    changes: { ...config, llm: { ...config.llm, providers } },
+    changes: {
+      ...config,
+      llm: { ...config.llm, providers },
+      image_providers: { ...config.image_providers, providers: imageProviders },
+    },
     provider_commands: providerCommands,
     provider_secrets: providerSecrets,
+    image_provider_secrets: imageProviderSecrets,
     expected_revision: revision,
   };
 }
