@@ -38,6 +38,9 @@ from backend.services.interop.character_card_adapter import (
     MAX_STRING_CHARS,
     ParsedCharacterCard,
 )
+from backend.services.interop.character_card_avatar_import import (
+    describe_avatar_source,
+)
 from backend.services.interop.world_book_adapter import (
     MAX_WORLD_BOOK_ENTRIES,
     MAX_WORLD_BOOK_JSON_BYTES,
@@ -177,7 +180,12 @@ def _proposal_digest(
 
 
 def _proposal_integrity_matches(proposal: dict[str, Any]) -> bool:
-    candidate_digest = _digest(proposal.get("proposed_cards") or [])
+    candidate_digest = _digest(
+        {
+            "proposed_cards": proposal.get("proposed_cards") or [],
+            "avatar_preview": proposal.get("avatar_preview"),
+        }
+    )
     if not hmac.compare_digest(
         candidate_digest,
         str(proposal.get("candidate_digest") or ""),
@@ -202,7 +210,7 @@ def _default_config_snapshot() -> dict[str, Any]:
     configured = get_config_value("card_import", {})
     return {
         "implementation": {
-            "mapping_version": 2,
+            "mapping_version": 3,
             "raw_payload_max_bytes": MAX_RAW_PAYLOAD_BYTES,
             "worldbook_raw_payload_max_bytes": (
                 MAX_WORLD_BOOK_RAW_PAYLOAD_BYTES
@@ -813,7 +821,17 @@ class CardImportProposalService:
                 )
             )
         target_cards_digest = _digest(conflict_sets)
-        candidate_digest = _digest(proposed_cards)
+        avatar_preview = (
+            describe_avatar_source(parsed).as_dict()
+            if isinstance(parsed, ParsedCharacterCard)
+            else None
+        )
+        candidate_digest = _digest(
+            {
+                "proposed_cards": proposed_cards,
+                "avatar_preview": avatar_preview,
+            }
+        )
         combined_digest = _proposal_digest(
             source_hash=source_hash,
             novel_snapshot_digest=novel_snapshot_digest,
@@ -857,6 +875,7 @@ class CardImportProposalService:
                 if isinstance(parsed, ParsedCharacterCard)
                 else []
             ),
+            "avatar_preview": avatar_preview,
             "container_preview": {
                 "selected_png_chunk": (
                     parsed.selected_png_chunk
@@ -1478,7 +1497,12 @@ class CardImportProposalService:
 
         novel_snapshot_digest = _digest(novel_snapshot)
         target_cards_digest = _digest(conflict_sets)
-        candidate_digest = _digest(proposed_cards)
+        candidate_digest = _digest(
+            {
+                "proposed_cards": proposed_cards,
+                "avatar_preview": proposal.get("avatar_preview"),
+            }
+        )
         rebound_digest = _proposal_digest(
             source_hash=str(proposal.get("source_hash") or ""),
             novel_snapshot_digest=novel_snapshot_digest,

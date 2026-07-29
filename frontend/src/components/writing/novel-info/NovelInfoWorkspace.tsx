@@ -10,7 +10,15 @@ import {
 import { useTranslations } from "next-intl";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { Button } from "@heroui/react";
-import { ApiError, apiGet, apiPost } from "@/lib/api";
+import { ApiError, apiGet, apiPost, apiPostRaw } from "@/lib/api";
+import {
+  deleteCardAvatarHandoffs,
+  loadCardAvatarHandoff,
+} from "@/lib/cardAvatarHandoff";
+import {
+  CardAvatarSourceUnavailable,
+  isPermanentCardAvatarTransferFailure,
+} from "@/lib/cardAvatarTransfer";
 import type {
   CreateNovelRequest,
   NovelDetail,
@@ -123,6 +131,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
 
   /* create novel */
   const handleCreate = async (openCardCuration: boolean) => {
+    let createdNovelId: string | null = null;
     try {
       setCreating(true);
       const sourceDraft = data as Partial<WritingDraft>;
@@ -156,7 +165,55 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         card_imports: sourceDraft.card_imports,
       };
       const res = await apiPost<{ id: string }>("/api/novels/create", payload);
+      createdNovelId = res.id;
+      const avatarProposalIds = sourceDraft.card_avatar_proposal_ids ?? [];
+      const completedAvatarProposalIds: string[] = [];
+      const permanentlyRejectedAvatarProposalIds: string[] = [];
+      const retryableAvatarProposalIds: string[] = [];
+      for (const proposalId of avatarProposalIds) {
+        try {
+          const source = await loadCardAvatarHandoff(proposalId);
+          if (!source) {
+            throw new CardAvatarSourceUnavailable();
+          }
+          await apiPostRaw(
+            `/api/card-imports/proposals/${proposalId}/avatar`,
+            source.blob,
+            source.contentType,
+          );
+          completedAvatarProposalIds.push(proposalId);
+        } catch (cause) {
+          if (isPermanentCardAvatarTransferFailure(cause)) {
+            permanentlyRejectedAvatarProposalIds.push(proposalId);
+          } else {
+            retryableAvatarProposalIds.push(proposalId);
+          }
+        }
+      }
+      await deleteCardAvatarHandoffs([
+        ...completedAvatarProposalIds,
+        ...permanentlyRejectedAvatarProposalIds,
+      ]).catch(() => undefined);
+      if (retryableAvatarProposalIds.length > 0) {
+        updateCreateData((previous) => ({
+          ...previous,
+          card_avatar_proposal_ids: retryableAvatarProposalIds,
+        }));
+        alert(
+          permanentlyRejectedAvatarProposalIds.length > 0
+            ? tw("avatarTransferMixedFailure")
+            : tw("avatarTransferFailed"),
+        );
+        return;
+      }
       clearWritingDraft(draftId);
+      if (permanentlyRejectedAvatarProposalIds.length > 0) {
+        alert(tw("avatarTransferRejected"));
+        router.push(
+          `/${locale}/writing/${createdNovelId}?cardType=character`,
+        );
+        return;
+      }
       const destinationParams = new URLSearchParams(searchParams.toString());
       destinationParams.delete("draft");
       destinationParams.delete("cardType");
@@ -172,7 +229,11 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         }`,
       );
     } catch {
-      alert(tw("createFailed"));
+      alert(
+        createdNovelId
+          ? tw("avatarTransferFailed")
+          : tw("createFailed"),
+      );
     } finally {
       setCreating(false);
     }
@@ -200,6 +261,16 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       [field]: value,
       _rewriteState: normalizeRewriteState(rewriteState),
     }));
+  };
+
+  const discardCreateDraft = async () => {
+    const avatarProposalIds =
+      (data as Partial<WritingDraft>).card_avatar_proposal_ids ?? [];
+    await deleteCardAvatarHandoffs(avatarProposalIds).catch(
+      () => undefined,
+    );
+    clearWritingDraft(draftId);
+    router.push(`/${locale}`);
   };
 
   /* danger confirm promise */
@@ -335,10 +406,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         <StickyActionBar>
           <Button
             variant="ghost"
-            onPress={() => {
-              clearWritingDraft(draftId);
-              router.push(`/${locale}`);
-            }}
+            onPress={() => void discardCreateDraft()}
           >
             {twd("backToCreate")}
           </Button>

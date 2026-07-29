@@ -1290,14 +1290,9 @@ def _with_png_preview(
     label: str,
     raw_card: dict[str, Any] | None = None,
 ) -> ParsedCharacterCard:
-    image_warning = "PNG 图像数据已丢弃，本版不导入头像"
-    warnings = parsed.compatibility_warnings
-    if image_warning not in warnings:
-        warnings += (image_warning,)
     return replace(
         parsed,
         raw_card=deepcopy(raw_card) if raw_card is not None else parsed.raw_card,
-        compatibility_warnings=warnings,
         selected_png_chunk=selected_chunk,
         png_chunk_classification=classification,
         png_preview_label=label,

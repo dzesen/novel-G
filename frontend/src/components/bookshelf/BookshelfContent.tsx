@@ -79,7 +79,11 @@ export default function BookshelfContent() {
   return (
     <div className="mx-auto max-w-7xl h-[calc(100vh-3.5rem)] flex gap-4 p-4">
       {/* Left: Novel List (3/10) */}
-      <div className="w-[30%] min-w-[280px] flex flex-col">
+      <div
+        className={`w-[30%] min-w-[280px] flex-col ${
+          rightPanel === "card-new" ? "hidden lg:flex" : "flex"
+        }`}
+      >
         <NovelList
           novels={novels}
           selectedId={selectedId}

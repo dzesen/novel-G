@@ -3,13 +3,18 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
-import { ApiError, apiPost, apiPostForm } from "@/lib/api";
+import { ApiError, apiPost, apiPostForm, apiPostRaw } from "@/lib/api";
+import {
+  CardAvatarSourceUnavailable,
+  isPermanentCardAvatarTransferFailure,
+} from "@/lib/cardAvatarTransfer";
 import { cardImportErrorMessage } from "@/lib/cardImportErrors";
 import type {
   CardImportCandidate,
   CardImportConflict,
   CardImportDecision,
   CardImportProposal,
+  CharacterCardAvatarImportResult,
   ReferenceCardCurationResult,
 } from "@/types/novel";
 
@@ -143,6 +148,17 @@ function addCounts(
   };
 }
 
+function requiresAvatarTransfer(
+  proposal: CardImportProposal,
+  result: ReferenceCardCurationResult | undefined,
+): boolean {
+  if (!proposal.avatar_preview?.importable || !result) return false;
+  const character = result.mappings.find(
+    (mapping) => mapping.candidate_id === "character:0",
+  );
+  return Boolean(character && character.action !== "skip" && character.card_id);
+}
+
 export default function CardImportDialog({
   novelId,
   isOpen,
@@ -156,6 +172,7 @@ export default function CardImportDialog({
   );
   const [files, setFiles] = useState<File[]>([]);
   const [proposals, setProposals] = useState<CardImportProposal[]>([]);
+  const [proposalFiles, setProposalFiles] = useState<Record<string, File>>({});
   const [decisions, setDecisions] = useState<
     Record<string, CardImportDecision>
   >({});
@@ -163,6 +180,12 @@ export default function CardImportDialog({
   const [applyErrors, setApplyErrors] = useState<Record<string, string>>({});
   const [results, setResults] = useState<
     Record<string, ReferenceCardCurationResult>
+  >({});
+  const [avatarResults, setAvatarResults] = useState<
+    Record<string, CharacterCardAvatarImportResult>
+  >({});
+  const [avatarRejections, setAvatarRejections] = useState<
+    Record<string, true>
   >({});
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
@@ -174,10 +197,13 @@ export default function CardImportDialog({
     setStage("upload");
     setFiles([]);
     setProposals([]);
+    setProposalFiles({});
     setDecisions({});
     setUploadFailures([]);
     setApplyErrors({});
     setResults({});
+    setAvatarResults({});
+    setAvatarRejections({});
     setUploadProgress({ current: 0, total: 0 });
     setApplyProgress({ current: 0, total: 0 });
     setPage(0);
@@ -230,6 +256,21 @@ export default function CardImportDialog({
       ),
     [results],
   );
+  const importedAvatarCount = Object.values(avatarResults).filter(
+    (result) => result.status === "imported",
+  ).length;
+  const rejectedAvatarCount = Object.keys(avatarRejections).length;
+  const allTransfersComplete =
+    proposals.length > 0 &&
+    proposals.every((proposal) => {
+      const result = results[proposal.proposal_id];
+      return Boolean(
+        result &&
+          (!requiresAvatarTransfer(proposal, result) ||
+            avatarResults[proposal.proposal_id] ||
+            avatarRejections[proposal.proposal_id]),
+      );
+    });
 
   const preview = async () => {
     if (!files.length || files.length > MAX_FILES) return;
@@ -237,18 +278,19 @@ export default function CardImportDialog({
     setUploadFailures([]);
     setUploadProgress({ current: 0, total: files.length });
     const nextProposals: CardImportProposal[] = [];
+    const nextProposalFiles: Record<string, File> = {};
     const nextFailures: UploadFailure[] = [];
     for (const [index, file] of files.entries()) {
       setUploadProgress({ current: index + 1, total: files.length });
       const form = new FormData();
       form.append("file", file);
       try {
-        nextProposals.push(
-          await apiPostForm<CardImportProposal>(
-            `/api/card-imports/novel/${novelId}/preview`,
-            form,
-          ),
+        const proposal = await apiPostForm<CardImportProposal>(
+          `/api/card-imports/novel/${novelId}/preview`,
+          form,
         );
+        nextProposals.push(proposal);
+        nextProposalFiles[proposal.proposal_id] = file;
       } catch (reason) {
         nextFailures.push({
           file,
@@ -262,6 +304,7 @@ export default function CardImportDialog({
     setUploadFailures(nextFailures);
     if (nextProposals.length) {
       setProposals(nextProposals);
+      setProposalFiles(nextProposalFiles);
       setDecisions(initializeDecisions(nextProposals));
       setPage(0);
       setStage("review");
@@ -297,19 +340,31 @@ export default function CardImportDialog({
 
   const apply = async () => {
     const pending = proposals.filter(
-      (proposal) => !results[proposal.proposal_id],
+      (proposal) => {
+        const result = results[proposal.proposal_id];
+        return (
+          !result ||
+          (requiresAvatarTransfer(proposal, result) &&
+            !avatarResults[proposal.proposal_id] &&
+            !avatarRejections[proposal.proposal_id])
+        );
+      },
     );
     if (!pending.length) return;
     setApplying(true);
     setApplyErrors({});
     setApplyProgress({ current: 0, total: pending.length });
     const nextResults = { ...results };
+    const nextAvatarResults = { ...avatarResults };
+    const nextAvatarRejections = { ...avatarRejections };
     const nextErrors: Record<string, string> = {};
     for (const [index, proposal] of pending.entries()) {
       setApplyProgress({ current: index + 1, total: pending.length });
+      let phase: "apply" | "avatar" = "apply";
       try {
-        nextResults[proposal.proposal_id] =
-          await apiPost<ReferenceCardCurationResult>(
+        const result =
+          nextResults[proposal.proposal_id] ??
+          (await apiPost<ReferenceCardCurationResult>(
             `/api/card-imports/proposals/${proposal.proposal_id}/apply`,
             {
               digest: proposal.digest,
@@ -321,24 +376,63 @@ export default function CardImportDialog({
                       candidate.candidate_id,
                     )
                   ] ?? recommendedDecision(candidate),
-              ),
+                ),
             },
-          );
+          ));
+        nextResults[proposal.proposal_id] = result;
+        if (
+          requiresAvatarTransfer(proposal, result) &&
+          !nextAvatarResults[proposal.proposal_id] &&
+          !nextAvatarRejections[proposal.proposal_id]
+        ) {
+          phase = "avatar";
+          const source = proposalFiles[proposal.proposal_id];
+          if (!source) {
+            throw new CardAvatarSourceUnavailable();
+          }
+          nextAvatarResults[proposal.proposal_id] =
+            await apiPostRaw<CharacterCardAvatarImportResult>(
+              `/api/card-imports/proposals/${proposal.proposal_id}/avatar`,
+              source,
+              proposal.source_container === "png"
+                ? "image/png"
+                : "application/json",
+            );
+        }
       } catch (reason) {
-        nextErrors[proposal.proposal_id] =
-          reason instanceof Error
-            ? reason.message
-            : t("errors.applyFailed");
+        if (
+          phase === "avatar" &&
+          isPermanentCardAvatarTransferFailure(reason)
+        ) {
+          nextAvatarRejections[proposal.proposal_id] = true;
+        } else {
+          nextErrors[proposal.proposal_id] =
+            phase === "avatar"
+              ? t("errors.avatarImportFailed")
+              : reason instanceof Error
+                ? reason.message
+                : t("errors.applyFailed");
+        }
       }
     }
     setResults(nextResults);
+    setAvatarResults(nextAvatarResults);
+    setAvatarRejections(nextAvatarRejections);
     setApplyErrors(nextErrors);
     if (Object.keys(nextResults).length > Object.keys(results).length) {
       await onApplied();
     }
     if (
       Object.keys(nextErrors).length === 0 &&
-      Object.keys(nextResults).length === proposals.length
+      proposals.every((proposal) => {
+        const result = nextResults[proposal.proposal_id];
+        return Boolean(
+          result &&
+            (!requiresAvatarTransfer(proposal, result) ||
+              nextAvatarResults[proposal.proposal_id] ||
+              nextAvatarRejections[proposal.proposal_id]),
+        );
+      })
     ) {
       setStage("complete");
     }
@@ -413,6 +507,20 @@ export default function CardImportDialog({
               <p className="mt-3 text-xs leading-5 text-muted">
                 {t("complete.refreshHint")}
               </p>
+              {importedAvatarCount > 0 && (
+                <p className="mt-2 text-sm font-medium text-emerald-700 dark:text-emerald-300">
+                  {t("complete.avatarsImported", {
+                    count: importedAvatarCount,
+                  })}
+                </p>
+              )}
+              {rejectedAvatarCount > 0 && (
+                <p className="mt-2 text-sm font-medium text-amber-800 dark:text-amber-200">
+                  {t("complete.avatarsRejected", {
+                    count: rejectedAvatarCount,
+                  })}
+                </p>
+              )}
               <Button
                 className="mt-7 bg-accent text-white hover:bg-accent-hover"
                 variant="primary"
@@ -465,6 +573,8 @@ export default function CardImportDialog({
                     key={proposal.proposal_id}
                     proposal={proposal}
                     result={results[proposal.proposal_id]}
+                    avatarResult={avatarResults[proposal.proposal_id]}
+                    avatarRejected={avatarRejections[proposal.proposal_id]}
                     applyError={applyErrors[proposal.proposal_id]}
                   />
                 ))}
@@ -549,6 +659,9 @@ export default function CardImportDialog({
                   setProposals([]);
                   setDecisions({});
                   setResults({});
+                  setAvatarResults({});
+                  setAvatarRejections({});
+                  setProposalFiles({});
                   setApplyErrors({});
                   setPage(0);
                 }}
@@ -560,7 +673,7 @@ export default function CardImportDialog({
                 variant="primary"
                 isDisabled={
                   applying ||
-                  Object.keys(results).length === proposals.length
+                  allTransfersComplete
                 }
                 onPress={() => void apply()}
               >
@@ -797,10 +910,14 @@ function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
 function SourceReview({
   proposal,
   result,
+  avatarResult,
+  avatarRejected,
   applyError,
 }: {
   proposal: CardImportProposal;
   result?: ReferenceCardCurationResult;
+  avatarResult?: CharacterCardAvatarImportResult;
+  avatarRejected?: boolean;
   applyError?: string;
 }) {
   const t = useTranslations("writing.referenceCards.import");
@@ -866,11 +983,23 @@ function SourceReview({
               </dd>
             </div>
           </dl>
-          {proposal.container_preview.image_data_discarded && (
+          {avatarRejected ? (
             <p className="mt-2 text-xs leading-5 text-amber-800 dark:text-amber-200">
-              {t("source.imageDiscarded")}
+              {t("source.avatarRejected")}
             </p>
-          )}
+          ) : avatarResult?.status === "imported" ? (
+            <p className="mt-2 text-xs leading-5 text-emerald-700 dark:text-emerald-300">
+              {t("source.avatarImported")}
+            </p>
+          ) : proposal.avatar_preview?.importable ? (
+            <p className="mt-2 text-xs leading-5 text-amber-800 dark:text-amber-200">
+              {t("source.avatarPending")}
+            </p>
+          ) : proposal.avatar_preview?.source_kind === "remote_url" ? (
+            <p className="mt-2 text-xs leading-5 text-amber-800 dark:text-amber-200">
+              {t("source.avatarRemoteNotDownloaded")}
+            </p>
+          ) : null}
         </div>
       )}
 
@@ -944,7 +1073,16 @@ function SourceReview({
                 <span className="break-all text-amber-700 dark:text-amber-300">
                   {asset.path}
                 </span>
-                <InertBadge>{t("source.notDownloaded")}</InertBadge>
+                <InertBadge>
+                  {asset.path === proposal.avatar_preview?.asset_path &&
+                  proposal.avatar_preview.source_kind === "data_uri"
+                    ? avatarRejected
+                      ? t("source.avatarRejected")
+                      : avatarResult?.status === "imported"
+                      ? t("source.avatarImported")
+                      : t("source.avatarPending")
+                    : t("source.notDownloaded")}
+                </InertBadge>
               </li>
             ))}
           </ul>

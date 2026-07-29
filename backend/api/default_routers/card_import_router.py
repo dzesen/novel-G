@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.api.default_routers.auth_router import (
@@ -15,6 +15,7 @@ from backend.api.default_routers.auth_router import (
 from backend.api.default_routers.reference_card_router import (
     ReferenceCardCurationDecision,
 )
+from backend.api.request_body import RequestBodyTooLarge, read_bounded_body
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mutation import MutationConflictError
 from backend.services.auth.identity_service import Actor
@@ -30,6 +31,12 @@ from backend.services.interop.character_card_adapter import (
     MAX_PNG_BYTES,
     CharacterCardAdapter,
     CharacterCardValidationError,
+)
+from backend.services.interop.character_card_avatar_import import (
+    CharacterCardAvatarImportService,
+    CharacterCardAvatarNotFound,
+    InvalidCharacterCardAvatar,
+    character_card_avatar_import_service,
 )
 from backend.services.interop.world_book_adapter import (
     MAX_WORLD_BOOK_JSON_BYTES,
@@ -53,6 +60,10 @@ class CardImportApplyRequest(BaseModel):
         min_length=1,
         max_length=MAX_CARD_IMPORT_CANDIDATES,
     )
+
+
+def get_character_card_avatar_import_service() -> CharacterCardAvatarImportService:
+    return character_card_avatar_import_service
 
 
 def _validation_http_error(
@@ -227,3 +238,78 @@ async def apply_card_import_proposal(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (CardImportProposalError, InvalidIdError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/proposals/{import_proposal_id}/avatar")
+async def import_applied_character_card_avatar(
+    import_proposal_id: str,
+    request: Request,
+    actor: Actor = Depends(require_authenticated_request),
+    service: CharacterCardAvatarImportService = Depends(
+        get_character_card_avatar_import_service
+    ),
+):
+    """Transfer reviewed card-owned image bytes into managed asset storage."""
+
+    declared_mime = (
+        request.headers.get("content-type", "")
+        .partition(";")[0]
+        .strip()
+        .lower()
+    )
+    if declared_mime == "image/png":
+        max_bytes = MAX_PNG_BYTES
+    elif declared_mime == "application/json":
+        max_bytes = MAX_JSON_BYTES
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "code": "unsupported_avatar_source_type",
+                "message": "头像来源必须是角色卡 PNG 或 JSON 文件",
+            },
+        )
+    try:
+        source_payload = await read_bounded_body(
+            request,
+            max_bytes=max_bytes,
+        )
+    except RequestBodyTooLarge as exc:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "code": "avatar_source_too_large",
+                "current_bytes": exc.current_bytes,
+                "max_bytes": exc.max_bytes,
+                "message": "角色卡头像来源文件超过允许的字节上限",
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_avatar_source_length",
+                "message": str(exc),
+            },
+        ) from exc
+
+    try:
+        result = await service.import_applied_source(
+            proposal_id=import_proposal_id,
+            owner_id=actor.id,
+            declared_mime=declared_mime,
+            source_payload=source_payload,
+        )
+        return result.as_dict()
+    except CharacterCardAvatarNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CharacterCardValidationError as exc:
+        raise _validation_http_error(exc) from exc
+    except InvalidCharacterCardAvatar as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_card_avatar",
+                "message": str(exc),
+            },
+        ) from exc

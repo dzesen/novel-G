@@ -281,6 +281,17 @@ export interface CardImportProposal {
     ext: string;
     retrieval_enabled: false;
   }>;
+  avatar_preview: {
+    source_kind:
+      | "png_container"
+      | "data_uri"
+      | "remote_url"
+      | "embedded_reference"
+      | "default"
+      | "none";
+    importable: boolean;
+    asset_path?: string | null;
+  } | null;
   container_preview: {
     selected_png_chunk?: string | null;
     png_chunk_classification?: string | null;
@@ -345,6 +356,13 @@ export interface ReferenceCardCurationResult {
     action: ReferenceCardCurationAction;
     card_id: string | null;
   }>;
+}
+
+export interface CharacterCardAvatarImportResult {
+  status: "imported" | "not_imported" | "skipped";
+  source_kind: NonNullable<CardImportProposal["avatar_preview"]>["source_kind"];
+  asset_id: string | null;
+  content_hash: string | null;
 }
 
 export interface ReferenceCardCurationProposal {
@@ -553,6 +571,7 @@ export type AICreateCachedSteps = Partial<{
 export interface WritingDraft extends CreateNovelRequest {
   _fromAI?: boolean;
   _rewriteState?: WritingDraftRewriteState;
+  card_avatar_proposal_ids?: string[];
 }
 
 /** Writing 侧栏导航项 */

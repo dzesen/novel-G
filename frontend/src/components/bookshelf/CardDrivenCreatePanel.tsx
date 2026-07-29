@@ -7,6 +7,10 @@ import { Button, Card } from "@heroui/react";
 import AICreateStepper from "./AICreateStepper";
 import { apiPostForm } from "@/lib/api";
 import { clearAICreateCache } from "@/lib/aiCreateCache";
+import {
+  deleteCardAvatarHandoffs,
+  stageCardAvatarHandoff,
+} from "@/lib/cardAvatarHandoff";
 import { cardImportErrorMessage } from "@/lib/cardImportErrors";
 import { saveWritingDraft } from "@/lib/writingDraft";
 import type {
@@ -177,6 +181,19 @@ export default function CardDrivenCreatePanel({
           throw new Error(t("notCharacterCard", { name: file.name }));
         }
         staged.push(proposal);
+        if (proposal.avatar_preview?.importable) {
+          try {
+            await stageCardAvatarHandoff(
+              proposal.proposal_id,
+              file,
+              proposal.source_container === "png"
+                ? "image/png"
+                : "application/json",
+            );
+          } catch {
+            throw new Error(t("avatarHandoffFailed"));
+          }
+        }
       }
       if (worldFile) {
         const proposal = await stageFile(worldFile);
@@ -198,6 +215,9 @@ export default function CardDrivenCreatePanel({
       setPage(0);
       setStage("review");
     } catch (cause) {
+      await deleteCardAvatarHandoffs(
+        staged.map((proposal) => proposal.proposal_id),
+      ).catch(() => undefined);
       const fallback =
         cause instanceof Error ? cause.message : t("previewFailed");
       setError(
@@ -261,11 +281,30 @@ export default function CardDrivenCreatePanel({
       creative_direction: creativeDirection,
       card_creation_id: newCreationId(),
       card_imports: creationSelections,
+      card_avatar_proposal_ids: proposals
+        .filter((proposal) => proposal.avatar_preview?.importable)
+        .map((proposal) => proposal.proposal_id),
     };
     const draftId = saveWritingDraft(draft);
     clearAICreateCache();
     setRedirecting(true);
     router.push(`/${locale}/writing/new?draft=${encodeURIComponent(draftId)}`);
+  };
+
+  const discardAndCancel = async () => {
+    await deleteCardAvatarHandoffs(
+      proposals.map((proposal) => proposal.proposal_id),
+    ).catch(() => undefined);
+    onCancel();
+  };
+
+  const chooseAgain = async () => {
+    await deleteCardAvatarHandoffs(
+      proposals.map((proposal) => proposal.proposal_id),
+    ).catch(() => undefined);
+    setProposals([]);
+    setDecisions({});
+    setStage("upload");
   };
 
   return (
@@ -277,7 +316,11 @@ export default function CardDrivenCreatePanel({
               <h2 className="text-lg font-bold text-foreground">{t("title")}</h2>
               <p className="mt-1 text-xs text-muted">{t("subtitle")}</p>
             </div>
-            <Button variant="ghost" size="sm" onPress={onCancel}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onPress={() => void discardAndCancel()}
+            >
               {tc("back")}
             </Button>
           </div>
@@ -420,9 +463,14 @@ export default function CardDrivenCreatePanel({
                       {proposal.container_preview.png_preview_label}
                     </p>
                   )}
-                  {proposal.container_preview.image_data_discarded && (
+                  {proposal.avatar_preview?.importable && (
                     <p className="mt-2 text-xs text-warning">
-                      {t("imageDiscarded")}
+                      {t("avatarPending")}
+                    </p>
+                  )}
+                  {proposal.avatar_preview?.source_kind === "remote_url" && (
+                    <p className="mt-2 text-xs text-warning">
+                      {t("avatarRemoteNotDownloaded")}
                     </p>
                   )}
                   {proposal.duplicate_source && (
@@ -579,7 +627,7 @@ export default function CardDrivenCreatePanel({
                 <Button
                   variant="ghost"
                   className="sm:flex-1"
-                  onPress={() => setStage("upload")}
+                  onPress={() => void chooseAgain()}
                 >
                   {t("chooseAgain")}
                 </Button>

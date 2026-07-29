@@ -124,6 +124,26 @@ class ImageAssetRepository(BaseRepository):
             sort=[("created_at", -1)],
         )
 
+    async def get_latest_owned_imported_subject(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        subject_kind: str,
+        subject_id: str,
+    ) -> dict[str, Any] | None:
+        return await self.collection.find_one(
+            {
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "source": "imported",
+                "is_deleted": False,
+            },
+            sort=[("created_at", -1), ("_id", -1)],
+        )
+
     async def list_owned_subject(
         self,
         *,

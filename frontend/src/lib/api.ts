@@ -167,6 +167,22 @@ export async function apiPostForm<T = unknown>(
   return res.json();
 }
 
+export async function apiPostRaw<T = unknown>(
+  path: string,
+  body: Blob,
+  contentType: "application/json" | "image/png",
+): Promise<T> {
+  const res = await authorizedFetch(path, {
+    method: "POST",
+    headers: { "Content-Type": contentType },
+    body,
+  });
+  if (!res.ok) {
+    throw await responseError(res);
+  }
+  return res.json();
+}
+
 export async function apiDelete<T = unknown>(path: string): Promise<T> {
   return apiRequest<T>(path, {
     method: "DELETE",

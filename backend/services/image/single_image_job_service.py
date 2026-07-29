@@ -446,6 +446,15 @@ class ImageAssetMetadataRepositoryProtocol(Protocol):
         content_hash: str,
     ) -> dict[str, Any] | None: ...
 
+    async def get_latest_owned_imported_subject(
+        self,
+        *,
+        owner_id: Any,
+        novel_id: Any,
+        subject_kind: str,
+        subject_id: str,
+    ) -> dict[str, Any] | None: ...
+
 
 class ReferenceCardAppearanceAnchorGateway:
     async def get_anchor(
@@ -1016,6 +1025,24 @@ class SingleImageJobService:
             latest.get("asset"), dict
         ):
             raw_asset = dict(latest["asset"])
+        if raw_asset is None and canonical_anchor is None:
+            get_imported = getattr(
+                self.asset_repository,
+                "get_latest_owned_imported_subject",
+                None,
+            )
+            if callable(get_imported):
+                imported_asset = await get_imported(
+                    owner_id=to_object_id(owner_id),
+                    novel_id=to_object_id(novel_id),
+                    subject_kind="character_portrait",
+                    subject_id=card_id,
+                )
+                if imported_asset is not None:
+                    raw_asset = {
+                        "asset_id": str(imported_asset["_id"]),
+                        **imported_asset,
+                    }
         if isinstance(raw_asset, dict) and raw_asset.get("asset_id"):
             asset_state = "available"
             try:
