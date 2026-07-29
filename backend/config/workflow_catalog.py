@@ -119,6 +119,16 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
         ),
     ),
     WorkflowDefinition(
+        name="illustration_prompt_by_agent",
+        label_key="settings.workflow.catalog.illustration_prompt_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="illustration_prompt",
+                label_key="settings.workflow.steps.illustration_prompt",
+            ),
+        ),
+    ),
+    WorkflowDefinition(
         name="volume_retrospective_by_agent",
         label_key="settings.workflow.catalog.volume_retrospective_by_agent",
         steps=(

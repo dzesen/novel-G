@@ -8,6 +8,7 @@ import json
 import re
 from typing import Any, Literal
 
+from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.character_repository import character_repo
@@ -17,11 +18,15 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.worldbook_repository import worldbook_repo
+from backend.db.utils import to_object_id
+from backend.services.llm.context_builder import normalize_outline_references
 from backend.services.novel.chapter_timeline import ChapterPosition, ChapterTimeline
 from backend.services.novel.story_health import StoryHealthReport, story_health
 
 
 AgentScope = Literal["novel", "volume", "chapter"]
+IllustrationAgentScope = Literal["character", "novel", "chapter"]
+AgentContextScope = Literal["character", "novel", "volume", "chapter"]
 StyleAgentScope = Literal["volume", "chapter"]
 StyleEvidenceKind = Literal["chapter_paragraph", "character_profile"]
 StyleEvidenceRole = Literal["target", "baseline"]
@@ -51,6 +56,30 @@ RETROSPECTIVE_CONTEXT_MIN_CHARACTERS = 8_000
 RETROSPECTIVE_CHAPTER_SAMPLE_LIMIT = 18
 RETROSPECTIVE_PROSE_PARAGRAPHS_PER_CHAPTER = 2
 RETROSPECTIVE_EVIDENCE_EXCERPT_CHARACTERS = 700
+ILLUSTRATION_CONTEXT_MIN_CHARACTERS = 4_000
+ILLUSTRATION_CONTEXT_MAX_CHARACTERS = 12_000
+ILLUSTRATION_NOVEL_FIELD_LIMITS: tuple[tuple[str, int], ...] = (
+    # Sum to 1,800 raw characters. JSON control-character escaping can expand
+    # each character to six serialized characters (for example ``\u0000``),
+    # so the complete required novel record still fits the 12k hard cap.
+    ("title", 60),
+    ("subtitle", 100),
+    ("genre", 80),
+    ("summary", 400),
+    ("core_seed", 250),
+    ("worldview", 500),
+    ("writing_style", 120),
+    ("narrative_pov", 60),
+    ("tone", 100),
+    ("era_background", 130),
+)
+# Required character-scope cards use the same 1,800-character raw ceiling as
+# the required novel/chapter records, so worst-case JSON escaping still fits.
+ILLUSTRATION_CARD_DESCRIPTION_CHARACTERS = 800
+ILLUSTRATION_CARD_DETAIL_CHARACTERS = 400
+ILLUSTRATION_SCENE_SUMMARY_CHARACTERS = 600
+ILLUSTRATION_SCENE_PURPOSE_CHARACTERS = 300
+ILLUSTRATION_DECLARED_CARD_ID_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -146,9 +175,10 @@ class AgentContextBundle:
     truncated_sections: tuple[str, ...]
     target_label: str
     novel_id: str = ""
-    scope: AgentScope = "novel"
+    scope: AgentContextScope = "novel"
     volume_id: str | None = None
     chapter_id: str | None = None
+    character_card_id: str | None = None
     narrative_revision: int = 0
     context_digest: str = ""
     story_health_schema_version: str | None = None
@@ -167,6 +197,7 @@ class AgentContextBundle:
             "scope": self.scope,
             "volume_id": self.volume_id,
             "chapter_id": self.chapter_id,
+            "character_card_id": self.character_card_id,
             "narrative_revision": self.narrative_revision,
             "context_digest": self.context_digest,
             "story_health_schema_version": self.story_health_schema_version,
@@ -651,6 +682,470 @@ async def build_agent_context(
                 if item.get("_id") and str(item["_id"]) in text
             )
         ),
+    )
+
+
+def _illustration_text(
+    value: Any,
+    limit: int,
+) -> tuple[str, bool]:
+    return _clip(str(value or "").strip(), limit)
+
+
+def _illustration_novel_record(
+    novel: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    record: dict[str, Any] = {"kind": "novel"}
+    truncated = False
+    for field, limit in ILLUSTRATION_NOVEL_FIELD_LIMITS:
+        value, was_truncated = _illustration_text(
+            novel.get(field),
+            limit,
+        )
+        if value:
+            record[field] = value
+        truncated = truncated or was_truncated
+    return record, truncated
+
+
+def _illustration_card_record(
+    card: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    name, name_truncated = _illustration_text(card.get("name"), 200)
+    description, description_truncated = _illustration_text(
+        card.get("description"),
+        ILLUSTRATION_CARD_DESCRIPTION_CHARACTERS,
+    )
+    details = (
+        card.get("details")
+        if isinstance(card.get("details"), dict)
+        else {}
+    )
+    visual_details: dict[str, str] = {}
+    details_truncated = False
+    for field in ("appearance", "personality"):
+        value, was_truncated = _illustration_text(
+            details.get(field),
+            ILLUSTRATION_CARD_DETAIL_CHARACTERS,
+        )
+        if value:
+            visual_details[field] = value
+        details_truncated = details_truncated or was_truncated
+    record = {
+        "kind": "reference_card",
+        "card_id": str(card.get("_id") or ""),
+        "card_type": str(card.get("card_type") or ""),
+        "name": name,
+        "description": description,
+        "details": visual_details or None,
+        "importance": str(card.get("importance") or ""),
+    }
+    return (
+        {
+            key: value
+            for key, value in record.items()
+            if value not in ("", None)
+        },
+        name_truncated or description_truncated or details_truncated,
+    )
+
+
+def _illustration_chapter_record(
+    chapter: dict[str, Any],
+    outline: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    title, title_truncated = _illustration_text(
+        chapter.get("title"),
+        200,
+    )
+    core_conflict, conflict_truncated = _illustration_text(
+        outline.get("core_conflict"),
+        800,
+    )
+    ending_hook, hook_truncated = _illustration_text(
+        outline.get("ending_hook"),
+        800,
+    )
+    record = {
+        "kind": "chapter_outline",
+        "chapter_id": str(chapter.get("_id") or ""),
+        "title": title,
+        "order_index": chapter.get("order_index"),
+        "core_conflict": core_conflict,
+        "ending_hook": ending_hook,
+    }
+    return (
+        {
+            key: value
+            for key, value in record.items()
+            if value not in ("", None)
+        },
+        title_truncated or conflict_truncated or hook_truncated,
+    )
+
+
+def _illustration_scene_record(
+    scene: Any,
+    index: int,
+) -> tuple[dict[str, Any], bool]:
+    source = scene if isinstance(scene, dict) else {"summary": str(scene)}
+    summary, summary_truncated = _illustration_text(
+        source.get("summary"),
+        ILLUSTRATION_SCENE_SUMMARY_CHARACTERS,
+    )
+    purpose, purpose_truncated = _illustration_text(
+        source.get("purpose"),
+        ILLUSTRATION_SCENE_PURPOSE_CHARACTERS,
+    )
+    return (
+        {
+            "kind": "chapter_scene",
+            "scene_index": index,
+            "summary": summary,
+            "purpose": purpose,
+        },
+        summary_truncated or purpose_truncated,
+    )
+
+
+def _canonical_declared_card_ids(
+    values: Any,
+    *,
+    field_name: str,
+) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{field_name} 必须是正式 card_id 列表")
+    if len(values) > ILLUSTRATION_DECLARED_CARD_ID_LIMIT:
+        raise ValueError(
+            f"{field_name} 超过数量上限 "
+            f"{ILLUSTRATION_DECLARED_CARD_ID_LIMIT}"
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None:
+            raise ValueError(f"{field_name} 包含非正式 card_id")
+        try:
+            canonical = str(to_object_id(value))
+        except InvalidIdError as exc:
+            raise ValueError(
+                f"{field_name} 包含非正式 card_id"
+            ) from exc
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        result.append(canonical)
+    return result
+
+
+def _render_illustration_records(
+    *,
+    required_records: list[dict[str, Any]],
+    optional_records: list[tuple[str, dict[str, Any]]],
+    max_characters: int,
+) -> tuple[str, tuple[str, ...], dict[str, int]]:
+    header = "【插图提示词有界证据】\n"
+    selected = list(required_records)
+    rendered = header + _json(selected)
+    if len(rendered) > max_characters:
+        raise ValueError("插图提示词的必需证据超过上下文预算")
+
+    truncated: list[str] = []
+    selected_counts: dict[str, int] = {}
+    for section, record in optional_records:
+        candidate = [*selected, record]
+        candidate_rendered = header + _json(candidate)
+        if len(candidate_rendered) > max_characters:
+            if section not in truncated:
+                truncated.append(section)
+            continue
+        selected = candidate
+        rendered = candidate_rendered
+        selected_counts[section] = selected_counts.get(section, 0) + 1
+    return rendered, tuple(truncated), selected_counts
+
+
+async def _declared_character_cards(
+    *,
+    novel_id: str,
+    card_ids: list[str],
+) -> tuple[list[dict[str, Any]], int]:
+    cards: list[dict[str, Any]] = []
+    unresolved = 0
+    for card_id in card_ids:
+        try:
+            cards.append(
+                await character_repo.get_card(
+                    novel_id,
+                    "character",
+                    card_id,
+                )
+            )
+        except (InvalidIdError, NotFoundError):
+            unresolved += 1
+    return cards, unresolved
+
+
+async def _declared_worldbook_cards(
+    *,
+    novel_id: str,
+    card_ids: list[str],
+) -> tuple[list[dict[str, Any]], int]:
+    cards: list[dict[str, Any]] = []
+    unresolved = 0
+    for card_id in card_ids:
+        resolved: dict[str, Any] | None = None
+        for card_type in ("location", "item", "rule", "lore"):
+            try:
+                resolved = await worldbook_repo.get_card(
+                    novel_id,
+                    card_type,
+                    card_id,
+                )
+                break
+            except (InvalidIdError, NotFoundError):
+                continue
+        if resolved is None:
+            unresolved += 1
+        else:
+            cards.append(resolved)
+    return cards, unresolved
+
+
+async def build_illustration_prompt_context(
+    *,
+    novel_id: str,
+    scope: IllustrationAgentScope,
+    character_card_id: str | None = None,
+    chapter_id: str | None = None,
+    max_characters: int = ILLUSTRATION_CONTEXT_MAX_CHARACTERS,
+) -> AgentContextBundle:
+    """Build a hard-bounded visual packet without prose or inferred cards."""
+
+    if not (
+        ILLUSTRATION_CONTEXT_MIN_CHARACTERS
+        <= max_characters
+        <= ILLUSTRATION_CONTEXT_MAX_CHARACTERS
+    ):
+        raise ValueError(
+            "插图提示词上下文预算必须在 "
+            f"{ILLUSTRATION_CONTEXT_MIN_CHARACTERS} 到 "
+            f"{ILLUSTRATION_CONTEXT_MAX_CHARACTERS} 字符之间"
+        )
+    if scope not in {"character", "novel", "chapter"}:
+        raise ValueError("插图提示词仅支持角色、全书或章节范围")
+    if scope == "character" and (not character_card_id or chapter_id):
+        raise ValueError(
+            "角色插图提示词必须且只能指定 character_card_id"
+        )
+    if scope == "novel" and (character_card_id or chapter_id):
+        raise ValueError("全书插图提示词不能指定角色或章节")
+    if scope == "chapter" and (not chapter_id or character_card_id):
+        raise ValueError("章节插图提示词必须且只能指定 chapter_id")
+
+    if novel_id is None:
+        raise ValueError("novel_id 不是正式小说 ID")
+    try:
+        novel_id = str(to_object_id(novel_id))
+    except InvalidIdError as exc:
+        raise ValueError("novel_id 不是正式小说 ID") from exc
+
+    captured_revision = await narrative_revision_store.current(novel_id)
+    novel = await novel_repo.get_novel_by_id(novel_id)
+    novel_record, novel_fields_truncated = _illustration_novel_record(
+        novel
+    )
+    required_records: list[dict[str, Any]] = []
+    optional_records: list[tuple[str, dict[str, Any]]] = []
+    projection_truncated: list[str] = []
+    normalized_character_id: str | None = None
+    normalized_chapter_id: str | None = None
+    unresolved_references = 0
+
+    if novel_fields_truncated:
+        projection_truncated.append("小说视觉设定字段")
+
+    if scope == "character":
+        try:
+            normalized_character_id = str(
+                to_object_id(character_card_id)
+            )
+        except InvalidIdError as exc:
+            raise ValueError(
+                "character_card_id 不是正式角色卡 ID"
+            ) from exc
+        card = await character_repo.get_card(
+            novel_id,
+            "character",
+            normalized_character_id,
+        )
+        card_record, card_truncated = _illustration_card_record(card)
+        required_records.append(card_record)
+        optional_records.append(("小说视觉设定", novel_record))
+        if card_truncated:
+            projection_truncated.append("目标角色卡字段")
+        target_label = f"角色：{card.get('name') or normalized_character_id}"
+    elif scope == "novel":
+        required_records.append(novel_record)
+        target_label = f"全书：{novel.get('title') or novel_id}"
+    else:
+        try:
+            normalized_chapter_id = str(to_object_id(chapter_id))
+        except InvalidIdError as exc:
+            raise ValueError("chapter_id 不是正式章节 ID") from exc
+        chapter_not_found = (
+            f"Chapter with id {normalized_chapter_id} not found"
+        )
+        try:
+            chapter = await chapter_repo.get_chapter_by_id(
+                normalized_chapter_id
+            )
+        except NotFoundError as exc:
+            raise NotFoundError(chapter_not_found) from exc
+        if str(chapter.get("novel_id") or "") != str(novel_id):
+            raise NotFoundError(chapter_not_found)
+        outline = normalize_outline_references(
+            chapter.get("outline")
+            if isinstance(chapter.get("outline"), dict)
+            else None
+        ) or {}
+        chapter_record, chapter_truncated = (
+            _illustration_chapter_record(chapter, outline)
+        )
+        required_records.append(chapter_record)
+        if chapter_truncated:
+            projection_truncated.append("章节细纲字段")
+
+        scene_records: list[dict[str, Any]] = []
+        for index, scene in enumerate(outline.get("scenes") or []):
+            scene_record, scene_truncated = _illustration_scene_record(
+                scene,
+                index,
+            )
+            scene_records.append(scene_record)
+            if scene_truncated and "章节场景字段" not in projection_truncated:
+                projection_truncated.append("章节场景字段")
+        if scene_records:
+            optional_records.append(("章节场景", scene_records[0]))
+
+        declared_character_ids = _canonical_declared_card_ids(
+            outline.get("present_character_card_ids"),
+            field_name="present_character_card_ids",
+        )
+        declared_worldbook_ids = _canonical_declared_card_ids(
+            outline.get("referenced_worldbook_card_ids"),
+            field_name="referenced_worldbook_card_ids",
+        )
+        character_cards, unresolved_characters = (
+            await _declared_character_cards(
+                novel_id=novel_id,
+                card_ids=declared_character_ids,
+            )
+        )
+        unresolved_references += unresolved_characters
+        for card in character_cards:
+            card_record, card_truncated = _illustration_card_record(card)
+            optional_records.append(("细纲声明角色卡", card_record))
+            if (
+                card_truncated
+                and "细纲声明角色卡字段" not in projection_truncated
+            ):
+                projection_truncated.append("细纲声明角色卡字段")
+
+        worldbook_cards, unresolved_worldbook = (
+            await _declared_worldbook_cards(
+                novel_id=novel_id,
+                card_ids=declared_worldbook_ids,
+            )
+        )
+        unresolved_references += unresolved_worldbook
+        for card in worldbook_cards:
+            card_record, card_truncated = _illustration_card_record(card)
+            optional_records.append(("细纲声明世界卡", card_record))
+            if (
+                card_truncated
+                and "细纲声明世界卡字段" not in projection_truncated
+            ):
+                projection_truncated.append("细纲声明世界卡字段")
+        optional_records.extend(
+            ("章节场景", scene_record)
+            for scene_record in scene_records[1:]
+        )
+        optional_records.append(("小说视觉设定", novel_record))
+        target_label = (
+            f"章节：{chapter.get('title') or normalized_chapter_id}"
+        )
+
+    text, budget_truncated, selected_counts = (
+        _render_illustration_records(
+            required_records=required_records,
+            optional_records=optional_records,
+            max_characters=max_characters,
+        )
+    )
+    truncated_sections = tuple(
+        dict.fromkeys([*projection_truncated, *budget_truncated])
+    )
+    coverage_parts = [
+        f"范围={scope}",
+        f"上下文 {len(text)}/{max_characters} 字符",
+    ]
+    if scope == "chapter":
+        coverage_parts.extend(
+            [
+                f"场景 {selected_counts.get('章节场景', 0)} 条",
+                (
+                    "正式角色卡 "
+                    f"{selected_counts.get('细纲声明角色卡', 0)} 张"
+                ),
+                (
+                    "正式世界卡 "
+                    f"{selected_counts.get('细纲声明世界卡', 0)} 张"
+                ),
+            ]
+        )
+        if unresolved_references:
+            coverage_parts.append(
+                f"未解析正式引用 {unresolved_references} 个"
+            )
+    if truncated_sections:
+        coverage_parts.append(
+            f"截断段落：{', '.join(truncated_sections)}"
+        )
+    coverage = "；".join(coverage_parts) + "。"
+
+    if await narrative_revision_store.current(novel_id) != captured_revision:
+        raise StaleAgentContext(
+            "小说内容在插图提示词上下文装配期间发生变化，请重试"
+        )
+    context_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "novel_id": novel_id,
+                "scope": scope,
+                "character_card_id": normalized_character_id,
+                "chapter_id": normalized_chapter_id,
+                "narrative_revision": captured_revision,
+                "text": text,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return AgentContextBundle(
+        text=text,
+        coverage=coverage,
+        truncated_sections=truncated_sections,
+        target_label=target_label,
+        novel_id=novel_id,
+        scope=scope,
+        chapter_id=normalized_chapter_id,
+        character_card_id=normalized_character_id,
+        narrative_revision=captured_revision,
+        context_digest=context_digest,
     )
 
 

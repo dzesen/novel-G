@@ -314,6 +314,7 @@
         "creative_inspiration_by_agent": "Agent 创意启发",
         "continuity_review_by_agent": "Agent 前后一致性检查",
         "style_consistency_by_agent": "Agent 文风与人物声音一致性",
+        "illustration_prompt_by_agent": "Agent 插图提示词转译",
         "volume_retrospective_by_agent": "Agent 卷级复盘"
       },
       "steps": {
@@ -332,6 +333,7 @@
         "inspiration": "生成受现有设定约束的创意方向预览",
         "review": "按证据检查前后一致性并生成问题预览",
         "style_consistency_review": "按抽样正文与角色声音基准检查风格漂移",
+        "illustration_prompt": "将小说证据转译为可编辑的结构化插图提示词",
         "volume_retrospective_review": "结合确定性故事健康证据复盘卷纲兑现与节奏"
       },
       "stepLabel": "步骤",
@@ -546,13 +548,14 @@
     "agentStudio": {
       "eyebrow": "受控智能协作",
       "title": "Agent 工作台",
-      "description": "在小说证据范围内获取创意方向、一致性问题、风格漂移和卷级复盘，也可以为自己配置可复用的 Agent。所有结果先形成预览。",
+      "description": "在小说证据范围内获取创意方向、一致性问题、风格漂移、插图提示词和卷级复盘，也可以为自己配置可复用的 Agent。所有结果先形成预览。",
       "skillBoundary": "能力由代码定义 · Agent 配置可管理",
       "tabsLabel": "Agent 工作台功能",
       "tabs": {
         "creative": "创意启发",
         "continuity": "一致性检查",
         "style": "文风与人物声音",
+        "illustration": "插图提示词",
         "retrospective": "卷级复盘",
         "history": "运行与修订",
         "management": "Agent 管理"
@@ -566,7 +569,7 @@
       "previewBadge": "只读预览",
       "previewOnlyHint": "生成本身只产生预览。可以复制结果，也可以创建带版本校验的修订提案后再接受。",
       "needNovelTitle": "先保存小说，再运行 Agent",
-      "needNovelDescription": "Agent 管理仍可使用；创意启发、一致性检查、文风审查和卷级复盘需要一部已保存的小说作为证据来源。",
+      "needNovelDescription": "Agent 管理仍可使用；创意启发、一致性检查、文风审查、插图提示词和卷级复盘需要一部已保存的小说作为证据来源。",
       "emptyResultTitle": "结果将在这里展开",
       "emptyResultDescription": "选择检查范围和 Agent，填写目标后生成。系统会同时标明实际上下文覆盖与截断情况。",
       "copy": "复制 JSON",
@@ -575,6 +578,7 @@
       "truncated": "上下文已截断：{sections}",
       "tool": {
         "scope": "分析范围",
+        "scopeCharacter": "指定角色",
         "scopeNovel": "全书结构",
         "scopeVolume": "指定卷",
         "scopeChapter": "指定章节",
@@ -584,13 +588,16 @@
         "allVolumes": "全部卷",
         "chapter": "目标章节",
         "selectChapter": "选择一章",
+        "character": "目标角色卡",
+        "selectCharacter": "选择一张正式角色卡",
         "volumeLabel": "第 {order} 卷 · {title}",
         "chapterLabel": "第 {volume} 卷 · 第 {order} 章 {title}",
         "agent": "执行 Agent",
         "extraInstruction": "本次补充指令",
         "extraInstructionPlaceholder": "可选；只影响本次生成，不会保存到 Agent",
         "chooseVolume": "请选择要分析的卷",
-        "chooseChapter": "请选择要分析的章节"
+        "chooseChapter": "请选择要分析的章节",
+        "chooseCharacter": "请选择要转译的正式角色卡"
       },
       "creative": {
         "eyebrow": "发散但服从事实",
@@ -657,6 +664,27 @@
         "category": {
           "prose_style": "整体文风",
           "character_voice": "人物声音"
+        }
+      },
+      "illustration": {
+        "eyebrow": "把叙事证据转成视觉语言",
+        "title": "插图提示词转译",
+        "description": "从正式角色卡、小说设定或章节细纲声明的资料卡中提取可视化特征，舍弃不可视化的心理描述，并按目标图像模型偏好组织。",
+        "targetModel": "目标图像模型",
+        "targetModelPlaceholder": "可选；例如填写模型系列或工作流偏好",
+        "focus": "画面重点",
+        "focusPlaceholder": "可选；例如突出雨夜站台上的人物全身轮廓，避免现代物件",
+        "resultTitle": "结构化插图提示词",
+        "editableBadge": "可编辑预览",
+        "editHint": "可直接调整五个字段并复制 JSON。本结果不会生成图片、写入素材或建立外观锚点。",
+        "previewOnlyHint": "本能力只转译并返回提示词预览，不调用图像后端，不写入小说或正文上下文，也不会自动触发其他生成。",
+        "totalLimitHint": "五个字段合计最多 4800 个字符",
+        "fields": {
+          "subject": "主体",
+          "appearance": "外观",
+          "scene": "场景",
+          "style": "风格",
+          "negative": "负向约束"
         }
       },
       "retrospective": {
@@ -747,6 +775,7 @@
         "creativeRun": "创意启发",
         "continuityRun": "一致性检查",
         "styleRun": "文风与人物声音一致性",
+        "illustrationRun": "插图提示词转译",
         "retrospectiveRun": "卷级复盘",
         "runMeta": "Agent {agent} v{version} · Provider {provider} · 上下文 revision {revision}",
         "runStatus": {

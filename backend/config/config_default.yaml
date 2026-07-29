@@ -251,6 +251,12 @@ llm:
         review:
           provider: ""
           timeout_seconds: null
+    illustration_prompt_by_agent:
+      default_provider: ""
+      steps:
+        illustration_prompt:
+          provider: ""
+          timeout_seconds: null
     volume_retrospective_by_agent:
       default_provider: ""
       steps:

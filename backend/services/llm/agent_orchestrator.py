@@ -10,7 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from backend.services.llm.generation_runtime import (
     ExplicitProviderTarget,
@@ -157,6 +164,18 @@ _AGENT_PROFILES: tuple[AgentProfile, ...] = (
             "不得直接改写正文。"
         ),
         capabilities=("style_consistency",),
+    ),
+    AgentProfile(
+        agent_id="illustration_prompt_translator",
+        label="插图提示词转译 Agent",
+        description="把中文小说设定转译为可编辑的结构化文生图提示词。",
+        instruction=(
+            "你是插图提示词转译 Agent。只使用本次有界证据，提取能够被画面表现的"
+            "主体、外观、动作、环境与构图，丢弃无法视觉化的心理判断；根据用户给出的"
+            "目标模型偏好组织表达。不得照抄整段小说描述，不得生成图片、写入素材、"
+            "建立外观锚点或修改小说数据。"
+        ),
+        capabilities=("illustration_prompt",),
     ),
     AgentProfile(
         agent_id="volume_retrospective_reviewer",
@@ -407,6 +426,92 @@ class StyleConsistencyResult(BaseModel):
         default_factory=list,
         max_length=40,
     )
+
+
+ILLUSTRATION_SUBJECT_MAX_CHARACTERS = 1200
+ILLUSTRATION_APPEARANCE_MAX_CHARACTERS = 1200
+ILLUSTRATION_SCENE_MAX_CHARACTERS = 1600
+ILLUSTRATION_STYLE_MAX_CHARACTERS = 800
+ILLUSTRATION_NEGATIVE_MAX_CHARACTERS = 800
+ILLUSTRATION_PROMPT_TOTAL_CHARACTER_LIMIT = 4800
+
+
+class IllustrationPromptResult(BaseModel):
+    """Editable visual-language fields produced before any image request."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+    )
+
+    subject: str = Field(max_length=ILLUSTRATION_SUBJECT_MAX_CHARACTERS)
+    appearance: str = Field(
+        max_length=ILLUSTRATION_APPEARANCE_MAX_CHARACTERS
+    )
+    scene: str = Field(max_length=ILLUSTRATION_SCENE_MAX_CHARACTERS)
+    style: str = Field(max_length=ILLUSTRATION_STYLE_MAX_CHARACTERS)
+    negative: str = Field(max_length=ILLUSTRATION_NEGATIVE_MAX_CHARACTERS)
+
+    @field_validator(
+        "subject",
+        "appearance",
+        "scene",
+        "style",
+        "negative",
+        mode="before",
+    )
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @field_validator(
+        "subject",
+        "appearance",
+        "scene",
+        "style",
+        "negative",
+    )
+    @classmethod
+    def enforce_assignment_total_limit(
+        cls,
+        value: str,
+        info: ValidationInfo,
+    ) -> str:
+        total = len(value) + sum(
+            len(str(other_value or ""))
+            for field_name, other_value in info.data.items()
+            if field_name
+            in {
+                "subject",
+                "appearance",
+                "scene",
+                "style",
+                "negative",
+            }
+        )
+        if total > ILLUSTRATION_PROMPT_TOTAL_CHARACTER_LIMIT:
+            raise ValueError(
+                "Illustration prompt exceeds the total character limit"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def enforce_total_limit(self) -> "IllustrationPromptResult":
+        total = sum(
+            len(value)
+            for value in (
+                self.subject,
+                self.appearance,
+                self.scene,
+                self.style,
+                self.negative,
+            )
+        )
+        if total > ILLUSTRATION_PROMPT_TOTAL_CHARACTER_LIMIT:
+            raise ValueError(
+                "Illustration prompt exceeds the total character limit"
+            )
+        return self
 
 
 class VolumeRetrospectiveEvidenceReference(BaseModel):

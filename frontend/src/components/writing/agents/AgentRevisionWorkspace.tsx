@@ -40,6 +40,14 @@ interface VolumeDetail extends VolumeSummary {
 const fieldClass =
   "w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition-colors placeholder:text-muted focus:border-accent";
 
+const RUN_CAPABILITY_LABEL_KEYS = {
+  creative_inspiration: "creativeRun",
+  continuity_review: "continuityRun",
+  style_consistency: "styleRun",
+  illustration_prompt: "illustrationRun",
+  volume_retrospective: "retrospectiveRun",
+} as const satisfies Record<AgentRun["capability"], string>;
+
 function compactPatch(
   kind: AgentRevisionTargetKind,
   draft: AgentRevisionPatch,
@@ -661,13 +669,7 @@ export default function AgentRevisionWorkspace({
               >
                 <div>
                   <p className="text-sm font-medium text-foreground">
-                    {run.capability === "creative_inspiration"
-                      ? t("creativeRun")
-                      : run.capability === "continuity_review"
-                        ? t("continuityRun")
-                        : run.capability === "style_consistency"
-                          ? t("styleRun")
-                          : t("retrospectiveRun")}
+                    {t(RUN_CAPABILITY_LABEL_KEYS[run.capability])}
                   </p>
                   <p className="mt-1 text-xs text-muted">
                     {t("runMeta", {

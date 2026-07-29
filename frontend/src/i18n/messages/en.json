@@ -314,6 +314,7 @@
         "creative_inspiration_by_agent": "Agent Creative Inspiration",
         "continuity_review_by_agent": "Agent Continuity Review",
         "style_consistency_by_agent": "Agent Style & Character Voice Consistency",
+        "illustration_prompt_by_agent": "Agent Illustration Prompt Translation",
         "volume_retrospective_by_agent": "Agent Volume Retrospective"
       },
       "steps": {
@@ -332,6 +333,7 @@
         "inspiration": "Preview creative directions constrained by the current story",
         "review": "Preview evidence-backed continuity issues",
         "style_consistency_review": "Review style drift against sampled prose and character voice baselines",
+        "illustration_prompt": "Translate novel evidence into an editable structured illustration prompt",
         "volume_retrospective_review": "Review volume promises and pacing with deterministic story-health evidence"
       },
       "stepLabel": "Step",
@@ -546,13 +548,14 @@
     "agentStudio": {
       "eyebrow": "Controlled intelligence",
       "title": "Agent Studio",
-      "description": "Explore creative directions, evidence-backed continuity issues, style drift, and volume retrospectives, then configure reusable Agents of your own. Every result begins as a preview.",
+      "description": "Explore creative directions, evidence-backed continuity issues, style drift, illustration prompts, and volume retrospectives, then configure reusable Agents of your own. Every result begins as a preview.",
       "skillBoundary": "Code-owned capabilities · Manageable Agent profiles",
       "tabsLabel": "Agent Studio tools",
       "tabs": {
         "creative": "Creative Inspiration",
         "continuity": "Continuity Review",
         "style": "Style & Character Voice",
+        "illustration": "Illustration Prompt",
         "retrospective": "Volume Retrospective",
         "history": "Runs & Revisions",
         "management": "Agent Management"
@@ -566,7 +569,7 @@
       "previewBadge": "Read-only preview",
       "previewOnlyHint": "Generation only creates a preview. Copy it, or create a revision proposal with stale checks before accepting any write.",
       "needNovelTitle": "Save the novel before running an Agent",
-      "needNovelDescription": "Agent management remains available. Inspiration, continuity, style review, and volume retrospectives need a saved novel as their evidence source.",
+      "needNovelDescription": "Agent management remains available. Inspiration, continuity, style review, illustration prompts, and volume retrospectives need a saved novel as their evidence source.",
       "emptyResultTitle": "Results will unfold here",
       "emptyResultDescription": "Choose a scope and Agent, then describe the goal. The response also reports actual context coverage and truncation.",
       "copy": "Copy JSON",
@@ -575,6 +578,7 @@
       "truncated": "Context truncated: {sections}",
       "tool": {
         "scope": "Analysis scope",
+        "scopeCharacter": "Specific character",
         "scopeNovel": "Whole-book structure",
         "scopeVolume": "Specific volume",
         "scopeChapter": "Specific chapter",
@@ -584,13 +588,16 @@
         "allVolumes": "All volumes",
         "chapter": "Target chapter",
         "selectChapter": "Select a chapter",
+        "character": "Target character card",
+        "selectCharacter": "Select a formal character card",
         "volumeLabel": "Volume {order} · {title}",
         "chapterLabel": "Volume {volume} · Chapter {order} {title}",
         "agent": "Agent",
         "extraInstruction": "Run-specific instruction",
         "extraInstructionPlaceholder": "Optional; affects this run only and is not saved to the Agent",
         "chooseVolume": "Choose a volume to analyze",
-        "chooseChapter": "Choose a chapter to analyze"
+        "chooseChapter": "Choose a chapter to analyze",
+        "chooseCharacter": "Choose the formal character card to translate"
       },
       "creative": {
         "eyebrow": "Divergent, fact-aware",
@@ -657,6 +664,27 @@
         "category": {
           "prose_style": "Overall prose style",
           "character_voice": "Character voice"
+        }
+      },
+      "illustration": {
+        "eyebrow": "Translate narrative evidence into visual language",
+        "title": "Illustration Prompt Translation",
+        "description": "Extract visual traits from a formal character card, novel setting, or cards explicitly declared by a chapter outline; discard nonvisual psychology and organize the result for the target image model.",
+        "targetModel": "Target image model",
+        "targetModelPlaceholder": "Optional; name a model family or workflow preference",
+        "focus": "Visual focus",
+        "focusPlaceholder": "Optional; for example, emphasize the full silhouette on a rainy platform and avoid modern objects",
+        "resultTitle": "Structured illustration prompt",
+        "editableBadge": "Editable preview",
+        "editHint": "Edit the five fields directly, then copy the JSON. This result does not generate an image, store an asset, or create an appearance anchor.",
+        "previewOnlyHint": "This capability only translates and previews a prompt. It does not call an image backend, write to the novel or prose context, or trigger another generation automatically.",
+        "totalLimitHint": "The five fields accept up to 4,800 characters in total",
+        "fields": {
+          "subject": "Subject",
+          "appearance": "Appearance",
+          "scene": "Scene",
+          "style": "Style",
+          "negative": "Negative constraints"
         }
       },
       "retrospective": {
@@ -747,6 +775,7 @@
         "creativeRun": "Creative inspiration",
         "continuityRun": "Continuity review",
         "styleRun": "Style & character voice consistency",
+        "illustrationRun": "Illustration prompt translation",
         "retrospectiveRun": "Volume retrospective",
         "runMeta": "Agent {agent} v{version} · Provider {provider} · context revision {revision}",
         "runStatus": {

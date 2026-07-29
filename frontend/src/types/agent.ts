@@ -7,9 +7,10 @@ export type AgentCapabilityId =
   | "creative_inspiration"
   | "continuity_review"
   | "style_consistency"
+  | "illustration_prompt"
   | "volume_retrospective";
 
-export type AgentScope = "novel" | "volume" | "chapter";
+export type AgentScope = "character" | "novel" | "volume" | "chapter";
 
 export interface AgentCapability {
   capability: AgentCapabilityId;
@@ -184,6 +185,14 @@ export interface StyleConsistencyResult {
   issues: StyleConsistencyIssue[];
 }
 
+export interface IllustrationPromptResult {
+  subject: string;
+  appearance: string;
+  scene: string;
+  style: string;
+  negative: string;
+}
+
 export interface VolumeRetrospectiveEvidenceReference {
   evidence_id: string;
   role: "promise" | "outcome" | "deterministic";
@@ -260,6 +269,7 @@ export interface AgentRun {
     | "creative_inspiration"
     | "continuity_review"
     | "style_consistency"
+    | "illustration_prompt"
     | "volume_retrospective";
   status: "running" | "completed" | "failed" | "stale";
   agent_id: string;
@@ -270,14 +280,17 @@ export interface AgentRun {
     scope?: AgentScope;
     volume_id?: string | null;
     chapter_id?: string | null;
+    character_card_id?: string | null;
     question?: string;
     focus?: string;
+    target_model?: string;
   };
   context_snapshot: {
     novel_id: string;
     scope: AgentScope;
     volume_id?: string | null;
     chapter_id?: string | null;
+    character_card_id?: string | null;
     narrative_revision: number;
     context_digest: string;
     story_health_schema_version?: string | null;
@@ -294,17 +307,13 @@ export interface AgentRun {
       Omit<VolumeRetrospectiveEvidenceReference, "excerpt">
     >;
   };
-  result?: {
-    framing?: string;
-    ideas?: CreativeIdea[];
-    summary?: string;
-    coverage?: string;
-    issues?: Array<
-      | ContinuityIssue
-      | StyleConsistencyIssue
-      | VolumeRetrospectiveIssue
-    >;
-  } | null;
+  result?:
+    | CreativeInspirationResult
+    | ContinuityReviewResult
+    | StyleConsistencyResult
+    | IllustrationPromptResult
+    | VolumeRetrospectiveResult
+    | null;
   usage: {
     input_tokens?: number;
     output_tokens?: number;

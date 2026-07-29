@@ -27,6 +27,7 @@ from backend.services.llm.agent_context import (
     AgentScope,
     StaleAgentContext,
     build_agent_context,
+    build_illustration_prompt_context,
     build_style_consistency_context,
     build_volume_retrospective_context,
     ensure_agent_context_current,
@@ -39,6 +40,7 @@ from backend.services.llm.agent_orchestrator import (
     ContinuityReviewResult,
     CreativeDirectionResult,
     CreativeInspirationResult,
+    IllustrationPromptResult,
     StyleConsistencyEvidenceReference,
     StyleConsistencyResult,
     VolumeRetrospectiveEvidenceReference,
@@ -72,6 +74,8 @@ CONTINUITY_WORKFLOW = "continuity_review_by_agent"
 CONTINUITY_STEP = "review"
 STYLE_CONSISTENCY_WORKFLOW = "style_consistency_by_agent"
 STYLE_CONSISTENCY_STEP = "review"
+ILLUSTRATION_PROMPT_WORKFLOW = "illustration_prompt_by_agent"
+ILLUSTRATION_PROMPT_STEP = "illustration_prompt"
 VOLUME_RETROSPECTIVE_WORKFLOW = "volume_retrospective_by_agent"
 VOLUME_RETROSPECTIVE_STEP = "review"
 logger = logging.getLogger(__name__)
@@ -133,6 +137,34 @@ class ContinuityReviewRequest(AgentScopeRequest):
 class StyleConsistencyRequest(AgentScopeRequest):
     scope: Literal["chapter", "volume"]
     focus: str = Field(default="", max_length=2000)
+
+
+class IllustrationPromptRequest(AgentScopeRequest):
+    scope: Literal["character", "novel", "chapter"] = "novel"
+    volume_id: None = None
+    character_card_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+    )
+    target_model: str = Field(default="", max_length=200)
+    focus: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_target_identifiers(self):
+        if self.scope == "character":
+            if not self.character_card_id or self.chapter_id:
+                raise ValueError(
+                    "character scope requires only character_card_id"
+                )
+        elif self.scope == "chapter":
+            if not self.chapter_id or self.character_card_id:
+                raise ValueError(
+                    "chapter scope requires only chapter_id"
+                )
+        elif self.character_card_id or self.chapter_id:
+            raise ValueError("novel scope does not accept target IDs")
+        return self
 
 
 class VolumeRetrospectiveRequest(AgentScopeRequest):
@@ -328,6 +360,65 @@ def _style_consistency_prompt(
 {suffix}""".strip()
 
 
+def _illustration_prompt(
+    *,
+    context: str,
+    target_label: str,
+    coverage: str,
+    target_model: str,
+    focus: str,
+    instruction: str,
+    json_only: bool,
+) -> str:
+    suffix = (
+        "只输出合法 JSON 对象，不要使用 Markdown 代码块。"
+        if json_only
+        else "严格按照提供的 JSON Schema 输出。"
+    )
+    schema_hint = (
+        "\n\n【必须遵循的 JSON Schema】\n"
+        + json.dumps(
+            IllustrationPromptResult.model_json_schema(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if json_only
+        else ""
+    )
+    return f"""把“{target_label}”的中文小说证据转译为可编辑的结构化文生图提示词。
+
+【证据覆盖范围】
+{coverage}
+
+【有界小说证据】
+{context}
+
+【目标图像模型偏好】
+{target_model or "通用文生图模型；使用清晰、具体、可迁移的视觉语言"}
+
+【用户关注点】
+{focus or "忠实呈现证据中的主体、外观、场景、构图与画风"}
+
+【本次补充指令】
+{instruction or "无"}
+
+要求：
+- 这一步的工作是转译，不是摘要或原文搬运：提取可视化特征，丢弃不可视化的心理描写，
+  并按目标图像模型偏好组织具体、无歧义的视觉语言。
+- 只使用有界证据；不得按名字猜测未提供的角色或设定，不得把外部 ID、占位符当成角色卡。
+- 顶层固定为 subject、appearance、scene、style、negative 五个字符串字段，全部必须出现；
+  不得额外返回 combined_prompt 或其他合并后的黑盒提示词。
+- subject 写画面主体及可见动作；appearance 只写客观可见且相对稳定的外观特征；
+  scene 写环境、构图、镜头、光线与空间关系；style 写适配目标模型的画风表达；
+  negative 写应避免的画面元素、瑕疵或冲突。
+- 心理、关系、动机或评价只有能转成表情、姿态、动作、服饰或环境线索时才保留；
+  不得把“冷酷”“悲伤”等抽象判断原样堆入外观字段。
+- 没有证据支持的字段可返回空字符串，不得编造；结果只是供用户编辑确认的预览。
+- 不得生成图片、调用图像后端、写入素材、建立外观锚点、修改小说或声称已经执行这些操作。
+{schema_hint}
+{suffix}""".strip()
+
+
 def _volume_retrospective_prompt(
     *,
     context: str,
@@ -435,6 +526,28 @@ async def _resolve_style_context_and_agent(
         novel_id=request.novel_id,
         scope=request.scope,
         volume_id=request.volume_id,
+        chapter_id=request.chapter_id,
+    )
+    return context, profile
+
+
+async def _resolve_illustration_prompt_context_and_agent(
+    *,
+    request: IllustrationPromptRequest,
+    actor: Actor,
+    access: NovelAccessService,
+    catalog: AgentCatalog,
+):
+    await access.require_owned_novel(actor, request.novel_id)
+    profile = await catalog.resolve_profile(
+        actor,
+        agent_id=request.agent_id,
+        capability="illustration_prompt",
+    )
+    context = await build_illustration_prompt_context(
+        novel_id=request.novel_id,
+        scope=request.scope,
+        character_card_id=request.character_card_id,
         chapter_id=request.chapter_id,
     )
     return context, profile
@@ -1014,6 +1127,113 @@ async def generate_agent_style_consistency(
         )
         _validate_style_references(canonical_result, context)
         result = canonical_result.model_dump()
+        await runs.complete(run_id, generated=generated, result=result)
+        return {
+            "result": result,
+            **_response_metadata(
+                generated=generated,
+                profile=profile,
+                context=context,
+                run_id=run_id,
+            ),
+        }
+    except StaleAgentContext as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+            stale=True,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        await _record_run_failure(
+            runs,
+            run_id,
+            error=exc,
+            runtime=runtime,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-illustration-prompt")
+async def generate_agent_illustration_prompt(
+    request: IllustrationPromptRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    """Translate bounded novel evidence into an editable prompt preview."""
+
+    run_id: str | None = None
+    runtime: Any | None = None
+    try:
+        context, profile = (
+            await _resolve_illustration_prompt_context_and_agent(
+                request=request,
+                actor=actor,
+                access=access,
+                catalog=catalog,
+            )
+        )
+        run_id = await runs.begin(
+            actor_id=actor.id,
+            novel_id=request.novel_id,
+            capability="illustration_prompt",
+            agent_id=profile.agent_id,
+            agent_version=profile.version,
+            request=request.model_dump(),
+            context=context,
+        )
+        runtime = create_generation_runtime(**build_runtime_kwargs(request))
+        generated = await AgentOrchestrator(runtime).generate_structured(
+            profile=profile,
+            target=WorkflowStepTarget(
+                ILLUSTRATION_PROMPT_WORKFLOW,
+                ILLUSTRATION_PROMPT_STEP,
+            ),
+            schema=IllustrationPromptResult,
+            prompts=PromptPlan(
+                native_schema_prompt=_illustration_prompt(
+                    context=context.text,
+                    target_label=context.target_label,
+                    coverage=context.coverage,
+                    target_model=request.target_model.strip(),
+                    focus=request.focus.strip(),
+                    instruction=request.instruction.strip(),
+                    json_only=False,
+                ),
+                prompt_json_prompt=_illustration_prompt(
+                    context=context.text,
+                    target_label=context.target_label,
+                    coverage=context.coverage,
+                    target_model=request.target_model.strip(),
+                    focus=request.focus.strip(),
+                    instruction=request.instruction.strip(),
+                    json_only=True,
+                ),
+            ),
+            **build_gen_kwargs(request),
+        )
+        await ensure_agent_context_current(context)
+        result = generated.value.model_dump()
         await runs.complete(run_id, generated=generated, result=result)
         return {
             "result": result,

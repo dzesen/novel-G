@@ -5,6 +5,12 @@ import { useTranslations } from "next-intl";
 
 import { useAuth } from "@/components/auth/AuthProvider";
 import { apiDelete, apiGet, apiPost, apiPut } from "@/lib/api";
+import {
+  constrainIllustrationPromptEdit,
+  ILLUSTRATION_FIELD_LIMITS,
+  ILLUSTRATION_TOTAL_LIMIT,
+  illustrationPromptCharacterCount,
+} from "@/lib/illustrationPrompt";
 import type {
   AgentCapability,
   AgentCapabilityId,
@@ -15,10 +21,15 @@ import type {
   ContinuityEvidenceReference,
   ContinuityReviewResult,
   CreativeInspirationResult,
+  IllustrationPromptResult,
   StyleConsistencyResult,
   VolumeRetrospectiveResult,
 } from "@/types/agent";
-import type { ChapterSummary, VolumeSummary } from "@/types/novel";
+import type {
+  ChapterSummary,
+  ReferenceCard,
+  VolumeSummary,
+} from "@/types/novel";
 import AgentRevisionWorkspace, {
   type AgentRevisionSourceSelection,
 } from "./AgentRevisionWorkspace";
@@ -33,9 +44,12 @@ type StudioTab =
   | "creative"
   | "continuity"
   | "style"
+  | "illustration"
   | "retrospective"
   | "history"
   | "management";
+
+type ToolScope = AgentScope | "character";
 
 interface AgentDraft {
   label: string;
@@ -122,13 +136,15 @@ export default function AgentStudioWorkspace({
   const [providers, setProviders] = useState<AgentProviderOption[]>([]);
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
+  const [characterCards, setCharacterCards] = useState<ReferenceCard[]>([]);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const [scope, setScope] = useState<AgentScope>("novel");
+  const [scope, setScope] = useState<ToolScope>("novel");
   const [volumeId, setVolumeId] = useState("");
   const [chapterId, setChapterId] = useState("");
+  const [characterCardId, setCharacterCardId] = useState("");
   const [toolAgentId, setToolAgentId] = useState("");
   const [question, setQuestion] = useState("");
   const [constraints, setConstraints] = useState("");
@@ -143,6 +159,10 @@ export default function AgentStudioWorkspace({
   const [styleResult, setStyleResult] =
     useState<StyleConsistencyResult | null>(null);
   const [styleFocus, setStyleFocus] = useState("");
+  const [illustrationResult, setIllustrationResult] =
+    useState<IllustrationPromptResult | null>(null);
+  const [illustrationFocus, setIllustrationFocus] = useState("");
+  const [targetImageModel, setTargetImageModel] = useState("");
   const [retrospectiveResult, setRetrospectiveResult] =
     useState<VolumeRetrospectiveResult | null>(null);
   const [retrospectiveFocus, setRetrospectiveFocus] = useState("");
@@ -190,8 +210,11 @@ export default function AgentStudioWorkspace({
     Promise.all([
       apiGet<{ data: VolumeSummary[] }>(`/api/volumes/novel/${novelId}`),
       apiGet<{ data: ChapterSummary[] }>(`/api/chapters/novel/${novelId}`),
+      apiGet<{ data: ReferenceCard[] }>(
+        `/api/reference-cards/novel/${novelId}/character`,
+      ),
     ])
-      .then(([volumeResponse, chapterResponse]) => {
+      .then(([volumeResponse, chapterResponse, characterResponse]) => {
         if (cancelled) return;
         setVolumes(
           [...volumeResponse.data].sort(
@@ -199,6 +222,15 @@ export default function AgentStudioWorkspace({
           ),
         );
         setChapters(chapterResponse.data);
+        setCharacterCards(
+          [...characterResponse.data]
+            .filter((card) => !card.is_deleted)
+            .sort(
+              (left, right) =>
+                left.sort_order - right.sort_order ||
+                left.name.localeCompare(right.name),
+            ),
+        );
       })
       .catch((caught: unknown) => {
         if (!cancelled) {
@@ -213,6 +245,8 @@ export default function AgentStudioWorkspace({
   const activeCapability =
     tab === "retrospective"
       ? "volume_retrospective"
+      : tab === "illustration"
+        ? "illustration_prompt"
       : tab === "style"
         ? "style_consistency"
         : tab === "continuity"
@@ -381,6 +415,10 @@ export default function AgentStudioWorkspace({
       setError(t("tool.chooseChapter"));
       return;
     }
+    if (scope === "character" && !characterCardId) {
+      setError(t("tool.chooseCharacter"));
+      return;
+    }
     setRunning(true);
     setError(null);
     setNotice(null);
@@ -407,6 +445,7 @@ export default function AgentStudioWorkspace({
         setCreativeResult(response.result);
         setContinuityResult(null);
         setStyleResult(null);
+        setIllustrationResult(null);
         setRetrospectiveResult(null);
         setToolMetadata(response);
       } else if (tab === "continuity") {
@@ -419,6 +458,7 @@ export default function AgentStudioWorkspace({
         setContinuityResult(response.result);
         setCreativeResult(null);
         setStyleResult(null);
+        setIllustrationResult(null);
         setRetrospectiveResult(null);
         setToolMetadata(response);
       } else if (tab === "style") {
@@ -431,6 +471,23 @@ export default function AgentStudioWorkspace({
         setStyleResult(response.result);
         setCreativeResult(null);
         setContinuityResult(null);
+        setIllustrationResult(null);
+        setRetrospectiveResult(null);
+        setToolMetadata(response);
+      } else if (tab === "illustration") {
+        const response = await apiPost<
+          { result: IllustrationPromptResult } & AgentToolMetadata
+        >("/api/llm/agent-illustration-prompt", {
+          ...base,
+          character_card_id:
+            scope === "character" ? characterCardId : null,
+          target_model: targetImageModel.trim(),
+          focus: illustrationFocus.trim(),
+        });
+        setIllustrationResult(response.result);
+        setCreativeResult(null);
+        setContinuityResult(null);
+        setStyleResult(null);
         setRetrospectiveResult(null);
         setToolMetadata(response);
       } else {
@@ -444,6 +501,7 @@ export default function AgentStudioWorkspace({
         setCreativeResult(null);
         setContinuityResult(null);
         setStyleResult(null);
+        setIllustrationResult(null);
         setToolMetadata(response);
       }
     } catch (caught) {
@@ -461,10 +519,30 @@ export default function AgentStudioWorkspace({
           ? continuityResult
           : tab === "style"
             ? styleResult
-            : retrospectiveResult;
+            : tab === "illustration"
+              ? illustrationResult
+              : retrospectiveResult;
     if (!result) return;
     await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
     setNotice(t("copied"));
+  };
+
+  const illustrationCharacterCount = illustrationResult
+    ? illustrationPromptCharacterCount(illustrationResult)
+    : 0;
+
+  const updateIllustrationField = (
+    field: keyof IllustrationPromptResult,
+    rawValue: string,
+  ) => {
+    setIllustrationResult((current) => {
+      if (!current) return current;
+      return constrainIllustrationPromptEdit(
+        current,
+        field,
+        rawValue,
+      );
+    });
   };
 
   const startRevision = (
@@ -492,17 +570,39 @@ export default function AgentStudioWorkspace({
         <select
           className={fieldClass}
           value={scope}
-          onChange={(event) => setScope(event.target.value as AgentScope)}
+          onChange={(event) => setScope(event.target.value as ToolScope)}
         >
+          {tab === "illustration" && (
+            <option value="character">{t("tool.scopeCharacter")}</option>
+          )}
           {tab !== "style" && tab !== "retrospective" && (
             <option value="novel">{t("tool.scopeNovel")}</option>
           )}
-          <option value="volume">{t("tool.scopeVolume")}</option>
+          {tab !== "illustration" && (
+            <option value="volume">{t("tool.scopeVolume")}</option>
+          )}
           {tab !== "retrospective" && (
             <option value="chapter">{t("tool.scopeChapter")}</option>
           )}
         </select>
       </label>
+      {scope === "character" && (
+        <label className="min-w-0 space-y-1.5 text-sm md:col-span-2">
+          <span className="text-muted">{t("tool.character")}</span>
+          <select
+            className={fieldClass}
+            value={characterCardId}
+            onChange={(event) => setCharacterCardId(event.target.value)}
+          >
+            <option value="">{t("tool.selectCharacter")}</option>
+            {characterCards.map((card) => (
+              <option key={card._id} value={card._id}>
+                {card.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       {scope === "volume" && (
         <label className="space-y-1.5 text-sm md:col-span-2">
           <span className="text-muted">{t("tool.volume")}</span>
@@ -567,11 +667,11 @@ export default function AgentStudioWorkspace({
     </div>
   );
 
-  const resultHeader = (title: string) => (
+  const resultHeader = (title: string, badge = t("previewBadge")) => (
     <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
       <div>
         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">
-          {t("previewBadge")}
+          {badge}
         </p>
         <h3 className="mt-1 text-lg font-semibold text-foreground">{title}</h3>
       </div>
@@ -608,7 +708,9 @@ export default function AgentStudioWorkspace({
                   ? t("continuity.eyebrow")
                   : tab === "style"
                     ? t("style.eyebrow")
-                    : t("retrospective.eyebrow")}
+                    : tab === "illustration"
+                      ? t("illustration.eyebrow")
+                      : t("retrospective.eyebrow")}
             </p>
             <h2 className="mt-1 text-xl font-semibold text-foreground">
               {tab === "creative"
@@ -617,7 +719,9 @@ export default function AgentStudioWorkspace({
                   ? t("continuity.title")
                   : tab === "style"
                     ? t("style.title")
-                    : t("retrospective.title")}
+                    : tab === "illustration"
+                      ? t("illustration.title")
+                      : t("retrospective.title")}
             </h2>
             <p className="mt-2 text-sm leading-6 text-muted">
               {tab === "creative"
@@ -626,7 +730,9 @@ export default function AgentStudioWorkspace({
                   ? t("continuity.description")
                   : tab === "style"
                     ? t("style.description")
-                    : t("retrospective.description")}
+                    : tab === "illustration"
+                      ? t("illustration.description")
+                      : t("retrospective.description")}
             </p>
           </div>
 
@@ -704,6 +810,37 @@ export default function AgentStudioWorkspace({
                   placeholder={t("style.focusPlaceholder")}
                 />
               </label>
+            ) : tab === "illustration" ? (
+              <>
+                <label className="block space-y-1.5 text-sm">
+                  <span className="text-muted">
+                    {t("illustration.targetModel")}
+                  </span>
+                  <input
+                    className={fieldClass}
+                    maxLength={200}
+                    value={targetImageModel}
+                    onChange={(event) =>
+                      setTargetImageModel(event.target.value)
+                    }
+                    placeholder={t("illustration.targetModelPlaceholder")}
+                  />
+                </label>
+                <label className="block space-y-1.5 text-sm">
+                  <span className="text-muted">
+                    {t("illustration.focus")}
+                  </span>
+                  <textarea
+                    className={`${fieldClass} min-h-28 resize-y`}
+                    maxLength={2000}
+                    value={illustrationFocus}
+                    onChange={(event) =>
+                      setIllustrationFocus(event.target.value)
+                    }
+                    placeholder={t("illustration.focusPlaceholder")}
+                  />
+                </label>
+              </>
             ) : (
               <label className="block space-y-1.5 text-sm">
                 <span className="text-muted">
@@ -744,6 +881,8 @@ export default function AgentStudioWorkspace({
             <p className="text-xs leading-5 text-muted">
               {tab === "style"
                 ? t("style.previewOnlyHint")
+                : tab === "illustration"
+                  ? t("illustration.previewOnlyHint")
                 : tab === "retrospective"
                   ? t("retrospective.previewOnlyHint")
                   : t("previewOnlyHint")}
@@ -1082,6 +1221,56 @@ export default function AgentStudioWorkspace({
                   ))}
                 </ol>
               )}
+            </div>
+          ) : tab === "illustration" && illustrationResult ? (
+            <div className="min-w-0 space-y-5">
+              {resultHeader(
+                t("illustration.resultTitle"),
+                t("illustration.editableBadge"),
+              )}
+              <p className="text-sm leading-6 text-muted">
+                {t("illustration.editHint")}
+              </p>
+              <div className="grid min-w-0 gap-x-4 gap-y-5 md:grid-cols-2">
+                {(
+                  [
+                    "subject",
+                    "appearance",
+                    "scene",
+                    "style",
+                    "negative",
+                  ] as const
+                ).map((field) => (
+                  <label
+                    key={field}
+                    className={`min-w-0 space-y-1.5 text-sm ${
+                      field === "scene" ? "md:col-span-2" : ""
+                    }`}
+                  >
+                    <span className="flex flex-wrap items-center justify-between gap-2 text-muted">
+                      <span>{t(`illustration.fields.${field}`)}</span>
+                      <span className="shrink-0 text-xs tabular-nums">
+                        {Array.from(illustrationResult[field]).length}/
+                        {ILLUSTRATION_FIELD_LIMITS[field]}
+                      </span>
+                    </span>
+                    <textarea
+                      data-testid={`illustration-${field}`}
+                      className={`${fieldClass} min-h-32 resize-y text-base leading-6 md:text-sm`}
+                      value={illustrationResult[field]}
+                      onChange={(event) =>
+                        updateIllustrationField(field, event.target.value)
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-4 text-xs text-muted">
+                <span>{t("illustration.totalLimitHint")}</span>
+                <span className="tabular-nums">
+                  {illustrationCharacterCount}/{ILLUSTRATION_TOTAL_LIMIT}
+                </span>
+              </div>
             </div>
           ) : tab === "retrospective" && retrospectiveResult ? (
             <div className="space-y-5">
@@ -1639,6 +1828,7 @@ export default function AgentStudioWorkspace({
               "creative",
               "continuity",
               "style",
+              "illustration",
               "retrospective",
               "history",
               "management",
@@ -1652,11 +1842,20 @@ export default function AgentStudioWorkspace({
                 aria-selected={tab === item}
                 onClick={() => {
                   setTab(item);
-                  if (item === "style" && scope === "novel") {
+                  if (
+                    item === "style" &&
+                    (scope === "novel" || scope === "character")
+                  ) {
                     setScope("chapter");
-                  }
-                  if (item === "retrospective") {
+                  } else if (item === "retrospective") {
                     setScope("volume");
+                  } else if (item === "illustration" && scope === "volume") {
+                    setScope("novel");
+                  } else if (
+                    item !== "illustration" &&
+                    scope === "character"
+                  ) {
+                    setScope("novel");
                   }
                   setError(null);
                   setNotice(null);
