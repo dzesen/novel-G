@@ -5,7 +5,16 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
+
+from backend.services.novel.appearance_anchor import RuntimeFingerprintSchema
 
 
 class ImageFailureCode(str, Enum):
@@ -116,10 +125,36 @@ class ImageJobAudit(_ContractModel):
     template_revision: str
     submitted_graph_hash: str
     comfyui_version: str
-    seed: int | None = None
+    seed: str | None = None
     checkpoint_names: tuple[str, ...] = ()
     lora_names: tuple[str, ...] = ()
     input_asset_hashes: dict[str, str] = Field(default_factory=dict)
+    runtime_fingerprint: RuntimeFingerprintSchema = Field(
+        default_factory=RuntimeFingerprintSchema
+    )
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def normalize_seed(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("seed must be an integer from 0 through 2^64-1")
+        if isinstance(value, int):
+            parsed = value
+        elif (
+            isinstance(value, str)
+            and value
+            and value.isascii()
+            and value.isdecimal()
+            and (value == "0" or not value.startswith("0"))
+        ):
+            parsed = int(value)
+        else:
+            raise ValueError("seed must be an integer from 0 through 2^64-1")
+        if not 0 <= parsed <= (2**64 - 1):
+            raise ValueError("seed must be an integer from 0 through 2^64-1")
+        return str(parsed)
 
 
 class ImageJobHandle(_ContractModel):

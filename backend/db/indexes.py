@@ -647,6 +647,114 @@ async def init_image_asset_indexes():
         raise
 
 
+async def init_image_job_indexes():
+    """Initialize durable image-job ownership, resume, and idempotency indexes."""
+    try:
+        collection = get_database()[collections.IMAGE_JOBS]
+        existing = await collection.index_information()
+        desired_idempotency_filter = {
+            "idempotency_key": {"$type": "string"},
+            "is_terminal": False,
+            "is_deleted": False,
+        }
+        desired_active_filter = {
+            "usage": "character_portrait",
+            "is_terminal": False,
+            "is_deleted": False,
+        }
+        active_index = existing.get("image_jobs_owner_character_active")
+        desired_active_key = [
+            ("owner_id", pymongo.ASCENDING),
+            ("novel_id", pymongo.ASCENDING),
+            ("character_card_id", pymongo.ASCENDING),
+            ("usage", pymongo.ASCENDING),
+        ]
+        if active_index is not None and (
+            active_index.get("key") != desired_active_key
+            or active_index.get("unique") is not True
+            or active_index.get("partialFilterExpression")
+            != desired_active_filter
+        ):
+            await collection.drop_index("image_jobs_owner_character_active")
+        idempotency_index = existing.get("image_jobs_owner_idempotency")
+        if (
+            idempotency_index is not None
+            and idempotency_index.get("partialFilterExpression")
+            != desired_idempotency_filter
+        ):
+            await collection.drop_index("image_jobs_owner_idempotency")
+        provider_prompt_index = existing.get("image_jobs_provider_prompt")
+        desired_provider_prompt_key = [
+            ("provider_alias", pymongo.ASCENDING),
+            ("handle.prompt_id", pymongo.ASCENDING),
+        ]
+        if (
+            provider_prompt_index is not None
+            and provider_prompt_index.get("key") != desired_provider_prompt_key
+        ):
+            await collection.drop_index("image_jobs_provider_prompt")
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                name="image_jobs_owner_novel_created",
+            ),
+            pymongo.IndexModel(
+                desired_active_key,
+                unique=True,
+                partialFilterExpression=desired_active_filter,
+                name="image_jobs_owner_character_active",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("idempotency_key", pymongo.ASCENDING),
+                ],
+                unique=True,
+                partialFilterExpression=desired_idempotency_filter,
+                name="image_jobs_owner_idempotency",
+            ),
+            pymongo.IndexModel(
+                desired_provider_prompt_key,
+                unique=True,
+                partialFilterExpression={
+                    "handle.prompt_id": {"$type": "string"},
+                    "is_deleted": False,
+                },
+                name="image_jobs_provider_prompt",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("character_card_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression={
+                    "cleanup_pending": True,
+                    "is_deleted": False,
+                },
+                name="image_jobs_owner_character_cleanup",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("is_terminal", pymongo.ASCENDING),
+                    ("status", pymongo.ASCENDING),
+                    ("updated_at", pymongo.ASCENDING),
+                ],
+                name="image_jobs_status_updated",
+            ),
+        ])
+        logger.info("Initialized image_jobs indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize image_jobs indexes: %s", exc)
+        # Idempotent submit/resume depends on the two unique indexes above.
+        raise
+
+
 async def init_state_timeline_indexes():
     """初始化可回放状态时间线、预览与 standalone journal 索引。"""
     try:
@@ -718,5 +826,6 @@ async def init_all_indexes():
     await init_generation_job_indexes()
     await init_prose_run_indexes()
     await init_image_asset_indexes()
+    await init_image_job_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

@@ -211,6 +211,44 @@ class ReferenceCardRepository(BaseRepository):
             raise NotFoundError(f"Reference card '{card_id}' was not found")
         return result.modified_count > 0
 
+    async def compare_and_set_appearance_anchor(
+        self,
+        novel_id: str,
+        card_id: str,
+        *,
+        expected: dict[str, Any] | None,
+        replacement: dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        """Atomically establish or replace a character's image-only anchor.
+
+        This write deliberately bypasses ``BaseRepository.update_one`` so it
+        does not touch ``updated_at``. That field breaks ties in reference-card
+        ordering and can therefore affect prose context indirectly.
+        """
+
+        if "character" not in self.supported_types:
+            raise ValueError("Appearance anchors are only supported for characters")
+        query: dict[str, Any] = {
+            "_id": to_object_id(card_id),
+            "novel_id": to_object_id(novel_id),
+            "card_type": "character",
+            "is_deleted": False,
+        }
+        if expected is None:
+            query["$or"] = [
+                {"appearance_anchor": {"$exists": False}},
+                {"appearance_anchor": None},
+            ]
+        else:
+            query["appearance_anchor"] = dict(expected)
+        result = await self.collection.update_one(
+            query,
+            {"$set": {"appearance_anchor": dict(replacement)}},
+            session=session,
+        )
+        return result.modified_count == 1
+
     async def soft_delete_card(
         self,
         novel_id: str,

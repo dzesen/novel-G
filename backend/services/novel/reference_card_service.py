@@ -16,6 +16,11 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.reference_card_repository import ReferenceCardRepository
 from backend.db.repositories.worldbook_repository import worldbook_repo
 from backend.services.novel.character_profile import normalize_character_profile
+from backend.services.novel.appearance_anchor import (
+    AppearanceAnchorConflictError,
+    normalize_appearance_anchor,
+    require_appearance_anchor_reset_confirmation,
+)
 
 
 CARD_TYPES = {"character", "location", "item", "rule", "lore"}
@@ -230,6 +235,109 @@ class ReferenceCardService:
             card_id,
             include_deleted=include_deleted,
         )
+
+    @staticmethod
+    async def get_appearance_anchor(
+        novel_id: str,
+        card_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the validated image-only anchor without projecting it to prose."""
+
+        card = await ReferenceCardService.get(
+            novel_id,
+            "character",
+            card_id,
+        )
+        anchor = card.get("appearance_anchor")
+        return (
+            normalize_appearance_anchor(anchor)
+            if anchor is not None
+            else None
+        )
+
+    @staticmethod
+    async def get_appearance_anchor_descriptor(
+        novel_id: str,
+        card_id: str,
+    ) -> str | None:
+        """Return the future scene-image mandatory prefix, if established."""
+
+        anchor = await ReferenceCardService.get_appearance_anchor(
+            novel_id,
+            card_id,
+        )
+        return str(anchor["descriptor"]) if anchor is not None else None
+
+    @staticmethod
+    async def establish_appearance_anchor(
+        novel_id: str,
+        card_id: str,
+        anchor: Any,
+    ) -> dict[str, Any]:
+        """Establish the first anchor only when the character has none."""
+
+        await novel_repo.get_novel_by_id(novel_id)
+        current = await character_repo.get_card(
+            novel_id,
+            "character",
+            card_id,
+        )
+        if current.get("appearance_anchor") is not None:
+            raise AppearanceAnchorConflictError(
+                "Appearance anchor already exists"
+            )
+        replacement = normalize_appearance_anchor(anchor)
+        changed = await character_repo.compare_and_set_appearance_anchor(
+            novel_id,
+            card_id,
+            expected=None,
+            replacement=replacement,
+        )
+        if not changed:
+            raise AppearanceAnchorConflictError(
+                "Appearance anchor already exists"
+            )
+        return replacement
+
+    @staticmethod
+    async def reset_appearance_anchor(
+        novel_id: str,
+        card_id: str,
+        anchor: Any,
+        *,
+        expected_previous: Any,
+        confirmed: bool,
+    ) -> dict[str, Any]:
+        """Replace an anchor only after warning acknowledgement and whole-value CAS."""
+
+        await novel_repo.get_novel_by_id(novel_id)
+        current = await character_repo.get_card(
+            novel_id,
+            "character",
+            card_id,
+        )
+        current_anchor = current.get("appearance_anchor")
+        if current_anchor is None:
+            raise AppearanceAnchorConflictError(
+                "Appearance anchor changed or no longer exists"
+            )
+        require_appearance_anchor_reset_confirmation(
+            current_anchor,
+            confirmed=confirmed,
+        )
+        expected = normalize_appearance_anchor(expected_previous)
+        replacement = normalize_appearance_anchor(anchor)
+        changed = await character_repo.compare_and_set_appearance_anchor(
+            novel_id,
+            card_id,
+            expected=expected,
+            replacement=replacement,
+        )
+        if not changed:
+            raise AppearanceAnchorConflictError(
+                "Appearance anchor changed after reset was prepared"
+            )
+        return replacement
 
     @staticmethod
     async def set_favorite(

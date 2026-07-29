@@ -103,6 +103,27 @@ class ImageAssetRepository(BaseRepository):
             }
         )
 
+    async def get_owned_subject_hash(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        subject_kind: str,
+        subject_id: str,
+        content_hash: str,
+    ) -> dict[str, Any] | None:
+        return await self.collection.find_one(
+            {
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "content_hash": content_hash,
+                "is_deleted": False,
+            },
+            sort=[("created_at", -1)],
+        )
+
     def iter_owned_metadata(
         self,
         *,

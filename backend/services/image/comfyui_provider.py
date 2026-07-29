@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import time
 from typing import Any, Callable, Literal
@@ -22,6 +23,7 @@ from backend.services.image.comfyui_failures import (
     execution_failed_failure,
     job_lost_failure,
     queue_full_failure,
+    sanitize_comfyui_text,
 )
 from backend.services.image.comfyui_template import (
     prepare_comfyui_template,
@@ -37,6 +39,10 @@ from backend.services.image.contracts import (
     ImageOutputBindingSnapshot,
     ImagePollResult,
     ImageProviderError,
+)
+from backend.services.novel.appearance_anchor import (
+    RuntimeFingerprintSchema,
+    RuntimePackageVersionSchema,
 )
 
 
@@ -101,6 +107,167 @@ def _comfyui_version(system_stats: dict[str, Any]) -> str:
     if not isinstance(system, dict):
         return ""
     return str(system.get("comfyui_version") or "").strip()
+
+
+_PRECISION_FLAG_PREFIXES = (
+    "--force-fp",
+    "--fp16-",
+    "--fp32-",
+    "--bf16-",
+    "--fp8-",
+    "--fp8_",
+)
+_RUNTIME_LIST_CHARACTER_BUDGET = 2_500
+
+
+def _digest_runtime_values(
+    values: list[str],
+    *,
+    label: str,
+    max_items: int,
+) -> list[str]:
+    normalized = sorted(dict.fromkeys(values))
+    if (
+        len(normalized) <= max_items
+        and sum(len(value) for value in normalized)
+        <= _RUNTIME_LIST_CHARACTER_BUDGET
+    ):
+        return normalized
+    digest = hashlib.sha256(
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return [f"{label}:sha256:{digest};count={len(normalized)}"]
+
+
+def build_comfyui_runtime_fingerprint(
+    system_stats: dict[str, Any],
+    *,
+    checkpoint_names: tuple[str, ...],
+    lora_names: tuple[str, ...],
+) -> RuntimeFingerprintSchema:
+    """Keep only bounded deployment facts; never persist argv or local paths."""
+
+    system = system_stats.get("system")
+    system = system if isinstance(system, dict) else {}
+    raw_packages = system.get("comfy_package_versions")
+    raw_normalized_packages: list[tuple[str, str]] = []
+    if isinstance(raw_packages, list):
+        for raw_package in raw_packages:
+            if not isinstance(raw_package, dict):
+                continue
+            name = sanitize_comfyui_text(
+                raw_package.get("name"),
+                limit=200,
+            )
+            if not name:
+                continue
+            version = sanitize_comfyui_text(
+                raw_package.get("installed") or "unknown",
+                limit=120,
+            )
+            raw_normalized_packages.append(
+                (name, version or "unknown")
+            )
+    normalized_packages = sorted(dict.fromkeys(raw_normalized_packages))
+    package_characters = sum(
+        len(name) + len(version)
+        for name, version in normalized_packages
+    )
+    if (
+        len(normalized_packages) > 128
+        or package_characters > _RUNTIME_LIST_CHARACTER_BUDGET
+    ):
+        package_digest = hashlib.sha256(
+            json.dumps(
+                normalized_packages,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        packages = [
+            RuntimePackageVersionSchema(
+                name=f"packages:sha256:{package_digest}",
+                version=f"count:{len(normalized_packages)}",
+            )
+        ]
+    else:
+        packages = [
+            RuntimePackageVersionSchema(name=name, version=version)
+            for name, version in normalized_packages
+        ]
+
+    raw_devices = system_stats.get("devices")
+    devices: list[str] = []
+    if isinstance(raw_devices, list):
+        for raw_device in raw_devices:
+            if not isinstance(raw_device, dict):
+                continue
+            device_type = sanitize_comfyui_text(
+                raw_device.get("type"),
+                limit=40,
+            )
+            device_name = sanitize_comfyui_text(
+                raw_device.get("name"),
+                limit=250,
+            )
+            rendered = ": ".join(
+                value for value in (device_type, device_name) if value
+            )
+            if rendered:
+                devices.append(rendered[:300])
+
+    raw_argv = system.get("argv")
+    precision_flags: list[str] = []
+    if isinstance(raw_argv, list):
+        for value in raw_argv:
+            flag = str(value or "").strip()
+            if flag.startswith(_PRECISION_FLAG_PREFIXES):
+                precision_flags.append(
+                    sanitize_comfyui_text(flag, limit=80)
+                )
+    precision = ", ".join(sorted(set(precision_flags))) or "default"
+
+    checkpoint_values = [
+        sanitize_comfyui_text(name, limit=500)
+        for name in checkpoint_names
+        if str(name).strip()
+    ]
+    lora_values = [
+        sanitize_comfyui_text(name, limit=500)
+        for name in lora_names
+        if str(name).strip()
+    ]
+    return RuntimeFingerprintSchema(
+        comfyui_version=sanitize_comfyui_text(
+            system.get("comfyui_version"),
+            limit=120,
+        ),
+        pytorch_version=sanitize_comfyui_text(
+            system.get("pytorch_version"),
+            limit=120,
+        ),
+        package_versions=packages,
+        devices=_digest_runtime_values(
+            devices,
+            label="devices",
+            max_items=8,
+        ),
+        precision=precision[:200],
+        checkpoint_names=_digest_runtime_values(
+            checkpoint_values,
+            label="checkpoints",
+            max_items=32,
+        ),
+        lora_names=_digest_runtime_values(
+            lora_values,
+            label="loras",
+            max_items=64,
+        ),
+    )
 
 
 class ComfyUIProvider:
@@ -228,6 +395,11 @@ class ComfyUIProvider:
                 checkpoint_names=prepared.loaded.checkpoint_names,
                 lora_names=prepared.loaded.lora_names,
                 input_asset_hashes=input_asset_hashes,
+                runtime_fingerprint=build_comfyui_runtime_fingerprint(
+                    system_stats,
+                    checkpoint_names=prepared.loaded.checkpoint_names,
+                    lora_names=prepared.loaded.lora_names,
+                ),
             ),
         )
 

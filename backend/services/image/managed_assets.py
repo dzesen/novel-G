@@ -152,6 +152,17 @@ class GeneratedImageAssetCreate(_AssetCommand):
     def validate_request_params(cls, value: Any) -> dict[str, Any]:
         return _normalize_request_params(value)
 
+    @field_validator("seed", mode="before")
+    @classmethod
+    def validate_seed(cls, value: Any) -> int:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= (2**64 - 1)
+        ):
+            raise ValueError("seed must be an integer from 0 through 2^64-1")
+        return value
+
 
 class ImportedImageAssetCreate(_AssetCommand):
     source: Literal["imported"] = "imported"
@@ -480,7 +491,9 @@ class ManagedImageAssetService:
                 "request_params": safe_request_params,
                 "final_prompt": command.final_prompt,
                 "negative_prompt": command.negative_prompt,
-                "seed": command.seed,
+                # MongoDB/BSON integers are signed int64. Persist the complete
+                # uint64 generation seed as exact canonical decimal text.
+                "seed": str(command.seed),
                 "revised_prompt": command.revised_prompt,
             }
         else:

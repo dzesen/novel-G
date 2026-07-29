@@ -199,6 +199,7 @@ class NovelService:
             )
             mutation_journals_repo = BaseRepository(collections.MUTATION_JOURNALS)
             image_assets_repo = BaseRepository(collections.IMAGE_ASSETS)
+            image_jobs_repo = BaseRepository(collections.IMAGE_JOBS)
 
             stats = {}
 
@@ -229,6 +230,10 @@ class NovelService:
             # Deliberately retain content-addressed files. A later backup restore
             # can bring this metadata back; slice 4 reports the resulting orphans.
             stats["image_assets_deleted"] = await image_assets_repo.hard_delete_many(
+                query,
+                session=session,
+            )
+            stats["image_jobs_deleted"] = await image_jobs_repo.hard_delete_many(
                 query,
                 session=session,
             )

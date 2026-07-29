@@ -11,6 +11,7 @@ import type {
   ReferenceCardType,
 } from "@/types/novel";
 import CardImportDialog from "./CardImportDialog";
+import CharacterPortraitPanel from "./CharacterPortraitPanel";
 import ReferenceCardCurationDialog from "./ReferenceCardCurationDialog";
 
 interface ReferenceCardsWorkspaceProps {
@@ -98,6 +99,14 @@ export default function ReferenceCardsWorkspace({
   const selectedCard = useMemo(
     () => cards.find((card) => card._id === selectedId) ?? null,
     [cards, selectedId],
+  );
+  const hasUnsavedChanges = useMemo(
+    () =>
+      Boolean(
+        selectedCard &&
+          JSON.stringify(draft) !== JSON.stringify(createDraft(selectedCard)),
+      ),
+    [draft, selectedCard],
   );
 
   const filteredCards = useMemo(() => {
@@ -520,6 +529,18 @@ export default function ReferenceCardsWorkspace({
                   onChange={(value) => setDraft((current) => ({ ...current, details: { ...current.details, [field]: value } }))}
                 />
               ))}
+              {cardType === "character" &&
+                !creating &&
+                selectedCard &&
+                novelId && (
+                  <CharacterPortraitPanel
+                    key={selectedCard._id}
+                    novelId={novelId}
+                    cardId={selectedCard._id}
+                    cardName={selectedCard.name}
+                    hasUnsavedChanges={hasUnsavedChanges}
+                  />
+                )}
               {cardType === "character" && (
                 <section className="border-t border-border pt-6 md:col-span-2">
                   <div className="max-w-2xl">
