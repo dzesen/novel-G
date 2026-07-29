@@ -103,3 +103,21 @@ export interface NovelCoverState {
   provider: ImageProviderState;
   warnings?: string[];
 }
+
+export interface SceneIllustrationCharacter {
+  card_id: string;
+  name: string;
+  descriptor: string | null;
+  anchored: boolean;
+}
+
+export type SceneIllustrationJob = ImageJob;
+
+export interface SceneIllustrationState {
+  characters: SceneIllustrationCharacter[];
+  assets: ImageAsset[];
+  active_job: SceneIllustrationJob | null;
+  cleanup_job: SceneIllustrationJob | null;
+  provider: ImageProviderState;
+  warnings?: string[];
+}

@@ -797,6 +797,42 @@ def _runtime_signature(value: Any) -> tuple[Any, ...]:
     )
 
 
+def appearance_anchor_drift_labels(
+    anchor: dict[str, Any] | AppearanceAnchorSchema,
+    snapshot: ImageProviderSnapshot,
+) -> tuple[str, ...]:
+    """Return the shared portrait/scene consistency dimensions that changed."""
+
+    canonical = AppearanceAnchorSchema.model_validate(anchor).model_dump(
+        mode="python"
+    )
+    comparisons = (
+        ("后端", canonical["provider"], snapshot.alias),
+        ("模型", canonical["model"], snapshot.model),
+        (
+            "workflow 版本",
+            canonical["workflow_revision"],
+            snapshot.workflow_revision,
+        ),
+        (
+            "参考模式",
+            canonical["reference_mode"],
+            snapshot.reference_mode,
+        ),
+    )
+    changed = [
+        label
+        for label, previous, current in comparisons
+        if current and previous != current
+    ]
+    if snapshot.runtime_fingerprint is not None and (
+        _runtime_signature(canonical["runtime_fingerprint"])
+        != _runtime_signature(snapshot.runtime_fingerprint)
+    ):
+        changed.append("运行环境")
+    return tuple(changed)
+
+
 class SingleImageJobService:
     def __init__(
         self,
@@ -831,6 +867,18 @@ class SingleImageJobService:
         scope: ImageJobScope,
         provider_alias: str | None = None,
     ) -> ImageJobStateProjection:
+        state, _snapshot = await self.get_job_state_with_snapshot(
+            scope=scope,
+            provider_alias=provider_alias,
+        )
+        return state
+
+    async def get_job_state_with_snapshot(
+        self,
+        *,
+        scope: ImageJobScope,
+        provider_alias: str | None = None,
+    ) -> tuple[ImageJobStateProjection, ImageProviderSnapshot]:
         scope = scope.canonical()
         if scope.usage != self.usage:
             raise ValueError("Image job scope usage does not match the service")
@@ -897,18 +945,21 @@ class SingleImageJobService:
             ),
             warnings=tuple(dict.fromkeys(provider_warnings)),
         )
-        return ImageJobStateProjection(
-            active_job=(
-                _image_job_projection(active)
-                if active is not None
-                else None
+        return (
+            ImageJobStateProjection(
+                active_job=(
+                    _image_job_projection(active)
+                    if active is not None
+                    else None
+                ),
+                cleanup_job=(
+                    _image_job_projection(cleanup)
+                    if cleanup is not None
+                    else None
+                ),
+                provider=provider,
             ),
-            cleanup_job=(
-                _image_job_projection(cleanup)
-                if cleanup is not None
-                else None
-            ),
-            provider=provider,
+            snapshot,
         )
 
     async def get_state(
@@ -1068,36 +1119,10 @@ class SingleImageJobService:
 
         consistency_warnings: list[str] = []
         if canonical_anchor is not None and snapshot.available:
-            comparisons = (
-                (
-                    "后端",
-                    canonical_anchor["provider"],
-                    snapshot.alias,
-                ),
-                ("模型", canonical_anchor["model"], snapshot.model),
-                (
-                    "workflow 版本",
-                    canonical_anchor["workflow_revision"],
-                    snapshot.workflow_revision,
-                ),
-                (
-                    "参考模式",
-                    canonical_anchor["reference_mode"],
-                    snapshot.reference_mode,
-                ),
+            changed = appearance_anchor_drift_labels(
+                canonical_anchor,
+                snapshot,
             )
-            changed = [
-                label
-                for label, previous, current in comparisons
-                if current and previous != current
-            ]
-            if snapshot.runtime_fingerprint is not None and (
-                _runtime_signature(
-                    canonical_anchor["runtime_fingerprint"]
-                )
-                != _runtime_signature(snapshot.runtime_fingerprint)
-            ):
-                changed.append("运行环境")
             if changed:
                 consistency_warnings.append(
                     "当前图像环境与外观锚点建立时不同（"

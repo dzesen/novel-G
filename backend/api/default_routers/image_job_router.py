@@ -5,7 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from backend.api.default_routers.auth_router import (
     require_authenticated_request,
@@ -35,6 +41,13 @@ from backend.services.image.novel_cover_service import (
     NovelCoverService,
     NovelCoverStateProjection,
     novel_cover_service,
+)
+from backend.services.image.scene_illustration_service import (
+    MAX_SCENE_CHARACTER_CARD_IDS,
+    SceneIllustrationConfigurationError,
+    SceneIllustrationService,
+    SceneIllustrationStateProjection,
+    scene_illustration_service,
 )
 from backend.services.image.single_image_job_service import ImageJobProjection
 from backend.services.llm.agent_orchestrator import IllustrationPromptResult
@@ -123,12 +136,80 @@ class NovelCoverCurrentRequest(BaseModel):
             ) from error
 
 
+class SceneIllustrationJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: IllustrationPromptResult
+    scene_character_card_ids: list[str] = Field(
+        min_length=1,
+        max_length=MAX_SCENE_CHARACTER_CARD_IDS,
+    )
+    reference_character_card_id: str
+    seed: int | None = None
+    provider_alias: str | None = Field(default=None, max_length=200)
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def validate_seed(cls, value: Any) -> int | None:
+        return CharacterPortraitJobRequest.validate_seed(value)
+
+    @field_validator("provider_alias", mode="before")
+    @classmethod
+    def normalize_provider_alias(cls, value: Any) -> str | None:
+        return CharacterPortraitJobRequest.normalize_provider_alias(value)
+
+    @field_validator("scene_character_card_ids", mode="after")
+    @classmethod
+    def validate_scene_character_card_ids(
+        cls,
+        value: list[str],
+    ) -> list[str]:
+        canonical: list[str] = []
+        for card_id in value:
+            try:
+                canonical.append(str(to_object_id(str(card_id).strip())))
+            except InvalidIdError as error:
+                raise ValueError(
+                    "scene_character_card_ids must contain formal card ids"
+                ) from error
+        if len(set(canonical)) != len(canonical):
+            raise ValueError(
+                "scene_character_card_ids must not contain duplicates"
+            )
+        return canonical
+
+    @field_validator("reference_character_card_id", mode="after")
+    @classmethod
+    def validate_reference_character_card_id(cls, value: str) -> str:
+        try:
+            return str(to_object_id(str(value).strip()))
+        except InvalidIdError as error:
+            raise ValueError(
+                "reference_character_card_id must be a formal card id"
+            ) from error
+
+    @model_validator(mode="after")
+    def reference_must_be_selected(self) -> "SceneIllustrationJobRequest":
+        if (
+            self.reference_character_card_id
+            not in self.scene_character_card_ids
+        ):
+            raise ValueError(
+                "reference_character_card_id must be selected for this scene"
+            )
+        return self
+
+
 def get_character_portrait_service() -> CharacterPortraitService:
     return character_portrait_service
 
 
 def get_novel_cover_service() -> NovelCoverService:
     return novel_cover_service
+
+
+def get_scene_illustration_service() -> SceneIllustrationService:
+    return scene_illustration_service
 
 
 def _translate_portrait_error(error: Exception) -> HTTPException:
@@ -162,6 +243,22 @@ def _translate_cover_error(error: Exception) -> HTTPException:
     if isinstance(error, (InvalidIdError, ValueError)):
         return HTTPException(status_code=400, detail=str(error))
     return HTTPException(status_code=500, detail="封面任务处理失败")
+
+
+def _translate_scene_illustration_error(error: Exception) -> HTTPException:
+    if isinstance(error, (PortraitJobNotFoundError, NotFoundError)):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(
+        error,
+        (
+            InvalidIdError,
+            PortraitConfigurationError,
+            SceneIllustrationConfigurationError,
+            ValueError,
+        ),
+    ):
+        return HTTPException(status_code=400, detail=str(error))
+    return HTTPException(status_code=500, detail="场景插图任务处理失败")
 
 
 @router.get(
@@ -361,6 +458,118 @@ async def select_novel_cover(
         )
     except Exception as error:
         raise _translate_cover_error(error) from error
+
+
+@router.get(
+    (
+        "/api/novels/{novel_id}/chapters/{chapter_id}/"
+        "scene-illustration"
+    ),
+    response_model=SceneIllustrationStateProjection,
+)
+async def get_scene_illustration_state(
+    novel_id: str,
+    chapter_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: SceneIllustrationService = Depends(
+        get_scene_illustration_service
+    ),
+) -> SceneIllustrationStateProjection:
+    try:
+        return await service.get_state(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+        )
+    except Exception as error:
+        raise _translate_scene_illustration_error(error) from error
+
+
+@router.post(
+    (
+        "/api/novels/{novel_id}/chapters/{chapter_id}/"
+        "scene-illustration/jobs"
+    ),
+    response_model=ImageJobProjection,
+)
+async def start_scene_illustration_job(
+    novel_id: str,
+    chapter_id: str,
+    request: SceneIllustrationJobRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: SceneIllustrationService = Depends(
+        get_scene_illustration_service
+    ),
+) -> ImageJobProjection:
+    try:
+        return await service.start(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            prompt=request.prompt,
+            scene_character_card_ids=request.scene_character_card_ids,
+            reference_character_card_id=(
+                request.reference_character_card_id
+            ),
+            seed=request.seed,
+            provider_alias=request.provider_alias,
+        )
+    except Exception as error:
+        raise _translate_scene_illustration_error(error) from error
+
+
+@router.get(
+    (
+        "/api/novels/{novel_id}/chapters/{chapter_id}/"
+        "scene-illustration/jobs/{job_id}"
+    ),
+    response_model=ImageJobProjection,
+)
+async def poll_scene_illustration_job(
+    novel_id: str,
+    chapter_id: str,
+    job_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: SceneIllustrationService = Depends(
+        get_scene_illustration_service
+    ),
+) -> ImageJobProjection:
+    try:
+        return await service.poll(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            job_id=job_id,
+        )
+    except Exception as error:
+        raise _translate_scene_illustration_error(error) from error
+
+
+@router.post(
+    (
+        "/api/novels/{novel_id}/chapters/{chapter_id}/"
+        "scene-illustration/jobs/{job_id}/cancel"
+    ),
+    response_model=ImageJobProjection,
+)
+async def cancel_scene_illustration_job(
+    novel_id: str,
+    chapter_id: str,
+    job_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: SceneIllustrationService = Depends(
+        get_scene_illustration_service
+    ),
+) -> ImageJobProjection:
+    try:
+        return await service.cancel(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            job_id=job_id,
+        )
+    except Exception as error:
+        raise _translate_scene_illustration_error(error) from error
 
 
 @router.get("/api/image-assets/{asset_id}/content")

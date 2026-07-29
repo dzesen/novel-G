@@ -27,6 +27,7 @@ import ProsePanel from "./prose/ProsePanel";
 import type { ProseRunSnapshot } from "./prose/useProseStream";
 import { StateBackfillPanel } from "./state/StateBackfillPanel";
 import StateCompletenessAuditPanel from "./state/StateCompletenessAuditPanel";
+import SceneIllustrationPanel from "./SceneIllustrationPanel";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -76,6 +77,8 @@ export default function ChapterWorkspace({
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
   const [proseOpen, setProseOpen] = useState(false);
+  const [sceneIllustrationOpen, setSceneIllustrationOpen] =
+    useState(false);
   const [initialProseRun, setInitialProseRun] =
     useState<ProseRunSnapshot | null>(null);
   const [pendingProseOpen, setPendingProseOpen] = useState<{
@@ -381,12 +384,13 @@ export default function ChapterWorkspace({
     setChapterOutline(undefined);
     setUpdatedAt(undefined);
     setSaveState("idle");
-    // 三个面板都持有 chapterId、以整容器覆盖的方式渲染：换章后若不关，
+    // 这些章节面板都持有 chapterId、以整容器覆盖的方式渲染：换章后若不关，
     // 面板会挂着上一章的 id 继续渲染（deleteChapter 已修过同一个坑）。
     setProseOpen(false);
     setInitialProseRun(null);
     setPendingProseOpen(null);
     setChapterOutlineOpen(false);
+    setSceneIllustrationOpen(false);
     setStateBackfillOpen(false);
     setStateBackfillBlocked("");
     selectedChapterIdRef.current = chapterId;
@@ -468,6 +472,7 @@ export default function ChapterWorkspace({
   const resetChapterPanels = () => {
     setProseOpen(false);
     setChapterOutlineOpen(false);
+    setSceneIllustrationOpen(false);
     setStateBackfillOpen(false);
     setStateBackfillBlocked("");
   };
@@ -652,6 +657,10 @@ export default function ChapterWorkspace({
             setProseOpen(true);
           }}
           canGenerateProse={Boolean(chapterOutline)}
+          onOpenSceneIllustration={() =>
+            setSceneIllustrationOpen(true)
+          }
+          canGenerateSceneIllustration={Boolean(chapterOutline)}
           onOpenStateBackfill={() => void openStateBackfill()}
           hasContent={Boolean(draft?.content?.trim())}
           stateBackfillBlocked={stateBackfillBlocked}
@@ -716,6 +725,19 @@ export default function ChapterWorkspace({
           }}
         />
       )}
+
+      {sceneIllustrationOpen &&
+        novelId &&
+        selectedChapterId &&
+        draft && (
+          <SceneIllustrationPanel
+            novelId={novelId}
+            chapterId={selectedChapterId}
+            chapterTitle={draft.title}
+            onClose={() => setSceneIllustrationOpen(false)}
+            onOpenCharacterCards={onNavigateToReferenceCards}
+          />
+        )}
 
       {stateBackfillOpen && novelId && selectedChapterId && (
         <StateBackfillPanel

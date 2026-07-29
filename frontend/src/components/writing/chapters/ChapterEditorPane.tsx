@@ -24,6 +24,9 @@ interface ChapterEditorPaneProps {
   onOpenProse: () => void;
   /** 无已接受细纲时禁用 AI 写正文：没有 outline 上下文包会退化（设计 §6）。 */
   canGenerateProse: boolean;
+  onOpenSceneIllustration: () => void;
+  /** 场景提示词只允许读取已接受章细纲声明的正式角色卡 ID。 */
+  canGenerateSceneIllustration: boolean;
   onOpenStateBackfill: () => void;
   /** chapter.content 为空时禁用 AI 状态回填：后端读库里的正文，没正文就没得回填（2b-2 设计 §4.1）。 */
   hasContent: boolean;
@@ -59,6 +62,8 @@ export default function ChapterEditorPane({
   onOpenChapterOutline,
   onOpenProse,
   canGenerateProse,
+  onOpenSceneIllustration,
+  canGenerateSceneIllustration,
   onOpenStateBackfill,
   hasContent,
   stateBackfillBlocked,
@@ -66,6 +71,7 @@ export default function ChapterEditorPane({
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
   const tProse = useTranslations("writing.prose");
+  const tSceneIllustration = useTranslations("writing.sceneIllustration");
   // stateBackfill 是顶层命名空间，与上面几个 writing.* 的 t() 不同源，需单独取。
   const tStateBackfill = useTranslations("stateBackfill");
   const [showSummary, setShowSummary] = useState(false);
@@ -155,6 +161,19 @@ export default function ChapterEditorPane({
               className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
             >
               {tProse("title")}
+            </button>
+            <button
+              type="button"
+              onClick={onOpenSceneIllustration}
+              disabled={!canGenerateSceneIllustration}
+              title={
+                canGenerateSceneIllustration
+                  ? undefined
+                  : tSceneIllustration("needOutline")
+              }
+              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+            >
+              {tSceneIllustration("openButton")}
             </button>
             <button
               type="button"
