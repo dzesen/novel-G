@@ -63,6 +63,16 @@ def _validation_http_error(
         "path": exc.path,
         "message": exc.message,
     }
+    if (
+        isinstance(exc, CharacterCardValidationError)
+        and exc.missing_metadata_kind is not None
+    ):
+        detail.update(
+            {
+                "missing_metadata_kind": exc.missing_metadata_kind,
+                "text_keywords": list(exc.text_keywords),
+            }
+        )
     if isinstance(exc, WorldBookValidationError) and exc.limit_name:
         detail.update(
             {

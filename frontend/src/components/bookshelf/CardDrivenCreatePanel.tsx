@@ -7,6 +7,7 @@ import { Button, Card } from "@heroui/react";
 import AICreateStepper from "./AICreateStepper";
 import { apiPostForm } from "@/lib/api";
 import { clearAICreateCache } from "@/lib/aiCreateCache";
+import { cardImportErrorMessage } from "@/lib/cardImportErrors";
 import { saveWritingDraft } from "@/lib/writingDraft";
 import type {
   AICreateResponse,
@@ -93,6 +94,7 @@ export default function CardDrivenCreatePanel({
   const t = useTranslations("create.cardDriven");
   const tc = useTranslations("create");
   const tb = useTranslations("bookshelf");
+  const tm = useTranslations("interopErrors.missingCharacterMetadata");
   const router = useRouter();
   const pathname = usePathname();
   const locale = pathname.startsWith("/en") ? "en" : "zh";
@@ -196,7 +198,17 @@ export default function CardDrivenCreatePanel({
       setPage(0);
       setStage("review");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("previewFailed"));
+      const fallback =
+        cause instanceof Error ? cause.message : t("previewFailed");
+      setError(
+        cardImportErrorMessage(cause, fallback, {
+          aiGeneratedIllustration: tm("aiGeneratedIllustration"),
+          metadataStripped: tm("metadataStripped"),
+          otherTextMetadata: (keywords) =>
+            tm("otherTextMetadata", { keywords }),
+          portraitDestination: tm("portraitDestination"),
+        }),
+      );
     } finally {
       setUploading(false);
     }

@@ -373,6 +373,14 @@
     "numberOfChapters": "Estimated Chapters",
     "wordsPerChapter": "Words per Chapter"
   },
+  "interopErrors": {
+    "missingCharacterMetadata": {
+      "aiGeneratedIllustration": "This is an AI-generated illustration. The PNG contains generation parameters, not character data.",
+      "metadataStripped": "This PNG has no text chunks. Its metadata was likely stripped during transfer or compression. Download the original file again from the card site; do not use a screenshot or a version forwarded through social media.",
+      "otherTextMetadata": "This PNG has no chara or ccv3 character-card text chunk. Text keywords present: {keywords}. Use them to check whether you downloaded the correct original character card.",
+      "portraitDestination": "If this file is an illustration, do not try to make character-card import accept an ordinary image. After image-pipeline slice 3, use it through managed assets or the character portrait entry point."
+    }
+  },
   "create": {
     "title": "Create Novel",
     "tabAI": "AI Creation",

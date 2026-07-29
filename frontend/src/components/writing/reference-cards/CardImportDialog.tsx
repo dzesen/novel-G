@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
 import { ApiError, apiPost, apiPostForm } from "@/lib/api";
+import { cardImportErrorMessage } from "@/lib/cardImportErrors";
 import type {
   CardImportCandidate,
   CardImportConflict,
@@ -128,10 +129,6 @@ function errorDetail(error: ApiError | Error): StructuredErrorDetail | null {
   if (!(error instanceof ApiError)) return null;
   if (!error.detail || typeof error.detail !== "object") return null;
   return error.detail as StructuredErrorDetail;
-}
-
-function errorMessage(error: ApiError | Error, fallback: string): string {
-  return error.message.trim() || fallback;
 }
 
 function addCounts(
@@ -705,6 +702,7 @@ function UploadStage({
 
 function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
   const t = useTranslations("writing.referenceCards.import");
+  const tm = useTranslations("interopErrors.missingCharacterMetadata");
   return (
     <section
       aria-labelledby="card-import-rejections"
@@ -740,7 +738,17 @@ function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
                 {failure.file.name}
               </p>
               <p className="mt-1 text-xs leading-5 text-red-800 dark:text-red-200">
-                {errorMessage(failure.error, t("errors.previewFailed"))}
+                {cardImportErrorMessage(
+                  failure.error,
+                  failure.error.message.trim() || t("errors.previewFailed"),
+                  {
+                    aiGeneratedIllustration: tm("aiGeneratedIllustration"),
+                    metadataStripped: tm("metadataStripped"),
+                    otherTextMetadata: (keywords) =>
+                      tm("otherTextMetadata", { keywords }),
+                    portraitDestination: tm("portraitDestination"),
+                  },
+                )}
               </p>
               {detail && (
                 <dl className="mt-2 grid gap-2 text-xs text-red-800 dark:text-red-200 sm:grid-cols-3">

@@ -40,9 +40,30 @@ MAX_PNG_BYTES = 10 * 1024 * 1024
 MAX_PNG_CHUNKS = 16_384
 MAX_PNG_CHUNK_JSON_BYTES = MAX_JSON_BYTES
 MAX_PNG_DECODED_BYTES = 2 * MAX_PNG_CHUNK_JSON_BYTES
+_MAX_PNG_CARD_ENCODED_BYTES = 4 * (
+    (MAX_PNG_CHUNK_JSON_BYTES + 2) // 3
+)
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_CARD_KEYWORDS = frozenset({"chara", "ccv3"})
+_PNG_GENERATION_METADATA_KEYS = frozenset({"software", "source", "comment"})
+_GENERATION_PARAMETER_KEYS = frozenset(
+    {
+        "prompt",
+        "negative_prompt",
+        "seed",
+        "sampler",
+        "steps",
+        "scale",
+        "cfg_scale",
+        "width",
+        "height",
+    }
+)
+_GENERATION_PARAMETER_SIGNAL_KEYS = _GENERATION_PARAMETER_KEYS - {
+    "width",
+    "height",
+}
 
 _V1_REQUIRED_STRINGS = (
     "name",
@@ -112,11 +133,28 @@ _ASSET_EXTENSION_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 class CharacterCardValidationError(ValueError):
     """A stable validation failure safe to show at an import boundary."""
 
-    def __init__(self, code: str, path: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        path: str,
+        message: str,
+        *,
+        missing_metadata_kind: (
+            Literal[
+                "ai_generation_metadata",
+                "no_text_chunks",
+                "other_text_chunks",
+            ]
+            | None
+        ) = None,
+        text_keywords: tuple[str, ...] = (),
+    ):
         super().__init__(f"{path}: {message}")
         self.code = code
         self.path = path
         self.message = message
+        self.missing_metadata_kind = missing_metadata_kind
+        self.text_keywords = text_keywords
 
 
 @dataclass(frozen=True)
@@ -851,7 +889,210 @@ def _parse_version(value: str, path: str) -> Decimal:
         _fail("invalid_version", path, "不是有效版本")
 
 
-def _extract_png_card_chunks(payload: bytes) -> dict[str, bytes]:
+@dataclass(frozen=True)
+class _PNGCardTextChunk:
+    encoded: bytes
+    chunk_type: Literal["tEXt", "zTXt", "iTXt"]
+
+
+def _png_text_path(chunk_type: str, keyword: str) -> str:
+    return f"$.png.{chunk_type}.{keyword}"
+
+
+def _bounded_decompress_png_text(
+    compressed: bytes,
+    *,
+    path: str,
+) -> bytes:
+    inflater = zlib.decompressobj()
+    try:
+        decompressed = inflater.decompress(
+            compressed,
+            _MAX_PNG_CARD_ENCODED_BYTES + 1,
+        )
+    except zlib.error as exc:
+        raise CharacterCardValidationError(
+            "malformed_png_text",
+            path,
+            "PNG 压缩文本数据无效",
+        ) from exc
+    if (
+        len(decompressed) > _MAX_PNG_CARD_ENCODED_BYTES
+        or inflater.unconsumed_tail
+    ):
+        _fail(
+            "decoded_metadata_too_large",
+            path,
+            (
+                "PNG 角色卡文本解压后超过既有解码上限："
+                f"单块解码后不得超过 {MAX_PNG_CHUNK_JSON_BYTES} bytes"
+            ),
+        )
+    if not inflater.eof or inflater.unused_data:
+        _fail("malformed_png_text", path, "PNG 压缩文本数据不完整或含多余数据")
+    return decompressed
+
+
+def _png_text_keyword(
+    raw: bytes,
+    *,
+    chunk_type: Literal["tEXt", "zTXt", "iTXt"],
+) -> tuple[str, int]:
+    separator = raw.find(b"\x00")
+    if separator < 1 or separator > 79:
+        _fail(
+            "malformed_png_text",
+            "$",
+            f"PNG {chunk_type} keyword 无效",
+        )
+    return raw[:separator].decode("latin-1"), separator
+
+
+def _parse_png_text_chunk(
+    data_view: memoryview,
+    *,
+    chunk_type: Literal["tEXt", "zTXt", "iTXt"],
+    decode_text: bool,
+) -> tuple[str, bytes | None]:
+    raw = data_view.tobytes()
+    keyword, separator = _png_text_keyword(raw, chunk_type=chunk_type)
+    path = _png_text_path(chunk_type, keyword.lower())
+
+    if chunk_type == "tEXt":
+        text = raw[separator + 1 :]
+    elif chunk_type == "zTXt":
+        if len(raw) < separator + 2:
+            _fail("malformed_png_text", path, "PNG zTXt 缺少压缩方法")
+        if raw[separator + 1] != 0:
+            _fail("malformed_png_text", path, "PNG zTXt 压缩方法必须为 0")
+        if not decode_text:
+            return keyword, None
+        text = _bounded_decompress_png_text(
+            raw[separator + 2 :],
+            path=path,
+        )
+    else:
+        if len(raw) < separator + 3:
+            _fail("malformed_png_text", path, "PNG iTXt 头部不完整")
+        compression_flag = raw[separator + 1]
+        compression_method = raw[separator + 2]
+        if compression_flag not in {0, 1}:
+            _fail("malformed_png_text", path, "PNG iTXt 压缩标志必须为 0 或 1")
+        if compression_method != 0:
+            _fail("malformed_png_text", path, "PNG iTXt 压缩方法必须为 0")
+        language_end = raw.find(b"\x00", separator + 3)
+        if language_end < 0:
+            _fail("malformed_png_text", path, "PNG iTXt 缺少语言标记分隔符")
+        translated_end = raw.find(b"\x00", language_end + 1)
+        if translated_end < 0:
+            _fail("malformed_png_text", path, "PNG iTXt 缺少翻译关键字分隔符")
+        if not decode_text:
+            return keyword, None
+        encoded_text = raw[translated_end + 1 :]
+        text = (
+            _bounded_decompress_png_text(encoded_text, path=path)
+            if compression_flag == 1
+            else encoded_text
+        )
+        try:
+            text.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CharacterCardValidationError(
+                "malformed_png_text",
+                path,
+                "PNG iTXt 文本必须是 UTF-8",
+            ) from exc
+
+    if len(text) > _MAX_PNG_CARD_ENCODED_BYTES:
+        _fail(
+            "decoded_metadata_too_large",
+            path,
+            (
+                "PNG 角色卡文本超过既有解码上限："
+                f"单块解码后不得超过 {MAX_PNG_CHUNK_JSON_BYTES} bytes"
+            ),
+        )
+    return keyword, text
+
+
+def _looks_like_generation_metadata(
+    *,
+    keyword_names: frozenset[str],
+    comments: tuple[bytes, ...],
+) -> bool:
+    if not ({"software", "source"} & keyword_names) or not comments:
+        return False
+
+    for comment in comments:
+        try:
+            parsed = json.loads(comment.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            try:
+                parsed = json.loads(comment.decode("latin-1"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        if not isinstance(parsed, dict):
+            continue
+        parameter_keys = {
+            str(key).lower() for key in parsed
+        } & _GENERATION_PARAMETER_KEYS
+        if (
+            len(parameter_keys) >= 2
+            and parameter_keys & _GENERATION_PARAMETER_SIGNAL_KEYS
+        ):
+            return True
+    return False
+
+
+def _raise_missing_character_metadata(
+    *,
+    text_keywords: tuple[str, ...],
+    diagnostic_text: dict[str, list[bytes]],
+) -> None:
+    destination = (
+        "如果它本来就是插图，请不要尝试让角色卡导入接受普通图片；"
+        "图形线切片 3 完成后，请从受管素材或角色立绘入口使用。"
+    )
+    lowered_keywords = frozenset(keyword.lower() for keyword in text_keywords)
+    if not text_keywords:
+        message = (
+            "PNG 完全没有文本块，元数据多半在转存或压缩时被剥离。"
+            "请从卡站重新下载原始文件，不要使用截图或社交平台转发的版本。"
+            f"{destination}"
+        )
+        kind: Literal[
+            "ai_generation_metadata",
+            "no_text_chunks",
+            "other_text_chunks",
+        ] = "no_text_chunks"
+    elif _looks_like_generation_metadata(
+        keyword_names=lowered_keywords,
+        comments=tuple(diagnostic_text.get("comment", [])),
+    ):
+        message = (
+            "这是 AI 生成的插图；PNG 携带的是 prompt、seed、sampler、steps、"
+            f"scale 等生成参数，不是角色数据。{destination}"
+        )
+        kind = "ai_generation_metadata"
+    else:
+        keywords = "、".join(text_keywords)
+        message = (
+            "PNG 不含 chara 或 ccv3 角色卡文本块。"
+            f"实际存在的文本关键字：{keywords}。"
+            "请据此确认是否下载了正确的原始角色卡。"
+            f"{destination}"
+        )
+        kind = "other_text_chunks"
+    raise CharacterCardValidationError(
+        "missing_character_metadata",
+        "$",
+        message,
+        missing_metadata_kind=kind,
+        text_keywords=text_keywords,
+    )
+
+
+def _extract_png_card_chunks(payload: bytes) -> dict[str, _PNGCardTextChunk]:
     if len(payload) > MAX_PNG_BYTES:
         _fail(
             "file_too_large",
@@ -861,7 +1102,10 @@ def _extract_png_card_chunks(payload: bytes) -> dict[str, bytes]:
     if not payload.startswith(_PNG_SIGNATURE):
         _fail("invalid_png_signature", "$", "不是有效的 PNG 文件")
 
-    chunks: dict[str, bytes] = {}
+    chunks: dict[str, _PNGCardTextChunk] = {}
+    text_keywords: list[str] = []
+    seen_text_keywords: set[str] = set()
+    diagnostic_text: dict[str, list[bytes]] = {}
     chunk_count = 0
     offset = len(_PNG_SIGNATURE)
     saw_ihdr = False
@@ -903,19 +1147,45 @@ def _extract_png_card_chunks(payload: bytes) -> dict[str, bytes]:
         elif chunk_type == b"IHDR":
             _fail("invalid_png_structure", "$", "PNG 只能包含一个首位 IHDR")
 
-        if chunk_type == b"tEXt":
-            separator = data_view.tobytes().find(b"\x00")
-            if separator < 1 or separator > 79:
-                _fail("malformed_png_text", "$", "PNG tEXt keyword 无效")
-            keyword = data_view[:separator].tobytes().decode("latin-1").lower()
+        if chunk_type in {b"tEXt", b"zTXt", b"iTXt"}:
+            text_chunk_type = chunk_type.decode("ascii")
+            raw_keyword = data_view.tobytes().split(b"\x00", 1)[0]
+            keyword_hint = raw_keyword.decode("latin-1").lower()
+            decode_text = (
+                keyword_hint in _PNG_CARD_KEYWORDS
+                or keyword_hint in _PNG_GENERATION_METADATA_KEYS
+            )
+            display_keyword, text = _parse_png_text_chunk(
+                data_view,
+                chunk_type=text_chunk_type,
+                decode_text=decode_text,
+            )
+            keyword = display_keyword.lower()
+            if display_keyword not in seen_text_keywords:
+                seen_text_keywords.add(display_keyword)
+                text_keywords.append(display_keyword)
             if keyword in _PNG_CARD_KEYWORDS:
                 if keyword in chunks:
                     _fail(
                         "duplicate_png_card_chunk",
-                        f"$.png.tEXt.{keyword}",
+                        _png_text_path(text_chunk_type, keyword),
                         f"PNG 含多个 {keyword} 角色卡块",
                     )
-                chunks[keyword] = data_view[separator + 1 :].tobytes()
+                if text is None:
+                    _fail(
+                        "malformed_png_text",
+                        _png_text_path(text_chunk_type, keyword),
+                        f"PNG {text_chunk_type} 角色卡文本缺失",
+                    )
+                chunks[keyword] = _PNGCardTextChunk(
+                    encoded=text,
+                    chunk_type=text_chunk_type,
+                )
+            elif (
+                keyword in _PNG_GENERATION_METADATA_KEYS
+                and text is not None
+            ):
+                diagnostic_text.setdefault(keyword, []).append(text)
 
         offset = crc_end
         if chunk_type == b"IEND":
@@ -929,33 +1199,42 @@ def _extract_png_card_chunks(payload: bytes) -> dict[str, bytes]:
     if not saw_ihdr or not saw_iend:
         _fail("truncated_png", "$", "PNG 缺少 IHDR 或 IEND")
     if not chunks:
-        _fail("missing_character_metadata", "$", "PNG 不含 chara 或 ccv3 tEXt 块")
+        _raise_missing_character_metadata(
+            text_keywords=tuple(text_keywords),
+            diagnostic_text=diagnostic_text,
+        )
 
     total_decoded_upper_bound = 0
-    for keyword, encoded in chunks.items():
+    for keyword, chunk in chunks.items():
+        encoded = chunk.encoded
+        path = _png_text_path(chunk.chunk_type, keyword)
         # Base64 padding means this upper bound can exceed the actual size by
         # at most two bytes per candidate chunk.
         decoded_upper_bound = ((len(encoded) + 3) // 4) * 3
         if decoded_upper_bound > MAX_PNG_CHUNK_JSON_BYTES + 2:
             _fail(
                 "decoded_metadata_too_large",
-                f"$.png.tEXt.{keyword}",
+                path,
                 f"单个 PNG 角色卡块解码后不得超过 {MAX_PNG_CHUNK_JSON_BYTES} bytes",
             )
         total_decoded_upper_bound += decoded_upper_bound
     if total_decoded_upper_bound > MAX_PNG_DECODED_BYTES + 4:
         _fail(
             "decoded_metadata_too_large",
-            "$.png.tEXt",
+            "$.png.text",
             f"PNG 角色卡块解码后合计不得超过 {MAX_PNG_DECODED_BYTES} bytes",
         )
     return chunks
 
 
-def _decode_png_card_chunk(encoded: bytes, *, keyword: str) -> Any:
-    path = f"$.png.tEXt.{keyword}"
+def _decode_png_card_chunk(
+    chunk: _PNGCardTextChunk,
+    *,
+    keyword: str,
+) -> Any:
+    path = _png_text_path(chunk.chunk_type, keyword)
     try:
-        decoded = base64.b64decode(encoded, validate=True)
+        decoded = base64.b64decode(chunk.encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise CharacterCardValidationError(
             "invalid_base64", path, f"{keyword} 不是有效的 Base64"
@@ -1088,27 +1367,29 @@ class CharacterCardAdapter:
             )
 
         ccv3 = _decode_png_card_chunk(chunks["ccv3"], keyword="ccv3")
+        ccv3_path = _png_text_path(chunks["ccv3"].chunk_type, "ccv3")
         try:
             parsed_v3 = cls.parse(ccv3, source_container="png")
             if parsed_v3.source_format != "v3":
                 _fail(
                     "invalid_ccv3_spec",
-                    "$.png.tEXt.ccv3.spec",
+                    f"{ccv3_path}.spec",
                     "ccv3 必须声明 chara_card_v3",
                 )
         except CharacterCardValidationError as v3_error:
             if "chara" not in chunks:
                 raise CharacterCardValidationError(
                     "malformed_v3_chunk",
-                    "$.png.tEXt.ccv3",
+                    ccv3_path,
                     f"ccv3 未通过 V3 严格校验且没有 chara 可核对：{v3_error.message}",
                 ) from v3_error
 
             chara = _decode_png_card_chunk(chunks["chara"], keyword="chara")
+            chara_path = _png_text_path(chunks["chara"].chunk_type, "chara")
             if not _equal_except_card_spec(ccv3, chara):
                 raise CharacterCardValidationError(
                     "malformed_v3_chunk",
-                    "$.png.tEXt.ccv3",
+                    ccv3_path,
                     f"ccv3 未通过 V3 严格校验且与 chara 有实质差异：{v3_error.message}",
                 ) from v3_error
 
@@ -1117,17 +1398,17 @@ class CharacterCardAdapter:
                 if parsed_chara.source_format != "v2":
                     _fail(
                         "invalid_chara_spec",
-                        "$.png.tEXt.chara.spec",
+                        f"{chara_path}.spec",
                         "伪 V3 的 chara 对照块必须是 V2",
                     )
-                v2_content = deepcopy(_require_object(ccv3, "$.png.tEXt.ccv3"))
+                v2_content = deepcopy(_require_object(ccv3, ccv3_path))
                 v2_content["spec"] = "chara_card_v2"
                 v2_content["spec_version"] = "2.0"
                 parsed_v2 = cls.parse(v2_content, source_container="png")
             except CharacterCardValidationError as v2_error:
                 raise CharacterCardValidationError(
                     "malformed_v3_chunk",
-                    "$.png.tEXt.ccv3",
+                    ccv3_path,
                     f"spec 改写块的内容也不是有效 V2：{v2_error.message}",
                 ) from v2_error
 
@@ -1136,7 +1417,7 @@ class CharacterCardAdapter:
                 selected_chunk="ccv3",
                 classification="pseudo_v3",
                 label="采用 ccv3，但内容实为 V2（酒馆导出的 spec 改写块）",
-                raw_card=_require_object(ccv3, "$.png.tEXt.ccv3"),
+                raw_card=_require_object(ccv3, ccv3_path),
             )
 
         return _with_png_preview(
