@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -72,10 +73,20 @@ class ComfyUIWorkflowConfig(_StrictConfigModel):
     outputs: list[WorkflowOutputBinding] = Field(default_factory=list)
     dependencies: WorkflowDependencies = Field(default_factory=WorkflowDependencies)
 
-    @field_validator("template_path", "template_revision")
+    @field_validator("template_path")
     @classmethod
-    def strip_text(cls, value: str) -> str:
+    def strip_template_path(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("template_revision")
+    @classmethod
+    def validate_template_revision(cls, value: str) -> str:
+        stripped = value.strip()
+        if stripped and re.fullmatch(r"sha256:[0-9a-f]{64}", stripped) is None:
+            raise ValueError(
+                "template_revision must be empty or sha256:<64 lowercase hex>"
+            )
+        return stripped
 
     @model_validator(mode="after")
     def validate_semantic_slot_names(self) -> "ComfyUIWorkflowConfig":

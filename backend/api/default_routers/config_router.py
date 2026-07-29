@@ -27,6 +27,11 @@ from backend.services.llm.provider_test_service import (
     resolve_provider_test_request,
     test_llm_provider_capabilities,
 )
+from backend.services.image.provider_test_service import (
+    ImageProviderTestRequest,
+    ImageProviderTestResponse,
+    test_image_provider_connection,
+)
 
 router = APIRouter(
     prefix="/api/config",
@@ -169,3 +174,28 @@ async def test_llm_provider(request: ProviderTestRequest) -> ProviderTestRespons
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/image-providers/test",
+    response_model=ImageProviderTestResponse,
+)
+async def test_image_provider(
+    request: ImageProviderTestRequest,
+) -> ImageProviderTestResponse:
+    """测试已保存的 ComfyUI 配置；本片不伪造 OpenAI-compatible 结果。"""
+
+    try:
+        return await test_image_provider_connection(
+            request,
+            _get_lifecycle().get_raw_config(),
+            template_root=Path(config_module.CONFIG_PATH).resolve().parent,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Image Provider connectivity test failed")
+        raise HTTPException(
+            status_code=500,
+            detail="图像 Provider 连通性测试失败",
+        ) from exc
