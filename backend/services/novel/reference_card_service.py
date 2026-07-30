@@ -12,9 +12,13 @@ from bson import ObjectId
 from backend.db.errors import NotFoundError
 from backend.db.mutation import MutationCommand, commit_mutation
 from backend.db.repositories.character_repository import character_repo
+from backend.db.repositories.character_visual_profile_repository import (
+    character_visual_profile_repo,
+)
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.reference_card_repository import ReferenceCardRepository
 from backend.db.repositories.worldbook_repository import worldbook_repo
+from backend.db.utils import to_object_id
 from backend.services.novel.character_profile import normalize_character_profile
 from backend.services.novel.appearance_anchor import (
     AppearanceAnchorConflictError,
@@ -150,12 +154,24 @@ class ReferenceCardService:
                     session=session,
                 )
             except NotFoundError:
+                if card_type == "character":
+                    await character_visual_profile_repo.hard_delete_for_character_card(
+                        novel_id=to_object_id(novel_id),
+                        character_card_id=to_object_id(card_id),
+                        session=session,
+                    )
                 return True
             if not current.get("is_deleted"):
                 raise ValueError("Only deleted reference cards can be permanently deleted")
             await repository.hard_delete_card(
                 novel_id, card_type, card_id, session=session
             )
+            if card_type == "character":
+                await character_visual_profile_repo.hard_delete_for_character_card(
+                    novel_id=to_object_id(novel_id),
+                    character_card_id=to_object_id(card_id),
+                    session=session,
+                )
             return True
         raise ValueError(f"Unsupported reference-card mutation: {operation}")
 

@@ -647,6 +647,40 @@ async def init_image_asset_indexes():
         raise
 
 
+async def init_character_visual_profile_indexes():
+    """Initialize the visual-profile identity and card-cascade indexes."""
+
+    try:
+        collection = get_database()[collections.CHARACTER_VISUAL_PROFILES]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("character_card_id", pymongo.ASCENDING),
+                ],
+                unique=True,
+                name="character_visual_profiles_owner_novel_card",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("novel_id", pymongo.ASCENDING),
+                    ("character_card_id", pymongo.ASCENDING),
+                ],
+                name="character_visual_profiles_novel_card",
+            ),
+        ])
+        logger.info("Initialized character_visual_profiles indexes.")
+    except Exception as exc:
+        logger.error(
+            "Failed to initialize character_visual_profiles indexes: %s",
+            exc,
+        )
+        # Concurrent first writes rely on this unique constraint. Starting
+        # without it would allow two active profiles for one formal card.
+        raise
+
+
 async def init_image_job_indexes():
     """Initialize durable image-job ownership, resume, and idempotency indexes."""
     try:
@@ -872,6 +906,7 @@ async def init_all_indexes():
     await init_generation_job_indexes()
     await init_prose_run_indexes()
     await init_image_asset_indexes()
+    await init_character_visual_profile_indexes()
     await init_image_job_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

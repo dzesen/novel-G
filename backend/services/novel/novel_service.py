@@ -201,6 +201,9 @@ class NovelService:
             mutation_journals_repo = BaseRepository(collections.MUTATION_JOURNALS)
             image_assets_repo = BaseRepository(collections.IMAGE_ASSETS)
             image_jobs_repo = BaseRepository(collections.IMAGE_JOBS)
+            character_visual_profiles_repo = BaseRepository(
+                collections.CHARACTER_VISUAL_PROFILES
+            )
 
             stats = {}
 
@@ -237,6 +240,11 @@ class NovelService:
             stats["image_jobs_deleted"] = await image_jobs_repo.hard_delete_many(
                 query,
                 session=session,
+            )
+            stats["character_visual_profiles_deleted"] = (
+                await character_visual_profiles_repo.hard_delete_many(
+                    query, session=session
+                )
             )
 
             novel_deleted = await novel_repo.hard_delete_one({"_id": obj_id}, session=session)

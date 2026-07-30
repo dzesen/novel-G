@@ -32,6 +32,15 @@ from backend.services.image.character_portrait_service import (
     PortraitJobProjection,
     character_portrait_service,
 )
+from backend.services.image.character_visual_profile_service import (
+    CharacterVisualProfileProjection,
+    CharacterVisualProfileRevisionConflict,
+    CharacterVisualProfileService,
+    CharacterVisualProfileUpdate,
+    CharacterVisualReference,
+    ExternalLoraAdapter,
+    character_visual_profile_service,
+)
 from backend.services.image.managed_assets import (
     ImageAssetIntegrityError,
     ImageAssetNotFoundError,
@@ -202,8 +211,26 @@ class SceneIllustrationJobRequest(BaseModel):
         return self
 
 
+class CharacterVisualReferenceAppendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    reference: CharacterVisualReference
+
+
+class CharacterVisualAdapterUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=0)
+    external_adapter: ExternalLoraAdapter | None
+
+
 def get_character_portrait_service() -> CharacterPortraitService:
     return character_portrait_service
+
+
+def get_character_visual_profile_service() -> CharacterVisualProfileService:
+    return character_visual_profile_service
 
 
 def get_novel_cover_service() -> NovelCoverService:
@@ -282,6 +309,19 @@ def _translate_scene_illustration_error(error: Exception) -> HTTPException:
     ):
         return HTTPException(status_code=400, detail=str(error))
     return HTTPException(status_code=500, detail="场景插图任务处理失败")
+
+
+def _translate_visual_profile_error(error: Exception) -> HTTPException:
+    if isinstance(error, CharacterVisualProfileRevisionConflict):
+        return HTTPException(status_code=409, detail=str(error))
+    if isinstance(error, NotFoundError):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, (InvalidIdError, ValueError)):
+        return HTTPException(status_code=400, detail=str(error))
+    return HTTPException(
+        status_code=500,
+        detail="角色视觉档案处理失败",
+    )
 
 
 @router.get(
@@ -653,3 +693,134 @@ async def get_managed_image_asset_content(
         media_type=str(document.get("mime") or "application/octet-stream"),
         headers={"Cache-Control": "private, no-store"},
     )
+
+
+@router.get(
+    "/api/reference-cards/novel/{novel_id}/character/{card_id}/visual-profile",
+    response_model=CharacterVisualProfileProjection,
+)
+async def get_character_visual_profile(
+    novel_id: str,
+    card_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterVisualProfileService = Depends(
+        get_character_visual_profile_service
+    ),
+) -> CharacterVisualProfileProjection:
+    try:
+        return await service.get(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            character_card_id=card_id,
+        )
+    except Exception as error:
+        raise _translate_visual_profile_error(error) from error
+
+
+@router.put(
+    "/api/reference-cards/novel/{novel_id}/character/{card_id}/visual-profile",
+    response_model=CharacterVisualProfileProjection,
+)
+async def replace_character_visual_profile(
+    novel_id: str,
+    card_id: str,
+    request: CharacterVisualProfileUpdate,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterVisualProfileService = Depends(
+        get_character_visual_profile_service
+    ),
+) -> CharacterVisualProfileProjection:
+    try:
+        return await service.replace(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            character_card_id=card_id,
+            update=request,
+        )
+    except Exception as error:
+        raise _translate_visual_profile_error(error) from error
+
+
+@router.post(
+    (
+        "/api/reference-cards/novel/{novel_id}/character/{card_id}/"
+        "visual-profile/references"
+    ),
+    response_model=CharacterVisualProfileProjection,
+)
+async def append_character_visual_reference(
+    novel_id: str,
+    card_id: str,
+    request: CharacterVisualReferenceAppendRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterVisualProfileService = Depends(
+        get_character_visual_profile_service
+    ),
+) -> CharacterVisualProfileProjection:
+    try:
+        return await service.add_reference(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            character_card_id=card_id,
+            expected_revision=request.expected_revision,
+            reference=request.reference,
+        )
+    except Exception as error:
+        raise _translate_visual_profile_error(error) from error
+
+
+@router.delete(
+    (
+        "/api/reference-cards/novel/{novel_id}/character/{card_id}/"
+        "visual-profile/references/{asset_id}"
+    ),
+    response_model=CharacterVisualProfileProjection,
+)
+async def remove_character_visual_reference(
+    novel_id: str,
+    card_id: str,
+    asset_id: str,
+    expected_revision: int = Query(ge=0),
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterVisualProfileService = Depends(
+        get_character_visual_profile_service
+    ),
+) -> CharacterVisualProfileProjection:
+    try:
+        return await service.remove_reference(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            character_card_id=card_id,
+            asset_id=asset_id,
+            expected_revision=expected_revision,
+        )
+    except Exception as error:
+        raise _translate_visual_profile_error(error) from error
+
+
+@router.put(
+    (
+        "/api/reference-cards/novel/{novel_id}/character/{card_id}/"
+        "visual-profile/external-adapter"
+    ),
+    response_model=CharacterVisualProfileProjection,
+)
+async def update_character_visual_adapter(
+    novel_id: str,
+    card_id: str,
+    request: CharacterVisualAdapterUpdateRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterVisualProfileService = Depends(
+        get_character_visual_profile_service
+    ),
+) -> CharacterVisualProfileProjection:
+    try:
+        return await service.set_external_adapter(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            character_card_id=card_id,
+            expected_revision=request.expected_revision,
+            external_adapter=request.external_adapter,
+        )
+    except Exception as error:
+        raise _translate_visual_profile_error(error) from error

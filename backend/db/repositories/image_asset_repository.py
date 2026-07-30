@@ -89,6 +89,28 @@ class ImageAssetRepository(BaseRepository):
             }
         )
 
+    async def get_owned_subject_asset(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        asset_id: ObjectId,
+        subject_kind: str,
+        subject_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one active asset only through its complete business lineage."""
+
+        return await self.collection.find_one(
+            {
+                "_id": asset_id,
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "is_deleted": False,
+            }
+        )
+
     async def get_owned_by_relative_path(
         self,
         *,
