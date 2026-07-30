@@ -9,7 +9,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
-from backend.config.image_providers import normalize_image_providers_config
+from backend.config.image_providers import (
+    image_pipeline_reference_paths,
+    image_provider_reference_paths,
+    normalize_image_providers_config,
+)
 from backend.config.workflow_catalog import WORKFLOW_STEPS
 
 CONFIG_DIR = Path(__file__).resolve().parent
@@ -34,6 +38,7 @@ _cached_config: Dict[str, Any] | None = None
 _cached_mtimes: tuple[float | None, float | None] | None = None
 _REPLACE_DICT_PATHS: dict[tuple[str, ...], frozenset[str]] = {
     ("image_providers", "providers"): frozenset({"load"}),
+    ("image_providers", "pipelines"): frozenset({"load", "patch"}),
     ("llm", "providers"): frozenset({"load"}),
     (
         "image_providers", "providers", "*", "workflow", "bindings"
@@ -59,7 +64,7 @@ def _should_replace_dict_path(
 _KNOWN_WORKFLOW_STEPS = WORKFLOW_STEPS
 _PROVIDER_RENAMES_KEY = "_provider_renames"
 _DEPRECATED_DEFAULT_REVIEWERS = {"openai_gpt5_4_nano"}
-CURRENT_CONFIG_VERSION = 6
+CURRENT_CONFIG_VERSION = 7
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)
 _OPENAI_ENDPOINT_SUFFIXES: tuple[tuple[str, ...], ...] = (
     ("chat", "completions"),
@@ -531,6 +536,66 @@ def _migrate_config_tree(config_data: Dict[str, Any]) -> Dict[str, Any]:
         version = 6
         migrated["config_version"] = version
 
+    if version == 6:
+        image_config = migrated.get("image_providers")
+        if not isinstance(image_config, dict):
+            image_config = {
+                "default_provider": "",
+                "providers": {},
+                "usages": {
+                    "character_portrait": "",
+                    "cover": "",
+                    "scene_illustration": "",
+                },
+            }
+            migrated["image_providers"] = image_config
+
+        image_config.setdefault("default_scene_pipeline", "")
+        image_config.setdefault("pipelines", {})
+        pipelines = image_config.get("pipelines")
+        default_pipeline = str(
+            image_config.get("default_scene_pipeline") or ""
+        ).strip()
+        if isinstance(pipelines, dict) and not pipelines and not default_pipeline:
+            usages = image_config.get("usages")
+            scene_alias = (
+                str(usages.get("scene_illustration") or "").strip()
+                if isinstance(usages, dict)
+                else ""
+            )
+            provider_alias = scene_alias
+            providers = image_config.get("providers")
+            provider = (
+                providers.get(provider_alias)
+                if provider_alias and isinstance(providers, dict)
+                else None
+            )
+            workflow = (
+                provider.get("workflow") if isinstance(provider, dict) else None
+            )
+            template_path = (
+                str(workflow.get("template_path") or "").strip()
+                if isinstance(workflow, dict)
+                else ""
+            )
+            if (
+                isinstance(provider, dict)
+                and provider.get("type") == "comfyui"
+                and provider.get("enabled") is True
+                and template_path
+            ):
+                pipelines["legacy_scene_default"] = {
+                    "kind": "quick",
+                    "display_name": "兼容场景插图",
+                    "compose_provider": provider_alias,
+                }
+                image_config["default_scene_pipeline"] = (
+                    "legacy_scene_default"
+                )
+
+        version = 7
+        migrated["config_version"] = version
+
     return migrated
 
 
@@ -569,27 +634,14 @@ def _provider_references(config: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _image_provider_references(config: Dict[str, Any]) -> Dict[str, str]:
-    """收集图像用途引用，命名空间与 LLM Provider 完全分离。"""
-    image_config = config.get("image_providers")
-    if not isinstance(image_config, dict):
-        return {}
-
-    references: Dict[str, str] = {}
-
-    def add(path: str, value: Any) -> None:
-        alias = str(value or "").strip()
-        if alias:
-            references[path] = alias
-
-    add("image_providers.default_provider", image_config.get("default_provider"))
-    usages = image_config.get("usages")
-    if isinstance(usages, dict):
-        for usage in ("character_portrait", "cover", "scene_illustration"):
-            add(f"image_providers.usages.{usage}", usages.get(usage))
-    return references
+    """收集全部图像 Provider 引用；具体字段由 image_providers 模块统一拥有。"""
+    return image_provider_reference_paths(config.get("image_providers"))
 
 
-def _validate_provider_reference_changes(current: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+def _validate_provider_reference_changes(
+    current: Dict[str, Any],
+    candidate: Dict[str, Any],
+) -> None:
     """允许保留历史坏引用，但拒绝本次新增或由删除 Provider 造成的坏引用。"""
     current_llm = current.get("llm") if isinstance(current.get("llm"), dict) else {}
     candidate_llm = candidate.get("llm") if isinstance(candidate.get("llm"), dict) else {}
@@ -638,6 +690,29 @@ def _validate_provider_reference_changes(current: Dict[str, Any], candidate: Dic
         )
         if not was_historically_invalid:
             raise ValueError(f"Invalid image Provider reference at {path}: {alias}")
+
+    current_pipeline_map = current_image.get("pipelines")
+    candidate_pipeline_map = candidate_image.get("pipelines")
+    current_pipelines = (
+        set(current_pipeline_map)
+        if isinstance(current_pipeline_map, dict)
+        else set()
+    )
+    candidate_pipelines = (
+        set(candidate_pipeline_map)
+        if isinstance(candidate_pipeline_map, dict)
+        else set()
+    )
+    current_pipeline_references = image_pipeline_reference_paths(current_image)
+    for path, alias in image_pipeline_reference_paths(candidate_image).items():
+        if alias in candidate_pipelines:
+            continue
+        old_alias = current_pipeline_references.get(path)
+        was_historically_invalid = (
+            old_alias == alias and alias not in current_pipelines
+        )
+        if not was_historically_invalid:
+            raise ValueError(f"Invalid image Pipeline reference at {path}: {alias}")
 
 
 def _get_mtime(path: Path) -> float | None:

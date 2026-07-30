@@ -147,9 +147,26 @@ export interface OpenAICompatibleImageProviderConfig {
 export type ImageProviderConfig =
   | ComfyUIImageProviderConfig
   | OpenAICompatibleImageProviderConfig;
+export interface QuickImagePipelineProfile {
+  kind: "quick";
+  display_name: string;
+  compose_provider: string;
+}
+export interface ConsistencyImagePipelineProfile {
+  kind: "consistency";
+  display_name: string;
+  compose_provider: string;
+  identity_edit_provider: string;
+  refine_provider?: string;
+}
+export type ImagePipelineProfile =
+  | QuickImagePipelineProfile
+  | ConsistencyImagePipelineProfile;
 export interface ImageProvidersConfig {
   default_provider: string;
+  default_scene_pipeline: string;
   providers: Record<string, ImageProviderConfig>;
+  pipelines: Record<string, ImagePipelineProfile>;
   usages: {
     character_portrait: string;
     cover: string;
@@ -458,6 +475,66 @@ export function getReplacementDefaultImageProviderAlias(
   ) || "";
 }
 
+const IMAGE_PIPELINE_PROVIDER_FIELDS = [
+  "compose_provider",
+  "identity_edit_provider",
+  "refine_provider",
+] as const;
+
+type ImagePipelineProviderField = typeof IMAGE_PIPELINE_PROVIDER_FIELDS[number];
+
+function getPipelineProviderReferences(
+  profile: ImagePipelineProfile,
+): Array<[ImagePipelineProviderField, string]> {
+  const references: Array<[ImagePipelineProviderField, string]> = [];
+  for (const field of IMAGE_PIPELINE_PROVIDER_FIELDS) {
+    if (field === "compose_provider") {
+      references.push([field, profile.compose_provider]);
+    } else if (profile.kind === "consistency") {
+      const alias = profile[field];
+      if (alias !== undefined) references.push([field, alias]);
+    }
+  }
+  return references;
+}
+
+function mapImagePipelineProviderAliases(
+  pipelines: Record<string, ImagePipelineProfile>,
+  mapAlias: (alias: string) => string,
+): Record<string, ImagePipelineProfile> {
+  return Object.fromEntries(
+    Object.entries(pipelines).map(([pipelineAlias, profile]) => {
+      if (profile.kind === "quick") {
+        return [pipelineAlias, {
+          ...profile,
+          compose_provider: mapAlias(profile.compose_provider),
+        }];
+      }
+      return [pipelineAlias, {
+        ...profile,
+        compose_provider: mapAlias(profile.compose_provider),
+        identity_edit_provider: mapAlias(profile.identity_edit_provider),
+        ...(profile.refine_provider === undefined
+          ? {}
+          : { refine_provider: mapAlias(profile.refine_provider) }),
+      }];
+    }),
+  );
+}
+
+export function getImageProviderPipelineReferencePaths(
+  imageConfig: ImageProvidersConfig,
+  providerAlias: string,
+): string[] {
+  return Object.keys(imageConfig.pipelines)
+    .sort()
+    .flatMap((pipelineAlias) =>
+      getPipelineProviderReferences(imageConfig.pipelines[pipelineAlias])
+        .filter(([, alias]) => alias === providerAlias)
+        .map(([field]) => `image_providers.pipelines.${pipelineAlias}.${field}`),
+    );
+}
+
 export function renameImageProviderAlias(
   config: AppConfig,
   currentAlias: string,
@@ -485,6 +562,7 @@ export function renameImageProviderAlias(
       usages: Object.fromEntries(
         Object.entries(imageConfig.usages).map(([usage, alias]) => [usage, mapAlias(alias)]),
       ) as ImageProvidersConfig["usages"],
+      pipelines: mapImagePipelineProviderAliases(imageConfig.pipelines, mapAlias),
     },
   };
 }
@@ -496,6 +574,9 @@ export function removeImageProviderAlias(
 ): AppConfig {
   const imageConfig = config.image_providers;
   if (!(aliasToRemove in imageConfig.providers)) return config;
+  if (getImageProviderPipelineReferencePaths(imageConfig, aliasToRemove).length > 0) {
+    return config;
+  }
   const providers = { ...imageConfig.providers };
   delete providers[aliasToRemove];
   const replacement = isImageProviderSelectable(providers, replacementDefaultAlias)
@@ -535,7 +616,9 @@ export function normalizeAppConfig(config: AppConfig, catalog: WorkflowDefinitio
   ]));
   const imageConfig = config.image_providers || {
     default_provider: "",
+    default_scene_pipeline: "",
     providers: {},
+    pipelines: {},
     usages: { character_portrait: "", cover: "", scene_illustration: "" },
   };
   const imageProviders: Record<string, ImageProviderConfig> = Object.fromEntries(
@@ -562,7 +645,9 @@ export function normalizeAppConfig(config: AppConfig, catalog: WorkflowDefinitio
     workflows,
   }, image_providers: {
     ...imageConfig,
+    default_scene_pipeline: imageConfig.default_scene_pipeline || "",
     providers: imageProviders,
+    pipelines: { ...(imageConfig.pipelines || {}) },
     usages: {
       character_portrait: imageConfig.usages?.character_portrait || "",
       cover: imageConfig.usages?.cover || "",

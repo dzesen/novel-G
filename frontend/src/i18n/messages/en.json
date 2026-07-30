@@ -452,6 +452,7 @@
       "danger": {
         "title": "Danger Zone",
         "description": "Deleting a Provider removes it from the complete configuration mapping and updates default and usage references. Reloading before Save still discards the change.",
+        "pipelineReferenceBlocked": "This Provider is still referenced by the following illustration Pipeline stages. Reassign or remove those Pipelines before deleting the Provider:\n{paths}",
         "confirm": "Confirm Delete"
       },
       "overrides": {

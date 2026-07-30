@@ -31,6 +31,7 @@ import type {
   OpenAICompatibleImageProviderConfig,
 } from "@/types/config";
 import {
+  getImageProviderPipelineReferencePaths,
   getReplacementDefaultImageProviderAlias,
   newComfyUIImageProviderConfig,
   newOpenAICompatibleImageProviderConfig,
@@ -235,6 +236,16 @@ export function ImageProviderCard({
   };
 
   const deleteProvider = (alias: string) => {
+    const pipelineReferences = getImageProviderPipelineReferencePaths(
+      config.image_providers,
+      alias,
+    );
+    if (pipelineReferences.length > 0) {
+      window.alert(t("danger.pipelineReferenceBlocked", {
+        paths: pipelineReferences.join("\n"),
+      }));
+      return;
+    }
     const replacement = config.image_providers.default_provider === alias
       ? getReplacementDefaultImageProviderAlias(providers, alias)
       : "";

@@ -452,6 +452,7 @@
       "danger": {
         "title": "危险操作",
         "description": "删除 Provider 会从完整配置映射中移除它，并同步处理默认项与用途引用。保存前仍可重载撤销。",
+        "pipelineReferenceBlocked": "该 Provider 仍被以下插图 Pipeline 阶段引用。请先改派或删除对应 Pipeline，再删除 Provider：\n{paths}",
         "confirm": "确认删除"
       },
       "overrides": {

@@ -26,7 +26,12 @@ from backend.config.config import (
     _normalize_config_tree,
     _should_replace_dict_path,
 )
-from backend.config.image_providers import ImageProvidersConfig
+from backend.config.image_providers import (
+    ImageProvidersConfig,
+    image_pipeline_reference_paths,
+    image_provider_reference_paths,
+    rename_image_provider_references,
+)
 from backend.config.workflow_catalog import WORKFLOW_STEPS
 
 
@@ -459,20 +464,19 @@ def _provider_issues(raw_config: dict[str, Any]) -> list[ConfigIssue]:
             image_providers if isinstance(image_providers, dict) else {}
         )
         image_aliases = set(image_providers)
-        check(
-            "image_providers.default_provider",
-            image_config.get("default_provider"),
-            image_providers,
-            image_aliases,
-        )
-        usages = image_config.get("usages")
-        if isinstance(usages, dict):
-            for usage, alias in usages.items():
-                check(
-                    f"image_providers.usages.{usage}",
-                    alias,
-                    image_providers,
-                    image_aliases,
+        for path, alias in image_provider_reference_paths(image_config).items():
+            check(path, alias, image_providers, image_aliases)
+
+        pipelines = image_config.get("pipelines")
+        pipeline_aliases = set(pipelines) if isinstance(pipelines, dict) else set()
+        for path, alias in image_pipeline_reference_paths(image_config).items():
+            if alias not in pipeline_aliases:
+                issues.append(
+                    ConfigIssue(
+                        path=path,
+                        code="pipeline_not_found",
+                        message=f"Image Pipeline does not exist: {alias}",
+                    )
                 )
     return issues
 
@@ -552,6 +556,34 @@ def _validate_image_provider_mapping_patch(
         )
 
 
+def _validate_image_pipeline_mapping_patch(
+    current: dict[str, Any],
+    changes: dict[str, Any],
+) -> None:
+    """Profile 尚无删除生命周期；普通 PATCH 不得以省略表达删除。"""
+    image_changes = changes.get("image_providers")
+    if not isinstance(image_changes, dict) or "pipelines" not in image_changes:
+        return
+    submitted = image_changes.get("pipelines")
+    if not isinstance(submitted, dict):
+        return
+    current_image = current.get("image_providers")
+    current_pipelines = (
+        current_image.get("pipelines")
+        if isinstance(current_image, dict)
+        else {}
+    )
+    if not isinstance(current_pipelines, dict):
+        return
+    omitted = sorted(set(current_pipelines) - set(submitted))
+    if omitted:
+        raise ValueError(
+            "Image Pipeline aliases cannot be removed through config changes; "
+            "Pipeline Profile deletion is not supported: "
+            + ", ".join(omitted)
+        )
+
+
 def _contains_forbidden_secret_field(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
@@ -591,14 +623,7 @@ def _rename_image_provider_references(
     from_alias: str,
     to_alias: str,
 ) -> None:
-    if image_config.get("default_provider") == from_alias:
-        image_config["default_provider"] = to_alias
-    usages = image_config.get("usages")
-    if not isinstance(usages, dict):
-        return
-    for usage, alias in usages.items():
-        if alias == from_alias:
-            usages[usage] = to_alias
+    rename_image_provider_references(image_config, from_alias, to_alias)
 
 
 def _clear_provider_references(llm_config: dict[str, Any], alias: str) -> None:
@@ -669,6 +694,10 @@ def _provider_reference_map(raw_config: dict[str, Any]) -> dict[str, Any]:
         if isinstance(usages, dict):
             for usage, alias in usages.items():
                 references[f"image_providers.usages.{usage}"] = alias
+        for path, alias in image_provider_reference_paths(image_config).items():
+            if path.startswith("image_providers.pipelines."):
+                references[path] = alias
+        references.update(image_pipeline_reference_paths(image_config))
     return references
 
 
@@ -728,6 +757,22 @@ def _provider_resolutions(raw_config: dict[str, Any]) -> dict[str, Any]:
         resolutions[f"image_providers.usages.{usage}"] = {
             "provider_alias": alias or None,
             "source": "usage" if usage_alias else "global",
+            "exists": isinstance(provider, dict),
+            "enabled": bool(
+                isinstance(provider, dict) and provider.get("enabled")
+            ),
+            "type": provider.get("type") if isinstance(provider, dict) else None,
+        }
+
+    for path, alias in image_provider_reference_paths(image_config).items():
+        prefix = "image_providers.pipelines."
+        if not path.startswith(prefix):
+            continue
+        profile_path, field = path.rsplit(".", 1)
+        stage = field.removesuffix("_provider")
+        provider = image_providers.get(alias)
+        resolutions[f"{profile_path}.{stage}"] = {
+            "provider_alias": alias,
             "exists": isinstance(provider, dict),
             "enabled": bool(
                 isinstance(provider, dict) and provider.get("enabled")
@@ -913,6 +958,29 @@ def _validate_provider_command_outcomes(
                 + ", ".join(resurrected)
             )
 
+        if target == "image" and isinstance(actual_config, dict):
+            retired_references = sorted(
+                path
+                for path, alias in image_provider_reference_paths(
+                    actual_config
+                ).items()
+                if alias in retired_aliases
+            )
+            if retired_references:
+                raise ValueError(
+                    "Provider command changes left retired image Provider "
+                    "references at: " + ", ".join(retired_references)
+                )
+
+
+def _validate_image_providers_config(
+    raw_config: dict[str, Any],
+) -> ImageProvidersConfig:
+    image_config = raw_config.get("image_providers")
+    if not isinstance(image_config, dict):
+        raise ValueError("image_providers must be a mapping")
+    return ImageProvidersConfig.model_validate(image_config)
+
 
 def _apply_image_provider_secrets(
     raw_config: dict[str, Any],
@@ -1036,27 +1104,27 @@ class ConfigLifecycle:
                 command_candidate,
                 request.changes,
             )
+            _validate_image_pipeline_mapping_patch(
+                command_candidate,
+                request.changes,
+            )
             replacements = _delete_command_replacement_defaults(
                 before,
                 request.provider_commands,
             )
             candidate = _merge_patch(command_candidate, request.changes)
+            _validate_confirmed_default_replacements(candidate, replacements)
             _validate_provider_command_outcomes(
                 command_candidate,
                 candidate,
                 request.provider_commands,
             )
-            _validate_confirmed_default_replacements(candidate, replacements)
-            ImageProvidersConfig.model_validate(
-                candidate.get("image_providers") or {}
-            )
+            _validate_image_providers_config(candidate)
             _apply_image_provider_secrets(
                 candidate,
                 request.image_provider_secrets,
             )
-            ImageProvidersConfig.model_validate(
-                candidate.get("image_providers") or {}
-            )
+            _validate_image_providers_config(candidate)
             before_references = _provider_reference_map(before)
             after_references = _provider_reference_map(candidate)
             reference_changes = [
@@ -1156,17 +1224,21 @@ class ConfigLifecycle:
                 command_candidate,
                 request.changes,
             )
+            _validate_image_pipeline_mapping_patch(
+                command_candidate,
+                request.changes,
+            )
             replacements = _delete_command_replacement_defaults(
                 before,
                 request.provider_commands,
             )
             candidate = _merge_patch(command_candidate, request.changes)
+            _validate_confirmed_default_replacements(candidate, replacements)
             _validate_provider_command_outcomes(
                 command_candidate,
                 candidate,
                 request.provider_commands,
             )
-            _validate_confirmed_default_replacements(candidate, replacements)
             providers = candidate.get("llm", {}).get("providers", {})
             if not isinstance(providers, dict):
                 raise ValueError("llm.providers must be a mapping")
@@ -1180,16 +1252,12 @@ class ConfigLifecycle:
                 elif secret_patch.mode == "clear":
                     provider["api_key"] = ""
 
-            ImageProvidersConfig.model_validate(
-                candidate.get("image_providers") or {}
-            )
+            _validate_image_providers_config(candidate)
             _apply_image_provider_secrets(
                 candidate,
                 request.image_provider_secrets,
             )
-            ImageProvidersConfig.model_validate(
-                candidate.get("image_providers") or {}
-            )
+            _validate_image_providers_config(candidate)
 
             if candidate.get("config_version") != CURRENT_CONFIG_VERSION:
                 raise ValueError(
