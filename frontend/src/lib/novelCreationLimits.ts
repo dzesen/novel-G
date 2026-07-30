@@ -1,0 +1,2 @@
+export const MIN_WORDS_PER_CHAPTER = 500;
+export const MAX_WORDS_PER_CHAPTER = 50000;

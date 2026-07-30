@@ -5,6 +5,10 @@ import { useTranslations } from "next-intl";
 import { Button, Switch } from "@heroui/react";
 import { apiGet, apiPost, apiPostSSE } from "@/lib/api";
 import {
+  MAX_WORDS_PER_CHAPTER,
+  MIN_WORDS_PER_CHAPTER,
+} from "@/lib/novelCreationLimits";
+import {
   clearAICreateCache,
   hasAICreateCachedSteps,
   isSameAICreateInput,
@@ -500,7 +504,7 @@ export default function AICreateStepper({
       </div>
 
       {/* Chapter / Words Config */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div>
           <label className="block text-sm font-medium text-foreground mb-1">
             {t("chaptersLabel")}
@@ -516,16 +520,20 @@ export default function AICreateStepper({
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-foreground mb-1">
+          <label
+            htmlFor="ai-words-per-chapter"
+            className="block text-sm font-medium text-foreground mb-1"
+          >
             {t("wordsPerChapterLabel")}
           </label>
           <input
+            id="ai-words-per-chapter"
             type="number"
             className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
             value={wordsPerChapter}
             onChange={(e) => handleWordsPerChapterChange(Number(e.target.value) || 1000)}
-            min={500}
-            max={10000}
+            min={MIN_WORDS_PER_CHAPTER}
+            max={MAX_WORDS_PER_CHAPTER}
             disabled={directorLocked}
           />
         </div>

@@ -5,6 +5,10 @@ import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiPost, apiPostForm, getImageUrl } from "@/lib/api";
+import {
+  MAX_WORDS_PER_CHAPTER,
+  MIN_WORDS_PER_CHAPTER,
+} from "@/lib/novelCreationLimits";
 import type { CreateNovelRequest } from "@/types/novel";
 
 interface NovelFormProps {
@@ -244,7 +248,7 @@ export default function NovelForm({ defaults, onCreated, onBack }: NovelFormProp
       </div>
 
       {/* Chapters / Words per Chapter Row */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <FormField label={t("numberOfChapters")}>
           <input
             type="number"
@@ -261,8 +265,8 @@ export default function NovelForm({ defaults, onCreated, onBack }: NovelFormProp
             className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
             value={form.words_per_chapter ?? ""}
             onChange={(e) => updateField("words_per_chapter", e.target.value ? Number(e.target.value) : undefined)}
-            min={500}
-            max={50000}
+            min={MIN_WORDS_PER_CHAPTER}
+            max={MAX_WORDS_PER_CHAPTER}
           />
         </FormField>
       </div>

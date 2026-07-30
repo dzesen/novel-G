@@ -261,7 +261,7 @@ def _get_contiguous_cached_steps(cached_steps: AICreateCachedSteps | None) -> di
 class AICreateNovelRequest(GenerationParamsMixin):
     user_idea: str
     number_of_chapters: int = 100
-    words_per_chapter: int = 3000
+    words_per_chapter: int = Field(default=3000, ge=500, le=50000)
     creative_direction: CreativeDirectionSelection | None = None
     cached_steps: AICreateCachedSteps | None = None
 

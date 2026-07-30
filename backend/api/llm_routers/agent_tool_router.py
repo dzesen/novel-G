@@ -112,7 +112,7 @@ class CreativeDirectorRequest(GenerationParamsMixin):
 
     user_idea: str = Field(default="", max_length=8000)
     number_of_chapters: int = Field(default=100, ge=1, le=1000)
-    words_per_chapter: int = Field(default=3000, ge=500, le=10000)
+    words_per_chapter: int = Field(default=3000, ge=500, le=50000)
     agent_id: str = Field(min_length=1, max_length=120)
     instruction: str = Field(default="", max_length=2000)
     direction_count: int = Field(default=3, ge=2, le=4)
