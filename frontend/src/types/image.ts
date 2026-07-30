@@ -84,6 +84,14 @@ export interface CharacterPortraitJob extends ImageJob {
   anchor: AppearanceAnchor | null;
 }
 
+export interface AppearanceAnchorDependency {
+  job_id: string;
+  chapter_id: string;
+  chapter_title: string;
+  chapter_order: number | null;
+  status: string;
+}
+
 export interface CharacterPortraitState {
   anchor: AppearanceAnchor | null;
   asset: CharacterPortraitAsset | null;
@@ -91,6 +99,8 @@ export interface CharacterPortraitState {
   cleanup_job: CharacterPortraitJob | null;
   provider: CharacterPortraitProvider;
   warnings?: string[];
+  anchor_dependencies: AppearanceAnchorDependency[];
+  anchor_dependency_total: number;
 }
 
 export type NovelCoverJob = ImageJob;

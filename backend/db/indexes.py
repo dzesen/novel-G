@@ -773,6 +773,20 @@ async def init_image_job_indexes():
             ),
             pymongo.IndexModel(
                 [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("usage", pymongo.ASCENDING),
+                    ("appearance_anchor_card_ids", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression={
+                    "usage": "scene_illustration",
+                    "is_deleted": False,
+                },
+                name="image_jobs_owner_anchor_dependencies",
+            ),
+            pymongo.IndexModel(
+                [
                     ("is_terminal", pymongo.ASCENDING),
                     ("status", pymongo.ASCENDING),
                     ("updated_at", pymongo.ASCENDING),

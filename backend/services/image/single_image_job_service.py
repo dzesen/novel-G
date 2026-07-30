@@ -178,6 +178,16 @@ class PortraitProviderProjection(BaseModel):
     warnings: tuple[str, ...] = ()
 
 
+class AppearanceAnchorDependencyProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    job_id: str
+    chapter_id: str
+    chapter_title: str = ""
+    chapter_order: int | None = None
+    status: str
+
+
 class CharacterPortraitStateProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -187,6 +197,8 @@ class CharacterPortraitStateProjection(BaseModel):
     cleanup_job: PortraitJobProjection | None = None
     provider: PortraitProviderProjection
     warnings: tuple[str, ...] = ()
+    anchor_dependencies: tuple[AppearanceAnchorDependencyProjection, ...] = ()
+    anchor_dependency_total: int = 0
 
 
 class ImageJobStateProjection(BaseModel):
@@ -321,6 +333,15 @@ class ImageJobRepositoryProtocol(Protocol):
         provider_alias: str,
     ) -> int | None: ...
 
+    async def list_anchor_dependencies(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        limit: int,
+    ) -> tuple[int, list[dict[str, Any]]]: ...
+
 
 class ScopedImageJobRepository:
     """Adapt the legacy card-shaped repository calls to a generic subject.
@@ -416,6 +437,14 @@ class AppearanceAnchorGatewayProtocol(Protocol):
         confirmed: bool,
     ) -> dict[str, Any]: ...
 
+    async def clear_anchor(
+        self,
+        *,
+        novel_id: str,
+        card_id: str,
+        expected_previous: dict[str, Any],
+    ) -> None: ...
+
 
 class ImageProviderResolverProtocol(Protocol):
     async def resolve(
@@ -496,6 +525,19 @@ class ReferenceCardAppearanceAnchorGateway:
             anchor,
             expected_previous=expected_previous,
             confirmed=confirmed,
+        )
+
+    async def clear_anchor(
+        self,
+        *,
+        novel_id: str,
+        card_id: str,
+        expected_previous: dict[str, Any],
+    ) -> None:
+        await ReferenceCardService.clear_appearance_anchor(
+            novel_id,
+            card_id,
+            expected_previous=expected_previous,
         )
 
 

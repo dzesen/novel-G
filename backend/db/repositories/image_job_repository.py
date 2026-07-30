@@ -391,6 +391,43 @@ class ImageJobRepository(BaseRepository):
             sort=[("created_at", DESCENDING)],
         )
 
+    async def list_anchor_dependencies(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        limit: int = 5,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """List scene jobs that still depend on a character anchor."""
+
+        canonical_card_id = str(to_object_id(card_id))
+        query = {
+            "owner_id": to_object_id(owner_id),
+            "novel_id": to_object_id(novel_id),
+            "usage": "scene_illustration",
+            "appearance_anchor_card_ids": canonical_card_id,
+            "is_deleted": False,
+            "$or": [
+                {"is_terminal": False},
+                {"status": "succeeded"},
+            ],
+        }
+        total = await self.collection.count_documents(query)
+        cursor = (
+            self.collection.find(
+                query,
+                projection={
+                    "subject_id": 1,
+                    "status": 1,
+                    "created_at": 1,
+                },
+            )
+            .sort("created_at", DESCENDING)
+            .limit(max(1, min(int(limit), 20)))
+        )
+        return total, await cursor.to_list(length=max(1, min(int(limit), 20)))
+
     async def median_completed_seconds(
         self,
         *,

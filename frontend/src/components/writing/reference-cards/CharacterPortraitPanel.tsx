@@ -4,7 +4,7 @@ import { Button } from "@heroui/react";
 import Image from "next/image";
 import { useLocale, useTranslations } from "next-intl";
 import { useEffect, useMemo, useState } from "react";
-import { apiGet, apiPost, getImageUrl } from "@/lib/api";
+import { ApiError, apiDelete, apiGet, apiPost, getImageUrl } from "@/lib/api";
 import {
   constrainIllustrationPromptEdit,
 } from "@/lib/illustrationPrompt";
@@ -84,6 +84,7 @@ export default function CharacterPortraitPanel({
   const [loading, setLoading] = useState(true);
   const [translating, setTranslating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [detaching, setDetaching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [imageFailed, setImageFailed] = useState(false);
   const { job, pollError, cancelling, adoptJob, cancel } =
@@ -197,6 +198,12 @@ export default function CharacterPortraitPanel({
   );
   const assetMissing =
     imageFailed || asset?.state === "missing" || Boolean(anchor && !asset);
+  const anchorDependencies = state?.anchor_dependencies ?? [];
+  const anchorDependencyTotal = state?.anchor_dependency_total ?? 0;
+  const hiddenAnchorDependencyCount = Math.max(
+    0,
+    anchorDependencyTotal - anchorDependencies.length,
+  );
   const cleanupJob =
     cleanupJobState?.cleanup_pending ? cleanupJobState : null;
   const activeJob = Boolean(
@@ -269,6 +276,52 @@ export default function CharacterPortraitPanel({
       setError(reason instanceof Error ? reason.message : t("submitFailed"));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const detachAnchor = async () => {
+    if (
+      !anchor ||
+      detaching ||
+      activeJob ||
+      anchorDependencyTotal > 0
+    ) return;
+    if (!window.confirm(t("detachWarning"))) return;
+
+    setDetaching(true);
+    setError(null);
+    try {
+      const nextState = await apiDelete<CharacterPortraitState>(
+        `${portraitPath}/anchor?expected_reference_asset=${encodeURIComponent(anchor.reference_asset)}`,
+      );
+      setState(nextState);
+      adoptJob(null);
+      setImageFailed(false);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) {
+        const detail =
+          reason.detail && typeof reason.detail === "object"
+            ? (reason.detail as Record<string, unknown>)
+            : null;
+        const code = typeof detail?.code === "string" ? detail.code : "";
+        try {
+          const refreshed = await apiGet<CharacterPortraitState>(portraitPath);
+          setState(refreshed);
+        } catch {
+          // Keep the inspected anchor visible; the next panel load retries.
+        }
+        setError(
+          code === "appearance_anchor_in_use"
+            ? t("detachBlockedChanged")
+            : code === "appearance_anchor_busy"
+              ? t("detachBusy")
+              : t("detachConflict"),
+        );
+      } else {
+        setError(reason instanceof Error ? reason.message : t("detachFailed"));
+      }
+    } finally {
+      setDetaching(false);
     }
   };
 
@@ -468,6 +521,63 @@ export default function CharacterPortraitPanel({
                   </div>
                 </div>
               </dl>
+              {anchorDependencyTotal > 0 ? (
+                <div
+                  role="status"
+                  className="mt-3 min-w-0 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100"
+                >
+                  <p className="font-medium">
+                    {t("detachBlocked", { count: anchorDependencyTotal })}
+                  </p>
+                  <p className="mt-1">{t("detachBlockedHint")}</p>
+                  <ul className="mt-2 space-y-1">
+                    {anchorDependencies.map((dependency) => (
+                      <li
+                        key={dependency.job_id}
+                        className="min-w-0 break-words"
+                        title={dependency.chapter_id}
+                      >
+                        {dependency.chapter_order !== null &&
+                        dependency.chapter_title
+                          ? t("dependencyChapter", {
+                              order: dependency.chapter_order,
+                              title: dependency.chapter_title,
+                            })
+                          : dependency.chapter_title
+                            ? t("dependencyTitle", {
+                                title: dependency.chapter_title,
+                              })
+                            : t("dependencyId", {
+                                id: dependency.chapter_id,
+                              })}
+                      </li>
+                    ))}
+                  </ul>
+                  {hiddenAnchorDependencyCount > 0 && (
+                    <p className="mt-1">
+                      {t("dependencyMore", {
+                        count: hiddenAnchorDependencyCount,
+                      })}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-3 text-xs leading-5 text-muted">
+                  {t("detachAvailable")}
+                </p>
+              )}
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                isDisabled={
+                  detaching || activeJob || anchorDependencyTotal > 0
+                }
+                onPress={() => void detachAnchor()}
+                className="mt-3 w-full border-red-300 text-red-700 dark:border-red-800 dark:text-red-300 sm:w-auto"
+              >
+                {detaching ? t("detaching") : t("detach")}
+              </Button>
             </section>
           )}
         </div>

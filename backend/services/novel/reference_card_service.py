@@ -340,6 +340,27 @@ class ReferenceCardService:
         return replacement
 
     @staticmethod
+    async def clear_appearance_anchor(
+        novel_id: str,
+        card_id: str,
+        *,
+        expected_previous: Any,
+    ) -> None:
+        """Clear a frozen image anchor only if it still matches the inspected value."""
+
+        await novel_repo.get_novel_by_id(novel_id)
+        expected = normalize_appearance_anchor(expected_previous)
+        changed = await character_repo.compare_and_clear_appearance_anchor(
+            novel_id,
+            card_id,
+            expected=expected,
+        )
+        if not changed:
+            raise AppearanceAnchorConflictError(
+                "外观锚点已变化，请刷新角色卡后再决定是否解绑"
+            )
+
+    @staticmethod
     async def set_favorite(
         novel_id: str,
         card_type: str,

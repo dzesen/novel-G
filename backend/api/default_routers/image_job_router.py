@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -22,6 +22,8 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.utils import to_object_id
 from backend.services.auth.identity_service import Actor
 from backend.services.image.character_portrait_service import (
+    AppearanceAnchorBusyError,
+    AppearanceAnchorInUseError,
     CharacterPortraitService,
     CharacterPortraitStateProjection,
     PortraitAnchorResetRequired,
@@ -213,6 +215,27 @@ def get_scene_illustration_service() -> SceneIllustrationService:
 
 
 def _translate_portrait_error(error: Exception) -> HTTPException:
+    if isinstance(error, AppearanceAnchorInUseError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "appearance_anchor_in_use",
+                "message": str(error),
+                "dependency_total": error.dependency_total,
+                "dependencies": [
+                    dependency.model_dump(mode="json")
+                    for dependency in error.dependencies
+                ],
+            },
+        )
+    if isinstance(error, AppearanceAnchorBusyError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "appearance_anchor_busy",
+                "message": str(error),
+            },
+        )
     if isinstance(error, PortraitJobNotFoundError):
         return HTTPException(status_code=404, detail=str(error))
     if isinstance(error, NotFoundError):
@@ -278,6 +301,34 @@ async def get_character_portrait_state(
             owner_id=actor.id,
             novel_id=novel_id,
             card_id=card_id,
+        )
+    except Exception as error:
+        raise _translate_portrait_error(error) from error
+
+
+@router.delete(
+    "/api/reference-cards/novel/{novel_id}/character/{card_id}/portrait/anchor",
+    response_model=CharacterPortraitStateProjection,
+)
+async def detach_character_portrait_anchor(
+    novel_id: str,
+    card_id: str,
+    expected_reference_asset: str = Query(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    ),
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitService = Depends(
+        get_character_portrait_service
+    ),
+) -> CharacterPortraitStateProjection:
+    try:
+        return await service.detach_anchor(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            card_id=card_id,
+            expected_reference_asset=expected_reference_asset,
         )
     except Exception as error:
         raise _translate_portrait_error(error) from error

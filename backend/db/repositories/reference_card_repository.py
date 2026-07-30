@@ -249,6 +249,31 @@ class ReferenceCardRepository(BaseRepository):
         )
         return result.modified_count == 1
 
+    async def compare_and_clear_appearance_anchor(
+        self,
+        novel_id: str,
+        card_id: str,
+        *,
+        expected: dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        """Clear exactly the anchor the user inspected without touching prose order."""
+
+        if "character" not in self.supported_types:
+            raise ValueError("Appearance anchors are only supported for characters")
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(card_id),
+                "novel_id": to_object_id(novel_id),
+                "card_type": "character",
+                "is_deleted": False,
+                "appearance_anchor": dict(expected),
+            },
+            {"$unset": {"appearance_anchor": ""}},
+            session=session,
+        )
+        return result.modified_count == 1
+
     async def soft_delete_card(
         self,
         novel_id: str,

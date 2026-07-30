@@ -5,14 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 import secrets
 import time
-from typing import Callable
+from typing import Any, Callable, Protocol
 
+from backend.db.errors import NotFoundError
+from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.image_job_repository import image_job_repo
 from backend.db.utils import get_utc_now
 from backend.services.image.managed_assets import (
     ImagePollAssetConsumer,
 )
 from backend.services.image.single_image_job_service import (
+    AppearanceAnchorDependencyProjection,
     AppearanceAnchorGatewayProtocol,
     CharacterPortraitStateProjection,
     ConfiguredImageProviderResolver,
@@ -32,6 +35,34 @@ from backend.services.image.single_image_job_service import (
     SingleImageJobService,
 )
 from backend.services.llm.agent_orchestrator import IllustrationPromptResult
+from backend.services.novel.appearance_anchor import (
+    AppearanceAnchorConflictError,
+)
+
+
+class ChapterLookupProtocol(Protocol):
+    async def get_chapter_by_id(
+        self,
+        chapter_id: str,
+        *,
+        include_deleted: bool = False,
+    ) -> dict[str, Any]: ...
+
+
+class AppearanceAnchorInUseError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        dependencies: tuple[AppearanceAnchorDependencyProjection, ...],
+        dependency_total: int,
+    ) -> None:
+        super().__init__("外观锚点仍被场景插图引用，暂时不能解绑")
+        self.dependencies = dependencies
+        self.dependency_total = dependency_total
+
+
+class AppearanceAnchorBusyError(RuntimeError):
+    pass
 
 
 class CharacterPortraitService:
@@ -46,10 +77,14 @@ class CharacterPortraitService:
         asset_consumer: ImagePollAssetConsumer | None = None,
         asset_reader: ManagedAssetReaderProtocol | None = None,
         asset_repository: ImageAssetMetadataRepositoryProtocol | None = None,
+        chapters: ChapterLookupProtocol | None = None,
         now: Callable[[], datetime],
         now_epoch: Callable[[], float] = time.time,
         seed_factory: Callable[[], int] = lambda: secrets.randbits(64),
     ) -> None:
+        self._anchors = anchors
+        self._job_repository = jobs
+        self._chapters = chapters
         self._jobs = SingleImageJobService(
             jobs=jobs,
             anchors=anchors,
@@ -71,11 +106,114 @@ class CharacterPortraitService:
         card_id: str,
         provider_alias: str | None = None,
     ) -> CharacterPortraitStateProjection:
-        return await self._jobs.get_state(
+        state = await self._jobs.get_state(
             owner_id=owner_id,
             novel_id=novel_id,
             card_id=card_id,
             provider_alias=provider_alias,
+        )
+        if state.anchor is None:
+            return state
+        dependency_total, dependencies = await self._anchor_dependencies(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            card_id=card_id,
+        )
+        return state.model_copy(
+            update={
+                "anchor_dependencies": dependencies,
+                "anchor_dependency_total": dependency_total,
+            }
+        )
+
+    async def _anchor_dependencies(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+    ) -> tuple[int, tuple[AppearanceAnchorDependencyProjection, ...]]:
+        total, documents = await self._job_repository.list_anchor_dependencies(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            card_id=card_id,
+            limit=5,
+        )
+        dependencies: list[AppearanceAnchorDependencyProjection] = []
+        for document in documents:
+            chapter_id = str(document.get("subject_id") or "")
+            chapter_title = ""
+            chapter_order: int | None = None
+            if self._chapters is not None and chapter_id:
+                try:
+                    chapter = await self._chapters.get_chapter_by_id(
+                        chapter_id,
+                        include_deleted=True,
+                    )
+                except NotFoundError:
+                    chapter = None
+                if chapter is not None:
+                    chapter_title = str(chapter.get("title") or "").strip()
+                    raw_order = chapter.get("order_index")
+                    chapter_order = (
+                        int(raw_order) if raw_order is not None else None
+                    )
+            dependencies.append(
+                AppearanceAnchorDependencyProjection(
+                    job_id=str(document.get("_id") or ""),
+                    chapter_id=chapter_id,
+                    chapter_title=chapter_title,
+                    chapter_order=chapter_order,
+                    status=str(document.get("status") or "unknown"),
+                )
+            )
+        return total, tuple(dependencies)
+
+    async def detach_anchor(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        expected_reference_asset: str,
+    ) -> CharacterPortraitStateProjection:
+        current = await self._anchors.get_anchor(
+            novel_id=novel_id,
+            card_id=card_id,
+        )
+        if current is None:
+            return await self.get_state(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                card_id=card_id,
+            )
+        if current.get("reference_asset") != expected_reference_asset:
+            raise AppearanceAnchorConflictError(
+                "外观锚点已变化，请刷新角色卡后再决定是否解绑"
+            )
+        state = await self.get_state(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            card_id=card_id,
+        )
+        if state.active_job is not None or state.cleanup_job is not None:
+            raise AppearanceAnchorBusyError(
+                "当前立绘作业尚未结束，请等待作业完成后再解绑"
+            )
+        if state.anchor_dependency_total:
+            raise AppearanceAnchorInUseError(
+                dependencies=state.anchor_dependencies,
+                dependency_total=state.anchor_dependency_total,
+            )
+        await self._anchors.clear_anchor(
+            novel_id=novel_id,
+            card_id=card_id,
+            expected_previous=current,
+        )
+        return await self.get_state(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            card_id=card_id,
         )
 
     async def start(
@@ -134,11 +272,14 @@ character_portrait_service = CharacterPortraitService(
     jobs=image_job_repo,
     anchors=ReferenceCardAppearanceAnchorGateway(),
     provider_resolver=ConfiguredImageProviderResolver(),
+    chapters=chapter_repo,
     now=get_utc_now,
 )
 
 
 __all__ = [
+    "AppearanceAnchorBusyError",
+    "AppearanceAnchorInUseError",
     "CharacterPortraitService",
     "CharacterPortraitStateProjection",
     "ConfiguredImageProviderResolver",
