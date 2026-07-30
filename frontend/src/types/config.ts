@@ -97,11 +97,17 @@ export interface ComfyUIWorkflowOutputBinding {
   node_id: string;
   field: string;
 }
+export interface ComfyUIWorkflowInputOverride {
+  node_id: string;
+  input: string;
+  value: ImageConfigScalar;
+}
 export interface ComfyUIWorkflowConfig {
   template_path: string;
   template_revision: string;
   reference_mode: "none" | "img2img" | "controlnet" | "style_reference" | "edit_model";
   bindings: Record<string, ComfyUIWorkflowInputBinding>;
+  overrides: ComfyUIWorkflowInputOverride[];
   outputs: ComfyUIWorkflowOutputBinding[];
   dependencies: {
     node_types: string[];
@@ -151,7 +157,28 @@ export interface ImageProvidersConfig {
   };
 }
 
-export type ImageProviderDependencyKind = "node_types" | "checkpoints" | "loras";
+export type ImageProviderDependencyKind =
+  | "node_types"
+  | "checkpoints"
+  | "loras"
+  | "workflow_inputs";
+export interface ImageProviderWorkflowInput {
+  node_id: string;
+  class_type: string;
+  node_title: string;
+  input: string;
+  group: "common" | "advanced";
+  value_type: "string" | "integer" | "number" | "boolean" | "choice" | "unknown";
+  template_value: ImageConfigScalar | null;
+  effective_value: ImageConfigScalar | null;
+  overridden: boolean;
+  choices: (ImageConfigScalar | null)[];
+  minimum: number | null;
+  maximum: number | null;
+  step: number | null;
+  status: "ready" | "missing" | "unknown";
+  issue: string;
+}
 export interface ImageProviderDependencyCheck {
   kind: ImageProviderDependencyKind;
   required: string[];
@@ -174,10 +201,12 @@ export interface ImageProviderTestResponse {
   summary: string;
   comfyui_version: string;
   template_revision: string;
+  effective_graph_hash: string;
   queue_running: number;
   queue_pending: number;
   checkpoint_names: string[];
   lora_names: string[];
+  workflow_inputs: ImageProviderWorkflowInput[];
   dependency_checks: ImageProviderDependencyCheck[];
   failure: ImageProviderTestFailure | null;
 }
@@ -194,6 +223,7 @@ export function newComfyUIImageProviderConfig(): ComfyUIImageProviderConfig {
       template_revision: "",
       reference_mode: "none",
       bindings: {},
+      overrides: [],
       outputs: [],
       dependencies: {
         node_types: [],

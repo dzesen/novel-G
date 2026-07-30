@@ -148,6 +148,7 @@ def build_comfyui_runtime_fingerprint(
     *,
     checkpoint_names: tuple[str, ...],
     lora_names: tuple[str, ...],
+    workflow_graph_hash: str = "",
 ) -> RuntimeFingerprintSchema:
     """Keep only bounded deployment facts; never persist argv or local paths."""
 
@@ -267,6 +268,7 @@ def build_comfyui_runtime_fingerprint(
             label="loras",
             max_items=64,
         ),
+        workflow_graph_hash=workflow_graph_hash,
     )
 
 
@@ -399,6 +401,7 @@ class ComfyUIProvider:
                     system_stats,
                     checkpoint_names=prepared.loaded.checkpoint_names,
                     lora_names=prepared.loaded.lora_names,
+                    workflow_graph_hash=prepared.loaded.effective_graph_hash,
                 ),
             ),
         )

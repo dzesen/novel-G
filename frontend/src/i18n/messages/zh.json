@@ -277,7 +277,10 @@
       "aliasRule": "别名只能包含英文字母、数字和下划线。",
       "aliasDuplicate": "该别名已经存在。",
       "protocol": "协议",
-      "types": { "comfyui": "ComfyUI", "openai_compatible": "OpenAI 兼容" },
+      "types": {
+        "comfyui": "ComfyUI",
+        "openai_compatible": "OpenAI 兼容"
+      },
       "add": "新增",
       "cancel": "取消",
       "confirm": "确认",
@@ -314,7 +317,7 @@
         "templatePath": "模板文件路径",
         "templatePathHint": "可填写可读 JSON 文件的绝对路径；文件必须是 ComfyUI API 格式节点图，而不是界面导出的工作流格式。",
         "templateRevision": "模板修订",
-        "templateRevisionEmpty": "保存后运行连通性测试以计算",
+        "templateRevisionEmpty": "检测当前草稿后自动计算",
         "referenceMode": "参考图模式",
         "referenceModes": {
           "none": "不使用参考图",
@@ -347,37 +350,56 @@
       },
       "dependencies": {
         "title": "工作流依赖",
-        "description": "逐行或用逗号填写模板必需的节点类型、checkpoint 与 LoRA。连通性测试会查询 ComfyUI 并显示缺失项。",
+        "description": "节点类型与标量资源值会从生效工作流和 ComfyUI 自动推导；旧版手工声明仅作为只读的额外校验保留。",
         "node_types": "节点类型",
         "checkpoints": "Checkpoints",
-        "loras": "LoRAs"
+        "loras": "LoRAs",
+        "legacyNote": "旧版额外校验（只读）",
+        "none": "没有额外校验",
+        "workflow_inputs": "工作流输入"
       },
       "test": {
         "passed": "测试通过",
         "failed": "测试未通过",
         "unknownError": "连通性测试失败，请检查连接地址和后端日志。",
-        "run": "测试连接",
-        "running": "测试中…",
-        "saveBeforeTest": "当前表单有未保存的图像 Provider 改动。请先保存，再运行测试；测试只读取已保存的别名配置。",
-        "savedConfigOnly": "连通性测试使用磁盘上已保存的配置，不会测试尚未保存的表单草稿。",
+        "run": "检测当前草稿",
+        "running": "检测中…",
         "resultTitle": "连接与就绪度",
-        "summaryPassed": "已连接 ComfyUI，且已保存配置中声明的工作流依赖均可发现。",
+        "summaryPassed": "ComfyUI 已连接，生效工作流的节点、资源与标量输入值均已就绪。",
         "summaryFailed": "连接或就绪度检查未通过，请按下方提示修正后重新测试。",
         "version": "ComfyUI 版本",
         "runningJobs": "运行中任务",
         "pendingJobs": "排队任务",
-        "revisionBackfilled": "后端已计算并回填新的模板修订。请再次保存，使该修订成为后续漂移检测的基准。",
+        "revisionBackfilled": "后端已计算并回填模板修订；确认无误后保存，才会成为后续生成的基准。",
         "ready": "已就绪",
         "missing": "有缺失",
         "readyCount": "已找到 {ready} / {total}",
         "promptIsFinalCheck": "依赖查询只做就绪度提示；ComfyUI 对实际工作流的 prompt 校验仍是最终裁决。",
         "failure": {
-          "provider_unavailable": { "message": "ComfyUI 暂时不可用", "action": "确认 ComfyUI 已启动且地址可访问，然后重新测试。" },
-          "workflow_validation_failed": { "message": "工作流模板未通过校验", "action": "确认模板是可读的 API 格式节点图，并修正模板路径、节点或输入。" },
-          "dependency_missing": { "message": "工作流依赖未就绪", "action": "安装下方缺失的节点包、checkpoint 或 LoRA，或修正依赖声明。" },
-          "execution_failed": { "message": "ComfyUI 就绪度检查失败", "action": "检查 ComfyUI 服务和已保存配置，修正后重新测试。" },
-          "generic": { "message": "连通性测试未完成", "action": "检查连接地址与 ComfyUI 状态，保存配置后重新测试。" }
-        }
+          "provider_unavailable": {
+            "message": "ComfyUI 暂时不可用",
+            "action": "确认 ComfyUI 已启动且地址可访问，然后重新测试。"
+          },
+          "workflow_validation_failed": {
+            "message": "工作流模板未通过校验",
+            "action": "确认模板是可读的 API 格式节点图，并修正模板路径、节点或输入。"
+          },
+          "dependency_missing": {
+            "message": "工作流要求尚未就绪",
+            "action": "安装缺失节点或资源，或把标出的工作流输入恢复为可用值。"
+          },
+          "execution_failed": {
+            "message": "ComfyUI 就绪检查失败",
+            "action": "检查 ComfyUI 服务与当前草稿，修正后重新检测。"
+          },
+          "generic": {
+            "message": "草稿检测未完成",
+            "action": "检查连接地址与 ComfyUI 状态，然后重新检测当前草稿。"
+          }
+        },
+        "draftUnsaved": "本次检测使用当前未保存草稿，且不会自动保存；只有点击“保存”才会改变后续生成行为。",
+        "draftOnly": "本次检测使用当前表单草稿，不会写入配置。",
+        "staleResult": "检测完成后草稿又发生了变化；请重新检测后再判断是否就绪。"
       },
       "openai": {
         "connectionTitle": "兼容接口",
@@ -425,6 +447,31 @@
         "title": "危险操作",
         "description": "删除 Provider 会从完整配置映射中移除它，并同步处理默认项与用途引用。保存前仍可重载撤销。",
         "confirm": "确认删除"
+      },
+      "overrides": {
+        "title": "工作流输入覆盖",
+        "description": "无需改动导出的工作流，即可调整安全的标量输入。提示词、种子、尺寸等语义槽位仍由生成流程管理；这里绝不允许改变连线或拓扑。",
+        "inspectHint": "先检测当前草稿，系统会识别可安全调整的标量输入，以及当前可用的模型和采样器选项。",
+        "common": "常用调整",
+        "advanced": "高级调整（{count}）",
+        "changed": "已修改",
+        "templateValue": "模板值",
+        "effectiveValue": "生效值",
+        "reset": "恢复模板值",
+        "booleanValue": "已启用",
+        "manual": "手动输入",
+        "unavailableValue": "{value}（当前不可用）",
+        "apply": "应用",
+        "useList": "使用可用列表",
+        "invalidInteger": "请输入整数。",
+        "invalidNumber": "请输入有效数字。",
+        "sharedTitle": "当前 Provider 同时影响 {count} 种出图用途",
+        "sharedConfirm": "当前 Provider 同时影响 {count} 种出图用途。确定把这项修改应用到全部用途吗？",
+        "cloneUsage": "单独复制给",
+        "cloneAction": "复制并改派用途",
+        "unresolvedTitle": "有覆盖项需要处理",
+        "unresolvedDescription": "当前安全输入中找不到这些精确节点位置，模板可能已变化。请手工重新选择或删除；系统不会模糊猜测。",
+        "removeInvalid": "删除覆盖"
       }
     },
     "workflow": {
@@ -1934,13 +1981,13 @@
         "loadFailed": "未能加载资料卡审核",
         "generateFailed": "资料卡候选生成失败",
         "applyFailed": "资料卡应用失败",
-        "discard": "\u653e\u5f03\u672c\u6b21\u65b9\u6848",
-        "discardConfirm": "\u653e\u5f03\u540e\u5019\u9009\u5c06\u9000\u51fa\u5ba1\u6838\uff0c\u4f46\u4e0d\u4f1a\u6539\u52a8\u4efb\u4f55\u6b63\u5f0f\u8d44\u6599\u5361\u3002\u786e\u5b9a\u7ee7\u7eed\u5417\uff1f",
-        "discarding": "\u6b63\u5728\u653e\u5f03...",
-        "discardFailed": "\u672a\u80fd\u653e\u5f03\u8fd9\u4efd\u5ba1\u6838\u65b9\u6848\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
-        "discardMissing": "\u8fd9\u4efd\u65b9\u6848\u5df2\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5176\u4ed6\u9875\u9762\u5904\u7406\uff0c\u5f53\u524d\u5ba1\u6838\u5df2\u6e05\u7a7a\u3002",
-        "discardConflict": "\u65b9\u6848\u72b6\u6001\u5df2\u53d8\u5316\uff0c\u65e0\u6cd5\u653e\u5f03\u3002\u8bf7\u5237\u65b0\u540e\u67e5\u770b\u6700\u65b0\u72b6\u6001\u3002",
-        "staleConflict": "\u8d44\u6599\u5361\u5df2\u53d1\u751f\u53d8\u5316\uff0c\u65e7\u65b9\u6848\u5df2\u81ea\u52a8\u5173\u95ed\u3002\u8bf7\u91cd\u65b0\u751f\u6210\u5019\u9009\u3002",
+        "discard": "放弃本次方案",
+        "discardConfirm": "放弃后候选将退出审核，但不会改动任何正式资料卡。确定继续吗？",
+        "discarding": "正在放弃...",
+        "discardFailed": "未能放弃这份审核方案，请稍后重试。",
+        "discardMissing": "这份方案已不存在或已被其他页面处理，当前审核已清空。",
+        "discardConflict": "方案状态已变化，无法放弃。请刷新后查看最新状态。",
+        "staleConflict": "资料卡已发生变化，旧方案已自动关闭。请重新生成候选。",
         "emptyTitle": "从小说设定提取资料卡",
         "emptyDetail": "一次模型请求只生成上方选中的类型，候选上限不会因少选类型而扩大。已有同名卡片会在审核中建议合并。",
         "generate": "生成候选",

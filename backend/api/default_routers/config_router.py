@@ -183,7 +183,7 @@ async def test_llm_provider(request: ProviderTestRequest) -> ProviderTestRespons
 async def test_image_provider(
     request: ImageProviderTestRequest,
 ) -> ImageProviderTestResponse:
-    """测试已保存的 ComfyUI 配置；本片不伪造 OpenAI-compatible 结果。"""
+    """检测当前 ComfyUI 表单草稿；请求不会写入配置或提交生成作业。"""
 
     try:
         return await test_image_provider_connection(

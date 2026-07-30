@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Annotated, Any, Literal, Union
 
@@ -55,6 +56,31 @@ class WorkflowOutputBinding(_StrictConfigModel):
         return stripped
 
 
+class WorkflowInputOverride(_StrictConfigModel):
+    """Persisted scalar input difference applied without changing workflow topology."""
+
+    node_id: str = Field(min_length=1, max_length=200)
+    input: str = Field(min_length=1, max_length=200)
+    value: JsonScalar
+
+    @field_validator("value")
+    @classmethod
+    def validate_bounded_scalar(cls, value: JsonScalar) -> JsonScalar:
+        if isinstance(value, str) and len(value) > 2_000:
+            raise ValueError("workflow override string values are limited to 2000 characters")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("workflow override numeric values must be finite")
+        return value
+
+    @field_validator("node_id", "input")
+    @classmethod
+    def strip_non_empty_value(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("workflow override targets must not be empty")
+        return stripped
+
+
 class WorkflowDependencies(_StrictConfigModel):
     """readiness 使用的部署依赖；最终仍以 ComfyUI /prompt 校验为准。"""
 
@@ -70,6 +96,7 @@ class ComfyUIWorkflowConfig(_StrictConfigModel):
     template_revision: str = ""
     reference_mode: ReferenceMode = "none"
     bindings: dict[str, WorkflowInputBinding] = Field(default_factory=dict)
+    overrides: list[WorkflowInputOverride] = Field(default_factory=list)
     outputs: list[WorkflowOutputBinding] = Field(default_factory=list)
     dependencies: WorkflowDependencies = Field(default_factory=WorkflowDependencies)
 
@@ -102,6 +129,23 @@ class ComfyUIWorkflowConfig(_StrictConfigModel):
                     f"都绑定到节点 {binding.node_id}.{binding.input}"
                 )
             targets[target] = slot
+        override_targets: dict[tuple[str, str], int] = {}
+        for index, override in enumerate(self.overrides):
+            target = (override.node_id, override.input)
+            previous_index = override_targets.get(target)
+            if previous_index is not None:
+                raise ValueError(
+                    "workflow overrides "
+                    f"{previous_index} and {index} both target "
+                    f"node {override.node_id}.{override.input}"
+                )
+            bound_slot = targets.get(target)
+            if bound_slot is not None:
+                raise ValueError(
+                    f"workflow override for node {override.node_id}.{override.input} "
+                    f"conflicts with semantic slot {bound_slot}"
+                )
+            override_targets[target] = index
         return self
 
 

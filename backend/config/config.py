@@ -59,7 +59,7 @@ def _should_replace_dict_path(
 _KNOWN_WORKFLOW_STEPS = WORKFLOW_STEPS
 _PROVIDER_RENAMES_KEY = "_provider_renames"
 _DEPRECATED_DEFAULT_REVIEWERS = {"openai_gpt5_4_nano"}
-CURRENT_CONFIG_VERSION = 5
+CURRENT_CONFIG_VERSION = 6
 _API_VERSION_RE = re.compile(r"^v\d+(?:[a-z0-9._-]+)?$", re.IGNORECASE)
 _OPENAI_ENDPOINT_SUFFIXES: tuple[tuple[str, ...], ...] = (
     ("chat", "completions"),
@@ -512,6 +512,23 @@ def _migrate_config_tree(config_data: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         version = 5
+        migrated["config_version"] = version
+
+    if version == 5:
+        image_config = migrated.get("image_providers")
+        providers = (
+            image_config.get("providers")
+            if isinstance(image_config, dict)
+            else None
+        )
+        if isinstance(providers, dict):
+            for provider in providers.values():
+                if not isinstance(provider, dict) or provider.get("type") != "comfyui":
+                    continue
+                workflow = provider.get("workflow")
+                if isinstance(workflow, dict):
+                    workflow.setdefault("overrides", [])
+        version = 6
         migrated["config_version"] = version
 
     return migrated

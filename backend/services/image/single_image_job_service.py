@@ -571,6 +571,7 @@ class ConfiguredImageProviderResolver:
                 system_stats,
                 checkpoint_names=loaded.checkpoint_names,
                 lora_names=loaded.lora_names,
+                workflow_graph_hash=loaded.effective_graph_hash,
             )
             return ImageProviderSnapshot(
                 alias=resolved.alias,

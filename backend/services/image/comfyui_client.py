@@ -138,12 +138,11 @@ class ComfyUIClient:
             raise ComfyUIProtocolError("ComfyUI /system_stats request failed")
         return self._json_object(response, endpoint="/system_stats")
 
-    async def get_object_info(self) -> tuple[str, ...]:
+    async def get_object_info(self) -> dict[str, Any]:
         response = await self._request("GET", "/object_info")
         if response.status_code != 200:
             raise ComfyUIProtocolError("ComfyUI /object_info request failed")
-        payload = self._json_object(response, endpoint="/object_info")
-        return tuple(payload)
+        return self._json_object(response, endpoint="/object_info")
 
     async def get_model_names(
         self,

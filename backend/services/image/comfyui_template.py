@@ -25,8 +25,10 @@ JsonScalar = str | int | float | bool | None
 
 @dataclass(frozen=True)
 class LoadedComfyUITemplate:
+    template_workflow: dict[str, dict[str, Any]]
     workflow: dict[str, dict[str, Any]]
     revision: str
+    effective_graph_hash: str
     checkpoint_names: tuple[str, ...]
     lora_names: tuple[str, ...]
 
@@ -232,11 +234,61 @@ def load_comfyui_template(
                 field=output.field,
             )
 
+    template_workflow = workflow
+    effective_workflow = deepcopy(template_workflow)
+    before_topology = _topology_snapshot(template_workflow)
+    for override in workflow_config.overrides:
+        node = effective_workflow.get(override.node_id)
+        if node is None:
+            raise _template_failure(
+                f"workflow 覆盖指向不存在的节点 {override.node_id}",
+                "删除这条覆盖，或按当前 API-format 模板重新选择节点输入",
+                node_id=override.node_id,
+                input_name=override.input,
+            )
+        inputs = node["inputs"]
+        if override.input not in inputs:
+            raise _template_failure(
+                f"workflow 覆盖指向节点中不存在的输入 {override.input}",
+                "删除这条覆盖，或按当前 API-format 模板重新选择节点输入",
+                node_id=override.node_id,
+                input_name=override.input,
+            )
+        current_value = inputs[override.input]
+        if _is_connection(current_value):
+            raise _template_failure(
+                "workflow 覆盖指向连线输入，拒绝替换",
+                "删除这条覆盖；只允许覆盖模板中已存在的标量输入",
+                node_id=override.node_id,
+                input_name=override.input,
+            )
+        if not _is_json_scalar(current_value):
+            raise _template_failure(
+                "workflow 覆盖指向的输入不是标量",
+                "删除这条覆盖；只允许覆盖字符串、数字、布尔值或 null",
+                node_id=override.node_id,
+                input_name=override.input,
+            )
+        inputs[override.input] = override.value
+
+    if _topology_snapshot(effective_workflow) != before_topology:
+        raise _template_failure(
+            "应用 workflow 覆盖时检测到拓扑变化",
+            "删除当前覆盖；程序只允许替换已存在的标量输入",
+        )
+    encoded = json.dumps(
+        effective_workflow,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return LoadedComfyUITemplate(
-        workflow=workflow,
+        template_workflow=template_workflow,
+        workflow=effective_workflow,
         revision=revision,
-        checkpoint_names=_dependency_names(workflow, input_name="ckpt_name"),
-        lora_names=_dependency_names(workflow, input_name="lora_name"),
+        effective_graph_hash=f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+        checkpoint_names=_dependency_names(effective_workflow, input_name="ckpt_name"),
+        lora_names=_dependency_names(effective_workflow, input_name="lora_name"),
     )
 
 

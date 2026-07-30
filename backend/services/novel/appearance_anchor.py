@@ -102,16 +102,27 @@ class RuntimeFingerprintSchema(BaseModel):
         default_factory=list,
         max_length=RUNTIME_LORA_LIMIT,
     )
+    workflow_graph_hash: str = Field(default="", max_length=71)
 
     @field_validator(
         "comfyui_version",
         "pytorch_version",
         "precision",
+        "workflow_graph_hash",
         mode="before",
     )
     @classmethod
     def normalize_text(cls, value: Any) -> str:
         return _normalize_text(value)
+
+    @field_validator("workflow_graph_hash", mode="after")
+    @classmethod
+    def validate_workflow_graph_hash(cls, value: str) -> str:
+        if value and _WORKFLOW_REVISION_PATTERN.fullmatch(value) is None:
+            raise ValueError(
+                "workflow_graph_hash must be empty or sha256:<64 lowercase hex>"
+            )
+        return value
 
     @field_validator(
         "devices",

@@ -17,6 +17,7 @@ import {
   TextField,
 } from "@heroui/react";
 import { apiPost } from "@/lib/api";
+import { ComfyUIWorkflowOverrides } from "./ComfyUIWorkflowOverrides";
 import type {
   AppConfig,
   ComfyUIImageProviderConfig,
@@ -50,6 +51,7 @@ type ProviderTestRunState = {
   response?: ImageProviderTestResponse;
   error?: string;
   revisionBackfilled?: boolean;
+  stale?: boolean;
 };
 
 const ALIAS_REGEX = /^[a-zA-Z0-9_]+$/;
@@ -83,40 +85,6 @@ function uniqueName(prefix: string, existing: Record<string, unknown>): string {
   let index = 1;
   while (`${prefix}_${index}` in existing) index += 1;
   return `${prefix}_${index}`;
-}
-
-function normalizeStringList(value: string): string[] {
-  return [...new Set(
-    value
-      .split(/\r?\n|,/)
-      .map((item) => item.trim())
-      .filter(Boolean),
-  )];
-}
-
-function StringListEditor({
-  value,
-  label,
-  onCommit,
-}: {
-  value: string[];
-  label: ReactNode;
-  onCommit: (value: string[]) => void;
-}) {
-  const serializedValue = value.join("\n");
-
-  return (
-    <label className="block text-sm text-muted">
-      <span>{label}</span>
-      <textarea
-        key={serializedValue}
-        defaultValue={serializedValue}
-        onBlur={(event) => onCommit(normalizeStringList(event.currentTarget.value))}
-        rows={3}
-        className="mt-1 w-full resize-y rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground"
-      />
-    </label>
-  );
 }
 
 function parseOptionalNumber(value: string): number | null {
@@ -172,16 +140,45 @@ export function ImageProviderCard({
   const selectedProvider = selectedAlias ? providers[selectedAlias] : undefined;
   const selectedTest = selectedAlias ? testStates[selectedAlias] : undefined;
   const selectableAliases = aliases.filter((alias) => imageProviderIsSelectable(providers[alias]));
+  const affectedUsages = (alias: string) => USAGE_KEYS.filter((usage) => (
+    config.image_providers.usages[usage] || config.image_providers.default_provider
+  ) === alias);
+
+  const cloneProviderForUsage = (
+    alias: string,
+    usage: typeof USAGE_KEYS[number],
+  ) => {
+    const provider = providers[alias];
+    if (!provider) return;
+    const prefix = `${alias}_${usage}`;
+    const cloneAlias = prefix in providers ? uniqueName(prefix, providers) : prefix;
+    const clone = JSON.parse(JSON.stringify(provider)) as ImageProviderConfig;
+    updateImageConfig({
+      ...config.image_providers,
+      providers: { ...providers, [cloneAlias]: clone },
+      usages: { ...config.image_providers.usages, [usage]: cloneAlias },
+    });
+    setSelectedAlias(cloneAlias);
+  };
 
   const updateImageConfig = (next: AppConfig["image_providers"]) => {
     onChange({ ...config, image_providers: next });
   };
 
-  const updateProvider = (alias: string, provider: ImageProviderConfig) => {
+  const updateProvider = (
+    alias: string,
+    provider: ImageProviderConfig,
+    markTestStale = true,
+  ) => {
     updateImageConfig({
       ...config.image_providers,
       providers: { ...providers, [alias]: provider },
     });
+    if (markTestStale) {
+      setTestStates((current) => current[alias]
+        ? { ...current, [alias]: { ...current[alias], stale: true } }
+        : current);
+    }
   };
 
   const addProvider = () => {
@@ -258,7 +255,7 @@ export function ImageProviderCard({
 
   const runConnectionTest = async (alias: string) => {
     const provider = providers[alias];
-    if (!provider || provider.type !== "comfyui" || hasUnsavedChanges) return;
+    if (!provider || provider.type !== "comfyui") return;
     setPendingDeleteAlias("");
     setTestStates((current) => ({
       ...current,
@@ -267,7 +264,7 @@ export function ImageProviderCard({
     try {
       const response = await apiPost<ImageProviderTestResponse>(
         "/api/config/image-providers/test",
-        { alias },
+        { alias, provider },
       );
       const revisionBackfilled = Boolean(
         response.template_revision
@@ -280,7 +277,7 @@ export function ImageProviderCard({
             ...provider.workflow,
             template_revision: response.template_revision,
           },
-        });
+        }, false);
       }
       setTestStates((current) => ({
         ...current,
@@ -288,6 +285,7 @@ export function ImageProviderCard({
           status: "done",
           response,
           revisionBackfilled,
+          stale: false,
         },
       }));
     } catch (error) {
@@ -468,6 +466,7 @@ export function ImageProviderCard({
                 renameError={renameError}
                 pendingDelete={pendingDeleteAlias === selectedAlias}
                 hasUnsavedChanges={hasUnsavedChanges}
+                affectedUsages={affectedUsages(selectedAlias)}
                 testState={selectedTest}
                 onChange={(provider) => updateProvider(selectedAlias, provider)}
                 onRenameStart={() => {
@@ -487,6 +486,7 @@ export function ImageProviderCard({
                   setRenameError("");
                 }}
                 onTest={() => runConnectionTest(selectedAlias)}
+                onCloneForUsage={(usage) => cloneProviderForUsage(selectedAlias, usage)}
                 onDeleteAsk={() => {
                   setPendingDeleteAlias(selectedAlias);
                   setRenamingAlias("");
@@ -610,6 +610,7 @@ function ProviderDetail({
   renameError,
   pendingDelete,
   hasUnsavedChanges,
+  affectedUsages,
   testState,
   onChange,
   onRenameStart,
@@ -617,6 +618,7 @@ function ProviderDetail({
   onRenameConfirm,
   onRenameCancel,
   onTest,
+  onCloneForUsage,
   onDeleteAsk,
   onDeleteConfirm,
   onDeleteCancel,
@@ -629,6 +631,7 @@ function ProviderDetail({
   renameError: string;
   pendingDelete: boolean;
   hasUnsavedChanges: boolean;
+  affectedUsages: (typeof USAGE_KEYS)[number][];
   testState?: ProviderTestRunState;
   onChange: (provider: ImageProviderConfig) => void;
   onRenameStart: () => void;
@@ -636,12 +639,13 @@ function ProviderDetail({
   onRenameConfirm: () => void;
   onRenameCancel: () => void;
   onTest: () => void;
+  onCloneForUsage: (usage: (typeof USAGE_KEYS)[number]) => void;
   onDeleteAsk: () => void;
   onDeleteConfirm: () => void;
   onDeleteCancel: () => void;
   t: ReturnType<typeof useTranslations>;
 }) {
-  const testDisabled = hasUnsavedChanges || provider.type !== "comfyui";
+  const testDisabled = provider.type !== "comfyui";
   return (
     <div className="space-y-4">
       <div className="rounded-lg border border-border bg-surface-secondary/30 p-3">
@@ -684,12 +688,15 @@ function ProviderDetail({
           <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
             {t("openaiUnavailable")}
           </div>
-        ) : hasUnsavedChanges ? (
-          <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
-            {t("test.saveBeforeTest")}
-          </div>
         ) : (
-          <p className="mt-3 text-xs text-muted">{t("test.savedConfigOnly")}</p>
+          <p className="mt-3 text-xs text-muted">
+            {t(hasUnsavedChanges ? "test.draftUnsaved" : "test.draftOnly")}
+          </p>
+        )}
+        {testState?.stale && provider.type === "comfyui" && (
+          <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+            {t("test.staleResult")}
+          </div>
         )}
 
         {isRenaming && (
@@ -713,9 +720,12 @@ function ProviderDetail({
 
       {provider.type === "comfyui" ? (
         <ComfyUIForm
+          key={alias}
           provider={provider}
           testState={testState}
+          affectedUsages={affectedUsages}
           onChange={onChange}
+          onCloneForUsage={onCloneForUsage}
           t={t}
         />
       ) : (
@@ -845,12 +855,16 @@ function BaseConnectionFields({
 function ComfyUIForm({
   provider,
   testState,
+  affectedUsages,
   onChange,
+  onCloneForUsage,
   t,
 }: {
   provider: ComfyUIImageProviderConfig;
   testState?: ProviderTestRunState;
+  affectedUsages: (typeof USAGE_KEYS)[number][];
   onChange: (provider: ImageProviderConfig) => void;
+  onCloneForUsage: (usage: (typeof USAGE_KEYS)[number]) => void;
   t: ReturnType<typeof useTranslations>;
 }) {
   const workflow = provider.workflow;
@@ -929,6 +943,16 @@ function ComfyUIForm({
           </label>
         </div>
       </section>
+
+      <ComfyUIWorkflowOverrides
+        workflow={workflow}
+        controls={testState?.response?.workflow_inputs ?? []}
+        inspected={Boolean(testState?.response)}
+        affectedUsages={affectedUsages}
+        onChange={(nextWorkflow) => onChange({ ...provider, workflow: nextWorkflow })}
+        onCloneForUsage={onCloneForUsage}
+        t={t}
+      />
 
       <section className="rounded-lg border border-border bg-surface-secondary/20 p-3">
         <SectionTitle title={t("slots.title")} description={t("slots.description")} />
@@ -1109,19 +1133,21 @@ function ComfyUIForm({
 
         <div className="rounded-lg border border-border bg-surface-secondary/20 p-3">
           <SectionTitle title={t("dependencies.title")} description={t("dependencies.description")} />
+          <p className="mt-3 text-xs text-muted">{t("dependencies.legacyNote")}</p>
           <div className="mt-3 space-y-3">
             {(["node_types", "checkpoints", "loras"] as const).map((kind) => (
-              <StringListEditor
-                key={kind}
-                value={workflow.dependencies[kind]}
-                label={t(`dependencies.${kind}`)}
-                onCommit={(value) => updateWorkflow({
-                  dependencies: {
-                    ...workflow.dependencies,
-                    [kind]: value,
-                  },
-                })}
-              />
+              <div key={kind}>
+                <div className="text-xs font-medium text-foreground">{t(`dependencies.${kind}`)}</div>
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  {workflow.dependencies[kind].length > 0 ? workflow.dependencies[kind].map((item) => (
+                    <code key={item} className="max-w-full break-all rounded bg-warm-200 px-2 py-1 text-xs text-muted dark:bg-warm-300/30">
+                      {item}
+                    </code>
+                  )) : (
+                    <span className="text-xs text-muted">{t("dependencies.none")}</span>
+                  )}
+                </div>
+              </div>
             ))}
           </div>
         </div>
@@ -1176,7 +1202,7 @@ function ReadinessResult({
           {t("test.revisionBackfilled")}
         </div>
       )}
-      <div className="mt-3 grid gap-3 md:grid-cols-3">
+      <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         {response.dependency_checks.map((check) => (
           <div key={check.kind} className="min-w-0 rounded-lg border border-border bg-surface p-3">
             <div className="flex items-center justify-between gap-2">

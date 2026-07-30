@@ -277,7 +277,10 @@
       "aliasRule": "Aliases may contain only letters, numbers, and underscores.",
       "aliasDuplicate": "This alias already exists.",
       "protocol": "Protocol",
-      "types": { "comfyui": "ComfyUI", "openai_compatible": "OpenAI-compatible" },
+      "types": {
+        "comfyui": "ComfyUI",
+        "openai_compatible": "OpenAI-compatible"
+      },
       "add": "Add",
       "cancel": "Cancel",
       "confirm": "Confirm",
@@ -314,7 +317,7 @@
         "templatePath": "Template File Path",
         "templatePathHint": "Enter an absolute path to a readable JSON file. It must be a ComfyUI API-format node graph, not a workflow exported for the UI.",
         "templateRevision": "Template Revision",
-        "templateRevisionEmpty": "Save, then run the connection test to calculate",
+        "templateRevisionEmpty": "Run draft inspection to calculate",
         "referenceMode": "Reference Image Mode",
         "referenceModes": {
           "none": "No reference image",
@@ -347,37 +350,56 @@
       },
       "dependencies": {
         "title": "Workflow Dependencies",
-        "description": "Enter required node types, checkpoints, and LoRAs one per line or comma-separated. The connection test queries ComfyUI and shows missing items.",
+        "description": "Node types and scalar resource values are derived from the effective workflow and ComfyUI. Older manual declarations remain as read-only extra assertions.",
         "node_types": "Node Types",
         "checkpoints": "Checkpoints",
-        "loras": "LoRAs"
+        "loras": "LoRAs",
+        "legacyNote": "Legacy extra assertions (read-only)",
+        "none": "No extra assertions",
+        "workflow_inputs": "Workflow Inputs"
       },
       "test": {
         "passed": "Test passed",
         "failed": "Test did not pass",
         "unknownError": "Connection test failed. Check the connection address and backend logs.",
-        "run": "Test Connection",
-        "running": "Testing…",
-        "saveBeforeTest": "This form has unsaved Image Provider changes. Save first, then test; the test reads only the saved alias configuration.",
-        "savedConfigOnly": "The connection test uses configuration already saved to disk. It does not test unsaved form drafts.",
+        "run": "Inspect Current Draft",
+        "running": "Inspecting?",
         "resultTitle": "Connection and Readiness",
-        "summaryPassed": "ComfyUI is connected, and all workflow dependencies declared in the saved configuration were discovered.",
+        "summaryPassed": "ComfyUI is connected, and the effective workflow?s nodes, resources, and scalar input values are ready.",
         "summaryFailed": "The connection or readiness check did not pass. Follow the guidance below, then test again.",
         "version": "ComfyUI Version",
         "runningJobs": "Running Jobs",
         "pendingJobs": "Queued Jobs",
-        "revisionBackfilled": "The backend calculated and filled a new template revision. Save again to make it the baseline for future drift detection.",
+        "revisionBackfilled": "The backend calculated and filled the template revision. Save when you want this draft to become the generation baseline.",
         "ready": "Ready",
         "missing": "Missing",
         "readyCount": "{ready} of {total} found",
         "promptIsFinalCheck": "Dependency discovery is a readiness hint only. ComfyUI's prompt validation of the actual workflow remains authoritative.",
         "failure": {
-          "provider_unavailable": { "message": "ComfyUI is temporarily unavailable", "action": "Confirm that ComfyUI is running and reachable at the configured address, then test again." },
-          "workflow_validation_failed": { "message": "The workflow template did not pass validation", "action": "Confirm that the template is a readable API-format node graph, then fix its path, nodes, or inputs." },
-          "dependency_missing": { "message": "Workflow dependencies are not ready", "action": "Install the missing custom nodes, checkpoint, or LoRA shown below, or correct the dependency declarations." },
-          "execution_failed": { "message": "The ComfyUI readiness check failed", "action": "Check the ComfyUI service and saved configuration, correct the issue, then test again." },
-          "generic": { "message": "The connection test did not finish", "action": "Check the connection address and ComfyUI status, save the configuration, then test again." }
-        }
+          "provider_unavailable": {
+            "message": "ComfyUI is temporarily unavailable",
+            "action": "Confirm that ComfyUI is running and reachable at the configured address, then test again."
+          },
+          "workflow_validation_failed": {
+            "message": "The workflow template did not pass validation",
+            "action": "Confirm that the template is a readable API-format node graph, then fix its path, nodes, or inputs."
+          },
+          "dependency_missing": {
+            "message": "Workflow requirements are not ready",
+            "action": "Install the missing node or resource, or restore the marked workflow input to an available value."
+          },
+          "execution_failed": {
+            "message": "The ComfyUI readiness check failed",
+            "action": "Check the ComfyUI service and current draft, correct the issue, then inspect again."
+          },
+          "generic": {
+            "message": "Draft inspection did not finish",
+            "action": "Check the connection address and ComfyUI status, then inspect the current draft again."
+          }
+        },
+        "draftUnsaved": "This checks the current unsaved draft and never saves it. Only the Save button changes generation behavior.",
+        "draftOnly": "This checks the current form draft and does not write configuration.",
+        "staleResult": "The draft changed after this result. Inspect again before relying on readiness."
       },
       "openai": {
         "connectionTitle": "Compatible API",
@@ -425,6 +447,31 @@
         "title": "Danger Zone",
         "description": "Deleting a Provider removes it from the complete configuration mapping and updates default and usage references. Reloading before Save still discards the change.",
         "confirm": "Confirm Delete"
+      },
+      "overrides": {
+        "title": "Workflow Input Overrides",
+        "description": "Adjust safe scalar inputs without editing the exported workflow. Prompt, seed, size, and other semantic bindings stay under the generation flow; connections and topology can never be changed here.",
+        "inspectHint": "Inspect the current draft to discover safe scalar inputs and available model or sampler choices.",
+        "common": "Common Controls",
+        "advanced": "Advanced Controls ({count})",
+        "changed": "Changed",
+        "templateValue": "Template value",
+        "effectiveValue": "Effective value",
+        "reset": "Restore template value",
+        "booleanValue": "Enabled",
+        "manual": "Enter manually",
+        "unavailableValue": "{value} (not currently available)",
+        "apply": "Apply",
+        "useList": "Use available list",
+        "invalidInteger": "Enter a whole number.",
+        "invalidNumber": "Enter a valid number.",
+        "sharedTitle": "This Provider currently affects {count} image uses",
+        "sharedConfirm": "This Provider affects {count} image uses. Apply this input change to all of them?",
+        "cloneUsage": "Create a separate copy for",
+        "cloneAction": "Clone and reassign",
+        "unresolvedTitle": "Overrides need attention",
+        "unresolvedDescription": "These exact node inputs were not found among safe controls. The template may have changed. Remap them manually or remove them; no fuzzy match will be attempted.",
+        "removeInvalid": "Remove override"
       }
     },
     "workflow": {
