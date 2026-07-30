@@ -103,6 +103,38 @@ export interface CharacterPortraitState {
   anchor_dependency_total: number;
 }
 
+export interface CharacterVisualReference {
+  asset_id: string;
+  view: string | null;
+  framing: string | null;
+  expression: string | null;
+  costume: string | null;
+  note: string | null;
+}
+
+export interface ExternalLoraAdapter {
+  kind: "lora";
+  lora_name: string;
+  trigger_word: string | null;
+  strength: number;
+  base_model_family: string;
+  version_note: string | null;
+}
+
+export interface CharacterVisualProfile {
+  exists: boolean;
+  profile_id: string | null;
+  owner_id: string;
+  novel_id: string;
+  character_card_id: string;
+  references: CharacterVisualReference[];
+  external_adapter: ExternalLoraAdapter | null;
+  appearance_anchor: AppearanceAnchor | null;
+  revision: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 export type NovelCoverJob = ImageJob;
 
 export interface NovelCoverState {

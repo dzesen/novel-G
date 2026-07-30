@@ -20,6 +20,7 @@ import type {
 } from "@/types/image";
 import IllustrationPromptEditor from "@/components/image/IllustrationPromptEditor";
 import ImageJobStatusPanel from "@/components/image/ImageJobStatusPanel";
+import CharacterVisualProfilePanel from "./CharacterVisualProfilePanel";
 import { useCharacterPortraitJob } from "./useCharacterPortraitJob";
 
 interface CharacterPortraitPanelProps {
@@ -689,6 +690,12 @@ export default function CharacterPortraitPanel({
           />
         </div>
       </div>
+      <CharacterVisualProfilePanel
+        novelId={novelId}
+        cardId={cardId}
+        cardName={cardName}
+        currentAsset={asset}
+      />
     </section>
   );
 }
