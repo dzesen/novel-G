@@ -345,7 +345,13 @@
       "outputs": {
         "title": "Output Nodes",
         "description": "Choose the node fields that contain image descriptors in the history response. Image bytes are then fetched through the view endpoint.",
+        "itemTitle": "Output {index}",
+        "remove": "Remove output {index}",
+        "pathPreview": "Reads history.outputs[{nodeId}].{field}",
+        "nodeIdHint": "Enter the node ID under history.outputs.",
         "field": "Output Field",
+        "fieldHint": "Usually images; it must match the actual field returned for this node in history.",
+        "empty": "No output node is declared. Add at least one item pointing to an image-producing node before generation.",
         "add": "Add Output Node"
       },
       "dependencies": {
@@ -1771,6 +1777,11 @@
         "imageAlt": "Character portrait of {name}",
         "assetMissing": "Asset missing",
         "empty": "No character portrait yet",
+        "anchorTitle": "Appearance anchor established",
+        "anchorBound": "In use",
+        "anchorDescription": "The first successful portrait creates this anchor automatically. It is bound here in this character card's portrait area.",
+        "anchorAsset": "Reference asset",
+        "anchorEstablishedAt": "Established",
         "anchorSeed": "Seed",
         "anchorProvider": "Provider / model",
         "anchorReferenceMode": "Reference mode",
@@ -1791,7 +1802,7 @@
         "resetAndGenerate": "Reset and generate 1 portrait",
         "submitting": "Submitting…",
         "submitFailed": "Could not submit the portrait job",
-        "resetWarning": "This will make future illustrations inconsistent with existing ones.",
+        "resetWarning": "The current appearance anchor is bound to reference asset {asset}. Resetting it can make future illustrations inconsistent with existing ones. Continue?",
         "status": {
           "pending": "Portrait job waiting to be queued",
           "submitting": "Confirming portrait job submission",

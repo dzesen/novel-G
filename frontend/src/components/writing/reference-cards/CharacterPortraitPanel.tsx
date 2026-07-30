@@ -2,7 +2,7 @@
 
 import { Button } from "@heroui/react";
 import Image from "next/image";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useEffect, useMemo, useState } from "react";
 import { apiGet, apiPost, getImageUrl } from "@/lib/api";
 import {
@@ -76,6 +76,7 @@ export default function CharacterPortraitPanel({
   hasUnsavedChanges,
 }: CharacterPortraitPanelProps) {
   const t = useTranslations("writing.referenceCards.portrait");
+  const locale = useLocale();
   const [state, setState] = useState<CharacterPortraitState | null>(null);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [agentId, setAgentId] = useState("");
@@ -142,6 +143,25 @@ export default function CharacterPortraitPanel({
     setImageFailed(false);
   }, [job?.asset?.asset_id, state?.asset?.asset_id]);
 
+  const terminalJobId = job?.terminal ? job.job_id : null;
+  useEffect(() => {
+    if (!terminalJobId) return;
+    let active = true;
+
+    void apiGet<CharacterPortraitState>(portraitPath)
+      .then((nextState) => {
+        if (active) setState(nextState);
+      })
+      .catch(() => {
+        // The terminal job already carries its own actionable failure. Keep it
+        // visible and let a later panel reload retry the state reconciliation.
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [portraitPath, terminalJobId]);
+
   const completedAnchor =
     job?.status === "succeeded" ? job.anchor : null;
   const completedAsset =
@@ -150,6 +170,18 @@ export default function CharacterPortraitPanel({
     completedAnchor ?? state?.anchor ?? null;
   const asset: CharacterPortraitAsset | null =
     completedAsset ?? state?.asset ?? null;
+  const anchorHashLabel = anchor
+    ? `${anchor.reference_asset.slice(0, 12)}…`
+    : "";
+  const anchorEstablishedAt = useMemo(() => {
+    if (!anchor) return "";
+    const parsed = new Date(anchor.established_at);
+    if (Number.isNaN(parsed.getTime())) return anchor.established_at;
+    return new Intl.DateTimeFormat(locale, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(parsed);
+  }, [anchor, locale]);
   const provider = job?.provider ?? state?.provider ?? null;
   const warnings = useMemo(
     () =>
@@ -215,7 +247,12 @@ export default function CharacterPortraitPanel({
   const submit = async () => {
     if (!prompt || submitting || activeJob || hasUnsavedChanges) return;
     const resetting = Boolean(anchor);
-    if (resetting && !window.confirm(t("resetWarning"))) return;
+    if (
+      resetting &&
+      !window.confirm(
+        t("resetWarning", { asset: anchorHashLabel }),
+      )
+    ) return;
 
     setSubmitting(true);
     setError(null);
@@ -371,22 +408,67 @@ export default function CharacterPortraitPanel({
             )}
           </div>
           {anchor && (
-            <dl className="mt-3 min-w-0 space-y-1 text-xs text-muted">
-              <div className="flex min-w-0 gap-2">
-                <dt className="shrink-0">{t("anchorSeed")}</dt>
-                <dd className="truncate">{anchor.seed}</dd>
+            <section
+              aria-labelledby={`portrait-anchor-title-${cardId}`}
+              className="mt-3 min-w-0 rounded-lg border border-accent/25 bg-accent/5 p-3"
+            >
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                <h4
+                  id={`portrait-anchor-title-${cardId}`}
+                  className="text-sm font-semibold text-foreground"
+                >
+                  {t("anchorTitle")}
+                </h4>
+                <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[0.6875rem] font-medium text-accent">
+                  {t("anchorBound")}
+                </span>
               </div>
-              <div className="flex min-w-0 gap-2">
-                <dt className="shrink-0">{t("anchorProvider")}</dt>
-                <dd className="truncate" title={`${anchor.provider} / ${anchor.model}`}>
-                  {anchor.provider} / {anchor.model}
-                </dd>
-              </div>
-              <div className="flex min-w-0 gap-2">
-                <dt className="shrink-0">{t("anchorReferenceMode")}</dt>
-                <dd className="truncate">{anchor.reference_mode}</dd>
-              </div>
-            </dl>
+              <p className="mt-1.5 text-xs leading-5 text-muted">
+                {t("anchorDescription")}
+              </p>
+              <dl className="mt-3 min-w-0 space-y-2 border-t border-accent/15 pt-3 text-xs">
+                <div className="min-w-0">
+                  <dt className="text-muted">{t("anchorAsset")}</dt>
+                  <dd
+                    className="mt-0.5 truncate font-mono text-foreground"
+                    title={anchor.reference_asset}
+                  >
+                    {anchorHashLabel}
+                  </dd>
+                </div>
+                <div className="min-w-0">
+                  <dt className="text-muted">{t("anchorEstablishedAt")}</dt>
+                  <dd className="mt-0.5 truncate text-foreground">
+                    <time dateTime={anchor.established_at}>
+                      {anchorEstablishedAt}
+                    </time>
+                  </dd>
+                </div>
+                <div className="min-w-0">
+                  <dt className="text-muted">{t("anchorProvider")}</dt>
+                  <dd
+                    className="mt-0.5 truncate text-foreground"
+                    title={`${anchor.provider} / ${anchor.model}`}
+                  >
+                    {anchor.provider} / {anchor.model}
+                  </dd>
+                </div>
+                <div className="grid min-w-0 grid-cols-2 gap-3">
+                  <div className="min-w-0">
+                    <dt className="text-muted">{t("anchorSeed")}</dt>
+                    <dd className="mt-0.5 truncate text-foreground">
+                      {anchor.seed}
+                    </dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="text-muted">{t("anchorReferenceMode")}</dt>
+                    <dd className="mt-0.5 truncate text-foreground">
+                      {anchor.reference_mode}
+                    </dd>
+                  </div>
+                </div>
+              </dl>
+            </section>
           )}
         </div>
 

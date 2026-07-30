@@ -2466,7 +2466,7 @@ class SingleImageJobService:
                 failure = ImageFailure(
                     code="execution_failed",
                     message="立绘已保存，但角色外观锚点同时被其他操作修改",
-                    action="保留现有素材，检查当前锚点后再决定是否人工重设；不要自动重跑",
+                    action="当前锚点显示在本角色卡的“外观锚点”区；核对基准素材后再决定是否人工重设。不要自动重跑。",
                 )
                 failed, _ = await self._cas_or_winner(
                     owner_id=owner_id,

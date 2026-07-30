@@ -1081,54 +1081,95 @@ function ComfyUIForm({
       <section className="grid gap-4 xl:grid-cols-2">
         <div className="rounded-lg border border-border bg-surface-secondary/20 p-3">
           <SectionTitle title={t("outputs.title")} description={t("outputs.description")} />
-          <div className="mt-3 space-y-3">
-            {workflow.outputs.map((output, index) => (
-              <div key={`${index}-${output.node_id}-${output.field}`} className="grid gap-3 rounded-lg border border-border bg-surface p-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
-                <TextField
-                  value={output.node_id}
-                  onChange={(node_id) => updateWorkflow({
-                    outputs: workflow.outputs.map((item, itemIndex) => (
-                      itemIndex === index ? { ...item, node_id } : item
-                    )),
-                  })}
+          <div className="mt-3 overflow-hidden rounded-lg border border-border bg-surface">
+            {workflow.outputs.length === 0 && (
+              <p className="px-3 py-4 text-sm leading-6 text-muted">
+                {t("outputs.empty")}
+              </p>
+            )}
+            {workflow.outputs.map((output, index) => {
+              const nodeLabel = output.node_id.trim() || "…";
+              const fieldLabel = output.field.trim() || "…";
+              return (
+                <fieldset
+                  key={`${index}-${output.node_id}-${output.field}`}
+                  className={`min-w-0 p-3 ${index > 0 ? "border-t border-border" : ""}`}
                 >
-                  <Label className="text-xs text-muted">{t("slots.nodeId")}</Label>
-                  <Input className="border-border" />
-                </TextField>
-                <TextField
-                  value={output.field}
-                  onChange={(field) => updateWorkflow({
-                    outputs: workflow.outputs.map((item, itemIndex) => (
-                      itemIndex === index ? { ...item, field } : item
-                    )),
-                  })}
-                >
-                  <Label className="text-xs text-muted">{t("outputs.field")}</Label>
-                  <Input className="border-border" />
-                </TextField>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onPress={() => updateWorkflow({
-                    outputs: workflow.outputs.filter((_, itemIndex) => itemIndex !== index),
-                  })}
-                  className="border-border text-red-600"
-                >
-                  {t("remove")}
-                </Button>
-              </div>
-            ))}
-            <Button
-              size="sm"
-              variant="outline"
-              onPress={() => updateWorkflow({
-                outputs: [...workflow.outputs, { node_id: "", field: "images" }],
-              })}
-              className="border-border text-foreground"
-            >
-              + {t("outputs.add")}
-            </Button>
+                  <legend className="sr-only">
+                    {t("outputs.itemTitle", { index: index + 1 })}
+                  </legend>
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <p className="text-sm font-semibold text-foreground">
+                      {t("outputs.itemTitle", { index: index + 1 })}
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-label={t("outputs.remove", { index: index + 1 })}
+                      onPress={() => updateWorkflow({
+                        outputs: workflow.outputs.filter((_, itemIndex) => itemIndex !== index),
+                      })}
+                      className="shrink-0 text-red-600"
+                    >
+                      {t("remove")}
+                    </Button>
+                  </div>
+                  <p className="mt-1 break-all text-xs text-muted">
+                    {t("outputs.pathPreview", {
+                      nodeId: nodeLabel,
+                      field: fieldLabel,
+                    })}
+                  </p>
+                  <div className="mt-3 grid min-w-0 gap-3 sm:grid-cols-2">
+                    <div className="min-w-0">
+                      <TextField
+                        value={output.node_id}
+                        onChange={(node_id) => updateWorkflow({
+                          outputs: workflow.outputs.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, node_id } : item
+                          )),
+                        })}
+                        className="min-w-0"
+                      >
+                        <Label className="text-xs text-muted">{t("slots.nodeId")}</Label>
+                        <Input className="w-full min-w-0 border-border" />
+                      </TextField>
+                      <p className="mt-1.5 text-xs leading-5 text-muted">
+                        {t("outputs.nodeIdHint")}
+                      </p>
+                    </div>
+                    <div className="min-w-0">
+                      <TextField
+                        value={output.field}
+                        onChange={(field) => updateWorkflow({
+                          outputs: workflow.outputs.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, field } : item
+                          )),
+                        })}
+                        className="min-w-0"
+                      >
+                        <Label className="text-xs text-muted">{t("outputs.field")}</Label>
+                        <Input className="w-full min-w-0 border-border" />
+                      </TextField>
+                      <p className="mt-1.5 text-xs leading-5 text-muted">
+                        {t("outputs.fieldHint")}
+                      </p>
+                    </div>
+                  </div>
+                </fieldset>
+              );
+            })}
           </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onPress={() => updateWorkflow({
+              outputs: [...workflow.outputs, { node_id: "", field: "images" }],
+            })}
+            className="mt-3 w-full border-border text-foreground sm:w-auto"
+          >
+            + {t("outputs.add")}
+          </Button>
         </div>
 
         <div className="rounded-lg border border-border bg-surface-secondary/20 p-3">

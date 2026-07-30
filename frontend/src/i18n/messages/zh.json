@@ -345,7 +345,13 @@
       "outputs": {
         "title": "产物节点",
         "description": "指定从 history 响应的哪些节点字段读取图片描述符；图片二进制随后通过 view 接口取回。",
+        "itemTitle": "产物 {index}",
+        "remove": "删除产物 {index}",
+        "pathPreview": "读取 history.outputs[{nodeId}].{field}",
+        "nodeIdHint": "填写 history.outputs 下的节点 ID。",
         "field": "产物字段",
+        "fieldHint": "通常为 images；必须与该节点在 history 中的实际字段一致。",
+        "empty": "尚未声明产物节点。生成前至少添加一项，并指向会输出图片的节点。",
         "add": "添加产物节点"
       },
       "dependencies": {
@@ -1771,6 +1777,11 @@
         "imageAlt": "{name}的角色立绘",
         "assetMissing": "素材缺失",
         "empty": "尚未生成角色立绘",
+        "anchorTitle": "外观锚点已建立",
+        "anchorBound": "正在使用",
+        "anchorDescription": "首次成功立绘会自动建立锚点；当前绑定在本角色卡的立绘区。",
+        "anchorAsset": "基准素材",
+        "anchorEstablishedAt": "建立时间",
         "anchorSeed": "Seed",
         "anchorProvider": "后端 / 模型",
         "anchorReferenceMode": "参考模式",
@@ -1791,7 +1802,7 @@
         "resetAndGenerate": "重设并生成 1 张立绘",
         "submitting": "正在提交…",
         "submitFailed": "立绘任务提交失败",
-        "resetWarning": "这会让后续插图与已有插图不一致",
+        "resetWarning": "当前外观锚点绑定到基准素材 {asset}。重设会让后续插图与已有插图不一致。是否继续？",
         "status": {
           "pending": "立绘任务等待提交",
           "submitting": "正在确认立绘任务提交",
