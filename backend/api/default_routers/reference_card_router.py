@@ -11,6 +11,7 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mutation import MutationConflictError
 from backend.services.novel.reference_card_curation import (
     ReferenceCardProposalError,
+    ReferenceCardProposalNotFound,
     StaleReferenceCardProposal,
     reference_card_curation_service,
 )
@@ -131,6 +132,31 @@ async def inspect_reference_card_curation(novel_id: str):
         raise _translate_error(exc) from exc
 
 
+@router.post("/novel/{novel_id}/curation/{proposal_id}/discard")
+async def discard_reference_card_curation(
+    novel_id: str,
+    proposal_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+):
+    """Discard an active review proposal without changing formal cards."""
+    try:
+        return await reference_card_curation_service.discard(
+            novel_id=novel_id,
+            proposal_id=proposal_id,
+            actor_id=actor.id,
+        )
+    except ReferenceCardProposalNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ReferenceCardProposalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/novel/{novel_id}/curation/{proposal_id}/apply")
 async def apply_reference_card_curation(
     novel_id: str,
@@ -148,7 +174,15 @@ async def apply_reference_card_curation(
             ],
             actor_id=actor.id,
         )
-    except (StaleReferenceCardProposal, MutationConflictError) as exc:
+    except StaleReferenceCardProposal as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "stale_reference_card_proposal",
+                "message": str(exc),
+            },
+        ) from exc
+    except MutationConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (ReferenceCardProposalError, InvalidIdError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

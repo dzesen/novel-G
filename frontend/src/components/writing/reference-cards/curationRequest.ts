@@ -13,3 +13,21 @@ export function buildReferenceCardCurationPrepareRequest(
   if (maxTokens !== null) request.max_tokens = maxTokens;
   return request;
 }
+
+export function buildReferenceCardCurationDiscardPath(
+  novelId: string,
+  proposalId: string,
+): string {
+  return (
+    `/api/reference-cards/novel/${encodeURIComponent(novelId)}/curation/` +
+    `${encodeURIComponent(proposalId)}/discard`
+  );
+}
+
+export function clearedReferenceCardCurationState() {
+  return {
+    proposal: null,
+    decisions: {},
+    result: null,
+  } as const;
+}

@@ -4,7 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
 import { OptionalNumberParam } from "@/components/shared/OptionalParamControls";
-import { buildReferenceCardCurationPrepareRequest } from "./curationRequest";
+import {
+  buildReferenceCardCurationDiscardPath,
+  buildReferenceCardCurationPrepareRequest,
+  clearedReferenceCardCurationState,
+} from "./curationRequest";
 import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type {
   ReferenceCardCandidate,
@@ -70,6 +74,12 @@ function unknownValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function apiErrorCode(error: ApiError): string | null {
+  if (!error.detail || typeof error.detail !== "object") return null;
+  const code = (error.detail as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
 export default function ReferenceCardCurationDialog({
   novelId,
   isOpen,
@@ -84,9 +94,19 @@ export default function ReferenceCardCurationDialog({
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReferenceCardCurationResult | null>(null);
   const [maxTokens, setMaxTokens] = useState<number | null>(null);
+
+  const clearProposalState = useCallback(() => {
+    const cleared = clearedReferenceCardCurationState();
+    setProposal(cleared.proposal);
+    setDecisions(cleared.decisions);
+    setResult(cleared.result);
+    setActiveGroup("characters");
+    setEditingId(null);
+  }, []);
 
   const adoptProposal = useCallback((next: ReferenceCardCurationProposal) => {
     setProposal(next);
@@ -100,11 +120,18 @@ export default function ReferenceCardCurationDialog({
   useEffect(() => {
     if (!isOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !generating && !applying) onClose();
+      if (
+        event.key === "Escape" &&
+        !generating &&
+        !applying &&
+        !discarding
+      ) {
+        onClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [applying, generating, isOpen, onClose]);
+  }, [applying, discarding, generating, isOpen, onClose]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -118,9 +145,12 @@ export default function ReferenceCardCurationDialog({
         if (!cancelled) adoptProposal(next);
       })
       .catch((reason: unknown) => {
-        if (!cancelled && (!(reason instanceof ApiError) || reason.status !== 404)) {
-          setError(reason instanceof Error ? reason.message : t("loadFailed"));
+        if (cancelled) return;
+        if (reason instanceof ApiError && reason.status === 404) {
+          clearProposalState();
+          return;
         }
+        setError(reason instanceof Error ? reason.message : t("loadFailed"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -128,7 +158,7 @@ export default function ReferenceCardCurationDialog({
     return () => {
       cancelled = true;
     };
-  }, [adoptProposal, isOpen, novelId, t]);
+  }, [adoptProposal, clearProposalState, isOpen, novelId, t]);
 
   const currentCandidates = proposal?.candidates[activeGroup] ?? [];
   const summary = useMemo(() => {
@@ -159,6 +189,30 @@ export default function ReferenceCardCurationDialog({
       setError(reason instanceof Error ? reason.message : t("generateFailed"));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const discard = async () => {
+    if (!proposal || !window.confirm(t("discardConfirm"))) return;
+    setDiscarding(true);
+    setError(null);
+    try {
+      await apiPost(
+        buildReferenceCardCurationDiscardPath(novelId, proposal.proposal_id),
+        {},
+      );
+      clearProposalState();
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 404) {
+        clearProposalState();
+        setError(t("discardMissing"));
+      } else if (reason instanceof ApiError && reason.status === 409) {
+        setError(t("discardConflict"));
+      } else {
+        setError(t("discardFailed"));
+      }
+    } finally {
+      setDiscarding(false);
     }
   };
 
@@ -200,7 +254,16 @@ export default function ReferenceCardCurationDialog({
       );
       await onApplied();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t("applyFailed"));
+      if (
+        reason instanceof ApiError &&
+        reason.status === 409 &&
+        apiErrorCode(reason) === "stale_reference_card_proposal"
+      ) {
+        clearProposalState();
+        setError(t("staleConflict"));
+      } else {
+        setError(reason instanceof Error ? reason.message : t("applyFailed"));
+      }
     } finally {
       setApplying(false);
     }
@@ -260,7 +323,7 @@ export default function ReferenceCardCurationDialog({
           <button
             type="button"
             onClick={onClose}
-            disabled={generating || applying}
+            disabled={generating || applying || discarding}
             aria-label={t("close")}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border text-xl text-muted transition-colors hover:bg-surface-secondary hover:text-foreground disabled:opacity-40"
           >
@@ -556,14 +619,26 @@ export default function ReferenceCardCurationDialog({
                 skip: summary.skip,
               })}
             </p>
-            <div className="flex gap-2">
-              <Button variant="ghost" onPress={() => void generate(true)}>
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                className="text-red-700 dark:text-red-300"
+                variant="ghost"
+                isDisabled={generating || applying || discarding}
+                onPress={() => void discard()}
+              >
+                {discarding ? t("discarding") : t("discard")}
+              </Button>
+              <Button
+                variant="ghost"
+                isDisabled={generating || applying || discarding}
+                onPress={() => void generate(true)}
+              >
                 {t("regenerate")}
               </Button>
               <Button
                 className="bg-accent text-white hover:bg-accent-hover"
                 variant="primary"
-                isDisabled={applying}
+                isDisabled={generating || applying || discarding}
                 onPress={() => void apply()}
               >
                 {applying ? t("applying") : t("apply")}

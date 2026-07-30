@@ -103,6 +103,10 @@ class ReferenceCardProposalError(ValueError):
     """A proposal cannot be inspected or accepted in its current state."""
 
 
+class ReferenceCardProposalNotFound(ReferenceCardProposalError):
+    """A proposal does not exist within the requested novel scope."""
+
+
 class StaleReferenceCardProposal(ReferenceCardProposalError):
     """The novel or its card set changed after proposal generation."""
 
@@ -590,6 +594,68 @@ class ReferenceCardCurationService:
             _card_set_digest(cards),
         )
 
+    async def _mark_stale(
+        self,
+        proposal: dict[str, Any],
+        reason: str,
+    ) -> None:
+        now = get_utc_now()
+        updated = await self.collection.update_one(
+            {
+                "_id": proposal["_id"],
+                "novel_id": proposal["novel_id"],
+                "status": "proposed",
+            },
+            {
+                "$set": {
+                    "status": "stale",
+                    "failure": {
+                        "error_type": "StaleReferenceCardProposal",
+                        "message": reason,
+                    },
+                    "stale_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        if updated.modified_count == 1:
+            return
+        current = await self.collection.find_one(
+            {
+                "_id": proposal["_id"],
+                "novel_id": proposal["novel_id"],
+            }
+        )
+        current_status = current.get("status") if current is not None else "missing"
+        raise ReferenceCardProposalError(
+            "Reference-card proposal changed while being marked stale "
+            f"(current status: {current_status}); reload and retry"
+        )
+
+    async def _close_mismatched_proposals(
+        self,
+        *,
+        novel_id: str,
+        source_digest: str,
+        card_set_digest: str,
+    ) -> None:
+        cursor = self.collection.find(
+            {
+                "novel_id": to_object_id(novel_id),
+                "status": "proposed",
+                "$or": [
+                    {"source_digest": {"$ne": source_digest}},
+                    {"card_set_digest": {"$ne": card_set_digest}},
+                ],
+            }
+        )
+        async for proposal in cursor:
+            if proposal.get("source_digest") != source_digest:
+                reason = "Novel source changed after reference-card generation"
+            else:
+                reason = "Reference-card set changed after reference-card generation"
+            await self._mark_stale(proposal, reason)
+
     async def prepare(
         self,
         novel_id: str,
@@ -602,6 +668,11 @@ class ReferenceCardCurationService:
         async with lock:
             novel, cards, source_digest, card_set_digest = await self._snapshot(
                 novel_id
+            )
+            await self._close_mismatched_proposals(
+                novel_id=novel_id,
+                source_digest=source_digest,
+                card_set_digest=card_set_digest,
             )
             now = get_utc_now()
             generating = await self.collection.find_one(
@@ -806,6 +877,64 @@ class ReferenceCardCurationService:
                     },
                 )
                 raise
+
+    async def discard(
+        self,
+        *,
+        novel_id: str,
+        proposal_id: str,
+        actor_id: str,
+    ) -> dict[str, str]:
+        proposal = await self.collection.find_one(
+            {
+                "_id": to_object_id(proposal_id),
+                "novel_id": to_object_id(novel_id),
+            }
+        )
+        if proposal is None:
+            raise ReferenceCardProposalNotFound(
+                "Reference-card proposal is missing for this novel; reload and retry"
+            )
+        status = str(proposal.get("status") or "")
+        result = {"proposal_id": proposal_id, "status": "discarded"}
+        if status == "discarded":
+            return result
+        if status == "claimed":
+            raise ReferenceCardProposalError(
+                "Reference-card proposal is being applied and cannot be discarded; "
+                "wait for application to finish and reload"
+            )
+        if status == "applied":
+            raise ReferenceCardProposalError(
+                "Reference-card proposal has already been applied and cannot be "
+                "discarded; review the formal cards instead"
+            )
+        if status != "proposed":
+            raise ReferenceCardProposalError(
+                f"Reference-card proposal is no longer active ({status}); reload"
+            )
+
+        now = get_utc_now()
+        updated = await self.collection.update_one(
+            {
+                "_id": proposal["_id"],
+                "novel_id": proposal["novel_id"],
+                "status": "proposed",
+            },
+            {
+                "$set": {
+                    "status": "discarded",
+                    "discarded_by": to_object_id(actor_id),
+                    "discarded_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        if updated.modified_count != 1:
+            raise ReferenceCardProposalError(
+                "Reference-card proposal changed during discard; reload and retry"
+            )
+        return result
 
     async def inspect(self, novel_id: str) -> dict[str, Any] | None:
         proposal = await self.collection.find_one(
@@ -1181,7 +1310,11 @@ class ReferenceCardCurationService:
                 ReferenceCardCurationService._execute_apply,
             )
 
-        await self._validate_current_snapshot(novel_id, proposal, normalized)
+        try:
+            await self._validate_current_snapshot(novel_id, proposal, normalized)
+        except StaleReferenceCardProposal as exc:
+            await self._mark_stale(proposal, str(exc))
+            raise
         if all(item["action"] == "skip" for item in normalized):
             result = {
                 "proposal_id": proposal_id,
