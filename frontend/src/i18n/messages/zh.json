@@ -1916,6 +1916,14 @@
         "eyebrow": "人工审核后写入",
         "title": "AI 资料卡整理",
         "description": "模型只生成候选，不会直接改动正式资料卡。请逐项选择新建、合并、恢复合并或跳过。",
+        "typeSelection": {
+          "label": "生成类型",
+          "regenerateLabel": "重新生成类型",
+          "hint": "默认只选当前页面类型；可以多选，但无论选择几类都只发起一次模型请求。至少保留一种。",
+          "regenerateHint": "这里调整的是下一次重新生成的类型；下方标签仍显示当前方案实际生成的类型。",
+          "selectAll": "全选",
+          "onlyCurrent": "仅当前类型"
+        },
         "maxTokens": "最大 token（可选）",
         "maxTokensHint": "默认不覆盖本次请求的 token 上限；未启用时仍受 Provider 配置和模型自身上限限制，启用后仅覆盖本次生成。",
         "close": "关闭",
@@ -1934,7 +1942,7 @@
         "discardConflict": "\u65b9\u6848\u72b6\u6001\u5df2\u53d8\u5316\uff0c\u65e0\u6cd5\u653e\u5f03\u3002\u8bf7\u5237\u65b0\u540e\u67e5\u770b\u6700\u65b0\u72b6\u6001\u3002",
         "staleConflict": "\u8d44\u6599\u5361\u5df2\u53d1\u751f\u53d8\u5316\uff0c\u65e7\u65b9\u6848\u5df2\u81ea\u52a8\u5173\u95ed\u3002\u8bf7\u91cd\u65b0\u751f\u6210\u5019\u9009\u3002",
         "emptyTitle": "从小说设定提取资料卡",
-        "emptyDetail": "一次模型请求会同时生成角色、地点、物品、规则和通用世界设定候选，候选总量不会因此扩大。已有同名卡片会在审核中建议合并。",
+        "emptyDetail": "一次模型请求只生成上方选中的类型，候选上限不会因少选类型而扩大。已有同名卡片会在审核中建议合并。",
         "generate": "生成候选",
         "regenerate": "重新生成",
         "regenerateConfirm": "重新生成会再次调用模型并产生新的用量，当前未应用候选将被替换。是否继续？",

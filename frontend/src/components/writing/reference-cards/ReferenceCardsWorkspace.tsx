@@ -648,6 +648,7 @@ export default function ReferenceCardsWorkspace({
       </main>
       <ReferenceCardCurationDialog
         novelId={novelId}
+        defaultCardType={cardType}
         isOpen={showCuration}
         onClose={() => setShowCuration(false)}
         onApplied={loadCards}

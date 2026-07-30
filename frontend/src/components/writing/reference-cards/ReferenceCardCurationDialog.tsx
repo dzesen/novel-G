@@ -15,10 +15,25 @@ import type {
   ReferenceCardCurationAction,
   ReferenceCardCurationProposal,
   ReferenceCardCurationResult,
+  ReferenceCardType,
 } from "@/types/novel";
 
 const GROUPS = ["characters", "locations", "items", "rules", "lores"] as const;
 type CandidateGroup = (typeof GROUPS)[number];
+const CARD_TYPES: readonly ReferenceCardType[] = [
+  "character",
+  "location",
+  "item",
+  "rule",
+  "lore",
+];
+const GROUP_BY_CARD_TYPE: Record<ReferenceCardType, CandidateGroup> = {
+  character: "characters",
+  location: "locations",
+  item: "items",
+  rule: "rules",
+  lore: "lores",
+};
 
 interface DecisionDraft {
   action: ReferenceCardCurationAction;
@@ -28,6 +43,7 @@ interface DecisionDraft {
 
 interface ReferenceCardCurationDialogProps {
   novelId: string;
+  defaultCardType: ReferenceCardType;
   isOpen: boolean;
   onClose: () => void;
   onApplied: () => void | Promise<void>;
@@ -80,8 +96,17 @@ function apiErrorCode(error: ApiError): string | null {
   return typeof code === "string" ? code : null;
 }
 
+function getProposalCardTypes(
+  proposal: ReferenceCardCurationProposal,
+): ReferenceCardType[] {
+  const stored = new Set(proposal.requested_card_types ?? CARD_TYPES);
+  const normalized = CARD_TYPES.filter((cardType) => stored.has(cardType));
+  return normalized.length ? normalized : [...CARD_TYPES];
+}
+
 export default function ReferenceCardCurationDialog({
   novelId,
+  defaultCardType,
   isOpen,
   onClose,
   onApplied,
@@ -98,22 +123,33 @@ export default function ReferenceCardCurationDialog({
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReferenceCardCurationResult | null>(null);
   const [maxTokens, setMaxTokens] = useState<number | null>(null);
+  const [selectedCardTypes, setSelectedCardTypes] = useState<
+    ReferenceCardType[]
+  >([defaultCardType]);
 
   const clearProposalState = useCallback(() => {
     const cleared = clearedReferenceCardCurationState();
     setProposal(cleared.proposal);
     setDecisions(cleared.decisions);
     setResult(cleared.result);
-    setActiveGroup("characters");
+    setSelectedCardTypes([defaultCardType]);
+    setActiveGroup(GROUP_BY_CARD_TYPE[defaultCardType]);
     setEditingId(null);
-  }, []);
+  }, [defaultCardType]);
 
   const adoptProposal = useCallback((next: ReferenceCardCurationProposal) => {
+    const proposalCardTypes = getProposalCardTypes(next);
+    const proposalGroups = proposalCardTypes.map(
+      (cardType) => GROUP_BY_CARD_TYPE[cardType],
+    );
     setProposal(next);
     setDecisions(initializeDecisions(next));
     setResult(next.apply_result ?? null);
-    const firstNonEmpty = GROUPS.find((group) => next.candidates[group]?.length);
-    setActiveGroup(firstNonEmpty ?? "characters");
+    setSelectedCardTypes(proposalCardTypes);
+    const firstNonEmpty = proposalGroups.find(
+      (group) => next.candidates[group]?.length,
+    );
+    setActiveGroup(firstNonEmpty ?? proposalGroups[0] ?? "characters");
     setEditingId(null);
   }, []);
 
@@ -160,6 +196,22 @@ export default function ReferenceCardCurationDialog({
     };
   }, [adoptProposal, clearProposalState, isOpen, novelId, t]);
 
+  const proposalCardTypes = proposal ? getProposalCardTypes(proposal) : [];
+  const visibleGroups = proposalCardTypes.map(
+    (cardType) => GROUP_BY_CARD_TYPE[cardType],
+  );
+  const controlsDisabled = loading || generating || applying || discarding;
+  const toggleCardType = (cardType: ReferenceCardType) => {
+    setSelectedCardTypes((current) => {
+      const isSelected = current.includes(cardType);
+      if (isSelected && current.length === 1) return current;
+      const next = isSelected
+        ? current.filter((item) => item !== cardType)
+        : [...current, cardType];
+      return CARD_TYPES.filter((item) => next.includes(item));
+    });
+  };
+
   const currentCandidates = proposal?.candidates[activeGroup] ?? [];
   const summary = useMemo(() => {
     const values = Object.values(decisions);
@@ -182,6 +234,7 @@ export default function ReferenceCardCurationDialog({
         buildReferenceCardCurationPrepareRequest(
           forceRegenerate,
           maxTokens,
+          selectedCardTypes,
         ),
       );
       adoptProposal(next);
@@ -334,19 +387,96 @@ export default function ReferenceCardCurationDialog({
         <div className="min-h-0 flex-1 overflow-y-auto">
           {!loading && !generating && !result && (
             <div className="border-b border-border bg-surface px-5 py-4 sm:px-7">
-              <div className="max-w-3xl space-y-2">
-                <OptionalNumberParam
-                  label={t("maxTokens")}
-                  value={maxTokens}
-                  onToggle={(enabled) => setMaxTokens(enabled ? 6000 : null)}
-                  onValueChange={setMaxTokens}
-                  min={1}
-                  max={Number.MAX_SAFE_INTEGER}
-                  step={1}
-                />
-                <p className="text-xs leading-5 text-muted">
-                  {t("maxTokensHint")}
-                </p>
+              <div className="max-w-4xl space-y-5">
+                <fieldset aria-describedby="curation-type-selection-hint">
+                  <legend className="text-sm font-semibold text-foreground">
+                    {proposal
+                      ? t("typeSelection.regenerateLabel")
+                      : t("typeSelection.label")}
+                  </legend>
+                  <div className="mt-1 flex flex-wrap items-start justify-between gap-2">
+                    <p
+                      id="curation-type-selection-hint"
+                      className="max-w-2xl text-xs leading-5 text-muted"
+                    >
+                      {proposal
+                        ? t("typeSelection.regenerateHint")
+                        : t("typeSelection.hint")}
+                    </p>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <button
+                        type="button"
+                        disabled={
+                          controlsDisabled ||
+                          selectedCardTypes.length === CARD_TYPES.length
+                        }
+                        onClick={() => setSelectedCardTypes([...CARD_TYPES])}
+                        className="text-xs font-semibold text-accent hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {t("typeSelection.selectAll")}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={
+                          controlsDisabled ||
+                          (selectedCardTypes.length === 1 &&
+                            selectedCardTypes[0] === defaultCardType)
+                        }
+                        onClick={() => setSelectedCardTypes([defaultCardType])}
+                        className="text-xs font-semibold text-accent hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {t("typeSelection.onlyCurrent")}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
+                    {CARD_TYPES.map((cardType) => {
+                      const checked = selectedCardTypes.includes(cardType);
+                      const keepLastSelected =
+                        checked && selectedCardTypes.length === 1;
+                      return (
+                        <label
+                          key={cardType}
+                          className={`flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2.5 text-sm transition-colors ${
+                            checked
+                              ? "border-accent/50 bg-accent/8 text-foreground"
+                              : "border-border bg-background text-muted hover:border-accent/35 hover:text-foreground"
+                          } ${
+                            controlsDisabled || keepLastSelected
+                              ? "cursor-not-allowed opacity-60"
+                              : "cursor-pointer"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={controlsDisabled || keepLastSelected}
+                            onChange={() => toggleCardType(cardType)}
+                            className="h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+                          />
+                          <span className="min-w-0 break-words">
+                            {t(`groups.${GROUP_BY_CARD_TYPE[cardType]}`)}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+
+                <div className="space-y-2 border-t border-border pt-4">
+                  <OptionalNumberParam
+                    label={t("maxTokens")}
+                    value={maxTokens}
+                    onToggle={(enabled) => setMaxTokens(enabled ? 6000 : null)}
+                    onValueChange={setMaxTokens}
+                    min={1}
+                    max={Number.MAX_SAFE_INTEGER}
+                    step={1}
+                  />
+                  <p className="text-xs leading-5 text-muted">
+                    {t("maxTokensHint")}
+                  </p>
+                </div>
               </div>
             </div>
           )}
@@ -400,7 +530,7 @@ export default function ReferenceCardCurationDialog({
               <div className="border-b border-border bg-surface px-5 py-4 sm:px-7">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex flex-wrap gap-2">
-                    {GROUPS.map((group) => (
+                    {visibleGroups.map((group) => (
                       <button
                         key={group}
                         type="button"

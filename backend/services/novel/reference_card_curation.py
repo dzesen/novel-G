@@ -37,7 +37,9 @@ from backend.llm.schemas.reference_card_pydantic import (
     LoreCandidateSchema,
     LocationCandidateSchema,
     ReferenceCardCandidatesSchema,
+    ReferenceCardType,
     RuleCandidateSchema,
+    reference_card_candidates_schema_for_types,
 )
 from backend.services.llm.generation_runtime import (
     PromptPlan,
@@ -71,6 +73,13 @@ SOURCE_FIELDS = (
     "number_of_chapters",
     "words_per_chapter",
 )
+REFERENCE_CARD_TYPES: tuple[ReferenceCardType, ...] = (
+    "character",
+    "location",
+    "item",
+    "rule",
+    "lore",
+)
 TYPE_TO_GROUP = {
     "character": "characters",
     "location": "locations",
@@ -79,6 +88,39 @@ TYPE_TO_GROUP = {
     "lore": "lores",
 }
 GROUP_TO_TYPE = {value: key for key, value in TYPE_TO_GROUP.items()}
+
+
+def _normalize_requested_card_types(
+    card_types: list[str] | tuple[str, ...] | None,
+) -> tuple[ReferenceCardType, ...]:
+    if card_types is None:
+        return REFERENCE_CARD_TYPES
+    requested = tuple(card_types)
+    if not requested:
+        raise ValueError("At least one reference-card type must be selected")
+    if len(requested) != len(set(requested)):
+        raise ValueError("Reference-card types must be unique")
+    unknown = set(requested).difference(REFERENCE_CARD_TYPES)
+    if unknown:
+        raise ValueError(f"Unsupported reference-card types: {sorted(unknown)}")
+    return tuple(
+        card_type for card_type in REFERENCE_CARD_TYPES if card_type in requested
+    )
+
+
+def _proposal_requested_card_types(
+    proposal: dict[str, Any],
+) -> tuple[ReferenceCardType, ...]:
+    stored = proposal.get("requested_card_types")
+    if stored is None:
+        return REFERENCE_CARD_TYPES
+    if not isinstance(stored, list):
+        raise ReferenceCardProposalError(
+            "Reference-card proposal has invalid requested_card_types"
+        )
+    return _normalize_requested_card_types(stored)
+
+
 SCHEMA_BY_TYPE = {
     "character": CharacterCandidateSchema,
     "location": LocationCandidateSchema,
@@ -443,6 +485,7 @@ def _public_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
             group: [_public_candidate(item) for item in proposal.get("candidates", {}).get(group, [])]
             for group in GROUP_TO_TYPE
         },
+        "requested_card_types": list(_proposal_requested_card_types(proposal)),
         "generation_audit": deepcopy(proposal.get("generation_audit") or {}),
         "proposal_expires_at": _as_utc(proposal["expires_at"]).isoformat(),
         "acceptance_token": _acceptance_token(proposal),
@@ -452,7 +495,11 @@ def _public_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _build_prompts(novel: dict[str, Any], cards: list[dict[str, Any]]) -> PromptPlan:
+def _build_prompts(
+    novel: dict[str, Any],
+    cards: list[dict[str, Any]],
+    requested_card_types: tuple[ReferenceCardType, ...],
+) -> PromptPlan:
     prompts = load_prompt_config().get(WORKFLOW_NAME) or {}
     base = str(prompts.get("reference_cards_prompt_base") or "")
     if not base:
@@ -477,9 +524,26 @@ def _build_prompts(novel: dict[str, Any], cards: list[dict[str, Any]]) -> Prompt
         ),
     }
     rendered = base.format(**args)
+    selected_json = json.dumps(
+        list(requested_card_types),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    selection_instruction = (
+        f"【本次生成范围（最高优先级）】\n{selected_json}\n"
+        "只生成上述 card_type；未选择类型对应的数组必须是空数组。"
+    )
     return PromptPlan(
-        native_schema_prompt=f"{rendered}\n{prompts.get('reference_cards_prompt_with_schema_suffix', '')}".strip(),
-        prompt_json_prompt=f"{rendered}\n{prompts.get('reference_cards_prompt_without_schema_suffix', '')}".strip(),
+        native_schema_prompt=(
+            f"{rendered}\n"
+            f"{prompts.get('reference_cards_prompt_with_schema_suffix', '')}\n"
+            f"{selection_instruction}"
+        ).strip(),
+        prompt_json_prompt=(
+            f"{rendered}\n"
+            f"{prompts.get('reference_cards_prompt_without_schema_suffix', '')}\n"
+            f"{selection_instruction}"
+        ).strip(),
     )
 
 
@@ -663,7 +727,10 @@ class ReferenceCardCurationService:
         actor_id: str,
         force_regenerate: bool = False,
         max_tokens: int | None = None,
+        card_types: list[ReferenceCardType] | None = None,
     ) -> dict[str, Any]:
+        card_types_are_explicit = card_types is not None
+        requested_card_types = _normalize_requested_card_types(card_types)
         lock = _PREPARE_LOCKS.setdefault(str(novel_id), asyncio.Lock())
         async with lock:
             novel, cards, source_digest, card_set_digest = await self._snapshot(
@@ -721,8 +788,14 @@ class ReferenceCardCurationService:
             )
             superseded_proposal_id: ObjectId | None = None
             if reusable is not None:
+                reusable_card_types = _proposal_requested_card_types(reusable)
                 if not force_regenerate:
-                    return _public_proposal(reusable)
+                    if reusable_card_types == requested_card_types:
+                        return _public_proposal(reusable)
+                    raise ReferenceCardProposalError(
+                        "A proposal for different reference-card types is already "
+                        "waiting for review; set force_regenerate to replace it"
+                    )
                 if reusable.get("status") == "claimed":
                     raise ReferenceCardProposalError(
                         "Reference-card proposal is being applied and cannot be regenerated"
@@ -741,6 +814,7 @@ class ReferenceCardCurationService:
                         "source_digest": source_digest,
                         "card_set_digest": card_set_digest,
                         "source_snapshot": _source_snapshot(novel),
+                        "requested_card_types": list(requested_card_types),
                         "generation_started_at": now,
                         "generation_lease_expires_at": now + timedelta(minutes=10),
                         "supersedes_proposal_id": superseded_proposal_id,
@@ -758,6 +832,11 @@ class ReferenceCardCurationService:
                 ) from exc
             try:
                 runtime = create_generation_runtime()
+                output_schema = (
+                    reference_card_candidates_schema_for_types(requested_card_types)
+                    if card_types_are_explicit
+                    else ReferenceCardCandidatesSchema
+                )
                 plan = runtime.plan_structured(
                     WorkflowStepTarget(WORKFLOW_NAME, WORKFLOW_STEP)
                 )
@@ -766,11 +845,11 @@ class ReferenceCardCurationService:
                     generation_kwargs["max_tokens"] = max_tokens
                 generated = await runtime.generate_structured(
                     plan,
-                    ReferenceCardCandidatesSchema,
-                    _build_prompts(novel, cards),
+                    output_schema,
+                    _build_prompts(novel, cards, requested_card_types),
                     **generation_kwargs,
                 )
-                parsed = ReferenceCardCandidatesSchema.model_validate(
+                parsed = output_schema.model_validate(
                     generated.value.model_dump()
                 )
                 candidates = _prepare_candidates(parsed, cards)

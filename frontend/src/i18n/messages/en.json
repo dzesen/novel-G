@@ -1916,6 +1916,14 @@
         "eyebrow": "Writes only after review",
         "title": "AI reference-card curation",
         "description": "The model only creates candidates and never edits formal cards directly. Review each item and choose create, merge, restore and merge, or skip.",
+        "typeSelection": {
+          "label": "Types to generate",
+          "regenerateLabel": "Types to regenerate",
+          "hint": "The current page type is selected by default. Choose more types if needed; every selection still uses one model request. At least one type stays selected.",
+          "regenerateHint": "This selection applies to the next regeneration. The tabs below still show the types generated for the current proposal.",
+          "selectAll": "Select all",
+          "onlyCurrent": "Current type only"
+        },
         "maxTokens": "Maximum tokens (optional)",
         "maxTokensHint": "No token-limit override is applied by default. When disabled, the Provider setting and model limit still apply; enabling it overrides only this generation.",
         "close": "Close",
@@ -1934,7 +1942,7 @@
         "discardConflict": "The proposal state changed and it cannot be discarded. Reload to see the latest state.",
         "staleConflict": "The reference cards changed, so the old proposal was closed automatically. Generate new candidates.",
         "emptyTitle": "Extract cards from the novel settings",
-        "emptyDetail": "One model request generates character, location, item, rule, and neutral lore candidates without increasing the total candidate budget. Existing same-name cards are proposed as merges.",
+        "emptyDetail": "One model request generates only the selected types without expanding their candidate limits. Existing same-name cards are proposed as merges.",
         "generate": "Generate candidates",
         "regenerate": "Regenerate",
         "regenerateConfirm": "Regenerating makes another model call and replaces the unapplied candidates. Continue?",

@@ -369,6 +369,7 @@ export interface ReferenceCardCurationProposal {
   proposal_id: string;
   novel_id: string;
   status: "proposed" | "claimed" | "applied";
+  requested_card_types: ReferenceCardType[];
   candidates: Record<
     "characters" | "locations" | "items" | "rules" | "lores",
     ReferenceCardCandidate[]

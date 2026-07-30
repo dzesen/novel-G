@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mutation import MutationConflictError
@@ -69,9 +69,28 @@ class ReferenceCardCurationApplyRequest(BaseModel):
     decisions: List[ReferenceCardCurationDecision] = Field(min_length=1, max_length=30)
 
 
+ReferenceCardCurationType = Literal[
+    "character", "location", "item", "rule", "lore"
+]
+
+
 class ReferenceCardCurationPrepareRequest(BaseModel):
     force_regenerate: bool = False
     max_tokens: Optional[int] = Field(default=None, gt=0)
+    card_types: Optional[List[ReferenceCardCurationType]] = Field(
+        default=None,
+        min_length=1,
+        max_length=5,
+    )
+
+    @field_validator("card_types")
+    @classmethod
+    def require_unique_card_types(
+        cls, value: Optional[List[ReferenceCardCurationType]]
+    ) -> Optional[List[ReferenceCardCurationType]]:
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("card_types must contain unique values")
+        return value
 
 
 def _serialize_card(card: dict) -> dict:
@@ -105,6 +124,7 @@ async def prepare_reference_card_curation(
             actor_id=actor.id,
             force_regenerate=req.force_regenerate,
             max_tokens=req.max_tokens,
+            card_types=req.card_types,
         )
     except (InvalidIdError, NotFoundError) as exc:
         raise _translate_error(exc) from exc
