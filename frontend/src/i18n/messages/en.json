@@ -1526,7 +1526,7 @@
       "leftoverReason": "Why it is incomplete: {reasons}",
       "reasonSeparator": ", ",
       "leftoverStale": "The outline or novel context changed, so this older draft cannot resume or be written back.",
-      "leftoverResumeExhausted": "This draft used all allowed continuations and cannot resume.",
+      "leftoverResumeExhausted": "This draft reached the automatic continuation limit; manual resume remains available, and each click starts one explicit request.",
       "leftoverSuperseded": "A later attempt replaced this draft, so it cannot resume.",
       "leftoverUncertain": "The last Provider request has an uncertain result and may already have been billed.",
       "leftoverIncomplete": "This draft is unfinished and still awaits your decision.",

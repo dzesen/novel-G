@@ -396,6 +396,7 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                     gen_kwargs=gen_kwargs,
                     existing_segments=list((run_document or {}).get("segments") or []),
                     confirm_uncertain_retry=req.confirm_uncertain_retry,
+                    manual_continuation=req.resume_run_id is not None,
                     on_delta=on_delta,
                     on_segment=on_segment,
                 )

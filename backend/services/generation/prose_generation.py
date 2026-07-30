@@ -152,6 +152,7 @@ async def execute_prose_plan(
     gen_kwargs: Mapping[str, Any] | None = None,
     existing_segments: Iterable[dict[str, Any]] = (),
     confirm_uncertain_retry: bool = False,
+    manual_continuation: bool = False,
     on_delta: DeltaCallback | None = None,
     on_segment: SegmentCallback | None = None,
 ) -> ProseGenerationResult:
@@ -195,6 +196,7 @@ async def execute_prose_plan(
             continue
         if (
             existing_segment is not None
+            and not manual_continuation
             and int(existing_segment.get("continuation_count") or 0)
             >= plan.max_continuations
         ):

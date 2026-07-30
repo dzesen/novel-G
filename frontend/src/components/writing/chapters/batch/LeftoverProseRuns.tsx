@@ -83,8 +83,8 @@ export default function LeftoverProseRuns({
 
   const availabilityText = (run: LeftoverProseRun) => {
     if (run.status === "stale") return t("leftoverStale");
-    if (run.continuation_exhausted) return t("leftoverResumeExhausted");
     if (run.status === "superseded") return t("leftoverSuperseded");
+    if (run.continuation_exhausted) return t("leftoverResumeExhausted");
     if (run.has_uncertain_attempt) return t("leftoverUncertain");
     return t("leftoverIncomplete");
   };

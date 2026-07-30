@@ -340,7 +340,6 @@ class ProseRunModule:
                         and status == "incomplete"
                         and narrative_current
                         and outline_current
-                        and not continuation_exhausted
                         and not has_live_lease
                     ),
                     "can_accept_partial": bool(

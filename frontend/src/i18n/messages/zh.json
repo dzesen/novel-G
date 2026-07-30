@@ -1526,7 +1526,7 @@
       "leftoverReason": "未完成原因：{reasons}",
       "reasonSeparator": "、",
       "leftoverStale": "章节细纲或小说上下文已变化，这份旧稿不能续写或写回。",
-      "leftoverResumeExhausted": "这份草稿已用完续写次数，不能再次续写。",
+      "leftoverResumeExhausted": "这份草稿已达到自动续写上限；人工续写仍可用，每次点击只会发起一次明确请求。",
       "leftoverSuperseded": "这份草稿已被后续尝试取代，不能续写。",
       "leftoverUncertain": "上一条 Provider 请求结果不确定，可能已经产生费用。",
       "leftoverIncomplete": "这份草稿尚未完成，仍在等待你的决定。",

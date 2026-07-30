@@ -253,9 +253,7 @@ export default function ProsePanel({
 
   const resumeUnavailableMessage = selectedInitialRun?.status === "stale"
     ? t("leftoverResumeStale")
-    : selectedInitialRun?.continuation_exhausted
-      ? t("leftoverResumeExhausted")
-      : selectedInitialRun?.status === "superseded"
+    : selectedInitialRun?.status === "superseded"
         ? t("leftoverResumeSuperseded")
         : t("leftoverResumeUnavailable");
 
