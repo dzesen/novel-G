@@ -204,6 +204,9 @@ class NovelService:
             character_visual_profiles_repo = BaseRepository(
                 collections.CHARACTER_VISUAL_PROFILES
             )
+            illustration_briefs_repo = BaseRepository(
+                collections.ILLUSTRATION_BRIEFS
+            )
 
             stats = {}
 
@@ -243,6 +246,11 @@ class NovelService:
             )
             stats["character_visual_profiles_deleted"] = (
                 await character_visual_profiles_repo.hard_delete_many(
+                    query, session=session
+                )
+            )
+            stats["illustration_briefs_deleted"] = (
+                await illustration_briefs_repo.hard_delete_many(
                     query, session=session
                 )
             )

@@ -681,6 +681,37 @@ async def init_character_visual_profile_indexes():
         raise
 
 
+async def init_illustration_brief_indexes():
+    """Initialize chapter illustration brief scope and ordering indexes."""
+
+    try:
+        collection = get_database()[collections.ILLUSTRATION_BRIEFS]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("chapter_id", pymongo.ASCENDING),
+                    ("status", pymongo.ASCENDING),
+                    ("sort_order", pymongo.ASCENDING),
+                    ("_id", pymongo.ASCENDING),
+                ],
+                name="illustration_briefs_owner_novel_chapter_status_sort",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("novel_id", pymongo.ASCENDING),
+                    ("chapter_id", pymongo.ASCENDING),
+                ],
+                name="illustration_briefs_novel_chapter",
+            ),
+        ])
+        logger.info("Initialized illustration_briefs indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize illustration_briefs indexes: %s", exc)
+        raise
+
+
 async def init_image_job_indexes():
     """Initialize durable image-job ownership, resume, and idempotency indexes."""
     try:
@@ -907,6 +938,7 @@ async def init_all_indexes():
     await init_prose_run_indexes()
     await init_image_asset_indexes()
     await init_character_visual_profile_indexes()
+    await init_illustration_brief_indexes()
     await init_image_job_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

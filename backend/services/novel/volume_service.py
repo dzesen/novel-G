@@ -570,12 +570,12 @@ class VolumeService:
             await record_chapter_tombstone(chapter, session=session)
             await mutation.receipt(receipt_key, {"chapter_id": str(chapter["_id"])})
 
+        chapter_ids = [
+            to_object_id(str(chapter["_id"]))
+            for chapter in command["chapters"]
+        ]
         deleted_runs = 0
         if not mutation.was_received("prose_runs"):
-            chapter_ids = [
-                to_object_id(str(chapter["_id"]))
-                for chapter in command["chapters"]
-            ]
             if chapter_ids:
                 deleted_runs = await BaseRepository(
                     collections.PROSE_RUNS
@@ -595,6 +595,30 @@ class VolumeService:
                 or 0
             )
 
+        deleted_briefs = 0
+        if not mutation.was_received("illustration_briefs"):
+            if chapter_ids:
+                deleted_briefs = await BaseRepository(
+                    collections.ILLUSTRATION_BRIEFS
+                ).hard_delete_many(
+                    {"chapter_id": {"$in": chapter_ids}},
+                    session=session,
+                )
+            await mutation.receipt(
+                "illustration_briefs",
+                {"deleted": deleted_briefs},
+            )
+        else:
+            deleted_briefs = int(
+                (
+                    (mutation.journal.get("receipts") or {}).get(
+                        "illustration_briefs"
+                    )
+                    or {}
+                ).get("deleted")
+                or 0
+            )
+
         chapters_repo = BaseRepository(collections.CHAPTERS)
         await chapters_repo.hard_delete_many({"volume_id": obj_id}, session=session)
         await mutation.receipt(
@@ -610,6 +634,7 @@ class VolumeService:
         return {
             "chapters_deleted": int(command["chapter_count"]),
             "prose_runs_deleted": deleted_runs,
+            "illustration_briefs_deleted": deleted_briefs,
             "volume_deleted": 1,
         }
 

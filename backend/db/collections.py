@@ -40,6 +40,7 @@ MUTATION_JOURNALS = "mutation_journals"
 IMAGE_ASSETS = "image_assets"
 IMAGE_JOBS = "image_jobs"
 CHARACTER_VISUAL_PROFILES = "character_visual_profiles"
+ILLUSTRATION_BRIEFS = "illustration_briefs"
 
 ACTIVE_COLLECTIONS = frozenset({
     NOVELS,
@@ -68,6 +69,7 @@ ACTIVE_COLLECTIONS = frozenset({
     IMAGE_ASSETS,
     IMAGE_JOBS,
     CHARACTER_VISUAL_PROFILES,
+    ILLUSTRATION_BRIEFS,
 })
 
 # 运行时集合不会进入备份。会话在恢复后必须重新建立，避免把可用凭据材料
