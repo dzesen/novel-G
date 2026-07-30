@@ -326,11 +326,15 @@ class ReferenceCardService:
             confirmed=confirmed,
         )
         expected = normalize_appearance_anchor(expected_previous)
+        if normalize_appearance_anchor(current_anchor) != expected:
+            raise AppearanceAnchorConflictError(
+                "Appearance anchor changed after reset was prepared"
+            )
         replacement = normalize_appearance_anchor(anchor)
         changed = await character_repo.compare_and_set_appearance_anchor(
             novel_id,
             card_id,
-            expected=expected,
+            expected=current_anchor,
             replacement=replacement,
         )
         if not changed:
@@ -349,11 +353,24 @@ class ReferenceCardService:
         """Clear a frozen image anchor only if it still matches the inspected value."""
 
         await novel_repo.get_novel_by_id(novel_id)
+        current = await character_repo.get_card(
+            novel_id,
+            "character",
+            card_id,
+        )
+        current_anchor = current.get("appearance_anchor")
         expected = normalize_appearance_anchor(expected_previous)
+        if (
+            current_anchor is None
+            or normalize_appearance_anchor(current_anchor) != expected
+        ):
+            raise AppearanceAnchorConflictError(
+                "外观锚点已变化，请刷新角色卡后再决定是否解绑"
+            )
         changed = await character_repo.compare_and_clear_appearance_anchor(
             novel_id,
             card_id,
-            expected=expected,
+            expected=current_anchor,
         )
         if not changed:
             raise AppearanceAnchorConflictError(
