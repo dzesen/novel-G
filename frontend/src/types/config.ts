@@ -162,6 +162,16 @@ export interface ConsistencyImagePipelineProfile {
 export type ImagePipelineProfile =
   | QuickImagePipelineProfile
   | ConsistencyImagePipelineProfile;
+export interface ImagePipelineStatusView {
+  alias: string;
+  kind: ImagePipelineProfile["kind"];
+  effective_revision: string;
+  quality_status: "accepted" | "experimental" | "drifted";
+  quality_reason:
+    | "real_provider_12_case_acceptance_missing"
+    | "pipeline_revision_unavailable";
+  issue: string;
+}
 export interface ImageProvidersConfig {
   default_provider: string;
   default_scene_pipeline: string;
@@ -295,6 +305,7 @@ export interface ConfigIssue { path: string; code: string; message: string; seve
 export interface ConfigView {
   editable_data: AppConfig;
   resolutions: Record<string, unknown>;
+  image_pipeline_statuses: ImagePipelineStatusView[];
   revision: string;
   issues: ConfigIssue[];
 }
@@ -594,6 +605,121 @@ export function removeImageProviderAlias(
       usages: Object.fromEntries(
         Object.entries(imageConfig.usages).map(([usage, alias]) => [usage, clearAlias(alias)]),
       ) as ImageProvidersConfig["usages"],
+    },
+  };
+}
+
+const IMAGE_PIPELINE_ALIAS_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
+
+export function addImagePipelineProfile(
+  config: AppConfig,
+  alias: string,
+  kind: ImagePipelineProfile["kind"],
+  composeProvider: string,
+): AppConfig {
+  const pipelineAlias = alias.trim();
+  const imageConfig = config.image_providers;
+  if (
+    !IMAGE_PIPELINE_ALIAS_REGEX.test(pipelineAlias)
+    || pipelineAlias in imageConfig.pipelines
+    || !(composeProvider in imageConfig.providers)
+  ) return config;
+  const profile: ImagePipelineProfile = kind === "quick"
+    ? { kind, display_name: "", compose_provider: composeProvider }
+    : {
+        kind,
+        display_name: "",
+        compose_provider: composeProvider,
+        identity_edit_provider: composeProvider,
+      };
+  return {
+    ...config,
+    image_providers: {
+      ...imageConfig,
+      pipelines: { ...imageConfig.pipelines, [pipelineAlias]: profile },
+      default_scene_pipeline: imageConfig.default_scene_pipeline || pipelineAlias,
+    },
+  };
+}
+
+export function renameImagePipelineAlias(
+  config: AppConfig,
+  currentAlias: string,
+  nextAlias: string,
+): AppConfig {
+  const imageConfig = config.image_providers;
+  const normalized = nextAlias.trim();
+  if (
+    !(currentAlias in imageConfig.pipelines)
+    || normalized === currentAlias
+    || !IMAGE_PIPELINE_ALIAS_REGEX.test(normalized)
+    || normalized in imageConfig.pipelines
+  ) return config;
+  const pipelines = Object.fromEntries(
+    Object.entries(imageConfig.pipelines).map(([alias, profile]) => [
+      alias === currentAlias ? normalized : alias,
+      profile,
+    ]),
+  );
+  return {
+    ...config,
+    image_providers: {
+      ...imageConfig,
+      pipelines,
+      default_scene_pipeline: imageConfig.default_scene_pipeline === currentAlias
+        ? normalized
+        : imageConfig.default_scene_pipeline,
+    },
+  };
+}
+
+export function removeImagePipelineAlias(
+  config: AppConfig,
+  aliasToRemove: string,
+): AppConfig {
+  const imageConfig = config.image_providers;
+  if (!(aliasToRemove in imageConfig.pipelines)) return config;
+  const pipelines = { ...imageConfig.pipelines };
+  delete pipelines[aliasToRemove];
+  return {
+    ...config,
+    image_providers: {
+      ...imageConfig,
+      pipelines,
+      default_scene_pipeline: imageConfig.default_scene_pipeline === aliasToRemove
+        ? ""
+        : imageConfig.default_scene_pipeline,
+    },
+  };
+}
+
+export function setImagePipelineKind(
+  config: AppConfig,
+  alias: string,
+  kind: ImagePipelineProfile["kind"],
+  fallbackProvider: string,
+): AppConfig {
+  const imageConfig = config.image_providers;
+  const current = imageConfig.pipelines[alias];
+  if (!current || current.kind === kind) return config;
+  const composeProvider = current.compose_provider || fallbackProvider;
+  const profile: ImagePipelineProfile = kind === "quick"
+    ? {
+        kind,
+        display_name: current.display_name,
+        compose_provider: composeProvider,
+      }
+    : {
+        kind,
+        display_name: current.display_name,
+        compose_provider: composeProvider,
+        identity_edit_provider: fallbackProvider || composeProvider,
+      };
+  return {
+    ...config,
+    image_providers: {
+      ...imageConfig,
+      pipelines: { ...imageConfig.pipelines, [alias]: profile },
     },
   };
 }

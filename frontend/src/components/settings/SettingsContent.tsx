@@ -107,6 +107,7 @@ export default function SettingsContent({
     queueProviderRename,
     queueProviderDelete,
     imageProvidersDirty,
+    imagePipelineStatuses,
     workflowCatalog,
     setConfig,
     clearMessages,
@@ -288,6 +289,7 @@ export default function SettingsContent({
                 config={config}
                 onChange={setConfig}
                 hasUnsavedChanges={imageProvidersDirty}
+                pipelineStatuses={imagePipelineStatuses}
                 onProviderRename={(from, to) => queueProviderRename({
                   kind: "rename",
                   target: "image",

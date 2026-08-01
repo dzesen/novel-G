@@ -9,6 +9,7 @@ import {
   type ConfigChangePreview,
   type ConfigView,
   type DeleteProviderCommand,
+  type ImagePipelineStatusView,
   type ProviderCommand,
   type RenameProviderCommand,
   type WorkflowDefinition,
@@ -22,6 +23,7 @@ interface ConfigState {
   config: AppConfig | null;
   workflowCatalog: WorkflowDefinition[];
   revision: string;
+  imagePipelineStatuses: ImagePipelineStatusView[];
   savedImageProvidersFingerprint: string;
   loading: boolean;
   saving: boolean;
@@ -37,7 +39,8 @@ interface SaveConfigOptions {
 export function useConfig() {
   const [pendingProviderCommands, setPendingProviderCommands] = useState<ProviderCommand[]>([]);
   const [state, setState] = useState<ConfigState>({
-    config: null, workflowCatalog: [], revision: "", loading: true, saving: false,
+    config: null, workflowCatalog: [], revision: "", imagePipelineStatuses: [],
+    loading: true, saving: false,
     savedImageProvidersFingerprint: "",
     error: null, success: null,
   });
@@ -56,7 +59,8 @@ export function useConfig() {
       setPendingProviderCommands([]);
       setState((current) => ({
         ...current, config: normalized, workflowCatalog: catalog,
-        revision: view.revision, loading: false,
+        revision: view.revision,
+        imagePipelineStatuses: view.image_pipeline_statuses || [], loading: false,
         savedImageProvidersFingerprint: fingerprintImageProviders(normalized),
       }));
       return normalized;
@@ -93,6 +97,7 @@ export function useConfig() {
       setPendingProviderCommands([]);
       setState((current) => ({
         ...current, config: normalized, revision: view.revision,
+        imagePipelineStatuses: view.image_pipeline_statuses || [],
         savedImageProvidersFingerprint: fingerprintImageProviders(normalized),
         saving: false, success: successMsg,
       }));

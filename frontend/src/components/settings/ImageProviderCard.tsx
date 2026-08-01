@@ -18,6 +18,7 @@ import {
 } from "@heroui/react";
 import { apiPost } from "@/lib/api";
 import { ComfyUIWorkflowOverrides } from "./ComfyUIWorkflowOverrides";
+import { ImagePipelineProfiles } from "./ImagePipelineProfiles";
 import type {
   AppConfig,
   ComfyUIImageProviderConfig,
@@ -26,6 +27,7 @@ import type {
   ImageFieldParameterMapping,
   ImageParameterMapping,
   ImageProviderConfig,
+  ImagePipelineStatusView,
   ImageProviderTestResponse,
   ImageValueMapParameterMapping,
   OpenAICompatibleImageProviderConfig,
@@ -45,6 +47,7 @@ interface Props {
   onProviderRename: (from: string, to: string) => void;
   onProviderDelete: (alias: string, replacementDefaultAlias?: string) => void;
   hasUnsavedChanges: boolean;
+  pipelineStatuses: ImagePipelineStatusView[];
 }
 
 type ProviderTestRunState = {
@@ -118,6 +121,7 @@ export function ImageProviderCard({
   onProviderRename,
   onProviderDelete,
   hasUnsavedChanges,
+  pipelineStatuses,
 }: Props) {
   const t = useTranslations("settings.imageProvider");
   const providers = config.image_providers.providers;
@@ -339,6 +343,13 @@ export function ImageProviderCard({
           onDefaultChange={setDefaultProvider}
           onUsageChange={setUsage}
           t={t}
+        />
+        <ImagePipelineProfiles
+          config={config}
+          statuses={pipelineStatuses}
+          selectableProviderAliases={selectableAliases}
+          hasUnsavedChanges={hasUnsavedChanges}
+          onChange={onChange}
         />
       </Card.Header>
 

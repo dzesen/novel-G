@@ -28,6 +28,7 @@ from backend.config.config import (
 )
 from backend.config.image_providers import (
     ImageProvidersConfig,
+    compute_image_pipeline_revision,
     image_pipeline_reference_paths,
     image_provider_reference_paths,
     rename_image_provider_references,
@@ -42,9 +43,24 @@ class ConfigIssue(BaseModel):
     severity: str = "warning"
 
 
+class ImagePipelineStatusView(BaseModel):
+    alias: str
+    kind: Literal["quick", "consistency"]
+    effective_revision: str = ""
+    quality_status: Literal["accepted", "experimental", "drifted"]
+    quality_reason: Literal[
+        "real_provider_12_case_acceptance_missing",
+        "pipeline_revision_unavailable",
+    ]
+    issue: str = ""
+
+
 class ConfigView(BaseModel):
     editable_data: dict[str, Any]
     resolutions: dict[str, Any] = Field(default_factory=dict)
+    image_pipeline_statuses: list[ImagePipelineStatusView] = Field(
+        default_factory=list
+    )
     revision: str
     issues: list[ConfigIssue] = Field(default_factory=list)
 
@@ -1146,6 +1162,45 @@ class ConfigLifecycle:
                 confirmation_token=self._make_confirmation_token(request) if destructive else None,
             )
 
+    def _image_pipeline_statuses(
+        self,
+        raw_config: dict[str, Any],
+    ) -> list[ImagePipelineStatusView]:
+        image_config = raw_config.get("image_providers")
+        if not isinstance(image_config, dict):
+            return []
+        try:
+            config = ImageProvidersConfig.model_validate(image_config)
+        except ValueError:
+            return []
+
+        statuses: list[ImagePipelineStatusView] = []
+        for alias in sorted(config.pipelines):
+            profile = config.pipelines[alias]
+            try:
+                effective_revision = compute_image_pipeline_revision(config, alias)
+            except ValueError as exc:
+                statuses.append(
+                    ImagePipelineStatusView(
+                        alias=alias,
+                        kind=profile.kind,
+                        quality_status="drifted",
+                        quality_reason="pipeline_revision_unavailable",
+                        issue=str(exc),
+                    )
+                )
+                continue
+            statuses.append(
+                ImagePipelineStatusView(
+                    alias=alias,
+                    kind=profile.kind,
+                    effective_revision=effective_revision,
+                    quality_status="experimental",
+                    quality_reason="real_provider_12_case_acceptance_missing",
+                )
+            )
+        return statuses
+
     def get_view(self) -> ConfigView:
         with self._lock:
             raw_config = self._store.read()
@@ -1167,6 +1222,7 @@ class ConfigLifecycle:
             return ConfigView(
                 editable_data=editable,
                 resolutions=_provider_resolutions(raw_config),
+                image_pipeline_statuses=self._image_pipeline_statuses(raw_config),
                 revision=revision,
                 issues=_provider_issues(raw_config),
             )
