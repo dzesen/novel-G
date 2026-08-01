@@ -28,10 +28,15 @@ from backend.config.config import (
 )
 from backend.config.image_providers import (
     ImageProvidersConfig,
+    compute_image_pipeline_quality_fingerprint,
     compute_image_pipeline_revision,
     image_pipeline_reference_paths,
     image_provider_reference_paths,
     rename_image_provider_references,
+)
+from backend.config.image_quality_acceptance import (
+    ImageQualityAcceptanceStore,
+    MemoryImageQualityAcceptanceStore,
 )
 from backend.config.workflow_catalog import WORKFLOW_STEPS
 
@@ -50,6 +55,9 @@ class ImagePipelineStatusView(BaseModel):
     quality_status: Literal["accepted", "experimental", "drifted"]
     quality_reason: Literal[
         "real_provider_12_case_acceptance_missing",
+        "real_provider_12_case_acceptance_rejected",
+        "quality_acceptance_fingerprint_drift",
+        "quality_acceptance_record_matches",
         "pipeline_revision_unavailable",
     ]
     issue: str = ""
@@ -1036,12 +1044,16 @@ class ConfigLifecycle:
         store: ConfigStore,
         secret_store: SecretVersionStore,
         confirmation_key: bytes | None = None,
+        quality_acceptance_store: ImageQualityAcceptanceStore | None = None,
     ) -> None:
         self._store = store
         self._secret_store = secret_store
         self._confirmation_key = confirmation_key or hashlib.sha256(
             b"novel-generator-config-confirmation"
         ).digest()
+        self._quality_acceptance_store = (
+            quality_acceptance_store or MemoryImageQualityAcceptanceStore()
+        )
         self._lock = RLock()
         self._apply_lock: asyncio.Lock | None = None
 
@@ -1190,13 +1202,63 @@ class ConfigLifecycle:
                     )
                 )
                 continue
+            quality_records = self._quality_acceptance_store.records_for_alias(alias)
+            if not quality_records:
+                statuses.append(
+                    ImagePipelineStatusView(
+                        alias=alias,
+                        kind=profile.kind,
+                        effective_revision=effective_revision,
+                        quality_status="experimental",
+                        quality_reason="real_provider_12_case_acceptance_missing",
+                    )
+                )
+                continue
+            quality_record = None
+            quality_issue = ""
+            for record in quality_records:
+                try:
+                    current_fingerprint = compute_image_pipeline_quality_fingerprint(
+                        config,
+                        alias,
+                        stage_evidence=record.stage_evidence,
+                    )
+                except ValueError as exc:
+                    quality_issue = str(exc)
+                    continue
+                if current_fingerprint == record.quality_fingerprint:
+                    quality_record = record
+                    break
+            if quality_record is None:
+                statuses.append(
+                    ImagePipelineStatusView(
+                        alias=alias,
+                        kind=profile.kind,
+                        effective_revision=effective_revision,
+                        quality_status="drifted",
+                        quality_reason="quality_acceptance_fingerprint_drift",
+                        issue=(
+                            quality_issue
+                            or "当前 Pipeline 配置不匹配任何已记录的 12 案质量指纹"
+                        ),
+                    )
+                )
+                continue
             statuses.append(
                 ImagePipelineStatusView(
                     alias=alias,
                     kind=profile.kind,
                     effective_revision=effective_revision,
-                    quality_status="experimental",
-                    quality_reason="real_provider_12_case_acceptance_missing",
+                    quality_status=(
+                        "accepted"
+                        if quality_record.decision == "accepted"
+                        else "experimental"
+                    ),
+                    quality_reason=(
+                        "quality_acceptance_record_matches"
+                        if quality_record.decision == "accepted"
+                        else "real_provider_12_case_acceptance_rejected"
+                    ),
                 )
             )
         return statuses

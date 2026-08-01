@@ -169,6 +169,9 @@ export interface ImagePipelineStatusView {
   quality_status: "accepted" | "experimental" | "drifted";
   quality_reason:
     | "real_provider_12_case_acceptance_missing"
+    | "real_provider_12_case_acceptance_rejected"
+    | "quality_acceptance_fingerprint_drift"
+    | "quality_acceptance_record_matches"
     | "pipeline_revision_unavailable";
   issue: string;
 }

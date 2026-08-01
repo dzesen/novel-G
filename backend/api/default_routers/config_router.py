@@ -10,6 +10,9 @@ from backend.api.default_routers.auth_router import require_admin_request
 
 from backend.config import config as config_module
 from backend.config.capability_cache import FileCapabilityCacheStore
+from backend.config.image_quality_acceptance import (
+    FileImageQualityAcceptanceStore,
+)
 from backend.config.lifecycle import (
     ConfigChangePreview,
     ConfigConflictError,
@@ -61,6 +64,11 @@ def _get_lifecycle() -> ConfigLifecycle:
         ),
         secret_store=secret_store,
         confirmation_key=secret_store.derive_key("config-delete-confirmation"),
+        quality_acceptance_store=FileImageQualityAcceptanceStore(
+            config_path.parents[2]
+            / "reports"
+            / "illustration-quality-acceptances.json"
+        ),
     )
     _lifecycle_cache = (config_path, lifecycle)
     return lifecycle

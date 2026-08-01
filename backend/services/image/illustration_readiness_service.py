@@ -28,6 +28,11 @@ from backend.config.image_providers import (
     compute_image_provider_revision,
     get_image_providers_config,
 )
+from backend.config.image_quality_acceptance import (
+    FileImageQualityAcceptanceStore,
+    ImageQualityAcceptanceStore,
+    MemoryImageQualityAcceptanceStore,
+)
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.illustration_run_repository import (
     IllustrationRunRepository,
@@ -218,6 +223,7 @@ class IllustrationReadinessService:
         jobs: _JobHistory | None = None,
         pipeline_config_loader: Callable[[], ImageProvidersConfig] | None = None,
         provider_probe: ProviderProbe | None = None,
+        quality_acceptance_store: ImageQualityAcceptanceStore | None = None,
     ) -> None:
         self._runs = runs or illustration_run_repo
         self._assets = assets or image_asset_repo
@@ -227,6 +233,9 @@ class IllustrationReadinessService:
             pipeline_config_loader or get_image_providers_config
         )
         self._provider_probe = provider_probe
+        self._quality_acceptance_store = (
+            quality_acceptance_store or MemoryImageQualityAcceptanceStore()
+        )
 
     async def _probe(
         self,
@@ -538,11 +547,43 @@ class IllustrationReadinessService:
                 pipeline_alias,
                 stage_evidence=quality_evidence,
             )
-        quality = IllustrationQualityReadiness(
-            status="experimental",
-            fingerprint=quality_fingerprint,
-            reason="No accepted real-provider quality record matches this fingerprint",
+        exact_quality_record = (
+            self._quality_acceptance_store.find_exact(
+                pipeline_alias,
+                quality_fingerprint,
+            )
+            if quality_fingerprint
+            else None
         )
+        latest_quality_record = self._quality_acceptance_store.latest_for_alias(
+            pipeline_alias
+        )
+        if exact_quality_record is not None and exact_quality_record.decision == "accepted":
+            quality = IllustrationQualityReadiness(
+                status="accepted",
+                fingerprint=quality_fingerprint,
+                reason="Accepted fixed 12-case record matches this fingerprint",
+            )
+        elif exact_quality_record is not None:
+            quality = IllustrationQualityReadiness(
+                status="experimental",
+                fingerprint=quality_fingerprint,
+                reason="The fixed 12-case record rejected this fingerprint",
+            )
+        elif latest_quality_record is not None:
+            quality = IllustrationQualityReadiness(
+                status="drifted",
+                fingerprint=quality_fingerprint,
+                reason="A quality record exists for a different fingerprint",
+            )
+        else:
+            quality = IllustrationQualityReadiness(
+                status="experimental",
+                fingerprint=quality_fingerprint,
+                reason=(
+                    "No accepted real-provider quality record matches this fingerprint"
+                ),
+            )
         status: Literal["passed", "blocked"] = "blocked" if issues else "passed"
         digest_payload = {
             "run_id": str(run_key),
@@ -587,7 +628,13 @@ class IllustrationReadinessService:
         )
 
 
-illustration_readiness_service = IllustrationReadinessService()
+illustration_readiness_service = IllustrationReadinessService(
+    quality_acceptance_store=FileImageQualityAcceptanceStore(
+        CONFIG_PATH.parents[2]
+        / "reports"
+        / "illustration-quality-acceptances.json"
+    )
+)
 
 
 __all__ = [
