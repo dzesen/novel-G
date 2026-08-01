@@ -51,6 +51,9 @@ from backend.api.default_routers.image_job_router import router as image_job_rou
 from backend.api.default_routers.illustration_brief_router import (
     router as illustration_brief_router,
 )
+from backend.api.default_routers.illustration_run_router import (
+    router as illustration_run_router,
+)
 
 apply_runtime_flags_from_argv()
 
@@ -151,6 +154,7 @@ app.include_router(card_import_router)
 app.include_router(card_export_router)
 app.include_router(image_job_router)
 app.include_router(illustration_brief_router)
+app.include_router(illustration_run_router)
 
 if __name__ == "__main__":
     import uvicorn

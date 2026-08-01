@@ -433,7 +433,9 @@ class IllustrationRunService:
         )
 
     @staticmethod
-    def _project(document: dict[str, Any]) -> IllustrationRunProjection:
+    def project_document(
+        document: dict[str, Any],
+    ) -> IllustrationRunProjection:
         def optional_id(value: Any) -> str | None:
             return str(value) if value is not None else None
 
@@ -470,6 +472,9 @@ class IllustrationRunService:
             created_at=_as_utc(document.get("created_at")),
             updated_at=_as_utc(document.get("updated_at")),
         )
+
+    # Backward-compatible private alias for the existing internal call sites.
+    _project = project_document
 
     @staticmethod
     def _stage_providers(profile: Any) -> dict[str, str]:

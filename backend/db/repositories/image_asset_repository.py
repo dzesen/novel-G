@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from bson import ObjectId
+from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -184,6 +185,116 @@ class ImageAssetRepository(BaseRepository):
             }
         ).sort([("created_at", -1), ("_id", -1)])
         return await cursor.to_list(length=None)
+
+    async def get_owned_stage_candidate(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        brief_id: ObjectId,
+        run_id: ObjectId,
+        stage: str,
+        asset_id: ObjectId,
+        session: AsyncClientSession | None = None,
+    ) -> dict[str, Any] | None:
+        """Resolve one active candidate through its complete staged lineage."""
+
+        return await self.collection.find_one(
+            {
+                "_id": asset_id,
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": "scene_illustration",
+                "subject_id": str(brief_id),
+                "illustration_brief_id": brief_id,
+                "illustration_run_id": run_id,
+                "pipeline_stage": stage,
+                "is_deleted": False,
+            },
+            session=session,
+        )
+
+    async def list_owned_stage_candidates(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        brief_id: ObjectId,
+        run_id: ObjectId,
+        stage: str,
+        session: AsyncClientSession | None = None,
+    ) -> list[dict[str, Any]]:
+        cursor = self.collection.find(
+            {
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": "scene_illustration",
+                "subject_id": str(brief_id),
+                "illustration_brief_id": brief_id,
+                "illustration_run_id": run_id,
+                "pipeline_stage": stage,
+                "is_deleted": False,
+            },
+            session=session,
+        ).sort([("created_at", -1), ("_id", -1)])
+        return await cursor.to_list(length=None)
+
+    async def select_owned_stage_candidate(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        brief_id: ObjectId,
+        run_id: ObjectId,
+        stage: str,
+        asset_id: ObjectId,
+        session: AsyncClientSession | None = None,
+    ) -> dict[str, Any] | None:
+        """Mark exactly one selectable candidate selected within a stage."""
+
+        scope = {
+            "owner_id": owner_id,
+            "novel_id": novel_id,
+            "subject_kind": "scene_illustration",
+            "subject_id": str(brief_id),
+            "illustration_brief_id": brief_id,
+            "illustration_run_id": run_id,
+            "pipeline_stage": stage,
+            "is_deleted": False,
+        }
+        available_update = self._prepare_audit_fields_for_update(
+            {
+                "candidate_state": "available",
+                "discarded_at": None,
+                "discard_reason": None,
+            }
+        )
+        await self.collection.update_many(
+            {
+                **scope,
+                "_id": {"$ne": asset_id},
+                "candidate_state": "selected",
+            },
+            {"$set": available_update},
+            session=session,
+        )
+        selected_update = self._prepare_audit_fields_for_update(
+            {
+                "candidate_state": "selected",
+                "discarded_at": None,
+                "discard_reason": None,
+            }
+        )
+        return await self.collection.find_one_and_update(
+            {
+                **scope,
+                "_id": asset_id,
+                "candidate_state": {"$in": ["available", "selected"]},
+            },
+            {"$set": selected_update},
+            return_document=ReturnDocument.AFTER,
+            session=session,
+        )
 
     def iter_owned_metadata(
         self,
