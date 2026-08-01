@@ -70,6 +70,18 @@ class ImageJobRepository(BaseRepository):
                 "deleted_at": None,
             }
         )
+        for field in (
+            "illustration_brief_id",
+            "illustration_run_id",
+            "parent_asset_id",
+        ):
+            value = document.get(field)
+            if value is None:
+                # ObjectId(None) creates a new identifier, so optional lineage
+                # must be omitted before any conversion is attempted.
+                prepared.pop(field, None)
+                continue
+            prepared[field] = to_object_id(value)
         if usage == "character_portrait":
             # Keep the old field during the compatibility window so both the
             # legacy and generic active-job indexes guard new portrait jobs.

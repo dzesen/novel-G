@@ -17,7 +17,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
 
 from bson import ObjectId
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from backend.db.repositories.image_asset_repository import ImageAssetRepository
 from backend.db.utils import to_object_id
@@ -30,6 +36,11 @@ from backend.services.image.image_probe import (
     InvalidImageError,
     ProbedImage,
     probe_image,
+)
+from backend.services.image.illustration_lineage import (
+    IllustrationAssetLineage,
+    IllustrationCandidateState,
+    IllustrationPipelineStage,
 )
 
 
@@ -73,6 +84,7 @@ class _AssetCommand(BaseModel):
     novel_id: str
     subject_kind: ImageSubjectKind
     subject_id: str = Field(min_length=1, max_length=512)
+    illustration_lineage: IllustrationAssetLineage | None = None
 
     @field_validator("owner_id", "novel_id", mode="before")
     @classmethod
@@ -85,6 +97,27 @@ class _AssetCommand(BaseModel):
             raise ValueError(
                 "owner_id and novel_id must be existing ObjectIds"
             ) from exc
+
+    @model_validator(mode="after")
+    def validate_illustration_scope(self) -> "_AssetCommand":
+        lineage = self.illustration_lineage
+        if lineage is None:
+            return self
+        if self.subject_kind != "scene_illustration":
+            raise ValueError(
+                "staged illustration lineage requires scene_illustration"
+            )
+        try:
+            subject_id = str(to_object_id(self.subject_id))
+        except Exception as exc:
+            raise ValueError(
+                "staged illustration subject_id must be an existing ObjectId"
+            ) from exc
+        if subject_id != lineage.illustration_brief_id:
+            raise ValueError(
+                "staged illustration subject_id must equal illustration_brief_id"
+            )
+        return self
 
 
 def _validate_json_metadata(value: Any, *, path: str = "request_params") -> Any:
@@ -163,9 +196,29 @@ class GeneratedImageAssetCreate(_AssetCommand):
             raise ValueError("seed must be an integer from 0 through 2^64-1")
         return value
 
+    @model_validator(mode="after")
+    def reject_external_import_stage(self) -> "GeneratedImageAssetCreate":
+        if (
+            self.illustration_lineage is not None
+            and self.illustration_lineage.pipeline_stage == "external_import"
+        ):
+            raise ValueError("external_import assets must use imported source")
+        return self
+
 
 class ImportedImageAssetCreate(_AssetCommand):
     source: Literal["imported"] = "imported"
+
+    @model_validator(mode="after")
+    def validate_external_import_stage(self) -> "ImportedImageAssetCreate":
+        if (
+            self.illustration_lineage is not None
+            and self.illustration_lineage.pipeline_stage != "external_import"
+        ):
+            raise ValueError(
+                "staged imported assets require external_import stage"
+            )
+        return self
 
 
 ImageAssetCreate = GeneratedImageAssetCreate | ImportedImageAssetCreate
@@ -193,6 +246,13 @@ class ImageAssetRecord(BaseModel):
     seed: int | None
     revised_prompt: str | None
     source: Literal["generated", "imported"]
+    illustration_brief_id: str | None = None
+    illustration_run_id: str | None = None
+    pipeline_stage: IllustrationPipelineStage | None = None
+    derived_from_asset_id: str | None = None
+    candidate_state: IllustrationCandidateState | None = None
+    discarded_at: datetime | None = None
+    discard_reason: str | None = None
     created_at: datetime | None = None
 
 
@@ -428,6 +488,25 @@ class ManagedImageAssetService:
             seed=document.get("seed"),
             revised_prompt=document.get("revised_prompt"),
             source=document["source"],
+            illustration_brief_id=(
+                str(document["illustration_brief_id"])
+                if document.get("illustration_brief_id") is not None
+                else None
+            ),
+            illustration_run_id=(
+                str(document["illustration_run_id"])
+                if document.get("illustration_run_id") is not None
+                else None
+            ),
+            pipeline_stage=document.get("pipeline_stage"),
+            derived_from_asset_id=(
+                str(document["derived_from_asset_id"])
+                if document.get("derived_from_asset_id") is not None
+                else None
+            ),
+            candidate_state=document.get("candidate_state"),
+            discarded_at=document.get("discarded_at"),
+            discard_reason=document.get("discard_reason"),
             created_at=document.get("created_at"),
         )
 
@@ -520,6 +599,26 @@ class ManagedImageAssetService:
             **generation_metadata,
             "source": command.source,
         }
+        if command.illustration_lineage is not None:
+            lineage = command.illustration_lineage.persisted_fields()
+            document.update(
+                {
+                    "illustration_brief_id": to_object_id(
+                        lineage["illustration_brief_id"]
+                    ),
+                    "illustration_run_id": to_object_id(
+                        lineage["illustration_run_id"]
+                    ),
+                    "pipeline_stage": lineage["pipeline_stage"],
+                    "candidate_state": "available",
+                    "discarded_at": None,
+                    "discard_reason": None,
+                }
+            )
+            if lineage.get("derived_from_asset_id") is not None:
+                document["derived_from_asset_id"] = to_object_id(
+                    lineage["derived_from_asset_id"]
+                )
         document["metadata_fingerprint"] = self._metadata_fingerprint(document)
         stored = await self.repository.upsert_metadata(document)
         return self._record(stored)

@@ -42,6 +42,11 @@ from backend.services.image.managed_assets import (
     ImagePollAssetConsumer,
     ManagedImageAssetService,
 )
+from backend.services.image.illustration_lineage import (
+    IllustrationAssetLineage,
+    IllustrationJobLineage,
+    IllustrationPipelineStage,
+)
 from backend.services.llm.agent_orchestrator import IllustrationPromptResult
 from backend.services.novel.appearance_anchor import (
     APPEARANCE_ANCHOR_RESET_WARNING,
@@ -99,6 +104,7 @@ class ImageJobPlan:
     required_slots: frozenset[str]
     persisted_fields: dict[str, Any]
     idempotency_context: dict[str, Any]
+    illustration_lineage: IllustrationJobLineage | None = None
 
 
 class ImageCompletionError(RuntimeError):
@@ -159,6 +165,10 @@ class ImageJobProjection(BaseModel):
     warnings: tuple[str, ...] = ()
     asset: PortraitAssetProjection | None = None
     provider: PortraitProviderProjection | None = None
+    illustration_brief_id: str | None = None
+    illustration_run_id: str | None = None
+    pipeline_stage: IllustrationPipelineStage | None = None
+    parent_asset_id: str | None = None
 
 
 class PortraitJobProjection(ImageJobProjection):
@@ -786,6 +796,22 @@ def _projection(document: dict[str, Any]) -> PortraitJobProjection:
                 warnings=tuple(document.get("warnings") or ()),
             )
             if provider_alias
+            else None
+        ),
+        illustration_brief_id=(
+            str(document["illustration_brief_id"])
+            if document.get("illustration_brief_id") is not None
+            else None
+        ),
+        illustration_run_id=(
+            str(document["illustration_run_id"])
+            if document.get("illustration_run_id") is not None
+            else None
+        ),
+        pipeline_stage=document.get("pipeline_stage"),
+        parent_asset_id=(
+            str(document["parent_asset_id"])
+            if document.get("parent_asset_id") is not None
             else None
         ),
     )
@@ -2251,11 +2277,24 @@ class SingleImageJobService:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Store one provider artifact and derive its frozen anchor payload."""
 
+        illustration_lineage = None
+        if job.get("illustration_run_id") is not None:
+            illustration_lineage = IllustrationAssetLineage(
+                illustration_brief_id=job.get("illustration_brief_id"),
+                illustration_run_id=job.get("illustration_run_id"),
+                pipeline_stage=job.get("pipeline_stage"),
+                derived_from_asset_id=job.get("parent_asset_id"),
+            )
         command = GeneratedImageAssetCreate(
             owner_id=owner_id,
             novel_id=novel_id,
             subject_kind=str(job.get("usage") or self.usage),
-            subject_id=str(job.get("subject_id") or card_id),
+            subject_id=(
+                illustration_lineage.illustration_brief_id
+                if illustration_lineage is not None
+                else str(job.get("subject_id") or card_id)
+            ),
+            illustration_lineage=illustration_lineage,
             provider_alias=str(job["provider_alias"]),
             model=str(job["model"]),
             request_params={
@@ -2557,6 +2596,26 @@ class SingleImageJobService:
         scope = scope.canonical()
         if scope.usage != self.usage:
             raise ValueError("Image job scope usage does not match the service")
+        lineage = plan.illustration_lineage
+        lineage_fields: dict[str, str] = {}
+        if lineage is not None:
+            if scope.usage != "scene_illustration":
+                raise ValueError(
+                    "Illustration lineage requires scene_illustration usage"
+                )
+            if lineage.illustration_run_id != scope.subject_id:
+                raise ValueError(
+                    "Staged illustration subject_id must equal illustration_run_id"
+                )
+            lineage_fields = lineage.persisted_fields()
+            reserved_lineage_fields = {
+                "illustration_brief_id",
+                "illustration_run_id",
+                "pipeline_stage",
+                "parent_asset_id",
+            }
+            if reserved_lineage_fields & set(plan.persisted_fields):
+                raise ValueError("Illustration lineage fields are reserved")
         if plan.seed is not None and (
             type(plan.seed) is not int
             or not 0 <= plan.seed <= (2**64 - 1)
@@ -2597,6 +2656,10 @@ class SingleImageJobService:
             "seed": chosen_seed,
             **dict(plan.idempotency_context),
         }
+        if lineage is not None:
+            idempotency_material["illustration_lineage"] = (
+                lineage.idempotency_fields()
+            )
         idempotency_key = hashlib.sha256(
             json.dumps(
                 idempotency_material,
@@ -2656,6 +2719,7 @@ class SingleImageJobService:
             "started_at_epoch": self._now_epoch(),
             "submit_timeout_seconds": resolved.timeout_seconds,
             **dict(plan.persisted_fields),
+            **lineage_fields,
         }
         if scope.usage == "character_portrait":
             document["character_card_id"] = scope.subject_id

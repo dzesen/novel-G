@@ -632,6 +632,23 @@ async def init_image_asset_indexes():
                 [
                     ("owner_id", pymongo.ASCENDING),
                     ("novel_id", pymongo.ASCENDING),
+                    ("illustration_brief_id", pymongo.ASCENDING),
+                    ("illustration_run_id", pymongo.ASCENDING),
+                    ("pipeline_stage", pymongo.ASCENDING),
+                    ("candidate_state", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression={
+                    "illustration_brief_id": {"$type": "objectId"},
+                    "illustration_run_id": {"$type": "objectId"},
+                    "is_deleted": False,
+                },
+                name="image_assets_owner_brief_candidates",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
                     ("metadata_fingerprint", pymongo.ASCENDING),
                 ],
                 unique=True,
@@ -898,6 +915,20 @@ async def init_image_job_indexes():
                     "is_deleted": False,
                 },
                 name="image_jobs_owner_anchor_dependencies",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("illustration_run_id", pymongo.ASCENDING),
+                    ("pipeline_stage", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression={
+                    "illustration_run_id": {"$type": "objectId"},
+                    "is_deleted": False,
+                },
+                name="image_jobs_owner_run_stage_created",
             ),
             pymongo.IndexModel(
                 [
