@@ -62,6 +62,27 @@ class IllustrationRunRepository(BaseRepository):
             session=session,
         )
 
+    async def list_for_brief(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        chapter_id: ObjectId,
+        illustration_brief_id: ObjectId,
+        session: AsyncClientSession | None = None,
+    ) -> list[dict[str, Any]]:
+        cursor = self.collection.find(
+            {
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "chapter_id": chapter_id,
+                "illustration_brief_id": illustration_brief_id,
+                "is_deleted": False,
+            },
+            session=session,
+        ).sort([("created_at", -1), ("_id", -1)])
+        return await cursor.to_list(length=None)
+
     async def create_active(
         self,
         document: dict[str, Any],

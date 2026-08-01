@@ -309,6 +309,40 @@ class ImageAssetRepository(BaseRepository):
             session=session,
         )
 
+    async def finalize_owned_stage_candidate(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        brief_id: ObjectId,
+        run_id: ObjectId,
+        stage: str,
+        asset_id: ObjectId,
+        session: AsyncClientSession | None = None,
+    ) -> dict[str, Any] | None:
+        """Promote the explicitly selected candidate without deleting history."""
+
+        update = self._prepare_audit_fields_for_update(
+            {"candidate_state": "finalized"}
+        )
+        return await self.collection.find_one_and_update(
+            {
+                "_id": asset_id,
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": "scene_illustration",
+                "subject_id": str(brief_id),
+                "illustration_brief_id": brief_id,
+                "illustration_run_id": run_id,
+                **self._effective_stage_scope(stage),
+                "candidate_state": "selected",
+                "is_deleted": False,
+            },
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+            session=session,
+        )
+
     async def discard_owned_stage_candidate(
         self,
         *,

@@ -170,7 +170,7 @@ export async function apiPostForm<T = unknown>(
 export async function apiPostRaw<T = unknown>(
   path: string,
   body: Blob,
-  contentType: "application/json" | "image/png",
+  contentType: "application/json" | "image/png" | "image/jpeg" | "image/webp",
 ): Promise<T> {
   const res = await authorizedFetch(path, {
     method: "POST",

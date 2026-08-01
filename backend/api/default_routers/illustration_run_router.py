@@ -18,6 +18,8 @@ from backend.services.image.illustration_readiness_service import (
 from backend.services.image.illustration_run_service import (
     IllustrationRunActiveConflict,
     IllustrationRunCreate,
+    IllustrationRunFinalize,
+    IllustrationRunListProjection,
     IllustrationRunProjection,
     IllustrationRunRevisionConflict,
     IllustrationRunService,
@@ -107,6 +109,31 @@ async def create_illustration_run(
 
 
 @router.get(
+    (
+        "/api/novels/{novel_id}/chapters/{chapter_id}/"
+        "illustration-briefs/{brief_id}/runs"
+    ),
+    response_model=IllustrationRunListProjection,
+)
+async def list_illustration_runs(
+    novel_id: str,
+    chapter_id: str,
+    brief_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: IllustrationRunService = Depends(get_illustration_run_service),
+) -> IllustrationRunListProjection:
+    try:
+        return await service.list_runs(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            brief_id=brief_id,
+        )
+    except Exception as error:
+        raise _translate_error(error) from error
+
+
+@router.get(
     "/api/novels/{novel_id}/illustration-runs/{run_id}",
     response_model=IllustrationRunProjection,
 )
@@ -121,6 +148,28 @@ async def get_illustration_run(
             owner_id=actor.id,
             novel_id=novel_id,
             run_id=run_id,
+        )
+    except Exception as error:
+        raise _translate_error(error) from error
+
+
+@router.post(
+    "/api/novels/{novel_id}/illustration-runs/{run_id}/finalize",
+    response_model=IllustrationRunProjection,
+)
+async def finalize_illustration_run(
+    novel_id: str,
+    run_id: str,
+    request: IllustrationRunFinalize,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: IllustrationRunService = Depends(get_illustration_run_service),
+) -> IllustrationRunProjection:
+    try:
+        return await service.finalize_run(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            run_id=run_id,
+            request=request,
         )
     except Exception as error:
         raise _translate_error(error) from error

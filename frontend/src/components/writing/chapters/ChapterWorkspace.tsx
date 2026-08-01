@@ -729,11 +729,13 @@ export default function ChapterWorkspace({
       {sceneIllustrationOpen &&
         novelId &&
         selectedChapterId &&
+        chapterOutline &&
         draft && (
           <SceneIllustrationPanel
             novelId={novelId}
             chapterId={selectedChapterId}
             chapterTitle={draft.title}
+            chapterOutline={chapterOutline}
             onClose={() => setSceneIllustrationOpen(false)}
             onOpenCharacterCards={onNavigateToReferenceCards}
           />

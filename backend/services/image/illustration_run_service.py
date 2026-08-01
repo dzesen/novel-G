@@ -38,6 +38,7 @@ from backend.db.repositories.image_asset_repository import (
     ImageAssetRepository,
     image_asset_repo,
 )
+from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import to_object_id
 from backend.services.image.character_visual_profile_service import (
     CharacterVisualProfileService,
@@ -135,6 +136,13 @@ class IllustrationRunCreate(BaseModel):
         return self
 
 
+class IllustrationRunFinalize(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expected_revision: int = Field(ge=1)
+    expected_brief_revision: int = Field(ge=1)
+
+
 class IllustrationPipelineSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -198,6 +206,12 @@ class IllustrationRunProjection(BaseModel):
     revision: int = Field(ge=1)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class IllustrationRunListProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    data: tuple[IllustrationRunProjection, ...]
 
 
 class IllustrationRunStateMachine:
@@ -650,6 +664,195 @@ class IllustrationRunService:
             ) from error
         return self._project(stored)
 
+    async def list_runs(
+        self,
+        *,
+        owner_id: str | ObjectId,
+        novel_id: str | ObjectId,
+        chapter_id: str | ObjectId,
+        brief_id: str | ObjectId,
+    ) -> IllustrationRunListProjection:
+        owner = _canonical_object_id(owner_id, field_name="owner_id")
+        novel = _canonical_object_id(novel_id, field_name="novel_id")
+        chapter = _canonical_object_id(chapter_id, field_name="chapter_id")
+        brief_key = _canonical_object_id(brief_id, field_name="brief_id")
+        brief = await self._briefs.get_owned(
+            owner_id=owner,
+            novel_id=novel,
+            chapter_id=chapter,
+            brief_id=brief_key,
+        )
+        if brief is None:
+            raise NotFoundError("Illustration brief was not found")
+        documents = await self._repository.list_for_brief(
+            owner_id=owner,
+            novel_id=novel,
+            chapter_id=chapter,
+            illustration_brief_id=brief_key,
+        )
+        return IllustrationRunListProjection(
+            data=tuple(self._project(document) for document in documents)
+        )
+
+    @staticmethod
+    def _final_stage(
+        document: dict[str, Any],
+        *,
+        final_asset_id: ObjectId,
+    ) -> Literal["compose", "identity_edit", "refine"]:
+        kind = document["pipeline_snapshot"].get("kind")
+        stage_names = (
+            ("compose",)
+            if kind == "quick"
+            else ("refine", "identity_edit")
+        )
+        for stage in stage_names:
+            if str(document["stages"][stage].get("selected_asset_id") or "") == str(final_asset_id):
+                return stage
+        raise IllustrationRunStateError(
+            "The final candidate is not selected in a legal pipeline stage"
+        )
+
+    async def finalize_run(
+        self,
+        *,
+        owner_id: str | ObjectId,
+        novel_id: str | ObjectId,
+        run_id: str | ObjectId,
+        request: IllustrationRunFinalize,
+    ) -> IllustrationRunProjection:
+        owner = _canonical_object_id(owner_id, field_name="owner_id")
+        novel = _canonical_object_id(novel_id, field_name="novel_id")
+        run_key = _canonical_object_id(run_id, field_name="run_id")
+
+        async def _finalize(session):
+            current = await self._repository.get_owned(
+                owner_id=owner,
+                novel_id=novel,
+                run_id=run_key,
+                session=session,
+            )
+            if (
+                current is None
+                or int(current.get("revision") or 0) != request.expected_revision
+                or current.get("status") in TERMINAL_ILLUSTRATION_RUN_STATUSES
+            ):
+                raise IllustrationRunRevisionConflict(
+                    "Illustration run revision is stale or already terminal"
+                )
+            if any(
+                stage.get("status") == "running"
+                for stage in (current.get("stages") or {}).values()
+            ):
+                raise IllustrationRunStateError(
+                    "A running illustration stage must finish or be cancelled before finalize"
+                )
+            normalized_stages = {
+                name: {
+                    **dict(stage),
+                    "selected_asset_id": (
+                        str(stage["selected_asset_id"])
+                        if stage.get("selected_asset_id") is not None
+                        else None
+                    ),
+                    "latest_job_id": (
+                        str(stage["latest_job_id"])
+                        if stage.get("latest_job_id") is not None
+                        else None
+                    ),
+                }
+                for name, stage in current["stages"].items()
+            }
+            final_asset_id = _canonical_object_id(
+                IllustrationRunStateMachine.final_asset_id(
+                    normalized_stages,
+                    kind=current["pipeline_snapshot"]["kind"],
+                ),
+                field_name="final_asset_id",
+            )
+            final_stage = self._final_stage(
+                current,
+                final_asset_id=final_asset_id,
+            )
+            brief = await self._briefs.get_owned(
+                owner_id=owner,
+                novel_id=novel,
+                chapter_id=current["chapter_id"],
+                brief_id=current["illustration_brief_id"],
+                session=session,
+            )
+            if (
+                brief is None
+                or brief.get("status") != "active"
+                or int(brief.get("revision") or 0)
+                != request.expected_brief_revision
+            ):
+                raise IllustrationRunRevisionConflict(
+                    "Illustration brief revision is stale or no longer active"
+                )
+            candidate = await self._assets.get_owned_stage_candidate(
+                owner_id=owner,
+                novel_id=novel,
+                brief_id=current["illustration_brief_id"],
+                run_id=run_key,
+                stage=final_stage,
+                asset_id=final_asset_id,
+                session=session,
+            )
+            if candidate is None or candidate.get("candidate_state") != "selected":
+                raise IllustrationRunStateError(
+                    "The selected final candidate is missing or no longer selected"
+                )
+
+            updated_run = await self._repository.update_if_revision(
+                owner_id=owner,
+                novel_id=novel,
+                run_id=run_key,
+                expected_revision=request.expected_revision,
+                changes={
+                    "status": "finalized",
+                    "final_asset_id": final_asset_id,
+                },
+                session=session,
+            )
+            if updated_run is None:
+                raise IllustrationRunRevisionConflict(
+                    "Illustration run revision is stale or already terminal"
+                )
+            updated_brief = await self._briefs.patch_if_revision(
+                owner_id=owner,
+                novel_id=novel,
+                chapter_id=current["chapter_id"],
+                brief_id=current["illustration_brief_id"],
+                expected_revision=request.expected_brief_revision,
+                changes={"current_asset_id": final_asset_id},
+                session=session,
+            )
+            if updated_brief is None:
+                raise IllustrationRunRevisionConflict(
+                    "Illustration brief revision is stale or no longer active"
+                )
+            finalized = await self._assets.finalize_owned_stage_candidate(
+                owner_id=owner,
+                novel_id=novel,
+                brief_id=current["illustration_brief_id"],
+                run_id=run_key,
+                stage=final_stage,
+                asset_id=final_asset_id,
+                session=session,
+            )
+            if finalized is None:
+                raise IllustrationRunStateError(
+                    "The selected final candidate changed during finalize"
+                )
+            return updated_run
+
+        stored = await run_mongo_write_unit(
+            _finalize,
+            "finalize_illustration_run",
+        )
+        return self._project(stored)
+
     async def preserve_for_branch(
         self,
         *,
@@ -735,6 +938,8 @@ __all__ = [
     "IllustrationRunStateMachine",
     "IllustrationRunCreate",
     "IllustrationRunProjection",
+    "IllustrationRunFinalize",
+    "IllustrationRunListProjection",
     "IllustrationRunService",
     "illustration_run_service",
 ]

@@ -12,6 +12,7 @@ import {
 } from "react";
 import IllustrationPromptEditor from "@/components/image/IllustrationPromptEditor";
 import ImageJobStatusPanel from "@/components/image/ImageJobStatusPanel";
+import StagedIllustrationWorkspace from "./StagedIllustrationWorkspace";
 import { useImageJob } from "@/components/image/useImageJob";
 import { apiGet, apiPost, getImageUrl } from "@/lib/api";
 import { constrainIllustrationPromptEdit } from "@/lib/illustrationPrompt";
@@ -25,11 +26,13 @@ import type {
   SceneIllustrationJob,
   SceneIllustrationState,
 } from "@/types/image";
+import type { StoredChapterOutline } from "./outline/outlineTypes";
 
 interface SceneIllustrationPanelProps {
   novelId: string;
   chapterId: string;
   chapterTitle: string;
+  chapterOutline: StoredChapterOutline;
   onClose: () => void;
   onOpenCharacterCards: () => void;
 }
@@ -38,6 +41,7 @@ export default function SceneIllustrationPanel({
   novelId,
   chapterId,
   chapterTitle,
+  chapterOutline,
   onClose,
   onOpenCharacterCards,
 }: SceneIllustrationPanelProps) {
@@ -723,8 +727,24 @@ export default function SceneIllustrationPanel({
                 />
               )}
 
-              <ImageJobStatusPanel
-                job={job}
+              <StagedIllustrationWorkspace
+                novelId={novelId}
+                chapterId={chapterId}
+                chapterTitle={chapterTitle}
+                outline={chapterOutline}
+                characters={state.characters}
+                selectedCharacterIds={selectedCharacterIds}
+                referenceCharacterId={referenceCharacterId}
+                prompt={prompt}
+                legacyAssets={assets}
+              />
+
+              <div className="mt-6 rounded-lg border border-dashed border-border bg-surface-secondary/30 p-3">
+                <p className="text-sm font-semibold text-foreground">{t("legacyModeTitle")}</p>
+                <p className="mt-1 text-xs leading-5 text-muted">{t("legacyModeDescription")}</p>
+              </div>
+
+              <ImageJobStatusPanel                job={job}
                 cleanupJob={cleanupJob}
                 pollError={pollError}
                 cleanupPollError={cleanupPollError}
