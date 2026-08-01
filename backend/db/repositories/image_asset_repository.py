@@ -12,6 +12,7 @@ from pymongo.errors import DuplicateKeyError
 
 from backend.db.base import BaseRepository
 from backend.db.collections import IMAGE_ASSETS, NOVELS
+from backend.db.utils import get_utc_now
 
 
 class ImageAssetRepository(BaseRepository):
@@ -19,6 +20,18 @@ class ImageAssetRepository(BaseRepository):
 
     def __init__(self) -> None:
         super().__init__(IMAGE_ASSETS)
+
+    @staticmethod
+    def _effective_stage_scope(stage: str) -> dict[str, Any]:
+        return {
+            "$or": [
+                {"pipeline_stage": stage},
+                {
+                    "pipeline_stage": "external_import",
+                    "external_import_target_stage": stage,
+                },
+            ]
+        }
 
     async def novel_belongs_to_owner(
         self,
@@ -208,7 +221,7 @@ class ImageAssetRepository(BaseRepository):
                 "subject_id": str(brief_id),
                 "illustration_brief_id": brief_id,
                 "illustration_run_id": run_id,
-                "pipeline_stage": stage,
+                **self._effective_stage_scope(stage),
                 "is_deleted": False,
             },
             session=session,
@@ -232,7 +245,7 @@ class ImageAssetRepository(BaseRepository):
                 "subject_id": str(brief_id),
                 "illustration_brief_id": brief_id,
                 "illustration_run_id": run_id,
-                "pipeline_stage": stage,
+                **self._effective_stage_scope(stage),
                 "is_deleted": False,
             },
             session=session,
@@ -259,7 +272,7 @@ class ImageAssetRepository(BaseRepository):
             "subject_id": str(brief_id),
             "illustration_brief_id": brief_id,
             "illustration_run_id": run_id,
-            "pipeline_stage": stage,
+            **self._effective_stage_scope(stage),
             "is_deleted": False,
         }
         available_update = self._prepare_audit_fields_for_update(
@@ -292,6 +305,79 @@ class ImageAssetRepository(BaseRepository):
                 "candidate_state": {"$in": ["available", "selected"]},
             },
             {"$set": selected_update},
+            return_document=ReturnDocument.AFTER,
+            session=session,
+        )
+
+    async def discard_owned_stage_candidate(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        brief_id: ObjectId,
+        run_id: ObjectId,
+        stage: str,
+        asset_id: ObjectId,
+        reason: str,
+        session: AsyncClientSession | None = None,
+    ) -> dict[str, Any] | None:
+        update = self._prepare_audit_fields_for_update(
+            {
+                "candidate_state": "discarded",
+                "discarded_at": get_utc_now(),
+                "discard_reason": reason,
+            }
+        )
+        return await self.collection.find_one_and_update(
+            {
+                "_id": asset_id,
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": "scene_illustration",
+                "subject_id": str(brief_id),
+                "illustration_brief_id": brief_id,
+                "illustration_run_id": run_id,
+                **self._effective_stage_scope(stage),
+                "candidate_state": "available",
+                "is_deleted": False,
+            },
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+            session=session,
+        )
+
+    async def restore_owned_stage_candidate(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        brief_id: ObjectId,
+        run_id: ObjectId,
+        stage: str,
+        asset_id: ObjectId,
+        session: AsyncClientSession | None = None,
+    ) -> dict[str, Any] | None:
+        update = self._prepare_audit_fields_for_update(
+            {
+                "candidate_state": "available",
+                "discarded_at": None,
+                "discard_reason": None,
+            }
+        )
+        return await self.collection.find_one_and_update(
+            {
+                "_id": asset_id,
+                "owner_id": owner_id,
+                "novel_id": novel_id,
+                "subject_kind": "scene_illustration",
+                "subject_id": str(brief_id),
+                "illustration_brief_id": brief_id,
+                "illustration_run_id": run_id,
+                **self._effective_stage_scope(stage),
+                "candidate_state": "discarded",
+                "is_deleted": False,
+            },
+            {"$set": update},
             return_document=ReturnDocument.AFTER,
             session=session,
         )

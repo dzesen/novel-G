@@ -1,8 +1,8 @@
 """Explicit staged illustration orchestration.
 
-Quick compose and consistency compose/identity-edit share one explicit stage
+Quick compose and consistency compose/identity-edit/refine share one explicit
 orchestrator. Provider submission requires a start request; readiness, polling,
-advance, and candidate selection never create an image job implicitly.
+advance, candidate selection, and external import never create jobs implicitly.
 """
 
 from __future__ import annotations
@@ -39,7 +39,10 @@ from backend.db.repositories.image_asset_repository import (
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.image.contracts import ImageInputAsset
-from backend.services.image.illustration_lineage import IllustrationJobLineage
+from backend.services.image.illustration_lineage import (
+    IllustrationAssetLineage,
+    IllustrationJobLineage,
+)
 from backend.services.image.illustration_readiness_service import (
     illustration_readiness_service,
 )
@@ -50,7 +53,11 @@ from backend.services.image.illustration_run_service import (
     IllustrationRunStateError,
     IllustrationRunStateMachine,
 )
-from backend.services.image.managed_assets import ManagedImageAssetService
+from backend.services.image.managed_assets import (
+    ImageAssetRecord,
+    ImportedImageAssetCreate,
+    ManagedImageAssetService,
+)
 from backend.services.image.single_image_job_service import (
     ConfiguredImageProviderResolver,
     ImageJobPlan,
@@ -96,6 +103,15 @@ class _AssetReader(Protocol):
         owner_id: str,
         asset_id: str,
     ) -> bytes: ...
+
+
+class _AssetStore(Protocol):
+    async def put(
+        self,
+        *,
+        content: bytes,
+        command: ImportedImageAssetCreate,
+    ) -> ImageAssetRecord: ...
 
 
 def _canonical_id(value: Any, *, field_name: str) -> ObjectId:
@@ -209,6 +225,30 @@ class IdentityEditInstruction(BaseModel):
         return self
 
 
+class RefineInstruction(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    goal: Literal[
+        "detail_recovery",
+        "artifact_cleanup",
+        "final_polish",
+    ]
+    strength: float = Field(ge=0.0, le=1.0)
+    supplemental_instruction: str = Field(default="", max_length=1_000)
+
+    @field_validator("strength", mode="before")
+    @classmethod
+    def reject_boolean_strength(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("refine strength must be a number from 0 through 1")
+        return value
+
+    @field_validator("supplemental_instruction", mode="before")
+    @classmethod
+    def normalize_supplemental_instruction(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+
 class IllustrationStageStart(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -216,6 +256,7 @@ class IllustrationStageStart(BaseModel):
     attempt_id: str = Field(min_length=36, max_length=36)
     prompt: IllustrationPromptResult | None = None
     identity_instruction: IdentityEditInstruction | None = None
+    refine_instruction: RefineInstruction | None = None
     readiness_digest: str | None = Field(default=None, max_length=71)
     seed: int | None = None
     use_external_adapter: bool = False
@@ -250,13 +291,50 @@ class IllustrationCandidateSelect(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class IllustrationCandidateDiscard(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expected_revision: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+
+class IllustrationCandidateRestore(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expected_revision: int = Field(ge=1)
+
+
+class IllustrationExternalEditImport(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    expected_revision: int = Field(ge=1)
+    target_stage: Literal["compose", "identity_edit", "refine"]
+    parent_asset_id: str
+
+    @field_validator("parent_asset_id", mode="before")
+    @classmethod
+    def validate_parent_asset_id(cls, value: Any) -> str:
+        return str(_canonical_id(value, field_name="parent_asset_id"))
+
+
 class IllustrationCandidateProjection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     asset_id: str
     illustration_brief_id: str
     illustration_run_id: str
-    pipeline_stage: Literal["compose", "identity_edit"]
+    pipeline_stage: Literal[
+        "compose",
+        "identity_edit",
+        "refine",
+        "external_import",
+    ]
+    target_stage: Literal["compose", "identity_edit", "refine"]
     content_hash: str
     mime: str
     width: int
@@ -294,8 +372,15 @@ class IllustrationCandidateSelectionProjection(BaseModel):
     candidate: IllustrationCandidateProjection
 
 
+class IllustrationCandidateMutationProjection(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run: IllustrationRunProjection
+    candidate: IllustrationCandidateProjection
+
+
 class IllustrationStageService:
-    """Explicit compose and identity-edit orchestration with manual gates."""
+    """Explicit staged generation, import, and candidate lifecycle gates."""
 
     def __init__(
         self,
@@ -304,6 +389,7 @@ class IllustrationStageService:
         assets: ImageAssetRepository | None = None,
         jobs: _StageJobService | None = None,
         asset_reader: _AssetReader | None = None,
+        asset_store: _AssetStore | None = None,
         readiness: _ReadinessService | None = None,
         pipeline_config_loader: Callable[[], ImageProvidersConfig] | None = None,
     ) -> None:
@@ -318,7 +404,9 @@ class IllustrationStageService:
             asset_repository=image_asset_repo,
             now=get_utc_now,
         )
-        self._asset_reader = asset_reader or ManagedImageAssetService()
+        managed_assets = ManagedImageAssetService()
+        self._asset_reader = asset_reader or managed_assets
+        self._asset_store = asset_store or managed_assets
         self._readiness = readiness or illustration_readiness_service
         self._pipeline_config_loader = (
             pipeline_config_loader or get_image_providers_config
@@ -366,14 +454,13 @@ class IllustrationStageService:
         require_active: bool = True,
         expected_revision: int | None = None,
     ) -> None:
-        kind = document.get("pipeline_snapshot", {}).get("kind")
-        allowed = (
-            {"compose"}
-            if kind == "quick"
-            else {"compose", "identity_edit"}
-            if kind == "consistency"
-            else set()
-        )
+        snapshot = document.get("pipeline_snapshot", {})
+        kind = snapshot.get("kind")
+        allowed = {"compose"} if kind == "quick" else set()
+        if kind == "consistency":
+            allowed = {"compose", "identity_edit"}
+            if "refine" in snapshot.get("effective_stage_providers", {}):
+                allowed.add("refine")
         if stage not in allowed:
             raise IllustrationRunStateError(
                 f"Stage {stage} is not supported by the frozen {kind} pipeline"
@@ -424,6 +511,12 @@ class IllustrationStageService:
             and isinstance(profile, ConsistencyIllustrationPipelineProfile)
         ):
             expected_provider_alias = profile.identity_edit_provider
+        elif (
+            stage == "refine"
+            and isinstance(profile, ConsistencyIllustrationPipelineProfile)
+            and profile.refine_provider is not None
+        ):
+            expected_provider_alias = profile.refine_provider
         else:
             raise IllustrationRunStateError(
                 f"Frozen pipeline does not configure stage {stage}"
@@ -513,7 +606,7 @@ class IllustrationStageService:
         owner_id: ObjectId,
         novel_id: ObjectId,
         document: dict[str, Any],
-        stage: Literal["compose", "identity_edit"],
+        stage: Literal["compose", "identity_edit", "refine"],
     ) -> tuple[ImageInputAsset, dict[str, Any]]:
         selected_id = document["stages"][stage].get("selected_asset_id")
         if selected_id is None or not str(selected_id).strip():
@@ -599,7 +692,7 @@ class IllustrationStageService:
         owner_id: ObjectId,
         novel_id: ObjectId,
         document: dict[str, Any],
-        stage: Literal["compose", "identity_edit"],
+        stage: Literal["compose", "identity_edit", "refine"],
         job: ImageJobProjection,
     ) -> dict[str, Any]:
         stages = IllustrationRunStateMachine.begin_attempt(
@@ -644,7 +737,7 @@ class IllustrationStageService:
         owner_id: ObjectId,
         novel_id: ObjectId,
         document: dict[str, Any],
-        stage: Literal["compose", "identity_edit"],
+        stage: Literal["compose", "identity_edit", "refine"],
         job: ImageJobProjection,
     ) -> dict[str, Any] | None:
         if job.asset is None:
@@ -664,7 +757,7 @@ class IllustrationStageService:
         owner_id: ObjectId,
         novel_id: ObjectId,
         document: dict[str, Any],
-        stage: Literal["compose", "identity_edit"],
+        stage: Literal["compose", "identity_edit", "refine"],
         stages: Any,
         job: ImageJobProjection,
     ):
@@ -727,14 +820,18 @@ class IllustrationStageService:
                 run_id=run_key,
                 supplied_digest=request.readiness_digest,
             )
-        descriptor = str(document["reference_snapshot"]["descriptor"])
         pipeline_revision = str(document["pipeline_snapshot"]["revision"])
 
         if stage == "compose":
-            if request.prompt is None or request.identity_instruction is not None:
+            if (
+                request.prompt is None
+                or request.identity_instruction is not None
+                or request.refine_instruction is not None
+            ):
                 raise IllustrationRunStateError(
-                    "Compose requires prompt and rejects identity instructions"
+                    "Compose requires prompt and rejects edit instructions"
                 )
+            descriptor = str(document["reference_snapshot"]["descriptor"])
             reference_input = await self._reference_input(
                 owner_id=owner,
                 novel_id=novel,
@@ -816,9 +913,10 @@ class IllustrationStageService:
                 },
                 illustration_lineage=lineage,
             )
-        else:
+        elif stage == "identity_edit":
             if (
                 request.identity_instruction is None
+                or request.refine_instruction is not None
                 or request.prompt is not None
                 or request.use_external_adapter
             ):
@@ -826,6 +924,7 @@ class IllustrationStageService:
                     "Identity edit requires identity_instruction only; "
                     "external adapters are compose-only"
                 )
+            descriptor = str(document["reference_snapshot"]["descriptor"])
             base_input, base_asset = await self._selected_stage_input(
                 owner_id=owner,
                 novel_id=novel,
@@ -922,6 +1021,92 @@ class IllustrationStageService:
                 illustration_lineage=lineage,
             )
 
+        else:
+            if (
+                request.refine_instruction is None
+                or request.identity_instruction is not None
+                or request.prompt is not None
+                or request.use_external_adapter
+            ):
+                raise IllustrationRunStateError(
+                    "Refine requires refine_instruction only; external adapters "
+                    "are compose-only"
+                )
+            base_input, base_asset = await self._selected_stage_input(
+                owner_id=owner,
+                novel_id=novel,
+                document=document,
+                stage="identity_edit",
+            )
+            instruction = request.refine_instruction
+            prompt_revision = _hash_payload(
+                {"refine_instruction": instruction.model_dump(mode="json")}
+            )
+            audit_prompt = IllustrationPromptResult(
+                subject=f"Refine goal: {instruction.goal}",
+                appearance="Use only the selected upstream image as input.",
+                scene=(
+                    instruction.supplemental_instruction
+                    or "No supplemental content change requested."
+                ),
+                style=f"Refine strength: {instruction.strength:.4f}",
+                negative="",
+            )
+            parent_asset_id = str(base_asset["_id"])
+            base_asset_hash = str(base_asset["content_hash"])
+            lineage = IllustrationJobLineage(
+                illustration_brief_id=str(document["illustration_brief_id"]),
+                illustration_run_id=str(document["_id"]),
+                pipeline_stage="refine",
+                parent_asset_id=parent_asset_id,
+                base_asset_hash=base_asset_hash,
+                profile_revision=pipeline_revision,
+                prompt_revision=prompt_revision,
+            )
+            plan = ImageJobPlan(
+                prompt=audit_prompt,
+                seed=request.seed,
+                slot_values={
+                    "base_image": base_input,
+                    "goal": instruction.goal,
+                    "strength": instruction.strength,
+                    "supplemental_instruction": (
+                        instruction.supplemental_instruction
+                    ),
+                    "seed": request.seed,
+                },
+                required_slots=frozenset(
+                    {
+                        "base_image",
+                        "goal",
+                        "strength",
+                        "supplemental_instruction",
+                        "seed",
+                    }
+                ),
+                persisted_fields={
+                    "attempt_id": request.attempt_id,
+                    "pipeline_alias": document["pipeline_snapshot"]["alias"],
+                    "pipeline_revision": pipeline_revision,
+                    "prompt_revision": prompt_revision,
+                    "final_prompt": (
+                        f"Refine goal: {instruction.goal}. "
+                        f"{instruction.supplemental_instruction}"
+                    ).strip(),
+                    "negative_prompt": "",
+                    "base_asset_id": parent_asset_id,
+                    "base_asset_hash": base_asset_hash,
+                    "use_external_adapter": False,
+                },
+                idempotency_context={
+                    "attempt_id": request.attempt_id,
+                    "refine_instruction": instruction.model_dump(mode="json"),
+                    "parent_asset_id": parent_asset_id,
+                    "base_asset_hash": base_asset_hash,
+                },
+                illustration_lineage=lineage,
+            )
+
         job = await self._jobs.start_job(
             scope=self._scope(
                 owner_id=owner,
@@ -967,10 +1152,10 @@ class IllustrationStageService:
         )
         if (
             document["pipeline_snapshot"].get("kind") != "consistency"
-            or stage != "compose"
+            or stage not in {"compose", "identity_edit"}
         ):
             raise IllustrationRunStateError(
-                "Slice 8 only advances consistency compose to identity_edit"
+                "Only consistency compose or identity_edit can advance"
             )
         stages = IllustrationRunStateMachine.advance(
             document["stages"],
@@ -995,12 +1180,8 @@ class IllustrationStageService:
         document: dict[str, Any],
         *,
         job_id: str,
-    ) -> Literal["compose", "identity_edit"]:
-        stages = (
-            ("compose",)
-            if document["pipeline_snapshot"].get("kind") == "quick"
-            else ("compose", "identity_edit")
-        )
+    ) -> Literal["compose", "identity_edit", "refine"]:
+        stages = IllustrationStageService._candidate_stages(document)
         for stage in stages:
             if str(
                 document["stages"][stage].get("latest_job_id") or ""
@@ -1011,12 +1192,18 @@ class IllustrationStageService:
     @staticmethod
     def _candidate_stages(
         document: dict[str, Any],
-    ) -> tuple[Literal["compose", "identity_edit"], ...]:
+    ) -> tuple[Literal["compose", "identity_edit", "refine"], ...]:
         kind = document["pipeline_snapshot"].get("kind")
         if kind == "quick":
             return ("compose",)
         if kind == "consistency":
-            return ("compose", "identity_edit")
+            return (
+                ("compose", "identity_edit", "refine")
+                if "refine" in document["pipeline_snapshot"].get(
+                    "effective_stage_providers", {}
+                )
+                else ("compose", "identity_edit")
+            )
         raise IllustrationRunStateError(
             f"Frozen pipeline kind {kind} does not expose candidates"
         )
@@ -1028,7 +1215,7 @@ class IllustrationStageService:
         owner_id: ObjectId,
         novel_id: ObjectId,
         document: dict[str, Any],
-        stage: Literal["compose", "identity_edit"],
+        stage: Literal["compose", "identity_edit", "refine"],
         job: ImageJobProjection,
     ) -> dict[str, Any]:
         current_stage = document["stages"][stage]
@@ -1159,6 +1346,10 @@ class IllustrationStageService:
             illustration_brief_id=str(document["illustration_brief_id"]),
             illustration_run_id=str(document["illustration_run_id"]),
             pipeline_stage=document["pipeline_stage"],
+            target_stage=(
+                document.get("external_import_target_stage")
+                or document["pipeline_stage"]
+            ),
             content_hash=str(document["content_hash"]),
             mime=str(document["mime"]),
             width=int(document["width"]),
@@ -1171,6 +1362,102 @@ class IllustrationStageService:
             selected=selected,
             content_url=f"/api/image-assets/{asset_id}/content",
             created_at=document.get("created_at"),
+        )
+
+    async def import_external_edit(
+        self,
+        *,
+        owner_id: str | ObjectId,
+        novel_id: str | ObjectId,
+        run_id: str | ObjectId,
+        request: IllustrationExternalEditImport,
+        content: bytes,
+    ) -> IllustrationCandidateProjection:
+        owner = _canonical_id(owner_id, field_name="owner_id")
+        novel = _canonical_id(novel_id, field_name="novel_id")
+        run_key = _canonical_id(run_id, field_name="run_id")
+        parent_key = _canonical_id(
+            request.parent_asset_id,
+            field_name="parent_asset_id",
+        )
+        run = await self._get_run(
+            owner_id=owner,
+            novel_id=novel,
+            run_id=run_key,
+        )
+        self._require_supported_stage(
+            run,
+            stage=request.target_stage,
+            expected_revision=request.expected_revision,
+        )
+        target_status = run["stages"][request.target_stage]["status"]
+        if target_status not in {
+            "awaiting_selection",
+            "selected",
+            "failed",
+            "cancelled",
+        }:
+            raise IllustrationRunStateError(
+                "External edits require an unlocked target stage with candidates"
+            )
+
+        candidate_stages = self._candidate_stages(run)
+        target_index = candidate_stages.index(request.target_stage)
+        parent = None
+        for parent_stage in candidate_stages[: target_index + 1]:
+            parent = await self._assets.get_owned_stage_candidate(
+                owner_id=owner,
+                novel_id=novel,
+                brief_id=run["illustration_brief_id"],
+                run_id=run_key,
+                stage=parent_stage,
+                asset_id=parent_key,
+            )
+            if parent is not None:
+                break
+        if parent is None:
+            raise NotFoundError("Parent illustration candidate was not found")
+        if parent.get("candidate_state") not in {"available", "selected"}:
+            raise IllustrationRunStateError(
+                "External edits require an available parent candidate"
+            )
+
+        stored = await self._asset_store.put(
+            content=content,
+            command=ImportedImageAssetCreate(
+                owner_id=str(owner),
+                novel_id=str(novel),
+                subject_kind="scene_illustration",
+                subject_id=str(run["illustration_brief_id"]),
+                illustration_lineage=IllustrationAssetLineage(
+                    illustration_brief_id=str(run["illustration_brief_id"]),
+                    illustration_run_id=str(run_key),
+                    pipeline_stage="external_import",
+                    derived_from_asset_id=str(parent_key),
+                ),
+                external_import_target_stage=request.target_stage,
+            ),
+        )
+        document = await self._assets.get_owned_stage_candidate(
+            owner_id=owner,
+            novel_id=novel,
+            brief_id=run["illustration_brief_id"],
+            run_id=run_key,
+            stage=request.target_stage,
+            asset_id=_canonical_id(stored.asset_id, field_name="asset_id"),
+        )
+        if document is None:  # pragma: no cover - persistence invariant.
+            raise RuntimeError("Imported illustration candidate disappeared")
+        selected_asset_id = run["stages"][request.target_stage].get(
+            "selected_asset_id"
+        )
+        return self._project_candidate(
+            document,
+            selected_asset_id=(
+                str(selected_asset_id)
+                if selected_asset_id is not None
+                else None
+            ),
         )
 
     async def list_candidates(
@@ -1216,6 +1503,230 @@ class IllustrationStageService:
             )
         )
 
+    async def _locate_candidate(
+        self,
+        *,
+        owner_id: ObjectId,
+        novel_id: ObjectId,
+        run: dict[str, Any],
+        asset_id: ObjectId,
+        session: Any = None,
+    ) -> tuple[Literal["compose", "identity_edit", "refine"], dict[str, Any]]:
+        for stage in self._candidate_stages(run):
+            candidate = await self._assets.get_owned_stage_candidate(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                brief_id=run["illustration_brief_id"],
+                run_id=run["_id"],
+                stage=stage,
+                asset_id=asset_id,
+                session=session,
+            )
+            if candidate is not None:
+                return stage, candidate
+        raise NotFoundError("Illustration candidate was not found")
+
+    async def _mutate_candidate_state(
+        self,
+        *,
+        owner_id: str | ObjectId,
+        novel_id: str | ObjectId,
+        run_id: str | ObjectId | None,
+        asset_id: str | ObjectId,
+        expected_revision: int,
+        operation: Literal["discard", "restore"],
+        reason: str | None = None,
+    ) -> IllustrationCandidateMutationProjection:
+        owner = _canonical_id(owner_id, field_name="owner_id")
+        novel = _canonical_id(novel_id, field_name="novel_id")
+        asset_key = _canonical_id(asset_id, field_name="asset_id")
+        if run_id is None:
+            asset_document = await self._assets.get_owned_by_id(
+                owner_id=owner,
+                asset_id=asset_key,
+            )
+            if (
+                asset_document is None
+                or str(asset_document.get("novel_id") or "") != str(novel)
+                or asset_document.get("illustration_run_id") is None
+            ):
+                raise NotFoundError("Illustration candidate was not found")
+            run_key = _canonical_id(
+                asset_document["illustration_run_id"],
+                field_name="illustration_run_id",
+            )
+        else:
+            run_key = _canonical_id(run_id, field_name="run_id")
+        initial = await self._get_run(
+            owner_id=owner,
+            novel_id=novel,
+            run_id=run_key,
+        )
+        if int(initial.get("revision") or 0) != expected_revision:
+            raise IllustrationRunRevisionConflict(
+                "Illustration run revision is stale"
+            )
+        stage, candidate = await self._locate_candidate(
+            owner_id=owner,
+            novel_id=novel,
+            run=initial,
+            asset_id=asset_key,
+        )
+        self._require_supported_stage(
+            initial,
+            stage=stage,
+            expected_revision=expected_revision,
+        )
+        selected_asset_id = initial["stages"][stage].get("selected_asset_id")
+        if operation == "discard":
+            if (
+                str(selected_asset_id or "") == str(asset_key)
+                or candidate.get("candidate_state") in {"selected", "finalized"}
+            ):
+                raise IllustrationRunStateError(
+                    "The selected candidate cannot be discarded"
+                )
+            if candidate.get("candidate_state") != "available":
+                raise IllustrationRunStateError(
+                    "Only available illustration candidates can be discarded"
+                )
+        elif candidate.get("candidate_state") != "discarded":
+            raise IllustrationRunStateError(
+                "Only discarded illustration candidates can be restored"
+            )
+
+        async def _mutate(session):
+            current = await self._runs.get_owned(
+                owner_id=owner,
+                novel_id=novel,
+                run_id=run_key,
+                session=session,
+            )
+            if current is None:
+                raise NotFoundError("Illustration run was not found")
+            self._require_supported_stage(
+                current,
+                stage=stage,
+                expected_revision=expected_revision,
+            )
+            current_stage, current_candidate = await self._locate_candidate(
+                owner_id=owner,
+                novel_id=novel,
+                run=current,
+                asset_id=asset_key,
+                session=session,
+            )
+            if current_stage != stage:
+                raise IllustrationRunStateError(
+                    "Illustration candidate stage changed"
+                )
+            current_selected = current["stages"][stage].get(
+                "selected_asset_id"
+            )
+            if operation == "discard" and (
+                str(current_selected or "") == str(asset_key)
+                or current_candidate.get("candidate_state")
+                in {"selected", "finalized"}
+            ):
+                raise IllustrationRunStateError(
+                    "The selected candidate cannot be discarded"
+                )
+            expected_state = "available" if operation == "discard" else "discarded"
+            if current_candidate.get("candidate_state") != expected_state:
+                raise IllustrationRunStateError(
+                    f"Candidate is no longer {expected_state}"
+                )
+            updated = await self._runs.update_if_revision(
+                owner_id=owner,
+                novel_id=novel,
+                run_id=run_key,
+                expected_revision=expected_revision,
+                changes={"stages": current["stages"]},
+                session=session,
+            )
+            if updated is None:
+                raise IllustrationRunRevisionConflict(
+                    "Illustration run revision is stale"
+                )
+            if operation == "discard":
+                mutated = await self._assets.discard_owned_stage_candidate(
+                    owner_id=owner,
+                    novel_id=novel,
+                    brief_id=current["illustration_brief_id"],
+                    run_id=run_key,
+                    stage=stage,
+                    asset_id=asset_key,
+                    reason=str(reason or ""),
+                    session=session,
+                )
+            else:
+                mutated = await self._assets.restore_owned_stage_candidate(
+                    owner_id=owner,
+                    novel_id=novel,
+                    brief_id=current["illustration_brief_id"],
+                    run_id=run_key,
+                    stage=stage,
+                    asset_id=asset_key,
+                    session=session,
+                )
+            if mutated is None:  # fully prevalidated before ordered fallback.
+                raise IllustrationRunStateError(
+                    "Illustration candidate state changed"
+                )
+            return updated, mutated
+
+        updated, mutated = await run_mongo_write_unit(
+            _mutate,
+            f"{operation}_illustration_candidate",
+        )
+        selected_after = updated["stages"][stage].get("selected_asset_id")
+        return IllustrationCandidateMutationProjection(
+            run=self._project_run(updated),
+            candidate=self._project_candidate(
+                mutated,
+                selected_asset_id=(
+                    str(selected_after) if selected_after is not None else None
+                ),
+            ),
+        )
+
+    async def discard_candidate(
+        self,
+        *,
+        owner_id: str | ObjectId,
+        novel_id: str | ObjectId,
+        run_id: str | ObjectId | None = None,
+        asset_id: str | ObjectId,
+        request: IllustrationCandidateDiscard,
+    ) -> IllustrationCandidateMutationProjection:
+        return await self._mutate_candidate_state(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            expected_revision=request.expected_revision,
+            operation="discard",
+            reason=request.reason,
+        )
+
+    async def restore_candidate(
+        self,
+        *,
+        owner_id: str | ObjectId,
+        novel_id: str | ObjectId,
+        run_id: str | ObjectId | None = None,
+        asset_id: str | ObjectId,
+        request: IllustrationCandidateRestore,
+    ) -> IllustrationCandidateMutationProjection:
+        return await self._mutate_candidate_state(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            run_id=run_id,
+            asset_id=asset_id,
+            expected_revision=request.expected_revision,
+            operation="restore",
+        )
+
     async def select_candidate(
         self,
         *,
@@ -1227,8 +1738,24 @@ class IllustrationStageService:
     ) -> IllustrationCandidateSelectionProjection:
         owner = _canonical_id(owner_id, field_name="owner_id")
         novel = _canonical_id(novel_id, field_name="novel_id")
-        run_key = _canonical_id(run_id, field_name="run_id")
         asset_key = _canonical_id(asset_id, field_name="asset_id")
+        if run_id is None:
+            asset_document = await self._assets.get_owned_by_id(
+                owner_id=owner,
+                asset_id=asset_key,
+            )
+            if (
+                asset_document is None
+                or str(asset_document.get("novel_id") or "") != str(novel)
+                or asset_document.get("illustration_run_id") is None
+            ):
+                raise NotFoundError("Illustration candidate was not found")
+            run_key = _canonical_id(
+                asset_document["illustration_run_id"],
+                field_name="illustration_run_id",
+            )
+        else:
+            run_key = _canonical_id(run_id, field_name="run_id")
         initial = await self._get_run(
             owner_id=owner,
             novel_id=novel,
@@ -1239,7 +1766,7 @@ class IllustrationStageService:
                 "Illustration run revision is stale"
             )
         candidate = None
-        candidate_stage: Literal["compose", "identity_edit"] | None = None
+        candidate_stage: Literal["compose", "identity_edit", "refine"] | None = None
         for current_stage in self._candidate_stages(initial):
             candidate = await self._assets.get_owned_stage_candidate(
                 owner_id=owner,
@@ -1327,13 +1854,18 @@ illustration_stage_service = IllustrationStageService()
 
 __all__ = [
     "IdentityEditInstruction",
+    "IllustrationCandidateDiscard",
     "IllustrationCandidateListProjection",
+    "IllustrationCandidateMutationProjection",
+    "IllustrationCandidateRestore",
     "IllustrationCandidateProjection",
     "IllustrationCandidateSelect",
     "IllustrationCandidateSelectionProjection",
+    "IllustrationExternalEditImport",
     "IllustrationStageAdvance",
     "IllustrationStageJobProjection",
     "IllustrationStageService",
     "IllustrationStageStart",
+    "RefineInstruction",
     "illustration_stage_service",
 ]

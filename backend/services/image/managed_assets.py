@@ -208,15 +208,28 @@ class GeneratedImageAssetCreate(_AssetCommand):
 
 class ImportedImageAssetCreate(_AssetCommand):
     source: Literal["imported"] = "imported"
+    external_import_target_stage: Literal[
+        "compose",
+        "identity_edit",
+        "refine",
+    ] | None = None
 
     @model_validator(mode="after")
     def validate_external_import_stage(self) -> "ImportedImageAssetCreate":
-        if (
-            self.illustration_lineage is not None
-            and self.illustration_lineage.pipeline_stage != "external_import"
-        ):
+        lineage = self.illustration_lineage
+        if lineage is None:
+            if self.external_import_target_stage is not None:
+                raise ValueError(
+                    "external_import_target_stage requires staged lineage"
+                )
+            return self
+        if lineage.pipeline_stage != "external_import":
             raise ValueError(
                 "staged imported assets require external_import stage"
+            )
+        if self.external_import_target_stage is None:
+            raise ValueError(
+                "staged imported assets require external_import_target_stage"
             )
         return self
 
@@ -249,6 +262,11 @@ class ImageAssetRecord(BaseModel):
     illustration_brief_id: str | None = None
     illustration_run_id: str | None = None
     pipeline_stage: IllustrationPipelineStage | None = None
+    external_import_target_stage: Literal[
+        "compose",
+        "identity_edit",
+        "refine",
+    ] | None = None
     derived_from_asset_id: str | None = None
     candidate_state: IllustrationCandidateState | None = None
     discarded_at: datetime | None = None
@@ -499,6 +517,9 @@ class ManagedImageAssetService:
                 else None
             ),
             pipeline_stage=document.get("pipeline_stage"),
+            external_import_target_stage=document.get(
+                "external_import_target_stage"
+            ),
             derived_from_asset_id=(
                 str(document["derived_from_asset_id"])
                 if document.get("derived_from_asset_id") is not None
@@ -615,6 +636,13 @@ class ManagedImageAssetService:
                     "discard_reason": None,
                 }
             )
+            if (
+                isinstance(command, ImportedImageAssetCreate)
+                and command.external_import_target_stage is not None
+            ):
+                document["external_import_target_stage"] = (
+                    command.external_import_target_stage
+                )
             if lineage.get("derived_from_asset_id") is not None:
                 document["derived_from_asset_id"] = to_object_id(
                     lineage["derived_from_asset_id"]
