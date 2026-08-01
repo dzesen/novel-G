@@ -1,4 +1,4 @@
-"""Owner-scoped staged illustration run and compose endpoints."""
+"""Owner-scoped staged illustration run and stage endpoints."""
 
 from __future__ import annotations
 
@@ -9,6 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.services.auth.identity_service import Actor
+from backend.services.image.illustration_readiness_service import (
+    IllustrationReadinessReport,
+    IllustrationReadinessService,
+    illustration_readiness_service,
+)
 from backend.services.image.illustration_run_service import (
     IllustrationRunActiveConflict,
     IllustrationRunCreate,
@@ -22,6 +27,7 @@ from backend.services.image.illustration_stage_service import (
     IllustrationCandidateListProjection,
     IllustrationCandidateSelect,
     IllustrationCandidateSelectionProjection,
+    IllustrationStageAdvance,
     IllustrationStageJobProjection,
     IllustrationStageService,
     IllustrationStageStart,
@@ -30,6 +36,10 @@ from backend.services.image.illustration_stage_service import (
 
 
 router = APIRouter(tags=["illustration-runs"])
+
+
+def get_illustration_readiness_service() -> IllustrationReadinessService:
+    return illustration_readiness_service
 
 
 def get_illustration_run_service() -> IllustrationRunService:
@@ -188,7 +198,7 @@ async def cancel_illustration_stage_job(
 async def list_illustration_candidates(
     novel_id: str,
     run_id: str,
-    stage: Literal["compose"] = Query(default="compose"),
+    stage: Literal["compose", "identity_edit"] = Query(default="compose"),
     actor: Actor = Depends(require_owned_path_resource),
     service: IllustrationStageService = Depends(get_illustration_stage_service),
 ) -> IllustrationCandidateListProjection:
@@ -230,7 +240,60 @@ async def select_illustration_candidate(
         raise _translate_error(error) from error
 
 
+
+@router.get(
+    "/api/novels/{novel_id}/illustration-runs/{run_id}/readiness",
+    response_model=IllustrationReadinessReport,
+)
+async def inspect_illustration_readiness(
+    novel_id: str,
+    run_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: IllustrationReadinessService = Depends(
+        get_illustration_readiness_service
+    ),
+) -> IllustrationReadinessReport:
+    try:
+        return await service.inspect(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            run_id=run_id,
+        )
+    except Exception as error:
+        raise _translate_error(error) from error
+
+
+@router.post(
+    (
+        "/api/novels/{novel_id}/illustration-runs/{run_id}/"
+        "stages/{stage}/advance"
+    ),
+    response_model=IllustrationRunProjection,
+)
+async def advance_illustration_stage(
+    novel_id: str,
+    run_id: str,
+    stage: str,
+    request: IllustrationStageAdvance,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: IllustrationStageService = Depends(
+        get_illustration_stage_service
+    ),
+) -> IllustrationRunProjection:
+    try:
+        return await service.advance_stage(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            run_id=run_id,
+            stage=stage,
+            request=request,
+        )
+    except Exception as error:
+        raise _translate_error(error) from error
+
+
 __all__ = [
+    "get_illustration_readiness_service",
     "get_illustration_run_service",
     "get_illustration_stage_service",
     "router",

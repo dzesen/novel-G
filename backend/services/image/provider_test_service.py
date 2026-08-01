@@ -17,6 +17,9 @@ from backend.services.image.comfyui_client import (
     ComfyUIClient,
     ComfyUIProtocolError,
 )
+from backend.services.image.comfyui_provider import (
+    build_comfyui_runtime_fingerprint,
+)
 from backend.services.image.comfyui_failures import execution_failed_failure
 from backend.services.image.comfyui_template import (
     LoadedComfyUITemplate,
@@ -27,6 +30,7 @@ from backend.services.image.contracts import (
     ImageFailureCode,
     ImageProviderError,
 )
+from backend.services.novel.appearance_anchor import RuntimeFingerprintSchema
 
 
 ControlScalar = str | int | float | bool | None
@@ -91,6 +95,9 @@ class ImageProviderTestResponse(BaseModel):
     lora_names: tuple[str, ...] = ()
     workflow_inputs: tuple[ImageProviderWorkflowInput, ...] = ()
     dependency_checks: tuple[ImageProviderDependencyCheck, ...] = ()
+    runtime_fingerprint: RuntimeFingerprintSchema = Field(
+        default_factory=RuntimeFingerprintSchema
+    )
     failure: ImageFailure | None = None
 
 
@@ -384,6 +391,7 @@ async def test_image_provider_connection(
     lora_names: tuple[str, ...] = ()
     workflow_inputs: tuple[ImageProviderWorkflowInput, ...] = ()
     dependency_checks: tuple[ImageProviderDependencyCheck, ...] = ()
+    runtime_fingerprint = RuntimeFingerprintSchema()
     try:
         probe_workflow = provider.workflow.model_copy(update={"template_revision": ""})
         probe_provider = provider.model_copy(update={"workflow": probe_workflow})
@@ -409,6 +417,12 @@ async def test_image_provider_connection(
         available_checkpoints = await active_client.get_model_names("checkpoints")
         available_loras = await active_client.get_model_names("loras")
         workflow_inputs = _workflow_input_controls(loaded, probe_provider, object_info)
+        runtime_fingerprint = build_comfyui_runtime_fingerprint(
+            system_stats,
+            checkpoint_names=checkpoint_names,
+            lora_names=lora_names,
+            workflow_graph_hash=effective_graph_hash,
+        )
         dependencies = provider.workflow.dependencies
         required_node_types = [
             str(node["class_type"])
@@ -448,6 +462,7 @@ async def test_image_provider_connection(
                 lora_names=lora_names,
                 workflow_inputs=workflow_inputs,
                 dependency_checks=dependency_checks,
+                runtime_fingerprint=runtime_fingerprint,
                 failure=dependency_failure,
             )
 
@@ -465,6 +480,7 @@ async def test_image_provider_connection(
             lora_names=lora_names,
             workflow_inputs=workflow_inputs,
             dependency_checks=dependency_checks,
+            runtime_fingerprint=runtime_fingerprint,
         )
     except ImageProviderError as error:
         return ImageProviderTestResponse(
@@ -481,6 +497,7 @@ async def test_image_provider_connection(
             lora_names=lora_names,
             workflow_inputs=workflow_inputs,
             dependency_checks=dependency_checks,
+            runtime_fingerprint=runtime_fingerprint,
             failure=error.failure,
         )
     except ComfyUIProtocolError:
@@ -502,6 +519,7 @@ async def test_image_provider_connection(
             lora_names=lora_names,
             workflow_inputs=workflow_inputs,
             dependency_checks=dependency_checks,
+            runtime_fingerprint=runtime_fingerprint,
             failure=failure,
         )
     finally:
