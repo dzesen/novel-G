@@ -712,6 +712,55 @@ async def init_illustration_brief_indexes():
         raise
 
 
+async def init_illustration_run_indexes():
+    """Initialize staged-run scope, active uniqueness, and lineage indexes."""
+
+    try:
+        collection = get_database()[collections.ILLUSTRATION_RUNS]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("illustration_brief_id", pymongo.ASCENDING),
+                ],
+                unique=True,
+                partialFilterExpression={
+                    "status": "active",
+                    "is_deleted": False,
+                },
+                name="illustration_runs_owner_novel_brief_active",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("chapter_id", pymongo.ASCENDING),
+                    ("illustration_brief_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                name="illustration_runs_owner_novel_chapter_brief_created",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("novel_id", pymongo.ASCENDING),
+                    ("parent_run_id", pymongo.ASCENDING),
+                ],
+                partialFilterExpression={
+                    "parent_run_id": {"$type": "objectId"}
+                },
+                name="illustration_runs_novel_parent",
+            ),
+        ])
+        logger.info("Initialized illustration_runs indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize illustration_runs indexes: %s", exc)
+        # Concurrent first writes rely on the partial unique index. Starting
+        # without it would allow two active runs for one formal brief.
+        raise
+
+
+
 async def init_image_job_indexes():
     """Initialize durable image-job ownership, resume, and idempotency indexes."""
     try:
@@ -939,6 +988,7 @@ async def init_all_indexes():
     await init_image_asset_indexes()
     await init_character_visual_profile_indexes()
     await init_illustration_brief_indexes()
+    await init_illustration_run_indexes()
     await init_image_job_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

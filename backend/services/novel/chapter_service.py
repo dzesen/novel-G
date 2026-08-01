@@ -760,6 +760,20 @@ class ChapterService:
                 "prose_runs",
                 {"chapter_id": chapter_id, "deleted": deleted_runs},
             )
+        if not mutation.was_received("illustration_runs"):
+            deleted_illustration_runs = await BaseRepository(
+                collections.ILLUSTRATION_RUNS
+            ).hard_delete_many(
+                {"chapter_id": to_object_id(chapter_id)},
+                session=session,
+            )
+            await mutation.receipt(
+                "illustration_runs",
+                {
+                    "chapter_id": chapter_id,
+                    "deleted": deleted_illustration_runs,
+                },
+            )
         if not mutation.was_received("illustration_briefs"):
             deleted_briefs = await BaseRepository(
                 collections.ILLUSTRATION_BRIEFS

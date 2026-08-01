@@ -595,6 +595,29 @@ class VolumeService:
                 or 0
             )
 
+        deleted_illustration_runs = 0
+        if not mutation.was_received("illustration_runs"):
+            if chapter_ids:
+                deleted_illustration_runs = await BaseRepository(
+                    collections.ILLUSTRATION_RUNS
+                ).hard_delete_many(
+                    {"chapter_id": {"$in": chapter_ids}},
+                    session=session,
+                )
+            await mutation.receipt(
+                "illustration_runs",
+                {"deleted": deleted_illustration_runs},
+            )
+        else:
+            deleted_illustration_runs = int(
+                (
+                    (mutation.journal.get("receipts") or {}).get(
+                        "illustration_runs"
+                    )
+                    or {}
+                ).get("deleted")
+                or 0
+            )
         deleted_briefs = 0
         if not mutation.was_received("illustration_briefs"):
             if chapter_ids:
@@ -634,6 +657,7 @@ class VolumeService:
         return {
             "chapters_deleted": int(command["chapter_count"]),
             "prose_runs_deleted": deleted_runs,
+            "illustration_runs_deleted": deleted_illustration_runs,
             "illustration_briefs_deleted": deleted_briefs,
             "volume_deleted": 1,
         }
