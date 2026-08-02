@@ -4,6 +4,7 @@ import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./batchTypes";
 import { buildChapterPresentation } from "./batchPresentation";
+import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 
 interface CheckpointReviewProps {
   job: GenerationJob;
@@ -16,16 +17,20 @@ interface CheckpointReviewProps {
   onAbort: () => void;
   busy: boolean;
   controlError: string | null;
+  onOpenGenerationRuns: () => void;
 }
 
 function Banner({ job }: { job: GenerationJob }) {
   const t = useTranslations("writing.batch");
+  const hasStructuredDiagnostic = Boolean(job.diagnostics?.length);
   if (job.status === "failed") {
     const e = job.error;
     return (
       <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
         <span className="font-medium">{t("failedTitle")}</span>
-        {e && <span className="ml-1">{t("failedBody", { step: e.step, message: e.message })}</span>}
+        {hasStructuredDiagnostic
+          ? <span className="ml-1">{t("failedStructuredBody")}</span>
+          : e && <span className="ml-1">{t("failedBody", { step: e.step, message: e.message })}</span>}
       </div>
     );
   }
@@ -33,6 +38,13 @@ function Banner({ job }: { job: GenerationJob }) {
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
         {t("reasonInterrupted")}
+      </div>
+    );
+  }
+  if (job.pause_reason === "source_changed") {
+    return (
+      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
+        {t("reasonSourceChanged")}
       </div>
     );
   }
@@ -230,16 +242,21 @@ export default function CheckpointReview({
   onAbort,
   busy,
   controlError,
+  onOpenGenerationRuns,
 }: CheckpointReviewProps) {
   const t = useTranslations("writing.batch");
   const reviewWindow = checkpointWindow(job);
   const hasUncertainAttempt = job.has_uncertain_attempts || job.pause_reason === "uncertain_attempt";
 
+  const latestDiagnostic = job.diagnostics?.[
+    Math.max(0, (job.diagnostics?.length ?? 1) - 1)
+  ];
+
   return (
     <div className="grid gap-3 border-b border-border bg-surface-secondary/40 px-4 py-3">
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <h3 className="text-sm font-semibold text-foreground">{t("reviewTitle")}</h3>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" size="sm" onPress={onAbort} isDisabled={busy}>
             {t("abort")}
           </Button>
@@ -270,7 +287,9 @@ export default function CheckpointReview({
                 ? t("resuming")
                 : job.pause_reason === "outline_deviation"
                   ? t("resumeAfterRewrite")
-                  : t("resume")}
+                  : job.pause_reason === "source_changed"
+                    ? t("resumeAfterSourceChange")
+                    : t("resume")}
             </Button>
           )}
         </div>
@@ -282,6 +301,23 @@ export default function CheckpointReview({
           {t("controlError", { message: controlError })}
         </div>
       )}
+      {latestDiagnostic && (
+        <div className="rounded-md border border-border bg-background px-3 py-2">
+          <p className="mb-1 text-xs font-semibold text-foreground">
+            {t("diagnosticsCurrentTitle")}
+          </p>
+          <DiagnosticEventSummary event={latestDiagnostic} />
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={onOpenGenerationRuns}
+        className="justify-self-start text-xs font-medium text-accent hover:underline"
+      >
+        {latestDiagnostic
+          ? t("generationRunsOpenDiagnostic")
+          : t("generationRunsOpen")}
+      </button>
       {hasUncertainAttempt && (
         <p className="text-xs leading-5 text-amber-700 dark:text-amber-300">
           {t("uncertainDetail")}

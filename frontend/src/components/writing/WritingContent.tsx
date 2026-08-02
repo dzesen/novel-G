@@ -8,6 +8,7 @@ import WritingSidebar from "./WritingSidebar";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
 import FactionCardsWorkspace from "./factions/FactionCardsWorkspace";
 import ChapterWorkspace from "./chapters/ChapterWorkspace";
+import type { GenerationRunsNavigationTarget } from "./chapters/batch/batchTypes";
 import ReferenceCardsDestination from "./reference-cards/ReferenceCardsDestination";
 import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
 import PlotThreadWorkspace from "./plot-threads/PlotThreadWorkspace";
@@ -46,6 +47,13 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       : null;
   const requestedCardCuration =
     mode === "edit" && searchParams.get("curateCards") === "1";
+  const requestedGenerationRuns =
+    mode === "edit" && searchParams.get("view") === "generation-runs";
+  const requestedGenerationRunsTarget: GenerationRunsNavigationTarget = {
+    jobId: searchParams.get("job") || undefined,
+    chapterId: searchParams.get("chapter") || undefined,
+    eventId: searchParams.get("event") || undefined,
+  };
   const [openCardCuration, setOpenCardCuration] = useState(requestedCardCuration);
   const [activeItem, setActiveItem] =
     useState<NonReferenceSidebarItem>("novel-info");
@@ -53,7 +61,8 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     useState<ContinuityEvidenceReference | null>(null);
   const referenceCardType = requestedCardType ?? "character";
   const resolvedActiveItem: WritingSidebarItem =
-    requestedCardCuration || requestedCardType
+    requestedGenerationRuns ? "chapter-editor"
+      : requestedCardCuration || requestedCardType
       ? "reference-cards"
       : activeItem;
 
@@ -77,23 +86,73 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     [pathname],
   );
 
+  const replaceGenerationRunsQuery = useCallback(
+    (target: GenerationRunsNavigationTarget | null) => {
+      const currentSearch = window.location.search.replace(/^\?/, "");
+      const next = new URLSearchParams(currentSearch);
+      if (target) {
+        next.set("view", "generation-runs");
+        if (target.jobId) next.set("job", target.jobId);
+        else next.delete("job");
+        if (target.chapterId) next.set("chapter", target.chapterId);
+        else next.delete("chapter");
+        if (target.eventId) next.set("event", target.eventId);
+        else next.delete("event");
+      } else {
+        next.delete("view");
+        next.delete("job");
+        next.delete("chapter");
+        next.delete("event");
+      }
+
+      const nextSearch = next.toString();
+      const nextHref = nextSearch ? `${pathname}?${nextSearch}` : pathname;
+      const currentHref = currentSearch
+        ? `${pathname}?${currentSearch}`
+        : pathname;
+      if (nextHref !== currentHref) {
+        window.history.replaceState(null, "", nextHref);
+      }
+    },
+    [pathname],
+  );
+
   const navigateToWorkspace = useCallback(
     (item: NonReferenceSidebarItem) => {
       setEvidenceReference(null);
       setOpenCardCuration(false);
       setActiveItem(item);
       replaceCardTypeQuery(null);
+      replaceGenerationRunsQuery(null);
     },
-    [replaceCardTypeQuery],
+    [replaceCardTypeQuery, replaceGenerationRunsQuery],
   );
+
+  const navigateToGenerationRuns = useCallback(
+    (target: GenerationRunsNavigationTarget = {}) => {
+      setEvidenceReference(null);
+      setOpenCardCuration(false);
+      setActiveItem("chapter-editor");
+      replaceCardTypeQuery(null);
+      replaceGenerationRunsQuery(target);
+    },
+    [replaceCardTypeQuery, replaceGenerationRunsQuery],
+  );
+
+  const closeGenerationRuns = useCallback(() => {
+    setActiveItem("chapter-editor");
+    replaceCardTypeQuery(null);
+    replaceGenerationRunsQuery(null);
+  }, [replaceCardTypeQuery, replaceGenerationRunsQuery]);
 
   const navigateToReferenceCards = useCallback(
     (cardType: ReferenceCardType, openCuration = false) => {
       setEvidenceReference(null);
       setOpenCardCuration(openCuration);
       replaceCardTypeQuery(cardType);
+      replaceGenerationRunsQuery(null);
     },
-    [replaceCardTypeQuery],
+    [replaceCardTypeQuery, replaceGenerationRunsQuery],
   );
 
   useEffect(() => {
@@ -124,6 +183,10 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           }
           initialChapterId={evidenceReference?.chapter_id}
           initialSceneIndex={evidenceReference?.scene_index}
+          generationRunsOpen={requestedGenerationRuns}
+          generationRunsTarget={requestedGenerationRunsTarget}
+          onOpenGenerationRuns={navigateToGenerationRuns}
+          onCloseGenerationRuns={closeGenerationRuns}
         />
       );
     }

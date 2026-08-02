@@ -12,6 +12,8 @@ import type {
 import ChapterEditorPane, { type ChapterSaveState } from "./ChapterEditorPane";
 import ChapterNavigator from "./ChapterNavigator";
 import BatchGenerationPanel from "./batch/BatchGenerationPanel";
+import GenerationRunsWorkspace from "./batch/GenerationRunsWorkspace";
+import type { GenerationRunsNavigationTarget } from "./batch/batchTypes";
 import {
   chapterToDraft,
   clearLocalChapterDraft,
@@ -36,6 +38,10 @@ interface ChapterWorkspaceProps {
   onNavigateToReferenceCards: () => void;
   initialChapterId?: string;
   initialSceneIndex?: number;
+  generationRunsOpen?: boolean;
+  generationRunsTarget?: GenerationRunsNavigationTarget;
+  onOpenGenerationRuns: (target?: GenerationRunsNavigationTarget) => void;
+  onCloseGenerationRuns: () => void;
 }
 
 interface ListResponse<T> {
@@ -49,6 +55,10 @@ export default function ChapterWorkspace({
   onNavigateToReferenceCards,
   initialChapterId,
   initialSceneIndex,
+  generationRunsOpen = false,
+  generationRunsTarget = {},
+  onOpenGenerationRuns,
+  onCloseGenerationRuns,
 }: ChapterWorkspaceProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
@@ -596,6 +606,33 @@ export default function ChapterWorkspace({
     );
   }
 
+  if (generationRunsOpen) {
+    return (
+      <GenerationRunsWorkspace
+        novelId={novelId}
+        chapters={chapters}
+        chaptersLoading={structureLoading}
+        volumes={volumes}
+        target={generationRunsTarget}
+        proseRunsRevision={proseRunsRevision}
+        onNavigate={onOpenGenerationRuns}
+        onClose={onCloseGenerationRuns}
+        onJumpToChapter={(chapterId) => {
+          onCloseGenerationRuns();
+          selectChapter(chapterId);
+        }}
+        onOpenProseRun={(run) => {
+          onCloseGenerationRuns();
+          queueProsePanel(run.chapter_id, run);
+        }}
+        onStartFreshProse={(chapterId) => {
+          onCloseGenerationRuns();
+          queueProsePanel(chapterId, null);
+        }}
+      />
+    );
+  }
+
   return (
     <div className="relative flex h-full min-h-0 flex-col lg:flex-row">
       <ChapterNavigator
@@ -635,6 +672,7 @@ export default function ChapterWorkspace({
           proseRunsRevision={proseRunsRevision}
           onOpenProseRun={(run) => queueProsePanel(run.chapter_id, run)}
           onStartFreshProse={(chapterId) => queueProsePanel(chapterId, null)}
+          onOpenGenerationRuns={onOpenGenerationRuns}
         />
         <ChapterEditorPane
           chapterId={selectedChapterId}

@@ -7,6 +7,7 @@ import { apiGet, apiPost } from "@/lib/api";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
   type GenerationJob,
+  type GenerationRunsNavigationTarget,
   type LeftoverProseRun,
   isActive,
   isResumable,
@@ -32,6 +33,7 @@ interface BatchGenerationPanelProps {
   proseRunsRevision: number;
   onOpenProseRun: (run: LeftoverProseRun) => void;
   onStartFreshProse: (chapterId: string) => void;
+  onOpenGenerationRuns: (target?: GenerationRunsNavigationTarget) => void;
 }
 
 export default function BatchGenerationPanel({
@@ -48,6 +50,7 @@ export default function BatchGenerationPanel({
   proseRunsRevision,
   onOpenProseRun,
   onStartFreshProse,
+  onOpenGenerationRuns,
 }: BatchGenerationPanelProps) {
   const t = useTranslations("writing.batch");
   const { job, error: pollError, setJob } = useGenerationJob({ onProgress: onQuietRefresh });
@@ -55,6 +58,7 @@ export default function BatchGenerationPanel({
   const [controlError, setControlError] = useState<string | null>(null);
   const [abortConfirm, setAbortConfirm] = useState(false);
   const [dismissed, setDismissed] = useState<string | null>(null); // 已关闭的终态作业 id
+
 
   // 发现：挂载时列小说作业，收养最近的非终态作业（设计 §5.1）。
   useEffect(() => {
@@ -129,6 +133,30 @@ export default function BatchGenerationPanel({
       />
     ) : null;
 
+  const generationRunsEntry = (
+    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-surface px-4 py-2.5">
+      <p className="min-w-0 text-xs leading-5 text-muted">
+        {job?.diagnostics?.length || job?.error || job?.pause_reason === "incomplete_scene"
+          ? t("generationRunsExceptionEntry")
+          : t("generationRunsEntryDescription")}
+      </p>
+      <button
+        type="button"
+        onClick={() => onOpenGenerationRuns(
+          job
+            ? {
+                jobId: job._id,
+                chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
+              }
+            : {},
+        )}
+        className="shrink-0 text-xs font-medium text-accent hover:underline"
+      >
+        {t("generationRunsOpen")}
+      </button>
+    </div>
+  );
+
   const leftoverPanel = (
     <LeftoverProseRuns
       key={novelId}
@@ -150,6 +178,7 @@ export default function BatchGenerationPanel({
       <>
         {dialog}
         {leftoverPanel}
+        {generationRunsEntry}
       </>
     );
   }
@@ -169,6 +198,7 @@ export default function BatchGenerationPanel({
     <>
       {dialog}
       {leftoverPanel}
+      {generationRunsEntry}
 
       <div className="shrink-0 border-b border-border">
         {isActive(job.status) && (
@@ -225,6 +255,10 @@ export default function BatchGenerationPanel({
             onAbort={() => setAbortConfirm(true)}
             busy={controlBusy}
             controlError={controlError}
+            onOpenGenerationRuns={() => onOpenGenerationRuns({
+              jobId: job._id,
+              chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
+            })}
           />
         )}
 
