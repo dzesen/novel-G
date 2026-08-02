@@ -569,7 +569,7 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
 
 
-def build_roster(cards: dict, worldbook_cards: dict, threads: list) -> dict:
+def build_roster(cards: dict, worldbook_cards: dict, threads: list, chapters=()) -> dict:
     """由已取到的卡片/伏笔构造 roster（AI 可选中的 id 名单）。纯函数，无 IO。
 
     抽成共享函数是因为它有**两个**调用方：预览侧的 fetch_context_inputs（用它
@@ -605,10 +605,34 @@ def build_roster(cards: dict, worldbook_cards: dict, threads: list) -> dict:
             {"id": thread["_id"], "name": thread["name"], "brief": thread.get("description", "")}
             for thread in threads
         ],
+        "chapters": [dict(chapter) for chapter in chapters],
     }
 
 
-async def fetch_roster(novel_id: str) -> dict:
+def _chapter_roster_entries(
+    timeline: ChapterTimeline,
+    chapter_by_id: dict[str, dict],
+    *,
+    after_chapter_id: str | None,
+) -> list[dict]:
+    positions = timeline.positions
+    if after_chapter_id is not None:
+        target = timeline.position(after_chapter_id)
+        positions = tuple(position for position in positions if position > target)
+    return [
+        {
+            "id": position.chapter_id,
+            "name": (
+                chapter_by_id[position.chapter_id].get("title")
+                or position.label
+            ),
+            "brief": position.label,
+        }
+        for position in positions
+    ]
+
+
+async def fetch_roster(novel_id: str, after_chapter_id: str | None = None) -> dict:
     """只取 roster 所需的数据并构造 roster（accept 侧的 id 存在性校验用）。
 
     伏笔只取 ACTIVE_THREAD_STATUSES，与 fetch_context_inputs 一致——accept 侧
@@ -643,7 +667,17 @@ async def fetch_roster(novel_id: str) -> dict:
         for thread in thread_docs
     ]
 
-    return build_roster(cards, worldbook_cards, threads)
+    volume_docs = await volume_repo.get_volumes_by_novel(novel_id)
+    chapter_docs = await chapter_repo.get_chapters_by_novel(novel_id)
+    timeline = ChapterTimeline(volume_docs, chapter_docs)
+    chapter_by_id = {str(chapter["_id"]): chapter for chapter in chapter_docs}
+    chapters = _chapter_roster_entries(
+        timeline,
+        chapter_by_id,
+        after_chapter_id=after_chapter_id,
+    )
+
+    return build_roster(cards, worldbook_cards, threads, chapters)
 
 
 def _roster_section(roster: dict) -> ContextSection:
@@ -664,6 +698,13 @@ def _roster_section(roster: dict) -> ContextSection:
             alias_text = f"（别名：{aliases}）" if aliases else ""
             lines.append(
                 f"- id={e['id']} {e['name']}{alias_text}：{e.get('brief', '')}"
+            )
+    chapter_entries = roster.get("chapters") or []
+    if chapter_entries:
+        lines.append("【章节】可用 id 名单（仅可填写这些正式 id，不得填写名称）：")
+        for entry in chapter_entries:
+            lines.append(
+                f"- id={entry['id']} {entry['name']}：{entry.get('brief', '')}"
             )
     return _blob("roster", "\n".join(lines))
 
@@ -849,6 +890,7 @@ def outline_selection_roster(
             if str(item.get("id") or "") in allowed
         ],
         "threads": list(roster.get("threads") or []),
+        "chapters": list(roster.get("chapters") or []),
     }
 
 
@@ -1128,7 +1170,12 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
     # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。
     # 形状由 build_roster 统一定义，accept 侧的 fetch_roster 用同一个函数。
-    roster = build_roster(cards, worldbook_cards, threads)
+    chapter_roster = _chapter_roster_entries(
+        timeline,
+        chapter_by_id,
+        after_chapter_id=chapter_id,
+    )
+    roster = build_roster(cards, worldbook_cards, threads, chapter_roster)
 
     return {
         "novel": {

@@ -265,6 +265,9 @@ class VolumeOutlineResultSchema(BaseModel):
     )
 
 
+MAX_CHAPTER_OUTLINE_SCENES = 20
+
+
 class SceneSchema(BaseModel):
     """章内一场戏。"""
     model_config = ConfigDict(extra="forbid")
@@ -344,7 +347,12 @@ class ChapterOutlineAuthoredSchema(BaseModel):
             "（worldbook 集合，非 characters）"
         ),
     )
-    scenes: List[SceneSchema] = Field(..., min_length=1, max_length=20, description="本章场景序列")
+    scenes: List[SceneSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_CHAPTER_OUTLINE_SCENES,
+        description="本章场景序列",
+    )
     core_conflict: str = Field(..., min_length=1, max_length=500, description="本章核心冲突")
     ending_hook: str = Field(..., min_length=1, max_length=500, description="章末钩子")
     target_word_count: int = Field(..., ge=100, le=50000, description="本章目标字数")

@@ -81,7 +81,7 @@ def known_id_sets(roster: Dict[str, Any]) -> Dict[str, set]:
     """
     return {
         key: {str(entry["id"]) for entry in (roster.get(key) or [])}
-        for key in ("characters", "worldbook", "threads")
+        for key in ("characters", "worldbook", "threads", "chapters")
     }
 
 
@@ -125,5 +125,30 @@ def validate_outline_ids(
             if value is not None and str(value) not in valid:
                 dropped[field] = [str(value)]
                 cleaned[field] = None
+
+    new_threads = cleaned.get("new_threads")
+    if isinstance(new_threads, list):
+        copied_threads: list[Any] = []
+        for index, raw_thread in enumerate(new_threads):
+            if not isinstance(raw_thread, dict):
+                copied_threads.append(raw_thread)
+                continue
+            thread = dict(raw_thread)
+            raw_due_target = thread.get("due_target")
+            if isinstance(raw_due_target, dict):
+                due_target = dict(raw_due_target)
+                if due_target.get("kind") == "chapter":
+                    chapter_id = due_target.get("chapter_id")
+                    value = str(chapter_id) if chapter_id is not None else ""
+                    if value not in known["chapters"]:
+                        dropped[
+                            f"new_threads[{index}].due_target.chapter_id"
+                        ] = [value]
+                        thread["due_target"] = None
+                    else:
+                        due_target["chapter_id"] = value
+                        thread["due_target"] = due_target
+            copied_threads.append(thread)
+        cleaned["new_threads"] = copied_threads
 
     return cleaned, dropped

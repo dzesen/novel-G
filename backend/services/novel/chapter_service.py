@@ -460,7 +460,7 @@ class ChapterService:
         # 变化（如伏笔已被回收），那正该报错。
         # 这里 raise 而非 drop：accept 没有预览可上报，静默剔除会以"细纲莫名其妙
         # 少了一半人物"的形式无声通过——正是设计 §5.3 要防的那种降级。
-        roster = await fetch_roster(novel_id)
+        roster = await fetch_roster(novel_id, after_chapter_id=chapter_id)
         _cleaned, dropped = validate_outline_ids(payload, roster)
         if dropped:
             details = "；".join(
@@ -543,7 +543,7 @@ class ChapterService:
         novel_id = str(chapter["novel_id"])
 
         # 层 1b：id 存在性校验（raise 模式，与 accept 同一函数、同一 roster）。
-        roster = await fetch_roster(novel_id)
+        roster = await fetch_roster(novel_id, after_chapter_id=chapter_id)
         _cleaned, dropped = validate_outline_ids(payload, roster)
         if dropped:
             details = "；".join(
