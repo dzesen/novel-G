@@ -159,7 +159,6 @@ def _build_probe_request(prompt: str) -> LLMRequest:
     """
     return LLMRequest(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0,
         max_tokens=64,
     )
 

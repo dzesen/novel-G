@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel
 
 
 class WorkflowStepDefinition(BaseModel):
     name: str
     label_key: str
+    thinking_mode: Literal["enabled", "disabled"] | None = None
 
 
 class WorkflowDefinition(BaseModel):
@@ -61,7 +64,13 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
     WorkflowDefinition(
         name="write_chapter_by_ai",
         label_key="settings.workflow.catalog.write_chapter_by_ai",
-        steps=(WorkflowStepDefinition(name="chapter_content", label_key="settings.workflow.steps.chapter_content"),),
+        steps=(
+            WorkflowStepDefinition(
+                name="chapter_content",
+                label_key="settings.workflow.steps.chapter_content",
+                thinking_mode="disabled",
+            ),
+        ),
     ),
     WorkflowDefinition(
         name="extract_chapter_state_by_ai",
@@ -150,3 +159,18 @@ WORKFLOW_STEPS: dict[str, tuple[str, ...]] = {
     workflow.name: tuple(step.name for step in workflow.steps)
     for workflow in _WORKFLOW_CATALOG
 }
+
+WORKFLOW_STEP_DEFINITIONS: dict[
+    tuple[str, str], WorkflowStepDefinition
+] = {
+    (workflow.name, step.name): step
+    for workflow in _WORKFLOW_CATALOG
+    for step in workflow.steps
+}
+
+
+def get_workflow_step_definition(
+    workflow_name: str,
+    step_name: str,
+) -> WorkflowStepDefinition | None:
+    return WORKFLOW_STEP_DEFINITIONS.get((workflow_name, step_name))
