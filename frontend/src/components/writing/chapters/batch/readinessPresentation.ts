@@ -3,6 +3,7 @@ import type {
   OutlineDeviationPolicy,
 } from "./batchTypes.ts";
 
+import type { ProseContinuationPolicy } from "../prose/proseContinuation";
 interface StartPayloadInput {
   checkpointInterval: number;
   tokenBudget: number | null;
@@ -10,6 +11,7 @@ interface StartPayloadInput {
   acknowledgedCodes: Set<string>;
   outlineDeviationPolicy?: OutlineDeviationPolicy;
   generationParams?: Record<string, unknown>;
+  proseContinuationPolicy?: ProseContinuationPolicy;
 }
 
 export function readinessAllowsStart(
@@ -31,6 +33,7 @@ export function buildAuthorizedStartPayload({
   acknowledgedCodes,
   outlineDeviationPolicy = "pause_for_rewrite",
   generationParams = {},
+  proseContinuationPolicy,
 }: StartPayloadInput) {
   return {
     checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
@@ -39,5 +42,6 @@ export function buildAuthorizedStartPayload({
     acknowledged_warning_codes: [...acknowledgedCodes].sort(),
     outline_deviation_policy: outlineDeviationPolicy,
     ...generationParams,
+    ...(proseContinuationPolicy ? { prose_continuation_policy: proseContinuationPolicy } : {}),
   };
 }

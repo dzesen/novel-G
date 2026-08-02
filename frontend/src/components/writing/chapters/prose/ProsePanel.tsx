@@ -26,6 +26,14 @@ import {
   proseReasonTranslationKey,
   proseRequiresPartialAcknowledgement,
 } from "./prosePresentation";
+import ProseContinuationControls from "./ProseContinuationControls";
+import {
+  DEFAULT_PROSE_CONTINUATION_POLICY,
+  parsePositiveInteger,
+  permitsAutomaticContinuation,
+  type ProseContinuationPolicy,
+  type ProseReadiness,
+} from "./proseContinuation";
 
 interface ProsePanelProps {
   novelId: string;
@@ -54,6 +62,15 @@ export default function ProsePanel({
   const stream = useProseStream();
   const hydrateRun = stream.hydrate;
   const [params, setParams] = useState<GenerationParams>(EMPTY_GENERATION_PARAMS);
+  const [continuationPolicy, setContinuationPolicy] =
+    useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
+  const [continuationBudget, setContinuationBudget] = useState("");
+  const [continuationReadiness, setContinuationReadiness] = useState<ProseReadiness | null>(null);
+  const [continuationReadinessKey, setContinuationReadinessKey] = useState<string | null>(null);
+  const [continuationReadinessLoading, setContinuationReadinessLoading] = useState(false);
+  const [continuationReadinessError, setContinuationReadinessError] = useState("");
+  const [automaticContinuationsConfirmed, setAutomaticContinuationsConfirmed] = useState(false);
+
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const [partialArmed, setPartialArmed] = useState(false);
   const [uncertainRetryArmed, setUncertainRetryArmed] = useState(false);
@@ -87,10 +104,30 @@ export default function ProsePanel({
       ? selectedInitialRun.reason_codes
       : stream.completion?.reason_codes
   ) ?? [];
+  const automaticContinuationsEnabled = permitsAutomaticContinuation(
+    continuationPolicy,
+  );
+  const continuationBudgetValue = parsePositiveInteger(continuationBudget);
+  const continuationConfigurationKey = JSON.stringify({
+    policy: continuationPolicy,
+    tokenBudget: continuationBudgetValue,
+    generationParams: params,
+    resumeRunId: resumableDraft ? stream.runId : null,
+    expectedRunRevision: resumableDraft ? stream.runRevision : null,
+  });
+  const continuationReadinessIsCurrent = Boolean(continuationReadiness)
+    && continuationReadinessKey === continuationConfigurationKey;
 
   useEffect(() => {
     setInitialRunResolved(false);
   }, [initialRun?.run_id, initialRun?._id]);
+
+  useEffect(() => {
+    setContinuationReadiness(null);
+    setContinuationReadinessKey(null);
+    setContinuationReadinessError("");
+    setAutomaticContinuationsConfirmed(false);
+  }, [continuationConfigurationKey]);
 
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement
@@ -182,7 +219,59 @@ export default function ProsePanel({
     }
   };
 
-  const startGeneration = () => {
+  const inspectContinuationReadiness = useCallback(async (): Promise<boolean> => {
+    if (!automaticContinuationsEnabled) return true;
+    if (!continuationBudgetValue) {
+      setContinuationReadinessError(t("continuationBudgetMissing"));
+      return false;
+    }
+    setContinuationReadinessLoading(true);
+    setContinuationReadinessError("");
+    try {
+      const report = await apiPost<ProseReadiness>(
+        "/api/llm/write-chapter-by-ai/readiness",
+        {
+          novel_id: novelId,
+          chapter_id: chapterId,
+          ...(resumableDraft
+            ? {
+                resume_run_id: stream.runId,
+                expected_run_revision: stream.runRevision,
+              }
+            : {}),
+          prose_continuation_policy: continuationPolicy,
+          token_budget: continuationBudgetValue,
+          ...toRequestParams(params),
+        },
+      );
+      setContinuationReadiness(report);
+      setContinuationReadinessKey(continuationConfigurationKey);
+      return true;
+    } catch (error) {
+      setContinuationReadiness(null);
+      setContinuationReadinessKey(null);
+      setContinuationReadinessError(
+        error instanceof Error ? error.message : String(error),
+      );
+      return false;
+    } finally {
+      setContinuationReadinessLoading(false);
+    }
+  }, [
+    automaticContinuationsEnabled,
+    chapterId,
+    continuationBudgetValue,
+    continuationConfigurationKey,
+    continuationPolicy,
+    novelId,
+    params,
+    resumableDraft,
+    stream.runId,
+    stream.runRevision,
+    t,
+  ]);
+
+  const startGeneration = async () => {
     // 保险栓在每次重新生成时复位：上一份预览已被新的一轮取代，
     // 针对它的确认不该延续到下一份（2a Task 7 就栽在栓不复位上）。
     setOverwriteArmed(false);
@@ -192,6 +281,24 @@ export default function ProsePanel({
       return;
     }
     const resuming = resumableDraft;
+    if (automaticContinuationsEnabled) {
+      if (!continuationBudgetValue) {
+        setContinuationReadinessError(t("continuationBudgetMissing"));
+        return;
+      }
+      if (!continuationReadinessIsCurrent) {
+        await inspectContinuationReadiness();
+        return;
+      }
+      if (!continuationReadiness?.token_bound_known) {
+        setContinuationReadinessError(t("continuationTokenBoundMissing"));
+        return;
+      }
+      if (!automaticContinuationsConfirmed) {
+        setContinuationReadinessError(t("continuationConfirmationMissing"));
+        return;
+      }
+    }
     if (resuming && stream.hasUncertainAttempt && !uncertainRetryArmed) {
       setUncertainRetryArmed(true);
       return;
@@ -202,6 +309,7 @@ export default function ProsePanel({
     setUncertainRetryArmed(false);
     setActionError("");
     if (selectedInitialRun) setInitialRunResolved(true);
+    setContinuationReadinessError("");
     void stream.start({
       novel_id: novelId,
       chapter_id: chapterId,
@@ -213,6 +321,14 @@ export default function ProsePanel({
           }
         : {}),
       ...toRequestParams(params),
+      prose_continuation_policy: continuationPolicy,
+      ...(automaticContinuationsEnabled
+        ? {
+            token_budget: continuationBudgetValue,
+            readiness_digest: continuationReadiness?.authorization.readiness_digest,
+            confirm_automatic_continuations: true,
+          }
+        : {}),
     });
   };
 
@@ -318,11 +434,12 @@ export default function ProsePanel({
                 variant="primary"
                 size="sm"
                 className="bg-accent text-white hover:bg-accent-hover"
-                onPress={startGeneration}
+                onPress={() => void startGeneration()}
                 isDisabled={
                   restoreLoading
                   || accepting
                   || selectedInitialRun?.can_resume === false
+                  || (automaticContinuationsEnabled && continuationReadinessLoading)
                 }
               >
                 {selectedInitialRun?.can_resume === false
@@ -341,13 +458,134 @@ export default function ProsePanel({
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-          <div className="mb-4">
+          <div className="mb-4 grid gap-3">
+            <ProseContinuationControls
+              idPrefix="single-prose"
+              value={continuationPolicy}
+              onChange={setContinuationPolicy}
+              disabled={running || restoreLoading || accepting}
+            />
             <OutlineGenerationParams value={params} onChange={setParams} />
+            {automaticContinuationsEnabled && (
+              <section
+                aria-labelledby="single-prose-readiness-title"
+                className="grid gap-3 rounded-md border border-border bg-background p-3"
+              >
+                <div>
+                  <h4
+                    id="single-prose-readiness-title"
+                    className="text-sm font-semibold text-foreground"
+                  >
+                    {t("continuationReadinessTitle")}
+                  </h4>
+                  <p className="mt-1 text-xs leading-5 text-muted">
+                    {t("continuationReadinessDescription")}
+                  </p>
+                </div>
+
+                <label className="grid gap-1 text-sm">
+                  <span className="text-xs font-medium text-muted">
+                    {t("continuationBudgetLabel")}
+                  </span>
+                  <input
+                    type="number"
+                    min={1}
+                    inputMode="numeric"
+                    value={continuationBudget}
+                    disabled={running || restoreLoading || accepting}
+                    onChange={(event) => setContinuationBudget(event.target.value)}
+                    placeholder={t("continuationBudgetPlaceholder")}
+                    className="min-h-9 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                  <span className="text-xs leading-5 text-muted">
+                    {t("continuationBudgetHint")}
+                  </span>
+                </label>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void inspectContinuationReadiness()}
+                    disabled={
+                      running
+                      || restoreLoading
+                      || accepting
+                      || continuationReadinessLoading
+                      || !continuationBudgetValue
+                    }
+                    className="min-h-9 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-surface disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {continuationReadinessLoading
+                      ? t("continuationInspecting")
+                      : t("continuationInspect")}
+                  </button>
+                  {!continuationReadinessIsCurrent && !continuationReadinessLoading && (
+                    <p role="status" className="text-xs leading-5 text-muted">
+                      {t("continuationReadinessRequired")}
+                    </p>
+                  )}
+                </div>
+
+                {continuationReadinessIsCurrent && continuationReadiness && (
+                  <div className="grid gap-2 rounded-md border border-border bg-surface p-3 text-xs leading-5 text-muted">
+                    <p>
+                      {t("continuationReadinessCalls", {
+                        base: continuationReadiness.authorization.max_base_calls,
+                        automatic: continuationReadiness.authorization.max_automatic_continuation_calls,
+                        total: continuationReadiness.authorization.max_logical_prose_calls,
+                      })}
+                    </p>
+                    <p>
+                      {t("continuationReadinessBudget", {
+                        bound: continuationReadiness.authorization.conservative_token_bound,
+                        budget: continuationReadiness.authorization.token_budget ?? t("continuationUnknown"),
+                      })}
+                    </p>
+                    <p>
+                      {t("continuationReadinessProvider", {
+                        provider: continuationReadiness.provider.alias,
+                        model: continuationReadiness.provider.model,
+                        tokens: continuationReadiness.provider.max_output_tokens ?? t("continuationUnknown"),
+                      })}
+                    </p>
+                    {!continuationReadiness.token_bound_known && (
+                      <p className="font-medium text-amber-800 dark:text-amber-200">
+                        {t("continuationTokenBoundMissing")}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                <label className="flex cursor-pointer items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={automaticContinuationsConfirmed}
+                    disabled={
+                      running
+                      || restoreLoading
+                      || accepting
+                      || !continuationReadinessIsCurrent
+                      || !continuationReadiness?.token_bound_known
+                    }
+                    onChange={(event) => setAutomaticContinuationsConfirmed(event.target.checked)}
+                    className="mt-0.5 size-4"
+                  />
+                  <span className="text-xs leading-5 text-muted">
+                    {t("continuationConfirmation", {
+                      count: continuationPolicy.automatic_continuations_per_scene,
+                    })}
+                  </span>
+                </label>
+              </section>
+            )}
           </div>
 
           <ContextNotices report={stream.contextReport} />
           {stream.error && <Notice tone="error">{stream.error}</Notice>}
           {actionError && <Notice tone="error">{actionError}</Notice>}
+          {continuationReadinessError && (
+            <Notice tone="error">{continuationReadinessError}</Notice>
+          )}
           {incomplete && !selectedInitialRun && (
             <Notice tone="warning">{t("incomplete")}</Notice>
           )}

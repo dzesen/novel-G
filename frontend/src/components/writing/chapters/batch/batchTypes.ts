@@ -1,6 +1,10 @@
 import type { ChapterSummary } from "@/types/novel";
 import type { ProseRunSnapshot } from "../prose/useProseStream";
 
+import type {
+  ProseContinuationAuthorization,
+  ProseContinuationPolicy,
+} from "../prose/proseContinuation";
 // 镜像后端 generation_job_router._serialize_job 后的 JSON 形状（设计 §8）。
 export type JobStatus =
   | "pending" | "running" | "paused"
@@ -9,7 +13,14 @@ export type JobStatus =
 export type PauseReason =
   | "checkpoint" | "conflict" | "outline_deviation" | "cost_cap" | "manual"
   | "attempt_capacity" | "uncertain_attempt" | "uncertain_skipped" | "process_restart"
+  | "source_changed" | "incomplete_scene"
   | null;
+
+export interface GenerationRunsNavigationTarget {
+  jobId?: string;
+  chapterId?: string;
+  eventId?: string;
+}
 
 export interface AttemptSummary {
   attempt_id: string;
@@ -33,6 +44,7 @@ export interface JobGenerationParams {
   frequency_penalty?: number;
   system_prompt?: string;
   allow_failure_retry?: boolean;
+  prose_continuation_policy?: ProseContinuationPolicy;
 }
 
 export interface OutlineAdherenceIssue {
@@ -136,7 +148,17 @@ export interface GenerationReadiness {
       max_output_tokens?: number | null;
       safe_output_words?: number;
       output_limit_known?: boolean;
+      high_risk_chapter_count?: number;
+      high_risk_chapter_ids?: string[];
+      maximum_target_words?: number;
+      maximum_base_prose_calls?: number;
+      maximum_automatic_continuation_calls?: number;
+      maximum_logical_prose_calls?: number;
+      max_actual_provider_attempts?: number;
+      conservative_token_bound?: number;
+      token_bound_known?: boolean;
     };
+    prose_continuation_authorization?: ProseContinuationAuthorization;
   };
 }
 
@@ -165,6 +187,65 @@ export interface JobError {
   message: string;
 }
 
+export type DiagnosticCategory =
+  | "model_output_incomplete"
+  | "provider_or_transport"
+  | "validation_logic"
+  | "source_changed"
+  | "context_or_budget"
+  | "user_action"
+  | "unknown_system";
+
+export type DiagnosticEvidence =
+  | "confirmed"
+  | "strong_inference"
+  | "insufficient";
+
+export interface GenerationDiagnostic {
+  schema_version: number;
+  category: DiagnosticCategory;
+  code: string;
+  evidence: DiagnosticEvidence;
+  source: "runtime" | "historical_inference";
+  step: string;
+  chapter_id: string;
+  occurred_at?: string;
+  details: {
+    status?: string;
+    requested_word_count?: number;
+    actual_word_count?: number;
+    raw_character_count?: number;
+    scene_count?: number;
+    completed_scene_count?: number;
+    finish_reason?: string;
+    raw_finish_reason?: string;
+    completion_reason?: string;
+    mode?: string;
+    reason_codes?: string[];
+    attempt_count?: number;
+    provider_aliases?: string[];
+    provider_models?: string[];
+    [key: string]: unknown;
+  };
+}
+
+export interface DiagnosticCategorySummary {
+  category: DiagnosticCategory;
+  event_count: number;
+  job_count: number;
+  evidence_counts: Record<DiagnosticEvidence, number>;
+}
+
+export interface GenerationDiagnosticsSummary {
+  schema_version: number;
+  window_job_count: number;
+  affected_job_count: number;
+  event_count: number;
+  inferred_event_count: number;
+  categories: DiagnosticCategorySummary[];
+  recent_events: Array<GenerationDiagnostic & { job_id: string }>;
+}
+
 export interface GenerationJob {
   _id: string;
   novel_id: string;
@@ -177,10 +258,14 @@ export interface GenerationJob {
   generation_params?: JobGenerationParams;
   token_budget: number | null;
   tokens_used: number;
+  tokens_reserved?: number;
   current_chapter_id: string | null;
   progress: ChapterProgress[];
   last_checkpoint_index: number;
   error: JobError | null;
+  diagnostics?: GenerationDiagnostic[];
+  prose_continuation_authorization?: ProseContinuationAuthorization;
+  readiness?: GenerationReadiness;
   usage_attempt_capacity: number;
   usage_attempt_claimed: number;
   usage_attempt_summaries: AttemptSummary[];

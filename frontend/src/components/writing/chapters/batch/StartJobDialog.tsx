@@ -3,12 +3,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
-import { apiGet, apiPost } from "@/lib/api";
+import { apiPost } from "@/lib/api";
 import OutlineGenerationParams, {
   EMPTY_GENERATION_PARAMS,
   toRequestParams,
   type GenerationParams,
 } from "../outline/OutlineGenerationParams";
+import ProseContinuationControls from "../prose/ProseContinuationControls";
+import {
+  DEFAULT_PROSE_CONTINUATION_POLICY,
+  parsePositiveInteger,
+  permitsAutomaticContinuation,
+  type ProseContinuationPolicy,
+} from "../prose/proseContinuation";
 import type {
   GenerationJob,
   GenerationReadiness,
@@ -46,14 +53,29 @@ export default function StartJobDialog({
   const t = useTranslations("writing.batch");
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [tokenBudget, setTokenBudget] = useState("");
+  const [continuationPolicy, setContinuationPolicy] =
+    useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
+
   const [outlineDeviationPolicy, setOutlineDeviationPolicy] =
     useState<OutlineDeviationPolicy>("pause_for_rewrite");
   const [generationParams, setGenerationParams] = useState<GenerationParams>(
     () => ({ ...EMPTY_GENERATION_PARAMS }),
   );
+  const parsedTokenBudget = parsePositiveInteger(tokenBudget);
+  const automaticContinuationsEnabled = permitsAutomaticContinuation(
+    continuationPolicy,
+  );
+  const readinessConfigurationKey = JSON.stringify({
+    continuationPolicy,
+    tokenBudget: parsedTokenBudget,
+    generationParams,
+  });
   const [submitting, setSubmitting] = useState(false);
   const [readiness, setReadiness] = useState<GenerationReadiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(true);
+  const [readinessConfiguration, setReadinessConfiguration] = useState<string | null>(null);
+  const readinessIsCurrent = Boolean(readiness)
+    && readinessConfiguration === readinessConfigurationKey;
   const [acknowledgedCodes, setAcknowledgedCodes] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
 
@@ -61,18 +83,32 @@ export default function StartJobDialog({
     setReadinessLoading(true);
     setError("");
     try {
-      const report = await apiGet<GenerationReadiness>(
+      const report = await apiPost<GenerationReadiness>(
         `/api/generation-jobs/${scope}/${targetId}/readiness`,
+        {
+          token_budget: parsedTokenBudget,
+          prose_continuation_policy: continuationPolicy,
+          ...toRequestParams(generationParams),
+        },
       );
       setReadiness(report);
+      setReadinessConfiguration(readinessConfigurationKey);
       setAcknowledgedCodes(new Set());
     } catch (err) {
       setReadiness(null);
+      setReadinessConfiguration(null);
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setReadinessLoading(false);
     }
-  }, [scope, targetId]);
+  }, [
+    continuationPolicy,
+    generationParams,
+    parsedTokenBudget,
+    readinessConfigurationKey,
+    scope,
+    targetId,
+  ]);
 
   useEffect(() => {
     void loadReadiness();
@@ -114,12 +150,42 @@ export default function StartJobDialog({
             calls: Number(issue.details.maximum_prose_calls ?? 0),
           }),
         };
+      case "prose_output_risk_requires_ack":
+        return {
+          title: t("readinessIssueOutputRiskTitle"),
+          body: t("readinessIssueOutputRiskBody", {
+            count: Number(issue.details.chapter_count ?? 0),
+            target: Number(issue.details.maximum_target_words ?? 0),
+            safe: Number(issue.details.safe_output_words ?? 0),
+            calls: Number(issue.details.maximum_prose_calls ?? 0),
+            source: issue.details.output_limit_known
+              ? t("readinessCapabilityKnown")
+              : t("readinessCapabilityConservative"),
+          }),
+        };
       case "partial_prose_requires_manual_completion":
         return {
           title: t("readinessIssuePartialProseTitle"),
           body: t("readinessIssuePartialProseBody", {
             count: Number(issue.details.chapter_count ?? 0),
           }),
+        };
+      case "automatic_continuations_require_confirmation":
+        return {
+          title: t("readinessIssueAutomaticConfirmationTitle"),
+          body: t("readinessIssueAutomaticConfirmationBody", {
+            count: continuationPolicy.automatic_continuations_per_scene,
+          }),
+        };
+      case "automatic_continuations_require_token_budget":
+        return {
+          title: t("readinessIssueAutomaticBudgetTitle"),
+          body: t("readinessIssueAutomaticBudgetBody"),
+        };
+      case "prose_token_bound_unproven":
+        return {
+          title: t("readinessIssueTokenBoundTitle"),
+          body: t("readinessIssueTokenBoundBody"),
         };
       default:
         return {
@@ -130,22 +196,20 @@ export default function StartJobDialog({
   };
 
   const submit = async () => {
-    if (!readiness || !readinessAllowsStart(readiness, acknowledgedCodes)) return;
+    if (!readiness || !readinessIsCurrent || !readinessAllowsStart(
+      readiness, acknowledgedCodes,
+    )) return;
     setSubmitting(true);
     setError("");
     try {
-      const parsedBudget = Number(tokenBudget);
-      const budget =
-        tokenBudget.trim() && Number.isFinite(parsedBudget) && parsedBudget >= 1
-          ? Math.floor(parsedBudget)
-          : null;
       const payload = buildAuthorizedStartPayload({
         checkpointInterval,
-        tokenBudget: budget,
+        tokenBudget: parsedTokenBudget,
         readiness,
         acknowledgedCodes,
         outlineDeviationPolicy,
         generationParams: toRequestParams(generationParams),
+        proseContinuationPolicy: continuationPolicy,
       });
       const job = await apiPost<GenerationJob>(
         `/api/generation-jobs/${scope}/${targetId}`,
@@ -201,6 +265,18 @@ export default function StartJobDialog({
             />
             <span className="text-xs text-muted">{t("dialogTokenHint")}</span>
           </label>
+          <ProseContinuationControls
+            idPrefix="batch-prose"
+            value={continuationPolicy}
+            onChange={setContinuationPolicy}
+            disabled={submitting}
+          />
+          {automaticContinuationsEnabled && !parsedTokenBudget && (
+            <p role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
+              {t("continuationBudgetRequired")}
+            </p>
+          )}
+
 
           <section className="grid gap-2">
             <OutlineGenerationParams
@@ -283,6 +359,12 @@ export default function StartJobDialog({
                 </button>
               )}
             </div>
+            {readiness && !readinessLoading && !readinessIsCurrent && (
+              <p role="status" className="mt-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
+                {t("readinessSettingsChanged")}
+              </p>
+            )}
+
 
             {readinessLoading && (
               <p role="status" className="mt-3 text-sm text-muted">{t("readinessLoading")}</p>
@@ -351,6 +433,23 @@ export default function StartJobDialog({
                       )}
                     </>
                   )}
+                  {readiness.planning.prose_continuation_authorization && (
+                    <>
+                      <p className="sm:col-span-2">
+                        {t("readinessContinuationCalls", {
+                          base: readiness.planning.prose_continuation_authorization.max_base_calls,
+                          automatic: readiness.planning.prose_continuation_authorization.max_automatic_continuation_calls,
+                          total: readiness.planning.prose_continuation_authorization.max_logical_prose_calls,
+                        })}
+                      </p>
+                      <p className="sm:col-span-2">
+                        {t("readinessContinuationBudget", {
+                          bound: readiness.planning.prose_continuation_authorization.conservative_token_bound,
+                          budget: readiness.planning.prose_continuation_authorization.token_budget ?? t("readinessNone"),
+                        })}
+                      </p>
+                    </>
+                  )}
                 </div>
 
                 {readiness.issues.map((issue) => {
@@ -393,7 +492,15 @@ export default function StartJobDialog({
                             }}
                             className="mt-0.5 size-4"
                           />
-                          <span>{t("readinessAcknowledge")}</span>
+                          <span>
+                            {issue.code === "automatic_continuations_require_confirmation"
+                              ? t("readinessAcknowledgeAutomatic", {
+                                  count: continuationPolicy.automatic_continuations_per_scene,
+                                })
+                              : issue.code === "prose_output_risk_requires_ack"
+                                ? t("readinessAcknowledgeOutputRisk")
+                                : t("readinessAcknowledge")}
+                          </span>
                         </label>
                       )}
                       {issue.action_codes.some((code) =>
@@ -444,6 +551,7 @@ export default function StartJobDialog({
               submitting
               || readinessLoading
               || !readiness
+              || !readinessIsCurrent
               || !readinessAllowsStart(readiness, acknowledgedCodes)
             }
           >
