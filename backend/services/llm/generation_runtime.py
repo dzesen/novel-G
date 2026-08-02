@@ -8,7 +8,8 @@ from enum import Enum
 import hashlib
 import json
 import re
-from typing import Any, Callable, Protocol, Union
+from typing import Any, Callable, Literal, Mapping, Protocol, Union
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from pydantic import BaseModel, ValidationError
@@ -19,6 +20,7 @@ from backend.llm.exceptions import (
 )
 from backend.llm.models import TokenUsage
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
+from backend.config.workflow_catalog import get_workflow_step_definition
 
 
 class StructuredOutputMode(str, Enum):
@@ -90,6 +92,8 @@ class GenerationPlan:
     max_semantic_attempts: int
     provider_model: str = ""
     max_output_tokens: int | None = None
+    max_context_tokens: int | None = None
+    thinking_mode: Literal["enabled", "disabled"] | None = None
 
 
 class StaleGenerationPlan(RuntimeError):
@@ -183,6 +187,33 @@ def _mode_for_provider(provider: dict[str, Any]) -> StructuredOutputMode:
     return StructuredOutputMode.PROMPT_JSON
 
 
+def _thinking_mode_for(
+    target: GenerationTarget,
+    resolved: ResolvedProvider,
+) -> Literal["enabled", "disabled"] | None:
+    if not isinstance(target, WorkflowStepTarget):
+        return None
+    definition = get_workflow_step_definition(
+        target.workflow_name,
+        target.step_name,
+    )
+    requested = definition.thinking_mode if definition is not None else None
+    if requested is None:
+        return None
+    provider_type = str(resolved.config.get("type") or "openai").strip().lower()
+    model = str(resolved.config.get("default_model") or "").strip().lower()
+    host = (
+        urlparse(str(resolved.config.get("base_url") or "")).hostname or ""
+    ).lower()
+    if (
+        provider_type == "openai"
+        and host == "api.deepseek.com"
+        and model.startswith("deepseek-v4-")
+    ):
+        return requested
+    return None
+
+
 class ProviderCatalog:
     """解析显式目标或 workflow→step→global 三层 Provider。"""
 
@@ -263,6 +294,7 @@ class GenerationRuntime:
         self._adapter_factory = adapter_factory
         self._attempt_scope = attempt_scope or InMemoryAttemptScope()
         self._last_finish_reason: FinishReason = "unreported"
+        self._last_raw_finish_reason = "unreported"
 
     @property
     def attempts(self) -> tuple[AttemptUsage, ...]:
@@ -288,6 +320,10 @@ class GenerationRuntime:
     @property
     def last_finish_reason(self) -> FinishReason:
         return self._last_finish_reason
+
+    @property
+    def last_raw_finish_reason(self) -> str:
+        return self._last_raw_finish_reason
 
     @staticmethod
     def _revision(config: dict[str, Any]) -> str:
@@ -346,6 +382,7 @@ class GenerationRuntime:
             max_semantic_attempts=base_attempts + (1 if reviewer else 0),
             provider_model=str(resolved.config.get("default_model") or ""),
             max_output_tokens=_positive_int(resolved.config.get("max_tokens")),
+            max_context_tokens=_positive_int(resolved.config.get("max_context_tokens")),
         )
 
     def plan_text(self, target: GenerationTarget) -> GenerationPlan:
@@ -363,6 +400,8 @@ class GenerationRuntime:
             max_semantic_attempts=1,
             provider_model=str(resolved.config.get("default_model") or ""),
             max_output_tokens=_positive_int(resolved.config.get("max_tokens")),
+            max_context_tokens=_positive_int(resolved.config.get("max_context_tokens")),
+            thinking_mode=_thinking_mode_for(target, resolved),
         )
 
     def _validate_plan(self, plan: GenerationPlan) -> None:
@@ -372,6 +411,53 @@ class GenerationRuntime:
         if self._capability_snapshot(current) != plan.capability_snapshot:
             raise StaleGenerationPlan("Provider capabilities changed after generation planning")
 
+    @staticmethod
+    def _conservative_token_bound(
+        plan: GenerationPlan,
+        prompt: str,
+        gen_kwargs: Mapping[str, Any],
+    ) -> int | None:
+        output_limit = _positive_int(gen_kwargs.get("max_tokens"))
+        if output_limit is None:
+            output_limit = plan.max_output_tokens
+        if output_limit is None:
+            return None
+        # UTF-8 bytes are a deliberately conservative upper estimate for the
+        # user-visible prompt; retain a fixed allowance for provider/system
+        # framing that is not represented in the rendered prompt.
+        system_prompt = str(gen_kwargs.get("system_prompt") or "")
+        return max(
+            1,
+            int(output_limit)
+            + len(str(prompt).encode("utf-8"))
+            + len(system_prompt.encode("utf-8"))
+            + 1024,
+        )
+
+    async def _claim_paid_attempt(
+        self,
+        provider_alias: str,
+        phase: str,
+        conservative_tokens: int | None,
+    ) -> str:
+        claim_with_budget = getattr(self._attempt_scope, "claim_with_budget", None)
+        if callable(claim_with_budget):
+            return await claim_with_budget(
+                provider_alias,
+                phase,
+                conservative_tokens,
+            )
+        return await self._attempt_scope.claim(provider_alias, phase)
+
+    async def _release_pre_dispatch(
+        self,
+        attempt_id: str,
+        reason: str,
+    ) -> None:
+        release = getattr(self._attempt_scope, "release_pre_dispatch", None)
+        if callable(release):
+            await release(attempt_id, reason)
+
     async def _paid_call(
         self,
         plan: GenerationPlan,
@@ -379,15 +465,23 @@ class GenerationRuntime:
         phase: str,
         adapter: Any,
         call: Callable[[], Any],
+        conservative_tokens: int | None,
     ) -> Any:
         self._validate_plan(plan)
-        attempt_id = await self._attempt_scope.claim(provider, phase)
+        attempt_id = await self._claim_paid_attempt(
+            provider,
+            phase,
+            conservative_tokens,
+        )
         try:
             value = await call()
         except asyncio.CancelledError:
             await self._attempt_scope.mark_uncertain(attempt_id, "request cancelled after dispatch")
             raise
-        except Exception:
+        except Exception as exc:
+            if bool(getattr(exc, "provider_request_not_dispatched", False)):
+                await self._release_pre_dispatch(attempt_id, str(exc))
+                raise
             usage = getattr(adapter, "last_usage", None) or TokenUsage()
             if usage.total_tokens or usage.input_tokens or usage.output_tokens:
                 await self._attempt_scope.account(attempt_id, usage)
@@ -416,8 +510,16 @@ class GenerationRuntime:
             return await adapter.generate_text(prompts.prompt_json_prompt, **gen_kwargs)
 
         try:
+            primary_prompt = (
+                prompts.native_schema_prompt
+                if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
+                else prompts.prompt_json_prompt
+            )
             produced = await self._paid_call(
-                plan, plan.provider_alias, "primary", adapter, primary_call
+                plan, plan.provider_alias, "primary", adapter, primary_call,
+                self._conservative_token_bound(
+                    plan, primary_prompt, gen_kwargs
+                ),
             )
         except LLMStructuredValidationError as error:
             # 调用已产生可计费用量；保留原始内容，进入同 Provider 的唯一纠错尝试。
@@ -435,6 +537,9 @@ class GenerationRuntime:
                 "schema_fallback",
                 adapter,
                 fallback_call,
+                self._conservative_token_bound(
+                    plan, prompts.prompt_json_prompt, gen_kwargs
+                ),
             )
         try:
             value = produced if isinstance(produced, BaseModel) else _parse_structured_text(str(produced), schema)
@@ -449,7 +554,10 @@ class GenerationRuntime:
                 return await adapter.generate_text(repair_prompt, **gen_kwargs)
 
             repaired = await self._paid_call(
-                plan, plan.provider_alias, "repair", adapter, repair_call
+                plan, plan.provider_alias, "repair", adapter, repair_call,
+                self._conservative_token_bound(
+                    plan, repair_prompt, gen_kwargs
+                ),
             )
             try:
                 value = _parse_structured_text(str(repaired), schema)
@@ -464,7 +572,10 @@ class GenerationRuntime:
                     return await reviewer.generate_structured(repair_prompt, schema, **gen_kwargs)
 
                 value = await self._paid_call(
-                    plan, plan.reviewer_alias, "reviewer", reviewer, review_call
+                    plan, plan.reviewer_alias, "reviewer", reviewer, review_call,
+                    self._conservative_token_bound(
+                        plan, repair_prompt, gen_kwargs
+                    ),
                 )
 
         attempts = self.attempts[attempt_offset:]
@@ -484,17 +595,37 @@ class GenerationRuntime:
         """流式纯文本入口；取消直接传播，流耗尽后立即记账。"""
         self._validate_plan(plan)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
+        request_kwargs = dict(gen_kwargs)
+        if plan.thinking_mode is not None:
+            metadata = dict(request_kwargs.get("metadata") or {})
+            configured = metadata.get("thinking_mode")
+            if configured is not None and configured != plan.thinking_mode:
+                raise ValueError(
+                    "thinking_mode conflicts with the immutable GenerationPlan"
+                )
+            metadata["thinking_mode"] = plan.thinking_mode
+            request_kwargs["metadata"] = metadata
         self._last_finish_reason = "unreported"
-        attempt_id = await self._attempt_scope.claim(plan.provider_alias, "text")
+        self._last_raw_finish_reason = "unreported"
+        attempt_id = await self._claim_paid_attempt(
+            plan.provider_alias,
+            "text",
+            self._conservative_token_bound(plan, prompt, request_kwargs),
+        )
         try:
-            async for chunk in adapter.stream_text(prompt, **gen_kwargs):
+            async for chunk in adapter.stream_text(prompt, **request_kwargs):
                 yield chunk
         except asyncio.CancelledError:
             self._last_finish_reason = "cancelled"
+            self._last_raw_finish_reason = "cancelled"
             await self._attempt_scope.mark_uncertain(attempt_id, "stream cancelled after dispatch")
             raise
-        except Exception:
+        except Exception as exc:
+            if bool(getattr(exc, "provider_request_not_dispatched", False)):
+                await self._release_pre_dispatch(attempt_id, str(exc))
+                raise
             self._last_finish_reason = "error"
+            self._last_raw_finish_reason = "error"
             usage = getattr(adapter, "last_usage", None) or TokenUsage()
             if usage.total_tokens or usage.input_tokens or usage.output_tokens:
                 await self._attempt_scope.account(attempt_id, usage)
@@ -505,6 +636,10 @@ class GenerationRuntime:
         await self._attempt_scope.account(attempt_id, usage)
         self._last_finish_reason = normalize_finish_reason(
             getattr(adapter, "last_finish_reason", None)
+        )
+        self._last_raw_finish_reason = str(
+            getattr(adapter, "last_raw_finish_reason", None)
+            or self._last_finish_reason
         )
 
 
@@ -551,12 +686,23 @@ def create_generation_runtime(
                     }
         return config
 
+    # A persisted budget scope reserves one real Provider request at a time.
+    # Letting an SDK retry internally would create paid attempts which the
+    # scope cannot observe or reserve. Legacy/unscoped workflows retain their
+    # configured retry behavior; callers can also explicitly request a value.
+    effective_max_provider_retries = (
+        0
+        if max_provider_retries is None
+        and callable(getattr(attempt_scope, "claim_with_budget", None))
+        else max_provider_retries
+    )
+
     return GenerationRuntime(
         config_supplier=supplied_config,
         adapter_factory=lambda alias, timeout: LLMService(
             provider_name=alias,
             timeout_seconds=timeout,
-            max_retries=max_provider_retries,
+            max_retries=effective_max_provider_retries,
         ),
         attempt_scope=attempt_scope,
     )

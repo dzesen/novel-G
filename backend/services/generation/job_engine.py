@@ -13,10 +13,18 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from backend.db.utils import get_utc_now
 from backend.db.repositories.generation_job_repository import (
     AttemptCapacityExceeded,
+    TokenBudgetExceeded,
     generation_job_repo,
 )
 from backend.services.generation import job_planner
-from backend.services.generation.chapter_pipeline import ChapterOutcome, ChapterPipelineFailed
+from backend.services.generation.chapter_pipeline import (
+    ChapterOutcome,
+    ChapterPipelineFailed,
+    IncompleteProseGeneration,
+)
+from backend.services.generation.failure_diagnostics import (
+    build_failure_diagnostic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +61,64 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
     }
 
 
+def _incomplete_prose_checkpoint(
+    completion: Dict[str, Any],
+    *,
+    chapter_id: str,
+) -> Dict[str, Any]:
+    """Persist a recovery pointer and counters, never draft prose or prompts."""
+    def integer(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    scenes: list[dict[str, Any]] = []
+    for raw in list(completion.get("scene_progress") or [])[:20]:
+        if not isinstance(raw, dict):
+            continue
+        scenes.append(
+            {
+                "scene_index": integer(raw.get("scene_index")),
+                "status": str(raw.get("status") or "incomplete")[:40],
+                "base_calls_used": integer(raw.get("base_calls_used")),
+                "automatic_continuations_used": integer(
+                    raw.get("automatic_continuations_used")
+                ),
+                "manual_continuations_used": integer(
+                    raw.get("manual_continuations_used")
+                ),
+                "word_count": integer(raw.get("word_count")),
+                "last_prompt_mode": str(
+                    raw.get("last_prompt_mode") or ""
+                )[:60],
+                "last_finish_reason": str(
+                    raw.get("last_finish_reason") or "unreported"
+                )[:60],
+                "pause_reason": str(raw.get("pause_reason") or "")[:100],
+            }
+        )
+    return {
+        "chapter_id": str(chapter_id),
+        "source_run_id": str(completion.get("source_run_id") or ""),
+        "source_run_revision": integer(completion.get("source_run_revision")),
+        "status": str(completion.get("status") or "incomplete")[:40],
+        "pause_reason": str(
+            completion.get("pause_reason") or "incomplete_scene"
+        )[:100],
+        "reason_codes": [
+            str(code)[:100]
+            for code in list(completion.get("reason_codes") or [])[:20]
+            if str(code).strip()
+        ],
+        "scene_count": integer(completion.get("scene_count")),
+        "completed_scene_count": integer(
+            completion.get("completed_scene_count")
+        ),
+        "scene_progress": scenes,
+    }
+
+
 async def _pause(repo, job_id: str, reason: str) -> None:
     await repo.update_job_fields(job_id, {
         "status": "paused",
@@ -75,6 +141,13 @@ async def _persist_attempts(repo, job_id: str, attempts: list[dict]) -> None:
         await account(job_id, attempt_id, TokenUsage.model_validate(attempt.get("usage") or {}))
 
 
+async def _persist_diagnostic(repo, job_id: str, event: dict[str, Any]) -> None:
+    append = getattr(repo, "append_diagnostic", None)
+    if append is None:
+        return
+    await append(job_id, event)
+
+
 async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo=generation_job_repo) -> None:
     """主循环。任何返回前都已把终态/暂停态持久化。"""
     try:
@@ -88,7 +161,10 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             job = await repo.get_job(job_id)
 
             # 成本上限：开下一章前的软天花板。
-            if job_planner.over_budget(int(job.get("tokens_used", 0)), job.get("token_budget")):
+            committed_or_reserved = int(job.get("tokens_used", 0)) + int(
+                job.get("tokens_reserved", 0) or 0
+            )
+            if job_planner.over_budget(committed_or_reserved, job.get("token_budget")):
                 await _pause(repo, job_id, "cost_cap")
                 return
 
@@ -103,9 +179,77 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             await repo.update_job_fields(job_id, {"current_chapter_id": str(chapter["_id"])})
             try:
                 outcome = await deps.run_chapter(str(job["novel_id"]), chapter)
-            except AttemptCapacityExceeded:
+            except TokenBudgetExceeded as exc:
+                diagnostic = build_failure_diagnostic(
+                    exc,
+                    step="run_chapter",
+                    chapter_id=str(chapter["_id"]),
+                    occurred_at=get_utc_now(),
+                )
+                await _persist_diagnostic(repo, job_id, diagnostic)
+                await _pause(repo, job_id, "cost_cap")
+                return
+
+            except AttemptCapacityExceeded as exc:
+                diagnostic = build_failure_diagnostic(
+                    exc,
+                    step="run_chapter",
+                    chapter_id=str(chapter["_id"]),
+                    occurred_at=get_utc_now(),
+                )
+                await _persist_diagnostic(repo, job_id, diagnostic)
                 await _pause(repo, job_id, "attempt_capacity")
                 return
+            except ChapterPipelineFailed as exc:
+                incomplete = exc.__cause__
+                if not isinstance(incomplete, IncompleteProseGeneration):
+                    raise
+                outcome = exc.outcome
+                attempts = list(outcome.attempts)
+                await _persist_attempts(repo, job_id, attempts)
+                diagnostic = build_failure_diagnostic(
+                    exc,
+                    step="prose",
+                    chapter_id=str(chapter["_id"]),
+                    attempts=attempts,
+                    occurred_at=get_utc_now(),
+                )
+                await _persist_diagnostic(repo, job_id, diagnostic)
+                checkpoint = _incomplete_prose_checkpoint(
+                    incomplete.completion,
+                    chapter_id=str(chapter["_id"]),
+                )
+                progress = outcome_to_progress(outcome)
+                progress["incomplete_prose"] = checkpoint
+                await repo.append_progress(
+                    job_id,
+                    progress,
+                    tokens_delta=0 if attempts else outcome.tokens,
+                )
+                budget_blocked = (
+                    checkpoint["pause_reason"]
+                    == "token_budget_exceeded_before_dispatch"
+                    or "token_budget_exceeded_before_dispatch"
+                    in checkpoint["reason_codes"]
+                )
+                if budget_blocked:
+                    await _pause(repo, job_id, "cost_cap")
+                    return
+                await repo.update_job_fields(job_id, {
+                    "status": "paused",
+                    "pause_reason": "incomplete_scene",
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                    "incomplete_prose": checkpoint,
+                    "error": {
+                        "step": "prose",
+                        "chapter_id": str(chapter["_id"]),
+                        "message": "An incomplete prose scene requires manual continuation",
+                        "reason_codes": checkpoint["reason_codes"],
+                    },
+                })
+                return
+
             except Exception as exc:  # noqa: BLE001 — fail-fast，人工 resume 即重试
                 logger.exception("[job %s] chapter %s failed", job_id, chapter.get("_id"))
                 failed_outcome = exc.outcome if isinstance(exc, ChapterPipelineFailed) else None
@@ -113,6 +257,28 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 if failed_outcome is not None:
                     attempts = list(failed_outcome.attempts)
                 await _persist_attempts(repo, job_id, attempts)
+                diagnostic = build_failure_diagnostic(
+                    exc,
+                    step=getattr(exc, "step", "run_chapter"),
+                    chapter_id=str(chapter["_id"]),
+                    attempts=attempts,
+                    occurred_at=get_utc_now(),
+                )
+                await _persist_diagnostic(repo, job_id, diagnostic)
+                if diagnostic["category"] == "source_changed":
+                    await repo.update_job_fields(job_id, {
+                        "status": "paused",
+                        "pause_reason": "source_changed",
+                        "current_chapter_id": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": getattr(exc, "step", "run_chapter"),
+                            "chapter_id": str(chapter["_id"]),
+                            "message": "Source changed during generation",
+                            "attempts": attempts,
+                        },
+                    })
+                    return
                 latest_job = await repo.get_job(job_id)
                 has_uncertain = bool(latest_job.get("has_uncertain_attempts"))
                 await repo.update_job_fields(job_id, {

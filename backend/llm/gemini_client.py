@@ -221,6 +221,7 @@ class GeminiClient(BaseLLMClient):
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
         self._last_finish_reason = "unreported"
+        self._last_raw_finish_reason = "unreported"
         model = self._resolve_model(request)
         log_llm_request(request, self.provider_name)
 
@@ -245,6 +246,7 @@ class GeminiClient(BaseLLMClient):
                         raw_reason = getattr(candidates[0], "finish_reason", None)
                         raw_name = getattr(raw_reason, "name", raw_reason)
                         if raw_name:
+                            self._last_raw_finish_reason = str(raw_name)
                             self._last_finish_reason = normalize_finish_reason(raw_name)
                     if chunk.text:
                         yield chunk.text

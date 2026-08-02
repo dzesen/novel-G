@@ -144,6 +144,15 @@ class OpenAICompatibleClient(BaseLLMClient):
             params["stop"] = request.stop
         if (request.metadata or {}).get("structured_output") == "json_object":
             params["response_format"] = {"type": "json_object"}
+        thinking_mode = str(
+            (request.metadata or {}).get("thinking_mode") or ""
+        ).strip()
+        if thinking_mode:
+            if thinking_mode not in {"enabled", "disabled"}:
+                raise ValueError(f"Unsupported thinking_mode: {thinking_mode}")
+            params["extra_body"] = {
+                "thinking": {"type": thinking_mode},
+            }
         return params
 
     def _map_error(self, exc: Exception, model: str = "") -> LLMError:
@@ -263,6 +272,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
         self._last_finish_reason = "unreported"
+        self._last_raw_finish_reason = "unreported"
         model = self._resolve_model(request)
         log_llm_request(request, self.provider_name)
 
@@ -288,6 +298,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                         choice = chunk.choices[0]
                         raw_reason = getattr(choice, "finish_reason", None)
                         if raw_reason:
+                            self._last_raw_finish_reason = str(raw_reason)
                             self._last_finish_reason = normalize_finish_reason(raw_reason)
                         content = getattr(getattr(choice, "delta", None), "content", None)
                         if content:

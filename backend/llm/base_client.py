@@ -109,11 +109,17 @@ class BaseLLMClient(ABC):
         self.config = config
         self.provider_name = provider_name
         self._last_finish_reason: FinishReason = "unreported"
+        self._last_raw_finish_reason = "unreported"
 
     @property
     def last_finish_reason(self) -> FinishReason:
         """最近一次流式文本调用的归一化结束原因。"""
         return self._last_finish_reason
+
+    @property
+    def last_raw_finish_reason(self) -> str:
+        """The Provider's unmodified finish reason from the latest stream."""
+        return self._last_raw_finish_reason
 
     def _resolve_model(self, request: LLMRequest) -> str:
         """确定实际使用的模型名称，请求未指定时回退到服务商默认模型。"""

@@ -247,6 +247,7 @@ class ClaudeClient(BaseLLMClient):
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
         request = self._apply_defaults(request).model_copy(update={"stream": True})
         self._last_finish_reason = "unreported"
+        self._last_raw_finish_reason = "unreported"
         model = self._resolve_model(request)
         log_llm_request(request, self.provider_name)
 
@@ -264,8 +265,11 @@ class ClaudeClient(BaseLLMClient):
                 # 流尽后 SDK 已聚合出完整消息；终止原因和用量必须从同一终态读取。
                 final_message = await self._get_stream_terminal(stream)
                 if final_message is not None:
+                    raw_reason = getattr(final_message, "stop_reason", None)
+                    if raw_reason:
+                        self._last_raw_finish_reason = str(raw_reason)
                     self._last_finish_reason = normalize_finish_reason(
-                        getattr(final_message, "stop_reason", None)
+                        raw_reason
                     )
                     if usage_sink is not None:
                         usage_sink(

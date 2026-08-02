@@ -78,6 +78,7 @@ class LLMService:
         self._last_usage = TokenUsage()
         self._total_usage = TokenUsage()
         self._last_finish_reason: FinishReason = "unreported"
+        self._last_raw_finish_reason = "unreported"
 
     @property
     def last_usage(self) -> TokenUsage:
@@ -97,6 +98,10 @@ class LLMService:
     def last_finish_reason(self) -> FinishReason:
         """最近一次流式文本调用的归一化结束原因。"""
         return self._last_finish_reason
+
+    @property
+    def last_raw_finish_reason(self) -> str:
+        return self._last_raw_finish_reason
 
     def _record_usage(self, usage: TokenUsage) -> None:
         """记录单次用量并累加到总量。"""
@@ -187,6 +192,7 @@ class LLMService:
         """
         request = self._make_request(prompt, system_prompt, **kwargs)
         self._last_finish_reason = "unreported"
+        self._last_raw_finish_reason = "unreported"
         try:
             async with _provider_request_slot(self._provider_name, self._max_concurrency):
                 async for chunk in self._client.stream_text(
@@ -196,11 +202,17 @@ class LLMService:
                     yield chunk
         except asyncio.CancelledError:
             self._last_finish_reason = "cancelled"
+            self._last_raw_finish_reason = "cancelled"
             raise
         except Exception:
             self._last_finish_reason = "error"
+            self._last_raw_finish_reason = "error"
             raise
         else:
             self._last_finish_reason = normalize_finish_reason(
                 getattr(self._client, "last_finish_reason", None)
+            )
+            self._last_raw_finish_reason = str(
+                getattr(self._client, "last_raw_finish_reason", None)
+                or self._last_finish_reason
             )

@@ -15,6 +15,10 @@ from backend.llm.models import TokenUsage
 
 USAGE_SUMMARY_LIMIT = 100
 
+
+MAX_ACTIVE_TOKEN_RESERVATIONS = 32
+
+
 class TokenBudgetExceeded(ValueError):
     """A Provider dispatch would exceed the explicitly authorized token budget."""
 
@@ -22,6 +26,14 @@ class TokenBudgetExceeded(ValueError):
 class TokenBudgetUnbounded(TokenBudgetExceeded):
     """A finite budget cannot authorize a call without a conservative bound."""
 
+
+def _trusted_usage_tokens(usage: TokenUsage) -> int:
+    reported_total = int(usage.total_tokens or 0)
+    if reported_total > 0:
+        return reported_total
+    return max(0, int(usage.input_tokens or 0)) + max(
+        0, int(usage.output_tokens or 0)
+    )
 
 
 class AttemptCapacityExceeded(ValueError):
@@ -41,10 +53,16 @@ class GenerationJobRepository(BaseRepository):
             raise NotFoundError(f"Generation job not found: {job_id}")
         return doc
 
-    async def list_jobs_by_novel(self, novel_id: str) -> List[Dict[str, Any]]:
+    async def list_jobs_by_novel(
+        self,
+        novel_id: str,
+        *,
+        limit: int = 0,
+    ) -> List[Dict[str, Any]]:
         return await self.find_many(
             {"novel_id": to_object_id(novel_id)},
             sort=[("created_at", -1)],
+            limit=max(0, int(limit)),
         )
 
     async def list_running_jobs(self) -> List[Dict[str, Any]]:
@@ -52,6 +70,20 @@ class GenerationJobRepository(BaseRepository):
 
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))
+
+    async def append_diagnostic(
+        self,
+        job_id: str,
+        event: Dict[str, Any],
+    ) -> bool:
+        result = await self.collection.update_one(
+            {"_id": to_object_id(job_id), "is_deleted": False},
+            {
+                "$push": {"diagnostics": {"$each": [dict(event)], "$slice": -200}},
+                "$set": {"diagnostic_schema_version": 1, "updated_at": get_utc_now()},
+            },
+        )
+        return result.matched_count > 0
 
     async def append_progress(self, job_id: str, entry: Dict[str, Any], tokens_delta: int) -> bool:
         # $push progress + $inc tokens_used 在一次原子 update 内完成。
@@ -239,13 +271,18 @@ class GenerationJobRepository(BaseRepository):
     async def mark_claimed_attempts_uncertain(self, job_id: str, reason: str) -> int:
         job = await self.get_job(job_id)
         pending = [
-            str(slot["attempt_id"])
+            (str(slot["attempt_id"]), slot.get("conservative_tokens"))
             for slot in job.get("attempt_slots") or []
             if slot.get("state") == "claimed"
         ]
         changed = 0
-        for attempt_id in pending:
-            changed += int(await self.mark_attempt_uncertain(job_id, attempt_id, reason))
+        for attempt_id, conservative_tokens in pending:
+            if conservative_tokens is None:
+                changed += int(await self.mark_attempt_uncertain(job_id, attempt_id, reason))
+            else:
+                changed += int(await self.mark_attempt_uncertain_with_budget(
+                    job_id, attempt_id, reason
+                ))
         return changed
 
     async def acknowledge_uncertain_attempts(self, job_id: str, action: str) -> bool:
@@ -268,4 +305,274 @@ class GenerationJobRepository(BaseRepository):
         return result.matched_count == 1
 
 
+    async def claim_attempt_with_budget(
+        self,
+        job_id: str,
+        chapter_id: str,
+        step_id: str,
+        phase: str,
+        provider_alias: str,
+        conservative_tokens: int | None,
+    ) -> str:
+        """Atomically claim an attempt slot and reserve its worst-case tokens."""
+        reserved = (
+            None
+            if conservative_tokens is None
+            else max(1, int(conservative_tokens))
+        )
+        attempt_id = uuid4().hex
+        now = get_utc_now()
+        slot = {
+            "attempt_id": attempt_id,
+            "chapter_id": str(chapter_id),
+            "step_id": str(step_id),
+            "phase": str(phase),
+            "provider_alias": str(provider_alias),
+            "state": "claimed",
+            "claimed_at": now,
+            "conservative_tokens": reserved,
+        }
+        query: dict[str, Any] = {
+            "_id": to_object_id(job_id),
+            "is_deleted": False,
+            "attempt_reservation.chapter_id": str(chapter_id),
+        }
+        if reserved is None:
+            # A finite job budget must never silently accept an unbounded call.
+            query["token_budget"] = None
+        else:
+            query["$expr"] = {
+                "$and": [
+                    {
+                        "$lt": [
+                            {"$ifNull": ["$usage_attempt_claimed", 0]},
+                            {"$ifNull": ["$usage_attempt_capacity", 0]},
+                        ]
+                    },
+                    {
+                        "$lt": [
+                            {"$ifNull": ["$attempt_reservation.claimed_slots", 0]},
+                            {"$ifNull": ["$attempt_reservation.reserved_slots", 0]},
+                        ]
+                    },
+                    {
+                        "$lt": [
+                            {"$size": {"$ifNull": ["$active_token_reservations", []]}},
+                            MAX_ACTIVE_TOKEN_RESERVATIONS,
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"$eq": [{"$ifNull": ["$token_budget", None]}, None]},
+                            {
+                                "$lte": [
+                                    {
+                                        "$add": [
+                                            {"$ifNull": ["$tokens_used", 0]},
+                                            {"$ifNull": ["$tokens_reserved", 0]},
+                                            reserved,
+                                        ]
+                                    },
+                                    {"$ifNull": ["$token_budget", 0]},
+                                ]
+                            },
+                        ]
+                    },
+                ]
+            }
+        update: dict[str, Any] = {
+            "$inc": {
+                "usage_attempt_claimed": 1,
+                "attempt_reservation.claimed_slots": 1,
+            },
+            "$push": {"attempt_slots": slot},
+            "$set": {"updated_at": now},
+        }
+        if reserved is not None:
+            update["$inc"]["tokens_reserved"] = reserved
+            update["$push"]["active_token_reservations"] = {
+                "attempt_id": attempt_id,
+                "chapter_id": str(chapter_id),
+                "step_id": str(step_id),
+                "phase": str(phase),
+                "provider_alias": str(provider_alias),
+                "conservative_tokens": reserved,
+                "state": "claimed",
+                "reserved_at": now,
+            }
+        result = await self.collection.update_one(query, update)
+        if result.modified_count == 1:
+            return attempt_id
+
+        job = await self.get_job(job_id)
+        budget = job.get("token_budget")
+        if reserved is None and budget is not None:
+            raise TokenBudgetUnbounded(
+                "A finite token budget requires a conservative Provider bound"
+            )
+        if budget is not None and reserved is not None:
+            used = int(job.get("tokens_used") or 0)
+            already_reserved = int(job.get("tokens_reserved") or 0)
+            if used + already_reserved + reserved > int(budget):
+                raise TokenBudgetExceeded(
+                    "Token budget would be exceeded before Provider dispatch"
+                )
+        if len(job.get("active_token_reservations") or []) >= (
+            MAX_ACTIVE_TOKEN_RESERVATIONS
+        ):
+            raise AttemptCapacityExceeded("Active token reservation limit reached")
+        raise AttemptCapacityExceeded(
+            "Attempt capacity or chapter reservation is exhausted"
+        )
+
+    async def settle_attempt_budget(
+        self,
+        job_id: str,
+        attempt_id: str,
+        usage: TokenUsage,
+        *,
+        conservative_tokens: int | None,
+    ) -> bool:
+        """Release a reservation once; missing usage is charged conservatively."""
+        if conservative_tokens is None:
+            return await self.account_attempt(job_id, attempt_id, usage)
+        reserved = max(1, int(conservative_tokens))
+        observed = _trusted_usage_tokens(usage)
+        charged = observed if observed > 0 else reserved
+        accounted_usage = usage.model_copy(update={"total_tokens": charged})
+        now = get_utc_now()
+        summary = {
+            "attempt_id": str(attempt_id),
+            "usage": accounted_usage.model_dump(),
+            "accounted_at": now,
+            "charged_tokens": charged,
+        }
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "usage_attempt_ids": {"$ne": str(attempt_id)},
+                "attempt_slots": {
+                    "$elemMatch": {
+                        "attempt_id": str(attempt_id),
+                        "state": {"$in": ["claimed", "uncertain"]},
+                    }
+                },
+                "active_token_reservations": {
+                    "$elemMatch": {
+                        "attempt_id": str(attempt_id),
+                        "conservative_tokens": reserved,
+                    }
+                },
+            },
+            {
+                "$addToSet": {"usage_attempt_ids": str(attempt_id)},
+                "$push": {
+                    "usage_attempt_summaries": {
+                        "$each": [summary],
+                        "$slice": -USAGE_SUMMARY_LIMIT,
+                    }
+                },
+                "$pull": {"active_token_reservations": {"attempt_id": str(attempt_id)}},
+                "$inc": {
+                    "tokens_used": charged,
+                    "tokens_reserved": -reserved,
+                },
+                "$set": {
+                    "attempt_slots.$[slot].state": "accounted",
+                    "attempt_slots.$[slot].usage": accounted_usage.model_dump(),
+                    "attempt_slots.$[slot].charged_tokens": charged,
+                    "attempt_slots.$[slot].accounted_at": now,
+                    "updated_at": now,
+                },
+            },
+            array_filters=[{"slot.attempt_id": str(attempt_id)}],
+        )
+        return result.modified_count == 1
+
+    async def mark_attempt_uncertain_with_budget(
+        self,
+        job_id: str,
+        attempt_id: str,
+        reason: str,
+    ) -> bool:
+        """Freeze the reservation when a dispatched Provider result is unknown."""
+        now = get_utc_now()
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "attempt_slots": {
+                    "$elemMatch": {
+                        "attempt_id": str(attempt_id),
+                        "state": "claimed",
+                    }
+                },
+                "active_token_reservations": {
+                    "$elemMatch": {"attempt_id": str(attempt_id)}
+                },
+            },
+            {
+                "$set": {
+                    "attempt_slots.$[slot].state": "uncertain",
+                    "attempt_slots.$[slot].uncertain_reason": str(reason),
+                    "attempt_slots.$[slot].updated_at": now,
+                    "active_token_reservations.$[reservation].state": "uncertain",
+                    "active_token_reservations.$[reservation].uncertain_reason": str(reason),
+                    "active_token_reservations.$[reservation].updated_at": now,
+                    "has_uncertain_attempts": True,
+                    "updated_at": now,
+                },
+                "$addToSet": {"uncertain_attempt_ids": str(attempt_id)},
+            },
+            array_filters=[
+                {"slot.attempt_id": str(attempt_id)},
+                {"reservation.attempt_id": str(attempt_id)},
+            ],
+        )
+        return result.modified_count == 1
+
+    async def release_attempt_budget(
+        self,
+        job_id: str,
+        attempt_id: str,
+        *,
+        conservative_tokens: int | None,
+        reason: str,
+    ) -> bool:
+        """Release only a proven pre-dispatch failure; uncertain calls stay frozen."""
+        if conservative_tokens is None:
+            return False
+        reserved = max(1, int(conservative_tokens))
+        now = get_utc_now()
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "attempt_slots": {
+                    "$elemMatch": {
+                        "attempt_id": str(attempt_id),
+                        "state": "claimed",
+                    }
+                },
+                "active_token_reservations": {
+                    "$elemMatch": {
+                        "attempt_id": str(attempt_id),
+                        "conservative_tokens": reserved,
+                    }
+                },
+            },
+            {
+                "$inc": {"tokens_reserved": -reserved},
+                "$pull": {"active_token_reservations": {"attempt_id": str(attempt_id)}},
+                "$set": {
+                    "attempt_slots.$[slot].state": "released_pre_dispatch",
+                    "attempt_slots.$[slot].release_reason": str(reason),
+                    "attempt_slots.$[slot].updated_at": now,
+                    "updated_at": now,
+                },
+            },
+            array_filters=[{"slot.attempt_id": str(attempt_id)}],
+        )
+        return result.modified_count == 1
 generation_job_repo = GenerationJobRepository()
