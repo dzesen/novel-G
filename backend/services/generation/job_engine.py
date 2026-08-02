@@ -95,6 +95,9 @@ def _incomplete_prose_checkpoint(
                 "converge_attempts_without_stop": integer(
                     raw.get("converge_attempts_without_stop")
                 ),
+                "continues_truncated_output_count": integer(
+                    raw.get("continues_truncated_output_count")
+                ),
                 "last_prompt_mode": str(
                     raw.get("last_prompt_mode") or ""
                 )[:60],

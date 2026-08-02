@@ -38,6 +38,14 @@ from backend.services.novel.chapter_service import count_chapter_words
 SceneProgressCallback = Callable[[tuple[dict[str, Any], ...]], Awaitable[None] | None]
 
 _AUTOMATIC_SEQUENCE_FLOOR = 1_000_000
+_TRUNCATED_OUTPUT_CONTINUATION_MODES = frozenset(
+    {"fill", "converge", "final_converge"}
+)
+
+TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION = (
+    " 上一次输出因输出上限被硬截断，可能停在句子中途；"
+    "本次必须先把被截断的句子写完，再继续，不得另起新的一拍。"
+)
 
 
 def _scene_target_words(plan: ProseExecutionPlan, scene_index: int) -> int:
@@ -239,6 +247,10 @@ def _scene_progress_snapshot(
         str(segment.get("finish_reason") or "unreported") != "stop"
         for segment in converge_segments
     )
+    state["continues_truncated_output_count"] = sum(
+        bool(segment.get("continues_truncated_output"))
+        for segment in scene_segments
+    )
     if scene_segments:
         latest = scene_segments[-1]
         state["last_prompt_mode"] = str(latest.get("prompt_mode") or "base")
@@ -289,6 +301,7 @@ def _scene_prompt(
     target_words: int,
     prior_text: str,
     prompt_mode: str,
+    continues_truncated_output: bool = False,
 ) -> str:
     scenes = list((outline or {}).get("scenes") or [])
     current_scene = scenes[scene_index] if scene_index < len(scenes) else {}
@@ -330,6 +343,11 @@ def _scene_prompt(
         ),
     }
     instruction = mode_instructions.get(prompt_mode, mode_instructions["base"])
+    if (
+        continues_truncated_output
+        and prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
+    ):
+        instruction += TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION
     return (
         f"{base_prompt}\n\n"
         "【Novel-G 场景正文协议】\n"
@@ -510,6 +528,16 @@ async def execute_v3_prose_plan(
         prompt_mode: str,
     ) -> dict[str, Any]:
         current_text = _scene_text(by_sequence.values(), scene_index=scene_index)
+        previous_scene_segments = _ordered_scene_segments(
+            by_sequence.values(), scene_index=scene_index
+        )
+        previous_segment = (
+            previous_scene_segments[-1] if previous_scene_segments else {}
+        )
+        continues_truncated_output = (
+            prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
+            and str(previous_segment.get("finish_reason") or "") == "length"
+        )
         target_words = (
             max(1, int(spec.target_words))
             if call_kind == "base" and spec is not None
@@ -535,6 +563,7 @@ async def execute_v3_prose_plan(
             target_words=target_words,
             prior_text=current_text,
             prompt_mode=prompt_mode,
+            continues_truncated_output=continues_truncated_output,
         )
         call_kwargs = dict(gen_kwargs or {})
         call_kwargs["max_tokens"] = v3_output_token_bound(
@@ -557,6 +586,7 @@ async def execute_v3_prose_plan(
             "target_word_count": target_words,
             "call_kind": call_kind,
             "prompt_mode": prompt_mode,
+            "continues_truncated_output": continues_truncated_output,
             "status": "uncertain",
             "text": "",
             "text_digest": hashlib.sha256(b"").hexdigest(),

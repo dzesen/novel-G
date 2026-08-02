@@ -203,6 +203,9 @@ def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
                 "converge_attempts_without_stop": _safe_non_negative_int(
                     item.get("converge_attempts_without_stop")
                 ),
+                "continues_truncated_output_count": _safe_non_negative_int(
+                    item.get("continues_truncated_output_count")
+                ),
                 "pause_reason": (
                     str(item.get("pause_reason"))
                     if item.get("pause_reason") is not None
