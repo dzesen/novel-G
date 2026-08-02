@@ -106,6 +106,11 @@ def _call_specs(plan: ProseExecutionPlan) -> list[_CallSpec]:
     return specs
 
 
+def planned_base_call_target_words(plan: ProseExecutionPlan) -> tuple[int, ...]:
+    """Expose the exact v3/legacy base-call targets without executing them."""
+    return tuple(spec.target_words for spec in _call_specs(plan))
+
+
 def _segment_prompt(
     *,
     plan: ProseExecutionPlan,
