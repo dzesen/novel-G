@@ -11,6 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Mapping
+from backend.services.generation.prose_protocol import CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 
 
 MIN_AUTOMATIC_CONTINUATIONS_PER_SCENE = 0
@@ -199,7 +200,7 @@ class ProseAuthorizationModule:
             None if token_budget is None else max(1, int(token_budget))
         )
         payload = {
-            "protocol_revision": "scene-continuation-v3",
+            "protocol_revision": CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
             "policy": policy.to_dict(),
             "authorization_revision": revision,
             "content_identity": str(content_identity or ""),

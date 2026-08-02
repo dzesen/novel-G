@@ -16,6 +16,9 @@ from backend.db.repositories.prose_run_repository import (
 )
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation.prose_completion import ProseExecutionPlan
+from backend.services.generation.prose_protocol import (
+    is_scene_continuation_v3_family,
+)
 from backend.services.generation.prose_generation import UncertainProseAttempt
 from backend.services.llm.context_builder import normalize_outline_references
 from backend.services.novel.chapter_service import count_chapter_words
@@ -39,9 +42,9 @@ def prose_run_draft_text(document: dict[str, Any]) -> str:
     assembled = str(document.get("assembled_text") or "")
     if assembled.strip():
         return assembled
-    is_v3 = str(
-        ((document.get("plan") or {}).get("protocol_revision") or "")
-    ) == "scene-continuation-v3"
+    is_v3 = is_scene_continuation_v3_family(
+        (document.get("plan") or {}).get("protocol_revision")
+    )
 
     def sort_key(segment: dict[str, Any]) -> tuple[int, int, int]:
         sequence = int(segment.get("sequence_index") or 0)
@@ -191,6 +194,15 @@ def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
                     item.get("manual_continuations_used")
                 ),
                 "word_count": _safe_non_negative_int(item.get("word_count")),
+                "scene_target_words": _safe_non_negative_int(
+                    item.get("scene_target_words")
+                ),
+                "converge_attempts": _safe_non_negative_int(
+                    item.get("converge_attempts")
+                ),
+                "converge_attempts_without_stop": _safe_non_negative_int(
+                    item.get("converge_attempts_without_stop")
+                ),
                 "pause_reason": (
                     str(item.get("pause_reason"))
                     if item.get("pause_reason") is not None

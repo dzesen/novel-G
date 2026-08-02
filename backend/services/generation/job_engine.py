@@ -89,6 +89,11 @@ def _incomplete_prose_checkpoint(
                     raw.get("manual_continuations_used")
                 ),
                 "word_count": integer(raw.get("word_count")),
+                "scene_target_words": integer(raw.get("scene_target_words")),
+                "converge_attempts": integer(raw.get("converge_attempts")),
+                "converge_attempts_without_stop": integer(
+                    raw.get("converge_attempts_without_stop")
+                ),
                 "last_prompt_mode": str(
                     raw.get("last_prompt_mode") or ""
                 )[:60],

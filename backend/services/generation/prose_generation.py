@@ -23,6 +23,9 @@ from backend.services.generation.prose_completion import (
     prose_completion_module,
 )
 from backend.services.generation.prose_continuation import ProseContinuationPolicy
+from backend.services.generation.prose_protocol import (
+    is_scene_continuation_v3_family,
+)
 from backend.services.novel.chapter_service import count_chapter_words
 
 
@@ -503,7 +506,7 @@ async def execute_prose_plan(
     ] | None = None,
 ) -> ProseGenerationResult:
     """Run the current prose protocol while preserving v2 draft readability."""
-    if plan.protocol_revision == "scene-continuation-v3":
+    if is_scene_continuation_v3_family(plan.protocol_revision):
         # Delayed import keeps the legacy executor import-safe for historical
         # persistence probes while letting v3 own the per-scene state machine.
         from backend.services.generation.prose_scene_execution import (

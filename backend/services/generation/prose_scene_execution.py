@@ -37,6 +37,16 @@ _AUTOMATIC_SEQUENCE_FLOOR = 1_000_000
 _SEAM_TAIL_CHARACTERS = 2_000
 
 
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, (bool, float)):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _scene_minimum_words(plan: ProseExecutionPlan, scene_index: int) -> int:
     budget = plan.segment_budgets[min(scene_index, len(plan.segment_budgets) - 1)]
     return math.ceil(max(1, int(budget)) * plan.minimum_completion_ratio)
@@ -217,6 +227,21 @@ def _scene_progress_snapshot(
     )
     scene_text = _scene_text(scene_segments, scene_index=scene_index)
     state["word_count"] = count_chapter_words(scene_text)
+    state["scene_target_words"] = max(
+        1,
+        int(plan.segment_budgets[min(scene_index, len(plan.segment_budgets) - 1)]),
+    )
+    converge_segments = [
+        segment
+        for segment in scene_segments
+        if str(segment.get("prompt_mode") or "")
+        in {"converge", "final_converge"}
+    ]
+    state["converge_attempts"] = len(converge_segments)
+    state["converge_attempts_without_stop"] = sum(
+        str(segment.get("finish_reason") or "unreported") != "stop"
+        for segment in converge_segments
+    )
     if scene_segments:
         latest = scene_segments[-1]
         state["last_prompt_mode"] = str(latest.get("prompt_mode") or "base")
@@ -512,8 +537,13 @@ async def execute_v3_prose_plan(
             prompt_mode=prompt_mode,
         )
         call_kwargs = dict(gen_kwargs or {})
-        if not call_kwargs.get("max_tokens"):
-            call_kwargs["max_tokens"] = max(256, math.ceil(target_words / 0.65))
+        derived_max_tokens = max(256, math.ceil(target_words / 0.65))
+        inherited_max_tokens = _positive_int(call_kwargs.get("max_tokens"))
+        call_kwargs["max_tokens"] = (
+            derived_max_tokens
+            if inherited_max_tokens is None
+            else min(inherited_max_tokens, derived_max_tokens)
+        )
 
         state = refresh_scene(scene_index)
         state["status"] = "generating"
@@ -795,6 +825,13 @@ async def execute_v3_prose_plan(
             remaining_automatic = (
                 policy.automatic_continuations_per_scene - automatic_used
             )
+            if no_progress and remaining_automatic <= 0:
+                state["status"] = "paused"
+                state["pause_reason"] = "prose_no_progress_without_quota"
+                await publish_progress()
+                pause_reason = state["pause_reason"]
+                break
+
             if remaining_automatic <= 0:
                 state["status"] = "paused"
                 state["pause_reason"] = "automatic_continuations_exhausted"

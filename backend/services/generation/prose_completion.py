@@ -13,6 +13,7 @@ from typing import Any, Iterable, Literal
 
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 from backend.services.generation.prose_continuation import ProseContinuationPolicy
+from backend.services.generation.prose_protocol import CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 from backend.services.novel.chapter_service import count_chapter_words
 
 
@@ -26,7 +27,7 @@ class ProseExecutionPlan:
     minimum_completion_ratio: float
     segment_budgets: tuple[int, ...]
     reason_codes: tuple[str, ...]
-    protocol_revision: str = "scene-continuation-v3"
+    protocol_revision: str = CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
     # Kept as a non-serialized compatibility attribute while v2 runs remain
     # readable. New plans never use it as a continuation authorization.
     max_continuations: int = field(default=0, compare=False, repr=False)
