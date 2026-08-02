@@ -66,6 +66,9 @@ from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
 from backend.services.generation.prose_completion import prose_completion_module
+from backend.services.generation.prose_continuation import (
+    ProseContinuationPolicy,
+)
 from backend.services.generation.prose_generation import execute_prose_plan
 from backend.services.generation.prose_runs import prose_run_module
 from backend.db.repositories.prose_run_repository import prose_run_repo
@@ -109,6 +112,14 @@ def _generation_options(
     return overrides, runtime_kwargs
 
 
+def _continuation_policy(
+    generation_params: Mapping[str, Any] | None,
+) -> ProseContinuationPolicy:
+    return ProseContinuationPolicy.from_mapping(
+        dict(generation_params or {}).get("prose_continuation_policy")
+    )
+
+
 def estimate_chapter_attempt_slots(
     chapter: Dict[str, Any],
     generation_params: Mapping[str, Any] | None = None,
@@ -116,6 +127,7 @@ def estimate_chapter_attempt_slots(
     """按当前不可变 GenerationPlan 计算一章的最大语义调用数。"""
     overrides, runtime_kwargs = _generation_options(generation_params)
     runtime = create_generation_runtime(**runtime_kwargs)
+    continuation_policy = _continuation_policy(generation_params)
     slots = 0
     if not chapter.get("outline"):
         slots += runtime.plan_structured(
@@ -140,11 +152,33 @@ def estimate_chapter_attempt_slots(
                 },
                 request_overrides=overrides,
             )
-            slots += prose_plan.call_count
+            maximum_logical_call_count = getattr(
+                prose_plan,
+                "maximum_logical_call_count",
+                None,
+            )
+            if callable(maximum_logical_call_count):
+                slots += maximum_logical_call_count(continuation_policy)
+            else:
+                # Compatibility for narrow test/embedding fakes which expose
+                # only the old base-call count surface.
+                base_calls = int(
+                    getattr(prose_plan, "scheduled_base_call_count", 0)
+                    or getattr(prose_plan, "call_count", 0)
+                )
+                slots += base_calls + (
+                    max(1, len(outline.get("scenes") or []))
+                    * continuation_policy.automatic_continuations_per_scene
+                )
         else:
             # 细纲尚未生成，场景数和逐场景预算未知。预留有界的保守容量，
             # 生成出细纲后实际调用仍受每章 reservation 约束，不可无限扩张。
-            slots += 32
+            from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
+
+            slots += 32 + (
+                MAX_CHAPTER_OUTLINE_SCENES
+                * continuation_policy.automatic_continuations_per_scene
+            )
     if (
         str(
             (chapter.get("state_completion") or {}).get("status")
@@ -311,6 +345,7 @@ async def generate_prose(
         + "\n" + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"]
     )
     gen_kwargs, runtime_kwargs = _generation_options(generation_params)
+    continuation_policy = _continuation_policy(generation_params)
     runtime = create_generation_runtime(
         attempt_scope=attempt_scope,
         **runtime_kwargs,
@@ -334,8 +369,22 @@ async def generate_prose(
         outline=outline,
         context_text=context.to_prompt_text(),
     )
-    if active is not None and active.get("status") == "stale":
-        active = None
+    if active is not None:
+        stored_protocol = str(
+            ((active.get("plan") or {}).get("protocol_revision") or "")
+        )
+        if stored_protocol != execution_plan.protocol_revision:
+            # A v2 residue is historical evidence, not a compatible checkpoint.
+            # Preserve it read-only and start a new v3 run instead of borrowing
+            # its per-part continuation count or text identity.
+            await prose_run_repo.mark_status(
+                run_id=str(active["_id"]),
+                owner_id=owner_id,
+                status="stale",
+            )
+            active = None
+        elif active.get("status") == "stale":
+            active = None
     run_document = await prose_run_module.begin(
         owner_id=owner_id,
         novel_id=novel_id,
@@ -347,6 +396,7 @@ async def generate_prose(
             "provider_alias": plan.provider_alias,
             "provider_model": plan.provider_model,
             "config_revision": plan.config_revision,
+            "thinking_mode": getattr(plan, "thinking_mode", None),
         },
         run_id=str(active["_id"]) if active is not None else None,
         expected_revision=int(active.get("revision") or 0) if active is not None else None,
@@ -363,6 +413,13 @@ async def generate_prose(
     def finish_reason_reader():
         return runtime.last_finish_reason
 
+    def raw_finish_reason_reader():
+        return getattr(
+            runtime,
+            "last_raw_finish_reason",
+            runtime.last_finish_reason,
+        )
+
     def usage_reader():
         attempts = runtime.attempts
         return attempts[-1].usage if attempts else runtime.usage
@@ -377,6 +434,16 @@ async def generate_prose(
             segment=segment,
         )
 
+    async def on_scene_progress(scene_progress: tuple[dict, ...]) -> None:
+        nonlocal latest_run
+        lease = latest_run.get("lease") or {}
+        latest_run = await prose_run_repo.update_scene_progress(
+            run_id=str(latest_run["_id"]),
+            owner_id=owner_id,
+            lease_token=str(lease.get("token") or ""),
+            scene_progress=[dict(item) for item in scene_progress],
+        )
+
     try:
         generated = await execute_prose_plan(
             plan=execution_plan,
@@ -385,14 +452,23 @@ async def generate_prose(
             stream_call=stream_call,
             finish_reason_reader=finish_reason_reader,
             usage_reader=usage_reader,
+            raw_finish_reason_reader=raw_finish_reason_reader,
             outline_revision=str(run_document["outline_revision"]),
             gen_kwargs=gen_kwargs,
             existing_segments=list(run_document.get("segments") or []),
+            existing_scene_progress=list(run_document.get("scene_progress") or []),
             confirm_uncertain_retry=bool(
                 getattr(attempt_scope, "confirm_uncertain_retry", False)
             ),
             on_segment=on_segment,
+            continuation_policy=continuation_policy,
+            on_scene_progress=on_scene_progress,
         )
+        run_completion = {
+            **generated.completion.to_dict(),
+            "scene_progress": [dict(item) for item in generated.scene_progress],
+            "pause_reason": generated.pause_reason,
+        }
         lease = latest_run.get("lease") or {}
         latest_run = await prose_run_repo.finish(
             run_id=str(latest_run["_id"]),
@@ -403,7 +479,7 @@ async def generate_prose(
                 if generated.completion.can_write_formal_prose
                 else generated.completion.status
             ),
-            completion=generated.completion.to_dict(),
+            completion=run_completion,
             assembled_text=generated.text,
         )
     except BaseException:
@@ -420,6 +496,8 @@ async def generate_prose(
     completion = {
         **generated.completion.to_dict(),
         "source_run_id": str(latest_run["_id"]),
+        "scene_progress": [dict(item) for item in generated.scene_progress],
+        "pause_reason": generated.pause_reason,
         "source_run_revision": int(latest_run.get("revision") or 0),
         "source_run_digest": chapter_content_digest(generated.text),
     }

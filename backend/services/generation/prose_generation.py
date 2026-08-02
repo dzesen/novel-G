@@ -22,6 +22,7 @@ from backend.services.generation.prose_completion import (
     ProseExecutionPlan,
     prose_completion_module,
 )
+from backend.services.generation.prose_continuation import ProseContinuationPolicy
 from backend.services.novel.chapter_service import count_chapter_words
 
 
@@ -45,6 +46,8 @@ class ProseGenerationResult:
     usage: TokenUsage
     completion: ProseCompletion
     outline_revision: str
+    scene_progress: tuple[dict[str, Any], ...] = ()
+    pause_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,7 @@ def _call_specs(plan: ProseExecutionPlan) -> list[_CallSpec]:
 
 def _segment_prompt(
     *,
+    plan: ProseExecutionPlan,
     base_prompt: str,
     outline: dict[str, Any],
     spec: _CallSpec,
@@ -109,6 +113,22 @@ def _segment_prompt(
     is_resume: bool = False,
 ) -> str:
     scenes = list((outline or {}).get("scenes") or [])
+    if plan.mode == "single_call":
+        continuation = (
+            "这是同一章的续写。紧接前文继续，不重写开头，不总结已写内容。"
+            if is_resume
+            else f"按章细纲顺序完整写完全部 {plan.scene_count} 个场景，不遗漏后续场景。"
+        )
+        return (
+            f"{base_prompt}\n\n"
+            "【Novel-G 单次正文协议】\n"
+            "SCENE_INDEX=ALL\n"
+            f"本章目标约 {spec.target_words} 字。\n"
+            f"{continuation}\n"
+            f"完整场景列表：{json.dumps(scenes, ensure_ascii=False, default=str)}\n"
+            f"已完成正文尾部（仅用于衔接，禁止复述）：{prior_tail or '无'}\n"
+            "只输出小说正文，不输出场景标题、协议字段、解释或完成声明。"
+        )
     current_scene = scenes[spec.scene_index] if spec.scene_index < len(scenes) else {}
     remaining = scenes[spec.scene_index + 1 :]
     continuation = (
@@ -122,6 +142,9 @@ def _segment_prompt(
         f"SCENE_INDEX={spec.scene_index}\n"
         f"PART_INDEX={spec.part_index}\n"
         f"PART_COUNT={spec.part_count}\n"
+        "上方“本章目标字数”是全章总量，不是本次调用的目标。"
+        "本次只写当前场景，以本段目标为准；达到目标后完整收束当前场景并停止，"
+        "不要为了凑全章字数继续扩写。\n"
         f"本段目标约 {spec.target_words} 字。\n"
         f"{continuation}\n"
         f"当前场景：{json.dumps(current_scene, ensure_ascii=False, default=str)}\n"
@@ -140,7 +163,7 @@ def _usage_sum(items: Iterable[TokenUsage]) -> TokenUsage:
     )
 
 
-async def execute_prose_plan(
+async def _execute_legacy_prose_plan(
     *,
     plan: ProseExecutionPlan,
     outline: dict[str, Any],
@@ -149,6 +172,7 @@ async def execute_prose_plan(
     finish_reason_reader: Callable[[], Any],
     usage_reader: Callable[[], TokenUsage],
     outline_revision: str,
+    raw_finish_reason_reader: Callable[[], Any] | None = None,
     gen_kwargs: Mapping[str, Any] | None = None,
     existing_segments: Iterable[dict[str, Any]] = (),
     confirm_uncertain_retry: bool = False,
@@ -188,8 +212,6 @@ async def execute_prose_plan(
         for item in by_sequence.values()
     ]
     kwargs = dict(gen_kwargs or {})
-    blocking_terminal = False
-
     for spec in specs:
         existing_segment = by_sequence.get(spec.sequence_index)
         if existing_segment is not None and existing_segment.get("status") == "completed":
@@ -197,12 +219,11 @@ async def execute_prose_plan(
         if (
             existing_segment is not None
             and not manual_continuation
-            and int(existing_segment.get("continuation_count") or 0)
-            >= plan.max_continuations
+            and not confirm_uncertain_retry
         ):
             raise ProseContinuationLimit(
-                "这份上次保留的正文草稿已达到续写次数上限；"
-                "请在当前页面接受部分正文，或丢弃草稿后重新生成"
+                "这份正文草稿尚未完成；默认不会自动继续付费调用，"
+                "请由用户明确发起一次手动续写"
             )
         prior_text = "\n\n".join(
             str(by_sequence[index].get("text") or "").strip()
@@ -221,6 +242,7 @@ async def execute_prose_plan(
             target_words=remaining_words,
         )
         prompt = _segment_prompt(
+            plan=plan,
             base_prompt=base_prompt,
             outline=outline,
             spec=effective_spec,
@@ -254,6 +276,7 @@ async def execute_prose_plan(
             "word_count": count_chapter_words(existing_text),
             "raw_character_count": len(existing_text),
             "finish_reason": "unreported",
+            "raw_finish_reason": "unreported",
             "usage": previous_usage.model_dump(),
             "continuation_count": int(
                 (existing_segment or {}).get("continuation_count") or 0
@@ -289,6 +312,7 @@ async def execute_prose_plan(
                     "word_count": count_chapter_words(partial_text),
                     "raw_character_count": len(partial_text),
                     "finish_reason": "cancelled",
+                    "raw_finish_reason": "cancelled",
                     "usage": previous_usage.model_dump(),
                     "continuation_count": int(
                         (existing_segment or {}).get("continuation_count") or 0
@@ -323,6 +347,7 @@ async def execute_prose_plan(
                     "word_count": count_chapter_words(partial_text),
                     "raw_character_count": len(partial_text),
                     "finish_reason": "error",
+                    "raw_finish_reason": "error",
                     "usage": _usage_sum(
                         [previous_usage, observed_usage]
                     ).model_dump(),
@@ -338,7 +363,16 @@ async def execute_prose_plan(
         text = "\n\n".join(
             part for part in (existing_text, generated_text) if part
         )
-        finish_reason = normalize_finish_reason(finish_reason_reader())
+        observed_finish_reason = finish_reason_reader()
+        finish_reason = normalize_finish_reason(observed_finish_reason)
+        raw_finish_reason = (
+            raw_finish_reason_reader()
+            if raw_finish_reason_reader is not None
+            else observed_finish_reason
+        )
+        raw_finish_reason = str(
+            getattr(raw_finish_reason, "value", raw_finish_reason) or "unreported"
+        ).strip() or "unreported"
         usage = usage_reader()
         usages.append(usage)
         persisted_usage = _usage_sum([previous_usage, usage])
@@ -368,6 +402,7 @@ async def execute_prose_plan(
             "word_count": count_chapter_words(text),
             "raw_character_count": len(text),
             "finish_reason": finish_reason,
+            "raw_finish_reason": raw_finish_reason,
             "usage": persisted_usage.model_dump(),
             "continuation_count": int(
                 (existing_segment or {}).get("continuation_count") or 0
@@ -376,7 +411,6 @@ async def execute_prose_plan(
         by_sequence[spec.sequence_index] = segment
         await _notify(on_segment, segment)
         if status != "completed":
-            blocking_terminal = True
             break
 
     scene_segments: list[dict[str, Any]] = []
@@ -424,12 +458,16 @@ async def execute_prose_plan(
         if ordered_segments
         else "unreported"
     )
-    if blocking_terminal and last_reason == "stop":
-        last_reason = "error"
+    last_raw_reason = (
+        ordered_segments[-1].get("raw_finish_reason")
+        if ordered_segments
+        else "unreported"
+    )
     completion = prose_completion_module.inspect(
         text=text,
         plan=plan,
         finish_reason=last_reason,
+        raw_finish_reason=last_raw_reason,
         completed_scene_indexes=completed_scene_indexes,
         outline_revision=outline_revision,
         expected_outline_revision=outline_revision,
@@ -440,4 +478,70 @@ async def execute_prose_plan(
         usage=_usage_sum(usages),
         completion=completion,
         outline_revision=outline_revision,
+    )
+
+async def execute_prose_plan(
+    *,
+    plan: ProseExecutionPlan,
+    outline: dict[str, Any],
+    base_prompt: str,
+    stream_call: StreamCall,
+    finish_reason_reader: Callable[[], Any],
+    usage_reader: Callable[[], TokenUsage],
+    outline_revision: str,
+    raw_finish_reason_reader: Callable[[], Any] | None = None,
+    gen_kwargs: Mapping[str, Any] | None = None,
+    existing_segments: Iterable[dict[str, Any]] = (),
+    existing_scene_progress: Iterable[dict[str, Any]] = (),
+    continuation_policy: ProseContinuationPolicy | None = None,
+    confirm_uncertain_retry: bool = False,
+    manual_continuation: bool = False,
+    on_delta: DeltaCallback | None = None,
+    on_segment: SegmentCallback | None = None,
+    on_scene_progress: Callable[
+        [tuple[dict[str, Any], ...]], Awaitable[None] | None
+    ] | None = None,
+) -> ProseGenerationResult:
+    """Run the current prose protocol while preserving v2 draft readability."""
+    if plan.protocol_revision == "scene-continuation-v3":
+        # Delayed import keeps the legacy executor import-safe for historical
+        # persistence probes while letting v3 own the per-scene state machine.
+        from backend.services.generation.prose_scene_execution import (
+            execute_v3_prose_plan,
+        )
+
+        return await execute_v3_prose_plan(
+            plan=plan,
+            outline=outline,
+            base_prompt=base_prompt,
+            stream_call=stream_call,
+            finish_reason_reader=finish_reason_reader,
+            usage_reader=usage_reader,
+            outline_revision=outline_revision,
+            raw_finish_reason_reader=raw_finish_reason_reader,
+            gen_kwargs=gen_kwargs,
+            existing_segments=existing_segments,
+            existing_scene_progress=existing_scene_progress,
+            continuation_policy=continuation_policy,
+            confirm_uncertain_retry=confirm_uncertain_retry,
+            manual_continuation=manual_continuation,
+            on_delta=on_delta,
+            on_segment=on_segment,
+            on_scene_progress=on_scene_progress,
+        )
+    return await _execute_legacy_prose_plan(
+        plan=plan,
+        outline=outline,
+        base_prompt=base_prompt,
+        stream_call=stream_call,
+        finish_reason_reader=finish_reason_reader,
+        usage_reader=usage_reader,
+        outline_revision=outline_revision,
+        raw_finish_reason_reader=raw_finish_reason_reader,
+        gen_kwargs=gen_kwargs,
+        existing_segments=existing_segments,
+        confirm_uncertain_retry=confirm_uncertain_retry,
+        manual_continuation=manual_continuation,
+        on_delta=on_delta,
+        on_segment=on_segment,
     )

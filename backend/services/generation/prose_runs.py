@@ -39,13 +39,26 @@ def prose_run_draft_text(document: dict[str, Any]) -> str:
     assembled = str(document.get("assembled_text") or "")
     if assembled.strip():
         return assembled
+    is_v3 = str(
+        ((document.get("plan") or {}).get("protocol_revision") or "")
+    ) == "scene-continuation-v3"
+
+    def sort_key(segment: dict[str, Any]) -> tuple[int, int, int]:
+        sequence = int(segment.get("sequence_index") or 0)
+        if not is_v3:
+            return (sequence, 0, 0)
+        return (
+            int(segment.get("scene_index") or 0),
+            int(segment.get("scene_call_index", segment.get("part_index") or 0) or 0),
+            sequence,
+        )
     ordered = sorted(
         (
             dict(segment)
             for segment in document.get("segments") or []
             if str(segment.get("text") or "").strip()
         ),
-        key=lambda segment: int(segment.get("sequence_index") or 0),
+        key=sort_key,
     )
     return "\n\n".join(
         str(segment.get("text") or "").strip()
@@ -68,6 +81,8 @@ def _has_exhausted_segment(
     document: dict[str, Any],
     plan: ProseExecutionPlan,
 ) -> bool:
+    if plan.protocol_revision != "scene-target-priority-v2":
+        return False
     return any(
         segment.get("status") != "completed"
         and int(segment.get("continuation_count") or 0)
@@ -77,8 +92,11 @@ def _has_exhausted_segment(
 
 
 def _stored_run_has_exhausted_segment(document: dict[str, Any]) -> bool:
+    plan = document.get("plan") or {}
+    if str(plan.get("protocol_revision") or "") != "scene-target-priority-v2":
+        return False
     max_continuations = int(
-        (document.get("plan") or {}).get("max_continuations") or 0
+        plan.get("max_continuations") or 0
     )
     if max_continuations <= 0:
         return False
@@ -103,6 +121,11 @@ def _leftover_reason_codes(document: dict[str, Any]) -> list[str]:
         for code in (document.get("completion") or {}).get("reason_codes") or []
         if str(code).strip()
     ]
+    codes.extend(
+        str(progress.get("pause_reason") or "")
+        for progress in document.get("scene_progress") or []
+        if str(progress.get("pause_reason") or "").strip()
+    )
     if _run_has_uncertain_attempt(document):
         codes.append("uncertain_provider_attempt")
     if _stored_run_has_exhausted_segment(document):
@@ -141,6 +164,158 @@ def _outline_revision_is_current(
     }
 
 
+def _safe_non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return persisted scene counters without prose, prompt, or raw error data."""
+    result: list[dict[str, Any]] = []
+    for item in document.get("scene_progress") or []:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "scene_index": _safe_non_negative_int(item.get("scene_index")),
+                "status": str(item.get("status") or "pending"),
+                "base_calls_used": _safe_non_negative_int(
+                    item.get("base_calls_used")
+                ),
+                "automatic_continuations_used": _safe_non_negative_int(
+                    item.get("automatic_continuations_used")
+                ),
+                "manual_continuations_used": _safe_non_negative_int(
+                    item.get("manual_continuations_used")
+                ),
+                "word_count": _safe_non_negative_int(item.get("word_count")),
+                "pause_reason": (
+                    str(item.get("pause_reason"))
+                    if item.get("pause_reason") is not None
+                    else None
+                ),
+                "last_prompt_mode": (
+                    str(item.get("last_prompt_mode"))
+                    if item.get("last_prompt_mode") is not None
+                    else None
+                ),
+                "last_finish_reason": str(
+                    item.get("last_finish_reason") or "unreported"
+                ),
+                "consecutive_no_progress": _safe_non_negative_int(
+                    item.get("consecutive_no_progress")
+                ),
+            }
+        )
+    return sorted(result, key=lambda item: item["scene_index"])
+
+
+def serialize_prose_run_telemetry(document: dict[str, Any]) -> dict[str, Any]:
+    """Serialize operational metadata while deliberately excluding prose and prompts."""
+    plan = document.get("plan") or {}
+    completion = document.get("completion") or {}
+    provider_plan = document.get("provider_plan") or {}
+    authorization = document.get("prose_continuation_authorization") or {}
+    policy = authorization.get("policy") or {}
+    scene_progress = _telemetry_scene_progress(document)
+    continuation_exhausted = _stored_run_has_exhausted_segment(document) or any(
+        item.get("pause_reason") == "automatic_continuations_exhausted"
+        for item in scene_progress
+    )
+    return {
+        "run_id": str(document["_id"]),
+        "novel_id": str(document["novel_id"]),
+        "chapter_id": str(document["chapter_id"]),
+        "revision": _safe_non_negative_int(document.get("revision")),
+        "status": str(document.get("status") or "unknown"),
+        "provider": {
+            "alias": str(provider_plan.get("provider_alias") or ""),
+            "model": str(provider_plan.get("provider_model") or ""),
+        },
+        "plan": {
+            "mode": str(plan.get("mode") or "single_call"),
+            "requested_word_count": _safe_non_negative_int(
+                plan.get("requested_word_count")
+            ),
+            "scene_count": _safe_non_negative_int(plan.get("scene_count")),
+            "scheduled_base_call_count": _safe_non_negative_int(
+                plan.get("scheduled_base_call_count", plan.get("call_count"))
+            ),
+            "protocol_revision": str(plan.get("protocol_revision") or ""),
+        },
+        "completion": {
+            "status": str(completion.get("status") or "pending"),
+            "requested_word_count": _safe_non_negative_int(
+                completion.get("requested_word_count")
+            ),
+            "actual_word_count": _safe_non_negative_int(
+                completion.get("actual_word_count")
+            ),
+            "scene_count": _safe_non_negative_int(completion.get("scene_count")),
+            "completed_scene_count": _safe_non_negative_int(
+                completion.get("completed_scene_count")
+            ),
+            "finish_reason": str(completion.get("finish_reason") or "unreported"),
+            "reason_codes": [
+                str(code)
+                for code in completion.get("reason_codes") or []
+                if str(code).strip()
+            ][:20],
+        },
+        "scene_progress": scene_progress,
+        "usage": {
+            "provider_attempt_count": _safe_non_negative_int(
+                document.get("provider_attempt_count")
+            ),
+            "tokens_used": _safe_non_negative_int(document.get("tokens_used")),
+            "tokens_reserved": _safe_non_negative_int(
+                document.get("tokens_reserved")
+            ),
+            "token_budget": (
+                _safe_non_negative_int(document.get("token_budget"))
+                if document.get("token_budget") is not None
+                else None
+            ),
+        },
+        "authorization": {
+            # This is a one-way SHA-256 identity for the inputs used to make
+            # the run, not prose or its readiness digest.  It lets users see
+            # whether a record belongs to the expected content snapshot.
+            "content_identity": str(authorization.get("content_identity") or ""),
+            "authorization_revision": _safe_non_negative_int(
+                authorization.get(
+                    "authorization_revision",
+                    document.get("authorization_revision"),
+                )
+            ),
+            "automatic_continuations_per_scene": _safe_non_negative_int(
+                policy.get("automatic_continuations_per_scene")
+            ),
+            "continuation_target_words": _safe_non_negative_int(
+                policy.get("continuation_target_words")
+            ),
+            "max_base_calls": _safe_non_negative_int(
+                authorization.get("max_base_calls")
+            ),
+            "max_automatic_continuation_calls": _safe_non_negative_int(
+                authorization.get("max_automatic_continuation_calls")
+            ),
+            "max_logical_prose_calls": _safe_non_negative_int(
+                authorization.get("max_logical_prose_calls")
+            ),
+            "conservative_token_bound": _safe_non_negative_int(
+                authorization.get("conservative_token_bound")
+            ),
+        },
+        "has_uncertain_attempt": _run_has_uncertain_attempt(document),
+        "continuation_exhausted": continuation_exhausted,
+        "created_at": document.get("created_at"),
+        "updated_at": document.get("updated_at"),
+    }
+
+
 class ProseRunModule:
     async def begin(
         self,
@@ -156,6 +331,7 @@ class ProseRunModule:
         expected_revision: int | None = None,
         confirm_uncertain_retry: bool = False,
         replace_exhausted: bool = False,
+        authorization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         outline_revision = prose_revision(outline)
         context_revision = prose_revision(context_text)
@@ -192,6 +368,7 @@ class ProseRunModule:
                     "provider_alias",
                     "provider_model",
                     "config_revision",
+                    "thinking_mode",
                 )
             )
             if provider_changed:
@@ -204,10 +381,16 @@ class ProseRunModule:
                     "正文草稿的 Provider 或模型已经变化，不能静默续写；"
                     "请保留旧稿参考并重新生成"
                 )
-            if any(
-                segment.get("status") == "uncertain"
-                for segment in existing.get("segments") or []
-            ) and not confirm_uncertain_retry:
+            has_uncertain_attempt = bool(
+                existing.get("has_uncertain_attempt")
+                or (existing.get("active_token_reservation") or {}).get("state")
+                == "uncertain"
+                or any(
+                    segment.get("status") == "uncertain"
+                    for segment in existing.get("segments") or []
+                )
+            )
+            if has_uncertain_attempt and not confirm_uncertain_retry:
                 raise UncertainProseAttempt(
                     "存在已派发但未确认结果的正文请求，可能已经计费；"
                     "请明确确认可能重复计费后再继续"
@@ -223,20 +406,68 @@ class ProseRunModule:
                 replace_exhausted
                 and _has_exhausted_segment(existing, plan)
             ):
-                return await prose_run_repo.claim(
+                claimed = await prose_run_repo.claim(
                     run_id=run_id,
                     owner_id=owner_id,
                     expected_revision=revision,
                 )
+                lease_token = str(
+                    (claimed.get("lease") or {}).get("token") or ""
+                )
+                if authorization is not None:
+                    claimed = await prose_run_repo.update_authorization(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        lease_token=lease_token,
+                        authorization=dict(authorization),
+                    )
+                if has_uncertain_attempt:
+                    acknowledged = await prose_run_repo.acknowledge_uncertain_call_budget(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        lease_token=lease_token,
+                        action="retry",
+                    )
+                    if not acknowledged:
+                        current = await prose_run_repo.get_run(run_id, owner_id)
+                        if (
+                            (current.get("active_token_reservation") or {}).get("state")
+                            == "uncertain"
+                        ):
+                            raise UncertainProseAttempt(
+                                "正文不确定调用的预算状态已变化"
+                            )
+                    claimed = await prose_run_repo.get_run(run_id, owner_id)
+                return claimed
             replace_run_id = run_id
             replace_revision = revision
 
+        if run_id is None:
+            active = await prose_run_repo.find_active(
+                chapter_id=chapter_id,
+                owner_id=owner_id,
+            )
+            if active is not None and str(
+                ((active.get("plan") or {}).get("protocol_revision") or "")
+            ) != plan.protocol_revision:
+                # Legacy execution state is preserved for inspection only. A
+                # clean request starts a new v3 draft; it never overwrites it.
+                await prose_run_repo.mark_status(
+                    run_id=str(active["_id"]),
+                    owner_id=owner_id,
+                    status="stale",
+                )
         created = await prose_run_repo.create_run(
             {
                 "owner_id": owner_id,
                 "novel_id": novel_id,
                 "chapter_id": chapter_id,
                 "outline_revision": outline_revision,
+                "prose_continuation_authorization": dict(authorization or {}),
+                "authorization_revision": int(
+                    (authorization or {}).get("authorization_revision") or 0
+                ),
+                "token_budget": (authorization or {}).get("token_budget"),
                 "context_revision": context_revision,
                 "plan": plan.to_dict(),
                 "provider_plan": dict(provider_plan),
@@ -354,6 +585,25 @@ class ProseRunModule:
                 }
             )
         return summaries
+
+    async def list_telemetry(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        limit: int = 100,
+        skip: int = 0,
+        chapter_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return user-owned, metadata-only prose-run inspection records."""
+        runs = await prose_run_repo.list_telemetry_by_novel(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            limit=limit,
+            skip=skip,
+            chapter_id=chapter_id,
+        )
+        return [serialize_prose_run_telemetry(run) for run in runs]
 
     async def accept(
         self,

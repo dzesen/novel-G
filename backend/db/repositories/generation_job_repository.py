@@ -15,6 +15,14 @@ from backend.llm.models import TokenUsage
 
 USAGE_SUMMARY_LIMIT = 100
 
+class TokenBudgetExceeded(ValueError):
+    """A Provider dispatch would exceed the explicitly authorized token budget."""
+
+
+class TokenBudgetUnbounded(TokenBudgetExceeded):
+    """A finite budget cannot authorize a call without a conservative bound."""
+
+
 
 class AttemptCapacityExceeded(ValueError):
     """作业固定 attempt 容量或当前章节 reservation 已耗尽。"""
