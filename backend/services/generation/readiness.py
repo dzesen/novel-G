@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
+)
+from backend.services.generation.prose_continuation import (
+    ProseContinuationPolicy,
+    prose_authorization_module,
 )
 
 
@@ -28,7 +33,10 @@ class StaleReadiness(ValueError):
 class ReadinessDeps:
     load_resource_counts: Callable[[str], Awaitable[dict[str, int]]]
     inspect_active_proposal: Callable[[str], Awaitable[dict[str, Any] | None]]
-    plan_work: Callable[[list[dict[str, Any]]], dict[str, Any]]
+    plan_work: Callable[
+        [list[dict[str, Any]], ProseContinuationPolicy, Mapping[str, Any] | None],
+        dict[str, Any],
+    ]
 
 
 def _jsonable(value: Any) -> Any:
@@ -120,6 +128,78 @@ def _issue(
     }
 
 
+def _batch_prose_authorization(
+    *,
+    scope: str,
+    volume_id: str | None,
+    work: Mapping[str, Any],
+    planning: Mapping[str, Any],
+    policy: ProseContinuationPolicy,
+    token_budget: int | None,
+    authorization_revision: int = 1,
+) -> dict[str, Any]:
+    """Bind mutable continuation authority to the current batch work snapshot."""
+    strategy = dict(planning.get("prose_strategy") or {})
+    maximum_base_calls = int(
+        strategy.get("maximum_base_prose_calls")
+        or strategy.get("maximum_prose_calls")
+        or 0
+    )
+    estimated_scene_count = int(
+        strategy.get("estimated_scene_count") or 0
+    )
+    conservative_bound = int(
+        strategy.get("conservative_token_bound") or 0
+    )
+    token_bound_known = bool(
+        strategy.get("token_bound_known")
+    )
+    if maximum_base_calls <= 0:
+        return {
+            "policy": policy.to_dict(),
+            "authorization_revision": max(1, int(authorization_revision)),
+            "max_base_calls": 0,
+            "max_automatic_continuation_calls": 0,
+            "max_logical_prose_calls": 0,
+            "max_actual_provider_attempts": 0,
+            "conservative_token_bound": conservative_bound,
+            "token_bound_known": token_bound_known,
+            "token_budget": token_budget,
+            "readiness_digest": "",
+        }
+    content_identity = _digest(
+        {
+            "scope": scope,
+            "volume_id": volume_id,
+            "chapters": list(work.get("chapters") or []),
+        }
+    )
+    provider_plan_revision = _digest(
+        {
+            "config_revision": planning.get("config_revision"),
+            "capability_snapshot": planning.get("capability_snapshot"),
+            "prose_strategy": strategy,
+        }
+    )
+    authorization = prose_authorization_module.authorize(
+        policy=policy,
+        authorization_revision=authorization_revision,
+        content_identity=content_identity,
+        provider_plan_revision=provider_plan_revision,
+        scheduled_base_calls=maximum_base_calls,
+        scene_count=estimated_scene_count,
+        conservative_token_bound=conservative_bound,
+        token_budget=token_budget,
+    ).to_dict()
+    return {
+        **authorization,
+        "token_bound_known": token_bound_known,
+        # Budget-tracked runtimes disable opaque SDK retries, so one logical
+        # prose call maps to exactly one maximum Provider attempt here.
+        "max_actual_provider_attempts": authorization["max_logical_prose_calls"],
+    }
+
+
 class GenerationReadinessModule:
     def __init__(self, deps: ReadinessDeps) -> None:
         self._deps = deps
@@ -131,7 +211,14 @@ class GenerationReadinessModule:
         scope: str,
         volume_id: str | None,
         chapters: list[dict[str, Any]],
+        prose_continuation_policy: ProseContinuationPolicy | None = None,
+        token_budget: int | None = None,
+        generation_params: Mapping[str, Any] | None = None,
+        authorization_revision: int = 1,
     ) -> dict[str, Any]:
+        continuation_policy = (
+            prose_continuation_policy or ProseContinuationPolicy()
+        )
         work = _work_summary(chapters)
         resources = await self._deps.load_resource_counts(novel_id)
         proposal = await self._deps.inspect_active_proposal(novel_id)
@@ -211,7 +298,7 @@ class GenerationReadinessModule:
             )
 
         try:
-            planning = self._deps.plan_work(chapters) if has_work else {
+            planning = self._deps.plan_work(chapters, continuation_policy, generation_params) if has_work else {
                 "attempt_capacity": 0,
                 "providers": [],
                 "config_revision": "",
@@ -254,6 +341,78 @@ class GenerationReadinessModule:
                     action_codes=["review_prose_plan"],
                 )
             )
+        high_risk_chapters = int(
+            prose_strategy.get("high_risk_chapter_count") or 0
+        )
+        if high_risk_chapters:
+            issues.append(
+                _issue(
+                    "prose_output_risk_requires_ack",
+                    "warning_requires_ack",
+                    details={
+                        "chapter_count": high_risk_chapters,
+                        "chapter_ids": list(
+                            prose_strategy.get("high_risk_chapter_ids") or []
+                        )[:50],
+                        "maximum_target_words": int(
+                            prose_strategy.get("maximum_target_words") or 0
+                        ),
+                        "safe_output_words": int(
+                            prose_strategy.get("safe_output_words") or 0
+                        ),
+                        "maximum_prose_calls": int(
+                            prose_strategy.get("maximum_prose_calls") or 0
+                        ),
+                        "output_limit_known": bool(
+                            prose_strategy.get("output_limit_known")
+                        ),
+                    },
+                    action_codes=["review_prose_plan"],
+                )
+            )
+
+
+        prose_authorization = _batch_prose_authorization(
+            scope=scope,
+            volume_id=volume_id,
+            work=work,
+            planning=planning,
+            policy=continuation_policy,
+            token_budget=token_budget,
+            authorization_revision=authorization_revision,
+        )
+        planning = {
+            **planning,
+            "prose_continuation_authorization": prose_authorization,
+        }
+        automatic_requested = bool(
+            continuation_policy.permits_automatic_continuation
+            and prose_authorization.get("max_base_calls")
+        )
+        if automatic_requested:
+            issues.append(
+                _issue(
+                    "automatic_continuations_require_confirmation",
+                    "warning_requires_ack",
+                    details={
+                        "per_scene": continuation_policy.automatic_continuations_per_scene,
+                        "continuation_target_words": continuation_policy.continuation_target_words,
+                        "maximum_automatic_calls": prose_authorization.get(
+                            "max_automatic_continuation_calls"
+                        ),
+                    },
+                    action_codes=["review_prose_plan"],
+                )
+            )
+            if not prose_authorization.get("token_bound_known"):
+                issues.append(_issue("prose_token_bound_unproven", "blocked"))
+            if token_budget is None:
+                issues.append(
+                    _issue(
+                        "automatic_continuations_require_token_budget",
+                        "blocked",
+                    )
+                )
 
         snapshot = {
             "version": 1,
@@ -305,6 +464,14 @@ class GenerationReadinessModule:
         acknowledged_warning_codes: Iterable[str],
     ) -> dict[str, Any]:
         current_digest = str(report.get("digest") or "")
+        automatic_confirmation_required = any(
+            item.get("code") == "automatic_continuations_require_confirmation"
+            for item in report.get("issues", [])
+        )
+        if automatic_confirmation_required and supplied_digest is None:
+            raise StaleReadiness(
+                "自动续写必须使用当前 readiness 摘要确认后才能启动"
+            )
         if supplied_digest is not None and supplied_digest != current_digest:
             raise StaleReadiness("生成前检查已过期，请重新检查后再启动")
 
@@ -406,6 +573,8 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
     segmented_chapters = 0
     unknown_outline_chapters = 0
     maximum_prose_calls = 0
+    high_risk_chapter_ids: list[str] = []
+    maximum_target_words = 0
     prose_capability: dict[str, Any] = {}
     if prose_text_plan is not None:
         capability_plan = prose_completion_module.plan(
@@ -428,18 +597,23 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
         for chapter in chapters:
             if _has_text(chapter, "content"):
                 continue
+            chapter_id = str(chapter.get("_id") or "")
             outline = chapter.get("outline") or {}
             if not outline:
+                target_words = int(chapter.get("words_per_chapter") or 3_000)
                 unknown_outline_chapters += 1
                 maximum_prose_calls += 32
+                maximum_target_words = max(maximum_target_words, target_words)
+                high_risk_chapter_ids.append(chapter_id)
                 continue
+            target_words = int(
+                outline.get("target_word_count")
+                or chapter.get("words_per_chapter")
+                or 3_000
+            )
             prose_plan = prose_completion_module.plan(
                 outline=outline,
-                target_word_count=int(
-                    outline.get("target_word_count")
-                    or chapter.get("words_per_chapter")
-                    or 3_000
-                ),
+                target_word_count=target_words,
                 provider_capability={
                     "max_output_tokens": prose_text_plan.max_output_tokens,
                     "model": prose_text_plan.provider_model,
@@ -447,6 +621,12 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
                 request_overrides={},
             )
             maximum_prose_calls += prose_plan.call_count
+            maximum_target_words = max(maximum_target_words, target_words)
+            if (
+                prose_plan.mode == "scene_segments"
+                or capability_plan.provider_output_limit is None
+            ):
+                high_risk_chapter_ids.append(chapter_id)
             if prose_plan.mode == "scene_segments":
                 segmented_chapters += 1
             else:
@@ -461,7 +641,158 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
             "scene_segment_chapters": segmented_chapters,
             "unknown_outline_chapters": unknown_outline_chapters,
             "maximum_prose_calls": maximum_prose_calls,
+            "high_risk_chapter_count": len(high_risk_chapter_ids),
+            "high_risk_chapter_ids": high_risk_chapter_ids,
+            "maximum_target_words": maximum_target_words,
             **prose_capability,
+        },
+    }
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _plan_work_with_prose_continuation(
+    chapters: list[dict[str, Any]],
+    policy: ProseContinuationPolicy,
+    generation_params: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Deepen the existing batch plan with bounded per-scene prose authority."""
+    from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
+    from backend.services.generation.headless_generation import (
+        PROSE_STEP,
+        PROSE_WORKFLOW,
+        estimate_worklist_attempt_capacity,
+    )
+    from backend.services.generation.prose_completion import prose_completion_module
+    from backend.services.llm.generation_runtime import (
+        WorkflowStepTarget,
+        create_generation_runtime,
+    )
+
+    base = _plan_work(chapters)
+    values = dict(generation_params or {})
+    overrides = {
+        key: values[key]
+        for key in (
+            "temperature", "top_p", "max_tokens", "presence_penalty",
+            "frequency_penalty", "system_prompt",
+        )
+        if values.get(key) is not None
+    }
+    runtime_kwargs = (
+        {} if values.get("allow_failure_retry", True)
+        else {"max_provider_retries": 0}
+    )
+    runtime = create_generation_runtime(**runtime_kwargs)
+    prose_plan = runtime.plan_text(
+        WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+    )
+    chapters_needing_prose = [
+        chapter for chapter in chapters if not _has_text(chapter, "content")
+    ]
+    strategy = dict(base.get("prose_strategy") or {})
+    if not chapters_needing_prose:
+        return {
+            **base,
+            "generation_params_digest": _digest(values),
+            "prose_strategy": {
+                **strategy,
+                "maximum_base_prose_calls": 0,
+                "estimated_scene_count": 0,
+                "maximum_automatic_continuation_calls": 0,
+                "maximum_logical_prose_calls": 0,
+                "max_actual_provider_attempts": 0,
+                "conservative_token_bound": 0,
+                "token_bound_known": False,
+            },
+        }
+
+    capability_plan = prose_completion_module.plan(
+        outline={"scenes": [{}]},
+        target_word_count=3_000,
+        provider_capability={
+            "max_output_tokens": prose_plan.max_output_tokens,
+            "model": prose_plan.provider_model,
+        },
+        request_overrides=overrides,
+    )
+    maximum_base_calls = 0
+    estimated_scene_count = 0
+    unknown_outline_chapters = 0
+    maximum_call_target_words = max(
+        policy.continuation_target_words,
+        capability_plan.safe_output_budget,
+    )
+    for chapter in chapters_needing_prose:
+        outline = chapter.get("outline") or {}
+        if not outline:
+            unknown_outline_chapters += 1
+            maximum_base_calls += 32
+            estimated_scene_count += MAX_CHAPTER_OUTLINE_SCENES
+            continue
+        target_words = int(
+            outline.get("target_word_count")
+            or chapter.get("words_per_chapter")
+            or 3_000
+        )
+        chapter_plan = prose_completion_module.plan(
+            outline=outline,
+            target_word_count=target_words,
+            provider_capability={
+                "max_output_tokens": prose_plan.max_output_tokens,
+                "model": prose_plan.provider_model,
+            },
+            request_overrides=overrides,
+        )
+        maximum_base_calls += chapter_plan.scheduled_base_call_count
+        estimated_scene_count += chapter_plan.scene_count
+        maximum_call_target_words = max(
+            maximum_call_target_words,
+            *chapter_plan.segment_budgets,
+        )
+
+    output_cap = _positive_int(overrides.get("max_tokens"))
+    if output_cap is None:
+        output_cap = max(256, math.ceil(maximum_call_target_words / 0.65))
+    max_context = _positive_int(
+        getattr(prose_plan, "max_context_tokens", None)
+    )
+    conservative_token_bound = (
+        int(max_context) + int(output_cap) + 1_024
+        if max_context is not None
+        else 0
+    )
+    maximum_automatic_calls = (
+        estimated_scene_count * policy.automatic_continuations_per_scene
+    )
+    maximum_logical_calls = maximum_base_calls + maximum_automatic_calls
+    return {
+        **base,
+        "attempt_capacity": estimate_worklist_attempt_capacity(chapters, values),
+        "generation_params_digest": _digest(values),
+        "prose_strategy": {
+            **strategy,
+            "provider_alias": prose_plan.provider_alias,
+            "provider_model": prose_plan.provider_model,
+            "max_output_tokens": prose_plan.max_output_tokens,
+            "max_context_tokens": max_context,
+            "unknown_outline_chapters": unknown_outline_chapters,
+            "unknown_scene_upper_bound": MAX_CHAPTER_OUTLINE_SCENES,
+            "maximum_prose_calls": maximum_base_calls,
+            "maximum_base_prose_calls": maximum_base_calls,
+            "estimated_scene_count": estimated_scene_count,
+            "maximum_automatic_continuation_calls": maximum_automatic_calls,
+            "maximum_logical_prose_calls": maximum_logical_calls,
+            "max_actual_provider_attempts": maximum_logical_calls,
+            "maximum_call_target_words": maximum_call_target_words,
+            "conservative_token_bound": conservative_token_bound,
+            "token_bound_known": conservative_token_bound > 0,
         },
     }
 
@@ -470,6 +801,6 @@ generation_readiness_module = GenerationReadinessModule(
     ReadinessDeps(
         load_resource_counts=_load_resource_counts,
         inspect_active_proposal=_inspect_active_proposal,
-        plan_work=_plan_work,
+        plan_work=_plan_work_with_prose_continuation,
     )
 )

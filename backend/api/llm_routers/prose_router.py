@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import AsyncGenerator
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import Field
 
@@ -23,6 +24,9 @@ from backend.api.llm_routers._common import (
     GenerationParamsMixin,
     build_gen_kwargs,
     build_runtime_kwargs,
+)
+from backend.api.prose_continuation_contracts import (
+    ProseContinuationPolicyRequest,
 )
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
@@ -45,6 +49,17 @@ from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     execute_prose_plan,
 )
+from backend.services.generation.prose_continuation import (
+    ProseContinuationPolicy,
+)
+from backend.services.generation.prose_readiness import (
+    ProseReadinessBlocked,
+    StaleProseReadiness,
+    build_prose_readiness,
+    validate_prose_readiness,
+)
+from backend.services.generation.prose_run_attempt_scope import ProseRunAttemptScope
+from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
 from backend.services.generation.prose_runs import (
     prose_run_module,
     serialize_prose_run,
@@ -78,6 +93,10 @@ class ProseRequest(GenerationParamsMixin):
     resume_run_id: str | None = Field(default=None, min_length=1)
     expected_run_revision: int | None = Field(default=None, ge=1)
     confirm_uncertain_retry: bool = False
+    prose_continuation_policy: ProseContinuationPolicyRequest | None = None
+    readiness_digest: str | None = Field(default=None, min_length=1, max_length=128)
+    confirm_automatic_continuations: bool = False
+    token_budget: int | None = Field(default=None, ge=1)
 
 
 class AcceptProseRunRequest(ProseRequest):
@@ -88,6 +107,181 @@ class AcceptProseRunRequest(ProseRequest):
 
 class DiscardProseRunRequest(ProseRequest):
     expected_run_revision: int = Field(ge=1)
+
+
+@dataclass(frozen=True)
+class _ProseReadinessPreflight:
+    """The immutable planning result reused by the first prose request."""
+
+    plan: Any
+    execution_plan: Any
+    policy: ProseContinuationPolicy
+    readiness: Any
+
+
+def _provider_capability(plan: Any) -> dict[str, Any]:
+    return {
+        "max_output_tokens": getattr(plan, "max_output_tokens", None),
+        "model": getattr(plan, "provider_model", ""),
+    }
+
+
+async def _authorization_revision_for(
+    *,
+    req: ProseRequest,
+    request: Request,
+    policy: ProseContinuationPolicy,
+    token_budget: int | None,
+) -> int:
+    """Advance only the mutable continuation authorization revision."""
+    actor = getattr(request.state, "actor", None)
+    if actor is None or not req.resume_run_id:
+        return 1
+    existing = await prose_run_repo.get_run(
+        req.resume_run_id,
+        str(actor.id),
+    )
+    stored = dict(existing.get("prose_continuation_authorization") or {})
+    stored_policy = dict(stored.get("policy") or {})
+    stored_budget = stored.get("token_budget")
+    stored_revision = int(
+        stored.get("authorization_revision")
+        or existing.get("authorization_revision")
+        or 0
+    )
+    if (
+        stored_policy == policy.to_dict()
+        and stored_budget == token_budget
+    ):
+        return max(1, stored_revision)
+    return max(1, stored_revision + 1)
+
+
+async def _build_prose_readiness(
+    *,
+    req: ProseRequest,
+    request: Request,
+    chapter: dict[str, Any],
+    context: Any,
+    prompt: str,
+    words_per_chapter: int,
+    gen_kwargs: dict[str, Any],
+) -> _ProseReadinessPreflight:
+    """Plan one prose request without creating a run or calling a Provider."""
+    runtime = create_generation_runtime(**build_runtime_kwargs(req))
+    plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
+    execution_plan = prose_completion_module.plan(
+        outline=chapter.get("outline") or {},
+        target_word_count=int(words_per_chapter),
+        provider_capability=_provider_capability(plan),
+        request_overrides=gen_kwargs,
+    )
+    policy = (
+        req.prose_continuation_policy.to_domain()
+        if req.prose_continuation_policy is not None
+        else ProseContinuationPolicy()
+    )
+    authorization_revision = await _authorization_revision_for(
+        req=req,
+        request=request,
+        policy=policy,
+        token_budget=req.token_budget,
+    )
+    readiness = build_prose_readiness(
+        execution_plan=execution_plan,
+        generation_plan=plan,
+        policy=policy,
+        token_budget=req.token_budget,
+        authorization_revision=authorization_revision,
+        novel_id=req.novel_id,
+        chapter_id=req.chapter_id,
+        outline=chapter.get("outline") or {},
+        context_text=context.to_prompt_text(),
+        base_prompt=prompt,
+        generation_kwargs=gen_kwargs,
+    )
+    return _ProseReadinessPreflight(
+        plan=plan,
+        execution_plan=execution_plan,
+        policy=policy,
+        readiness=readiness,
+    )
+
+
+@dataclass(frozen=True)
+class _PreparedProseInputs:
+    novel: dict[str, Any]
+    chapter: dict[str, Any]
+    context: Any
+    words_per_chapter: int
+    prompt: str
+    gen_kwargs: dict[str, Any]
+
+
+async def _prepare_prose_inputs(req: ProseRequest) -> _PreparedProseInputs:
+    """Load and render the stable content identity for one chapter request."""
+    novel = await novel_repo.get_novel_by_id(req.novel_id)
+    chapter = await chapter_repo.get_chapter_by_id(req.chapter_id)
+    if chapter.get("novel_id") != to_object_id(req.novel_id):
+        raise ValueError("该章节不属于指定小说")
+    if not chapter.get("outline"):
+        raise ValueError("本章还没有已接受的细纲，请先生成并接受章节细纲")
+    context = assemble_context(
+        await fetch_context_inputs(req.novel_id, req.chapter_id)
+    )
+    words_per_chapter = int(
+        (chapter.get("outline") or {}).get("target_word_count")
+        or novel.get("words_per_chapter")
+        or 3000
+    )
+    prompts = _load_prompts().get(PROSE_PROMPT_NAME, {})
+    prompt = apply_agent_profile(
+        "chapter_writer",
+        prompts[f"{PROSE_STEP}_prompt_base"].format(
+            context=context.to_prompt_text(),
+            chapter_order=int(chapter.get("order_index") or 0),
+            chapter_title=str(chapter.get("title") or ""),
+            style_controls=render_style_controls(novel.get("style_controls")),
+            words_per_chapter=words_per_chapter,
+        )
+        + "\n"
+        + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"],
+    )
+    return _PreparedProseInputs(
+        novel=novel,
+        chapter=chapter,
+        context=context,
+        words_per_chapter=words_per_chapter,
+        prompt=prompt,
+        gen_kwargs=build_gen_kwargs(req),
+    )
+
+
+@router.get(
+    "/prose-runs/novel/{novel_id}/telemetry",
+    dependencies=[Depends(require_owned_path_resource)],
+)
+async def list_prose_run_telemetry(
+    novel_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    chapter_id: str | None = Query(default=None),
+):
+    """List metadata-only prose-run telemetry; never return prose or prompts."""
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await prose_run_module.list_telemetry(
+            owner_id=str(actor.id),
+            novel_id=novel_id,
+            limit=limit,
+            skip=offset,
+            chapter_id=chapter_id,
+        )
+    except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get(
@@ -182,6 +376,37 @@ async def discard_prose_run(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/write-chapter-by-ai/readiness")
+async def inspect_prose_readiness(req: ProseRequest, request: Request):
+    """Return a frozen, no-charge prose authorization preview."""
+    try:
+        inputs = await _prepare_prose_inputs(req)
+        preflight = await _build_prose_readiness(
+            req=req,
+            request=request,
+            chapter=inputs.chapter,
+            context=inputs.context,
+            prompt=inputs.prompt,
+            words_per_chapter=inputs.words_per_chapter,
+            gen_kwargs=inputs.gen_kwargs,
+        )
+        response = preflight.readiness.to_dict()
+        response["provider"] = {
+            "alias": str(getattr(preflight.plan, "provider_alias", "") or ""),
+            "model": str(getattr(preflight.plan, "provider_model", "") or ""),
+            "max_output_tokens": getattr(
+                preflight.plan,
+                "max_output_tokens",
+                None,
+            ),
+        }
+        return response
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ContextBudgetError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/write-chapter-by-ai")
 async def write_chapter_by_ai(req: ProseRequest, request: Request):
     """流式生成正文并保存可恢复草稿，不直接覆盖正式章节正文。"""
@@ -236,6 +461,47 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
     gen_kwargs = build_gen_kwargs(req)
     request_id = uuid4().hex[:8]
 
+    policy = (
+        req.prose_continuation_policy.to_domain()
+        if req.prose_continuation_policy is not None
+        else ProseContinuationPolicy()
+    )
+    preflight: _ProseReadinessPreflight | None = None
+    if policy.permits_automatic_continuation:
+        try:
+            preflight = await _build_prose_readiness(
+                req=req,
+                request=request,
+                chapter=chapter,
+                context=context,
+                prompt=prompt,
+                words_per_chapter=int(words_per_chapter),
+                gen_kwargs=gen_kwargs,
+            )
+            validate_prose_readiness(
+                preflight.readiness,
+                supplied_digest=req.readiness_digest,
+                confirmed_automatic_continuations=(
+                    req.confirm_automatic_continuations
+                ),
+            )
+        except StaleProseReadiness as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "readiness_stale", "message": str(exc)},
+            ) from exc
+        except ProseReadinessBlocked as exc:
+            codes = [code for code in str(exc).split(",") if code]
+            raise HTTPException(
+                status_code=400,
+                detail={"code": codes[0], "codes": codes, "message": str(exc)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "readiness_unavailable", "message": str(exc)},
+            ) from exc
+
     async def event_stream() -> AsyncGenerator[str, None]:
         if context.truncated_sections or context.dropped_item_counts:
             # 截断在 LLM 调用之前就已知，故立刻告知前端而不是等到结束——
@@ -251,7 +517,13 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
         try:
             runtime = create_generation_runtime(**build_runtime_kwargs(req))
             try:
-                plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
+                plan = (
+                    preflight.plan
+                    if preflight is not None
+                    else runtime.plan_text(
+                        WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+                    )
+                )
                 service = None
             except ValueError:
                 # 迁移兼容：测试/嵌入方可能仍通过旧 seam 注入临时 service。
@@ -265,25 +537,27 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
             yield sse_event("done", {"success": False, "error": str(exc)})
             return
 
-        provider_capability = {
-            "max_output_tokens": (
-                getattr(plan, "max_output_tokens", None)
-                if plan is not None
-                else None
-            ),
-            "model": getattr(plan, "provider_model", "") if plan is not None else "",
-        }
-        execution_plan = prose_completion_module.plan(
-            outline=chapter.get("outline") or {},
-            target_word_count=int(words_per_chapter),
-            provider_capability=provider_capability,
-            request_overrides=gen_kwargs,
+        provider_capability = _provider_capability(plan)
+        execution_plan = (
+            preflight.execution_plan
+            if preflight is not None
+            else prose_completion_module.plan(
+                outline=chapter.get("outline") or {},
+                target_word_count=int(words_per_chapter),
+                provider_capability=provider_capability,
+                request_overrides=gen_kwargs,
+            )
         )
         yield sse_event("plan", execution_plan.to_dict())
 
         actor = getattr(request.state, "actor", None)
         owner_id = str(actor.id) if actor is not None else None
         run_document = None
+        authorization = (
+            preflight.readiness.authorization.to_dict()
+            if preflight is not None
+            else None
+        )
         if owner_id:
             try:
                 run_document = await prose_run_module.begin(
@@ -305,10 +579,16 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                             if plan is not None
                             else ""
                         ),
+                        "thinking_mode": (
+                            getattr(plan, "thinking_mode", None)
+                            if plan is not None
+                            else None
+                        ),
                     },
                     run_id=req.resume_run_id,
                     expected_revision=req.expected_run_revision,
                     confirm_uncertain_retry=req.confirm_uncertain_retry,
+                    authorization=authorization,
                 )
             except Exception as exc:
                 yield sse_event("done", {
@@ -322,6 +602,19 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                 "run_id": str(run_document["_id"]),
                 "run_revision": int(run_document.get("revision") or 0),
             })
+
+        if run_document is not None and runtime is not None and plan is not None:
+            lease = run_document.get("lease") or {}
+            runtime = create_generation_runtime(
+                attempt_scope=ProseRunAttemptScope(
+                    run_id=str(run_document["_id"]),
+                    owner_id=owner_id or "",
+                    lease_token=str(lease.get("token") or ""),
+                ),
+                # A persistent scope must see every actual request; the SDK
+                # therefore cannot hide its own retries inside one claim.
+                max_provider_retries=0,
+            )
 
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         latest_run = run_document
@@ -342,6 +635,13 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                 runtime if runtime is not None else service,
                 "last_finish_reason",
                 None,
+            )
+
+        def raw_finish_reason_reader():
+            return getattr(
+                runtime if runtime is not None else service,
+                "last_raw_finish_reason",
+                finish_reason_reader(),
             )
 
         def stream_call(call_prompt: str, call_kwargs: dict):
@@ -380,6 +680,18 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                 segment=segment,
             )
 
+        async def on_scene_progress(scene_progress: tuple[dict, ...]) -> None:
+            nonlocal latest_run
+            if latest_run is None or owner_id is None:
+                return
+            lease = latest_run.get("lease") or {}
+            latest_run = await prose_run_repo.update_scene_progress(
+                run_id=str(latest_run["_id"]),
+                owner_id=owner_id,
+                lease_token=str(lease.get("token") or ""),
+                scene_progress=[dict(item) for item in scene_progress],
+            )
+
         async def produce() -> None:
             nonlocal latest_run
             try:
@@ -390,17 +702,26 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                     stream_call=stream_call,
                     finish_reason_reader=finish_reason_reader,
                     usage_reader=usage_reader,
+                    raw_finish_reason_reader=raw_finish_reason_reader,
                     outline_revision=(
                         str((run_document or {}).get("outline_revision") or "ephemeral")
                     ),
                     gen_kwargs=gen_kwargs,
                     existing_segments=list((run_document or {}).get("segments") or []),
+                    existing_scene_progress=list((run_document or {}).get("scene_progress") or []),
                     confirm_uncertain_retry=req.confirm_uncertain_retry,
+                    continuation_policy=policy,
                     manual_continuation=req.resume_run_id is not None,
                     on_delta=on_delta,
                     on_segment=on_segment,
+                    on_scene_progress=on_scene_progress,
                 )
                 if latest_run is not None and owner_id is not None:
+                    completion = {
+                        **result.completion.to_dict(),
+                        "scene_progress": [dict(item) for item in result.scene_progress],
+                        "pause_reason": result.pause_reason,
+                    }
                     lease = latest_run.get("lease") or {}
                     latest_run = await prose_run_repo.finish(
                         run_id=str(latest_run["_id"]),
@@ -411,7 +732,7 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                             if result.completion.can_write_formal_prose
                             else result.completion.status
                         ),
-                        completion=result.completion.to_dict(),
+                        completion=completion,
                         assembled_text=result.text,
                     )
                 completion = result.completion.to_dict()
@@ -427,6 +748,8 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                     "scene_count": result.completion.scene_count,
                     "completed_scene_count": result.completion.completed_scene_count,
                     "mode": result.completion.mode,
+                    "scene_progress": [dict(item) for item in result.scene_progress],
+                    "pause_reason": result.pause_reason,
                     "reason_codes": list(result.completion.reason_codes),
                     "run_id": str(latest_run["_id"]) if latest_run else None,
                     "run_revision": int(latest_run.get("revision") or 0) if latest_run else None,
@@ -460,6 +783,7 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                     exc,
                     ProseContinuationLimit,
                 )
+                budget_limited = isinstance(exc, TokenBudgetExceeded)
                 await queue.put(sse_event("done", {
                     "success": False,
                     "error": str(exc),
@@ -468,10 +792,16 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                         (
                             "continuation_limit_reached"
                             if continuation_limited
-                            else "uncertain_provider_attempt"
+                            else (
+                                "token_budget_exceeded_before_dispatch"
+                                if budget_limited
+                                else "uncertain_provider_attempt"
+                            )
                         )
                     ],
-                    "has_uncertain_attempt": not continuation_limited,
+                    "has_uncertain_attempt": not (
+                        continuation_limited or budget_limited
+                    ),
                     "run_id": str(latest_run["_id"]) if latest_run else None,
                     "run_revision": (
                         int(latest_run.get("revision") or 0)

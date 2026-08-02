@@ -3,16 +3,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.services.generation.failure_diagnostics import infer_job_diagnostics
 from backend.services.generation.job_service import ConflictError, GenerationJobService
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
     build_gen_kwargs,
+)
+from backend.api.prose_continuation_contracts import (
+    ProseContinuationPolicyRequest,
 )
 
 router = APIRouter(
@@ -34,6 +38,7 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     for entry in out.get("progress", []):
         if entry.get("chapter_id") is not None:
             entry["chapter_id"] = str(entry["chapter_id"])
+    out["diagnostics"] = infer_job_diagnostics(out)
     return out
 
 
@@ -46,11 +51,25 @@ class StartJobRequest(GenerationParamsMixin):
         "pause_for_rewrite",
         "accept_and_continue",
     ] = "pause_for_rewrite"
+    prose_continuation_policy: ProseContinuationPolicyRequest = Field(
+        default_factory=ProseContinuationPolicyRequest
+    )
+
+
+class BatchReadinessRequest(GenerationParamsMixin):
+    token_budget: Optional[int] = Field(default=None, ge=1)
+    prose_continuation_policy: ProseContinuationPolicyRequest = Field(
+        default_factory=ProseContinuationPolicyRequest
+    )
 
 
 class ResumeJobRequest(BaseModel):
     confirm_uncertain_retry: bool = False
     skip_uncertain: bool = False
+    prose_continuation_policy: ProseContinuationPolicyRequest | None = None
+    token_budget: Optional[int] = Field(default=None, ge=1)
+    readiness_digest: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    acknowledged_warning_codes: list[str] | None = Field(default=None, max_length=50)
 
 
 def _handle(exc: Exception) -> HTTPException:
@@ -76,7 +95,9 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
             generation_params={
                 **build_gen_kwargs(req),
                 "allow_failure_retry": req.allow_failure_retry,
+                "prose_continuation_policy": req.prose_continuation_policy.to_domain().to_dict(),
             },
+            prose_continuation_policy=req.prose_continuation_policy.to_domain(),
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -96,7 +117,9 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
             generation_params={
                 **build_gen_kwargs(req),
                 "allow_failure_retry": req.allow_failure_retry,
+                "prose_continuation_policy": req.prose_continuation_policy.to_domain().to_dict(),
             },
+            prose_continuation_policy=req.prose_continuation_policy.to_domain(),
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -118,6 +141,64 @@ async def inspect_book_readiness(novel_id: str):
     except Exception as exc:
         raise _handle(exc) from exc
 
+
+@router.post("/volume/{volume_id}/readiness")
+async def inspect_volume_readiness_with_policy(
+    volume_id: str,
+    req: BatchReadinessRequest,
+):
+    try:
+        return await GenerationJobService.inspect_volume_readiness(
+            volume_id,
+            prose_continuation_policy=(
+                req.prose_continuation_policy.to_domain()
+            ),
+            token_budget=req.token_budget,
+            generation_params={
+                **build_gen_kwargs(req),
+                "allow_failure_retry": req.allow_failure_retry,
+                "prose_continuation_policy": (
+                    req.prose_continuation_policy.to_domain().to_dict()
+                ),
+            },
+        )
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.post("/book/{novel_id}/readiness")
+async def inspect_book_readiness_with_policy(
+    novel_id: str,
+    req: BatchReadinessRequest,
+):
+    try:
+        return await GenerationJobService.inspect_book_readiness(
+            novel_id,
+            prose_continuation_policy=(
+                req.prose_continuation_policy.to_domain()
+            ),
+            token_budget=req.token_budget,
+            generation_params={
+                **build_gen_kwargs(req),
+                "allow_failure_retry": req.allow_failure_retry,
+                "prose_continuation_policy": (
+                    req.prose_continuation_policy.to_domain().to_dict()
+                ),
+            },
+        )
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/novel/{novel_id}/diagnostics")
+async def summarize_diagnostics(
+    novel_id: str,
+    limit: int = Query(default=30, ge=1, le=200),
+):
+    try:
+        return await GenerationJobService.summarize_diagnostics(novel_id, limit=limit)
+    except Exception as exc:
+        raise _handle(exc) from exc
 
 @router.get("/{job_id}")
 async def get_job(job_id: str):
@@ -153,6 +234,15 @@ async def resume_job(job_id: str, req: ResumeJobRequest | None = None):
             job_id,
             confirm_uncertain_retry=body.confirm_uncertain_retry,
             skip_uncertain=body.skip_uncertain,
+            prose_continuation_policy=(
+                body.prose_continuation_policy.to_domain()
+                if body.prose_continuation_policy is not None
+                else None
+            ),
+            token_budget=body.token_budget,
+            token_budget_provided="token_budget" in body.model_fields_set,
+            readiness_digest=body.readiness_digest,
+            acknowledged_warning_codes=body.acknowledged_warning_codes,
         ))
     except Exception as exc:
         raise _handle(exc) from exc

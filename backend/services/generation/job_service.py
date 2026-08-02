@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from pymongo.errors import DuplicateKeyError
 
 from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
 from backend.services.generation.chapter_pipeline import run_chapter
@@ -18,6 +19,7 @@ from backend.services.generation.headless_generation import (
     estimate_chapter_attempt_slots,
     estimate_worklist_attempt_capacity,
 )
+from backend.services.generation.failure_diagnostics import summarize_jobs
 from backend.services.generation.job_engine import (
     JobControl, JobEngineDeps, run_job, _REGISTRY,
 )
@@ -31,6 +33,9 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
 from backend.services.generation.readiness import generation_readiness_module
 from backend.services.novel.state_completion import state_completion_module
+from backend.services.generation.prose_continuation import (
+    ProseContinuationPolicy,
+)
 
 logger = logging.getLogger(__name__)
 _START_LOCK: asyncio.Lock | None = None
@@ -61,6 +66,8 @@ def _new_job_doc(
         "status": "running", "pause_reason": None,
         "checkpoint_interval": int(checkpoint_interval), "token_budget": token_budget,
         "tokens_used": 0, "current_chapter_id": None, "progress": [],
+        "tokens_reserved": 0,
+        "active_token_reservations": [],
         "last_checkpoint_index": 0, "error": None,
         "active_slot": "global",
         "usage_attempt_capacity": int(attempt_capacity),
@@ -72,12 +79,22 @@ def _new_job_doc(
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
         "confirm_uncertain_prose_retry": False,
+        "diagnostic_schema_version": 1,
+        "diagnostics": [],
         "outline_deviation_policy": validate_outline_deviation_policy(
             outline_deviation_policy
         ),
         # 请求级参数是作业快照的一部分。暂停/恢复只重读这份快照，不会被
         # 后续页面操作覆盖；未设置的键仍由每次调用时选中的 Provider 默认值兜底。
         "generation_params": dict(generation_params or {}),
+        "prose_continuation_authorization": dict(
+            ((readiness.get("planning") or {}).get(
+                "prose_continuation_authorization"
+            ) or {})
+        ),
+        "authorization_revision": int(((readiness.get("planning") or {}).get(
+            "prose_continuation_authorization"
+        ) or {}).get("authorization_revision") or 0),
         "readiness": readiness,
     }
 
@@ -88,6 +105,51 @@ class GenerationJobService:
         running = await generation_job_repo.list_running_jobs()
         if not job_planner.can_start_new(len(running)):
             raise ConflictError("已有正在运行的批量作业，请先暂停或等待其结束")
+
+    @staticmethod
+    async def _incomplete_prose_is_resolved(job: Mapping[str, Any]) -> bool:
+        pending = dict(job.get("incomplete_prose") or {})
+        chapter_id = str(pending.get("chapter_id") or "")
+        if not chapter_id:
+            return False
+        chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+        if str(chapter.get("novel_id")) != str(job.get("novel_id")):
+            raise ValueError("Incomplete prose checkpoint belongs to another novel")
+        if not str(chapter.get("content") or "").strip():
+            return False
+        prose_state = str(
+            (chapter.get("prose_acceptance") or {}).get("state")
+            or (chapter.get("state_completion") or {}).get(
+                "prose_acceptance_state"
+            )
+            or ""
+        )
+        return prose_state != "partial_manual_required"
+
+    @staticmethod
+    def _pending_scene_can_use_new_policy(
+        pending: Mapping[str, Any],
+        policy: ProseContinuationPolicy,
+    ) -> bool:
+        if str(pending.get("pause_reason") or "") != (
+            "automatic_continuations_exhausted"
+        ):
+            return False
+        for scene in list(pending.get("scene_progress") or []):
+            if not isinstance(scene, Mapping):
+                continue
+            if str(scene.get("status") or "") == "complete":
+                continue
+            try:
+                used = max(
+                    0,
+                    int(scene.get("automatic_continuations_used") or 0),
+                )
+            except (TypeError, ValueError):
+                return False
+            return policy.automatic_continuations_per_scene > used
+        # No paused scene means no evidence for a safe quota extension.
+        return False
 
     @staticmethod
     def _spawn(job_id: str, control: JobControl) -> None:
@@ -166,7 +228,13 @@ class GenerationJobService:
         _REGISTRY[job_id] = (task, control)
 
     @staticmethod
-    async def inspect_volume_readiness(volume_id: str) -> Dict[str, Any]:
+    async def inspect_volume_readiness(
+        volume_id: str,
+        *,
+        prose_continuation_policy: ProseContinuationPolicy | None = None,
+        token_budget: int | None = None,
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)
         novel_id = str(volume["novel_id"])
         chapters = await ChapterService.get_chapters_by_volume(
@@ -178,10 +246,19 @@ class GenerationJobService:
             scope="volume",
             volume_id=volume_id,
             chapters=chapters,
+            prose_continuation_policy=prose_continuation_policy,
+            token_budget=token_budget,
+            generation_params=generation_params,
         )
 
     @staticmethod
-    async def inspect_book_readiness(novel_id: str) -> Dict[str, Any]:
+    async def inspect_book_readiness(
+        novel_id: str,
+        *,
+        prose_continuation_policy: ProseContinuationPolicy | None = None,
+        token_budget: int | None = None,
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)
         chapters = await get_book_worklist(novel_id, include_content=True)
         return await generation_readiness_module.inspect(
@@ -189,6 +266,9 @@ class GenerationJobService:
             scope="book",
             volume_id=None,
             chapters=chapters,
+            prose_continuation_policy=prose_continuation_policy,
+            token_budget=token_budget,
+            generation_params=generation_params,
         )
 
     @staticmethod
@@ -198,6 +278,7 @@ class GenerationJobService:
                                acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
                                outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                                generation_params: Mapping[str, Any] | None = None,
+                               prose_continuation_policy: ProseContinuationPolicy | None = None,
                                ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
@@ -212,18 +293,27 @@ class GenerationJobService:
                 volume_id, include_content=True
             )
             chapters = await state_completion_module.attach_many(chapters)
+            continuation_policy = (
+                prose_continuation_policy or ProseContinuationPolicy()
+            )
+            generation_params_snapshot = {
+                **dict(generation_params or {}),
+                "prose_continuation_policy": continuation_policy.to_dict(),
+            }
             report = await generation_readiness_module.inspect(
                 novel_id=novel_id,
                 scope="volume",
                 volume_id=volume_id,
                 chapters=chapters,
+                prose_continuation_policy=continuation_policy,
+                token_budget=token_budget,
+                generation_params=generation_params_snapshot,
             )
             authorization = generation_readiness_module.authorize(
                 report,
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
-            generation_params_snapshot = dict(generation_params or {})
             capacity = max(
                 int(
                     (authorization.get("planning") or {}).get(
@@ -258,6 +348,7 @@ class GenerationJobService:
                              acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
                              outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                              generation_params: Mapping[str, Any] | None = None,
+                             prose_continuation_policy: ProseContinuationPolicy | None = None,
                              ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
         chapters = await get_book_worklist(novel_id, include_content=True)
@@ -266,18 +357,27 @@ class GenerationJobService:
         async with _get_start_lock():
             await GenerationJobService._guard_no_running()
             chapters = await get_book_worklist(novel_id, include_content=True)
+            continuation_policy = (
+                prose_continuation_policy or ProseContinuationPolicy()
+            )
+            generation_params_snapshot = {
+                **dict(generation_params or {}),
+                "prose_continuation_policy": continuation_policy.to_dict(),
+            }
             report = await generation_readiness_module.inspect(
                 novel_id=novel_id,
                 scope="book",
                 volume_id=None,
                 chapters=chapters,
+                prose_continuation_policy=continuation_policy,
+                token_budget=token_budget,
+                generation_params=generation_params_snapshot,
             )
             authorization = generation_readiness_module.authorize(
                 report,
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
-            generation_params_snapshot = dict(generation_params or {})
             capacity = max(
                 int(
                     (authorization.get("planning") or {}).get(
@@ -307,7 +407,15 @@ class GenerationJobService:
 
     @staticmethod
     async def resume_job(
-        job_id: str, *, confirm_uncertain_retry: bool = False, skip_uncertain: bool = False
+        job_id: str,
+        *,
+        confirm_uncertain_retry: bool = False,
+        skip_uncertain: bool = False,
+        prose_continuation_policy: ProseContinuationPolicy | None = None,
+        token_budget: int | None = None,
+        token_budget_provided: bool = False,
+        readiness_digest: str | None = None,
+        acknowledged_warning_codes: tuple[str, ...] | list[str] | None = None,
     ) -> Dict[str, Any]:
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
@@ -331,11 +439,127 @@ class GenerationJobService:
                     "存在请求已发出但未取得 usage 的 attempt，可能已计费；"
                     "请明确确认可能重复计费后再重试"
                 )
+            authorization_updates: Dict[str, Any] = {}
+            candidate_policy: ProseContinuationPolicy | None = None
+            authorization_settings_changed = (
+                prose_continuation_policy is not None or token_budget_provided
+            )
+            if authorization_settings_changed:
+                authorization = dict(
+                    job.get("prose_continuation_authorization") or {}
+                )
+                stored_policy = ProseContinuationPolicy.from_mapping(
+                    authorization.get("policy")
+                    or (job.get("generation_params") or {}).get(
+                        "prose_continuation_policy"
+                    )
+                )
+                candidate_policy = prose_continuation_policy or stored_policy
+                candidate_budget = (
+                    token_budget if token_budget_provided else job.get("token_budget")
+                )
+                generation_params_snapshot = {
+                    **dict(job.get("generation_params") or {}),
+                    "prose_continuation_policy": candidate_policy.to_dict(),
+                }
+                current_revision = max(
+                    int(job.get("authorization_revision") or 0),
+                    int(authorization.get("authorization_revision") or 0),
+                )
+                if job.get("scope") == "book":
+                    chapters = await get_book_worklist(
+                        str(job["novel_id"]),
+                        include_content=True,
+                    )
+                else:
+                    chapters = await ChapterService.get_chapters_by_volume(
+                        str(job["volume_id"]),
+                        include_content=True,
+                    )
+                    chapters = await state_completion_module.attach_many(chapters)
+                report = await generation_readiness_module.inspect(
+                    novel_id=str(job["novel_id"]),
+                    scope=str(job["scope"]),
+                    volume_id=(
+                        str(job["volume_id"])
+                        if job.get("volume_id") is not None
+                        else None
+                    ),
+                    chapters=chapters,
+                    prose_continuation_policy=candidate_policy,
+                    token_budget=candidate_budget,
+                    generation_params=generation_params_snapshot,
+                    authorization_revision=max(1, current_revision + 1),
+                )
+                accepted_readiness = generation_readiness_module.authorize(
+                    report,
+                    supplied_digest=readiness_digest,
+                    acknowledged_warning_codes=acknowledged_warning_codes or (),
+                )
+                remaining_capacity = max(
+                    int(
+                        (accepted_readiness.get("planning") or {}).get(
+                            "attempt_capacity"
+                        )
+                        or 0
+                    ),
+                    estimate_worklist_attempt_capacity(
+                        chapters,
+                        generation_params_snapshot,
+                    ),
+                )
+                authorization_updates = {
+                    "token_budget": candidate_budget,
+                    "generation_params": generation_params_snapshot,
+                    "prose_continuation_authorization": dict(
+                        (accepted_readiness.get("planning") or {}).get(
+                            "prose_continuation_authorization"
+                        )
+                        or {}
+                    ),
+                    "authorization_revision": max(1, current_revision + 1),
+                    "readiness": accepted_readiness,
+                    # Historical claims are never rolled back. The new policy
+                    # governs only the work still visible in the current list.
+                    "usage_attempt_capacity": max(
+                        int(job.get("usage_attempt_claimed") or 0),
+                        int(job.get("usage_attempt_claimed") or 0)
+                        + remaining_capacity,
+                    ),
+                    # A prior reservation may have been sized for the old policy.
+                    # Clearing it forces the runner to reserve against the new cap.
+                    "attempt_reservation": None,
+                }
+
+            incomplete_prose_updates: Dict[str, Any] = {}
+            pending_incomplete_prose = dict(job.get("incomplete_prose") or {})
+            if pending_incomplete_prose:
+                manually_resolved = await GenerationJobService._incomplete_prose_is_resolved(
+                    job
+                )
+                can_use_new_automatic_policy = bool(
+                    authorization_settings_changed
+                    and prose_continuation_policy is not None
+                    and candidate_policy is not None
+                    and GenerationJobService._pending_scene_can_use_new_policy(
+                        pending_incomplete_prose,
+                        candidate_policy,
+                    )
+                )
+                if not manually_resolved and not can_use_new_automatic_policy:
+                    raise ValueError(
+                        "The incomplete prose scene must be manually continued and accepted "
+                        "before this batch job can resume"
+                    )
+                incomplete_prose_updates["incomplete_prose"] = None
+
             if job.get("has_uncertain_attempts") and confirm_uncertain_retry:
                 await generation_job_repo.acknowledge_uncertain_attempts(job_id, "retry")
             await GenerationJobService._guard_no_running()
             # 任何 resume 把检查点窗口推进到当前 progress 长度（设计 §7）。
             await generation_job_repo.update_job_fields(job_id, {
+                **authorization_updates,
+                **incomplete_prose_updates,
                 "status": "running", "pause_reason": None, "error": None,
                 "active_slot": "global",
                 "has_uncertain_attempts": False if confirm_uncertain_retry else bool(
@@ -382,3 +606,15 @@ class GenerationJobService:
     @staticmethod
     async def list_jobs(novel_id: str) -> List[Dict[str, Any]]:
         return await generation_job_repo.list_jobs_by_novel(novel_id)
+
+    @staticmethod
+    async def summarize_diagnostics(
+        novel_id: str,
+        *,
+        limit: int = 30,
+    ) -> Dict[str, Any]:
+        jobs = await generation_job_repo.list_jobs_by_novel(
+            novel_id,
+            limit=limit,
+        )
+        return summarize_jobs(jobs, limit=limit)
