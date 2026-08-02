@@ -726,6 +726,13 @@ def _plan_work_with_prose_continuation(
     prose_plan = runtime.plan_text(
         WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
     )
+    # Mirror GenerationRuntime._conservative_token_bound: a per-job max_tokens
+    # override is the effective provider output cap and must be what readiness
+    # displays, even when the provider configuration has no default cap.
+    effective_prose_output_token_limit = (
+        positive_token_limit(overrides.get("max_tokens"))
+        or positive_token_limit(getattr(prose_plan, "max_output_tokens", None))
+    )
     chapters_needing_prose = [
         chapter for chapter in chapters if not _has_text(chapter, "content")
     ]
@@ -758,7 +765,7 @@ def _plan_work_with_prose_continuation(
         outline={"scenes": [{}]},
         target_word_count=3_000,
         provider_capability={
-            "max_output_tokens": prose_plan.max_output_tokens,
+            "max_output_tokens": effective_prose_output_token_limit,
             "model": prose_plan.provider_model,
         },
         request_overrides=overrides,
@@ -783,7 +790,7 @@ def _plan_work_with_prose_continuation(
             outline=outline,
             target_word_count=target_words,
             provider_capability={
-                "max_output_tokens": prose_plan.max_output_tokens,
+                "max_output_tokens": effective_prose_output_token_limit,
                 "model": prose_plan.provider_model,
             },
             request_overrides=overrides,
@@ -841,7 +848,7 @@ def _plan_work_with_prose_continuation(
             **strategy,
             "provider_alias": prose_plan.provider_alias,
             "provider_model": prose_plan.provider_model,
-            "max_output_tokens": prose_plan.max_output_tokens,
+            "max_output_tokens": effective_prose_output_token_limit,
             "max_context_tokens": max_context,
             "unknown_outline_chapters": unknown_outline_chapters,
             "unknown_scene_upper_bound": MAX_CHAPTER_OUTLINE_SCENES,
