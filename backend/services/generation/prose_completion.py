@@ -296,24 +296,5 @@ class ProseCompletionModule:
             reason_codes=tuple(reasons),
         )
 
-    def assemble_segments(
-        self,
-        segments: Iterable[dict[str, Any]],
-        *,
-        expected_scene_count: int,
-    ) -> str:
-        by_index: dict[int, str] = {}
-        for segment in segments:
-            if segment.get("status") != "completed":
-                raise ValueError("Cannot assemble an incomplete prose segment")
-            index = int(segment.get("scene_index"))
-            if index in by_index:
-                raise ValueError(f"Duplicate prose segment index: {index}")
-            by_index[index] = str(segment.get("text") or "").strip()
-        expected = set(range(max(1, int(expected_scene_count))))
-        if set(by_index) != expected:
-            raise ValueError("Prose segments do not cover every scene exactly once")
-        return "\n\n".join(by_index[index] for index in sorted(by_index))
-
 
 prose_completion_module = ProseCompletionModule()
