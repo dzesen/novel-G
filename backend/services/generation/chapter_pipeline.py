@@ -48,6 +48,7 @@ class ChapterOutcome:
     attempts: List[dict] = field(default_factory=list)
     step_outcomes: List[dict] = field(default_factory=list)
     notices: List[dict] = field(default_factory=list)
+    prose_completion: Dict[str, Any] = field(default_factory=dict)
 
 
 class ChapterPipelineFailed(RuntimeError):
@@ -66,6 +67,23 @@ class IncompleteProseGeneration(ValueError):
         reasons = ", ".join(completion.get("reason_codes") or []) or "unknown"
         super().__init__(f"正文未满足完整性要求: {reasons}")
         self.completion = dict(completion)
+
+
+def _checkpoint_prose_completion(completion: dict[str, Any]) -> Dict[str, Any]:
+    """Project only scalar prose result metadata into a batch checkpoint."""
+    def non_negative_int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "status": str(completion.get("status") or "unknown"),
+        "requested_word_count": non_negative_int(
+            completion.get("requested_word_count"),
+        ),
+        "actual_word_count": non_negative_int(completion.get("actual_word_count")),
+    }
 
 
 @dataclass(frozen=True)
@@ -189,6 +207,9 @@ async def run_chapter(
             text, tokens, truncation = generated[:3]
             attempts = generated[3] if len(generated) > 3 else []
             completion = generated[4] if len(generated) > 4 else None
+            if isinstance(completion, dict):
+                # The checkpoint is metadata-only: no prose, prompt, or run identity.
+                outcome.prose_completion = _checkpoint_prose_completion(completion)
             _merge_attempts(outcome, attempts)
             outcome.tokens += tokens
             if completion and not completion.get("can_write_formal_prose", False):

@@ -3,13 +3,28 @@ export interface ProseContinuationPolicy {
   continuation_target_words: number;
 }
 
+export interface ProseBudgetCoverage {
+  status: "available" | "unavailable";
+  estimated_prose_chapter_count: number;
+  chapters_with_automatic_continuations: number | null;
+  chapters_without_automatic_continuations: number | null;
+  unavailable_reason: string | null;
+}
+
 export interface ProseContinuationAuthorization {
   policy: ProseContinuationPolicy;
   authorization_revision: number;
   max_base_calls: number;
   max_automatic_continuation_calls: number;
   max_logical_prose_calls: number;
+  base_output_token_bound?: number;
+  continuation_output_token_bound?: number;
+  conservative_base_token_bound?: number;
+  conservative_continuation_token_bound?: number;
   conservative_token_bound: number;
+  conservative_total_token_bound?: number;
+  token_bound_known?: boolean;
+  budget_coverage?: ProseBudgetCoverage;
   token_budget: number | null;
   readiness_digest: string;
 }

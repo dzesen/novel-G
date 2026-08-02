@@ -26,6 +26,8 @@ const PROSE_REASON_KEYS = {
   scenes_incomplete: "scenesIncomplete",
   below_minimum_word_ratio: "belowMinimumWordRatio",
   continuation_limit_reached: "continuationLimitReached",
+  prose_no_progress: "proseNoProgress",
+  prose_no_progress_without_quota: "proseNoProgressWithoutQuota",
   uncertain_provider_attempt: "uncertainProviderAttempt",
   completion_contract_failed: "completionContractFailed",
 } as const;

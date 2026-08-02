@@ -155,11 +155,25 @@ export interface GenerationReadiness {
       maximum_automatic_continuation_calls?: number;
       maximum_logical_prose_calls?: number;
       max_actual_provider_attempts?: number;
+      estimated_prose_chapter_count?: number;
+      maximum_base_call_target_words?: number;
+      continuation_call_target_words?: number;
+      base_output_token_bound?: number;
+      continuation_output_token_bound?: number;
+      conservative_base_token_bound?: number;
+      conservative_continuation_token_bound?: number;
       conservative_token_bound?: number;
+      conservative_total_token_bound?: number;
       token_bound_known?: boolean;
     };
     prose_continuation_authorization?: ProseContinuationAuthorization;
   };
+}
+
+export interface CheckpointProseCompletion {
+  status: string;
+  requested_word_count: number;
+  actual_word_count: number;
 }
 
 export interface ChapterProgress {
@@ -175,6 +189,8 @@ export interface ChapterProgress {
   summary_written: boolean;
   dropped_ids: Record<string, unknown>;
   truncations: Truncation[];
+  /** 正文完成契约的只读标量摘要；旧作业可能没有。 */
+  prose_completion?: CheckpointProseCompletion;
   /** 新作业写入；旧作业缺失时由 batchPresentation 从 legacy 字段投影。 */
   step_outcomes?: StepOutcome[];
   notices?: GenerationNotice[];

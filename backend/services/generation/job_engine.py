@@ -57,6 +57,7 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "attempts": outcome.attempts,
         "step_outcomes": outcome.step_outcomes,
         "notices": outcome.notices,
+        "prose_completion": dict(outcome.prose_completion),
         "completed_at": get_utc_now(),
     }
 

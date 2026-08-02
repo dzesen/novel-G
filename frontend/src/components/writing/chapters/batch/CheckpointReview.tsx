@@ -5,6 +5,7 @@ import { Button } from "@heroui/react";
 import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./batchTypes";
 import { buildChapterPresentation } from "./batchPresentation";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
+import { checkpointWordCountPresentation } from "./checkpointWordCount";
 
 interface CheckpointReviewProps {
   job: GenerationJob;
@@ -113,6 +114,7 @@ function ChapterCard({
   const adherence = progress.outline_adherence;
   const hasOutlineDeviation = adherence?.verdict === "fail";
   const presentation = buildChapterPresentation(progress);
+  const proseWordCount = checkpointWordCountPresentation(progress.prose_completion);
   return (
     <div className={`rounded-md border p-3 ${hasConflict || hasOutlineDeviation ? "border-red-300 dark:border-red-900/70" : "border-border"} bg-surface`}>
       <button type="button" onClick={onJump} title={t("jumpHint")} className="mb-2 block w-full text-left">
@@ -127,6 +129,28 @@ function ChapterCard({
         <span>{t("factsAdded", { count: progress.facts_added })}</span>
         <span>{t("threadsAdvanced", { count: progress.threads_advanced })}</span>
       </div>
+
+      {proseWordCount && (
+        <div
+          data-testid="checkpoint-word-count"
+          className={`mt-2 grid gap-1 rounded-md border p-2 text-xs leading-5 ${
+            proseWordCount.hasVisibleOverrun
+              ? "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200"
+              : "border-border bg-surface-secondary/40 text-muted"
+          }`}
+        >
+          <span>{t("checkpointWordCount", {
+            actual: proseWordCount.actualWordCount,
+            target: proseWordCount.targetWordCount,
+            ratio: proseWordCount.ratio.toFixed(2),
+          })}</span>
+          {proseWordCount.hasVisibleOverrun && (
+            <span data-testid="checkpoint-word-count-overrun" className="font-medium">
+              {t("checkpointWordCountOverrun")}
+            </span>
+          )}
+        </div>
+      )}
 
       {hasConflict && (
         <div className="mt-2 grid gap-2 rounded-md border border-red-200 bg-red-50 p-2 dark:border-red-900/60 dark:bg-red-950/30">

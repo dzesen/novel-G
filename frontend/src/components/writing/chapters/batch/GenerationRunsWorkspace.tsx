@@ -18,6 +18,7 @@ import GenerationDiagnosticsPanel, {
   DiagnosticEventSummary,
 } from "./GenerationDiagnosticsPanel";
 import LeftoverProseRuns from "./LeftoverProseRuns";
+import { proseReasonTranslationKey } from "../prose/prosePresentation";
 
 interface ProseRunTelemetry {
   run_id: string;
@@ -49,6 +50,9 @@ interface ProseRunTelemetry {
     automatic_continuations_used: number;
     manual_continuations_used: number;
     word_count: number;
+    scene_target_words: number;
+    converge_attempts: number;
+    converge_attempts_without_stop: number;
     pause_reason: string | null;
     last_prompt_mode: string | null;
     last_finish_reason: string;
@@ -290,6 +294,7 @@ export default function GenerationRunsWorkspace({
 }: GenerationRunsWorkspaceProps) {
   const t = useTranslations("writing.generationRuns");
   const tBatch = useTranslations("writing.batch");
+  const tProse = useTranslations("writing.prose");
   const locale = useLocale();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
@@ -310,6 +315,11 @@ export default function GenerationRunsWorkspace({
   const [actionJobId, setActionJobId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [abortArmed, setAbortArmed] = useState<string | null>(null);
+
+  const pauseReasonLabel = (reasonCode: string) => {
+    const key = proseReasonTranslationKey(reasonCode);
+    return key ? tProse(`reasons.${key}`) : reasonCode;
+  };
 
   const load = useCallback(async (initial = false) => {
     if (initial) setLoading(true);
@@ -604,7 +614,7 @@ export default function GenerationRunsWorkspace({
               >
                 <option value="all">{t("allReasons")}</option>
                 {reasonOptions.map((reason) => (
-                  <option key={reason} value={reason}>{reason}</option>
+                  <option key={reason} value={reason}>{pauseReasonLabel(reason)}</option>
                 ))}
               </select>
             </label>
@@ -953,9 +963,28 @@ export default function GenerationRunsWorkspace({
                             - scene.automatic_continuations_used,
                         ),
                       })}</span>
+                      {scene.scene_target_words > 0 ? (
+                        <span className="min-w-0 break-words">
+                          {t("sceneDivergenceMetrics", {
+                            actual: scene.word_count,
+                            target: scene.scene_target_words,
+                            ratio: (scene.word_count / scene.scene_target_words).toFixed(2),
+                            converge: scene.converge_attempts,
+                            withoutStop: scene.converge_attempts_without_stop,
+                          })}
+                        </span>
+                      ) : (
+                        <span className="min-w-0 break-words">
+                          {t("sceneDivergenceMetricsTargetUnknown", {
+                            actual: scene.word_count,
+                            converge: scene.converge_attempts,
+                            withoutStop: scene.converge_attempts_without_stop,
+                          })}
+                        </span>
+                      )}
                       {scene.pause_reason && (
                         <span className="min-w-0 break-words text-amber-800 dark:text-amber-200">
-                          {t("scenePause", { reason: scene.pause_reason })}
+                          {t("scenePause", { reason: pauseReasonLabel(scene.pause_reason) })}
                         </span>
                       )}
                     </div>

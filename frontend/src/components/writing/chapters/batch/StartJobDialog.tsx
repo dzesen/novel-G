@@ -14,6 +14,7 @@ import {
   DEFAULT_PROSE_CONTINUATION_POLICY,
   parsePositiveInteger,
   permitsAutomaticContinuation,
+  type ProseBudgetCoverage,
   type ProseContinuationPolicy,
 } from "../prose/proseContinuation";
 import type {
@@ -192,6 +193,21 @@ export default function StartJobDialog({
           title: t("readinessIssueUnknownTitle"),
           body: t("readinessIssueUnknownBody", { code: issue.code }),
         };
+    }
+  };
+
+  const budgetCoverageReason = (coverage: ProseBudgetCoverage) => {
+    switch (coverage.unavailable_reason) {
+      case "token_budget_missing":
+        return t("readinessCoverageReasonTokenBudgetMissing");
+      case "token_bound_unproven":
+        return t("readinessCoverageReasonTokenBoundUnproven");
+      case "zero_token_bound":
+        return t("readinessCoverageReasonZeroTokenBound");
+      case "no_prose_chapters":
+        return t("readinessCoverageReasonNoProseChapters");
+      default:
+        return t("readinessCoverageReasonUnknown");
     }
   };
 
@@ -448,6 +464,40 @@ export default function StartJobDialog({
                           budget: readiness.planning.prose_continuation_authorization.token_budget ?? t("readinessNone"),
                         })}
                       </p>
+                      {(() => {
+                        const authorization = readiness.planning.prose_continuation_authorization;
+                        const coverage = authorization.budget_coverage;
+                        if (!coverage) return null;
+                        if (
+                          coverage.status === "available"
+                          && coverage.chapters_with_automatic_continuations !== null
+                          && coverage.chapters_without_automatic_continuations !== null
+                        ) {
+                          return authorization.max_automatic_continuation_calls > 0 ? (
+                            <p className="sm:col-span-2">
+                              {t("readinessBudgetCoverage", {
+                                automatic: coverage.chapters_with_automatic_continuations,
+                                base: coverage.chapters_without_automatic_continuations,
+                                total: coverage.estimated_prose_chapter_count,
+                              })}
+                            </p>
+                          ) : (
+                            <p className="sm:col-span-2">
+                              {t("readinessBudgetCoverageNoAutomatic", {
+                                base: coverage.chapters_without_automatic_continuations,
+                                total: coverage.estimated_prose_chapter_count,
+                              })}
+                            </p>
+                          );
+                        }
+                        return (
+                          <p className="sm:col-span-2">
+                            {t("readinessBudgetCoverageUnavailable", {
+                              reason: budgetCoverageReason(coverage),
+                            })}
+                          </p>
+                        );
+                      })()}
                     </>
                   )}
                 </div>
