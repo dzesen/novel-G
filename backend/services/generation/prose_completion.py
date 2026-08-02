@@ -8,10 +8,11 @@ definitions of a complete chapter.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal
 
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
+from backend.services.generation.prose_continuation import ProseContinuationPolicy
 from backend.services.novel.chapter_service import count_chapter_words
 
 
@@ -24,20 +25,36 @@ class ProseExecutionPlan:
     safe_output_budget: int
     minimum_completion_ratio: float
     segment_budgets: tuple[int, ...]
-    max_continuations: int
     reason_codes: tuple[str, ...]
+    protocol_revision: str = "scene-continuation-v3"
+    # Kept as a non-serialized compatibility attribute while v2 runs remain
+    # readable. New plans never use it as a continuation authorization.
+    max_continuations: int = field(default=0, compare=False, repr=False)
 
     @property
-    def scheduled_call_count(self) -> int:
+    def scheduled_base_call_count(self) -> int:
         return sum(
             max(1, math.ceil(budget / self.safe_output_budget))
             for budget in self.segment_budgets
         ) if self.mode == "scene_segments" else 1
 
     @property
+    def scheduled_call_count(self) -> int:
+        """Compatibility alias for callers that only need base calls."""
+        return self.scheduled_base_call_count
+
+    @property
     def call_count(self) -> int:
-        """Worst-case paid calls, including bounded resumes of every planned call."""
-        return self.scheduled_call_count * (1 + self.max_continuations)
+        """Compatibility alias; v3 continuation calls are authorization-derived."""
+        return self.scheduled_base_call_count
+
+    def maximum_logical_call_count(
+        self,
+        policy: ProseContinuationPolicy,
+    ) -> int:
+        return self.scheduled_base_call_count + (
+            self.scene_count * policy.automatic_continuations_per_scene
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,8 +65,9 @@ class ProseExecutionPlan:
             "safe_output_budget": self.safe_output_budget,
             "minimum_completion_ratio": self.minimum_completion_ratio,
             "segment_budgets": list(self.segment_budgets),
-            "max_continuations": self.max_continuations,
             "reason_codes": list(self.reason_codes),
+            "protocol_revision": self.protocol_revision,
+            "scheduled_base_call_count": self.scheduled_base_call_count,
             "scheduled_call_count": self.scheduled_call_count,
             "call_count": self.call_count,
         }
@@ -64,6 +82,8 @@ class ProseCompletion:
     scene_count: int
     completed_scene_count: int
     finish_reason: FinishReason
+    raw_finish_reason: str
+    completion_reason: str
     mode: Literal["single_call", "scene_segments"]
     reason_codes: tuple[str, ...]
 
@@ -80,6 +100,8 @@ class ProseCompletion:
             "scene_count": self.scene_count,
             "completed_scene_count": self.completed_scene_count,
             "finish_reason": self.finish_reason,
+            "raw_finish_reason": self.raw_finish_reason,
+            "completion_reason": self.completion_reason,
             "mode": self.mode,
             "reason_codes": list(self.reason_codes),
             "can_write_formal_prose": self.can_write_formal_prose,
@@ -113,7 +135,6 @@ class ProseCompletionModule:
         unknown_provider_safe_words: int = 6_000,
         safety_ratio: float = 0.8,
         minimum_completion_ratio: float = 0.8,
-        max_continuations: int = 2,
     ) -> None:
         self._unknown_provider_safe_words = max(1, int(unknown_provider_safe_words))
         self._safety_ratio = min(1.0, max(0.1, float(safety_ratio)))
@@ -121,7 +142,6 @@ class ProseCompletionModule:
             1.0,
             max(0.1, float(minimum_completion_ratio)),
         )
-        self._max_continuations = max(1, int(max_continuations))
 
     def plan(
         self,
@@ -162,17 +182,20 @@ class ProseCompletionModule:
         else:
             safe_budget = max(1, math.floor(output_limit * self._safety_ratio))
 
+        # Every multi-scene chapter is executed scene-by-scene in v3. A long
+        # one-scene chapter may still be split into base parts by output capacity.
+        scene_count_requires_segmentation = scene_count >= 2
         mode: Literal["single_call", "scene_segments"] = (
-            "scene_segments" if requested > safe_budget else "single_call"
+            "scene_segments"
+            if requested > safe_budget or scene_count_requires_segmentation
+            else "single_call"
         )
         if mode == "scene_segments":
-            reason_codes.append("requested_words_exceed_safe_output")
+            if requested > safe_budget:
+                reason_codes.append("requested_words_exceed_safe_output")
+            if scene_count_requires_segmentation:
+                reason_codes.append("scene_count_requires_segmentation")
         budgets = _allocate_budgets(requested, scene_count)
-        longest_segment = max(budgets)
-        max_continuations = max(
-            self._max_continuations,
-            math.ceil(longest_segment / safe_budget) - 1,
-        )
 
         return ProseExecutionPlan(
             requested_word_count=requested,
@@ -182,7 +205,6 @@ class ProseCompletionModule:
             safe_output_budget=safe_budget,
             minimum_completion_ratio=self._minimum_completion_ratio,
             segment_budgets=budgets,
-            max_continuations=max_continuations,
             reason_codes=tuple(reason_codes),
         )
 
@@ -195,8 +217,13 @@ class ProseCompletionModule:
         completed_scene_indexes: Iterable[int],
         outline_revision: str,
         expected_outline_revision: str,
+        raw_finish_reason: Any = None,
     ) -> ProseCompletion:
         normalized_reason = normalize_finish_reason(finish_reason)
+        raw_source = finish_reason if raw_finish_reason is None else raw_finish_reason
+        raw_reason = str(
+            getattr(raw_source, "value", raw_source) or "unreported"
+        ).strip() or "unreported"
         indexes = {
             int(index)
             for index in completed_scene_indexes
@@ -233,6 +260,27 @@ class ProseCompletionModule:
         else:
             status = "complete"
 
+        if status == "stale":
+            completion_reason = "outline_revision_stale"
+        elif normalized_reason == "length":
+            completion_reason = "provider_length_limit"
+        elif normalized_reason == "content_filter":
+            completion_reason = "provider_content_filter"
+        elif normalized_reason == "tool_call":
+            completion_reason = "provider_tool_call"
+        elif normalized_reason == "cancelled":
+            completion_reason = "cancelled"
+        elif normalized_reason == "error":
+            completion_reason = "provider_or_transport_error"
+        elif normalized_reason == "stop" and reasons:
+            completion_reason = "short_stop"
+        elif normalized_reason == "unreported":
+            completion_reason = "provider_reason_unreported"
+        elif status == "complete":
+            completion_reason = "complete"
+        else:
+            completion_reason = "completion_contract_failed"
+
         return ProseCompletion(
             status=status,
             requested_word_count=plan.requested_word_count,
@@ -241,6 +289,8 @@ class ProseCompletionModule:
             scene_count=plan.scene_count,
             completed_scene_count=len(indexes),
             finish_reason=normalized_reason,
+            raw_finish_reason=raw_reason,
+            completion_reason=completion_reason,
             mode=plan.mode,
             reason_codes=tuple(reasons),
         )
