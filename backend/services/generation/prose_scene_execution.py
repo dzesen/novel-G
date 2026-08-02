@@ -17,6 +17,7 @@ from backend.db.repositories.generation_job_repository import TokenBudgetExceede
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.generation.prose_completion import ProseExecutionPlan
 from backend.services.generation.prose_continuation import ProseContinuationPolicy
+from backend.services.generation.prose_token_bounds import v3_output_token_bound
 from backend.services.generation.prose_generation import (
     DeltaCallback,
     ProseGenerationResult,
@@ -35,16 +36,6 @@ SceneProgressCallback = Callable[[tuple[dict[str, Any], ...]], Awaitable[None] |
 
 _AUTOMATIC_SEQUENCE_FLOOR = 1_000_000
 _SEAM_TAIL_CHARACTERS = 2_000
-
-
-def _positive_int(value: Any) -> int | None:
-    if isinstance(value, (bool, float)):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
 
 
 def _scene_minimum_words(plan: ProseExecutionPlan, scene_index: int) -> int:
@@ -537,12 +528,9 @@ async def execute_v3_prose_plan(
             prompt_mode=prompt_mode,
         )
         call_kwargs = dict(gen_kwargs or {})
-        derived_max_tokens = max(256, math.ceil(target_words / 0.65))
-        inherited_max_tokens = _positive_int(call_kwargs.get("max_tokens"))
-        call_kwargs["max_tokens"] = (
-            derived_max_tokens
-            if inherited_max_tokens is None
-            else min(inherited_max_tokens, derived_max_tokens)
+        call_kwargs["max_tokens"] = v3_output_token_bound(
+            target_words=target_words,
+            inherited_max_tokens=call_kwargs.get("max_tokens"),
         )
 
         state = refresh_scene(scene_index)

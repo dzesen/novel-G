@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Mapping
@@ -18,6 +17,10 @@ from backend.services.generation.job_planner import (
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     prose_authorization_module,
+)
+from backend.services.generation.prose_token_bounds import (
+    positive_token_limit,
+    v3_output_token_bound,
 )
 
 
@@ -145,16 +148,43 @@ def _batch_prose_authorization(
         or strategy.get("maximum_prose_calls")
         or 0
     )
-    estimated_scene_count = int(
-        strategy.get("estimated_scene_count") or 0
+    estimated_scene_count = int(strategy.get("estimated_scene_count") or 0)
+    work_steps = dict(work.get("steps") or {})
+    prose_steps = dict(work_steps.get("prose") or {})
+    estimated_chapter_count = int(
+        strategy.get("estimated_prose_chapter_count")
+        or prose_steps.get("generate")
+        or 0
     )
-    conservative_bound = int(
+    base_output_bound = int(strategy.get("base_output_token_bound") or 0)
+    continuation_output_bound = int(
+        strategy.get("continuation_output_token_bound") or 0
+    )
+    legacy_conservative_bound = int(
         strategy.get("conservative_token_bound") or 0
     )
-    token_bound_known = bool(
-        strategy.get("token_bound_known")
+    base_conservative_bound = int(
+        strategy.get("conservative_base_token_bound")
+        or legacy_conservative_bound
     )
+    continuation_conservative_bound = int(
+        strategy.get("conservative_continuation_token_bound")
+        or legacy_conservative_bound
+    )
+    conservative_bound = max(
+        legacy_conservative_bound,
+        base_conservative_bound,
+        continuation_conservative_bound,
+    )
+    token_bound_known = bool(strategy.get("token_bound_known"))
     if maximum_base_calls <= 0:
+        coverage = prose_authorization_module.estimate_budget_coverage(
+            token_budget=token_budget,
+            token_bound_known=token_bound_known,
+            estimated_chapter_count=estimated_chapter_count,
+            conservative_base_token_bound=0,
+            conservative_total_token_bound=0,
+        )
         return {
             "policy": policy.to_dict(),
             "authorization_revision": max(1, int(authorization_revision)),
@@ -162,8 +192,14 @@ def _batch_prose_authorization(
             "max_automatic_continuation_calls": 0,
             "max_logical_prose_calls": 0,
             "max_actual_provider_attempts": 0,
+            "base_output_token_bound": base_output_bound,
+            "continuation_output_token_bound": continuation_output_bound,
+            "conservative_base_token_bound": base_conservative_bound,
+            "conservative_continuation_token_bound": continuation_conservative_bound,
             "conservative_token_bound": conservative_bound,
+            "conservative_total_token_bound": 0,
             "token_bound_known": token_bound_known,
+            "budget_coverage": coverage.to_dict(),
             "token_budget": token_budget,
             "readiness_digest": "",
         }
@@ -189,16 +225,20 @@ def _batch_prose_authorization(
         scheduled_base_calls=maximum_base_calls,
         scene_count=estimated_scene_count,
         conservative_token_bound=conservative_bound,
+        base_output_token_bound=base_output_bound,
+        continuation_output_token_bound=continuation_output_bound,
+        conservative_base_token_bound=base_conservative_bound,
+        conservative_continuation_token_bound=continuation_conservative_bound,
+        token_bound_known=token_bound_known,
+        estimated_chapter_count=estimated_chapter_count,
         token_budget=token_budget,
     ).to_dict()
     return {
         **authorization,
-        "token_bound_known": token_bound_known,
         # Budget-tracked runtimes disable opaque SDK retries, so one logical
         # prose call maps to exactly one maximum Provider attempt here.
         "max_actual_provider_attempts": authorization["max_logical_prose_calls"],
     }
-
 
 class GenerationReadinessModule:
     def __init__(self, deps: ReadinessDeps) -> None:
@@ -649,13 +689,6 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
 
 def _plan_work_with_prose_continuation(
     chapters: list[dict[str, Any]],
@@ -704,11 +737,19 @@ def _plan_work_with_prose_continuation(
             "prose_strategy": {
                 **strategy,
                 "maximum_base_prose_calls": 0,
+                "estimated_prose_chapter_count": 0,
                 "estimated_scene_count": 0,
                 "maximum_automatic_continuation_calls": 0,
                 "maximum_logical_prose_calls": 0,
                 "max_actual_provider_attempts": 0,
+                "maximum_base_call_target_words": 0,
+                "continuation_call_target_words": 0,
+                "base_output_token_bound": 0,
+                "continuation_output_token_bound": 0,
+                "conservative_base_token_bound": 0,
+                "conservative_continuation_token_bound": 0,
                 "conservative_token_bound": 0,
+                "conservative_total_token_bound": 0,
                 "token_bound_known": False,
             },
         }
@@ -725,10 +766,7 @@ def _plan_work_with_prose_continuation(
     maximum_base_calls = 0
     estimated_scene_count = 0
     unknown_outline_chapters = 0
-    maximum_call_target_words = max(
-        policy.continuation_target_words,
-        capability_plan.safe_output_budget,
-    )
+    maximum_base_call_target_words = capability_plan.safe_output_budget
     for chapter in chapters_needing_prose:
         outline = chapter.get("outline") or {}
         if not outline:
@@ -752,26 +790,49 @@ def _plan_work_with_prose_continuation(
         )
         maximum_base_calls += chapter_plan.scheduled_base_call_count
         estimated_scene_count += chapter_plan.scene_count
-        maximum_call_target_words = max(
-            maximum_call_target_words,
+        maximum_base_call_target_words = max(
+            maximum_base_call_target_words,
             *chapter_plan.segment_budgets,
         )
 
-    output_cap = _positive_int(overrides.get("max_tokens"))
-    if output_cap is None:
-        output_cap = max(256, math.ceil(maximum_call_target_words / 0.65))
-    max_context = _positive_int(
+    inherited_max_tokens = values.get("max_tokens")
+    base_output_token_bound = v3_output_token_bound(
+        target_words=maximum_base_call_target_words,
+        inherited_max_tokens=inherited_max_tokens,
+    )
+    continuation_output_token_bound = v3_output_token_bound(
+        target_words=policy.continuation_target_words,
+        inherited_max_tokens=inherited_max_tokens,
+    )
+    max_context = positive_token_limit(
         getattr(prose_plan, "max_context_tokens", None)
     )
-    conservative_token_bound = (
-        int(max_context) + int(output_cap) + 1_024
+    conservative_base_token_bound = (
+        int(max_context) + base_output_token_bound + 1_024
         if max_context is not None
         else 0
+    )
+    conservative_continuation_token_bound = (
+        int(max_context) + continuation_output_token_bound + 1_024
+        if max_context is not None
+        else 0
+    )
+    conservative_token_bound = max(
+        conservative_base_token_bound,
+        conservative_continuation_token_bound,
     )
     maximum_automatic_calls = (
         estimated_scene_count * policy.automatic_continuations_per_scene
     )
     maximum_logical_calls = maximum_base_calls + maximum_automatic_calls
+    conservative_total_token_bound = (
+        maximum_base_calls * conservative_base_token_bound
+        + maximum_automatic_calls * conservative_continuation_token_bound
+    )
+    maximum_call_target_words = max(
+        maximum_base_call_target_words,
+        policy.continuation_target_words,
+    )
     return {
         **base,
         "attempt_capacity": estimate_worklist_attempt_capacity(chapters, values),
@@ -786,12 +847,20 @@ def _plan_work_with_prose_continuation(
             "unknown_scene_upper_bound": MAX_CHAPTER_OUTLINE_SCENES,
             "maximum_prose_calls": maximum_base_calls,
             "maximum_base_prose_calls": maximum_base_calls,
+            "estimated_prose_chapter_count": len(chapters_needing_prose),
             "estimated_scene_count": estimated_scene_count,
             "maximum_automatic_continuation_calls": maximum_automatic_calls,
             "maximum_logical_prose_calls": maximum_logical_calls,
             "max_actual_provider_attempts": maximum_logical_calls,
+            "maximum_base_call_target_words": maximum_base_call_target_words,
+            "continuation_call_target_words": policy.continuation_target_words,
             "maximum_call_target_words": maximum_call_target_words,
+            "base_output_token_bound": base_output_token_bound,
+            "continuation_output_token_bound": continuation_output_token_bound,
+            "conservative_base_token_bound": conservative_base_token_bound,
+            "conservative_continuation_token_bound": conservative_continuation_token_bound,
             "conservative_token_bound": conservative_token_bound,
+            "conservative_total_token_bound": conservative_total_token_bound,
             "token_bound_known": conservative_token_bound > 0,
         },
     }

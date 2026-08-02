@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
+
 from backend.services.generation.prose_protocol import CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 
 
@@ -120,6 +121,30 @@ class ProseContinuationPolicy:
 
 
 @dataclass(frozen=True)
+class ProseBudgetCoverage:
+    """A side-effect-free, conservative chapter-coverage estimate."""
+
+    status: Literal["available", "unavailable"]
+    estimated_prose_chapter_count: int
+    chapters_with_automatic_continuations: int | None
+    chapters_without_automatic_continuations: int | None
+    unavailable_reason: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "estimated_prose_chapter_count": self.estimated_prose_chapter_count,
+            "chapters_with_automatic_continuations": (
+                self.chapters_with_automatic_continuations
+            ),
+            "chapters_without_automatic_continuations": (
+                self.chapters_without_automatic_continuations
+            ),
+            "unavailable_reason": self.unavailable_reason,
+        }
+
+
+@dataclass(frozen=True)
 class ProseContinuationAuthorization:
     """Immutable readiness snapshot for one explicit paid-call authorization."""
 
@@ -130,7 +155,14 @@ class ProseContinuationAuthorization:
     max_base_calls: int
     max_automatic_continuation_calls: int
     max_logical_prose_calls: int
+    base_output_token_bound: int
+    continuation_output_token_bound: int
+    conservative_base_token_bound: int
+    conservative_continuation_token_bound: int
     conservative_token_bound: int
+    conservative_total_token_bound: int
+    token_bound_known: bool
+    budget_coverage: ProseBudgetCoverage
     token_budget: int | None
     readiness_digest: str
 
@@ -145,7 +177,16 @@ class ProseContinuationAuthorization:
                 self.max_automatic_continuation_calls
             ),
             "max_logical_prose_calls": self.max_logical_prose_calls,
+            "base_output_token_bound": self.base_output_token_bound,
+            "continuation_output_token_bound": self.continuation_output_token_bound,
+            "conservative_base_token_bound": self.conservative_base_token_bound,
+            "conservative_continuation_token_bound": (
+                self.conservative_continuation_token_bound
+            ),
             "conservative_token_bound": self.conservative_token_bound,
+            "conservative_total_token_bound": self.conservative_total_token_bound,
+            "token_bound_known": self.token_bound_known,
+            "budget_coverage": self.budget_coverage.to_dict(),
             "token_budget": self.token_budget,
             "readiness_digest": self.readiness_digest,
         }
@@ -176,6 +217,49 @@ class ProseAuthorizationModule:
             )
         )
 
+    @staticmethod
+    def estimate_budget_coverage(
+        *,
+        token_budget: int | None,
+        token_bound_known: bool,
+        estimated_chapter_count: int,
+        conservative_base_token_bound: int,
+        conservative_total_token_bound: int,
+    ) -> ProseBudgetCoverage:
+        chapter_count = max(0, int(estimated_chapter_count))
+        base_total = max(0, int(conservative_base_token_bound))
+        total = max(0, int(conservative_total_token_bound))
+        if token_budget is None:
+            reason = "token_budget_missing"
+        elif not token_bound_known:
+            reason = "token_bound_unproven"
+        elif chapter_count <= 0:
+            reason = "no_prose_chapters"
+        elif base_total <= 0 or total <= 0:
+            reason = "zero_token_bound"
+        else:
+            budget = max(1, int(token_budget))
+            return ProseBudgetCoverage(
+                status="available",
+                estimated_prose_chapter_count=chapter_count,
+                chapters_with_automatic_continuations=min(
+                    chapter_count,
+                    (budget * chapter_count) // total,
+                ),
+                chapters_without_automatic_continuations=min(
+                    chapter_count,
+                    (budget * chapter_count) // base_total,
+                ),
+                unavailable_reason=None,
+            )
+        return ProseBudgetCoverage(
+            status="unavailable",
+            estimated_prose_chapter_count=chapter_count,
+            chapters_with_automatic_continuations=None,
+            chapters_without_automatic_continuations=None,
+            unavailable_reason=reason,
+        )
+
     def authorize(
         self,
         *,
@@ -186,6 +270,12 @@ class ProseAuthorizationModule:
         scheduled_base_calls: int,
         scene_count: int,
         conservative_token_bound: int = 0,
+        base_output_token_bound: int = 0,
+        continuation_output_token_bound: int = 0,
+        conservative_base_token_bound: int | None = None,
+        conservative_continuation_token_bound: int | None = None,
+        token_bound_known: bool | None = None,
+        estimated_chapter_count: int = 1,
         token_budget: int | None = None,
     ) -> ProseContinuationAuthorization:
         revision = max(1, int(authorization_revision))
@@ -196,8 +286,48 @@ class ProseAuthorizationModule:
         )
         logical_calls = base_calls + automatic_calls
         conservative_bound = max(0, int(conservative_token_bound))
+        base_output_bound = max(0, int(base_output_token_bound))
+        continuation_output_bound = max(0, int(continuation_output_token_bound))
+        base_conservative_bound = max(
+            0,
+            int(
+                conservative_bound
+                if conservative_base_token_bound is None
+                else conservative_base_token_bound
+            ),
+        )
+        continuation_conservative_bound = max(
+            0,
+            int(
+                conservative_bound
+                if conservative_continuation_token_bound is None
+                else conservative_continuation_token_bound
+            ),
+        )
+        conservative_bound = max(
+            conservative_bound,
+            base_conservative_bound,
+            continuation_conservative_bound,
+        )
+        known_bound = (
+            conservative_bound > 0
+            if token_bound_known is None
+            else bool(token_bound_known)
+        )
+        chapter_count = max(0, int(estimated_chapter_count))
+        conservative_total = (
+            base_calls * base_conservative_bound
+            + automatic_calls * continuation_conservative_bound
+        )
         normalized_budget = (
             None if token_budget is None else max(1, int(token_budget))
+        )
+        budget_coverage = self.estimate_budget_coverage(
+            token_budget=normalized_budget,
+            token_bound_known=known_bound,
+            estimated_chapter_count=chapter_count,
+            conservative_base_token_bound=base_calls * base_conservative_bound,
+            conservative_total_token_bound=conservative_total,
         )
         payload = {
             "protocol_revision": CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
@@ -208,7 +338,15 @@ class ProseAuthorizationModule:
             "max_base_calls": base_calls,
             "max_automatic_continuation_calls": automatic_calls,
             "max_logical_prose_calls": logical_calls,
+            "base_output_token_bound": base_output_bound,
+            "continuation_output_token_bound": continuation_output_bound,
+            "conservative_base_token_bound": base_conservative_bound,
+            "conservative_continuation_token_bound": continuation_conservative_bound,
             "conservative_token_bound": conservative_bound,
+            "conservative_total_token_bound": conservative_total,
+            "token_bound_known": known_bound,
+            "estimated_chapter_count": chapter_count,
+            "budget_coverage": budget_coverage.to_dict(),
             "token_budget": normalized_budget,
         }
         return ProseContinuationAuthorization(
@@ -219,7 +357,14 @@ class ProseAuthorizationModule:
             max_base_calls=base_calls,
             max_automatic_continuation_calls=automatic_calls,
             max_logical_prose_calls=logical_calls,
+            base_output_token_bound=base_output_bound,
+            continuation_output_token_bound=continuation_output_bound,
+            conservative_base_token_bound=base_conservative_bound,
+            conservative_continuation_token_bound=continuation_conservative_bound,
             conservative_token_bound=conservative_bound,
+            conservative_total_token_bound=conservative_total,
+            token_bound_known=known_bound,
+            budget_coverage=budget_coverage,
             token_budget=normalized_budget,
             readiness_digest=_digest(payload),
         )

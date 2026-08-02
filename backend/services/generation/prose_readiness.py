@@ -18,6 +18,10 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     prose_authorization_module,
 )
+from backend.services.generation.prose_token_bounds import (
+    positive_token_limit,
+    v3_output_token_bound,
+)
 
 
 class ProseReadinessBlocked(ValueError):
@@ -27,13 +31,6 @@ class ProseReadinessBlocked(ValueError):
 class StaleProseReadiness(ValueError):
     """A browser confirmation does not match the current prose inputs."""
 
-
-def _positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
 
 
 def _digest(value: Mapping[str, Any]) -> str:
@@ -59,40 +56,41 @@ def _provider_identity(plan: Any) -> dict[str, Any]:
         "capability_snapshot": str(
             _plan_value(plan, "capability_snapshot", "") or ""
         ),
-        "max_output_tokens": _positive_int(
+        "max_output_tokens": positive_token_limit(
             _plan_value(plan, "max_output_tokens")
         ),
         "thinking_mode": _plan_value(plan, "thinking_mode"),
     }
 
 
-def conservative_prose_call_token_bound(
+def _output_bound_is_proven(
     *,
     generation_plan: Any,
+    generation_kwargs: Mapping[str, Any] | None,
+) -> bool:
+    kwargs = dict(generation_kwargs or {})
+    return bool(
+        positive_token_limit(kwargs.get("max_tokens"))
+        or positive_token_limit(_plan_value(generation_plan, "max_output_tokens"))
+        or _plan_value(generation_plan, "supports_output_token_cap", True)
+    )
+
+
+def conservative_prose_call_token_bound(
+    *,
     base_prompt: str,
     outline: Mapping[str, Any],
     generation_kwargs: Mapping[str, Any] | None,
-    fallback_output_tokens: int | None = None,
+    output_token_bound: int | None,
 ) -> int | None:
-    """Return a safe per-call upper bound for the supported text envelope.
+    """Return a safe per-call upper bound for an already-capped v3 request.
 
-    The runtime sends one user prompt and an optional system prompt.  UTF-8
-    bytes are an upper bound for their text-token representation for the three
-    supported text protocols; the fixed allowance covers role/protocol tokens.
-    A later continuation additionally carries at most 2,000 tail characters
-    (at most 8,000 UTF-8 bytes) plus one serialized scene from ``outline``.
-    We deliberately return ``None`` without a Provider output hard limit.
+    The runtime sends one user prompt and an optional system prompt. UTF-8 bytes
+    are an upper bound for their text-token representation for the supported text
+    protocols; the fixed allowance covers role/protocol tokens and the largest
+    continuation seam. The caller supplies the actual target-specific output cap.
     """
-    kwargs = dict(generation_kwargs or {})
-    output_limit = _positive_int(kwargs.get("max_tokens"))
-    if output_limit is None:
-        output_limit = _positive_int(
-            _plan_value(generation_plan, "max_output_tokens")
-        )
-    if output_limit is None and _plan_value(
-        generation_plan, "supports_output_token_cap", True
-    ):
-        output_limit = _positive_int(fallback_output_tokens)
+    output_limit = positive_token_limit(output_token_bound)
     if output_limit is None:
         return None
     outline_json = json.dumps(
@@ -102,6 +100,7 @@ def conservative_prose_call_token_bound(
         separators=(",", ":"),
         default=str,
     )
+    kwargs = dict(generation_kwargs or {})
     system_prompt = str(kwargs.get("system_prompt") or "")
     input_upper = (
         len(str(base_prompt or "").encode("utf-8"))
@@ -111,7 +110,6 @@ def conservative_prose_call_token_bound(
         + 1_024
     )
     return max(1, int(output_limit) + input_upper)
-
 
 @dataclass(frozen=True)
 class ProseReadiness:
@@ -151,19 +149,43 @@ def build_prose_readiness(
     generation_kwargs: Mapping[str, Any] | None,
 ) -> ProseReadiness:
     provider_identity = _provider_identity(generation_plan)
-    maximum_call_target = max(
-        [policy.continuation_target_words, *execution_plan.segment_budgets]
+    maximum_base_call_target = max(execution_plan.segment_budgets or (1,))
+    inherited_max_tokens = dict(generation_kwargs or {}).get("max_tokens")
+    base_output_token_bound = v3_output_token_bound(
+        target_words=maximum_base_call_target,
+        inherited_max_tokens=inherited_max_tokens,
     )
-    fallback_output_tokens = max(
-        256,
-        int((maximum_call_target / 0.65) + 0.999999),
+    continuation_output_token_bound = v3_output_token_bound(
+        target_words=policy.continuation_target_words,
+        inherited_max_tokens=inherited_max_tokens,
     )
-    conservative_bound = conservative_prose_call_token_bound(
+    output_bound_known = _output_bound_is_proven(
         generation_plan=generation_plan,
+        generation_kwargs=generation_kwargs,
+    )
+    conservative_base_token_bound = conservative_prose_call_token_bound(
         base_prompt=base_prompt,
         outline=outline,
         generation_kwargs=generation_kwargs,
-        fallback_output_tokens=fallback_output_tokens,
+        output_token_bound=(
+            base_output_token_bound if output_bound_known else None
+        ),
+    )
+    conservative_continuation_token_bound = conservative_prose_call_token_bound(
+        base_prompt=base_prompt,
+        outline=outline,
+        generation_kwargs=generation_kwargs,
+        output_token_bound=(
+            continuation_output_token_bound if output_bound_known else None
+        ),
+    )
+    token_bound_known = (
+        conservative_base_token_bound is not None
+        and conservative_continuation_token_bound is not None
+    )
+    conservative_bound = max(
+        conservative_base_token_bound or 0,
+        conservative_continuation_token_bound or 0,
     )
     content_identity = _digest(
         {
@@ -185,13 +207,21 @@ def build_prose_readiness(
         provider_plan_revision=provider_plan_revision,
         scheduled_base_calls=execution_plan.scheduled_base_call_count,
         scene_count=execution_plan.scene_count,
-        conservative_token_bound=conservative_bound or 0,
+        conservative_token_bound=conservative_bound,
+        base_output_token_bound=base_output_token_bound,
+        continuation_output_token_bound=continuation_output_token_bound,
+        conservative_base_token_bound=conservative_base_token_bound or 0,
+        conservative_continuation_token_bound=(
+            conservative_continuation_token_bound or 0
+        ),
+        token_bound_known=token_bound_known,
+        estimated_chapter_count=1,
         token_budget=token_budget,
     )
     warnings: list[str] = []
     if policy.permits_automatic_continuation:
         warnings.append("automatic_continuations_require_confirmation")
-        if conservative_bound is None:
+        if not token_bound_known:
             warnings.append("prose_token_bound_unproven")
         if token_budget is None:
             warnings.append("automatic_continuations_require_token_budget")
@@ -199,7 +229,7 @@ def build_prose_readiness(
         execution_plan=execution_plan,
         authorization=authorization,
         warnings=tuple(warnings),
-        token_bound_known=conservative_bound is not None,
+        token_bound_known=token_bound_known,
     )
 
 
