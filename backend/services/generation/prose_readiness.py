@@ -18,6 +18,9 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     prose_authorization_module,
 )
+from backend.services.generation.prose_protocol import (
+    scene_continuation_seam_window_characters,
+)
 from backend.services.generation.prose_token_bounds import (
     positive_token_limit,
     v3_output_token_bound,
@@ -82,13 +85,15 @@ def conservative_prose_call_token_bound(
     outline: Mapping[str, Any],
     generation_kwargs: Mapping[str, Any] | None,
     output_token_bound: int | None,
+    seam_tail_characters: int,
 ) -> int | None:
     """Return a safe per-call upper bound for an already-capped v3 request.
 
     The runtime sends one user prompt and an optional system prompt. UTF-8 bytes
     are an upper bound for their text-token representation for the supported text
-    protocols; the fixed allowance covers role/protocol tokens and the largest
-    continuation seam. The caller supplies the actual target-specific output cap.
+    protocols; the fixed allowance covers role/protocol tokens and the caller's
+    target-derived largest continuation seam. The caller supplies the actual
+    target-specific output cap.
     """
     output_limit = positive_token_limit(output_token_bound)
     if output_limit is None:
@@ -102,11 +107,12 @@ def conservative_prose_call_token_bound(
     )
     kwargs = dict(generation_kwargs or {})
     system_prompt = str(kwargs.get("system_prompt") or "")
+    seam_tail_bytes = max(0, int(seam_tail_characters)) * 4
     input_upper = (
         len(str(base_prompt or "").encode("utf-8"))
         + len(outline_json.encode("utf-8"))
         + len(system_prompt.encode("utf-8"))
-        + 8_000
+        + seam_tail_bytes
         + 1_024
     )
     return max(1, int(output_limit) + input_upper)
@@ -150,6 +156,10 @@ def build_prose_readiness(
 ) -> ProseReadiness:
     provider_identity = _provider_identity(generation_plan)
     maximum_base_call_target = max(execution_plan.segment_budgets or (1,))
+    maximum_seam_tail_characters = max(
+        scene_continuation_seam_window_characters(target_words)
+        for target_words in (execution_plan.segment_budgets or (1,))
+    )
     inherited_max_tokens = dict(generation_kwargs or {}).get("max_tokens")
     base_output_token_bound = v3_output_token_bound(
         target_words=maximum_base_call_target,
@@ -170,6 +180,7 @@ def build_prose_readiness(
         output_token_bound=(
             base_output_token_bound if output_bound_known else None
         ),
+        seam_tail_characters=maximum_seam_tail_characters,
     )
     conservative_continuation_token_bound = conservative_prose_call_token_bound(
         base_prompt=base_prompt,
@@ -178,6 +189,7 @@ def build_prose_readiness(
         output_token_bound=(
             continuation_output_token_bound if output_bound_known else None
         ),
+        seam_tail_characters=maximum_seam_tail_characters,
     )
     token_bound_known = (
         conservative_base_token_bound is not None

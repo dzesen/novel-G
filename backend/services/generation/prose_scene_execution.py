@@ -17,6 +17,9 @@ from backend.db.repositories.generation_job_repository import TokenBudgetExceede
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.generation.prose_completion import ProseExecutionPlan
 from backend.services.generation.prose_continuation import ProseContinuationPolicy
+from backend.services.generation.prose_protocol import (
+    scene_continuation_seam_window_characters,
+)
 from backend.services.generation.prose_token_bounds import v3_output_token_bound
 from backend.services.generation.prose_generation import (
     DeltaCallback,
@@ -35,12 +38,18 @@ from backend.services.novel.chapter_service import count_chapter_words
 SceneProgressCallback = Callable[[tuple[dict[str, Any], ...]], Awaitable[None] | None]
 
 _AUTOMATIC_SEQUENCE_FLOOR = 1_000_000
-_SEAM_TAIL_CHARACTERS = 2_000
+
+
+def _scene_target_words(plan: ProseExecutionPlan, scene_index: int) -> int:
+    budgets = plan.segment_budgets or (plan.requested_word_count,)
+    budget = budgets[min(max(0, scene_index), len(budgets) - 1)]
+    return max(1, int(budget))
 
 
 def _scene_minimum_words(plan: ProseExecutionPlan, scene_index: int) -> int:
-    budget = plan.segment_budgets[min(scene_index, len(plan.segment_budgets) - 1)]
-    return math.ceil(max(1, int(budget)) * plan.minimum_completion_ratio)
+    return math.ceil(
+        _scene_target_words(plan, scene_index) * plan.minimum_completion_ratio
+    )
 
 
 def _call_kind(segment: Mapping[str, Any], *, base_count: int) -> str:
@@ -218,10 +227,7 @@ def _scene_progress_snapshot(
     )
     scene_text = _scene_text(scene_segments, scene_index=scene_index)
     state["word_count"] = count_chapter_words(scene_text)
-    state["scene_target_words"] = max(
-        1,
-        int(plan.segment_budgets[min(scene_index, len(plan.segment_budgets) - 1)]),
-    )
+    state["scene_target_words"] = _scene_target_words(plan, scene_index)
     converge_segments = [
         segment
         for segment in scene_segments
@@ -286,7 +292,10 @@ def _scene_prompt(
 ) -> str:
     scenes = list((outline or {}).get("scenes") or [])
     current_scene = scenes[scene_index] if scene_index < len(scenes) else {}
-    tail = str(prior_text or "")[-_SEAM_TAIL_CHARACTERS:] or "（无）"
+    seam_window = scene_continuation_seam_window_characters(
+        _scene_target_words(plan, scene_index)
+    )
+    tail = str(prior_text or "")[-seam_window:] or "（无）"
     mode_instructions = {
         "base": (
             "只写当前场景，不提前进入后续场景；在合适的位置自然收束当前场景。"
