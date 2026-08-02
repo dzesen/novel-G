@@ -53,6 +53,8 @@ interface ProseRunTelemetry {
     scene_target_words: number;
     converge_attempts: number;
     converge_attempts_without_stop: number;
+    continues_truncated_output_count: number;
+    max_cross_call_repeat_characters: number;
     pause_reason: string | null;
     last_prompt_mode: string | null;
     last_finish_reason: string;
@@ -982,6 +984,12 @@ export default function GenerationRunsWorkspace({
                           })}
                         </span>
                       )}
+                      <span className="min-w-0 break-words">
+                        {t("sceneContinuityMetrics", {
+                          repeat: scene.max_cross_call_repeat_characters,
+                          truncated: scene.continues_truncated_output_count,
+                        })}
+                      </span>
                       {scene.pause_reason && (
                         <span className="min-w-0 break-words text-amber-800 dark:text-amber-200">
                           {t("scenePause", { reason: pauseReasonLabel(scene.pause_reason) })}

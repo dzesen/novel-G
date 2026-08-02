@@ -2048,6 +2048,7 @@
       "sceneCalls": "基础 {base} · 自动 {automatic}（剩余 {remaining}）· 人工 {manual} · {words} 字 · {status}",
       "sceneDivergenceMetrics": "本场产出 {actual} / 目标 {target} 字（{ratio}×）；收束调用 {converge} 次，其中未以 stop 结束 {withoutStop} 次",
       "sceneDivergenceMetricsTargetUnknown": "本场产出 {actual} 字；未记录本场目标；收束调用 {converge} 次，其中未以 stop 结束 {withoutStop} 次",
+      "sceneContinuityMetrics": "跨调用最长逐字重复 {repeat} 字；硬截断续接 {truncated} 次",
       "scenePause": "暂停原因：{reason}",
       "sceneEmpty": "尚未持久化逐场检查点。"
     },

@@ -2048,6 +2048,7 @@
       "sceneCalls": "Base {base} · automatic {automatic} ({remaining} remaining) · manual {manual} · {words} words · {status}",
       "sceneDivergenceMetrics": "Scene output: {actual} / target {target} words ({ratio}×); {converge} convergence call(s), {withoutStop} not ending in stop",
       "sceneDivergenceMetricsTargetUnknown": "Scene output: {actual} words; no per-scene target was recorded; {converge} convergence call(s), {withoutStop} not ending in stop",
+      "sceneContinuityMetrics": "Longest verbatim cross-call repeat: {repeat} chars; hard-truncation continuations: {truncated}",
       "scenePause": "Pause reason: {reason}",
       "sceneEmpty": "No scene-level checkpoint has been persisted yet."
     },

@@ -206,6 +206,9 @@ def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
                 "continues_truncated_output_count": _safe_non_negative_int(
                     item.get("continues_truncated_output_count")
                 ),
+                "max_cross_call_repeat_characters": _safe_non_negative_int(
+                    item.get("max_cross_call_repeat_characters")
+                ),
                 "pause_reason": (
                     str(item.get("pause_reason"))
                     if item.get("pause_reason") is not None

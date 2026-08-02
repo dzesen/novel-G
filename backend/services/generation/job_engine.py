@@ -98,6 +98,9 @@ def _incomplete_prose_checkpoint(
                 "continues_truncated_output_count": integer(
                     raw.get("continues_truncated_output_count")
                 ),
+                "max_cross_call_repeat_characters": integer(
+                    raw.get("max_cross_call_repeat_characters")
+                ),
                 "last_prompt_mode": str(
                     raw.get("last_prompt_mode") or ""
                 )[:60],

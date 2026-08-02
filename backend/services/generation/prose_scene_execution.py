@@ -125,6 +125,68 @@ def _deduplicate_exact_seam(existing_text: str, generated_text: str) -> str:
     return generated
 
 
+def _longest_exact_common_substring_characters(
+    earlier_text: str,
+    later_text: str,
+) -> int:
+    """Measure an exact cross-call repeat in O(len(earlier) + len(later))."""
+    earlier = str(earlier_text or "")
+    later = str(later_text or "")
+    if not earlier or not later:
+        return 0
+
+    links = [-1]
+    lengths = [0]
+    transitions: list[dict[str, int]] = [{}]
+    last_state = 0
+    for character in earlier:
+        current_state = len(lengths)
+        lengths.append(lengths[last_state] + 1)
+        links.append(0)
+        transitions.append({})
+        probe = last_state
+        while probe != -1 and character not in transitions[probe]:
+            transitions[probe][character] = current_state
+            probe = links[probe]
+        if probe == -1:
+            links[current_state] = 0
+        else:
+            next_state = transitions[probe][character]
+            if lengths[probe] + 1 == lengths[next_state]:
+                links[current_state] = next_state
+            else:
+                clone_state = len(lengths)
+                lengths.append(lengths[probe] + 1)
+                links.append(links[next_state])
+                transitions.append(dict(transitions[next_state]))
+                while (
+                    probe != -1
+                    and transitions[probe].get(character) == next_state
+                ):
+                    transitions[probe][character] = clone_state
+                    probe = links[probe]
+                links[next_state] = clone_state
+                links[current_state] = clone_state
+        last_state = current_state
+
+    state = 0
+    matched = 0
+    longest = 0
+    for character in later:
+        while state and character not in transitions[state]:
+            state = links[state]
+            matched = lengths[state]
+        next_state = transitions[state].get(character)
+        if next_state is None:
+            state = 0
+            matched = 0
+            continue
+        state = next_state
+        matched += 1
+        longest = max(longest, matched)
+    return longest
+
+
 def _normal_finish_reason(value: Any, raw_value: Any = None) -> tuple[str, str]:
     normalized = normalize_finish_reason(value)
     raw_source = value if raw_value is None else raw_value
@@ -250,6 +312,13 @@ def _scene_progress_snapshot(
     state["continues_truncated_output_count"] = sum(
         bool(segment.get("continues_truncated_output"))
         for segment in scene_segments
+    )
+    state["max_cross_call_repeat_characters"] = max(
+        (
+            max(0, int(segment.get("cross_call_repeat_characters") or 0))
+            for segment in scene_segments
+        ),
+        default=0,
     )
     if scene_segments:
         latest = scene_segments[-1]
@@ -592,6 +661,7 @@ async def execute_v3_prose_plan(
             "text_digest": hashlib.sha256(b"").hexdigest(),
             "word_count": 0,
             "raw_character_count": 0,
+            "cross_call_repeat_characters": 0,
             "finish_reason": "unreported",
             "raw_finish_reason": "unreported",
             "usage": TokenUsage().model_dump(),
@@ -612,6 +682,9 @@ async def execute_v3_prose_plan(
         except asyncio.CancelledError:
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
+            cross_call_repeat_characters = (
+                _longest_exact_common_substring_characters(current_text, contribution)
+            )
             terminal = {
                 **checkpoint,
                 "status": "incomplete",
@@ -619,6 +692,7 @@ async def execute_v3_prose_plan(
                 "text_digest": hashlib.sha256(contribution.encode("utf-8")).hexdigest(),
                 "word_count": count_chapter_words(contribution),
                 "raw_character_count": len(contribution),
+                "cross_call_repeat_characters": cross_call_repeat_characters,
                 "finish_reason": "cancelled",
                 "raw_finish_reason": "cancelled",
                 "empty_output": not bool(generated),
@@ -634,6 +708,9 @@ async def execute_v3_prose_plan(
             # but it must never masquerade as an uncertain paid request.
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
+            cross_call_repeat_characters = (
+                _longest_exact_common_substring_characters(current_text, contribution)
+            )
             terminal = {
                 **checkpoint,
                 "status": "incomplete",
@@ -641,6 +718,7 @@ async def execute_v3_prose_plan(
                 "text_digest": hashlib.sha256(contribution.encode("utf-8")).hexdigest(),
                 "word_count": count_chapter_words(contribution),
                 "raw_character_count": len(contribution),
+                "cross_call_repeat_characters": cross_call_repeat_characters,
                 "finish_reason": "budget",
                 "raw_finish_reason": "budget",
                 "error_code": "token_budget_exceeded_before_dispatch",
@@ -658,6 +736,9 @@ async def execute_v3_prose_plan(
         except Exception:
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
+            cross_call_repeat_characters = (
+                _longest_exact_common_substring_characters(current_text, contribution)
+            )
             try:
                 observed_usage = usage_reader()
             except Exception:
@@ -669,6 +750,7 @@ async def execute_v3_prose_plan(
                 "text_digest": hashlib.sha256(contribution.encode("utf-8")).hexdigest(),
                 "word_count": count_chapter_words(contribution),
                 "raw_character_count": len(contribution),
+                "cross_call_repeat_characters": cross_call_repeat_characters,
                 "finish_reason": "error",
                 "raw_finish_reason": "error",
                 "usage": observed_usage.model_dump(),
@@ -683,6 +765,9 @@ async def execute_v3_prose_plan(
 
         generated = "".join(chunks).strip()
         contribution = _deduplicate_exact_seam(current_text, generated).strip()
+        cross_call_repeat_characters = (
+            _longest_exact_common_substring_characters(current_text, contribution)
+        )
         observed_finish = finish_reason_reader()
         raw_finish = (
             raw_finish_reason_reader()
@@ -713,6 +798,7 @@ async def execute_v3_prose_plan(
             "text_digest": hashlib.sha256(contribution.encode("utf-8")).hexdigest(),
             "word_count": count_chapter_words(contribution),
             "raw_character_count": len(contribution),
+            "cross_call_repeat_characters": cross_call_repeat_characters,
             "finish_reason": finish_reason,
             "raw_finish_reason": raw_finish_reason,
             "usage": usage.model_dump(),
