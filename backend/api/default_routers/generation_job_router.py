@@ -9,7 +9,12 @@ from pydantic import BaseModel, Field
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.services.generation.failure_diagnostics import infer_job_diagnostics
-from backend.services.generation.job_service import ConflictError, GenerationJobService
+from backend.services.generation.job_service import (
+    ConflictError,
+    GenerationJobService,
+    ResumeReadinessRequired,
+)
+from backend.services.generation.readiness import StaleReadiness
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
@@ -111,6 +116,16 @@ class ResumeJobRequest(BaseModel):
 
 
 def _handle(exc: Exception) -> HTTPException:
+    if isinstance(exc, ResumeReadinessRequired):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "resume_readiness_required", "message": str(exc)},
+        )
+    if isinstance(exc, StaleReadiness):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "readiness_stale", "message": str(exc)},
+        )
     if isinstance(exc, ConflictError):
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, NotFoundError):
@@ -287,6 +302,19 @@ async def resume_job(job_id: str, req: ResumeJobRequest | None = None):
         body = req or ResumeJobRequest()
         if body.confirm_uncertain_retry and body.skip_uncertain:
             raise ValueError("confirm_uncertain_retry and skip_uncertain are mutually exclusive")
+        reauthorization_payload_supplied = (
+            body.prose_continuation_policy is not None
+            or "token_budget" in body.model_fields_set
+            or body.readiness_digest is not None
+            or body.acknowledged_warning_codes is not None
+        )
+        if (
+            (body.confirm_uncertain_retry or body.skip_uncertain)
+            and reauthorization_payload_supplied
+        ):
+            raise ValueError(
+                "uncertain-attempt recovery and re-authorized resume are mutually exclusive"
+            )
         return _serialize_job(await GenerationJobService.resume_job(
             job_id,
             confirm_uncertain_retry=body.confirm_uncertain_retry,

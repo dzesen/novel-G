@@ -57,6 +57,51 @@ class ConflictError(Exception):
     """已有在跑作业（全局单作业约束）。路由映射为 409。"""
 
 
+class ResumeReadinessRequired(ValueError):
+    """The paused job needs a fresh, user-confirmed authorization preview."""
+
+
+_AUTHORIZATION_SCOPE_FIELDS = (
+    "max_base_calls",
+    "max_automatic_continuation_calls",
+    "max_logical_prose_calls",
+    "max_actual_provider_attempts",
+    "conservative_base_token_bound",
+    "conservative_continuation_token_bound",
+    "conservative_token_bound",
+    "conservative_total_token_bound",
+)
+
+
+def _safe_scope_value(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _authorization_scope(authorization: Mapping[str, Any] | None) -> dict[str, int]:
+    values = dict(authorization or {})
+    return {
+        field: _safe_scope_value(values.get(field))
+        for field in _AUTHORIZATION_SCOPE_FIELDS
+    }
+
+
+def _authorization_scope_increases(
+    *,
+    authorized: Mapping[str, Any] | None,
+    candidate: Mapping[str, Any] | None,
+) -> list[str]:
+    authorized_scope = _authorization_scope(authorized)
+    candidate_scope = _authorization_scope(candidate)
+    return [
+        field
+        for field in _AUTHORIZATION_SCOPE_FIELDS
+        if candidate_scope[field] > authorized_scope[field]
+    ]
+
+
 def _new_job_doc(
     novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity,
     readiness, outline_deviation_policy, generation_params,
@@ -503,6 +548,30 @@ class GenerationJobService:
             job = await generation_job_repo.get_job(job_id)
             if not job_planner.can_resume(job["status"]):
                 raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
+            if confirm_uncertain_retry and skip_uncertain:
+                raise ValueError(
+                    "confirm_uncertain_retry and skip_uncertain are mutually exclusive"
+                )
+            reauthorization_payload_supplied = (
+                prose_continuation_policy is not None
+                or token_budget_provided
+                or readiness_digest is not None
+                or acknowledged_warning_codes is not None
+            )
+            if (
+                (confirm_uncertain_retry or skip_uncertain)
+                and reauthorization_payload_supplied
+            ):
+                raise ValueError(
+                    "uncertain-attempt recovery and re-authorized resume are mutually exclusive"
+                )
+            if (
+                (confirm_uncertain_retry or skip_uncertain)
+                and not job.get("has_uncertain_attempts")
+            ):
+                raise ValueError(
+                    "uncertain-attempt recovery requires an uncertain Provider attempt"
+                )
             if job.get("has_uncertain_attempts") and not confirm_uncertain_retry:
                 if skip_uncertain:
                     await generation_job_repo.acknowledge_uncertain_attempts(job_id, "skip")
@@ -534,12 +603,30 @@ class GenerationJobService:
                 authorization,
                 policy=candidate_policy,
             )
+            authorization_confirmation_required = bool(
+                job.get("authorization_confirmation_required")
+            )
             authorization_settings_changed = (
                 prose_continuation_policy is not None
                 or token_budget_provided
-                or authorization_ruleset_changed
+                or authorization_confirmation_required
+                or (
+                    authorization_ruleset_changed
+                    and not (confirm_uncertain_retry or skip_uncertain)
+                )
             )
+            if (
+                not authorization_settings_changed
+                and (readiness_digest is not None or acknowledged_warning_codes is not None)
+            ):
+                raise ValueError(
+                    "readiness confirmation is only valid for a re-authorized resume"
+                )
             if authorization_settings_changed:
+                if readiness_digest is None:
+                    raise ResumeReadinessRequired(
+                        "继续前需要查看并确认当前自动续写调用容量与 token 预算"
+                    )
                 candidate_budget = (
                     token_budget if token_budget_provided else job.get("token_budget")
                 )
@@ -604,6 +691,7 @@ class GenerationJobService:
                     ),
                     "authorization_revision": max(1, current_revision + 1),
                     "readiness": accepted_readiness,
+                    "authorization_confirmation_required": None,
                     # Historical claims are never rolled back. The new policy
                     # governs only the work still visible in the current list.
                     "usage_attempt_capacity": max(
