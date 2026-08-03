@@ -91,16 +91,45 @@ def _scene_minimum_words(plan: ProseExecutionPlan, scene_index: int) -> int:
     )
 
 
-def _scene_hits_divergence_stop_threshold(state: Mapping[str, Any]) -> bool:
+def effective_scene_divergence_stop_factor(
+    acceptance_scene_divergence_stop_factor_override: float | None,
+) -> float:
+    """Return the production factor or a validated acceptance-only override.
+
+    A zero override is deliberately meaningful: it disables the divergence
+    stop for a preregistered acceptance comparison.  It is not part of the
+    continuation policy and production callers leave it unset.
+    """
+    if acceptance_scene_divergence_stop_factor_override is None:
+        return SCENE_DIVERGENCE_STOP_FACTOR
+    if isinstance(acceptance_scene_divergence_stop_factor_override, bool) or not isinstance(
+        acceptance_scene_divergence_stop_factor_override,
+        (int, float),
+    ):
+        raise ValueError("acceptance divergence stop override must be a finite number")
+    factor = float(acceptance_scene_divergence_stop_factor_override)
+    if not math.isfinite(factor) or factor < 0:
+        raise ValueError(
+            "acceptance divergence stop override must be a finite non-negative number"
+        )
+    return factor
+
+
+def _scene_hits_divergence_stop_threshold(
+    state: Mapping[str, Any],
+    *,
+    factor: float = SCENE_DIVERGENCE_STOP_FACTOR,
+) -> bool:
     """Return whether incomplete prose has crossed the measured safety cutoff."""
+    if factor <= 0:
+        return False
     try:
         effective_word_count = max(0, int(state.get("effective_word_count") or 0))
         scene_target_words = max(1, int(state.get("scene_target_words") or 0))
-    except (TypeError, ValueError):
+        threshold = math.ceil(scene_target_words * factor)
+    except (OverflowError, TypeError, ValueError):
         return False
-    return effective_word_count >= math.ceil(
-        scene_target_words * SCENE_DIVERGENCE_STOP_FACTOR
-    )
+    return effective_word_count >= threshold
 
 
 def _call_kind(segment: Mapping[str, Any], *, base_count: int) -> str:
@@ -710,6 +739,7 @@ async def execute_v3_prose_plan(
     manual_continuation: bool = False,
     stop_after_scene_index: int | None = None,
     acceptance_continuation_seam_window_characters_override: int | None = None,
+    acceptance_scene_divergence_stop_factor_override: float | None = None,
     on_delta: DeltaCallback | None = None,
     on_segment: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     on_scene_progress: SceneProgressCallback | None = None,
@@ -737,6 +767,9 @@ async def execute_v3_prose_plan(
             raise ValueError("acceptance continuation seam override must be positive")
     else:
         acceptance_seam_window = None
+    acceptance_divergence_stop_factor = effective_scene_divergence_stop_factor(
+        acceptance_scene_divergence_stop_factor_override
+    )
     specs = _call_specs(plan)
     base_by_sequence = {spec.sequence_index: spec for spec in specs}
     by_sequence: dict[int, dict[str, Any]] = {}
@@ -1189,7 +1222,10 @@ async def execute_v3_prose_plan(
             )
             if (
                 divergence_stop_is_authorized
-                and _scene_hits_divergence_stop_threshold(state)
+                and _scene_hits_divergence_stop_threshold(
+                    state,
+                    factor=acceptance_divergence_stop_factor,
+                )
             ):
                 state["status"] = "paused"
                 state["pause_reason"] = "prose_scene_divergence_stopped"

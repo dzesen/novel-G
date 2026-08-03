@@ -506,6 +506,7 @@ async def execute_prose_plan(
     manual_continuation: bool = False,
     stop_after_scene_index: int | None = None,
     acceptance_continuation_seam_window_characters_override: int | None = None,
+    acceptance_scene_divergence_stop_factor_override: float | None = None,
     on_delta: DeltaCallback | None = None,
     on_segment: SegmentCallback | None = None,
     on_scene_progress: Callable[
@@ -544,10 +545,18 @@ async def execute_prose_plan(
             v3_kwargs["acceptance_continuation_seam_window_characters_override"] = (
                 acceptance_continuation_seam_window_characters_override
             )
+        if acceptance_scene_divergence_stop_factor_override is not None:
+            v3_kwargs["acceptance_scene_divergence_stop_factor_override"] = (
+                acceptance_scene_divergence_stop_factor_override
+            )
         return await execute_v3_prose_plan(**v3_kwargs)
     if acceptance_continuation_seam_window_characters_override is not None:
         raise ValueError(
             "acceptance continuation seam override only supports v3 prose plans"
+        )
+    if acceptance_scene_divergence_stop_factor_override is not None:
+        raise ValueError(
+            "acceptance divergence stop override only supports v3 prose plans"
         )
     return await _execute_legacy_prose_plan(
         plan=plan,
