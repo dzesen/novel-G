@@ -528,11 +528,16 @@ def _scene_prompt(
     prior_text: str,
     prompt_mode: str,
     continues_truncated_output: bool = False,
+    acceptance_continuation_seam_window_characters_override: int | None = None,
 ) -> str:
     scenes = list((outline or {}).get("scenes") or [])
     current_scene = scenes[scene_index] if scene_index < len(scenes) else {}
-    seam_window = scene_continuation_seam_window_characters(
-        _scene_target_words(plan, scene_index)
+    seam_window = (
+        int(acceptance_continuation_seam_window_characters_override)
+        if acceptance_continuation_seam_window_characters_override is not None
+        else scene_continuation_seam_window_characters(
+            _scene_target_words(plan, scene_index)
+        )
     )
     tail = str(prior_text or "")[-seam_window:] or "（无）"
     mode_instructions = {
@@ -703,6 +708,7 @@ async def execute_v3_prose_plan(
     confirm_uncertain_retry: bool = False,
     manual_continuation: bool = False,
     stop_after_scene_index: int | None = None,
+    acceptance_continuation_seam_window_characters_override: int | None = None,
     on_delta: DeltaCallback | None = None,
     on_segment: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     on_scene_progress: SceneProgressCallback | None = None,
@@ -713,6 +719,23 @@ async def execute_v3_prose_plan(
         0 <= int(stop_after_scene_index) < plan.scene_count
     ):
         raise ValueError("stop_after_scene_index must name a planned scene")
+    if acceptance_continuation_seam_window_characters_override is not None:
+        if (
+            isinstance(
+                acceptance_continuation_seam_window_characters_override,
+                bool,
+            )
+            or not isinstance(
+                acceptance_continuation_seam_window_characters_override,
+                int,
+            )
+        ):
+            raise ValueError("acceptance continuation seam override must be positive")
+        acceptance_seam_window = acceptance_continuation_seam_window_characters_override
+        if acceptance_seam_window <= 0:
+            raise ValueError("acceptance continuation seam override must be positive")
+    else:
+        acceptance_seam_window = None
     specs = _call_specs(plan)
     base_by_sequence = {spec.sequence_index: spec for spec in specs}
     by_sequence: dict[int, dict[str, Any]] = {}
@@ -837,6 +860,9 @@ async def execute_v3_prose_plan(
             prior_text=current_text,
             prompt_mode=prompt_mode,
             continues_truncated_output=continues_truncated_output,
+            acceptance_continuation_seam_window_characters_override=(
+                acceptance_seam_window
+            ),
         )
         call_kwargs = dict(gen_kwargs or {})
         call_kwargs["max_tokens"] = v3_output_token_bound(

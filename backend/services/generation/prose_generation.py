@@ -505,6 +505,7 @@ async def execute_prose_plan(
     confirm_uncertain_retry: bool = False,
     manual_continuation: bool = False,
     stop_after_scene_index: int | None = None,
+    acceptance_continuation_seam_window_characters_override: int | None = None,
     on_delta: DeltaCallback | None = None,
     on_segment: SegmentCallback | None = None,
     on_scene_progress: Callable[
@@ -519,25 +520,34 @@ async def execute_prose_plan(
             execute_v3_prose_plan,
         )
 
-        return await execute_v3_prose_plan(
-            plan=plan,
-            outline=outline,
-            base_prompt=base_prompt,
-            stream_call=stream_call,
-            finish_reason_reader=finish_reason_reader,
-            usage_reader=usage_reader,
-            outline_revision=outline_revision,
-            raw_finish_reason_reader=raw_finish_reason_reader,
-            gen_kwargs=gen_kwargs,
-            existing_segments=existing_segments,
-            existing_scene_progress=existing_scene_progress,
-            continuation_policy=continuation_policy,
-            confirm_uncertain_retry=confirm_uncertain_retry,
-            manual_continuation=manual_continuation,
-            stop_after_scene_index=stop_after_scene_index,
-            on_delta=on_delta,
-            on_segment=on_segment,
-            on_scene_progress=on_scene_progress,
+        v3_kwargs = {
+            "plan": plan,
+            "outline": outline,
+            "base_prompt": base_prompt,
+            "stream_call": stream_call,
+            "finish_reason_reader": finish_reason_reader,
+            "usage_reader": usage_reader,
+            "outline_revision": outline_revision,
+            "raw_finish_reason_reader": raw_finish_reason_reader,
+            "gen_kwargs": gen_kwargs,
+            "existing_segments": existing_segments,
+            "existing_scene_progress": existing_scene_progress,
+            "continuation_policy": continuation_policy,
+            "confirm_uncertain_retry": confirm_uncertain_retry,
+            "manual_continuation": manual_continuation,
+            "stop_after_scene_index": stop_after_scene_index,
+            "on_delta": on_delta,
+            "on_segment": on_segment,
+            "on_scene_progress": on_scene_progress,
+        }
+        if acceptance_continuation_seam_window_characters_override is not None:
+            v3_kwargs["acceptance_continuation_seam_window_characters_override"] = (
+                acceptance_continuation_seam_window_characters_override
+            )
+        return await execute_v3_prose_plan(**v3_kwargs)
+    if acceptance_continuation_seam_window_characters_override is not None:
+        raise ValueError(
+            "acceptance continuation seam override only supports v3 prose plans"
         )
     return await _execute_legacy_prose_plan(
         plan=plan,
