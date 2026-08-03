@@ -23,6 +23,7 @@ import { ContextNotices, Notice } from "../outline/outlineUi";
 import { countChapterWords } from "../chapterUtils";
 import {
   buildProseAcceptPayload,
+  finishReasonTranslationKey,
   proseReasonTranslationKey,
   proseRequiresPartialAcknowledgement,
 } from "./prosePresentation";
@@ -635,7 +636,13 @@ export default function ProsePanel({
                   total: stream.completion.scene_count,
                 })}
               </span>
-              <span>{t("completionFinish", { reason: stream.completion.finish_reason })}</span>
+              <span>
+                {t("completionFinish", {
+                  reason: t(`reasons.${finishReasonTranslationKey(
+                    stream.completion.finish_reason,
+                  )}`),
+                })}
+              </span>
             </div>
           )}
 

@@ -7,6 +7,7 @@ import type {
   GenerationDiagnostic,
   GenerationDiagnosticsSummary,
 } from "./batchTypes";
+import { finishReasonTranslationKey } from "../prose/prosePresentation";
 
 function useDiagnosticCopy() {
   const t = useTranslations("writing.batch");
@@ -148,8 +149,7 @@ export function DiagnosticEventSummary({
       {(finishReason || rawFinishReason) && (
         <p className="break-words text-xs leading-5 text-muted">
           {t("diagnosticsFinishReason", {
-            normalized: finishReason || t("readinessUnknown"),
-            raw: rawFinishReason || t("readinessUnknown"),
+            reason: t(finishReasonTranslationKey(finishReason || rawFinishReason)),
           })}
         </p>
       )}

@@ -319,8 +319,11 @@ export default function GenerationRunsWorkspace({
   const [abortArmed, setAbortArmed] = useState<string | null>(null);
 
   const pauseReasonLabel = (reasonCode: string) => {
+    if (reasonCode === "incomplete_scene") {
+      return tBatch("reasonIncompleteScene");
+    }
     const key = proseReasonTranslationKey(reasonCode);
-    return key ? tProse(`reasons.${key}`) : reasonCode;
+    return key ? tProse(`reasons.${key}`) : tProse("reasons.unreported");
   };
 
   const load = useCallback(async (initial = false) => {
@@ -754,7 +757,11 @@ export default function GenerationRunsWorkspace({
                   </div>
                   <div className="min-w-0 rounded-md border border-border bg-surface p-3">
                     <dt className="text-muted">{t("detailPause")}</dt>
-                    <dd className="mt-1 break-words text-foreground">{selectedJob.pause_reason ?? t("none")}</dd>
+                    <dd className="mt-1 break-words text-foreground">
+                      {selectedJob.pause_reason
+                        ? pauseReasonLabel(selectedJob.pause_reason)
+                        : t("none")}
+                    </dd>
                   </div>
                   <div className="min-w-0 rounded-md border border-border bg-surface p-3">
                     <dt className="text-muted">{t("detailCurrentChapter")}</dt>

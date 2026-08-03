@@ -32,6 +32,38 @@ const PROSE_REASON_KEYS = {
   completion_contract_failed: "completionContractFailed",
 } as const;
 
+const FINISH_REASON_KEYS = {
+  stop: "finishReasonStop",
+  end_turn: "finishReasonStop",
+  stop_sequence: "finishReasonStop",
+  complete: "finishReasonStop",
+  completed: "finishReasonStop",
+  length: "finishReasonLength",
+  max_tokens: "finishReasonLength",
+  max_token: "finishReasonLength",
+  max_output_tokens: "finishReasonLength",
+  token_limit: "finishReasonLength",
+  content_filter: "finishReasonContentFilter",
+  safety: "finishReasonContentFilter",
+  recitation: "finishReasonContentFilter",
+  prohibited_content: "finishReasonContentFilter",
+  blocklist: "finishReasonContentFilter",
+  spii: "finishReasonContentFilter",
+  tool_call: "finishReasonToolCall",
+  tool_calls: "finishReasonToolCall",
+  tool_use: "finishReasonToolCall",
+  function_call: "finishReasonToolCall",
+  cancelled: "finishReasonCancelled",
+  canceled: "finishReasonCancelled",
+  abort: "finishReasonCancelled",
+  aborted: "finishReasonCancelled",
+  error: "finishReasonError",
+  failed: "finishReasonError",
+  failure: "finishReasonError",
+  budget: "finishReasonBudget",
+  unreported: "finishReasonUnreported",
+} as const;
+
 export type ProseReasonTranslationKey =
   (typeof PROSE_REASON_KEYS)[keyof typeof PROSE_REASON_KEYS];
 
@@ -41,6 +73,26 @@ export function proseReasonTranslationKey(
   return PROSE_REASON_KEYS[
     reasonCode as keyof typeof PROSE_REASON_KEYS
   ] ?? null;
+}
+
+export type FinishReasonTranslationKey =
+  | (typeof FINISH_REASON_KEYS)[keyof typeof FINISH_REASON_KEYS]
+  | "finishReasonUnknown";
+
+/**
+ * Provider finish values are useful telemetry, but raw values are not useful
+ * instructions for a writer. Keep the display vocabulary bounded and friendly.
+ */
+export function finishReasonTranslationKey(
+  reasonCode: string,
+): FinishReasonTranslationKey {
+  const normalizedReason = reasonCode
+    .trim()
+    .toLowerCase()
+    .replace(/[-\s]+/g, "_");
+  return FINISH_REASON_KEYS[
+    normalizedReason as keyof typeof FINISH_REASON_KEYS
+  ] ?? "finishReasonUnknown";
 }
 
 interface AcceptPayloadInput {
