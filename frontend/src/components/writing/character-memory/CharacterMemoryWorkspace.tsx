@@ -151,7 +151,7 @@ export default function CharacterMemoryWorkspace({
         const draft = stateDraft[s.card_id] ?? { current_state: s.current_state, as_of: s.as_of_chapter_id ?? "" };
         return (
           <section key={s._id} className="rounded-lg border border-border bg-surface p-4">
-            <h3 className="mb-2 font-medium text-foreground">{names[s.card_id] ?? `${t("unknownCharacter")} (${s.card_id})`}</h3>
+            <h3 className="mb-2 font-medium text-foreground">{names[s.card_id] ?? t("unknownCharacter")}</h3>
 
             <div className="mb-3 flex flex-col gap-2">
               <label className="text-sm text-muted">{t("currentState")}</label>

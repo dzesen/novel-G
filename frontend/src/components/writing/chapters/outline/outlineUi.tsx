@@ -2,7 +2,17 @@
 
 import type { ReactNode } from "react";
 import { useTranslations } from "next-intl";
-import type { ContextReport } from "./outlineTypes";
+import {
+  contextCountsForDisplay,
+  contextSectionKind,
+  referenceCleanupForDisplay,
+  referenceRemapForDisplay,
+} from "../../generationMetadataPresentation";
+import type {
+  ContextReport,
+  DroppedIds,
+  RemappedReference,
+} from "./outlineTypes";
 
 export function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -36,26 +46,116 @@ export function Notice({
  * "这段是完整的"——那正是阶段 1 整分支评审在 minor_cards 上抓到的假象。
  */
 export function ContextNotices({ report }: { report: ContextReport | null }) {
-  const t = useTranslations("writing.outline");
+  const t = useTranslations("writing.generationMetadata");
   if (!report) return null;
 
-  const droppedEntries = Object.entries(report.dropped_item_counts);
+  const truncatedSections = Array.from(new Set(
+    report.truncated_sections.map(contextSectionKind),
+  ));
+  const droppedEntries = Object.entries(
+    contextCountsForDisplay(report.dropped_item_counts),
+  );
 
   return (
     <>
-      {report.truncated_sections.length > 0 && (
+      {truncatedSections.length > 0 && (
         <Notice tone="warning">
-          {t("truncationWarning", { sections: report.truncated_sections.join("、") })}
+          {t("contextTruncated", {
+            step: t("steps.job"),
+            sections: truncatedSections
+              .map((section) => t(`contextSections.${section}`))
+              .join(t("listSeparator")),
+          })}
         </Notice>
       )}
       {droppedEntries.length > 0 && (
         <Notice tone="warning">
-          {t("droppedItems", {
-            detail: droppedEntries.map(([section, count]) => `${section} ${count}`).join("、"),
+          {t("contextReduced", {
+            step: t("steps.job"),
+            detail: droppedEntries
+              .map(([section, count]) => t("contextItemCount", {
+                section: t(`contextSections.${section}`),
+                count,
+              }))
+              .join(t("listSeparator")),
           })}
         </Notice>
       )}
     </>
+  );
+}
+
+export function ReferenceCleanupNotice({
+  droppedIds,
+}: {
+  droppedIds: DroppedIds | null;
+}) {
+  const t = useTranslations("writing.generationMetadata");
+  const groups = referenceCleanupForDisplay(droppedIds);
+  if (groups.length === 0) return null;
+  return (
+    <Notice tone="warning">
+      <div className="grid gap-1.5">
+        <p>{t("referenceCleanupIntro")}</p>
+        {groups.map((group) => (
+          <div key={group.kind}>
+            <span className="font-medium">
+              {t("referenceCleanupCount", {
+                count: group.count,
+                kind: t(`referenceKinds.${group.kind}`),
+              })}
+            </span>
+            <span className="ml-1">
+              {group.readableValues.length > 0
+                ? t("referenceCleanupNames", {
+                    names: group.readableValues.join(t("listSeparator")),
+                  })
+                : t("referenceCleanupOpaque")}
+            </span>
+          </div>
+        ))}
+      </div>
+    </Notice>
+  );
+}
+
+export function ReferenceRemapNotice({
+  remappedReferences,
+  nameById,
+}: {
+  remappedReferences: RemappedReference[];
+  nameById?: Record<string, string>;
+}) {
+  const t = useTranslations("writing.generationMetadata");
+  if (remappedReferences.length === 0) return null;
+  return (
+    <Notice tone="info">
+      <div className="grid gap-1">
+        <p>{t("referenceRemapIntro", { count: remappedReferences.length })}</p>
+        {remappedReferences.map((item, index) => {
+          const display = referenceRemapForDisplay(item, nameById);
+          const method = t(`matchMethods.${display.matchedBy}`);
+          const kind = t(`referenceKinds.${display.kind}`);
+          return (
+            <div key={`${display.source ?? "reference"}-${index}`}>
+              {display.source
+                ? display.targetName
+                  ? t("referenceRemapNamed", {
+                      source: display.source,
+                      method,
+                      target: display.targetName,
+                    })
+                  : t("referenceRemapWithoutTarget", {
+                      source: display.source,
+                      method,
+                      kind,
+                    })
+                : t("referenceRemapGeneric", { method, kind })}
+            </div>
+          );
+        })}
+      </div>
+    </Notice>
   );
 }
 
@@ -125,6 +225,7 @@ export function ReadOnlyIds({
   ids: string[];
   nameById: Record<string, string>;
 }) {
+  const t = useTranslations("writing.generationMetadata");
   if (ids.length === 0) return null;
   return (
     <div className="grid gap-1">
@@ -132,7 +233,7 @@ export function ReadOnlyIds({
       <dd className="flex flex-wrap gap-1.5">
         {ids.map((id) => (
           <span key={id} className="rounded-md border border-border px-2 py-0.5 text-xs text-foreground">
-            {nameById[id] ?? id}
+            {nameById[id] ?? t("unavailableReference")}
           </span>
         ))}
       </dd>

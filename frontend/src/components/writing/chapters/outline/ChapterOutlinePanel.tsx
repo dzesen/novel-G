@@ -12,7 +12,15 @@ import OutlineGenerationParams, {
   type GenerationParams,
 } from "./OutlineGenerationParams";
 import OutlineFieldsEditor from "./OutlineFieldsEditor";
-import { ContextNotices, Field, Notice, ReadOnlyIds, RowEditor } from "./outlineUi";
+import {
+  ContextNotices,
+  Field,
+  Notice,
+  ReadOnlyIds,
+  ReferenceCleanupNotice,
+  ReferenceRemapNotice,
+  RowEditor,
+} from "./outlineUi";
 import type {
   AcceptChapterOutlineResponse,
   ChapterOutlineEditPayload,
@@ -305,31 +313,18 @@ export default function ChapterOutlinePanel({
           )}
 
           <ContextNotices report={stream.contextReport} />
-          {stream.remappedReferences.length > 0 && (
-            <Notice tone="info">
-              {t("remappedIdsNotice", {
-                count: stream.remappedReferences.length,
-                detail: stream.remappedReferences
-                  .map((item) => `${item.from} → ${item.to} (${item.matched_by})`)
-                  .join("、"),
-              })}
-            </Notice>
-          )}
-          {stream.droppedIds && Object.keys(stream.droppedIds).length > 0 && (
-            <Notice tone="warning">
-              {t("droppedIdsWarning", {
-                count: Object.values(stream.droppedIds).reduce((sum, ids) => sum + ids.length, 0),
-                detail: Object.entries(stream.droppedIds)
-                  .map(([field, ids]) => `${field}: ${ids.join(", ")}`)
-                  .join("；"),
-              })}
-            </Notice>
-          )}
+          <ReferenceRemapNotice
+            remappedReferences={stream.remappedReferences}
+            nameById={roster.nameById}
+          />
+          <ReferenceCleanupNotice droppedIds={stream.droppedIds} />
           {orphanThreadIds.length > 0 && (
             <Notice tone="warning">
               {t("orphanThreadsNotice", {
                 count: orphanThreadIds.length,
-                names: orphanThreadIds.map((id) => roster.nameById[id] ?? id).join("、"),
+                names: orphanThreadIds
+                  .map((id) => roster.nameById[id] ?? t("unknownThreadReference"))
+                  .join("、"),
               })}
             </Notice>
           )}

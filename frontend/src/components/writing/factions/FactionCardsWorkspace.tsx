@@ -934,13 +934,14 @@ function RelationRow({
   relation: FactionRelation;
   relationTypeLabels: Record<FactionRelationType, string>;
 }) {
+  const t = useTranslations("writing.factions");
   return (
     <article className="rounded-md border border-border bg-surface p-4">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0 text-sm font-semibold text-foreground">
-          <span>{relation.source_faction_name ?? relation.source_faction_id}</span>
+          <span>{relation.source_faction_name ?? t("unknownFaction")}</span>
           <span className="mx-2 text-muted">→</span>
-          <span>{relation.target_faction_name ?? relation.target_faction_id}</span>
+          <span>{relation.target_faction_name ?? t("unknownFaction")}</span>
         </div>
         <span className="rounded-md bg-surface-secondary px-2 py-1 text-xs text-muted">
           {relationTypeLabels[relation.relation_type]}

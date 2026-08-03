@@ -203,7 +203,7 @@ export default function StartJobDialog({
       default:
         return {
           title: t("readinessIssueUnknownTitle"),
-          body: t("readinessIssueUnknownBody", { code: issue.code }),
+          body: t("readinessIssueUnknownBody"),
         };
     }
   };

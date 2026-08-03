@@ -17,6 +17,11 @@ import type {
   CharacterCardAvatarImportResult,
   ReferenceCardCurationResult,
 } from "@/types/novel";
+import {
+  referenceCardFieldKind,
+  referenceMatchKind,
+  worldBookBehaviorKind,
+} from "../generationMetadataPresentation";
 
 const MAX_FILES = 32;
 const PAGE_SIZE = 24;
@@ -1141,6 +1146,7 @@ function CandidateReview({
 }) {
   const t = useTranslations("writing.referenceCards.import");
   const tc = useTranslations("writing.referenceCards.curation");
+  const metadataT = useTranslations("writing.generationMetadata");
   const selectedConflict =
     decision.target_card_id &&
     candidate.conflicts.find(
@@ -1160,6 +1166,16 @@ function CandidateReview({
   );
   const participation =
     candidate.fields.interop?.writing_participation;
+  const unsupportedBehaviorCounts = Object.entries(
+    (preview?.unsupported_features ?? []).reduce<Record<string, number>>(
+      (counts, feature) => {
+        const kind = worldBookBehaviorKind(feature.category);
+        counts[kind] = (counts[kind] ?? 0) + 1;
+        return counts;
+      },
+      {},
+    ),
+  );
   return (
     <article className="rounded-xl border border-border bg-surface p-4 sm:p-5">
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_250px]">
@@ -1205,8 +1221,8 @@ function CandidateReview({
                 {conflict.is_deleted
                   ? tc("actions.restore_merge")
                   : tc("actions.merge")}{" "}
-                · {conflict.match_kind} ·{" "}
-                {conflict.target_card_id.slice(-6)}
+                · {conflict.target_card_name || metadataT("unavailableReference")}
+                · {metadataT(`matchMethods.${referenceMatchKind(conflict.match_kind)}`)}
               </option>
             ))}
             <option value="skip">{tc("actions.skip")}</option>
@@ -1234,7 +1250,11 @@ function CandidateReview({
             {participation.status === "not_participating"
               ? t("candidate.participation.notParticipatingHint")
               : t("candidate.participation.activeHint", {
-                  fields: participation.projected_fields.join(", "),
+                  fields: participation.projected_fields
+                    .map((field) => metadataT(
+                      `referenceCardFields.${referenceCardFieldKind(field)}`,
+                    ))
+                    .join(metadataT("listSeparator")),
                 })}
           </p>
         </div>
@@ -1248,22 +1268,18 @@ function CandidateReview({
           <p className="mt-1 text-xs leading-5 text-amber-800 dark:text-amber-200">
             {t("candidate.regexDetail")}
           </p>
-          <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-amber-900 dark:text-amber-100">
-            {regexPaths.map((path) => (
-              <li key={path} className="break-all">
-                {path}
-              </li>
-            ))}
-          </ul>
+          <p className="mt-2 text-xs text-amber-900 dark:text-amber-100">
+            {t("candidate.affectedItems", { count: regexPaths.length })}
+          </p>
         </div>
       )}
 
       {(preview?.unrecognized_fields?.length ?? 0) > 0 && (
-        <LabeledValues
-          className="mt-4"
-          label={t("candidate.unrecognizedFields")}
-          values={preview?.unrecognized_fields ?? []}
-        />
+        <div className="mt-4 rounded-md bg-surface-secondary px-3 py-2 text-xs text-muted">
+          {t("candidate.unrecognizedFieldCount", {
+            count: preview?.unrecognized_fields?.length ?? 0,
+          })}
+        </div>
       )}
 
       {(preview?.unsupported_features?.length ?? 0) > 0 && (
@@ -1272,13 +1288,15 @@ function CandidateReview({
             {t("candidate.unsupportedFeatures")}
           </p>
           <ul className="mt-2 flex flex-wrap gap-2">
-            {preview?.unsupported_features?.map((feature) => (
+            {unsupportedBehaviorCounts.map(([kind, count]) => (
               <li
-                key={`${feature.field}:${feature.category}`}
+                key={kind}
                 className="rounded-md bg-surface-secondary px-2 py-1 text-xs text-muted"
               >
-                {feature.field} · {feature.category} ·{" "}
-                {t("candidate.disabled")}
+                {metadataT(`worldBookBehaviors.${kind}`)} · {t(
+                  "candidate.itemCount",
+                  { count },
+                )} · {t("candidate.disabled")}
               </li>
             ))}
           </ul>
@@ -1307,11 +1325,8 @@ function CandidateReview({
                           ? t("candidate.notice.unsupported")
                           : notice.code === "unknown_position"
                             ? t("candidate.notice.unknownPosition")
-                            : t("candidate.notice.other", {
-                                code: notice.code,
-                              })}
+                            : t("candidate.notice.other")}
                 </span>
-                <span className="ml-2 break-all">{notice.path}</span>
               </li>
             ))}
           </ul>
@@ -1339,6 +1354,7 @@ function CandidateReview({
 
 function MappedFields({ candidate }: { candidate: CardImportCandidate }) {
   const t = useTranslations("writing.referenceCards.import");
+  const metadataT = useTranslations("writing.generationMetadata");
   const fields = Object.entries(candidate.fields).filter(
     ([key, value]) => key !== "interop" && !isBlank(value),
   );
@@ -1353,7 +1369,9 @@ function MappedFields({ candidate }: { candidate: CardImportCandidate }) {
             key={field}
             className="grid gap-1 py-2 first:pt-0 last:pb-0 sm:grid-cols-[180px_minmax(0,1fr)]"
           >
-            <dt className="break-all text-xs font-medium text-muted">{field}</dt>
+            <dt className="text-xs font-medium text-muted">
+              {metadataT(`referenceCardFields.${referenceCardFieldKind(field)}`)}
+            </dt>
             <dd className="min-w-0">
               <DiffValue value={value} />
             </dd>
@@ -1377,6 +1395,7 @@ function MergeDiff({
 }) {
   const t = useTranslations("writing.referenceCards.import");
   const tc = useTranslations("writing.referenceCards.curation");
+  const metadataT = useTranslations("writing.generationMetadata");
   const diffs = Object.entries(conflict.field_diffs);
   return (
     <section className="mt-4 rounded-lg border border-border bg-background p-3">
@@ -1387,8 +1406,8 @@ function MergeDiff({
           </p>
           <p className="mt-1 break-all text-sm font-medium text-foreground">
             {t("merge.target", {
-              match: conflict.match_kind,
-              id: conflict.target_card_id,
+              name: conflict.target_card_name || metadataT("unavailableReference"),
+              match: metadataT(`matchMethods.${referenceMatchKind(conflict.match_kind)}`),
             })}
           </p>
         </div>
@@ -1413,7 +1432,7 @@ function MergeDiff({
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="break-all text-xs font-semibold text-foreground">
-                    {field}
+                    {metadataT(`referenceCardFields.${referenceCardFieldKind(field)}`)}
                   </p>
                   {mergesAutomatically ? (
                     <span className="text-xs font-medium text-accent">

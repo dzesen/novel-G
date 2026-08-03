@@ -22,6 +22,9 @@ interface RosterPickerProps {
 export default function RosterPicker({ label, options, value, onChange, mode, emptyText }: RosterPickerProps) {
   const t = useTranslations("writing.outline");
   const selected = mode === "multi" ? (value as string[]) : value ? [value as string] : [];
+  const unavailableCount = selected.filter(
+    (id) => !options.some((option) => option.id === id),
+  ).length;
 
   const toggle = (id: string) => {
     if (mode === "single") {
@@ -58,12 +61,9 @@ export default function RosterPicker({ label, options, value, onChange, mode, em
           })}
         </div>
       )}
-      {selected.some((id) => !options.some((option) => option.id === id)) && (
+      {unavailableCount > 0 && (
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          {selected
-            .filter((id) => !options.some((option) => option.id === id))
-            .map((id) => t("unknownId", { id }))
-            .join("；")}
+          {t("unavailableReferences", { count: unavailableCount })}
         </p>
       )}
     </div>

@@ -7,12 +7,15 @@ import { buildChapterPresentation, outlineAdherenceForDisplay } from "./batchPre
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
 import { jobPauseReasonTranslationKey } from "./generationReasonPresentation";
+import { generationStepKind } from "../../generationMetadataPresentation";
 
 interface CheckpointReviewProps {
   job: GenerationJob;
   titleForChapter: (chapterId: string) => string;
   onJumpToChapter: (chapterId: string) => void;
   onNavigateToMemory: () => void;
+  onNavigateToReferenceCards: () => void;
+  onNavigateToPlotThreads: () => void;
   onResume: () => void;
   onRetryUncertain: () => void;
   onSkipUncertain: () => void;
@@ -24,6 +27,7 @@ interface CheckpointReviewProps {
 
 function Banner({ job }: { job: GenerationJob }) {
   const t = useTranslations("writing.batch");
+  const metadataT = useTranslations("writing.generationMetadata");
   const hasStructuredDiagnostic = Boolean(job.diagnostics?.length);
   if (job.status === "failed") {
     const e = job.error;
@@ -32,7 +36,9 @@ function Banner({ job }: { job: GenerationJob }) {
         <span className="font-medium">{t("failedTitle")}</span>
         {hasStructuredDiagnostic
           ? <span className="ml-1">{t("failedStructuredBody")}</span>
-          : e && <span className="ml-1">{t("failedBody", { step: e.step, message: e.message })}</span>}
+          : e && <span className="ml-1">{t("failedBody", {
+              step: metadataT(`steps.${generationStepKind(e.step)}`),
+            })}</span>}
       </div>
     );
   }
@@ -57,13 +63,11 @@ function Banner({ job }: { job: GenerationJob }) {
 
 function StepTags({ progress }: { progress: ChapterProgress }) {
   const t = useTranslations("writing.batch");
+  const metadataT = useTranslations("writing.generationMetadata");
   const { stepBadges } = buildChapterPresentation(progress);
-  const label = (s: string) =>
-    s === "outline" ? t("stepOutline")
-      : s === "prose" ? t("stepProse")
-        : s === "outline_adherence" ? t("stepOutlineAdherence")
-          : s === "state" ? t("stepState")
-            : s;
+  const label = (step: string) => metadataT(
+    `steps.${generationStepKind(step)}`,
+  );
   const statusLabel = (status: string) =>
     status === "reused" ? t("reusedTag")
       : status === "skipped" ? t("skippedTag")
@@ -95,13 +99,18 @@ function ChapterCard({
   title,
   onJump,
   onNavigateToMemory,
+  onNavigateToReferenceCards,
+  onNavigateToPlotThreads,
 }: {
   progress: ChapterProgress;
   title: string;
   onJump: () => void;
   onNavigateToMemory: () => void;
+  onNavigateToReferenceCards: () => void;
+  onNavigateToPlotThreads: () => void;
 }) {
   const t = useTranslations("writing.batch");
+  const metadataT = useTranslations("writing.generationMetadata");
   const hasConflict = progress.consistency_issues.length > 0;
   const adherence = outlineAdherenceForDisplay(progress.outline_adherence);
   const hasOutlineDeviation = adherence?.verdict === "fail";
@@ -192,13 +201,23 @@ function ChapterCard({
           {presentation.contextNotices.map((notice, i) => (
             <div key={i}>
               {notice.truncatedSections.length > 0 && (
-                <div>{t("truncationSections", { step: notice.step ?? "-", sections: notice.truncatedSections.join("、") })}</div>
+                <div>{metadataT("contextTruncated", {
+                  step: metadataT(`steps.${notice.step}`),
+                  sections: notice.truncatedSections
+                    .map((section) => metadataT(`contextSections.${section}`))
+                    .join(metadataT("listSeparator")),
+                })}</div>
               )}
               {Object.keys(notice.droppedItemCounts).length > 0 && (
                 <div>
-                  {t("truncationDropped", {
-                    step: notice.step ?? "-",
-                    detail: Object.entries(notice.droppedItemCounts).map(([k, v]) => `${k} ${v}`).join("、"),
+                  {metadataT("contextReduced", {
+                    step: metadataT(`steps.${notice.step}`),
+                    detail: Object.entries(notice.droppedItemCounts)
+                      .map(([section, count]) => metadataT("contextItemCount", {
+                        section: metadataT(`contextSections.${section}`),
+                        count,
+                      }))
+                      .join(metadataT("listSeparator")),
                   })}
                 </div>
               )}
@@ -211,18 +230,39 @@ function ChapterCard({
         <div className="mt-2 grid gap-1.5 rounded-md border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
           <span className="font-semibold">{t("referenceCleanupTitle")}</span>
           {presentation.referenceNotices.map((notice, i) => (
-            <div key={`${notice.field}-${i}`}>
-              {t("referenceCleanupDetail", {
-                step: notice.step ?? "-",
-                field: notice.field,
-                values: notice.values.join("、"),
-              })}
+            <div key={`${notice.kind}-${i}`}>
+              <span className="font-medium">
+                {metadataT("referenceCleanupCount", {
+                  count: notice.count,
+                  kind: metadataT(`referenceKinds.${notice.kind}`),
+                })}
+              </span>
+              <span className="ml-1">
+                {notice.readableValues.length > 0
+                  ? metadataT("referenceCleanupNames", {
+                      names: notice.readableValues.join(metadataT("listSeparator")),
+                    })
+                  : metadataT("referenceCleanupOpaque")}
+              </span>
             </div>
           ))}
           <div>{t("referenceCleanupImpact")}</div>
-          <button type="button" onClick={onNavigateToMemory} className="justify-self-start font-medium text-accent hover:underline">
-            {t("referenceCleanupAction")}
-          </button>
+          <div className="flex flex-wrap gap-x-4 gap-y-1">
+            {presentation.referenceNotices.some(
+              (notice) => notice.actionTarget === "reference_cards",
+            ) && (
+              <button type="button" onClick={onNavigateToReferenceCards} className="font-medium text-accent hover:underline">
+                {t("referenceCleanupOpenCards")}
+              </button>
+            )}
+            {presentation.referenceNotices.some(
+              (notice) => notice.actionTarget === "plot_threads",
+            ) && (
+              <button type="button" onClick={onNavigateToPlotThreads} className="font-medium text-accent hover:underline">
+                {t("referenceCleanupOpenThreads")}
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -230,14 +270,17 @@ function ChapterCard({
         <div className="mt-2 grid gap-1.5 rounded-md border border-blue-200 bg-blue-50 p-2 text-[11px] text-blue-800 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-200">
           <span className="font-semibold">{t("referenceRemapTitle")}</span>
           {presentation.referenceRemapNotices.map((notice, i) => (
-            <div key={`${notice.field}-${notice.from}-${i}`}>
-              {t("referenceRemapDetail", {
-                step: notice.step ?? "-",
-                field: notice.field,
-                from: notice.from,
-                to: notice.to,
-                matchedBy: notice.matchedBy,
-              })}
+            <div key={`${notice.kind}-${notice.source ?? "reference"}-${i}`}>
+              {notice.source
+                ? metadataT("referenceRemapWithoutTarget", {
+                    source: notice.source,
+                    method: metadataT(`matchMethods.${notice.matchedBy}`),
+                    kind: metadataT(`referenceKinds.${notice.kind}`),
+                  })
+                : metadataT("referenceRemapGeneric", {
+                    method: metadataT(`matchMethods.${notice.matchedBy}`),
+                    kind: metadataT(`referenceKinds.${notice.kind}`),
+                  })}
             </div>
           ))}
           <div>{t("referenceRemapImpact")}</div>
@@ -252,6 +295,8 @@ export default function CheckpointReview({
   titleForChapter,
   onJumpToChapter,
   onNavigateToMemory,
+  onNavigateToReferenceCards,
+  onNavigateToPlotThreads,
   onResume,
   onRetryUncertain,
   onSkipUncertain,
@@ -366,6 +411,8 @@ export default function CheckpointReview({
               title={titleForChapter(p.chapter_id)}
               onJump={() => onJumpToChapter(p.chapter_id)}
               onNavigateToMemory={onNavigateToMemory}
+              onNavigateToReferenceCards={onNavigateToReferenceCards}
+              onNavigateToPlotThreads={onNavigateToPlotThreads}
             />
           ))}
         </div>

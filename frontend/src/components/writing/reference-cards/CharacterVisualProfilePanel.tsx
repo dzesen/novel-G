@@ -537,11 +537,8 @@ export default function CharacterVisualProfilePanel({
                             </div>
                           )}
                         </div>
-                        <p
-                          className="mt-2 truncate font-mono text-[0.6875rem] text-muted"
-                          title={reference.asset_id}
-                        >
-                          {reference.asset_id}
+                        <p className="mt-2 truncate text-[0.6875rem] text-muted">
+                          {t("referenceLabel", { index: index + 1 })}
                         </p>
                         <button
                           type="button"

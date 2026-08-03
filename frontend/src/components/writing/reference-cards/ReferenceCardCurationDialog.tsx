@@ -17,6 +17,7 @@ import type {
   ReferenceCardCurationResult,
   ReferenceCardType,
 } from "@/types/novel";
+import { referenceCardFieldKind } from "../generationMetadataPresentation";
 
 const GROUPS = ["characters", "locations", "items", "rules", "lores"] as const;
 type CandidateGroup = (typeof GROUPS)[number];
@@ -112,6 +113,7 @@ export default function ReferenceCardCurationDialog({
   onApplied,
 }: ReferenceCardCurationDialogProps) {
   const t = useTranslations("writing.referenceCards.curation");
+  const metadataT = useTranslations("writing.generationMetadata");
   const [proposal, setProposal] = useState<ReferenceCardCurationProposal | null>(null);
   const [decisions, setDecisions] = useState<Record<string, DecisionDraft>>({});
   const [activeGroup, setActiveGroup] = useState<CandidateGroup>("characters");
@@ -660,7 +662,9 @@ export default function ReferenceCardCurationDialog({
                                         />
                                         <span className="min-w-0 text-xs leading-5">
                                           <span className="font-medium text-foreground">
-                                            {conflict.field}
+                                            {metadataT(
+                                              `referenceCardFields.${referenceCardFieldKind(conflict.field)}`,
+                                            )}
                                           </span>
                                           <span className="block text-muted">
                                             {t("keepExisting")}: {unknownValue(conflict.existing)}

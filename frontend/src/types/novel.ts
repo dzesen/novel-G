@@ -191,6 +191,7 @@ export interface CardImportCreationSelection
 
 export interface CardImportConflict {
   target_card_id: string;
+  target_card_name?: string;
   match_kind: string;
   is_deleted: boolean;
   field_diffs: Record<

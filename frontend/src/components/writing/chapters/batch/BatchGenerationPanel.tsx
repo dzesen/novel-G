@@ -31,6 +31,7 @@ interface BatchGenerationPanelProps {
   onQuietRefresh: () => void;
   onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
+  onNavigateToPlotThreads: () => void;
   proseRunsRevision: number;
   onOpenProseRun: (run: LeftoverProseRun) => void;
   onStartFreshProse: (chapterId: string) => void;
@@ -48,6 +49,7 @@ export default function BatchGenerationPanel({
   onQuietRefresh,
   onNavigateToMemory,
   onNavigateToReferenceCards,
+  onNavigateToPlotThreads,
   proseRunsRevision,
   onOpenProseRun,
   onStartFreshProse,
@@ -279,6 +281,8 @@ export default function BatchGenerationPanel({
             titleForChapter={titleForChapter}
             onJumpToChapter={onJumpToChapter}
             onNavigateToMemory={onNavigateToMemory}
+            onNavigateToReferenceCards={onNavigateToReferenceCards}
+            onNavigateToPlotThreads={onNavigateToPlotThreads}
             onResume={requestResume}
             onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
             onSkipUncertain={() => void control("resume", { skip_uncertain: true })}

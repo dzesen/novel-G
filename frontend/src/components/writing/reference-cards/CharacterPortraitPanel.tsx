@@ -172,9 +172,6 @@ export default function CharacterPortraitPanel({
     completedAnchor ?? state?.anchor ?? null;
   const asset: CharacterPortraitAsset | null =
     completedAsset ?? state?.asset ?? null;
-  const anchorHashLabel = anchor
-    ? `${anchor.reference_asset.slice(0, 12)}…`
-    : "";
   const anchorEstablishedAt = useMemo(() => {
     if (!anchor) return "";
     const parsed = new Date(anchor.established_at);
@@ -257,9 +254,7 @@ export default function CharacterPortraitPanel({
     const resetting = Boolean(anchor);
     if (
       resetting &&
-      !window.confirm(
-        t("resetWarning", { asset: anchorHashLabel }),
-      )
+      !window.confirm(t("resetWarning"))
     ) return;
 
     setSubmitting(true);
@@ -483,11 +478,8 @@ export default function CharacterPortraitPanel({
               <dl className="mt-3 min-w-0 space-y-2 border-t border-accent/15 pt-3 text-xs">
                 <div className="min-w-0">
                   <dt className="text-muted">{t("anchorAsset")}</dt>
-                  <dd
-                    className="mt-0.5 truncate font-mono text-foreground"
-                    title={anchor.reference_asset}
-                  >
-                    {anchorHashLabel}
+                  <dd className="mt-0.5 truncate text-foreground">
+                    {t("anchorAssetValue")}
                   </dd>
                 </div>
                 <div className="min-w-0">
@@ -536,7 +528,6 @@ export default function CharacterPortraitPanel({
                       <li
                         key={dependency.job_id}
                         className="min-w-0 break-words"
-                        title={dependency.chapter_id}
                       >
                         {dependency.chapter_order !== null &&
                         dependency.chapter_title
@@ -548,9 +539,7 @@ export default function CharacterPortraitPanel({
                             ? t("dependencyTitle", {
                                 title: dependency.chapter_title,
                               })
-                            : t("dependencyId", {
-                                id: dependency.chapter_id,
-                              })}
+                            : t("dependencyUnavailable")}
                       </li>
                     ))}
                   </ul>

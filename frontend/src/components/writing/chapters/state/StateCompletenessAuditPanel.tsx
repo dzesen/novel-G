@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { apiGet } from "@/lib/api";
+import { referenceCleanupForDisplay } from "../../generationMetadataPresentation";
 import {
   auditCategoryTone,
   buildStateAuditQuery,
@@ -62,6 +63,7 @@ export default function StateCompletenessAuditPanel({
   onLocate,
 }: StateCompletenessAuditPanelProps) {
   const t = useTranslations("stateAudit");
+  const metadataT = useTranslations("writing.generationMetadata");
   const [scope, setScope] = useState<"book" | "volume">(
     selectedVolumeId ? "volume" : "book",
   );
@@ -227,9 +229,9 @@ export default function StateCompletenessAuditPanel({
             <div className="grid gap-2">
               {visible.map((chapter) => {
                 const tone = auditCategoryTone(chapter.category);
-                const dropped = Object.values(
-                  chapter.completion.reference_resolution?.dropped ?? {},
-                ).flat();
+                const dropped = referenceCleanupForDisplay(
+                  chapter.completion.reference_resolution?.dropped,
+                );
                 return (
                   <article
                     key={chapter.chapter_id}
@@ -248,7 +250,15 @@ export default function StateCompletenessAuditPanel({
                         </span>
                         {dropped.length > 0 && (
                           <span className="max-w-full truncate text-[11px] text-muted">
-                            {t("droppedReferences", { values: dropped.join(", ") })}
+                            {t("droppedReferences", {
+                              summary: dropped.map((group) => metadataT(
+                                "referenceCleanupCount",
+                                {
+                                  count: group.count,
+                                  kind: metadataT(`referenceKinds.${group.kind}`),
+                                },
+                              )).join(metadataT("listSeparator")),
+                            })}
                           </span>
                         )}
                       </div>

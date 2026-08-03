@@ -6,6 +6,18 @@ import type {
   StepOutcome,
   StepOutcomeStatus,
 } from "./batchTypes.ts";
+import {
+  contextCountsForDisplay,
+  contextSectionKind,
+  generationStepKind,
+  referenceCleanupForDisplay,
+  referenceRemapForDisplay,
+  type ContextSectionKind,
+  type GenerationStepKind,
+  type ReferenceCleanupPresentation,
+  type ReferenceRemapPresentation,
+// @ts-expect-error Node's strip-types test runner requires the source extension.
+} from "../../generationMetadataPresentation.ts";
 
 export interface StepBadge {
   step: string;
@@ -14,31 +26,15 @@ export interface StepBadge {
 }
 
 export interface ContextNoticePresentation {
-  step: string | null;
-  truncatedSections: string[];
-  droppedItemCounts: Record<string, number>;
-}
-
-export interface ReferenceNoticePresentation {
-  step?: string | null;
-  field: string;
-  values: string[];
-  impact: string;
-  actionCodes: string[];
-}
-
-export interface ReferenceRemapPresentation {
-  step: string | null;
-  field: string;
-  from: string;
-  to: string;
-  matchedBy: string;
+  step: GenerationStepKind;
+  truncatedSections: ContextSectionKind[];
+  droppedItemCounts: Partial<Record<ContextSectionKind, number>>;
 }
 
 export interface ChapterPresentation {
   stepBadges: StepBadge[];
   contextNotices: ContextNoticePresentation[];
-  referenceNotices: ReferenceNoticePresentation[];
+  referenceNotices: ReferenceCleanupPresentation[];
   referenceRemapNotices: ReferenceRemapPresentation[];
 }
 
@@ -134,22 +130,17 @@ function legacyStepBadges(progress: ChapterProgress): StepBadge[] {
   ];
 }
 
-function noticeFields(notice: GenerationNotice): ReferenceNoticePresentation[] {
+function noticeFields(notice: GenerationNotice): ReferenceCleanupPresentation[] {
   const rawFields = notice.details.fields;
   if (!Array.isArray(rawFields)) return [];
-  return rawFields.flatMap((raw) => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const dropped: Record<string, unknown> = {};
+  for (const raw of rawFields) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
     const field = String((raw as Record<string, unknown>).field ?? "");
     const values = asStrings((raw as Record<string, unknown>).values);
-    if (!field || values.length === 0) return [];
-    return [{
-      step: notice.step,
-      field,
-      values,
-      impact: notice.impact,
-      actionCodes: notice.action_codes,
-    }];
-  });
+    if (field && values.length > 0) dropped[field] = values;
+  }
+  return referenceCleanupForDisplay(dropped);
 }
 
 function noticeMappings(notice: GenerationNotice): ReferenceRemapPresentation[] {
@@ -162,13 +153,12 @@ function noticeMappings(notice: GenerationNotice): ReferenceRemapPresentation[] 
     const from = String(item.from ?? "");
     const to = String(item.to ?? "");
     if (!field || !from || !to) return [];
-    return [{
-      step: notice.step,
+    return [referenceRemapForDisplay({
       field,
       from,
       to,
-      matchedBy: String(item.matched_by ?? ""),
-    }];
+      matched_by: item.matched_by,
+    })];
   });
 }
 
@@ -184,15 +174,15 @@ export function buildChapterPresentation(progress: ChapterProgress): ChapterPres
   const contextNotices = (progress.notices ?? [])
     .filter((notice) => notice.category === "context")
     .map((notice) => ({
-      step: notice.step,
-      truncatedSections: asStrings(notice.details.truncated_sections),
-      droppedItemCounts: asCounts(notice.details.dropped_item_counts),
+      step: generationStepKind(notice.step),
+      truncatedSections: asStrings(notice.details.truncated_sections).map(contextSectionKind),
+      droppedItemCounts: contextCountsForDisplay(asCounts(notice.details.dropped_item_counts)),
     }));
   if (contextNotices.length === 0) {
     contextNotices.push(...progress.truncations.map((truncation) => ({
-      step: truncation.step,
-      truncatedSections: truncation.truncated_sections,
-      droppedItemCounts: truncation.dropped_item_counts,
+      step: generationStepKind(truncation.step),
+      truncatedSections: truncation.truncated_sections.map(contextSectionKind),
+      droppedItemCounts: contextCountsForDisplay(truncation.dropped_item_counts),
     })));
   }
 
@@ -200,16 +190,7 @@ export function buildChapterPresentation(progress: ChapterProgress): ChapterPres
     .filter((notice) => notice.category === "reference")
     .flatMap(noticeFields);
   if (referenceNotices.length === 0) {
-    referenceNotices.push(...Object.entries(progress.dropped_ids).flatMap(([field, raw]) => {
-      const values = asStrings(raw);
-      if (values.length === 0) return [];
-      return [{
-        field,
-        values,
-        impact: "references_not_applied",
-        actionCodes: ["review_reference_cards"],
-      }];
-    }));
+    referenceNotices.push(...referenceCleanupForDisplay(progress.dropped_ids));
   }
 
   const referenceRemapNotices = (progress.notices ?? [])

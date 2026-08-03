@@ -33,6 +33,7 @@ import type {
 import AgentRevisionWorkspace, {
   type AgentRevisionSourceSelection,
 } from "./AgentRevisionWorkspace";
+import { contextSectionKind } from "../generationMetadataPresentation";
 
 interface Props {
   mode: "create" | "edit";
@@ -129,6 +130,7 @@ export default function AgentStudioWorkspace({
   onNavigateReference,
 }: Props) {
   const t = useTranslations("writing.agentStudio");
+  const metadataT = useTranslations("writing.generationMetadata");
   const { user } = useAuth();
   const [tab, setTab] = useState<StudioTab>("creative");
   const [agents, setAgents] = useState<AgentProfile[]>([]);
@@ -1391,8 +1393,12 @@ export default function AgentStudioWorkspace({
               {toolMetadata.context_report.truncated_sections.length > 0 && (
                 <p className="text-amber-700 dark:text-amber-300">
                   {t("truncated", {
-                    sections:
-                      toolMetadata.context_report.truncated_sections.join("、"),
+                    sections: Array.from(new Set(
+                      toolMetadata.context_report.truncated_sections.map(
+                        contextSectionKind,
+                      ),
+                    )).map((section) => metadataT(`contextSections.${section}`))
+                      .join(metadataT("listSeparator")),
                   })}
                 </p>
               )}

@@ -186,7 +186,7 @@ export default function LeftoverProseRuns({
                   order: chapter.order_index,
                   title: chapter.title,
                 })
-              : t("leftoverUnknownChapter", { id: run.chapter_id });
+              : t("leftoverUnknownChapter");
             const reasons = run.reason_codes.length > 0
               ? run.reason_codes.map(reasonLabel)
               : [tProse("reasons.unreported")];

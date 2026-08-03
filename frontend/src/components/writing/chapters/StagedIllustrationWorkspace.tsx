@@ -24,6 +24,28 @@ const STAGES: IllustrationStageName[] = ["compose", "identity_edit", "refine"];
 type CandidateMap = Record<IllustrationStageName, IllustrationCandidate[]>;
 const EMPTY_CANDIDATES: CandidateMap = { compose: [], identity_edit: [], refine: [] };
 
+const READINESS_ISSUE_CODES = new Set([
+  "missing_required_binding",
+  "invalid_upload_binding",
+  "invalid_output_contract",
+  "pipeline_invalid",
+  "pipeline_revision_drift",
+  "pipeline_provider_drift",
+  "run_not_active",
+  "reference_not_found",
+  "reference_hash_mismatch",
+  "unsupported_provider",
+  "provider_disabled",
+  "external_lora_not_declared",
+  "provider_not_ready",
+  "template_revision_drift",
+  "missing_quality_evidence",
+]);
+
+function readinessIssueKind(code: string): string {
+  return READINESS_ISSUE_CODES.has(code) ? code : "other";
+}
+
 type Props = {
   novelId: string;
   chapterId: string;
@@ -439,18 +461,18 @@ export default function StagedIllustrationWorkspace(props: Props) {
             <div className="grid min-w-0 gap-3 sm:grid-cols-2">
               <label className="min-w-0 text-xs font-medium text-muted">{t("pipelineLabel")}
                 <select className="mt-1 w-full min-w-0 truncate rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground" value={pipelineAlias} onChange={(event) => { setPipelineAlias(event.target.value); setAckQuality(false); }}>
-                  {pipelines.map((item) => <option key={item.alias} value={item.alias}>{item.alias} · {item.kind}</option>)}
+                  {pipelines.map((item) => <option key={item.alias} value={item.alias}>{item.alias} · {t(`pipelineKinds.${item.kind}`)}</option>)}
                 </select>
               </label>
               <label className="min-w-0 text-xs font-medium text-muted">{t("referenceAssetLabel")}
                 <select className="mt-1 w-full min-w-0 truncate rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground" value={referenceAssetId} onChange={(event) => setReferenceAssetId(event.target.value)}>
                   <option value="">{t("referenceAssetNone")}</option>
-                  {referenceAssets.map((assetId, index) => <option key={assetId} value={assetId}>{t("referenceAssetOption", { index: index + 1 })} · {assetId.slice(-8)}</option>)}
+                  {referenceAssets.map((assetId, index) => <option key={assetId} value={assetId}>{t("referenceAssetOption", { index: index + 1 })}</option>)}
                 </select>
               </label>
             </div>
             {pipeline && <div className={`mt-3 rounded-lg border p-3 text-xs ${pipeline.quality_status === "accepted" ? "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-100" : "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100"}`}>
-              <p className="font-medium">{t("qualityStatus", { status: pipeline.quality_status })}</p>
+              <p className="font-medium">{t("qualityStatus", { status: t(`qualityStatuses.${pipeline.quality_status}`) })}</p>
               {pipeline.quality_status !== "accepted" && <label className="mt-2 flex items-start gap-2"><input className="mt-0.5" type="checkbox" checked={ackQuality} onChange={(event) => setAckQuality(event.target.checked)} /><span>{t("qualityAcknowledge")}</span></label>}
             </div>}
             {profile?.external_adapter && <div className="mt-3 rounded-lg border border-border bg-surface-secondary p-3 text-xs text-muted">
@@ -460,7 +482,7 @@ export default function StagedIllustrationWorkspace(props: Props) {
             </div>}
             <div className="mt-3 flex min-w-0 flex-wrap gap-2">
               <Button size="sm" variant="primary" className="bg-accent text-white" isDisabled={Boolean(busy) || !referenceAssetId || runs.some((item) => item.status === "active")} onPress={() => void createRun()}>{t("createRun")}</Button>
-              {runs.length > 0 && <label className="min-w-0 flex-1 text-xs text-muted"><span className="sr-only">{t("runLabel")}</span><select data-testid="illustration-run-select" className="w-full min-w-0 truncate rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground" value={runId} onChange={(event) => setRunId(event.target.value)}>{runs.map((item) => <option key={item.run_id} value={item.run_id}>{item.pipeline_snapshot.alias} · {item.status} · r{item.revision}</option>)}</select></label>}
+              {runs.length > 0 && <label className="min-w-0 flex-1 text-xs text-muted"><span className="sr-only">{t("runLabel")}</span><select data-testid="illustration-run-select" className="w-full min-w-0 truncate rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground" value={runId} onChange={(event) => setRunId(event.target.value)}>{runs.map((item) => <option key={item.run_id} value={item.run_id}>{t("runOption", { pipeline: item.pipeline_snapshot.alias, status: t(`runStatuses.${item.status}`), revision: item.revision })}</option>)}</select></label>}
             </div>
           </section>}
 
@@ -473,7 +495,7 @@ export default function StagedIllustrationWorkspace(props: Props) {
 
             {run.pipeline_snapshot.kind === "consistency" && <section className="rounded-lg border border-border p-3 text-xs">
               <div className="flex flex-wrap items-center justify-between gap-2"><div><p className="font-medium text-foreground">{t("readinessTitle")}</p><p className="mt-1 text-muted">{t("readinessDescription")}</p></div><Button size="sm" variant="secondary" onPress={inspectReadiness}>{t("inspectReadiness")}</Button></div>
-              {readiness && <div className={`mt-3 rounded-lg p-3 ${readiness.status === "passed" ? "bg-emerald-50 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-100" : "bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100"}`}><p className="font-medium">{t(`readiness.${readiness.status}`)}</p><p className="mt-1">{t("readinessCalls", { calls: readiness.max_provider_calls })}</p>{readiness.issues.map((issue) => <p key={`${issue.stage}-${issue.code}`} className="mt-1 break-words">{issue.message}</p>)}</div>}
+              {readiness && <div className={`mt-3 rounded-lg p-3 ${readiness.status === "passed" ? "bg-emerald-50 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-100" : "bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100"}`}><p className="font-medium">{t(`readiness.${readiness.status}`)}</p><p className="mt-1">{t("readinessCalls", { calls: readiness.max_provider_calls })}</p>{readiness.issues.map((issue) => { const issueLabel = t(`readinessIssues.${readinessIssueKind(issue.code)}`); return <p key={`${issue.stage}-${issue.code}`} className="mt-1 break-words">{issue.stage ? t("readinessIssueWithStage", { stage: t(`stage.${issue.stage}`), issue: issueLabel }) : issueLabel}</p>; })}</div>}
             </section>}
 
             <section className="min-w-0 space-y-4">
@@ -483,14 +505,14 @@ export default function StagedIllustrationWorkspace(props: Props) {
                   <div className="flex min-w-0 flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h5 className="truncate text-sm font-semibold text-foreground">{t(`stage.${stage}`)}</h5><p className="mt-1 text-xs text-muted">{t(`stageStatus.${stageState.status}`)}</p></div>{["ready", "failed", "cancelled"].includes(stageState.status) && <Button size="sm" variant="primary" className="bg-accent text-white" isDisabled={Boolean(busy) || Boolean(job && !job.job.terminal) || (stage === "compose" && !prompt)} onPress={() => startStage(stage)}>{t("startStage")}</Button>}</div>
                   {stage === "identity_edit" && stageState.status === "ready" && <div className="mt-3 grid gap-2 sm:grid-cols-2"><label className="text-xs text-muted">{t("identityInstruction")}<textarea className="mt-1 min-h-24 w-full rounded-lg border border-border bg-surface p-2 text-sm text-foreground" value={identityInstruction} onChange={(event) => setIdentityInstruction(event.target.value)} /></label><label className="text-xs text-muted">{t("mustPreserve")}<textarea className="mt-1 min-h-24 w-full rounded-lg border border-border bg-surface p-2 text-sm text-foreground" value={mustPreserve} onChange={(event) => setMustPreserve(event.target.value)} /></label></div>}
                   {stage === "refine" && stageState.status === "ready" && <label className="mt-3 block text-xs text-muted">{t("refineStrength", { value: refineStrength.toFixed(2) })}<input className="mt-2 w-full" type="range" min="0" max="1" step="0.01" value={refineStrength} onChange={(event) => setRefineStrength(Number(event.target.value))} /></label>}
-                  {candidates[stage].length > 0 && <ul className="mt-3 grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-3">{candidates[stage].map((candidate) => <li key={candidate.asset_id} className={`min-w-0 overflow-hidden rounded-lg border ${candidate.selected ? "border-accent" : "border-border"}`}><div className="relative aspect-[4/3] bg-surface-secondary"><Image src={getImageUrl(candidate.content_url)} alt={t("candidateAlt", { stage: t(`stage.${stage}`) })} fill unoptimized sizes="(min-width: 1024px) 20rem, 90vw" className="object-cover" /></div><div className="space-y-2 p-2 text-xs"><p className="truncate text-muted">{candidate.source} · {candidate.candidate_state} · {(candidate.byte_size / 1024 / 1024).toFixed(1)} MB</p><div className="flex flex-wrap gap-2">{candidate.candidate_state !== "discarded" && !candidate.selected && <Button size="sm" variant="secondary" onPress={() => selectCandidate(candidate)}>{t("selectCandidate")}</Button>}{candidate.candidate_state === "discarded" ? <Button size="sm" variant="secondary" onPress={() => mutateCandidate(candidate, "restore")}>{t("restoreCandidate")}</Button> : candidate.candidate_state !== "finalized" && <Button size="sm" variant="ghost" onPress={() => mutateCandidate(candidate, "discard")}>{t("discardCandidate")}</Button>}</div></div></li>)}</ul>}
+                  {candidates[stage].length > 0 && <ul className="mt-3 grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-3">{candidates[stage].map((candidate) => <li key={candidate.asset_id} className={`min-w-0 overflow-hidden rounded-lg border ${candidate.selected ? "border-accent" : "border-border"}`}><div className="relative aspect-[4/3] bg-surface-secondary"><Image src={getImageUrl(candidate.content_url)} alt={t("candidateAlt", { stage: t(`stage.${stage}`) })} fill unoptimized sizes="(min-width: 1024px) 20rem, 90vw" className="object-cover" /></div><div className="space-y-2 p-2 text-xs"><p className="truncate text-muted">{t(`candidateSource.${candidate.source}`)} · {t(`candidateState.${candidate.candidate_state}`)} · {(candidate.byte_size / 1024 / 1024).toFixed(1)} MB</p><div className="flex flex-wrap gap-2">{candidate.candidate_state !== "discarded" && !candidate.selected && <Button size="sm" variant="secondary" onPress={() => selectCandidate(candidate)}>{t("selectCandidate")}</Button>}{candidate.candidate_state === "discarded" ? <Button size="sm" variant="secondary" onPress={() => mutateCandidate(candidate, "restore")}>{t("restoreCandidate")}</Button> : candidate.candidate_state !== "finalized" && <Button size="sm" variant="ghost" onPress={() => mutateCandidate(candidate, "discard")}>{t("discardCandidate")}</Button>}</div></div></li>)}</ul>}
                   {stageState.status === "selected" && stage === "compose" && run.pipeline_snapshot.kind === "consistency" && <Button size="sm" variant="secondary" className="mt-3" onPress={() => advance("compose")}>{t("advanceIdentity")}</Button>}
                   {stageState.status === "selected" && stage === "identity_edit" && run.pipeline_snapshot.kind === "consistency" && run.stages.refine.status === "locked" && <Button size="sm" variant="secondary" className="mt-3" onPress={() => advance("identity_edit")}>{t("advanceRefine")}</Button>}
                 </div>;
               })}
             </section>
 
-            {job && <div role="status" className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-surface-secondary p-3 text-sm text-muted"><span>{t("jobStatus", { status: job.job.status })}</span>{!job.job.terminal && <Button size="sm" variant="secondary" isDisabled={Boolean(busy)} onPress={cancelStageJob}>{t("cancelJob")}</Button>}</div>}
+            {job && <div role="status" className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-surface-secondary p-3 text-sm text-muted"><span>{t("jobStatus", { status: t(`jobStatuses.${job.job.status}`) })}</span>{!job.job.terminal && <Button size="sm" variant="secondary" isDisabled={Boolean(busy)} onPress={cancelStageJob}>{t("cancelJob")}</Button>}</div>}
             <section className="rounded-lg border border-border p-3 text-xs"><p className="font-medium text-foreground">{t("candidateStorageTitle")}</p><p className="mt-1 leading-5 text-muted">{t("candidateStorage", { count: stats.count, discarded: stats.discarded, size: stats.megabytes })}</p><p className="mt-1 leading-5 text-amber-700 dark:text-amber-300">{t("discardDoesNotFreeDisk")}</p></section>
             <section className="rounded-lg border border-border p-3"><div className="flex min-w-0 flex-wrap items-center gap-2"><input aria-label={t("externalFile")} className="min-w-0 max-w-full text-xs" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => setExternalFile(event.target.files?.[0] ?? null)} /><Button size="sm" variant="secondary" isDisabled={!externalFile || Boolean(busy)} onPress={importExternal}>{t("importExternal")}</Button></div></section>
             <div className="flex min-w-0 flex-wrap justify-end gap-2">
@@ -499,11 +521,11 @@ export default function StagedIllustrationWorkspace(props: Props) {
             </div>
           </>}
 
-          {legacyAssets.length > 0 && brief && <section className="rounded-lg border border-dashed border-border p-3 text-xs"><p className="font-medium text-foreground">{t("legacyTitle")}</p><p className="mt-1 leading-5 text-muted">{t("legacyDescription")}</p><ul className="mt-3 grid min-w-0 gap-2 sm:grid-cols-2">{legacyAssets.map((asset) => <li key={asset.asset_id} className="flex min-w-0 items-center justify-between gap-2 rounded-lg bg-surface-secondary p-2"><span className="min-w-0 truncate">{asset.asset_id}</span><Button size="sm" variant="secondary" onPress={() => adoptLegacy(asset.asset_id)}>{t("adoptLegacy")}</Button></li>)}</ul></section>}
+          {legacyAssets.length > 0 && brief && <section className="rounded-lg border border-dashed border-border p-3 text-xs"><p className="font-medium text-foreground">{t("legacyTitle")}</p><p className="mt-1 leading-5 text-muted">{t("legacyDescription")}</p><ul className="mt-3 grid min-w-0 gap-2 sm:grid-cols-2">{legacyAssets.map((asset, index) => <li key={asset.asset_id} className="flex min-w-0 items-center justify-between gap-2 rounded-lg bg-surface-secondary p-2"><span className="min-w-0 truncate">{t("legacyAssetOption", { index: index + 1 })}</span><Button size="sm" variant="secondary" onPress={() => adoptLegacy(asset.asset_id)}>{t("adoptLegacy")}</Button></li>)}</ul></section>}
         </div>
       </div>
 
-      {finalizeOpen && run && brief && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-3"><div role="dialog" aria-modal="true" aria-labelledby="illustration-finalize-title" className="max-h-[calc(100vh-1.5rem)] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-surface p-4 shadow-xl"><h5 id="illustration-finalize-title" className="text-base font-semibold text-foreground">{t("finalizeTitle")}</h5><p className="mt-2 text-sm leading-6 text-muted">{t("finalizeDescription")}</p><dl className="mt-3 grid gap-2 rounded-lg bg-surface-secondary p-3 text-xs"><div className="flex justify-between gap-3"><dt>{t("finalizePipeline")}</dt><dd className="min-w-0 truncate font-medium">{run.pipeline_snapshot.alias}</dd></div><div className="flex justify-between gap-3"><dt>{t("finalizeRevision")}</dt><dd>run r{run.revision} / brief r{brief.revision}</dd></div><div className="flex justify-between gap-3"><dt>{t("finalizeAsset")}</dt><dd className="min-w-0 truncate">{run.stages.refine.selected_asset_id || run.stages.identity_edit.selected_asset_id || run.stages.compose.selected_asset_id}</dd></div></dl><p className="mt-3 text-xs leading-5 text-muted">{t("finalizeNoProviderCall")}</p><div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="secondary" onPress={() => setFinalizeOpen(false)}>{t("cancelFinalize")}</Button><Button variant="primary" className="bg-accent text-white" isDisabled={Boolean(busy)} onPress={finalize}>{t("confirmFinalize")}</Button></div></div></div>}
+      {finalizeOpen && run && brief && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-3"><div role="dialog" aria-modal="true" aria-labelledby="illustration-finalize-title" className="max-h-[calc(100vh-1.5rem)] w-full max-w-lg overflow-y-auto rounded-xl border border-border bg-surface p-4 shadow-xl"><h5 id="illustration-finalize-title" className="text-base font-semibold text-foreground">{t("finalizeTitle")}</h5><p className="mt-2 text-sm leading-6 text-muted">{t("finalizeDescription")}</p><dl className="mt-3 grid gap-2 rounded-lg bg-surface-secondary p-3 text-xs"><div className="flex justify-between gap-3"><dt>{t("finalizePipeline")}</dt><dd className="min-w-0 truncate font-medium">{run.pipeline_snapshot.alias}</dd></div><div className="flex justify-between gap-3"><dt>{t("finalizeRevision")}</dt><dd>{t("finalizeRevisionValue", { run: run.revision, brief: brief.revision })}</dd></div><div className="flex justify-between gap-3"><dt>{t("finalizeAsset")}</dt><dd className="min-w-0 truncate">{t("finalizeAssetReady")}</dd></div></dl><p className="mt-3 text-xs leading-5 text-muted">{t("finalizeNoProviderCall")}</p><div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="secondary" onPress={() => setFinalizeOpen(false)}>{t("cancelFinalize")}</Button><Button variant="primary" className="bg-accent text-white" isDisabled={Boolean(busy)} onPress={finalize}>{t("confirmFinalize")}</Button></div></div></div>}
     </section>
   );
 }

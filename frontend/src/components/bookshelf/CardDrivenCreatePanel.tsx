@@ -23,6 +23,7 @@ import type {
   WritingDraft,
 } from "@/types/novel";
 import type { CreativeDirectionSelection } from "@/types/agent";
+import { referenceMatchKind } from "../writing/generationMetadataPresentation";
 
 interface CardDrivenCreatePanelProps {
   onCancel: () => void;
@@ -99,6 +100,7 @@ export default function CardDrivenCreatePanel({
   const tc = useTranslations("create");
   const tb = useTranslations("bookshelf");
   const tm = useTranslations("interopErrors.missingCharacterMetadata");
+  const metadataT = useTranslations("writing.generationMetadata");
   const router = useRouter();
   const pathname = usePathname();
   const locale = pathname.startsWith("/en") ? "en" : "zh";
@@ -580,6 +582,8 @@ export default function CardDrivenCreatePanel({
                                     ? "decision.restore_merge"
                                     : "decision.merge",
                                 )}
+                                {" · "}{conflict.target_card_name || metadataT("unavailableReference")}
+                                {" · "}{metadataT(`matchMethods.${referenceMatchKind(conflict.match_kind)}`)}
                               </option>
                             ))}
                             <option value="skip">

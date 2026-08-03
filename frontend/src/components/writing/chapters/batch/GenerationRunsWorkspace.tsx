@@ -866,7 +866,7 @@ export default function GenerationRunsWorkspace({
                             className="min-w-0 text-left"
                           >
                             <span className="block truncate text-sm font-medium text-foreground hover:text-accent">
-                              {chapter?.title ?? t("unknownChapter", { id: progress.chapter_id })}
+                              {chapter?.title ?? t("unknownChapter")}
                             </span>
                             <span className="mt-1 block text-xs leading-5 text-muted">
                               {t("chapterProgress", {
@@ -966,7 +966,7 @@ export default function GenerationRunsWorkspace({
                 <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0">
                     <h4 className="truncate text-sm font-medium text-foreground">
-                      {chapters.find((chapter) => chapter._id === run.chapter_id)?.title ?? t("unknownChapter", { id: run.chapter_id })}
+                      {chapters.find((chapter) => chapter._id === run.chapter_id)?.title ?? t("unknownChapter")}
                     </h4>
                     <p className="mt-1 truncate text-xs text-muted">
                       {t("telemetryProvider", {
@@ -998,7 +998,7 @@ export default function GenerationRunsWorkspace({
                     <dt>{t("telemetryIdentity")}</dt>
                     <dd className="break-all text-foreground">
                       {run.authorization.content_identity
-                        ? t("telemetryIdentityValue", { digest: run.authorization.content_identity.slice(0, 16) })
+                        ? t("telemetryIdentityValue")
                         : t("unknown")}
                     </dd>
                   </div>

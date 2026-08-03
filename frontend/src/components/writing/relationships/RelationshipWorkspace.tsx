@@ -146,8 +146,8 @@ export default function RelationshipWorkspace({ mode, novelId }: RelationshipWor
             </div>
             {relations.length ? relations.map((relation) => {
               const key = relation.relation_id ?? relation._id ?? `${relation.source_faction_id}-${relation.target_faction_id}`;
-              const sourceName = relation.source_faction_name ?? nodeById.get(relation.source_faction_id)?.faction.name ?? relation.source_faction_id;
-              const targetName = relation.target_faction_name ?? nodeById.get(relation.target_faction_id)?.faction.name ?? relation.target_faction_id;
+              const sourceName = relation.source_faction_name ?? nodeById.get(relation.source_faction_id)?.faction.name ?? tf("unknownFaction");
+              const targetName = relation.target_faction_name ?? nodeById.get(relation.target_faction_id)?.faction.name ?? tf("unknownFaction");
               return (
                 <button key={key} type="button" onClick={() => setSelectedId(key)} className={`mb-2 w-full rounded-lg border p-3 text-left transition-colors ${key === selectedId ? "border-accent bg-accent/8" : "border-border hover:bg-surface-secondary"}`}>
                   <div className="flex items-center justify-between gap-2 text-sm font-medium text-foreground"><span>{sourceName} → {targetName}</span><span className="shrink-0 text-xs" style={{ color: EDGE_COLORS[relation.relation_type] }}>{relationLabels[relation.relation_type]}</span></div>

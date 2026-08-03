@@ -636,6 +636,7 @@ class CardImportProposalService:
             conflicts.append(
                 {
                     "target_card_id": str(card["_id"]),
+                    "target_card_name": str(card.get("name") or ""),
                     "match_kind": match_kind,
                     "is_deleted": bool(card.get("is_deleted")),
                     "field_diffs": field_diffs,

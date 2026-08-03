@@ -181,6 +181,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           onNavigateToReferenceCards={() =>
             navigateToReferenceCards("character", true)
           }
+          onNavigateToPlotThreads={() => navigateToWorkspace("plot-threads")}
           initialChapterId={evidenceReference?.chapter_id}
           initialSceneIndex={evidenceReference?.scene_index}
           generationRunsOpen={requestedGenerationRuns}

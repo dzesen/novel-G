@@ -6,7 +6,13 @@ import { Button } from "@heroui/react";
 import { apiPost } from "@/lib/api";
 import { useOutlineStream } from "../outline/useOutlineStream";
 import { useRoster } from "../outline/useRoster";
-import { ContextNotices, Field, Notice } from "../outline/outlineUi";
+import {
+  ContextNotices,
+  Field,
+  Notice,
+  ReferenceCleanupNotice,
+  ReferenceRemapNotice,
+} from "../outline/outlineUi";
 import type {
   ChapterStateAcceptResponse,
   ChapterStateResult,
@@ -131,15 +137,15 @@ export function StateBackfillPanel({
     }
   };
 
-  // 六条约束之五：角色/伏笔一律按名称显示；roster 里查不到时回落成裸 id 并
-  // 明确标注 unknownCharacter/unknownThread，不静默丢弃。
+  // 角色/伏笔一律按名称显示；roster 里查不到时标注为不可识别对象，
+  // 但不把只能由数据库或开发工具定位的内部 id 暴露给作者。
   const characterName = (cardId: string | null) => {
     if (!cardId) return t("unknownCharacter");
-    return roster.nameById[cardId] ?? `${cardId} (${t("unknownCharacter")})`;
+    return roster.nameById[cardId] ?? t("unknownCharacter");
   };
 
   const threadName = (threadId: string) =>
-    roster.nameById[threadId] ?? `${threadId} (${t("unknownThread")})`;
+    roster.nameById[threadId] ?? t("unknownThread");
 
   const accept = async () => {
     if (!stream.result) return;
@@ -224,26 +230,11 @@ export function StateBackfillPanel({
 
           {/* context / id_remapping / id_validation 都先于结果帧到达并即时可见。 */}
           <ContextNotices report={stream.contextReport} />
-          {stream.remappedReferences.length > 0 && (
-            <Notice tone="info">
-              {t("remappedIdsNotice", {
-                count: stream.remappedReferences.length,
-                detail: stream.remappedReferences
-                  .map((item) => `${item.from} → ${item.to} (${item.matched_by})`)
-                  .join("、"),
-              })}
-            </Notice>
-          )}
-          {stream.droppedIds && Object.keys(stream.droppedIds).length > 0 && (
-            <Notice tone="warning">
-              {t("droppedIdsWarning", {
-                count: Object.values(stream.droppedIds).reduce((sum, ids) => sum + ids.length, 0),
-                detail: Object.entries(stream.droppedIds)
-                  .map(([field, ids]) => `${field}: ${ids.join(", ")}`)
-                  .join("、"),
-              })}
-            </Notice>
-          )}
+          <ReferenceRemapNotice
+            remappedReferences={stream.remappedReferences}
+            nameById={roster.nameById}
+          />
+          <ReferenceCleanupNotice droppedIds={stream.droppedIds} />
 
           {stream.error && (
             <Notice tone="error">
