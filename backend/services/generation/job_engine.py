@@ -82,6 +82,20 @@ def _incomplete_prose_checkpoint(
     for raw in list(completion.get("scene_progress") or [])[:20]:
         if not isinstance(raw, dict):
             continue
+        word_count = integer(raw.get("word_count"))
+        raw_word_count = (
+            integer(raw.get("raw_word_count"))
+            if raw.get("raw_word_count") is not None
+            else word_count
+        )
+        effective_word_count = min(
+            raw_word_count,
+            (
+                integer(raw.get("effective_word_count"))
+                if raw.get("effective_word_count") is not None
+                else raw_word_count
+            ),
+        )
         scenes.append(
             {
                 "scene_index": integer(raw.get("scene_index")),
@@ -93,7 +107,12 @@ def _incomplete_prose_checkpoint(
                 "manual_continuations_used": integer(
                     raw.get("manual_continuations_used")
                 ),
-                "word_count": integer(raw.get("word_count")),
+                "word_count": word_count,
+                "raw_word_count": raw_word_count,
+                "effective_word_count": effective_word_count,
+                "replayed_characters_total": integer(
+                    raw.get("replayed_characters_total")
+                ),
                 "scene_target_words": integer(raw.get("scene_target_words")),
                 "converge_attempts": integer(raw.get("converge_attempts")),
                 "converge_attempts_without_stop": integer(

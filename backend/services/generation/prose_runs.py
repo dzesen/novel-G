@@ -174,12 +174,40 @@ def _safe_non_negative_int(value: Any) -> int:
         return 0
 
 
+def _scene_count_telemetry(item: dict[str, Any]) -> tuple[int, int, int]:
+    """Project raw/effective/replay counts while keeping legacy runs readable."""
+    word_count = _safe_non_negative_int(item.get("word_count"))
+    raw_word_count = (
+        _safe_non_negative_int(item.get("raw_word_count"))
+        if item.get("raw_word_count") is not None
+        else word_count
+    )
+    effective_word_count = min(
+        raw_word_count,
+        (
+            _safe_non_negative_int(item.get("effective_word_count"))
+            if item.get("effective_word_count") is not None
+            else raw_word_count
+        ),
+    )
+    return (
+        raw_word_count,
+        effective_word_count,
+        _safe_non_negative_int(item.get("replayed_characters_total")),
+    )
+
+
 def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
     """Return persisted scene counters without prose, prompt, or raw error data."""
     result: list[dict[str, Any]] = []
     for item in document.get("scene_progress") or []:
         if not isinstance(item, dict):
             continue
+        (
+            raw_word_count,
+            effective_word_count,
+            replayed_characters_total,
+        ) = _scene_count_telemetry(item)
         result.append(
             {
                 "scene_index": _safe_non_negative_int(item.get("scene_index")),
@@ -194,6 +222,9 @@ def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
                     item.get("manual_continuations_used")
                 ),
                 "word_count": _safe_non_negative_int(item.get("word_count")),
+                "raw_word_count": raw_word_count,
+                "effective_word_count": effective_word_count,
+                "replayed_characters_total": replayed_characters_total,
                 "scene_target_words": _safe_non_negative_int(
                     item.get("scene_target_words")
                 ),

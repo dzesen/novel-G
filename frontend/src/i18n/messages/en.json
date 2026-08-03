@@ -2064,6 +2064,7 @@
       "telemetryIdentityValue": "Fingerprint {digest}…",
       "sceneLabel": "Scene {index}",
       "sceneCalls": "Base {base} · automatic {automatic} ({remaining} remaining) · manual {manual} · {words} words · {status}",
+      "sceneWordMetrics": "Raw words {raw} / effective words {effective} / replayed characters {replayed}",
       "sceneDivergenceMetrics": "Scene output: {actual} / target {target} words ({ratio}×); {converge} convergence call(s), {withoutStop} not ending naturally",
       "sceneDivergenceMetricsTargetUnknown": "Scene output: {actual} words; no per-scene target was recorded; {converge} convergence call(s), {withoutStop} not ending naturally",
       "sceneContinuityMetrics": "Longest verbatim cross-call repeat: {repeat} chars; hard-truncation continuations: {truncated}",

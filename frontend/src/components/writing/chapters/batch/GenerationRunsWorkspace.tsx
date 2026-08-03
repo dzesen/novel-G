@@ -50,6 +50,9 @@ interface ProseRunTelemetry {
     automatic_continuations_used: number;
     manual_continuations_used: number;
     word_count: number;
+    raw_word_count: number;
+    effective_word_count: number;
+    replayed_characters_total: number;
     scene_target_words: number;
     converge_attempts: number;
     converge_attempts_without_stop: number;
@@ -991,6 +994,13 @@ export default function GenerationRunsWorkspace({
                           })}
                         </span>
                       )}
+                      <span className="min-w-0 break-words">
+                        {t("sceneWordMetrics", {
+                          raw: scene.raw_word_count,
+                          effective: scene.effective_word_count,
+                          replayed: scene.replayed_characters_total,
+                        })}
+                      </span>
                       <span className="min-w-0 break-words">
                         {t("sceneContinuityMetrics", {
                           repeat: scene.max_cross_call_repeat_characters,
