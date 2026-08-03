@@ -23,11 +23,12 @@ MIN_CONTINUATION_TARGET_WORDS = 400
 MAX_CONTINUATION_TARGET_WORDS = 5_000
 DEFAULT_CONTINUATION_TARGET_WORDS = 1_000
 
-# Healthy scenes stayed at or below 1.7x their target with repeats no longer
-# than 14 characters, while pathological scenes reached at least 2.5x with
-# 1,884+ replayed characters.  2.0 is the measured gap between them: a
-# centrally-owned safety cutoff, not a user-facing generation control.
-SCENE_DIVERGENCE_STOP_FACTOR = 2.0
+# The fifth-round 2.0147x--3.5633x stops were retested with the stop disabled:
+# four of five target runs then completed, while normal completed scenes peaked
+# at 1.9113x.  The only genuinely divergent scene reached 7.0433x after all
+# three automatic continuations.  4.0 sits in that observed gap: it releases
+# the false-positive band while retaining the centrally-owned safety cutoff.
+SCENE_DIVERGENCE_STOP_FACTOR = 4.0
 
 # A divergence stop only decides whether the scene may spend *another* automatic
 # continuation. It cannot deny the first automatic opportunity, because no
@@ -36,11 +37,11 @@ MIN_AUTOMATIC_CONTINUATIONS_BEFORE_DIVERGENCE_STOP = 1
 
 # This is intentionally separate from ``protocol_revision``. The ruleset
 # controls mutable dispatch authorization (like N, M and the token budget), not
-# model-visible content identity. The previous ruleset was implicit; v2 makes
-# its first-continuation floor explicit and forces a fresh authorization on a
-# legacy N>0 draft without making that draft stale.
+# model-visible content identity.  v2 made the first-continuation floor
+# explicit; v3 records the calibrated 4x stop authorization.  The bump forces
+# fresh N>0 authorization without making a v3.3 draft stale.
 CURRENT_CONTINUATION_AUTHORIZATION_RULESET_REVISION = (
-    "scene-continuation-authorization-v2"
+    "scene-continuation-authorization-v3"
 )
 
 
