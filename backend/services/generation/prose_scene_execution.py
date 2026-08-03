@@ -45,6 +45,22 @@ MIN_REPLAY_CHARACTERS = 100
 _TRUNCATED_OUTPUT_CONTINUATION_MODES = frozenset(
     {"fill", "converge", "final_converge"}
 )
+CONTINUATION_PROMPT_MODES = frozenset(
+    {
+        "base",
+        "fill",
+        "converge",
+        "final_converge",
+        "recovery",
+        "final_recovery",
+        "manual",
+        "uncertain_retry",
+    }
+)
+# The written-prose window is already included verbatim in the continuation
+# prompt. Keep the separately-labelled anchor small so it cannot duplicate a
+# second full window and invalidate existing readiness bounds.
+MAX_CONTINUATION_ANCHOR_CHARACTERS = 160
 
 TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION = (
     " 上一次输出因输出上限被硬截断，可能停在句子中途；"
@@ -284,6 +300,25 @@ def _scene_replay_measurement(
     )
 
 
+def _continuation_anchor(prior_text: str) -> tuple[str, bool]:
+    """Return a bounded last-sentence anchor and whether it was shortened."""
+    text = str(prior_text or "").strip()
+    if not text:
+        return "（无）", False
+    boundaries = [
+        index for index, character in enumerate(text) if character in "。！？!?…"
+    ]
+    sentence_start = (
+        (boundaries[-2] + 1)
+        if boundaries and boundaries[-1] == len(text) - 1 and len(boundaries) >= 2
+        else (boundaries[-1] + 1 if boundaries else 0)
+    )
+    anchor = text[sentence_start:].strip() or text
+    return anchor[-MAX_CONTINUATION_ANCHOR_CHARACTERS:], (
+        len(anchor) > MAX_CONTINUATION_ANCHOR_CHARACTERS
+    )
+
+
 def _normal_finish_reason(value: Any, raw_value: Any = None) -> tuple[str, str]:
     normalized = normalize_finish_reason(value)
     raw_source = value if raw_value is None else raw_value
@@ -518,12 +553,37 @@ def _scene_prompt(
             "避免复述或重复。"
         ),
     }
+    if frozenset(mode_instructions) != CONTINUATION_PROMPT_MODES:
+        raise RuntimeError("Continuation prompt mode registry drifted")
     instruction = mode_instructions.get(prompt_mode, mode_instructions["base"])
     if (
         continues_truncated_output
         and prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
     ):
         instruction += TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION
+    if prompt_mode == "base":
+        # Keep the initial-call prompt byte-for-byte stable. This slice only
+        # changes continuation framing, never the base generation task.
+        return (
+            f"{base_prompt}\n\n"
+            "【Novel-G 场景正文协议】\n"
+            f"SCENE_INDEX={scene_index}\n"
+            f"CONTINUATION_MODE={prompt_mode}\n"
+            f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
+            "本次只写当前场景，以本段目标为准。\n"
+            f"{instruction}\n"
+            f"当前场景：{current_scene}\n"
+            f"已写正文尾部（仅用于衔接，禁止复述）：{tail}\n"
+            "只输出小说正文，不输出场景标题、协议字段、解释或完成声明。"
+        )
+
+    anchor, anchor_was_shortened = _continuation_anchor(tail)
+    anchor_line = (
+        "已写正文的最后一句（或被截断的最后句段）超过 "
+        f"{MAX_CONTINUATION_ANCHOR_CHARACTERS} 字，以下仅显示其末尾：{anchor}\n"
+        if anchor_was_shortened
+        else f"已写正文的最后一句（或被截断的最后句段）是：{anchor}\n"
+    )
     return (
         f"{base_prompt}\n\n"
         "【Novel-G 场景正文协议】\n"
@@ -532,8 +592,17 @@ def _scene_prompt(
         f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
         "本次只写当前场景，以本段目标为准。\n"
         f"{instruction}\n"
-        f"当前场景：{current_scene}\n"
-        f"已写正文尾部（仅用于衔接，禁止复述）：{tail}\n"
+        "【本场已完成正文】\n"
+        "以下是本场已经完成的正文（按续写窗口保留其末段），不是待写任务；"
+        "不得重写、复述或从场景开头重新开始。\n"
+        f"{tail}\n"
+        "【续写锚点】\n"
+        f"{anchor_line}"
+        "必须从这句之后继续；若该句未完，先自然接完它，再写新的连续正文。\n"
+        "【当前场景细纲（仅作参考）】\n"
+        f"{current_scene}\n"
+        "细纲描述整场目标；已经在本场已完成正文中实现的部分不得当作待写任务。\n"
+        "重复已经完成的正文不会增加有效字数。\n"
         "只输出小说正文，不输出场景标题、协议字段、解释或完成声明。"
     )
 
