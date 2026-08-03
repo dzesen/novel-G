@@ -277,6 +277,83 @@ class GenerationJobService:
         )
 
     @staticmethod
+    async def inspect_resume_readiness(
+        job_id: str,
+        *,
+        prose_continuation_policy: (
+            ProseContinuationPolicy | Mapping[str, Any] | None
+        ) = None,
+        token_budget: int | None = None,
+        token_budget_provided: bool = False,
+    ) -> Dict[str, Any]:
+        """Preview a paused job's *next* authorization revision without writes.
+
+        The revision is derived from the persisted job rather than supplied by
+        the client.  That makes the returned digest usable only for the exact
+        resume it previews and prevents a stale browser tab from authorizing a
+        higher budget under an older revision.
+        """
+        job = await generation_job_repo.get_job(job_id)
+        if not job_planner.can_resume(job["status"]):
+            raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
+        if job.get("has_uncertain_attempts"):
+            raise ValueError(
+                "存在结果不确定的 Provider 请求，请先选择重试或跳过"
+            )
+        authorization = dict(job.get("prose_continuation_authorization") or {})
+        stored_policy = ProseContinuationPolicy.from_mapping(
+            authorization.get("policy")
+            or (job.get("generation_params") or {}).get(
+                "prose_continuation_policy"
+            )
+        )
+        requested_policy = prose_continuation_policy
+        if requested_policy is not None and not isinstance(
+            requested_policy,
+            ProseContinuationPolicy,
+        ):
+            requested_policy = ProseContinuationPolicy.from_mapping(
+                requested_policy
+            )
+        candidate_policy = requested_policy or stored_policy
+        candidate_budget = (
+            token_budget if token_budget_provided else job.get("token_budget")
+        )
+        generation_params_snapshot = {
+            **dict(job.get("generation_params") or {}),
+            "prose_continuation_policy": candidate_policy.to_dict(),
+        }
+        current_revision = max(
+            int(job.get("authorization_revision") or 0),
+            int(authorization.get("authorization_revision") or 0),
+        )
+        if job.get("scope") == "book":
+            chapters = await get_book_worklist(
+                str(job["novel_id"]),
+                include_content=True,
+            )
+        else:
+            chapters = await ChapterService.get_chapters_by_volume(
+                str(job["volume_id"]),
+                include_content=True,
+            )
+            chapters = await state_completion_module.attach_many(chapters)
+        return await generation_readiness_module.inspect(
+            novel_id=str(job["novel_id"]),
+            scope=str(job["scope"]),
+            volume_id=(
+                str(job["volume_id"])
+                if job.get("volume_id") is not None
+                else None
+            ),
+            chapters=chapters,
+            prose_continuation_policy=candidate_policy,
+            token_budget=candidate_budget,
+            generation_params=generation_params_snapshot,
+            authorization_revision=max(1, current_revision + 1),
+        )
+
+    @staticmethod
     async def start_volume_job(volume_id: str, checkpoint_interval: int,
                                token_budget: Optional[int], *,
                                readiness_digest: str | None = None,

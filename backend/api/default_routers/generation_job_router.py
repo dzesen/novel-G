@@ -88,6 +88,19 @@ class BatchReadinessRequest(GenerationParamsMixin):
     )
 
 
+class ResumeReadinessRequest(BaseModel):
+    """A proposed authorization for one existing, paused generation job.
+
+    This deliberately excludes general generation-parameter overrides.  Resume
+    readiness may only vary the two continuation-authority controls covered by
+    the persisted job snapshot; accepting a preview must never silently change
+    any other generation behavior.
+    """
+
+    token_budget: Optional[int] = Field(default=None, ge=1)
+    prose_continuation_policy: ProseContinuationPolicyRequest | None = None
+
+
 class ResumeJobRequest(BaseModel):
     confirm_uncertain_retry: bool = False
     skip_uncertain: bool = False
@@ -224,6 +237,25 @@ async def summarize_diagnostics(
         return await GenerationJobService.summarize_diagnostics(novel_id, limit=limit)
     except Exception as exc:
         raise _handle(exc) from exc
+
+
+@router.post("/{job_id}/readiness")
+async def inspect_resume_readiness(job_id: str, req: ResumeReadinessRequest):
+    """Return the next revision's read-only authorization preview for a job."""
+    try:
+        return await GenerationJobService.inspect_resume_readiness(
+            job_id,
+            prose_continuation_policy=(
+                req.prose_continuation_policy.to_domain().to_dict()
+                if req.prose_continuation_policy is not None
+                else None
+            ),
+            token_budget=req.token_budget,
+            token_budget_provided="token_budget" in req.model_fields_set,
+        )
+    except Exception as exc:
+        raise _handle(exc) from exc
+
 
 @router.get("/{job_id}")
 async def get_job(job_id: str):
