@@ -27,6 +27,13 @@ import {
   diagnosticReasonTranslationKey,
   jobPauseReasonTranslationKey,
 } from "./generationReasonPresentation";
+import {
+  aggregateChapterProgress,
+  currentJobReasonCode,
+  currentJobStatusByProseRun,
+  diagnosticHistoryState,
+  newestDiagnostics,
+} from "./generationRunsPresentation";
 
 interface ProseRunTelemetry {
   run_id: string;
@@ -440,6 +447,18 @@ export default function GenerationRunsWorkspace({
   const selectedJob = target.jobId
     ? jobs.find((job) => job._id === target.jobId) ?? null
     : null;
+  const selectedChapterProgress = useMemo(
+    () => aggregateChapterProgress(selectedJob?.progress ?? []),
+    [selectedJob],
+  );
+  const orderedDiagnostics = useMemo(
+    () => newestDiagnostics(selectedJob?.diagnostics),
+    [selectedJob],
+  );
+  const draftJobStatuses = useMemo(
+    () => currentJobStatusByProseRun(jobs),
+    [jobs],
+  );
   const selectedChapter = target.chapterId
     ? chapters.find((chapter) => chapter._id === target.chapterId) ?? null
     : null;
@@ -687,7 +706,10 @@ export default function GenerationRunsWorkspace({
         </section>
 
         <div className="grid min-h-0 gap-4 lg:grid-cols-[minmax(17rem,0.85fr)_minmax(0,1.75fr)]">
-          <section aria-labelledby="generation-run-list-title" className="min-w-0 rounded-md border border-border bg-background">
+          <section
+            aria-label={t("jobsListAria")}
+            className="min-w-0 rounded-md border border-border bg-background"
+          >
             <div className="border-b border-border px-3 py-2.5">
               <h3 id="generation-run-list-title" className="text-sm font-semibold text-foreground">
                 {t("jobsTitle", { count: filteredJobs.length })}
@@ -702,6 +724,7 @@ export default function GenerationRunsWorkspace({
               )}
               {filteredJobs.map((job) => {
                 const isSelected = job._id === target.jobId;
+                const currentReason = currentJobReasonCode(job);
                 return (
                   <button
                     key={job._id}
@@ -722,9 +745,9 @@ export default function GenerationRunsWorkspace({
                     <span className="truncate text-xs text-muted">
                       {formatDate(job.updated_at, locale, t("unknown"))}
                     </span>
-                    {reasonValues(job)[0] && (
+                    {currentReason && (
                       <span className="truncate text-[11px] text-amber-800 dark:text-amber-200">
-                        {pauseReasonLabel(reasonValues(job)[0])}
+                        {pauseReasonLabel(currentReason)}
                       </span>
                     )}
                   </button>
@@ -848,13 +871,21 @@ export default function GenerationRunsWorkspace({
                     <p className="text-xs text-muted">{t("chaptersDescription")}</p>
                   </div>
                   <div className="mt-2 grid gap-2">
-                    {selectedJob.progress.length === 0 && (
+                    {selectedChapterProgress.length === 0 && (
                       <p className="rounded-md border border-dashed border-border px-3 py-3 text-xs text-muted">
                         {t("chaptersEmpty")}
                       </p>
                     )}
-                    {selectedJob.progress.map((progress) => {
+                    {selectedChapterProgress.map((progress) => {
                       const chapter = chapters.find((item) => item._id === progress.chapter_id);
+                      const sceneCount = progress.incomplete_prose?.scene_count ?? 0;
+                      const completedSceneCount = Math.min(
+                        sceneCount,
+                        progress.incomplete_prose?.completed_scene_count ?? 0,
+                      );
+                      const scenePercent = sceneCount > 0
+                        ? Math.round((completedSceneCount / sceneCount) * 100)
+                        : null;
                       return (
                         <div key={progress.chapter_id} className="grid gap-2 rounded-md border border-border p-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
                           <button
@@ -868,11 +899,22 @@ export default function GenerationRunsWorkspace({
                             <span className="block truncate text-sm font-medium text-foreground hover:text-accent">
                               {chapter?.title ?? t("unknownChapter")}
                             </span>
-                            <span className="mt-1 block text-xs leading-5 text-muted">
-                              {t("chapterProgress", {
-                                steps: progress.steps_done.length,
+                            <span className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs leading-5 text-muted">
+                              {scenePercent !== null && (
+                                <span>{t("chapterSceneProgress", {
+                                  completed: completedSceneCount,
+                                  total: sceneCount,
+                                  percent: scenePercent,
+                                })}</span>
+                              )}
+                              <span>{t("chapterStepProgress", {
+                                completed: progress.completedStepCount,
+                                total: 3,
+                                percent: progress.stepPercent,
+                              })}</span>
+                              <span>{t("chapterTokensCumulative", {
                                 tokens: progress.tokens,
-                              })}
+                              })}</span>
                             </span>
                           </button>
                           <button
@@ -892,29 +934,56 @@ export default function GenerationRunsWorkspace({
                   <h4 id="generation-run-events-title" className="text-sm font-semibold text-foreground">
                     {t("eventsTitle")}
                   </h4>
-                  <div className="mt-2 divide-y divide-border rounded-md border border-border">
-                    {(selectedJob.diagnostics ?? []).length === 0 && (
+                  <div className="mt-2 rounded-md border border-border">
+                    {orderedDiagnostics.length === 0 && (
                       <p className="px-3 py-3 text-xs text-muted">{t("eventsEmpty")}</p>
                     )}
-                    {(selectedJob.diagnostics ?? []).map((event, index) => {
-                      const locator = eventLocator(selectedJob._id, event, index);
-                      return (
-                        <button
-                          key={locator}
-                          type="button"
-                          onClick={() => onNavigate({
-                            jobId: selectedJob._id,
-                            chapterId: event.chapter_id || undefined,
-                            eventId: locator,
-                          })}
-                          className={`block w-full px-3 py-3 text-left hover:bg-surface-secondary ${
-                            target.eventId === locator ? "bg-accent/10" : ""
-                          }`}
-                        >
-                          <DiagnosticEventSummary event={event} />
-                        </button>
-                      );
-                    })}
+                    {orderedDiagnostics.length > 0 && (
+                      <ol className="divide-y divide-border">
+                        {orderedDiagnostics.map(({
+                          event,
+                          originalIndex,
+                        }, orderedIndex) => {
+                          const locator = eventLocator(
+                            selectedJob._id,
+                            event,
+                            originalIndex,
+                          );
+                          const historyState = diagnosticHistoryState(
+                            selectedJob,
+                            orderedIndex,
+                          );
+                          return (
+                            <li key={locator}>
+                              <button
+                                type="button"
+                                onClick={() => onNavigate({
+                                  jobId: selectedJob._id,
+                                  chapterId: event.chapter_id || undefined,
+                                  eventId: locator,
+                                })}
+                                className={`block w-full px-3 py-3 text-left hover:bg-surface-secondary ${
+                                  target.eventId === locator ? "bg-accent/10" : ""
+                                }`}
+                              >
+                                <p className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] leading-4 text-muted">
+                                  <time dateTime={event.occurred_at}>
+                                    {formatDate(
+                                      event.occurred_at,
+                                      locale,
+                                      t("eventTimeUnknown"),
+                                    )}
+                                  </time>
+                                  <span aria-hidden="true">·</span>
+                                  <span>{t(`eventStates.${historyState}`)}</span>
+                                </p>
+                                <DiagnosticEventSummary event={event} />
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    )}
                   </div>
                   {selectedEvent && (
                     <p className="mt-2 text-xs leading-5 text-muted">{t("eventLocated")}</p>
@@ -1093,6 +1162,7 @@ export default function GenerationRunsWorkspace({
             novelId={novelId}
             chapters={chapters}
             refreshKey={String(proseRunsRevision)}
+            jobStatusByRun={draftJobStatuses}
             onOpenRun={onOpenProseRun}
             onStartFresh={onStartFreshProse}
           />

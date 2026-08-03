@@ -176,6 +176,18 @@ export interface CheckpointProseCompletion {
   actual_word_count: number;
 }
 
+export interface IncompleteProseProgress {
+  chapter_id: string;
+  source_run_id: string;
+  source_run_revision: number;
+  status: string;
+  pause_reason: string;
+  reason_codes: string[];
+  scene_count: number;
+  completed_scene_count: number;
+  scene_progress: Array<Record<string, unknown>>;
+}
+
 export interface ChapterProgress {
   chapter_id: string;
   order_index: number;
@@ -191,6 +203,8 @@ export interface ChapterProgress {
   truncations: Truncation[];
   /** 正文完成契约的只读标量摘要；旧作业可能没有。 */
   prose_completion?: CheckpointProseCompletion;
+  /** 未完成正文的恢复快照；同章重试会追加新的 progress 条目。 */
+  incomplete_prose?: IncompleteProseProgress;
   /** 新作业写入；旧作业缺失时由 batchPresentation 从 legacy 字段投影。 */
   step_outcomes?: StepOutcome[];
   notices?: GenerationNotice[];
