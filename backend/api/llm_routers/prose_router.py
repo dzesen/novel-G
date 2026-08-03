@@ -51,6 +51,7 @@ from backend.services.generation.prose_generation import (
 )
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
+    authorization_ruleset_requires_refresh,
 )
 from backend.services.generation.prose_readiness import (
     ProseReadinessBlocked,
@@ -152,6 +153,7 @@ async def _authorization_revision_for(
     if (
         stored_policy == policy.to_dict()
         and stored_budget == token_budget
+        and not authorization_ruleset_requires_refresh(stored, policy=policy)
     ):
         return max(1, stored_revision)
     return max(1, stored_revision + 1)

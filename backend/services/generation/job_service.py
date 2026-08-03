@@ -35,6 +35,7 @@ from backend.services.generation.readiness import generation_readiness_module
 from backend.services.novel.state_completion import state_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
+    authorization_ruleset_requires_refresh,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,9 +131,13 @@ class GenerationJobService:
     def _pending_scene_can_use_new_policy(
         pending: Mapping[str, Any],
         policy: ProseContinuationPolicy,
+        *,
+        allow_divergence_stop: bool = False,
     ) -> bool:
-        if str(pending.get("pause_reason") or "") != (
-            "automatic_continuations_exhausted"
+        pause_reason = str(pending.get("pause_reason") or "")
+        if pause_reason != "automatic_continuations_exhausted" and not (
+            allow_divergence_stop
+            and pause_reason == "prose_scene_divergence_stopped"
         ):
             return False
         for scene in list(pending.get("scene_progress") or []):
@@ -440,21 +445,24 @@ class GenerationJobService:
                     "请明确确认可能重复计费后再重试"
                 )
             authorization_updates: Dict[str, Any] = {}
-            candidate_policy: ProseContinuationPolicy | None = None
+            authorization = dict(job.get("prose_continuation_authorization") or {})
+            stored_policy = ProseContinuationPolicy.from_mapping(
+                authorization.get("policy")
+                or (job.get("generation_params") or {}).get(
+                    "prose_continuation_policy"
+                )
+            )
+            candidate_policy = prose_continuation_policy or stored_policy
+            authorization_ruleset_changed = authorization_ruleset_requires_refresh(
+                authorization,
+                policy=candidate_policy,
+            )
             authorization_settings_changed = (
-                prose_continuation_policy is not None or token_budget_provided
+                prose_continuation_policy is not None
+                or token_budget_provided
+                or authorization_ruleset_changed
             )
             if authorization_settings_changed:
-                authorization = dict(
-                    job.get("prose_continuation_authorization") or {}
-                )
-                stored_policy = ProseContinuationPolicy.from_mapping(
-                    authorization.get("policy")
-                    or (job.get("generation_params") or {}).get(
-                        "prose_continuation_policy"
-                    )
-                )
-                candidate_policy = prose_continuation_policy or stored_policy
                 candidate_budget = (
                     token_budget if token_budget_provided else job.get("token_budget")
                 )
@@ -539,11 +547,15 @@ class GenerationJobService:
                 )
                 can_use_new_automatic_policy = bool(
                     authorization_settings_changed
-                    and prose_continuation_policy is not None
                     and candidate_policy is not None
+                    and (
+                        prose_continuation_policy is not None
+                        or authorization_ruleset_changed
+                    )
                     and GenerationJobService._pending_scene_can_use_new_policy(
                         pending_incomplete_prose,
                         candidate_policy,
+                        allow_divergence_stop=authorization_ruleset_changed,
                     )
                 )
                 if not manually_resolved and not can_use_new_automatic_policy:

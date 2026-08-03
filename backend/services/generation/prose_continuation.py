@@ -29,6 +29,20 @@ DEFAULT_CONTINUATION_TARGET_WORDS = 1_000
 # centrally-owned safety cutoff, not a user-facing generation control.
 SCENE_DIVERGENCE_STOP_FACTOR = 2.0
 
+# A divergence stop only decides whether the scene may spend *another* automatic
+# continuation. It cannot deny the first automatic opportunity, because no
+# automatic authorization has been consumed at that point.
+MIN_AUTOMATIC_CONTINUATIONS_BEFORE_DIVERGENCE_STOP = 1
+
+# This is intentionally separate from ``protocol_revision``. The ruleset
+# controls mutable dispatch authorization (like N, M and the token budget), not
+# model-visible content identity. The previous ruleset was implicit; v2 makes
+# its first-continuation floor explicit and forces a fresh authorization on a
+# legacy N>0 draft without making that draft stale.
+CURRENT_CONTINUATION_AUTHORIZATION_RULESET_REVISION = (
+    "scene-continuation-authorization-v2"
+)
+
 
 class ProseContinuationPolicyError(ValueError):
     """Raised when a user-facing continuation control is outside its contract."""
@@ -126,6 +140,23 @@ class ProseContinuationPolicy:
         }
 
 
+def authorization_ruleset_requires_refresh(
+    authorization: Mapping[str, Any] | None,
+    *,
+    policy: ProseContinuationPolicy,
+) -> bool:
+    """Return whether an N>0 authorization predates current dispatch rules.
+
+    N=0 never permits an automatic continuation, so changes to the automatic
+    dispatch rules have no authorization effect there.
+    """
+    if not policy.permits_automatic_continuation:
+        return False
+    return str(
+        (authorization or {}).get("authorization_ruleset_revision") or ""
+    ).strip() != CURRENT_CONTINUATION_AUTHORIZATION_RULESET_REVISION
+
+
 @dataclass(frozen=True)
 class ProseBudgetCoverage:
     """A side-effect-free, conservative chapter-coverage estimate."""
@@ -156,6 +187,7 @@ class ProseContinuationAuthorization:
 
     policy: ProseContinuationPolicy
     authorization_revision: int
+    authorization_ruleset_revision: str
     content_identity: str
     provider_plan_revision: str
     max_base_calls: int
@@ -176,6 +208,7 @@ class ProseContinuationAuthorization:
         return {
             "policy": self.policy.to_dict(),
             "authorization_revision": self.authorization_revision,
+            "authorization_ruleset_revision": self.authorization_ruleset_revision,
             "content_identity": self.content_identity,
             "provider_plan_revision": self.provider_plan_revision,
             "max_base_calls": self.max_base_calls,
@@ -339,6 +372,9 @@ class ProseAuthorizationModule:
             "protocol_revision": CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
             "policy": policy.to_dict(),
             "authorization_revision": revision,
+            "authorization_ruleset_revision": (
+                CURRENT_CONTINUATION_AUTHORIZATION_RULESET_REVISION
+            ),
             "content_identity": str(content_identity or ""),
             "provider_plan_revision": str(provider_plan_revision or ""),
             "max_base_calls": base_calls,
@@ -358,6 +394,9 @@ class ProseAuthorizationModule:
         return ProseContinuationAuthorization(
             policy=policy,
             authorization_revision=revision,
+            authorization_ruleset_revision=payload[
+                "authorization_ruleset_revision"
+            ],
             content_identity=payload["content_identity"],
             provider_plan_revision=payload["provider_plan_revision"],
             max_base_calls=base_calls,

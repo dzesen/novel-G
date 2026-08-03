@@ -18,6 +18,7 @@ from backend.db.repositories.generation_job_repository import TokenBudgetExceede
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.generation.prose_completion import ProseExecutionPlan
 from backend.services.generation.prose_continuation import (
+    MIN_AUTOMATIC_CONTINUATIONS_BEFORE_DIVERGENCE_STOP,
     SCENE_DIVERGENCE_STOP_FACTOR,
     ProseContinuationPolicy,
 )
@@ -1180,14 +1181,22 @@ async def execute_v3_prose_plan(
             # after planned base calls (which are not automatic continuations)
             # and after the explicit manual branch above, so a user can still
             # choose one manual continuation for a retained incomplete draft.
-            if _scene_hits_divergence_stop_threshold(state):
+            automatic_used = int(state.get("automatic_continuations_used") or 0)
+            divergence_stop_is_authorized = (
+                policy.permits_automatic_continuation
+                and automatic_used
+                >= MIN_AUTOMATIC_CONTINUATIONS_BEFORE_DIVERGENCE_STOP
+            )
+            if (
+                divergence_stop_is_authorized
+                and _scene_hits_divergence_stop_threshold(state)
+            ):
                 state["status"] = "paused"
                 state["pause_reason"] = "prose_scene_divergence_stopped"
                 await publish_progress()
                 pause_reason = state["pause_reason"]
                 break
 
-            automatic_used = int(state.get("automatic_continuations_used") or 0)
             remaining_automatic = (
                 policy.automatic_continuations_per_scene - automatic_used
             )
