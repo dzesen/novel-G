@@ -23,6 +23,12 @@ MIN_CONTINUATION_TARGET_WORDS = 400
 MAX_CONTINUATION_TARGET_WORDS = 5_000
 DEFAULT_CONTINUATION_TARGET_WORDS = 1_000
 
+# Healthy scenes stayed at or below 1.7x their target with repeats no longer
+# than 14 characters, while pathological scenes reached at least 2.5x with
+# 1,884+ replayed characters.  2.0 is the measured gap between them: a
+# centrally-owned safety cutoff, not a user-facing generation control.
+SCENE_DIVERGENCE_STOP_FACTOR = 2.0
+
 
 class ProseContinuationPolicyError(ValueError):
     """Raised when a user-facing continuation control is outside its contract."""

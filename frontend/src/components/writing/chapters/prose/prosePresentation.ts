@@ -28,6 +28,7 @@ const PROSE_REASON_KEYS = {
   continuation_limit_reached: "continuationLimitReached",
   prose_no_progress: "proseNoProgress",
   prose_no_progress_without_quota: "proseNoProgressWithoutQuota",
+  prose_scene_divergence_stopped: "proseSceneDivergenceStopped",
   uncertain_provider_attempt: "uncertainProviderAttempt",
   completion_contract_failed: "completionContractFailed",
 } as const;

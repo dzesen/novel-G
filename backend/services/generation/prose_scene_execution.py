@@ -17,7 +17,10 @@ from backend.llm.models import TokenUsage
 from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.generation.prose_completion import ProseExecutionPlan
-from backend.services.generation.prose_continuation import ProseContinuationPolicy
+from backend.services.generation.prose_continuation import (
+    SCENE_DIVERGENCE_STOP_FACTOR,
+    ProseContinuationPolicy,
+)
 from backend.services.generation.prose_protocol import (
     scene_continuation_seam_window_characters,
 )
@@ -84,6 +87,18 @@ def _scene_target_words(plan: ProseExecutionPlan, scene_index: int) -> int:
 def _scene_minimum_words(plan: ProseExecutionPlan, scene_index: int) -> int:
     return math.ceil(
         _scene_target_words(plan, scene_index) * plan.minimum_completion_ratio
+    )
+
+
+def _scene_hits_divergence_stop_threshold(state: Mapping[str, Any]) -> bool:
+    """Return whether incomplete prose has crossed the measured safety cutoff."""
+    try:
+        effective_word_count = max(0, int(state.get("effective_word_count") or 0))
+        scene_target_words = max(1, int(state.get("scene_target_words") or 0))
+    except (TypeError, ValueError):
+        return False
+    return effective_word_count >= math.ceil(
+        scene_target_words * SCENE_DIVERGENCE_STOP_FACTOR
     )
 
 
@@ -1134,6 +1149,17 @@ async def execute_v3_prose_plan(
                     prompt_mode="base",
                 )
                 continue
+
+            # This safety stop consumes no more automatic quota. It comes
+            # after planned base calls (which are not automatic continuations)
+            # and after the explicit manual branch above, so a user can still
+            # choose one manual continuation for a retained incomplete draft.
+            if _scene_hits_divergence_stop_threshold(state):
+                state["status"] = "paused"
+                state["pause_reason"] = "prose_scene_divergence_stopped"
+                await publish_progress()
+                pause_reason = state["pause_reason"]
+                break
 
             automatic_used = int(state.get("automatic_continuations_used") or 0)
             remaining_automatic = (

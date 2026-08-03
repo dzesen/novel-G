@@ -171,6 +171,13 @@ export default function StartJobDialog({
             count: Number(issue.details.chapter_count ?? 0),
           }),
         };
+      case "prose_scene_divergence_protection":
+        return {
+          title: t("readinessIssueDivergenceProtectionTitle"),
+          body: t("readinessIssueDivergenceProtectionBody", {
+            factor: Number(issue.details.stop_factor ?? 0),
+          }),
+        };
       case "automatic_continuations_require_confirmation":
         return {
           title: t("readinessIssueAutomaticConfirmationTitle"),

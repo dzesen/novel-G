@@ -15,6 +15,7 @@ from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
 from backend.services.generation.prose_continuation import (
+    SCENE_DIVERGENCE_STOP_FACTOR,
     ProseContinuationPolicy,
     prose_authorization_module,
 )
@@ -430,6 +431,18 @@ class GenerationReadinessModule:
             and prose_authorization.get("max_base_calls")
         )
         if automatic_requested:
+            issues.append(
+                _issue(
+                    "prose_scene_divergence_protection",
+                    "warning",
+                    details={
+                        "counting_basis": "effective_word_count",
+                        "stop_factor": SCENE_DIVERGENCE_STOP_FACTOR,
+                        "manual_continuation_allowed": True,
+                    },
+                    action_codes=["review_prose_plan"],
+                )
+            )
             issues.append(
                 _issue(
                     "automatic_continuations_require_confirmation",
