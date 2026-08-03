@@ -45,12 +45,11 @@ class JobEngineDeps:
 
 
 def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
-    return {
+    progress = {
         "chapter_id": outcome.chapter_id, "order_index": outcome.order_index,
         "steps_done": outcome.steps_done, "steps_skipped": outcome.steps_skipped,
         "agents_used": outcome.agents_used,
         "tokens": outcome.tokens, "consistency_issues": outcome.consistency_issues,
-        "outline_adherence": outcome.outline_adherence,
         "facts_added": outcome.facts_added, "threads_advanced": outcome.threads_advanced,
         "summary_written": outcome.summary_written, "dropped_ids": outcome.dropped_ids,
         "truncations": outcome.truncations,
@@ -60,6 +59,11 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "prose_completion": dict(outcome.prose_completion),
         "completed_at": get_utc_now(),
     }
+    # An incomplete prose run stops before the adherence review.  Do not persist
+    # its default empty object as if it were a completed review.
+    if outcome.outline_adherence:
+        progress["outline_adherence"] = outcome.outline_adherence
+    return progress
 
 
 def _incomplete_prose_checkpoint(

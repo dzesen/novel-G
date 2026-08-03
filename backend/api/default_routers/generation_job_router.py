@@ -26,6 +26,20 @@ router = APIRouter(
 )
 
 _ID_FIELDS = ("_id", "novel_id", "volume_id", "current_chapter_id")
+_OUTLINE_ADHERENCE_VERDICTS = frozenset(("pass", "warn", "fail"))
+
+
+def _serialize_outline_adherence(value: Any) -> Optional[Dict[str, Any]]:
+    """Return only a usable historical adherence review for API consumers."""
+    if not isinstance(value, dict):
+        return None
+    verdict = value.get("verdict")
+    if not isinstance(verdict, str) or verdict not in _OUTLINE_ADHERENCE_VERDICTS:
+        return None
+    review = dict(value)
+    if not isinstance(review.get("issues"), list):
+        review["issues"] = []
+    return review
 
 
 def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -35,9 +49,20 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     for f in _ID_FIELDS:
         if out.get(f) is not None:
             out[f] = str(out[f])
-    for entry in out.get("progress", []):
+    progress: list[Dict[str, Any]] = []
+    for raw_entry in out.get("progress", []):
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
         if entry.get("chapter_id") is not None:
             entry["chapter_id"] = str(entry["chapter_id"])
+        review = _serialize_outline_adherence(entry.get("outline_adherence"))
+        if review is None:
+            entry.pop("outline_adherence", None)
+        else:
+            entry["outline_adherence"] = review
+        progress.append(entry)
+    out["progress"] = progress
     out["diagnostics"] = infer_job_diagnostics(out)
     return out
 

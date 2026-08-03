@@ -3,7 +3,7 @@
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./batchTypes";
-import { buildChapterPresentation } from "./batchPresentation";
+import { buildChapterPresentation, outlineAdherenceForDisplay } from "./batchPresentation";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
 
@@ -111,7 +111,7 @@ function ChapterCard({
 }) {
   const t = useTranslations("writing.batch");
   const hasConflict = progress.consistency_issues.length > 0;
-  const adherence = progress.outline_adherence;
+  const adherence = outlineAdherenceForDisplay(progress.outline_adherence);
   const hasOutlineDeviation = adherence?.verdict === "fail";
   const presentation = buildChapterPresentation(progress);
   const proseWordCount = checkpointWordCountPresentation(progress.prose_completion);

@@ -1,6 +1,8 @@
 import type {
   ChapterProgress,
   GenerationNotice,
+  OutlineAdherenceIssue,
+  OutlineAdherenceReview,
   StepOutcome,
   StepOutcomeStatus,
 } from "./batchTypes.ts";
@@ -55,6 +57,66 @@ function asCounts(value: unknown): Record<string, number> {
       .map(([key, raw]) => [key, Number(raw)] as const)
       .filter(([, count]) => Number.isFinite(count) && count >= 0),
   );
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function isOutlineAdherenceIssue(value: unknown): value is OutlineAdherenceIssue {
+  const issue = asRecord(value);
+  if (!issue) return false;
+  return (
+    (issue.severity === "warning" || issue.severity === "error")
+    && (
+      issue.category === "scene_coverage"
+      || issue.category === "scene_order"
+      || issue.category === "core_conflict"
+      || issue.category === "ending_hook"
+      || issue.category === "unplanned_major_event"
+      || issue.category === "volume_arc"
+    )
+    && typeof issue.outline_requirement === "string"
+    && typeof issue.prose_evidence === "string"
+    && typeof issue.explanation === "string"
+  );
+}
+
+function isSceneCoverage(
+  value: unknown,
+): value is OutlineAdherenceReview["scene_coverage"][number] {
+  const scene = asRecord(value);
+  return Boolean(
+    scene
+    && typeof scene.scene_index === "number"
+    && (scene.status === "covered" || scene.status === "partial" || scene.status === "missing")
+    && typeof scene.evidence === "string",
+  );
+}
+
+/**
+ * Old checkpoints can contain the default `{}` when generation stopped before
+ * the adherence step.  An absent review is not a failed review and must not
+ * be rendered as one.
+ */
+export function outlineAdherenceForDisplay(
+  value: unknown,
+): OutlineAdherenceReview | null {
+  const review = asRecord(value);
+  if (!review) return null;
+  const verdict = review.verdict;
+  if (verdict !== "pass" && verdict !== "warn" && verdict !== "fail") return null;
+  return {
+    verdict,
+    summary: typeof review.summary === "string" ? review.summary : "",
+    scene_coverage: Array.isArray(review.scene_coverage)
+      ? review.scene_coverage.filter(isSceneCoverage)
+      : [],
+    issues: Array.isArray(review.issues)
+      ? review.issues.filter(isOutlineAdherenceIssue)
+      : [],
+  };
 }
 
 function legacyStepBadges(progress: ChapterProgress): StepBadge[] {
