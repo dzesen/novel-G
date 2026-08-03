@@ -504,6 +504,7 @@ async def execute_prose_plan(
     continuation_policy: ProseContinuationPolicy | None = None,
     confirm_uncertain_retry: bool = False,
     manual_continuation: bool = False,
+    stop_after_scene_index: int | None = None,
     on_delta: DeltaCallback | None = None,
     on_segment: SegmentCallback | None = None,
     on_scene_progress: Callable[
@@ -533,6 +534,7 @@ async def execute_prose_plan(
             continuation_policy=continuation_policy,
             confirm_uncertain_retry=confirm_uncertain_retry,
             manual_continuation=manual_continuation,
+            stop_after_scene_index=stop_after_scene_index,
             on_delta=on_delta,
             on_segment=on_segment,
             on_scene_progress=on_scene_progress,

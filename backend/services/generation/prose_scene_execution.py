@@ -503,12 +503,17 @@ async def execute_v3_prose_plan(
     continuation_policy: ProseContinuationPolicy | None = None,
     confirm_uncertain_retry: bool = False,
     manual_continuation: bool = False,
+    stop_after_scene_index: int | None = None,
     on_delta: DeltaCallback | None = None,
     on_segment: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None,
     on_scene_progress: SceneProgressCallback | None = None,
 ) -> ProseGenerationResult:
     """Execute v3 with a shared continuation quota for every logical scene."""
     policy = continuation_policy or ProseContinuationPolicy()
+    if stop_after_scene_index is not None and not (
+        0 <= int(stop_after_scene_index) < plan.scene_count
+    ):
+        raise ValueError("stop_after_scene_index must name a planned scene")
     specs = _call_specs(plan)
     base_by_sequence = {spec.sequence_index: spec for spec in specs}
     by_sequence: dict[int, dict[str, Any]] = {}
@@ -972,6 +977,12 @@ async def execute_v3_prose_plan(
             )
 
         if pause_reason is not None:
+            break
+        if (
+            stop_after_scene_index is not None
+            and scene_index >= int(stop_after_scene_index)
+        ):
+            pause_reason = "target_scene_reached"
             break
 
     return _result(
