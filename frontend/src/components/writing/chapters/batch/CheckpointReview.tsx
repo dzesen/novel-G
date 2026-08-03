@@ -49,6 +49,8 @@ function Banner({ job }: { job: GenerationJob }) {
   const tone =
     job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
+      : job.pause_reason === "incomplete_scene"
+        ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
       : "border-border bg-background text-foreground";
   return <div className={`rounded-md border px-3 py-2 text-sm ${tone}`}>{t(key)}</div>;
 }
@@ -269,7 +271,9 @@ export default function CheckpointReview({
   return (
     <div className="grid gap-3 border-b border-border bg-surface-secondary/40 px-4 py-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <h3 className="text-sm font-semibold text-foreground">{t("reviewTitle")}</h3>
+        <h3 className="text-sm font-semibold text-foreground">
+          {t(job.pause_reason === "checkpoint" ? "reviewTitle" : "reviewRecoveryTitle")}
+        </h3>
         <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" size="sm" onPress={onAbort} isDisabled={busy}>
             {t("abort")}
@@ -310,28 +314,41 @@ export default function CheckpointReview({
       </div>
 
       <Banner job={job} />
+      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
+        {job.pause_reason === "incomplete_scene" && job.error?.chapter_id && (
+          <button
+            type="button"
+            onClick={() => onJumpToChapter(job.error!.chapter_id)}
+            className="text-xs font-medium text-accent hover:underline"
+          >
+            {t("incompleteSceneOpenChapter")}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onOpenGenerationRuns}
+          className="text-xs font-medium text-accent hover:underline"
+        >
+          {latestDiagnostic
+            ? t("generationRunsOpenDiagnostic")
+            : t("generationRunsOpen")}
+        </button>
+      </div>
       {controlError && (
         <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
           {t("controlError", { message: controlError })}
         </div>
       )}
       {latestDiagnostic && (
-        <div className="rounded-md border border-border bg-background px-3 py-2">
-          <p className="mb-1 text-xs font-semibold text-foreground">
+        <details className="rounded-md border border-border bg-background px-3 py-2">
+          <summary className="cursor-pointer text-xs font-semibold text-foreground">
             {t("diagnosticsCurrentTitle")}
-          </p>
-          <DiagnosticEventSummary event={latestDiagnostic} />
-        </div>
+          </summary>
+          <div className="mt-2 border-t border-border pt-2">
+            <DiagnosticEventSummary event={latestDiagnostic} />
+          </div>
+        </details>
       )}
-      <button
-        type="button"
-        onClick={onOpenGenerationRuns}
-        className="justify-self-start text-xs font-medium text-accent hover:underline"
-      >
-        {latestDiagnostic
-          ? t("generationRunsOpenDiagnostic")
-          : t("generationRunsOpen")}
-      </button>
       {hasUncertainAttempt && (
         <p className="text-xs leading-5 text-amber-700 dark:text-amber-300">
           {t("uncertainDetail")}

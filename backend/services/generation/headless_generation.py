@@ -214,6 +214,8 @@ async def build_batch_prose_prompt_input_bounds(
         if actual_outline:
             outline_for_context = actual_outline
             outline_for_execution = actual_outline
+            context = assemble_context(context_inputs)
+            context_text = context.to_prompt_text()
         else:
             unknown_outline_chapters += 1
             outline_for_context = _unknown_outline_prompt_envelope()
@@ -223,21 +225,23 @@ async def build_batch_prose_prompt_input_bounds(
                 **outline_for_context,
                 "scenes": [dict(outline_for_context["scenes"][0])],
             }
-        measured_inputs = {
-            **context_inputs,
-            "chapter": {
-                **dict(context_inputs.get("chapter") or {}),
-                "outline": outline_for_context,
-            },
-        }
-        context = assemble_context(measured_inputs)
+            # Validate and truncate the real context under the runtime budget.
+            # The synthetic maximum outline is an authorization envelope, not
+            # persisted content, so append it only to the measured prompt. If
+            # it were inserted into assemble_context it would trip the 8k
+            # runtime guard before a real outline even exists.
+            context = assemble_context(context_inputs)
+            context_text = "\n\n".join(filter(None, (
+                context.to_prompt_text(),
+                f"本章细纲：{outline_for_context}",
+            )))
         target_words = int(
             outline_for_execution.get("target_word_count")
             or novel.get("words_per_chapter")
             or 3_000
         )
         base_prompt = build_prose_base_prompt(
-            context_text=context.to_prompt_text(),
+            context_text=context_text,
             chapter_order=int(chapter.get("order_index") or 0),
             chapter_title=str(chapter.get("title") or ""),
             style_controls=novel.get("style_controls"),

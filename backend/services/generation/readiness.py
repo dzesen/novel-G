@@ -23,6 +23,7 @@ from backend.services.generation.prose_token_bounds import (
     positive_token_limit,
     v3_output_token_bound,
 )
+from backend.services.llm.context_builder import ContextBudgetError
 
 
 class ReadinessBlocked(ValueError):
@@ -349,7 +350,8 @@ class GenerationReadinessModule:
 
         try:
             planning_generation_params = generation_params
-            if has_work and self._deps.prepare_generation_params is not None:
+            needs_prose = work["steps"]["prose"]["generate"] > 0
+            if needs_prose and self._deps.prepare_generation_params is not None:
                 planning_generation_params = await self._deps.prepare_generation_params(
                     novel_id,
                     chapters,
@@ -366,6 +368,21 @@ class GenerationReadinessModule:
                 "config_revision": "",
                 "capability_snapshot": "",
             }
+        except ContextBudgetError as exc:
+            planning = {
+                "attempt_capacity": 0,
+                "providers": [],
+                "config_revision": "",
+                "capability_snapshot": "",
+            }
+            issues.append(
+                _issue(
+                    "generation_context_too_large",
+                    "blocked",
+                    details={"message": str(exc)[:500]},
+                    action_codes=["review_generation_context"],
+                )
+            )
         except Exception as exc:
             planning = {
                 "attempt_capacity": 0,
@@ -768,29 +785,6 @@ def _plan_work_with_prose_continuation(
 
     base = _plan_work(chapters)
     values = dict(generation_params or {})
-    overrides = {
-        key: values[key]
-        for key in (
-            "temperature", "top_p", "max_tokens", "presence_penalty",
-            "frequency_penalty", "system_prompt",
-        )
-        if values.get(key) is not None
-    }
-    runtime_kwargs = (
-        {} if values.get("allow_failure_retry", True)
-        else {"max_provider_retries": 0}
-    )
-    runtime = create_generation_runtime(**runtime_kwargs)
-    prose_plan = runtime.plan_text(
-        WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
-    )
-    # Mirror GenerationRuntime._conservative_token_bound: a per-job max_tokens
-    # override is the effective provider output cap and must be what readiness
-    # displays, even when the provider configuration has no default cap.
-    effective_prose_output_token_limit = (
-        positive_token_limit(overrides.get("max_tokens"))
-        or positive_token_limit(getattr(prose_plan, "max_output_tokens", None))
-    )
     chapters_needing_prose = [
         chapter for chapter in chapters if not _has_text(chapter, "content")
     ]
@@ -821,7 +815,29 @@ def _plan_work_with_prose_continuation(
                 "token_bound_known": False,
             },
         }
-
+    overrides = {
+        key: values[key]
+        for key in (
+            "temperature", "top_p", "max_tokens", "presence_penalty",
+            "frequency_penalty", "system_prompt",
+        )
+        if values.get(key) is not None
+    }
+    runtime_kwargs = (
+        {} if values.get("allow_failure_retry", True)
+        else {"max_provider_retries": 0}
+    )
+    runtime = create_generation_runtime(**runtime_kwargs)
+    prose_plan = runtime.plan_text(
+        WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+    )
+    # Mirror GenerationRuntime._conservative_token_bound: a per-job max_tokens
+    # override is the effective provider output cap and must be what readiness
+    # displays, even when the provider configuration has no default cap.
+    effective_prose_output_token_limit = (
+        positive_token_limit(overrides.get("max_tokens"))
+        or positive_token_limit(getattr(prose_plan, "max_output_tokens", None))
+    )
     capability_plan = prose_completion_module.plan(
         outline={"scenes": [{}]},
         target_word_count=3_000,

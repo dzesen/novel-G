@@ -228,7 +228,7 @@ export default function BatchGenerationPanel({
       {dialog}
       {resumeDialog}
       {leftoverPanel}
-      {generationRunsEntry}
+      {!isResumable(job.status) && generationRunsEntry}
 
       <div className="shrink-0 border-b border-border">
         {isActive(job.status) && (
@@ -274,64 +274,22 @@ export default function BatchGenerationPanel({
         )}
 
         {isResumable(job.status) && (
-          <>
-            {job.pause_reason === "incomplete_scene" && (
-              <section
-                aria-labelledby="incomplete-scene-recovery-title"
-                className="border-b border-amber-200 bg-amber-50/70 px-4 py-3 dark:border-amber-900/60 dark:bg-amber-950/25"
-              >
-                <h3
-                  id="incomplete-scene-recovery-title"
-                  className="text-sm font-semibold text-amber-950 dark:text-amber-100"
-                >
-                  {t("incompleteSceneTitle")}
-                </h3>
-                <p className="mt-1 max-w-3xl text-xs leading-5 text-amber-900/80 dark:text-amber-100/75">
-                  {t("incompleteSceneSummary")}
-                </p>
-                <p className="mt-2 max-w-3xl text-xs leading-5 text-amber-900/80 dark:text-amber-100/75">
-                  {t("incompleteSceneNextSteps")}
-                </p>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {job.error?.chapter_id && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onPress={() => onJumpToChapter(job.error!.chapter_id)}
-                    >
-                      {t("incompleteSceneOpenChapter")}
-                    </Button>
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onPress={() => onOpenGenerationRuns({
-                      jobId: job._id,
-                      chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
-                    })}
-                  >
-                    {t("incompleteSceneOpenRuns")}
-                  </Button>
-                </div>
-              </section>
-            )}
-            <CheckpointReview
-              job={job}
-              titleForChapter={titleForChapter}
-              onJumpToChapter={onJumpToChapter}
-              onNavigateToMemory={onNavigateToMemory}
-              onResume={requestResume}
-              onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
-              onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
-              onAbort={() => setAbortConfirm(true)}
-              busy={controlBusy}
-              controlError={controlError}
-              onOpenGenerationRuns={() => onOpenGenerationRuns({
-                jobId: job._id,
-                chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
-              })}
-            />
-          </>
+          <CheckpointReview
+            job={job}
+            titleForChapter={titleForChapter}
+            onJumpToChapter={onJumpToChapter}
+            onNavigateToMemory={onNavigateToMemory}
+            onResume={requestResume}
+            onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
+            onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
+            onAbort={() => setAbortConfirm(true)}
+            busy={controlBusy}
+            controlError={controlError}
+            onOpenGenerationRuns={() => onOpenGenerationRuns({
+              jobId: job._id,
+              chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
+            })}
+          />
         )}
 
         {isTerminal(job.status) && (

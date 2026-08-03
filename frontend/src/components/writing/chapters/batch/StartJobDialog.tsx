@@ -137,6 +137,11 @@ export default function StartJobDialog({
           title: t("readinessIssueProviderInvalidTitle"),
           body: t("readinessIssueProviderInvalidBody"),
         };
+      case "generation_context_too_large":
+        return {
+          title: t("readinessIssueContextTooLargeTitle"),
+          body: t("readinessIssueContextTooLargeBody"),
+        };
       case "no_generation_work":
         return {
           title: t("readinessIssueNoWorkTitle"),
