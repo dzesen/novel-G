@@ -87,16 +87,29 @@ class ProseCompletion:
     completion_reason: str
     mode: Literal["single_call", "scene_segments"]
     reason_codes: tuple[str, ...]
+    # The raw assembled text remains the authoritative stored prose.  Scene-v3
+    # callers may additionally provide a stricter completion count after
+    # excluding deterministic replay coverage.
+    effective_word_count: int | None = None
 
     @property
     def can_write_formal_prose(self) -> bool:
         return self.status in {"complete", "degraded"}
 
     def to_dict(self) -> dict[str, Any]:
+        effective_words = (
+            self.actual_word_count
+            if self.effective_word_count is None
+            else max(
+                0,
+                min(self.actual_word_count, int(self.effective_word_count)),
+            )
+        )
         return {
             "status": self.status,
             "requested_word_count": self.requested_word_count,
             "actual_word_count": self.actual_word_count,
+            "effective_word_count": effective_words,
             "raw_character_count": self.raw_character_count,
             "scene_count": self.scene_count,
             "completed_scene_count": self.completed_scene_count,
@@ -219,6 +232,7 @@ class ProseCompletionModule:
         outline_revision: str,
         expected_outline_revision: str,
         raw_finish_reason: Any = None,
+        effective_word_count: int | None = None,
     ) -> ProseCompletion:
         normalized_reason = normalize_finish_reason(finish_reason)
         raw_source = finish_reason if raw_finish_reason is None else raw_finish_reason
@@ -245,10 +259,20 @@ class ProseCompletionModule:
             reasons.append("scenes_incomplete")
 
         actual_words = count_chapter_words(text)
+        if effective_word_count is None:
+            completion_words = actual_words
+        else:
+            try:
+                supplied_effective_words = int(effective_word_count)
+            except (TypeError, ValueError):
+                supplied_effective_words = 0
+            # Completion can only become stricter. This defensive bound also
+            # makes the monotonicity contract explicit for all callers.
+            completion_words = max(0, min(actual_words, supplied_effective_words))
         required_words = math.ceil(
             plan.requested_word_count * plan.minimum_completion_ratio
         )
-        if actual_words < required_words:
+        if completion_words < required_words:
             reasons.append("below_minimum_word_ratio")
 
         if "outline_revision_stale" in reasons:
@@ -294,6 +318,7 @@ class ProseCompletionModule:
             completion_reason=completion_reason,
             mode=plan.mode,
             reason_codes=tuple(reasons),
+            effective_word_count=completion_words,
         )
 
 

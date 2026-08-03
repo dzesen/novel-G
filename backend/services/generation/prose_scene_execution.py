@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
 from backend.llm.models import TokenUsage
@@ -38,6 +39,9 @@ from backend.services.novel.chapter_service import count_chapter_words
 SceneProgressCallback = Callable[[tuple[dict[str, Any], ...]], Awaitable[None] | None]
 
 _AUTOMATIC_SEQUENCE_FLOOR = 1_000_000
+# Healthy observed repeats were 10–23 characters, while pathological replays
+# were 230–2,045.  100 is deliberately in that measured gap.
+MIN_REPLAY_CHARACTERS = 100
 _TRUNCATED_OUTPUT_CONTINUATION_MODES = frozenset(
     {"fill", "converge", "final_converge"}
 )
@@ -46,6 +50,13 @@ TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION = (
     " 上一次输出因输出上限被硬截断，可能停在句子中途；"
     "本次必须先把被截断的句子写完，再继续，不得另起新的一拍。"
 )
+
+
+@dataclass(frozen=True)
+class _SceneReplayMeasurement:
+    raw_word_count: int
+    effective_word_count: int
+    replayed_characters_total: int
 
 
 def _scene_target_words(plan: ProseExecutionPlan, scene_index: int) -> int:
@@ -125,15 +136,15 @@ def _deduplicate_exact_seam(existing_text: str, generated_text: str) -> str:
     return generated
 
 
-def _longest_exact_common_substring_characters(
+def _ending_exact_common_substring_lengths(
     earlier_text: str,
     later_text: str,
-) -> int:
-    """Measure an exact cross-call repeat in O(len(earlier) + len(later))."""
+) -> list[int]:
+    """Return the exact-match length ending at every later-text character."""
     earlier = str(earlier_text or "")
     later = str(later_text or "")
     if not earlier or not later:
-        return 0
+        return [0] * len(later)
 
     links = [-1]
     lengths = [0]
@@ -171,7 +182,7 @@ def _longest_exact_common_substring_characters(
 
     state = 0
     matched = 0
-    longest = 0
+    ending_lengths: list[int] = []
     for character in later:
         while state and character not in transitions[state]:
             state = links[state]
@@ -180,11 +191,97 @@ def _longest_exact_common_substring_characters(
         if next_state is None:
             state = 0
             matched = 0
+            ending_lengths.append(0)
             continue
         state = next_state
         matched += 1
-        longest = max(longest, matched)
-    return longest
+        ending_lengths.append(matched)
+    return ending_lengths
+
+
+def _longest_exact_common_substring_characters(
+    earlier_text: str,
+    later_text: str,
+) -> int:
+    """Measure an exact cross-call repeat in O(len(earlier) + len(later))."""
+    return max(
+        _ending_exact_common_substring_lengths(earlier_text, later_text),
+        default=0,
+    )
+
+
+def _merged_character_ranges(
+    ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Merge overlapping half-open character ranges deterministically."""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _replayed_character_ranges(
+    earlier_text: str,
+    later_text: str,
+) -> tuple[tuple[int, int], ...]:
+    """Locate only later-text ranges that exactly replay earlier scene prose."""
+    return _merged_character_ranges(
+        (index - length + 1, index + 1)
+        for index, length in enumerate(
+            _ending_exact_common_substring_lengths(earlier_text, later_text)
+        )
+        if length >= MIN_REPLAY_CHARACTERS
+    )
+
+
+def _exclude_character_ranges(
+    text: str,
+    ranges: Iterable[tuple[int, int]],
+) -> str:
+    """Keep all prose except the exact replay positions used for counting."""
+    cursor = 0
+    kept: list[str] = []
+    for start, end in _merged_character_ranges(ranges):
+        kept.append(text[cursor:start])
+        cursor = end
+    kept.append(text[cursor:])
+    return "".join(kept)
+
+
+def _scene_replay_measurement(
+    scene_segments: Iterable[Mapping[str, Any]],
+) -> _SceneReplayMeasurement:
+    """Measure deterministic replay coverage without modifying stored prose."""
+    raw_parts: list[str] = []
+    effective_parts: list[str] = []
+    replayed_characters_total = 0
+    earlier_text = ""
+    for segment in scene_segments:
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        replayed_ranges = _replayed_character_ranges(earlier_text, text)
+        replayed_characters_total += sum(
+            end - start for start, end in replayed_ranges
+        )
+        raw_parts.append(text)
+        effective_parts.append(_exclude_character_ranges(text, replayed_ranges))
+        earlier_text = "\n\n".join(raw_parts)
+
+    raw_word_count = count_chapter_words("\n\n".join(raw_parts))
+    effective_word_count = count_chapter_words("\n\n".join(effective_parts))
+    # The input text is only ever removed from the effective representation.
+    # Clamp defensively so a future tokenizer change cannot weaken the gate.
+    return _SceneReplayMeasurement(
+        raw_word_count=raw_word_count,
+        effective_word_count=max(0, min(raw_word_count, effective_word_count)),
+        replayed_characters_total=replayed_characters_total,
+    )
 
 
 def _normal_finish_reason(value: Any, raw_value: Any = None) -> tuple[str, str]:
@@ -222,6 +319,7 @@ def _is_safe_pre_dispatch_budget_refusal(segment: Mapping[str, Any]) -> bool:
 def _is_scene_complete(
     *,
     scene_text: str,
+    effective_word_count: int,
     finish_reason: str,
     plan: ProseExecutionPlan,
     scene_index: int,
@@ -231,7 +329,7 @@ def _is_scene_complete(
     return bool(
         finish_reason == "stop"
         and scene_text.strip()
-        and count_chapter_words(scene_text)
+        and max(0, int(effective_word_count))
         >= _scene_minimum_words(plan, scene_index)
     )
 
@@ -296,7 +394,15 @@ def _scene_progress_snapshot(
         if _call_kind(segment, base_count=len(_call_specs(plan))) == "manual"
     )
     scene_text = _scene_text(scene_segments, scene_index=scene_index)
-    state["word_count"] = count_chapter_words(scene_text)
+    replay_measurement = _scene_replay_measurement(scene_segments)
+    # Preserve the established `word_count` contract while making both count
+    # meanings explicit for v3 progress and the stricter completion gate.
+    state["word_count"] = replay_measurement.raw_word_count
+    state["raw_word_count"] = replay_measurement.raw_word_count
+    state["effective_word_count"] = replay_measurement.effective_word_count
+    state["replayed_characters_total"] = (
+        replay_measurement.replayed_characters_total
+    )
     state["scene_target_words"] = _scene_target_words(plan, scene_index)
     converge_segments = [
         segment
@@ -349,6 +455,7 @@ def _scene_progress_snapshot(
 
     if _is_scene_complete(
         scene_text=scene_text,
+        effective_word_count=replay_measurement.effective_word_count,
         finish_reason=str(state.get("last_finish_reason") or "unreported"),
         plan=plan,
         scene_index=scene_index,
@@ -457,6 +564,13 @@ def _result(
         for scene_index in range(plan.scene_count)
         if str((progress_by_scene.get(scene_index) or {}).get("status")) == "complete"
     ]
+    effective_chapter_word_count = sum(
+        max(0, int((progress_by_scene.get(scene_index) or {}).get(
+            "effective_word_count",
+            0,
+        ) or 0))
+        for scene_index in range(plan.scene_count)
+    )
     last = ordered[-1] if ordered else {}
     completion = prose_completion_module.inspect(
         text=text,
@@ -466,6 +580,7 @@ def _result(
         completed_scene_indexes=completed_scene_indexes,
         outline_revision=outline_revision,
         expected_outline_revision=outline_revision,
+        effective_word_count=effective_chapter_word_count,
     )
     usage_items: list[TokenUsage] = []
     for segment in ordered:
@@ -790,8 +905,20 @@ async def execute_v3_prose_plan(
         candidate_text = "\n\n".join(
             part for part in (current_text, contribution) if part
         )
+        candidate_replay_measurement = _scene_replay_measurement(
+            [
+                *previous_scene_segments,
+                {
+                    **checkpoint,
+                    "text": contribution,
+                },
+            ]
+        )
         scene_complete = _is_scene_complete(
             scene_text=candidate_text,
+            effective_word_count=(
+                candidate_replay_measurement.effective_word_count
+            ),
             finish_reason=finish_reason,
             plan=plan,
             scene_index=scene_index,
