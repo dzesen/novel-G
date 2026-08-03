@@ -7,6 +7,11 @@ from typing import Any
 
 TOKENS_PER_WORD_ESTIMATE = 0.65
 MIN_DERIVED_OUTPUT_TOKENS = 256
+# The rendered prompt is counted in UTF-8 bytes, while this fixed allowance
+# covers Provider framing that is not present in the rendered text.  Keeping
+# it here makes the readiness calculation and the dispatch-time reservation
+# share one source of truth.
+PROVIDER_SYSTEM_FRAMING_TOKEN_ALLOWANCE = 1_024
 
 
 def positive_token_limit(value: Any) -> int | None:
@@ -18,6 +23,40 @@ def positive_token_limit(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def conservative_prompt_input_bound(
+    *,
+    prompt: str,
+    system_prompt: str = "",
+) -> int:
+    """Return the input portion of one conservative Provider reservation."""
+    return max(
+        1,
+        len(str(prompt or "").encode("utf-8"))
+        + len(str(system_prompt or "").encode("utf-8"))
+        + PROVIDER_SYSTEM_FRAMING_TOKEN_ALLOWANCE,
+    )
+
+
+def conservative_runtime_token_bound(
+    *,
+    output_token_bound: Any,
+    prompt: str,
+    system_prompt: str = "",
+) -> int | None:
+    """Return the exact conservative formula used before Provider dispatch."""
+    output_limit = positive_token_limit(output_token_bound)
+    if output_limit is None:
+        return None
+    return max(
+        1,
+        int(output_limit)
+        + conservative_prompt_input_bound(
+            prompt=prompt,
+            system_prompt=system_prompt,
+        ),
+    )
 
 
 def v3_output_token_bound(

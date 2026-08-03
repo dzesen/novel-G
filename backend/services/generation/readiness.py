@@ -33,6 +33,11 @@ class StaleReadiness(ValueError):
     """用户确认的报告已经不是当前启动快照。"""
 
 
+READINESS_PROSE_PROMPT_INPUT_BOUNDS_KEY = (
+    "_internal_readiness_prose_prompt_input_bounds"
+)
+
+
 @dataclass(frozen=True)
 class ReadinessDeps:
     load_resource_counts: Callable[[str], Awaitable[dict[str, int]]]
@@ -41,6 +46,10 @@ class ReadinessDeps:
         [list[dict[str, Any]], ProseContinuationPolicy, Mapping[str, Any] | None],
         dict[str, Any],
     ]
+    prepare_generation_params: Callable[
+        [str, list[dict[str, Any]], ProseContinuationPolicy, Mapping[str, Any] | None],
+        Awaitable[Mapping[str, Any] | None],
+    ] | None = None
 
 
 def _jsonable(value: Any) -> Any:
@@ -339,7 +348,19 @@ class GenerationReadinessModule:
             )
 
         try:
-            planning = self._deps.plan_work(chapters, continuation_policy, generation_params) if has_work else {
+            planning_generation_params = generation_params
+            if has_work and self._deps.prepare_generation_params is not None:
+                planning_generation_params = await self._deps.prepare_generation_params(
+                    novel_id,
+                    chapters,
+                    continuation_policy,
+                    generation_params,
+                )
+            planning = self._deps.plan_work(
+                chapters,
+                continuation_policy,
+                planning_generation_params,
+            ) if has_work else {
                 "attempt_capacity": 0,
                 "providers": [],
                 "config_revision": "",
@@ -578,6 +599,30 @@ async def _inspect_active_proposal(novel_id: str) -> dict[str, Any] | None:
     return await reference_card_curation_service.inspect(novel_id)
 
 
+async def _prepare_generation_params(
+    novel_id: str,
+    chapters: list[dict[str, Any]],
+    policy: ProseContinuationPolicy,
+    generation_params: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    """Attach trusted scalar prompt bounds for the read-only planning pass."""
+    from backend.services.generation.headless_generation import (
+        build_batch_prose_prompt_input_bounds,
+    )
+
+    return {
+        **dict(generation_params or {}),
+        READINESS_PROSE_PROMPT_INPUT_BOUNDS_KEY: (
+            await build_batch_prose_prompt_input_bounds(
+                novel_id=novel_id,
+                chapters=chapters,
+                policy=policy,
+                generation_params=generation_params,
+            )
+        ),
+    }
+
+
 def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
     from backend.services.generation.headless_generation import (
         CHAPTER_OUTLINE_STEP,
@@ -766,6 +811,9 @@ def _plan_work_with_prose_continuation(
                 "continuation_call_target_words": 0,
                 "base_output_token_bound": 0,
                 "continuation_output_token_bound": 0,
+                "prompt_input_bound_basis": "not_applicable",
+                "base_prompt_input_token_bound": 0,
+                "continuation_prompt_input_token_bound": 0,
                 "conservative_base_token_bound": 0,
                 "conservative_continuation_token_bound": 0,
                 "conservative_token_bound": 0,
@@ -827,14 +875,36 @@ def _plan_work_with_prose_continuation(
     max_context = positive_token_limit(
         getattr(prose_plan, "max_context_tokens", None)
     )
+    raw_prompt_input_bounds = values.get(
+        READINESS_PROSE_PROMPT_INPUT_BOUNDS_KEY
+    )
+    prompt_input_bounds = (
+        dict(raw_prompt_input_bounds)
+        if isinstance(raw_prompt_input_bounds, Mapping)
+        else {}
+    )
+    try:
+        base_prompt_input_bound = max(
+            0,
+            int(prompt_input_bounds.get("base_input_token_bound") or 0),
+        )
+    except (TypeError, ValueError):
+        base_prompt_input_bound = 0
+    try:
+        continuation_prompt_input_bound = max(
+            0,
+            int(prompt_input_bounds.get("continuation_input_token_bound") or 0),
+        )
+    except (TypeError, ValueError):
+        continuation_prompt_input_bound = 0
     conservative_base_token_bound = (
-        int(max_context) + base_output_token_bound + 1_024
-        if max_context is not None
+        base_prompt_input_bound + base_output_token_bound
+        if base_prompt_input_bound > 0
         else 0
     )
     conservative_continuation_token_bound = (
-        int(max_context) + continuation_output_token_bound + 1_024
-        if max_context is not None
+        continuation_prompt_input_bound + continuation_output_token_bound
+        if continuation_prompt_input_bound > 0
         else 0
     )
     conservative_token_bound = max(
@@ -863,6 +933,13 @@ def _plan_work_with_prose_continuation(
             "provider_model": prose_plan.provider_model,
             "max_output_tokens": effective_prose_output_token_limit,
             "max_context_tokens": max_context,
+            "prompt_input_bound_basis": str(
+                prompt_input_bounds.get("basis") or "unavailable"
+            ),
+            "base_prompt_input_token_bound": base_prompt_input_bound,
+            "continuation_prompt_input_token_bound": (
+                continuation_prompt_input_bound
+            ),
             "unknown_outline_chapters": unknown_outline_chapters,
             "unknown_scene_upper_bound": MAX_CHAPTER_OUTLINE_SCENES,
             "maximum_prose_calls": maximum_base_calls,
@@ -891,5 +968,6 @@ generation_readiness_module = GenerationReadinessModule(
         load_resource_counts=_load_resource_counts,
         inspect_active_proposal=_inspect_active_proposal,
         plan_work=_plan_work_with_prose_continuation,
+        prepare_generation_params=_prepare_generation_params,
     )
 )

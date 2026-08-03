@@ -49,6 +49,8 @@ class ChapterOutcome:
     step_outcomes: List[dict] = field(default_factory=list)
     notices: List[dict] = field(default_factory=list)
     prose_completion: Dict[str, Any] = field(default_factory=dict)
+    authorization_recalculation: Dict[str, Any] = field(default_factory=dict)
+    requires_authorization_confirmation: bool = False
 
 
 class ChapterPipelineFailed(RuntimeError):
@@ -96,6 +98,9 @@ class ChapterPipelineDeps:
     accept_state: Callable[[str, dict], Awaitable[dict]]
     review_outline_adherence: (
         Callable[[str, dict], Awaitable[tuple]] | None
+    ) = None
+    recalculate_prose_authorization: (
+        Callable[[str, dict], Awaitable[dict[str, Any]]] | None
     ) = None
 
 
@@ -195,6 +200,25 @@ async def run_chapter(
             outcome.notices.append(remap_notice)
         degraded = _record_truncation(outcome, "outline", truncation) or degraded
         _record_completed_step(outcome, "outline", degraded=degraded)
+        if deps.recalculate_prose_authorization is not None:
+            try:
+                recalculation = await deps.recalculate_prose_authorization(
+                    chapter_id,
+                    result,
+                )
+            except Exception as exc:
+                raise _capture_failure(outcome, "outline", exc) from exc
+            outcome.authorization_recalculation = dict(recalculation or {})
+            if bool(recalculation.get("requires_confirmation")):
+                outcome.requires_authorization_confirmation = True
+                outcome.step_outcomes.append(
+                    step_outcome(
+                        "prose",
+                        "blocked",
+                        "authorization_scope_increased",
+                    )
+                )
+                return outcome
 
     # 2. 正文。headless 生成先持久化 ProseRun 分段；只有完成契约通过后，
     # 批量编排才调用 write_prose 写入正式 chapter.content。

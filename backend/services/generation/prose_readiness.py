@@ -22,6 +22,7 @@ from backend.services.generation.prose_protocol import (
     scene_continuation_seam_window_characters,
 )
 from backend.services.generation.prose_token_bounds import (
+    conservative_prompt_input_bound,
     positive_token_limit,
     v3_output_token_bound,
 )
@@ -117,6 +118,86 @@ def conservative_prose_call_token_bound(
     )
     return max(1, int(output_limit) + input_upper)
 
+
+def runtime_scene_prompt_input_bounds(
+    *,
+    execution_plan: ProseExecutionPlan,
+    policy: ProseContinuationPolicy,
+    base_prompt: str,
+    outline: Mapping[str, Any],
+    generation_kwargs: Mapping[str, Any] | None,
+) -> tuple[int, int]:
+    """Bound the exact v3 rendered prompts before Provider dispatch.
+
+    The executor owns prompt rendering.  Readiness deliberately calls that
+    renderer with the largest possible UTF-8 continuation tail and every
+    continuation mode, then applies the same input formula as
+    ``GenerationRuntime._conservative_token_bound``.  The returned pair is
+    input-only; callers add the target-derived output cap for each call kind.
+    """
+    # Local imports keep this pure module usable by the lightweight readiness
+    # tools without creating a module-import cycle at startup.
+    from backend.services.generation.prose_generation import _call_specs
+    from backend.services.generation.prose_scene_execution import _scene_prompt
+
+    normalized_outline = dict(outline or {})
+    system_prompt = str(dict(generation_kwargs or {}).get("system_prompt") or "")
+    maximum_tail_characters = max(
+        scene_continuation_seam_window_characters(target_words)
+        for target_words in (execution_plan.segment_budgets or (1,))
+    )
+    # A scalar can occupy four UTF-8 bytes.  The actual tail is clipped by the
+    # executor to this character count, so this covers every possible prose
+    # tail without pretending a Provider context window will always be used.
+    maximum_tail = "\U0001f600" * maximum_tail_characters
+
+    base_inputs: list[int] = []
+    for spec in _call_specs(execution_plan):
+        prompt = _scene_prompt(
+            plan=execution_plan,
+            base_prompt=base_prompt,
+            outline=normalized_outline,
+            scene_index=int(spec.scene_index),
+            target_words=int(spec.target_words),
+            prior_text=maximum_tail,
+            prompt_mode="base",
+        )
+        base_inputs.append(
+            conservative_prompt_input_bound(
+                prompt=prompt,
+                system_prompt=system_prompt,
+            )
+        )
+
+    continuation_inputs: list[int] = []
+    for scene_index in range(max(1, int(execution_plan.scene_count))):
+        for prompt_mode in (
+            "fill",
+            "converge",
+            "final_converge",
+            "recovery",
+            "final_recovery",
+            "manual",
+            "uncertain_retry",
+        ):
+            prompt = _scene_prompt(
+                plan=execution_plan,
+                base_prompt=base_prompt,
+                outline=normalized_outline,
+                scene_index=scene_index,
+                target_words=policy.continuation_target_words,
+                prior_text=maximum_tail,
+                prompt_mode=prompt_mode,
+                continues_truncated_output=True,
+            )
+            continuation_inputs.append(
+                conservative_prompt_input_bound(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                )
+            )
+    return max(base_inputs or [1]), max(continuation_inputs or [1])
+
 @dataclass(frozen=True)
 class ProseReadiness:
     execution_plan: ProseExecutionPlan
@@ -156,10 +237,6 @@ def build_prose_readiness(
 ) -> ProseReadiness:
     provider_identity = _provider_identity(generation_plan)
     maximum_base_call_target = max(execution_plan.segment_budgets or (1,))
-    maximum_seam_tail_characters = max(
-        scene_continuation_seam_window_characters(target_words)
-        for target_words in (execution_plan.segment_budgets or (1,))
-    )
     inherited_max_tokens = dict(generation_kwargs or {}).get("max_tokens")
     base_output_token_bound = v3_output_token_bound(
         target_words=maximum_base_call_target,
@@ -173,24 +250,25 @@ def build_prose_readiness(
         generation_plan=generation_plan,
         generation_kwargs=generation_kwargs,
     )
-    conservative_base_token_bound = conservative_prose_call_token_bound(
-        base_prompt=base_prompt,
-        outline=outline,
-        generation_kwargs=generation_kwargs,
-        output_token_bound=(
-            base_output_token_bound if output_bound_known else None
-        ),
-        seam_tail_characters=maximum_seam_tail_characters,
-    )
-    conservative_continuation_token_bound = conservative_prose_call_token_bound(
-        base_prompt=base_prompt,
-        outline=outline,
-        generation_kwargs=generation_kwargs,
-        output_token_bound=(
-            continuation_output_token_bound if output_bound_known else None
-        ),
-        seam_tail_characters=maximum_seam_tail_characters,
-    )
+    if output_bound_known:
+        base_input_bound, continuation_input_bound = (
+            runtime_scene_prompt_input_bounds(
+                execution_plan=execution_plan,
+                policy=policy,
+                base_prompt=base_prompt,
+                outline=outline,
+                generation_kwargs=generation_kwargs,
+            )
+        )
+        conservative_base_token_bound = (
+            base_output_token_bound + base_input_bound
+        )
+        conservative_continuation_token_bound = (
+            continuation_output_token_bound + continuation_input_bound
+        )
+    else:
+        conservative_base_token_bound = None
+        conservative_continuation_token_bound = None
     token_bound_known = (
         conservative_base_token_bound is not None
         and conservative_continuation_token_bound is not None

@@ -20,6 +20,7 @@ from backend.llm.prompts.prompt_selector import (
 )
 from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineAdherenceResultSchema,
+    MAX_CHAPTER_OUTLINE_SCENES,
 )
 from backend.services.llm.context_builder import (
     assemble_context,
@@ -118,6 +119,156 @@ def _continuation_policy(
     return ProseContinuationPolicy.from_mapping(
         dict(generation_params or {}).get("prose_continuation_policy")
     )
+
+
+def build_prose_base_prompt(
+    *,
+    context_text: str,
+    chapter_order: int,
+    chapter_title: str,
+    style_controls: Mapping[str, Any] | None,
+    words_per_chapter: int,
+) -> str:
+    """Render the exact stable base text shared by prose execution/readiness.
+
+    This is deliberately pure: preflight can use it to measure the same
+    request shape without constructing an LLM runtime or crossing the Provider
+    boundary.
+    """
+    prompts = load_prompt_config().get(PROSE_PROMPT_NAME, {})
+    return apply_agent_profile(
+        "chapter_writer",
+        prompts[f"{PROSE_STEP}_prompt_base"].format(
+            context=str(context_text or ""),
+            chapter_order=int(chapter_order or 0),
+            chapter_title=str(chapter_title or ""),
+            style_controls=render_style_controls(style_controls),
+            words_per_chapter=max(1, int(words_per_chapter or 1)),
+        )
+        + "\n" + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"],
+    )
+
+
+def _unknown_outline_prompt_envelope() -> dict[str, Any]:
+    """Return the schema-sized, content-free upper envelope for one outline.
+
+    An outline is not available until its own accepted write has occurred.
+    Until then the initial authorization must cover the bounded schema shape;
+    after acceptance the job recalculates from the real scene list and can only
+    narrow its existing authority without a new confirmation.
+    """
+    widest = "\U0001f600"
+    scene = {
+        "summary": widest * 500,
+        "purpose": widest * 200,
+    }
+    return {
+        "pov_character_card_id": None,
+        "present_character_card_ids": [],
+        "mentioned_character_card_ids": [],
+        "referenced_worldbook_card_ids": [],
+        "scenes": [dict(scene) for _ in range(MAX_CHAPTER_OUTLINE_SCENES)],
+        "core_conflict": widest * 500,
+        "ending_hook": widest * 500,
+        "target_word_count": 50_000,
+        "threads_resolved": [],
+    }
+
+
+async def build_batch_prose_prompt_input_bounds(
+    *,
+    novel_id: str,
+    chapters: list[dict[str, Any]],
+    policy: ProseContinuationPolicy,
+    generation_params: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Measure the largest rendered v3 prompt shape without Provider calls.
+
+    Only scalar upper bounds leave this function.  It never returns prompt,
+    prose, credentials, or a Provider adapter.  Known outlines use the exact
+    context and scene data that dispatch will render; missing outlines use the
+    bounded schema envelope until the post-acceptance reconciliation can make
+    the authorization narrower.
+    """
+    from backend.services.generation.prose_readiness import (
+        runtime_scene_prompt_input_bounds,
+    )
+
+    values = dict(generation_params or {})
+    overrides, runtime_kwargs = _generation_options(values)
+    runtime = create_generation_runtime(**runtime_kwargs)
+    prose_plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
+    novel = await novel_repo.get_novel_by_id(novel_id)
+
+    base_inputs: list[int] = []
+    continuation_inputs: list[int] = []
+    unknown_outline_chapters = 0
+    for chapter in chapters:
+        if str(chapter.get("content") or "").strip():
+            continue
+        chapter_id = str(chapter.get("_id") or "")
+        if not chapter_id:
+            raise ValueError("readiness cannot measure a chapter without an id")
+        context_inputs = await fetch_context_inputs(novel_id, chapter_id)
+        actual_outline = dict((context_inputs.get("chapter") or {}).get("outline") or {})
+        if actual_outline:
+            outline_for_context = actual_outline
+            outline_for_execution = actual_outline
+        else:
+            unknown_outline_chapters += 1
+            outline_for_context = _unknown_outline_prompt_envelope()
+            # The base-call output cap must cover a one-scene, max-word outline;
+            # the separate planning layer still retains the 20-scene call count.
+            outline_for_execution = {
+                **outline_for_context,
+                "scenes": [dict(outline_for_context["scenes"][0])],
+            }
+        measured_inputs = {
+            **context_inputs,
+            "chapter": {
+                **dict(context_inputs.get("chapter") or {}),
+                "outline": outline_for_context,
+            },
+        }
+        context = assemble_context(measured_inputs)
+        target_words = int(
+            outline_for_execution.get("target_word_count")
+            or novel.get("words_per_chapter")
+            or 3_000
+        )
+        base_prompt = build_prose_base_prompt(
+            context_text=context.to_prompt_text(),
+            chapter_order=int(chapter.get("order_index") or 0),
+            chapter_title=str(chapter.get("title") or ""),
+            style_controls=novel.get("style_controls"),
+            words_per_chapter=target_words,
+        )
+        execution_plan = prose_completion_module.plan(
+            outline=outline_for_execution,
+            target_word_count=target_words,
+            provider_capability={
+                "max_output_tokens": prose_plan.max_output_tokens,
+                "model": prose_plan.provider_model,
+            },
+            request_overrides=overrides,
+        )
+        base_input, continuation_input = runtime_scene_prompt_input_bounds(
+            execution_plan=execution_plan,
+            policy=policy,
+            base_prompt=base_prompt,
+            outline=outline_for_context,
+            generation_kwargs=overrides,
+        )
+        base_inputs.append(base_input)
+        continuation_inputs.append(continuation_input)
+
+    return {
+        "basis": "v3_rendered_prompt_utf8_plus_provider_framing",
+        "base_input_token_bound": max(base_inputs or [0]),
+        "continuation_input_token_bound": max(continuation_inputs or [0]),
+        "measured_prose_chapter_count": len(base_inputs),
+        "unknown_outline_chapter_count": unknown_outline_chapters,
+    }
 
 
 def estimate_chapter_attempt_slots(
@@ -332,17 +483,12 @@ async def generate_prose(
     # 同一处注释。
     novel = await novel_repo.get_novel_by_id(novel_id)
     words = outline.get("target_word_count") or novel.get("words_per_chapter") or 3000
-    prompts = load_prompt_config().get(PROSE_PROMPT_NAME, {})
-    prompt = apply_agent_profile(
-        "chapter_writer",
-        prompts[f"{PROSE_STEP}_prompt_base"].format(
-            context=context.to_prompt_text(),
-            chapter_order=int(chapter.get("order_index") or 0),
-            chapter_title=str(chapter.get("title") or ""),
-            style_controls=render_style_controls(novel.get("style_controls")),
-            words_per_chapter=words,
-        )
-        + "\n" + prompts[f"{PROSE_STEP}_prompt_without_schema_suffix"]
+    prompt = build_prose_base_prompt(
+        context_text=context.to_prompt_text(),
+        chapter_order=int(chapter.get("order_index") or 0),
+        chapter_title=str(chapter.get("title") or ""),
+        style_controls=novel.get("style_controls"),
+        words_per_chapter=int(words),
     )
     gen_kwargs, runtime_kwargs = _generation_options(generation_params)
     continuation_policy = _continuation_policy(generation_params)
@@ -731,6 +877,9 @@ def build_chapter_pipeline_deps(
     attempt_scope_factory: Callable[[str], AttemptScope] | None = None,
     *,
     generation_params: Mapping[str, Any] | None = None,
+    recalculate_prose_authorization: (
+        Callable[[str, dict[str, Any]], Any] | None
+    ) = None,
 ) -> ChapterPipelineDeps:
     def scope(step: str) -> AttemptScope | None:
         return attempt_scope_factory(step) if attempt_scope_factory is not None else None
@@ -760,5 +909,8 @@ def build_chapter_pipeline_deps(
             scope("state"),
             generation_params,
         ),
-        accept_outline=_accept_outline, write_prose=_write_prose, accept_state=_accept_state,
+        accept_outline=_accept_outline,
+        write_prose=_write_prose,
+        accept_state=_accept_state,
+        recalculate_prose_authorization=recalculate_prose_authorization,
     )

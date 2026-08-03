@@ -21,6 +21,9 @@ from backend.llm.exceptions import (
 from backend.llm.models import TokenUsage
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 from backend.config.workflow_catalog import get_workflow_step_definition
+from backend.services.generation.prose_token_bounds import (
+    conservative_runtime_token_bound,
+)
 
 
 class StructuredOutputMode(str, Enum):
@@ -420,18 +423,10 @@ class GenerationRuntime:
         output_limit = _positive_int(gen_kwargs.get("max_tokens"))
         if output_limit is None:
             output_limit = plan.max_output_tokens
-        if output_limit is None:
-            return None
-        # UTF-8 bytes are a deliberately conservative upper estimate for the
-        # user-visible prompt; retain a fixed allowance for provider/system
-        # framing that is not represented in the rendered prompt.
-        system_prompt = str(gen_kwargs.get("system_prompt") or "")
-        return max(
-            1,
-            int(output_limit)
-            + len(str(prompt).encode("utf-8"))
-            + len(system_prompt.encode("utf-8"))
-            + 1024,
+        return conservative_runtime_token_bound(
+            output_token_bound=output_limit,
+            prompt=prompt,
+            system_prompt=str(gen_kwargs.get("system_prompt") or ""),
         )
 
     async def _claim_paid_attempt(

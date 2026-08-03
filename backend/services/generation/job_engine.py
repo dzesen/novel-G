@@ -57,6 +57,7 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
         "step_outcomes": outcome.step_outcomes,
         "notices": outcome.notices,
         "prose_completion": dict(outcome.prose_completion),
+        "authorization_recalculation": dict(outcome.authorization_recalculation),
         "completed_at": get_utc_now(),
     }
     # An incomplete prose run stops before the adherence review.  Do not persist
@@ -336,6 +337,26 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 outcome_to_progress(outcome),
                 tokens_delta=0 if outcome.attempts else outcome.tokens,
             )
+
+            if outcome.requires_authorization_confirmation:
+                await repo.update_job_fields(job_id, {
+                    "status": "paused",
+                    "pause_reason": "authorization_scope_increased",
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                    "authorization_confirmation_required": dict(
+                        outcome.authorization_recalculation
+                    ),
+                    "error": {
+                        "step": "prose",
+                        "chapter_id": outcome.chapter_id,
+                        "message": (
+                            "Accepted outline changed the remaining authorization "
+                            "scope; a fresh readiness confirmation is required"
+                        ),
+                    },
+                })
+                return
 
             # 暂停判定（顺序：细纲偏离 > 事实冲突 > 提醒 > 手动 > 计划检查点）。
             if outcome.requires_outline_pause:

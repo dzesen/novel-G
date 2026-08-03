@@ -122,6 +122,7 @@ def _new_job_doc(
         "usage_attempt_summaries": [],
         "attempt_slots": [],
         "attempt_reservation": None,
+        "authorization_confirmation_required": None,
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
         "confirm_uncertain_prose_retry": False,
@@ -202,6 +203,121 @@ class GenerationJobService:
         return False
 
     @staticmethod
+    async def _recalculate_after_outline_acceptance(
+        job_id: str,
+        chapter_id: str,
+    ) -> dict[str, Any]:
+        """Narrow a running job after its real scene count becomes known.
+
+        An outline acceptance is already an authorized normal write.  The
+        follow-up calculation is read-only until it proves every relevant call
+        and token ceiling is no larger than the existing authorization.  A
+        larger or newly-unacknowledged scope is returned to the engine for a
+        pause; it is never persisted as an implicit expansion.
+        """
+        job = await generation_job_repo.get_job(job_id)
+        authorization = dict(job.get("prose_continuation_authorization") or {})
+        current_revision = max(
+            int(job.get("authorization_revision") or 0),
+            int(authorization.get("authorization_revision") or 0),
+        )
+        if job.get("scope") == "book":
+            chapters = await get_book_worklist(
+                str(job["novel_id"]),
+                include_content=True,
+            )
+        else:
+            chapters = await ChapterService.get_chapters_by_volume(
+                str(job["volume_id"]),
+                include_content=True,
+            )
+            chapters = await state_completion_module.attach_many(chapters)
+        if not any(str(item.get("_id") or "") == str(chapter_id) for item in chapters):
+            raise ValueError("accepted outline chapter is outside the generation job")
+
+        policy = ProseContinuationPolicy.from_mapping(
+            authorization.get("policy")
+            or (job.get("generation_params") or {}).get(
+                "prose_continuation_policy"
+            )
+        )
+        generation_params = {
+            **dict(job.get("generation_params") or {}),
+            "prose_continuation_policy": policy.to_dict(),
+        }
+        report = await generation_readiness_module.inspect(
+            novel_id=str(job["novel_id"]),
+            scope=str(job["scope"]),
+            volume_id=(
+                str(job["volume_id"])
+                if job.get("volume_id") is not None
+                else None
+            ),
+            chapters=chapters,
+            prose_continuation_policy=policy,
+            token_budget=job.get("token_budget"),
+            generation_params=generation_params,
+            authorization_revision=max(1, current_revision),
+        )
+        candidate = dict(
+            (report.get("planning") or {}).get(
+                "prose_continuation_authorization"
+            ) or {}
+        )
+        authorized_scope = _authorization_scope(authorization)
+        candidate_scope = _authorization_scope(candidate)
+        exceeded_fields = _authorization_scope_increases(
+            authorized=authorization,
+            candidate=candidate,
+        )
+        previously_acknowledged = set(
+            str(code)
+            for code in list((job.get("readiness") or {}).get(
+                "acknowledged_warning_codes"
+            ) or [])
+        )
+        new_acknowledgements = sorted(
+            str(issue.get("code") or "")
+            for issue in list(report.get("issues") or [])
+            if issue.get("level") == "warning_requires_ack"
+            and str(issue.get("code") or "") not in previously_acknowledged
+        )
+        blocked = [
+            str(issue.get("code") or "")
+            for issue in list(report.get("issues") or [])
+            if issue.get("level") == "blocked"
+        ]
+        recalculation = {
+            "chapter_id": str(chapter_id),
+            "authorization_revision": max(1, current_revision),
+            "authorized_scope": authorized_scope,
+            "candidate_scope": candidate_scope,
+            "exceeded_fields": exceeded_fields,
+            "new_acknowledgement_codes": new_acknowledgements,
+            "blocked_issue_codes": blocked,
+        }
+        if not candidate or exceeded_fields or new_acknowledgements or blocked:
+            return {
+                **recalculation,
+                "status": "confirmation_required",
+                "requires_confirmation": True,
+            }
+
+        await generation_job_repo.update_job_fields(job_id, {
+            "prose_continuation_authorization": candidate,
+            "readiness_recalculation": {
+                **recalculation,
+                "status": "narrowed_or_unchanged",
+                "requires_confirmation": False,
+            },
+        })
+        return {
+            **recalculation,
+            "status": "narrowed_or_unchanged",
+            "requires_confirmation": False,
+        }
+
+    @staticmethod
     def _spawn(job_id: str, control: JobControl) -> None:
         """在当前事件循环拉起后台任务并记入注册表。测试用 monkeypatch 换成 no-op。
 
@@ -259,6 +375,13 @@ class GenerationJobService:
                     ),
                 ),
                 generation_params=generation_params,
+                recalculate_prose_authorization=(
+                    lambda accepted_chapter_id, _outline:
+                    GenerationJobService._recalculate_after_outline_acceptance(
+                        job_id,
+                        accepted_chapter_id,
+                    )
+                ),
             )
             try:
                 return await run_chapter(
