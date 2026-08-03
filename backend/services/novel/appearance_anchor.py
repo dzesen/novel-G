@@ -231,11 +231,14 @@ class AppearanceAnchorSchema(BaseModel):
     @field_validator("established_at", mode="after")
     @classmethod
     def normalize_established_at(cls, value: datetime) -> datetime:
-        normalized = value
-        if normalized.tzinfo is not None:
-            normalized = normalized.astimezone(timezone.utc).replace(tzinfo=None)
-        # BSON datetimes round-trip at millisecond precision and are decoded
-        # without tzinfo by the project's Mongo client. Normalize before CAS.
+        normalized = (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+        # BSON datetimes round-trip at millisecond precision. Keep the UTC
+        # offset as well, so client decoding, CAS, and API serialization all
+        # describe the same instant unambiguously.
         return normalized.replace(
             microsecond=(normalized.microsecond // 1000) * 1000
         )

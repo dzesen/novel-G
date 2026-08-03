@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from datetime import timezone
+
 from pymongo import AsyncMongoClient
 from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import ConnectionFailure
@@ -49,7 +51,15 @@ async def connect_to_mongo():
         logger.info("MongoDB config changed, reconnecting client.")
 
     mongo_uri, _, timeout_ms = connection_settings
-    next_client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=timeout_ms)
+    # BSON 日期本身代表 UTC 时间点；若不启用 tz_aware，PyMongo 读回的是
+    # 无时区 datetime，FastAPI 会序列化成没有偏移的字符串，浏览器随后会把
+    # 它误解成本地时间。保持库内 UTC 存储，同时让读取端保留 +00:00 偏移。
+    next_client = AsyncMongoClient(
+        mongo_uri,
+        serverSelectionTimeoutMS=timeout_ms,
+        tz_aware=True,
+        tzinfo=timezone.utc,
+    )
     try:
         # 连接对象是惰性的，主动 ping 可以在启动期暴露配置或网络错误。
         await next_client.admin.command("ping")
