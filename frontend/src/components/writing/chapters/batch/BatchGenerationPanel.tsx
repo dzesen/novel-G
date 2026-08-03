@@ -16,6 +16,7 @@ import {
 } from "./batchTypes";
 import { useGenerationJob } from "./useGenerationJob";
 import StartJobDialog from "./StartJobDialog";
+import ResumeJobDialog, { isResumeReadinessRequired } from "./ResumeJobDialog";
 import CheckpointReview from "./CheckpointReview";
 import LeftoverProseRuns from "./LeftoverProseRuns";
 
@@ -57,6 +58,7 @@ export default function BatchGenerationPanel({
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [abortConfirm, setAbortConfirm] = useState(false);
+  const [resumeReviewOpen, setResumeReviewOpen] = useState(false);
   const [dismissed, setDismissed] = useState<string | null>(null); // 已关闭的终态作业 id
 
 
@@ -92,11 +94,27 @@ export default function BatchGenerationPanel({
       const next = await apiPost<GenerationJob>(`/api/generation-jobs/${job._id}/${action}`, body);
       setJob(next);
     } catch (err) {
+      if (action === "resume" && isResumeReadinessRequired(err)) {
+        setResumeReviewOpen(true);
+        return;
+      }
       // resume 可能 409（别处有在跑作业）；原样展示（设计 §7.4）。
       setControlError(err instanceof Error ? err.message : String(err));
     } finally {
       setControlBusy(false);
     }
+  };
+
+  const requestResume = () => {
+    if (!job) return;
+    if (
+      job.pause_reason === "cost_cap"
+      || job.pause_reason === "authorization_scope_increased"
+    ) {
+      setResumeReviewOpen(true);
+      return;
+    }
+    void control("resume");
   };
 
   // accepted state delta 不在章节列表响应里；真实工作量由 readiness 报告决定。
@@ -132,6 +150,16 @@ export default function BatchGenerationPanel({
         onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
       />
     ) : null;
+  const resumeDialog = resumeReviewOpen && job ? (
+    <ResumeJobDialog
+      job={job}
+      onClose={() => setResumeReviewOpen(false)}
+      onSubmitted={(resumed) => {
+        setJob(resumed);
+        setResumeReviewOpen(false);
+      }}
+    />
+  ) : null;
 
   const generationRunsEntry = (
     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-surface px-4 py-2.5">
@@ -177,6 +205,7 @@ export default function BatchGenerationPanel({
     return (
       <>
         {dialog}
+        {resumeDialog}
         {leftoverPanel}
         {generationRunsEntry}
       </>
@@ -197,6 +226,7 @@ export default function BatchGenerationPanel({
   return (
     <>
       {dialog}
+      {resumeDialog}
       {leftoverPanel}
       {generationRunsEntry}
 
@@ -290,7 +320,7 @@ export default function BatchGenerationPanel({
               titleForChapter={titleForChapter}
               onJumpToChapter={onJumpToChapter}
               onNavigateToMemory={onNavigateToMemory}
-              onResume={() => void control("resume")}
+              onResume={requestResume}
               onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
               onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
               onAbort={() => setAbortConfirm(true)}

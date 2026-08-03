@@ -18,7 +18,15 @@ import GenerationDiagnosticsPanel, {
   DiagnosticEventSummary,
 } from "./GenerationDiagnosticsPanel";
 import LeftoverProseRuns from "./LeftoverProseRuns";
-import { proseReasonTranslationKey } from "../prose/prosePresentation";
+import ResumeJobDialog, { isResumeReadinessRequired } from "./ResumeJobDialog";
+import {
+  finishReasonTranslationKey,
+  proseReasonTranslationKey,
+} from "../prose/prosePresentation";
+import {
+  diagnosticReasonTranslationKey,
+  jobPauseReasonTranslationKey,
+} from "./generationReasonPresentation";
 
 interface ProseRunTelemetry {
   run_id: string;
@@ -151,10 +159,12 @@ function modelValues(job: GenerationJob): string[] {
 function telemetryReasonValues(run: ProseRunTelemetry): string[] {
   return Array.from(new Set([
     ...run.completion.reason_codes,
+    run.completion.finish_reason,
     ...run.scene_progress.map((scene) => scene.pause_reason).filter(
       (reason): reason is string => Boolean(reason),
     ),
-  ]));
+    ...run.scene_progress.map((scene) => scene.last_finish_reason).filter(Boolean),
+  ].filter(Boolean)));
 }
 
 function telemetryMatchesScope(scope: ScopeFilter): boolean {
@@ -163,7 +173,10 @@ function telemetryMatchesScope(scope: ScopeFilter): boolean {
 
 function reasonValues(job: GenerationJob): string[] {
   return Array.from(new Set(
-    (job.diagnostics ?? []).map((event) => event.code).filter(Boolean),
+    [
+      ...(job.diagnostics ?? []).map((event) => event.code),
+      job.pause_reason,
+    ].filter((reason): reason is string => Boolean(reason)),
   ));
 }
 
@@ -320,13 +333,16 @@ export default function GenerationRunsWorkspace({
   const [actionJobId, setActionJobId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [abortArmed, setAbortArmed] = useState<string | null>(null);
+  const [resumeReviewJob, setResumeReviewJob] = useState<GenerationJob | null>(null);
 
   const pauseReasonLabel = (reasonCode: string) => {
-    if (reasonCode === "incomplete_scene") {
-      return tBatch("reasonIncompleteScene");
-    }
+    const diagnosticKey = diagnosticReasonTranslationKey(reasonCode);
+    if (diagnosticKey) return tBatch(diagnosticKey);
+    const pauseKey = jobPauseReasonTranslationKey(reasonCode);
+    if (pauseKey) return tBatch(pauseKey);
     const key = proseReasonTranslationKey(reasonCode);
-    return key ? tProse(`reasons.${key}`) : tProse("reasons.unreported");
+    if (key) return tProse(`reasons.${key}`);
+    return tProse(`reasons.${finishReasonTranslationKey(reasonCode)}`);
   };
 
   const load = useCallback(async (initial = false) => {
@@ -465,6 +481,10 @@ export default function GenerationRunsWorkspace({
       setAbortArmed(null);
       void load();
     } catch (error) {
+      if (action === "resume" && isResumeReadinessRequired(error)) {
+        setResumeReviewJob(job);
+        return;
+      }
       setActionError(
         t("actionError", {
           message: error instanceof Error ? error.message : String(error),
@@ -474,6 +494,17 @@ export default function GenerationRunsWorkspace({
       setActionJobId(null);
     }
   }, [load, t]);
+
+  const requestResume = useCallback((job: GenerationJob) => {
+    if (
+      job.pause_reason === "cost_cap"
+      || job.pause_reason === "authorization_scope_increased"
+    ) {
+      setResumeReviewJob(job);
+      return;
+    }
+    void control(job, "resume");
+  }, [control]);
 
   const requestAbort = (job: GenerationJob) => {
     if (abortArmed !== job._id) {
@@ -491,6 +522,19 @@ export default function GenerationRunsWorkspace({
 
   return (
     <main className="flex h-full min-h-0 flex-col bg-surface" aria-labelledby="generation-runs-title">
+      {resumeReviewJob && (
+        <ResumeJobDialog
+          job={resumeReviewJob}
+          onClose={() => setResumeReviewJob(null)}
+          onSubmitted={(resumed) => {
+            setJobs((current) => current.map((item) => (
+              item._id === resumed._id ? resumed : item
+            )));
+            setResumeReviewJob(null);
+            void load();
+          }}
+        />
+      )}
       <header className="shrink-0 border-b border-border px-4 py-4 sm:px-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
@@ -680,7 +724,7 @@ export default function GenerationRunsWorkspace({
                     </span>
                     {reasonValues(job)[0] && (
                       <span className="truncate text-[11px] text-amber-800 dark:text-amber-200">
-                        {reasonValues(job)[0]}
+                        {pauseReasonLabel(reasonValues(job)[0])}
                       </span>
                     )}
                   </button>
@@ -714,7 +758,7 @@ export default function GenerationRunsWorkspace({
                     busy={actionJobId === selectedJob._id}
                     abortArmed={abortArmed === selectedJob._id}
                     onPause={() => void control(selectedJob, "pause")}
-                    onResume={() => void control(selectedJob, "resume")}
+                    onResume={() => requestResume(selectedJob)}
                     onRetryUncertain={() => void control(selectedJob, "resume", { confirm_uncertain_retry: true })}
                     onSkipUncertain={() => void control(selectedJob, "resume", { skip_uncertain: true })}
                     onAbort={() => requestAbort(selectedJob)}
@@ -958,6 +1002,12 @@ export default function GenerationRunsWorkspace({
                         : t("unknown")}
                     </dd>
                   </div>
+                  <div>
+                    <dt>{t("telemetryFinishReason")}</dt>
+                    <dd className="text-foreground">
+                      {pauseReasonLabel(run.completion.finish_reason)}
+                    </dd>
+                  </div>
                 </dl>
                 <div className="mt-3 grid gap-2 border-t border-border pt-3">
                   {run.scene_progress.map((scene) => (
@@ -1010,6 +1060,13 @@ export default function GenerationRunsWorkspace({
                       {scene.pause_reason && (
                         <span className="min-w-0 break-words text-amber-800 dark:text-amber-200">
                           {t("scenePause", { reason: pauseReasonLabel(scene.pause_reason) })}
+                        </span>
+                      )}
+                      {scene.last_finish_reason && (
+                        <span className="min-w-0 break-words">
+                          {t("sceneFinishReason", {
+                            reason: pauseReasonLabel(scene.last_finish_reason),
+                          })}
                         </span>
                       )}
                     </div>

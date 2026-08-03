@@ -13,7 +13,7 @@ export type JobStatus =
 export type PauseReason =
   | "checkpoint" | "conflict" | "outline_deviation" | "cost_cap" | "manual"
   | "attempt_capacity" | "uncertain_attempt" | "uncertain_skipped" | "process_restart"
-  | "source_changed" | "incomplete_scene"
+  | "source_changed" | "incomplete_scene" | "authorization_scope_increased"
   | null;
 
 export interface GenerationRunsNavigationTarget {

@@ -6,6 +6,7 @@ import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./ba
 import { buildChapterPresentation, outlineAdherenceForDisplay } from "./batchPresentation";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
+import { jobPauseReasonTranslationKey } from "./generationReasonPresentation";
 
 interface CheckpointReviewProps {
   job: GenerationJob;
@@ -42,20 +43,9 @@ function Banner({ job }: { job: GenerationJob }) {
       </div>
     );
   }
-  if (job.pause_reason === "source_changed") {
-    return (
-      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-        {t("reasonSourceChanged")}
-      </div>
-    );
-  }
-  const key =
-    job.pause_reason === "outline_deviation" ? "reasonOutlineDeviation"
-      : job.pause_reason === "conflict" ? "reasonConflict"
-      : job.pause_reason === "cost_cap" ? "reasonCostCap"
-        : job.pause_reason === "attempt_capacity" ? "reasonAttemptCapacity"
-        : job.pause_reason === "manual" ? "reasonManual"
-          : "reasonCheckpoint";
+  const key = job.pause_reason
+    ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
+    : "reasonCheckpoint";
   const tone =
     job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"

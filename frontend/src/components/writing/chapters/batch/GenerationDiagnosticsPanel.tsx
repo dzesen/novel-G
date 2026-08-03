@@ -8,6 +8,7 @@ import type {
   GenerationDiagnosticsSummary,
 } from "./batchTypes";
 import { finishReasonTranslationKey } from "../prose/prosePresentation";
+import { diagnosticReasonTranslationKey } from "./generationReasonPresentation";
 
 function useDiagnosticCopy() {
   const t = useTranslations("writing.batch");
@@ -43,46 +44,8 @@ function useDiagnosticCopy() {
   };
 
   const reasonLabel = (code: string) => {
-    switch (code) {
-      case "short_stop":
-        return t("diagnosticsReasonShortStop");
-      case "provider_length_limit":
-        return t("diagnosticsReasonLength");
-      case "provider_content_filter":
-        return t("diagnosticsReasonContentFilter");
-      case "provider_tool_call":
-        return t("diagnosticsReasonToolCall");
-      case "cancelled":
-        return t("diagnosticsReasonCancelled");
-      case "provider_or_transport_error":
-      case "provider_or_transport_failure":
-        return t("diagnosticsReasonProviderFailure");
-      case "provider_attempt_uncertain":
-      case "historical_provider_attempt_uncertain":
-        return t("diagnosticsReasonUncertain");
-      case "chapter_or_narrative_changed":
-        return t("diagnosticsReasonSourceChanged");
-      case "chapter_deleted_during_generation":
-        return t("diagnosticsReasonChapterDeleted");
-      case "context_budget_exceeded":
-        return t("diagnosticsReasonContextBudget");
-      case "attempt_capacity_exhausted":
-        return t("diagnosticsReasonAttemptCapacity");
-      case "continuation_limit_reached":
-        return t("diagnosticsReasonContinuationLimit");
-      case "invalid_internal_id":
-      case "historical_invalid_internal_id":
-        return t("diagnosticsReasonInvalidId");
-      case "validation_rejected":
-        return t("diagnosticsReasonValidation");
-      case "historical_completion_contract_failed":
-      case "completion_contract_failed":
-        return t("diagnosticsReasonCompletion");
-      case "job_aborted":
-        return t("diagnosticsReasonAborted");
-      default:
-        return t("diagnosticsReasonUnknown");
-    }
+    const key = diagnosticReasonTranslationKey(code);
+    return key ? t(key) : t("diagnosticsReasonUnknown");
   };
 
   const stepLabel = (step: string) => {
