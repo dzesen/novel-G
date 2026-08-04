@@ -40,6 +40,40 @@ export interface ChapterPresentation {
   referenceRemapNotices: ReferenceRemapPresentation[];
 }
 
+export interface PlotThreadReferenceCleanupSummary {
+  itemCount: number;
+  chapterCount: number;
+  readableValues: string[];
+}
+
+/**
+ * Summarize thread updates that were rejected because they could not be
+ * matched to a formal plot-thread ID. This is separate from the stored-thread
+ * reference audit: there may be no existing record that can be highlighted.
+ */
+export function summarizePlotThreadReferenceCleanup(
+  progressItems: ChapterProgress[],
+): PlotThreadReferenceCleanupSummary | null {
+  let itemCount = 0;
+  let chapterCount = 0;
+  const readableValues = new Set<string>();
+
+  for (const progress of progressItems) {
+    const notices = buildChapterPresentation(progress).referenceNotices
+      .filter((notice) => notice.actionTarget === "plot_threads");
+    if (notices.length === 0) continue;
+    chapterCount += 1;
+    for (const notice of notices) {
+      itemCount += notice.count;
+      notice.readableValues.forEach((value) => readableValues.add(value));
+    }
+  }
+
+  return itemCount > 0
+    ? { itemCount, chapterCount, readableValues: [...readableValues] }
+    : null;
+}
+
 function normalizedPlaceholderTitle(value: string): string {
   return value.normalize("NFKC").replace(/\s+/g, "").toLowerCase();
 }

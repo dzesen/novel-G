@@ -6,6 +6,11 @@ import { useTranslations } from "next-intl";
 import { apiGet, apiPost, apiPut, apiDelete } from "@/lib/api";
 import type { PlotThread, ThreadStatus, ThreadImportance } from "../chapters/outline/outlineTypes";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
+import { isTerminal, type GenerationJob } from "../chapters/batch/batchTypes";
+import {
+  summarizePlotThreadReferenceCleanup,
+  type PlotThreadReferenceCleanupSummary,
+} from "../chapters/batch/batchPresentation";
 import {
   plotThreadDraftToPayload,
   plotThreadToDraft,
@@ -26,9 +31,11 @@ export default function PlotThreadWorkspace({
   initialThreadId,
 }: Props) {
   const t = useTranslations("plotThreads");
+  const metadataT = useTranslations("writing.generationMetadata");
   const [threads, setThreads] = useState<PlotThread[]>([]);
   const [chapters, setChapters] = useState<Array<ChapterSummary & { label: string }>>([]);
   const [error, setError] = useState<string | null>(null);
+  const [unmatchedReferenceReview, setUnmatchedReferenceReview] = useState<PlotThreadReferenceCleanupSummary | null>(null);
   const [orphansOnly, setOrphansOnly] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<ThreadDraft | null>(null);
@@ -38,13 +45,27 @@ export default function PlotThreadWorkspace({
   const load = useCallback(async () => {
     if (!novelId) return;
     setError(null);
+    setUnmatchedReferenceReview(null);
     try {
-      const [res, chapterRes, volumeRes] = await Promise.all([
+      const [res, chapterRes, volumeRes, jobs] = await Promise.all([
         apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}?with_reference_audit=true`),
         apiGet<{ data: ChapterSummary[] }>(`/api/chapters/novel/${novelId}`),
         apiGet<{ data: VolumeSummary[] }>(`/api/volumes/novel/${novelId}`),
+        apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`).catch(
+          () => [] as GenerationJob[],
+        ),
       ]);
       setThreads(res.data);
+      const currentJob = jobs
+        .filter((job) => !isTerminal(job.status))
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+      setUnmatchedReferenceReview(
+        currentJob
+          ? summarizePlotThreadReferenceCleanup(
+              currentJob.progress.slice(currentJob.last_checkpoint_index),
+            )
+          : null,
+      );
       const volumeOrders = Object.fromEntries(volumeRes.data.map((volume) => [volume._id, volume.order_index]));
       setChapters(
         [...chapterRes.data]
@@ -168,6 +189,28 @@ export default function PlotThreadWorkspace({
       </div>
 
       {error && <div className="rounded border border-red-400 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+      {unmatchedReferenceReview && (
+        <div
+          role="status"
+          data-testid="unmatched-thread-reference-attention"
+          className="grid gap-1 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200"
+        >
+          <span className="font-semibold">
+            {t("unmatchedReferenceAttentionTitle", { count: unmatchedReferenceReview.itemCount })}
+          </span>
+          <span className="leading-5">{t("unmatchedReferenceAttentionBody")}</span>
+          <span className="leading-5">
+            {t("unmatchedReferenceAttentionScope", { count: unmatchedReferenceReview.chapterCount })}
+          </span>
+          {unmatchedReferenceReview.readableValues.length > 0 && (
+            <span className="break-words text-xs">
+              {t("unmatchedReferenceAttentionNames", {
+                names: unmatchedReferenceReview.readableValues.join(metadataT("listSeparator")),
+              })}
+            </span>
+          )}
+        </div>
+      )}
       {orphanCount > 0 && (
         <div
           role="status"
