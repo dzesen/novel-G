@@ -184,6 +184,103 @@ async def _persist_diagnostic(repo, job_id: str, event: dict[str, Any]) -> None:
     await append(job_id, event)
 
 
+async def _handle_chapter_failure(
+    repo,
+    job_id: str,
+    chapter: Dict[str, Any],
+    exc: Exception,
+) -> None:
+    """Persist every recoverable chapter failure before the background task exits."""
+    chapter_id = str(chapter["_id"])
+    step = str(getattr(exc, "step", "run_chapter"))
+    failed_outcome = exc.outcome if isinstance(exc, ChapterPipelineFailed) else None
+    attempts = list(getattr(exc, "attempts", []) or [])
+    if failed_outcome is not None:
+        attempts = list(failed_outcome.attempts)
+
+    logger.error(
+        "[job %s] chapter %s failed at %s",
+        job_id,
+        chapter_id,
+        step,
+        exc_info=exc,
+    )
+    await _persist_attempts(repo, job_id, attempts)
+    diagnostic = build_failure_diagnostic(
+        exc,
+        step=step,
+        chapter_id=chapter_id,
+        attempts=attempts,
+        occurred_at=get_utc_now(),
+    )
+    await _persist_diagnostic(repo, job_id, diagnostic)
+
+    pause_reason = {
+        "token_budget_exceeded_before_dispatch": "cost_cap",
+        "attempt_capacity_exhausted": "attempt_capacity",
+    }.get(diagnostic["code"])
+    if pause_reason is not None:
+        has_partial_checkpoint = bool(
+            failed_outcome is not None
+            and (
+                failed_outcome.steps_done
+                or failed_outcome.steps_skipped
+                or failed_outcome.step_outcomes
+                or failed_outcome.tokens
+                or failed_outcome.attempts
+            )
+        )
+        if has_partial_checkpoint:
+            await repo.append_progress(
+                job_id,
+                outcome_to_progress(failed_outcome),
+                tokens_delta=0 if attempts else failed_outcome.tokens,
+            )
+        await repo.update_job_fields(job_id, {
+            "status": "paused",
+            "pause_reason": pause_reason,
+            "current_chapter_id": None,
+            "active_slot": None,
+            "error": {
+                "step": step,
+                "chapter_id": chapter_id,
+                "message": str(exc),
+                "attempts": attempts,
+            },
+        })
+        return
+
+    if diagnostic["category"] == "source_changed":
+        await repo.update_job_fields(job_id, {
+            "status": "paused",
+            "pause_reason": "source_changed",
+            "current_chapter_id": None,
+            "active_slot": None,
+            "error": {
+                "step": step,
+                "chapter_id": chapter_id,
+                "message": "Source changed during generation",
+                "attempts": attempts,
+            },
+        })
+        return
+
+    latest_job = await repo.get_job(job_id)
+    has_uncertain = bool(latest_job.get("has_uncertain_attempts"))
+    await repo.update_job_fields(job_id, {
+        "status": "interrupted" if has_uncertain else "failed",
+        "pause_reason": "uncertain_attempt" if has_uncertain else None,
+        "current_chapter_id": None,
+        "active_slot": None,
+        "error": {
+            "step": step,
+            "chapter_id": chapter_id,
+            "message": str(exc),
+            "attempts": attempts,
+        },
+    })
+
+
 async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo=generation_job_repo) -> None:
     """主循环。任何返回前都已把终态/暂停态持久化。"""
     try:
@@ -239,7 +336,8 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             except ChapterPipelineFailed as exc:
                 incomplete = exc.__cause__
                 if not isinstance(incomplete, IncompleteProseGeneration):
-                    raise
+                    await _handle_chapter_failure(repo, job_id, chapter, exc)
+                    return
                 outcome = exc.outcome
                 attempts = list(outcome.attempts)
                 await _persist_attempts(repo, job_id, attempts)
@@ -287,48 +385,7 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             except Exception as exc:  # noqa: BLE001 — fail-fast，人工 resume 即重试
-                logger.exception("[job %s] chapter %s failed", job_id, chapter.get("_id"))
-                failed_outcome = exc.outcome if isinstance(exc, ChapterPipelineFailed) else None
-                attempts = list(getattr(exc, "attempts", []) or [])
-                if failed_outcome is not None:
-                    attempts = list(failed_outcome.attempts)
-                await _persist_attempts(repo, job_id, attempts)
-                diagnostic = build_failure_diagnostic(
-                    exc,
-                    step=getattr(exc, "step", "run_chapter"),
-                    chapter_id=str(chapter["_id"]),
-                    attempts=attempts,
-                    occurred_at=get_utc_now(),
-                )
-                await _persist_diagnostic(repo, job_id, diagnostic)
-                if diagnostic["category"] == "source_changed":
-                    await repo.update_job_fields(job_id, {
-                        "status": "paused",
-                        "pause_reason": "source_changed",
-                        "current_chapter_id": None,
-                        "active_slot": None,
-                        "error": {
-                            "step": getattr(exc, "step", "run_chapter"),
-                            "chapter_id": str(chapter["_id"]),
-                            "message": "Source changed during generation",
-                            "attempts": attempts,
-                        },
-                    })
-                    return
-                latest_job = await repo.get_job(job_id)
-                has_uncertain = bool(latest_job.get("has_uncertain_attempts"))
-                await repo.update_job_fields(job_id, {
-                    "status": "interrupted" if has_uncertain else "failed",
-                    "pause_reason": "uncertain_attempt" if has_uncertain else None,
-                    "current_chapter_id": None,
-                    "active_slot": None,
-                    "error": {
-                        "step": getattr(exc, "step", "run_chapter"),
-                        "chapter_id": str(chapter["_id"]),
-                        "message": str(exc),
-                        "attempts": attempts,
-                    },
-                })
+                await _handle_chapter_failure(repo, job_id, chapter, exc)
                 return
 
             await _persist_attempts(repo, job_id, outcome.attempts)
