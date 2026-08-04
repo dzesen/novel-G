@@ -1,5 +1,7 @@
 import type {
   ChapterProgress,
+  GenerationDiagnostic,
+  GenerationJob,
   GenerationNotice,
   OutlineAdherenceIssue,
   OutlineAdherenceReview,
@@ -36,6 +38,49 @@ export interface ChapterPresentation {
   contextNotices: ContextNoticePresentation[];
   referenceNotices: ReferenceCleanupPresentation[];
   referenceRemapNotices: ReferenceRemapPresentation[];
+}
+
+function normalizedPlaceholderTitle(value: string): string {
+  return value.normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+}
+
+/**
+ * Newly-created chapter stubs use a localized ordinal as their title. The
+ * checkpoint card already renders that ordinal, so repeating the same text
+ * after a colon adds no information. Whitespace is ignored for older stubs.
+ */
+export function isPlaceholderChapterTitle(
+  title: string,
+  localizedPlaceholder: string,
+): boolean {
+  const normalizedTitle = normalizedPlaceholderTitle(title);
+  return normalizedTitle.length === 0
+    || normalizedTitle === normalizedPlaceholderTitle(localizedPlaceholder);
+}
+
+/**
+ * A job may retain several diagnostic events. Prefer the event tied to the
+ * current error's chapter and step instead of assuming the array tail is the
+ * reason the user is being stopped now.
+ */
+export function currentStopDiagnostic(
+  job: Pick<GenerationJob, "current_chapter_id" | "diagnostics" | "error">,
+): GenerationDiagnostic | null {
+  const diagnostics = job.diagnostics ?? [];
+  if (diagnostics.length === 0) return null;
+
+  const chapterId = job.error?.chapter_id ?? job.current_chapter_id;
+  const chapterMatches = chapterId
+    ? diagnostics.filter((event) => event.chapter_id === chapterId)
+    : diagnostics;
+  const exactMatches = job.error?.step
+    ? chapterMatches.filter((event) => event.step === job.error?.step)
+    : chapterMatches;
+
+  return exactMatches.at(-1)
+    ?? chapterMatches.at(-1)
+    ?? diagnostics.at(-1)
+    ?? null;
 }
 
 function asStrings(value: unknown): string[] {

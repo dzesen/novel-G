@@ -39,9 +39,8 @@ export default function PlotThreadWorkspace({
     if (!novelId) return;
     setError(null);
     try {
-      const query = orphansOnly ? "?with_reference_audit=true" : "";
       const [res, chapterRes, volumeRes] = await Promise.all([
-        apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}${query}`),
+        apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}?with_reference_audit=true`),
         apiGet<{ data: ChapterSummary[] }>(`/api/chapters/novel/${novelId}`),
         apiGet<{ data: VolumeSummary[] }>(`/api/volumes/novel/${novelId}`),
       ]);
@@ -55,7 +54,7 @@ export default function PlotThreadWorkspace({
     } catch (e) {
       setError(e instanceof Error ? e.message : t("loadError"));
     }
-  }, [novelId, orphansOnly, t]);
+  }, [novelId, t]);
 
   useEffect(() => {
     void load();
@@ -75,6 +74,7 @@ export default function PlotThreadWorkspace({
   const isOrphan = (th: PlotThread) =>
     th.source === "outline" && (th.referenced_by_chapter_orders?.length ?? 0) === 0;
   const visible = orphansOnly ? threads.filter(isOrphan) : threads;
+  const orphanCount = threads.filter(isOrphan).length;
 
   const startCreate = () => {
     setCreating(true);
@@ -155,10 +155,10 @@ export default function PlotThreadWorkspace({
   );
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-y-auto p-6">
+    <div className="flex h-full flex-col gap-4 overflow-y-auto p-4 sm:p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-lg font-semibold text-foreground">{t("title")}</h2>
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center justify-end gap-3">
           <label className="flex items-center gap-2 text-sm text-muted">
             <input type="checkbox" checked={orphansOnly} onChange={(e) => setOrphansOnly(e.target.checked)} />
             {t("orphanFilter")}
@@ -168,6 +168,16 @@ export default function PlotThreadWorkspace({
       </div>
 
       {error && <div className="rounded border border-red-400 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+      {orphanCount > 0 && (
+        <div
+          role="status"
+          data-testid="orphan-thread-attention"
+          className="grid gap-1 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200"
+        >
+          <span className="font-semibold">{t("orphanAttentionTitle", { count: orphanCount })}</span>
+          <span className="leading-5">{t("orphanAttentionBody")}</span>
+        </div>
+      )}
       {creating && editor}
       {visible.length === 0 && !creating && <div className="text-sm text-muted">{t("empty")}</div>}
 
@@ -176,28 +186,24 @@ export default function PlotThreadWorkspace({
           <li
             id={`thread-${th._id}`}
             key={th._id}
-            className={`rounded-lg border bg-surface p-3 ${
+            className={`min-w-0 rounded-lg border p-3 ${
               initialThreadId === th._id
                 ? "border-accent ring-2 ring-accent/20"
-                : "border-border"
+                : isOrphan(th)
+                  ? "border-amber-300 bg-amber-50/70 dark:border-amber-900/70 dark:bg-amber-950/20"
+                  : "border-border bg-surface"
             }`}
           >
             {editingId === th._id ? editor : (
               <div className="flex flex-col gap-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium text-foreground">{th.name}</span>
+                  <span className="min-w-0 break-words font-medium text-foreground">{th.name}</span>
                   <span className="rounded bg-surface-secondary px-2 py-0.5 text-xs text-muted">{t(`status${th.status.charAt(0).toUpperCase()}${th.status.slice(1)}`)}</span>
                   <span className="rounded bg-surface-secondary px-2 py-0.5 text-xs text-muted">{th.importance === "main" ? t("importanceMain") : t("importanceSub")}</span>
-                  {orphansOnly && isOrphan(th) && <span className="rounded bg-amber-100 px-2 py-0.5 text-xs text-amber-700">{t("orphanBadge")}</span>}
+                  {isOrphan(th) && <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-200">{t("orphanBadge")}</span>}
                 </div>
                 {th.description && <p className="text-sm text-muted">{th.description}</p>}
-                {orphansOnly && (
-                  <p className="text-xs text-muted">
-                    {(th.referenced_by_chapters?.length ?? 0) > 0
-                      ? `${t("referencedBy")}${th.referenced_by_chapters!.map((item) => item.label).join(", ")}`
-                      : t("notReferenced")}
-                  </p>
-                )}
+                {isOrphan(th) && <p className="text-xs text-amber-800 dark:text-amber-200">{t("notReferenced")}</p>}
                 <div className="mt-1 flex gap-3 text-sm">
                   <button className="text-accent" onClick={() => startEdit(th)}>{t("edit")}</button>
                   {confirmingDeleteId === th._id ? (

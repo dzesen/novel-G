@@ -3,7 +3,12 @@
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./batchTypes";
-import { buildChapterPresentation, outlineAdherenceForDisplay } from "./batchPresentation";
+import {
+  buildChapterPresentation,
+  currentStopDiagnostic,
+  isPlaceholderChapterTitle,
+  outlineAdherenceForDisplay,
+} from "./batchPresentation";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
 import { jobPauseReasonTranslationKey } from "./generationReasonPresentation";
@@ -101,6 +106,7 @@ function ChapterCard({
   onNavigateToMemory,
   onNavigateToReferenceCards,
   onNavigateToPlotThreads,
+  isCurrentStopCause,
 }: {
   progress: ChapterProgress;
   title: string;
@@ -108,19 +114,27 @@ function ChapterCard({
   onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
   onNavigateToPlotThreads: () => void;
+  isCurrentStopCause: boolean;
 }) {
   const t = useTranslations("writing.batch");
+  const chapterEditorT = useTranslations("writing.chapterEditor");
   const metadataT = useTranslations("writing.generationMetadata");
   const hasConflict = progress.consistency_issues.length > 0;
   const adherence = outlineAdherenceForDisplay(progress.outline_adherence);
   const hasOutlineDeviation = adherence?.verdict === "fail";
   const presentation = buildChapterPresentation(progress);
   const proseWordCount = checkpointWordCountPresentation(progress.prose_completion);
+  const chapterHeading = isPlaceholderChapterTitle(
+    title,
+    chapterEditorT("defaultChapterTitle", { index: progress.order_index }),
+  )
+    ? t("chapterRowOrder", { order: progress.order_index })
+    : t("chapterRowTitle", { order: progress.order_index, title });
   return (
     <div className={`rounded-md border p-3 ${hasConflict || hasOutlineDeviation ? "border-red-300 dark:border-red-900/70" : "border-border"} bg-surface`}>
       <button type="button" onClick={onJump} title={t("jumpHint")} className="mb-2 block w-full text-left">
         <span className="text-sm font-medium text-foreground hover:text-accent">
-          {t("chapterRowTitle", { order: progress.order_index, title })}
+          {chapterHeading}
         </span>
       </button>
 
@@ -155,7 +169,14 @@ function ChapterCard({
 
       {hasConflict && (
         <div className="mt-2 grid gap-2 rounded-md border border-red-200 bg-red-50 p-2 dark:border-red-900/60 dark:bg-red-950/30">
-          <span className="text-xs font-semibold text-red-700 dark:text-red-300">{t("conflictTitle")}</span>
+          <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-red-700 dark:text-red-300">
+            <span>{t("conflictTitle")}</span>
+            {isCurrentStopCause && (
+              <span className="rounded-full border border-red-300 px-2 py-0.5 dark:border-red-800">
+                {t("currentStopReason")}
+              </span>
+            )}
+          </div>
           {progress.consistency_issues.map((issue, i) => (
             <div key={i} className="text-xs text-red-700 dark:text-red-300">
               <div>{t("conflictFact", { fact: issue.fact })}</div>
@@ -174,11 +195,18 @@ function ChapterCard({
             ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300"
             : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200"
         }`}>
-          <span className="text-xs font-semibold">
-            {adherence.verdict === "fail"
-              ? t("outlineDeviationTitle")
-              : t("outlineDeviationWarningTitle")}
-          </span>
+          <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
+            <span>
+              {adherence.verdict === "fail"
+                ? t("outlineDeviationTitle")
+                : t("outlineDeviationWarningTitle")}
+            </span>
+            {isCurrentStopCause && adherence.verdict === "fail" && (
+              <span className="rounded-full border border-current/40 px-2 py-0.5">
+                {t("currentStopReason")}
+              </span>
+            )}
+          </div>
           <p className="text-xs">{adherence.summary}</p>
           {adherence.issues.map((issue, index) => (
             <div key={`${issue.category}-${index}`} className="grid gap-0.5 text-xs">
@@ -309,9 +337,15 @@ export default function CheckpointReview({
   const reviewWindow = checkpointWindow(job);
   const hasUncertainAttempt = job.has_uncertain_attempts || job.pause_reason === "uncertain_attempt";
 
-  const latestDiagnostic = job.diagnostics?.[
-    Math.max(0, (job.diagnostics?.length ?? 1) - 1)
-  ];
+  const stopDiagnostic = currentStopDiagnostic(job);
+  const blockingProgress = [...reviewWindow].reverse().find((progress) => {
+    if (job.pause_reason === "outline_deviation") {
+      return outlineAdherenceForDisplay(progress.outline_adherence)?.verdict === "fail";
+    }
+    return job.pause_reason === "conflict" && progress.consistency_issues.length > 0;
+  });
+  const currentStopChapterId = blockingProgress?.chapter_id ?? job.error?.chapter_id ?? null;
+  const incompleteChapterId = job.pause_reason === "incomplete_scene" ? job.error?.chapter_id : null;
 
   return (
     <div className="grid gap-3 border-b border-border bg-surface-secondary/40 px-4 py-3">
@@ -359,38 +393,40 @@ export default function CheckpointReview({
       </div>
 
       <Banner job={job} />
-      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
-        {job.pause_reason === "incomplete_scene" && job.error?.chapter_id && (
-          <button
-            type="button"
-            onClick={() => onJumpToChapter(job.error!.chapter_id)}
-            className="text-xs font-medium text-accent hover:underline"
-          >
-            {t("incompleteSceneOpenChapter")}
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={onOpenGenerationRuns}
-          className="text-xs font-medium text-accent hover:underline"
-        >
-          {latestDiagnostic
-            ? t("generationRunsOpenDiagnostic")
-            : t("generationRunsOpen")}
-        </button>
-      </div>
+      {(incompleteChapterId || !stopDiagnostic) && (
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
+          {incompleteChapterId && (
+            <button
+              type="button"
+              onClick={() => onJumpToChapter(incompleteChapterId)}
+              className="text-xs font-medium text-accent hover:underline"
+            >
+              {t("incompleteSceneOpenChapter")}
+            </button>
+          )}
+          {!stopDiagnostic && (
+            <button
+              type="button"
+              onClick={onOpenGenerationRuns}
+              className="text-xs font-medium text-accent hover:underline"
+            >
+              {t("generationRunsOpen")}
+            </button>
+          )}
+        </div>
+      )}
       {controlError && (
         <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
           {t("controlError", { message: controlError })}
         </div>
       )}
-      {latestDiagnostic && (
+      {stopDiagnostic && (
         <details className="rounded-md border border-border bg-background px-3 py-2">
           <summary className="cursor-pointer text-xs font-semibold text-foreground">
             {t("diagnosticsCurrentTitle")}
           </summary>
           <div className="mt-2 border-t border-border pt-2">
-            <DiagnosticEventSummary event={latestDiagnostic} />
+            <DiagnosticEventSummary event={stopDiagnostic} />
           </div>
         </details>
       )}
@@ -413,6 +449,7 @@ export default function CheckpointReview({
               onNavigateToMemory={onNavigateToMemory}
               onNavigateToReferenceCards={onNavigateToReferenceCards}
               onNavigateToPlotThreads={onNavigateToPlotThreads}
+              isCurrentStopCause={p.chapter_id === currentStopChapterId}
             />
           ))}
         </div>
