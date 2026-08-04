@@ -1013,6 +1013,9 @@ def normalize_outline_references(raw_outline: dict | None) -> dict | None:
     outline["threads_resolved"] = [
         str(tid) for tid in (raw_outline.get("threads_resolved") or [])
     ]
+    outline["threads_planted"] = [
+        str(tid) for tid in (raw_outline.get("threads_planted") or [])
+    ]
     outline["referenced_worldbook_card_ids"] = [
         str(cid)
         for cid in (raw_outline.get("referenced_worldbook_card_ids") or [])
@@ -1137,12 +1140,30 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         }
 
     thread_docs = (
-        projection.active_threads
+        list(projection.active_threads)
         if projection.threads_tracked
         else await plot_thread_repo.list_threads(
             novel_id, statuses=ACTIVE_THREAD_STATUSES
         )
     )
+    if projection.threads_tracked:
+        current_outline_thread_ids = {
+            str(thread_id)
+            for thread_id in (
+                (chapter.get("outline") or {}).get("threads_planted") or []
+            )
+        }
+        if current_outline_thread_ids:
+            historical_thread_ids = {str(thread["_id"]) for thread in thread_docs}
+            current_thread_docs = await plot_thread_repo.list_threads(
+                novel_id, statuses=ACTIVE_THREAD_STATUSES
+            )
+            thread_docs.extend(
+                thread
+                for thread in current_thread_docs
+                if str(thread["_id"]) in current_outline_thread_ids
+                and str(thread["_id"]) not in historical_thread_ids
+            )
     threads = [
         {
             "_id": str(t["_id"]),
@@ -1162,10 +1183,8 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     # 复制成新 dict 再改，不动 chapter 里读出来的原始子文档。
     raw_outline = chapter.get("outline")
     outline = normalize_outline_references(raw_outline)
-    # threads_planted（设计 §4.1，同为 [ObjectId]）故意不在 helper 里 str() 化：
-    # assemble_context 目前不读这个字段，转换了也是死代码。但它和上面几个字段
-    # 是同一种 BSON ObjectId，将来谁把它接进装配逻辑，必须先 str() 化，否则
-    # ObjectId != str，匹配不上任何东西，不报错，只是悄悄地永远装不进上下文。
+    # threads_planted also feeds the state-update roster. It must be normalized
+    # before prompt assembly so BSON ObjectId values never leak into matching.
 
     # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
     # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。
