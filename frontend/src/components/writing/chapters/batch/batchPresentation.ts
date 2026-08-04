@@ -12,7 +12,10 @@ import {
   contextCountsForDisplay,
   contextSectionKind,
   generationStepKind,
+  referenceActionTarget,
   referenceCleanupForDisplay,
+  referenceFieldKind,
+  readableReferenceValue,
   referenceRemapForDisplay,
   type ContextSectionKind,
   type GenerationStepKind,
@@ -42,35 +45,87 @@ export interface ChapterPresentation {
 
 export interface PlotThreadReferenceCleanupSummary {
   itemCount: number;
+  nowMatchedCount: number;
+  unresolvedCount: number;
+  recoverableThreadIds: string[];
   chapterCount: number;
   readableValues: string[];
 }
 
+interface DroppedReferenceField {
+  field: string;
+  values: string[];
+}
+
+function reconciliationFields(progress: ChapterProgress): DroppedReferenceField[] {
+  const noticeFields = (progress.notices ?? [])
+    .filter((notice) => notice.category === "reference")
+    .flatMap((notice) => {
+      const fields = notice.details.fields;
+      if (!Array.isArray(fields)) return [];
+      return fields.flatMap((raw): DroppedReferenceField[] => {
+        const item = asRecord(raw);
+        if (!item) return [];
+        const field = String(item.field ?? "");
+        const values = asStrings(item.values);
+        return field && values.length > 0 ? [{ field, values }] : [];
+      });
+    });
+
+  return noticeFields.length > 0
+    ? noticeFields
+    : Object.entries(progress.dropped_ids).flatMap(([field, raw]) => {
+        const values = asStrings(raw);
+        return values.length > 0 ? [{ field, values }] : [];
+      });
+}
+
 /**
- * Summarize thread updates that were rejected because they could not be
- * matched to a formal plot-thread ID. This is separate from the stored-thread
- * reference audit: there may be no existing record that can be highlighted.
+ * Reconcile historically rejected thread updates against the current active
+ * plot-thread roster. Exact IDs only: names and other reference types remain
+ * unresolved and are never guessed.
  */
 export function summarizePlotThreadReferenceCleanup(
   progressItems: ChapterProgress[],
+  currentThreadIds: Iterable<string> = [],
 ): PlotThreadReferenceCleanupSummary | null {
   let itemCount = 0;
+  let nowMatchedCount = 0;
   let chapterCount = 0;
   const readableValues = new Set<string>();
+  const recoverableThreadIds = new Set<string>();
+  const currentIds = new Set([...currentThreadIds].map(String));
 
   for (const progress of progressItems) {
-    const notices = buildChapterPresentation(progress).referenceNotices
-      .filter((notice) => notice.actionTarget === "plot_threads");
-    if (notices.length === 0) continue;
+    const values = reconciliationFields(progress)
+      .filter((entry) => (
+        referenceActionTarget(referenceFieldKind(entry.field)) === "plot_threads"
+      ))
+      .flatMap((entry) => entry.values);
+    if (values.length === 0) continue;
+
     chapterCount += 1;
-    for (const notice of notices) {
-      itemCount += notice.count;
-      notice.readableValues.forEach((value) => readableValues.add(value));
+    itemCount += values.length;
+    for (const value of values) {
+      if (currentIds.has(value)) {
+        nowMatchedCount += 1;
+        recoverableThreadIds.add(value);
+        continue;
+      }
+      const readableValue = readableReferenceValue(value);
+      if (readableValue) readableValues.add(readableValue);
     }
   }
 
   return itemCount > 0
-    ? { itemCount, chapterCount, readableValues: [...readableValues] }
+    ? {
+        itemCount,
+        nowMatchedCount,
+        unresolvedCount: itemCount - nowMatchedCount,
+        recoverableThreadIds: [...recoverableThreadIds],
+        chapterCount,
+        readableValues: [...readableValues],
+      }
     : null;
 }
 

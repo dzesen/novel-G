@@ -63,6 +63,9 @@ export default function PlotThreadWorkspace({
         currentJob
           ? summarizePlotThreadReferenceCleanup(
               currentJob.progress.slice(currentJob.last_checkpoint_index),
+              res.data
+                .filter((thread) => thread.status === "planted" || thread.status === "developing")
+                .map((thread) => thread._id),
             )
           : null,
       );
@@ -96,6 +99,9 @@ export default function PlotThreadWorkspace({
     th.source === "outline" && (th.referenced_by_chapter_orders?.length ?? 0) === 0;
   const visible = orphansOnly ? threads.filter(isOrphan) : threads;
   const orphanCount = threads.filter(isOrphan).length;
+  const recoverableThreadIds = new Set(
+    unmatchedReferenceReview?.recoverableThreadIds ?? [],
+  );
 
   const startCreate = () => {
     setCreating(true);
@@ -193,18 +199,38 @@ export default function PlotThreadWorkspace({
         <div
           role="status"
           data-testid="unmatched-thread-reference-attention"
-          className="grid gap-1 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200"
+          className={`grid min-w-0 gap-3 rounded-lg border p-3 text-sm ${
+            unmatchedReferenceReview.unresolvedCount > 0
+              ? "border-amber-300 bg-amber-50 text-amber-950 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-100"
+              : "border-sky-300 bg-sky-50 text-sky-950 dark:border-sky-900/70 dark:bg-sky-950/30 dark:text-sky-100"
+          }`}
         >
-          <span className="font-semibold">
-            {t("unmatchedReferenceAttentionTitle", { count: unmatchedReferenceReview.itemCount })}
-          </span>
-          <span className="leading-5">{t("unmatchedReferenceAttentionBody")}</span>
+          {unmatchedReferenceReview.nowMatchedCount > 0 && (
+            <div className="grid min-w-0 gap-1">
+              <span className="font-semibold">
+                {t("referenceRecoveryTitle", { count: unmatchedReferenceReview.nowMatchedCount })}
+              </span>
+              <span className="break-words leading-5">{t("referenceRecoveryBody")}</span>
+            </div>
+          )}
+          {unmatchedReferenceReview.unresolvedCount > 0 && (
+            <div className={`grid min-w-0 gap-1 ${
+              unmatchedReferenceReview.nowMatchedCount > 0
+                ? "border-t border-amber-300 pt-3 dark:border-amber-900/70"
+                : ""
+            }`}>
+              <span className="font-semibold">
+                {t("referenceUnresolvedTitle", { count: unmatchedReferenceReview.unresolvedCount })}
+              </span>
+              <span className="break-words leading-5">{t("referenceUnresolvedBody")}</span>
+            </div>
+          )}
           <span className="leading-5">
-            {t("unmatchedReferenceAttentionScope", { count: unmatchedReferenceReview.chapterCount })}
+            {t("referenceCleanupScope", { count: unmatchedReferenceReview.chapterCount })}
           </span>
           {unmatchedReferenceReview.readableValues.length > 0 && (
             <span className="break-words text-xs">
-              {t("unmatchedReferenceAttentionNames", {
+              {t("referenceCleanupNames", {
                 names: unmatchedReferenceReview.readableValues.join(metadataT("listSeparator")),
               })}
             </span>
@@ -225,44 +251,52 @@ export default function PlotThreadWorkspace({
       {visible.length === 0 && !creating && <div className="text-sm text-muted">{t("empty")}</div>}
 
       <ul className="flex flex-col gap-2">
-        {visible.map((th) => (
-          <li
-            id={`thread-${th._id}`}
-            key={th._id}
-            className={`min-w-0 rounded-lg border p-3 ${
-              initialThreadId === th._id
-                ? "border-accent ring-2 ring-accent/20"
-                : isOrphan(th)
-                  ? "border-amber-300 bg-amber-50/70 dark:border-amber-900/70 dark:bg-amber-950/20"
-                  : "border-border bg-surface"
-            }`}
-          >
-            {editingId === th._id ? editor : (
-              <div className="flex flex-col gap-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="min-w-0 break-words font-medium text-foreground">{th.name}</span>
-                  <span className="rounded bg-surface-secondary px-2 py-0.5 text-xs text-muted">{t(`status${th.status.charAt(0).toUpperCase()}${th.status.slice(1)}`)}</span>
-                  <span className="rounded bg-surface-secondary px-2 py-0.5 text-xs text-muted">{th.importance === "main" ? t("importanceMain") : t("importanceSub")}</span>
-                  {isOrphan(th) && <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-200">{t("orphanBadge")}</span>}
+        {visible.map((th) => {
+          const needsRecovery = recoverableThreadIds.has(th._id);
+          return (
+            <li
+              id={`thread-${th._id}`}
+              key={th._id}
+              data-testid={needsRecovery ? "recoverable-thread-attention" : undefined}
+              className={`min-w-0 rounded-lg border p-3 ${
+                initialThreadId === th._id
+                  ? "border-accent ring-2 ring-accent/20"
+                  : needsRecovery
+                    ? "border-amber-400 bg-amber-50/70 dark:border-amber-800 dark:bg-amber-950/25"
+                    : isOrphan(th)
+                      ? "border-amber-300 bg-amber-50/70 dark:border-amber-900/70 dark:bg-amber-950/20"
+                      : "border-border bg-surface"
+              }`}
+            >
+              {editingId === th._id ? editor : (
+                <div className="flex flex-col gap-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="min-w-0 break-words font-medium text-foreground">{th.name}</span>
+                    <span className="rounded bg-surface-secondary px-2 py-0.5 text-xs text-muted">{t(`status${th.status.charAt(0).toUpperCase()}${th.status.slice(1)}`)}</span>
+                    <span className="rounded bg-surface-secondary px-2 py-0.5 text-xs text-muted">{th.importance === "main" ? t("importanceMain") : t("importanceSub")}</span>
+                    {needsRecovery && <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-900/60 dark:text-amber-100">{t("referenceRecoveryBadge")}</span>}
+                    {isOrphan(th) && <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-200">{t("orphanBadge")}</span>}
+                  </div>
+                  {th.description && <p className="text-sm text-muted">{th.description}</p>}
+                  {needsRecovery && <p className="break-words text-xs text-amber-900 dark:text-amber-100">{t("referenceRecoveryThreadHint")}</p>}
+                  {isOrphan(th) && <p className="text-xs text-amber-800 dark:text-amber-200">{t("notReferenced")}</p>}
+                  <div className="mt-1 flex gap-3 text-sm">
+                    <button className="text-accent" onClick={() => startEdit(th)}>{t("edit")}</button>
+                    {confirmingDeleteId === th._id ? (
+                      <span className="flex items-center gap-2">
+                        <span className="text-muted">{t("confirmDelete")}</span>
+                        <button className="text-red-600" onClick={() => remove(th._id)}>{t("delete")}</button>
+                        <button className="text-muted" onClick={() => setConfirmingDeleteId(null)}>{t("cancel")}</button>
+                      </span>
+                    ) : (
+                      <button className="text-red-600" onClick={() => setConfirmingDeleteId(th._id)}>{t("delete")}</button>
+                    )}
+                  </div>
                 </div>
-                {th.description && <p className="text-sm text-muted">{th.description}</p>}
-                {isOrphan(th) && <p className="text-xs text-amber-800 dark:text-amber-200">{t("notReferenced")}</p>}
-                <div className="mt-1 flex gap-3 text-sm">
-                  <button className="text-accent" onClick={() => startEdit(th)}>{t("edit")}</button>
-                  {confirmingDeleteId === th._id ? (
-                    <span className="flex items-center gap-2">
-                      <span className="text-muted">{t("confirmDelete")}</span>
-                      <button className="text-red-600" onClick={() => remove(th._id)}>{t("delete")}</button>
-                      <button className="text-muted" onClick={() => setConfirmingDeleteId(null)}>{t("cancel")}</button>
-                    </span>
-                  ) : (
-                    <button className="text-red-600" onClick={() => setConfirmingDeleteId(th._id)}>{t("delete")}</button>
-                  )}
-                </div>
-              </div>
-            )}
-          </li>
-        ))}
+              )}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
