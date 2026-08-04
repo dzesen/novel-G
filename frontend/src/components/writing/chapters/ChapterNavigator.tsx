@@ -150,7 +150,7 @@ export default function ChapterNavigator({
   };
 
   return (
-    <aside className="flex max-h-[44vh] w-full shrink-0 flex-col border-b border-border bg-surface-secondary/45 lg:h-full lg:max-h-none lg:w-72 lg:border-b-0 lg:border-r">
+    <aside className="flex h-full max-h-none w-full shrink-0 flex-col border-b border-border bg-surface-secondary/45 md:max-h-[44vh] lg:max-h-none lg:w-72 lg:border-b-0 lg:border-r">
       <div className="border-b border-border px-3 py-3">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">

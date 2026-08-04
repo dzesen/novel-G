@@ -49,6 +49,8 @@ interface ListResponse<T> {
   data: T[];
 }
 
+type MobileChapterPane = "structure" | "editor" | "generation";
+
 export default function ChapterWorkspace({
   mode,
   novelId,
@@ -104,6 +106,8 @@ export default function ChapterWorkspace({
     useState<string | null>(null);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
   const [batchStartScope, setBatchStartScope] = useState<"volume" | "book" | null>(null);
+  const [mobilePane, setMobilePane] =
+    useState<MobileChapterPane>("editor");
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
@@ -380,6 +384,7 @@ export default function ChapterWorkspace({
   };
 
   const selectChapter = (chapterId: string) => {
+    setMobilePane("editor");
     const previousChapterId = selectedChapterIdRef.current;
     if (previousChapterId === chapterId) return;
     if (
@@ -635,32 +640,85 @@ export default function ChapterWorkspace({
     );
   }
 
+  const mobilePaneLabels: Record<MobileChapterPane, string> = {
+    structure: t("mobileStructure"),
+    editor: t("mobileEditor"),
+    generation: t("mobileGeneration"),
+  };
+
   return (
-    <div className="relative flex h-full min-h-0 flex-col lg:flex-row">
-      <ChapterNavigator
-        volumes={volumes}
-        deletedVolumes={volumeTrash}
-        chapters={chapters}
-        trash={trash}
-        selectedChapterId={selectedChapterId}
-        selectedVolumeId={selectedVolumeId}
-        loading={structureLoading}
-        onSelectChapter={selectChapter}
-        onSelectVolume={setSelectedVolumeId}
-        onCreateVolume={createVolume}
-        onCreateChapter={createChapter}
-        onRestoreChapter={restoreChapter}
-        onDeleteVolume={deleteVolume}
-        onRestoreVolume={restoreVolume}
-        onHardDeleteVolume={hardDeleteVolume}
-        onBulkDeleteChapters={bulkDeleteChapters}
-        onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
-        onStartVolumeJob={() => setBatchStartScope("volume")}
-        onStartBookJob={() => setBatchStartScope("book")}
-        onOpenStateAudit={() => setStateAuditOpen(true)}
-      />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <BatchGenerationPanel
+    <div className="relative flex h-full min-h-0 flex-col">
+      <nav
+        aria-label={t("mobilePaneNavigation")}
+        className="grid shrink-0 grid-cols-3 border-b border-border bg-surface p-1.5 md:hidden"
+      >
+        {(["structure", "editor", "generation"] as const).map((pane) => (
+          <button
+            key={pane}
+            type="button"
+            onClick={() => setMobilePane(pane)}
+            aria-pressed={mobilePane === pane}
+            className={[
+              "min-h-11 rounded-md px-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+              mobilePane === pane
+                ? "bg-accent/10 text-accent"
+                : "text-muted hover:bg-surface-secondary hover:text-foreground",
+            ].join(" ")}
+          >
+            {mobilePaneLabels[pane]}
+          </button>
+        ))}
+      </nav>
+
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <div
+          className={[
+            mobilePane === "structure" ? "flex" : "hidden md:flex",
+            "min-h-0 w-full flex-1 lg:w-auto lg:flex-none",
+          ].join(" ")}
+        >
+          <ChapterNavigator
+            volumes={volumes}
+            deletedVolumes={volumeTrash}
+            chapters={chapters}
+            trash={trash}
+            selectedChapterId={selectedChapterId}
+            selectedVolumeId={selectedVolumeId}
+            loading={structureLoading}
+            onSelectChapter={selectChapter}
+            onSelectVolume={setSelectedVolumeId}
+            onCreateVolume={createVolume}
+            onCreateChapter={createChapter}
+            onRestoreChapter={restoreChapter}
+            onDeleteVolume={deleteVolume}
+            onRestoreVolume={restoreVolume}
+            onHardDeleteVolume={hardDeleteVolume}
+            onBulkDeleteChapters={bulkDeleteChapters}
+            onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
+            onStartVolumeJob={() => {
+              setBatchStartScope("volume");
+              setMobilePane("generation");
+            }}
+            onStartBookJob={() => {
+              setBatchStartScope("book");
+              setMobilePane("generation");
+            }}
+            onOpenStateAudit={() => setStateAuditOpen(true)}
+          />
+        </div>
+        <div
+          className={[
+            mobilePane === "structure" ? "hidden md:flex" : "flex",
+            "min-h-0 min-w-0 flex-1 flex-col",
+          ].join(" ")}
+        >
+          <div
+            className={[
+              mobilePane === "generation" ? "flex" : "hidden md:flex",
+              "min-h-0 flex-1 flex-col overflow-y-auto md:flex-none md:overflow-visible",
+            ].join(" ")}
+          >
+            <BatchGenerationPanel
           novelId={novelId}
           selectedVolumeId={selectedVolumeId}
           volumes={volumes}
@@ -677,7 +735,14 @@ export default function ChapterWorkspace({
           onStartFreshProse={(chapterId) => queueProsePanel(chapterId, null)}
           onOpenGenerationRuns={onOpenGenerationRuns}
         />
-        <ChapterEditorPane
+          </div>
+          <div
+            className={[
+              mobilePane === "editor" ? "flex" : "hidden md:flex",
+              "min-h-0 flex-1 flex-col",
+            ].join(" ")}
+          >
+            <ChapterEditorPane
           chapterId={selectedChapterId}
           draft={draft}
           wordCount={wordCount}
@@ -706,6 +771,8 @@ export default function ChapterWorkspace({
           hasContent={Boolean(draft?.content?.trim())}
           stateBackfillBlocked={stateBackfillBlocked}
         />
+          </div>
+        </div>
       </div>
 
       {volumeOutlineOpen && novelId && (

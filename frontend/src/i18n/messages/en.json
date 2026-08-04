@@ -620,6 +620,7 @@
     "wordCount": "{count} words",
     "emptyGuide": "Your bookshelf is empty. Click \"New Novel\" to start your creative journey!",
     "noSelection": "Select a novel from the left to view details, or create a new one",
+    "backToShelf": "Back to bookshelf",
     "novelCount": "{count} novels total",
     "searchPlaceholder": "Search novels...",
     "deleteConfirm": "Confirm to delete \"{title}\"? This can be restored.",
@@ -1310,6 +1311,10 @@
       "summaryPlaceholder": "Note this chapter's goal, conflict, or important setup...",
       "content": "Chapter content",
       "contentPlaceholder": "Start writing the story here...",
+      "mobilePaneNavigation": "Chapter workspace views",
+      "mobileStructure": "Chapters",
+      "mobileEditor": "Prose editor",
+      "mobileGeneration": "Generation",
       "status": "Status",
       "statuses": {
         "draft": "Draft",

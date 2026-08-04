@@ -76,13 +76,28 @@ export default function BookshelfContent() {
     await handleSelect(novelId);
   };
 
+  const handleBackToList = () => {
+    setSelectedId(null);
+    setSelectedNovel(null);
+    setRightPanel("detail");
+  };
+
+  const mobilePanelOpen =
+    rightPanel !== "detail" || selectedId !== null;
+  const listVisibility = mobilePanelOpen
+    ? rightPanel === "card-new"
+      ? "hidden lg:flex"
+      : "hidden md:flex"
+    : "flex";
+
   return (
-    <div className="mx-auto max-w-7xl h-[calc(100vh-3.5rem)] flex gap-4 p-4">
+    <div className="mx-auto flex h-[calc(100dvh-3.5rem)] max-w-7xl gap-0 p-3 sm:p-4 md:gap-4">
       {/* Left: Novel List (3/10) */}
       <div
-        className={`w-[30%] min-w-[280px] flex-col ${
-          rightPanel === "card-new" ? "hidden lg:flex" : "flex"
-        }`}
+        className={[
+          listVisibility,
+          "w-full min-w-0 flex-col md:w-[30%] md:min-w-[280px]",
+        ].join(" ")}
       >
         <NovelList
           novels={novels}
@@ -96,20 +111,26 @@ export default function BookshelfContent() {
       </div>
 
       {/* Right: Detail / New Panel (7/10) */}
-      <div className="flex-1 min-w-0 overflow-hidden">
+      <div
+        className={[
+          mobilePanelOpen ? "flex" : "hidden md:flex",
+          "min-w-0 flex-1 flex-col overflow-hidden",
+        ].join(" ")}
+      >
         {rightPanel === "new" ? (
           <NewNovelPanel
             onCreated={handleNovelCreated}
-            onCancel={() => setRightPanel("detail")}
+            onCancel={handleBackToList}
           />
         ) : rightPanel === "card-new" ? (
           <CardDrivenCreatePanel
-            onCancel={() => setRightPanel("detail")}
+            onCancel={handleBackToList}
           />
         ) : (
           <NovelDetailPanel
             novel={selectedNovel}
             onDelete={handleDelete}
+            onBack={handleBackToList}
           />
         )}
       </div>
