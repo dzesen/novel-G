@@ -359,6 +359,63 @@ export interface ReferenceCardCurationResult {
   }>;
 }
 
+export type EmergentReferenceCardDecisionAction =
+  | "create"
+  | "merge"
+  | "restore_merge"
+  | "defer"
+  | "ignore";
+
+export interface EmergentReferenceCardCandidate
+  extends Omit<
+    ReferenceCardCandidate,
+    "recommended_action"
+  > {
+  recommended_action:
+    | ReferenceCardCurationAction
+    | "defer"
+    | "ignore";
+  queue_status: "pending" | "deferred";
+  requires_review_before_next_chapter: boolean;
+  evidence: {
+    summary: string;
+    chapter_id: string;
+    chapter_order: number;
+    chapter_title: string;
+    source_kind: "chapter_outline";
+  };
+  source_chapter_id: string;
+}
+
+export interface EmergentReferenceCardReview {
+  candidates: EmergentReferenceCardCandidate[];
+  counts: {
+    pending: number;
+    deferred: number;
+    ignored: number;
+    resolved: number;
+    superseded: number;
+    blocking: number;
+  };
+  review_digest: string;
+}
+
+export interface EmergentReferenceCardApplyResult {
+  counts: {
+    created: number;
+    merged: number;
+    restored_merged: number;
+    deferred: number;
+    ignored: number;
+  };
+  mappings: Array<{
+    candidate_id: string;
+    action: EmergentReferenceCardDecisionAction;
+    card_id: string | null;
+  }>;
+  resumed_job_ids: string[];
+}
+
 export interface CharacterCardAvatarImportResult {
   status: "imported" | "not_imported" | "skipped";
   source_kind: NonNullable<CardImportProposal["avatar_preview"]>["source_kind"];

@@ -47,6 +47,8 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       : null;
   const requestedCardCuration =
     mode === "edit" && searchParams.get("curateCards") === "1";
+  const requestedCandidateReview =
+    mode === "edit" && searchParams.get("reviewCards") === "1";
   const requestedGenerationRuns =
     mode === "edit" && searchParams.get("view") === "generation-runs";
   const requestedGenerationRunsTarget: GenerationRunsNavigationTarget = {
@@ -62,17 +64,22 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   const referenceCardType = requestedCardType ?? "character";
   const resolvedActiveItem: WritingSidebarItem =
     requestedGenerationRuns ? "chapter-editor"
-      : requestedCardCuration || requestedCardType
+      : requestedCardCuration || requestedCandidateReview || requestedCardType
       ? "reference-cards"
       : activeItem;
 
   const replaceCardTypeQuery = useCallback(
-    (cardType: ReferenceCardType | null) => {
+    (
+      cardType: ReferenceCardType | null,
+      reviewCandidates = false,
+    ) => {
       const currentSearch = window.location.search.replace(/^\?/, "");
       const next = new URLSearchParams(currentSearch);
       next.delete("curateCards");
       if (cardType) next.set("cardType", cardType);
       else next.delete("cardType");
+      if (reviewCandidates) next.set("reviewCards", "1");
+      else next.delete("reviewCards");
 
       const nextSearch = next.toString();
       const nextHref = nextSearch ? `${pathname}?${nextSearch}` : pathname;
@@ -155,6 +162,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     [replaceCardTypeQuery, replaceGenerationRunsQuery],
   );
 
+  const navigateToReferenceCardCandidates = useCallback(() => {
+    setEvidenceReference(null);
+    setOpenCardCuration(false);
+    replaceCardTypeQuery(referenceCardType, true);
+    replaceGenerationRunsQuery(null);
+  }, [
+    referenceCardType,
+    replaceCardTypeQuery,
+    replaceGenerationRunsQuery,
+  ]);
+
   useEffect(() => {
     if (!requestedCardCuration) return;
     const cardType = requestedCardType ?? "character";
@@ -185,6 +203,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           initialChapterId={evidenceReference?.chapter_id}
           initialSceneIndex={evidenceReference?.scene_index}
           generationRunsOpen={requestedGenerationRuns}
+          onNavigateToReferenceCardCandidates={
+            navigateToReferenceCardCandidates
+          }
           generationRunsTarget={requestedGenerationRunsTarget}
           onOpenGenerationRuns={navigateToGenerationRuns}
           onCloseGenerationRuns={closeGenerationRuns}
@@ -222,6 +243,11 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
             openCardCuration || requestedCardCuration
           }
           onCurationOpened={() => setOpenCardCuration(false)}
+          reviewCandidatesOnMount={requestedCandidateReview}
+          onCandidateReviewChange={(open) => {
+            if (open) navigateToReferenceCardCandidates();
+            else replaceCardTypeQuery(referenceCardType);
+          }}
         />
       );
     }

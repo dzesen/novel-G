@@ -14,6 +14,7 @@ export type PauseReason =
   | "checkpoint" | "conflict" | "outline_deviation" | "cost_cap" | "manual"
   | "attempt_capacity" | "uncertain_attempt" | "uncertain_skipped" | "process_restart"
   | "source_changed" | "incomplete_scene" | "authorization_scope_increased"
+  | "reference_card_review"
   | null;
 
 export interface GenerationRunsNavigationTarget {
@@ -215,6 +216,8 @@ export interface JobError {
   step: string;
   chapter_id: string;
   message: string;
+  candidate_ids?: string[];
+  candidate_names?: string[];
 }
 
 export type DiagnosticCategory =

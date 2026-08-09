@@ -1,9 +1,14 @@
 "use client";
 
-import { useEffect, useRef, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  type KeyboardEvent,
+} from "react";
 import { useTranslations } from "next-intl";
 import type { ReferenceCardType } from "@/types/novel";
 import ReferenceCardsWorkspace from "./ReferenceCardsWorkspace";
+import CandidateReviewWorkspace from "./CandidateReviewWorkspace";
 
 const CARD_TYPES: ReferenceCardType[] = [
   "character",
@@ -13,12 +18,16 @@ const CARD_TYPES: ReferenceCardType[] = [
   "lore",
 ];
 
+type ReferenceCardsTab = ReferenceCardType | "candidates";
+const EDIT_TABS: ReferenceCardsTab[] = [...CARD_TYPES, "candidates"];
 interface ReferenceCardsDestinationProps {
   mode: "create" | "edit";
   novelId?: string;
   cardType: ReferenceCardType;
   onCardTypeChange: (cardType: ReferenceCardType) => void;
   openCurationOnMount?: boolean;
+  reviewCandidatesOnMount?: boolean;
+  onCandidateReviewChange?: (open: boolean) => void;
   onCurationOpened?: () => void;
 }
 
@@ -29,17 +38,31 @@ export default function ReferenceCardsDestination({
   onCardTypeChange,
   openCurationOnMount = false,
   onCurationOpened,
+  reviewCandidatesOnMount = false,
+  onCandidateReviewChange,
 }: ReferenceCardsDestinationProps) {
   const t = useTranslations("writing.referenceCards");
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const tabs = mode === "edit" ? EDIT_TABS : CARD_TYPES;
+  const activeTab: ReferenceCardsTab =
+    reviewCandidatesOnMount ? "candidates" : cardType;
 
   useEffect(() => {
-    const selectedIndex = CARD_TYPES.indexOf(cardType);
+    const selectedIndex = tabs.indexOf(activeTab);
     tabRefs.current[selectedIndex]?.scrollIntoView({
       block: "nearest",
       inline: "nearest",
     });
-  }, [cardType]);
+  }, [activeTab, tabs]);
+
+  const selectTab = (tab: ReferenceCardsTab) => {
+    if (tab === "candidates") {
+      onCandidateReviewChange?.(true);
+      return;
+    }
+    onCandidateReviewChange?.(false);
+    onCardTypeChange(tab);
+  };
 
   const handleTabKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
@@ -47,19 +70,19 @@ export default function ReferenceCardsDestination({
   ) => {
     let nextIndex: number | null = null;
     if (event.key === "ArrowRight") {
-      nextIndex = (index + 1) % CARD_TYPES.length;
+      nextIndex = (index + 1) % tabs.length;
     } else if (event.key === "ArrowLeft") {
-      nextIndex = (index - 1 + CARD_TYPES.length) % CARD_TYPES.length;
+      nextIndex = (index - 1 + tabs.length) % tabs.length;
     } else if (event.key === "Home") {
       nextIndex = 0;
     } else if (event.key === "End") {
-      nextIndex = CARD_TYPES.length - 1;
+      nextIndex = tabs.length - 1;
     }
     if (nextIndex === null) return;
 
     event.preventDefault();
     tabRefs.current[nextIndex]?.focus();
-    onCardTypeChange(CARD_TYPES[nextIndex]);
+    selectTab(tabs[nextIndex]);
   };
 
   return (
@@ -71,7 +94,7 @@ export default function ReferenceCardsDestination({
           aria-orientation="horizontal"
           aria-label={t("typeSwitcherLabel")}
         >
-          {CARD_TYPES.map((item, index) => (
+          {tabs.map((item, index) => (
             <button
               id={`reference-card-type-${item}`}
               key={item}
@@ -80,18 +103,22 @@ export default function ReferenceCardsDestination({
               }}
               type="button"
               role="tab"
-              aria-selected={cardType === item}
+              aria-selected={activeTab === item}
               aria-controls="reference-card-panel"
-              tabIndex={cardType === item ? 0 : -1}
-              onClick={() => onCardTypeChange(item)}
+              tabIndex={activeTab === item ? 0 : -1}
+              onClick={() => selectTab(item)}
               onKeyDown={(event) => handleTabKeyDown(event, index)}
               className={`min-h-11 shrink-0 whitespace-nowrap rounded-md px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-                cardType === item
-                  ? "bg-accent text-white"
+                activeTab === item
+                  ? item === "candidates"
+                    ? "bg-amber-700 text-white dark:bg-amber-600"
+                    : "bg-accent text-white"
                   : "text-muted hover:bg-surface-secondary hover:text-foreground"
               }`}
             >
-              {t(`types.${item}`)}
+              {item === "candidates"
+                ? t("candidateReview.tab")
+                : t(`types.${item}`)}
             </button>
           ))}
         </div>
@@ -99,17 +126,21 @@ export default function ReferenceCardsDestination({
       <div
         id="reference-card-panel"
         role="tabpanel"
-        aria-labelledby={`reference-card-type-${cardType}`}
+        aria-labelledby={`reference-card-type-${activeTab}`}
         className="min-h-0 min-w-0 flex-1"
       >
-        <ReferenceCardsWorkspace
-          key={cardType}
-          mode={mode}
-          novelId={novelId}
-          cardType={cardType}
-          openCurationOnMount={openCurationOnMount}
-          onCurationOpened={onCurationOpened}
-        />
+        {activeTab === "candidates" && novelId ? (
+          <CandidateReviewWorkspace novelId={novelId} />
+        ) : (
+          <ReferenceCardsWorkspace
+            key={cardType}
+            mode={mode}
+            novelId={novelId}
+            cardType={cardType}
+            openCurationOnMount={openCurationOnMount}
+            onCurationOpened={onCurationOpened}
+          />
+        )}
       </div>
     </div>
   );

@@ -33,6 +33,7 @@ const JOB_PAUSE_REASON_KEYS = {
   source_changed: "reasonSourceChanged",
   incomplete_scene: "reasonIncompleteScene",
   authorization_scope_increased: "reasonAuthorizationScopeIncreased",
+  reference_card_review: "reasonReferenceCardReview",
 } as const;
 
 export type DiagnosticReasonTranslationKey =

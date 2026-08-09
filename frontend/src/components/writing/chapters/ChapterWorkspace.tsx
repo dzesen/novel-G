@@ -36,6 +36,7 @@ interface ChapterWorkspaceProps {
   novelId?: string;
   onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
+  onNavigateToReferenceCardCandidates: () => void;
   onNavigateToPlotThreads: () => void;
   initialChapterId?: string;
   initialSceneIndex?: number;
@@ -56,6 +57,7 @@ export default function ChapterWorkspace({
   novelId,
   onNavigateToMemory,
   onNavigateToReferenceCards,
+  onNavigateToReferenceCardCandidates,
   onNavigateToPlotThreads,
   initialChapterId,
   initialSceneIndex,
@@ -729,6 +731,9 @@ export default function ChapterWorkspace({
           onQuietRefresh={() => void loadStructure({ silent: true })}
           onNavigateToMemory={onNavigateToMemory}
           onNavigateToReferenceCards={onNavigateToReferenceCards}
+          onNavigateToReferenceCardCandidates={
+            onNavigateToReferenceCardCandidates
+          }
           onNavigateToPlotThreads={onNavigateToPlotThreads}
           proseRunsRevision={proseRunsRevision}
           onOpenProseRun={(run) => queueProsePanel(run.chapter_id, run)}

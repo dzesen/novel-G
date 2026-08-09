@@ -20,6 +20,7 @@ interface CheckpointReviewProps {
   onJumpToChapter: (chapterId: string) => void;
   onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
+  onNavigateToReferenceCardCandidates: () => void;
   onNavigateToPlotThreads: () => void;
   onResume: () => void;
   onRetryUncertain: () => void;
@@ -61,6 +62,7 @@ function Banner({ job }: { job: GenerationJob }) {
     job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
       : job.pause_reason === "incomplete_scene"
+          || job.pause_reason === "reference_card_review"
         ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
       : "border-border bg-background text-foreground";
   return <div className={`rounded-md border px-3 py-2 text-sm ${tone}`}>{t(key)}</div>;
@@ -324,6 +326,7 @@ export default function CheckpointReview({
   onJumpToChapter,
   onNavigateToMemory,
   onNavigateToReferenceCards,
+  onNavigateToReferenceCardCandidates,
   onNavigateToPlotThreads,
   onResume,
   onRetryUncertain,
@@ -372,6 +375,16 @@ export default function CheckpointReview({
                 {busy ? t("resuming") : t("uncertainRetry")}
               </Button>
             </>
+          ) : job.pause_reason === "reference_card_review" ? (
+            <Button
+              variant="primary"
+              size="sm"
+              className="bg-amber-700 text-white hover:bg-amber-800 dark:bg-amber-600"
+              onPress={onNavigateToReferenceCardCandidates}
+              isDisabled={busy}
+            >
+              {t("reviewReferenceCards")}
+            </Button>
           ) : (
             <Button
               variant="primary"
@@ -393,6 +406,14 @@ export default function CheckpointReview({
       </div>
 
       <Banner job={job} />
+      {job.pause_reason === "reference_card_review"
+        && job.error?.candidate_names?.length ? (
+          <p className="text-xs leading-5 text-amber-800 dark:text-amber-200">
+            {t("referenceCardReviewNames", {
+              names: job.error.candidate_names.join(t("referenceCardNameSeparator")),
+            })}
+          </p>
+        ) : null}
       {(incompleteChapterId || !stopDiagnostic) && (
         <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
           {incompleteChapterId && (
