@@ -26,6 +26,9 @@ from backend.llm.schemas.novel_pydantic import (
 )
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.derived_stats import derived_stats
+from backend.services.novel.emergent_reference_card_candidates import (
+    emergent_reference_card_candidate_module,
+)
 from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.services.novel.outline_validation import validate_outline_ids
 from backend.services.novel.state_timeline import (
@@ -370,6 +373,21 @@ class ChapterService:
                 # 只有领域对象和时间线事件都成功后才记录子步骤完成。
                 await mutation.receipt(child_key, {"thread_id": stable_id})
 
+            created_candidate_ids = (
+                await emergent_reference_card_candidate_module.register_from_outline(
+                    session=session,
+                    mutation=mutation,
+                    novel_id=novel_id,
+                    chapter={
+                        "_id": chapter_id,
+                        "volume_id": command.get("volume_id"),
+                        "order_index": chapter_order,
+                        "title": command.get("chapter_title", ""),
+                    },
+                    candidates=command["reference_card_candidates"],
+                )
+            )
+
             stored = {
                 "pov_character_card_id": _optional_object_id(payload["pov_character_card_id"]),
                 "present_character_card_ids": [
@@ -398,6 +416,7 @@ class ChapterService:
             return {
                 "chapter_id": chapter_id,
                 "created_thread_ids": created_thread_ids,
+                "created_reference_card_candidate_ids": created_candidate_ids,
                 "previous_thread_ids": previous_thread_ids,
             }
         except Exception:
@@ -450,6 +469,9 @@ class ChapterService:
         except ValidationError as exc:
             raise ValueError(f"章节细纲数据非法，未做任何写入：{exc}") from exc
         payload = parsed.model_dump()
+        raw_reference_card_candidates = payload.pop(
+            "new_reference_card_candidates"
+        )
 
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
         novel_id = str(chapter["novel_id"])
@@ -484,9 +506,26 @@ class ChapterService:
             f"thread_{index}": str(ObjectId())
             for index, _thread in enumerate(payload["new_threads"])
         }
+        for index, _candidate in enumerate(raw_reference_card_candidates):
+            child_ids[f"reference_card_candidate_{index}"] = str(ObjectId())
+            child_ids[f"reference_card_candidate_card_{index}"] = str(ObjectId())
+        reference_card_candidates = [
+            {
+                "candidate_id": child_ids[f"reference_card_candidate_{index}"],
+                "reserved_card_id": child_ids[
+                    f"reference_card_candidate_card_{index}"
+                ],
+                "candidate": candidate,
+            }
+            for index, candidate in enumerate(raw_reference_card_candidates)
+        ]
         digest = hashlib.sha256(
             json.dumps(
-                {"payload": payload, "previous_outline": chapter.get("outline")},
+                {
+                    "payload": payload,
+                    "reference_card_candidates": raw_reference_card_candidates,
+                    "previous_outline": chapter.get("outline"),
+                },
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
@@ -500,8 +539,11 @@ class ChapterService:
                 operation="accept_chapter_outline",
                 payload={
                     "chapter_id": chapter_id,
+                    "volume_id": str(chapter["volume_id"]),
                     "chapter_order": chapter_order,
+                    "chapter_title": str(chapter.get("title") or ""),
                     "outline": payload,
+                    "reference_card_candidates": reference_card_candidates,
                     "previous_thread_ids": previous_thread_ids,
                     "edited_by_human": bool(edited_by_human),
                     "generated_at": get_utc_now(),

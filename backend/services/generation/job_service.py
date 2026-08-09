@@ -33,6 +33,9 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
 from backend.services.generation.readiness import generation_readiness_module
 from backend.services.novel.state_completion import state_completion_module
+from backend.services.novel.emergent_reference_card_candidates import (
+    emergent_reference_card_candidate_module,
+)
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     authorization_ruleset_requires_refresh,
@@ -393,12 +396,59 @@ class GenerationJobService:
             finally:
                 await generation_job_repo.finish_attempt_reservation(job_id, chapter_id)
 
+        async def _inspect_reference_card_blockers():
+            current_job = await generation_job_repo.get_job(job_id)
+            return await emergent_reference_card_candidate_module.blocking_summary(
+                str(current_job["novel_id"])
+            )
+
         deps = JobEngineDeps(
             list_worklist_chapters=_list_worklist,
             run_chapter=_run_chapter,
+            inspect_reference_card_blockers=_inspect_reference_card_blockers,
         )
         task = asyncio.create_task(run_job(job_id, deps, control))
         _REGISTRY[job_id] = (task, control)
+
+    @staticmethod
+    async def resume_after_reference_card_review(
+        novel_id: str,
+    ) -> List[str]:
+        """Resume the latest job paused only for a now-cleared card review."""
+        if await emergent_reference_card_candidate_module.blocking_summary(
+            novel_id
+        ):
+            return []
+        job_id: str | None = None
+        async with _get_start_lock():
+            if await emergent_reference_card_candidate_module.blocking_summary(
+                novel_id
+            ):
+                return []
+            jobs = await generation_job_repo.list_jobs_by_novel(novel_id)
+            target = next(
+                (
+                    item
+                    for item in jobs
+                    if item.get("status") == "paused"
+                    and item.get("pause_reason") == "reference_card_review"
+                ),
+                None,
+            )
+            if target is None:
+                return []
+            await GenerationJobService._guard_no_running()
+            job_id = str(target["_id"])
+            await generation_job_repo.update_job_fields(job_id, {
+                "status": "running",
+                "pause_reason": None,
+                "error": None,
+                "active_slot": "global",
+                "current_chapter_id": None,
+            })
+        control = JobControl()
+        GenerationJobService._spawn(job_id, control)
+        return [job_id]
 
     @staticmethod
     async def inspect_volume_readiness(

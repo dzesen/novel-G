@@ -16,6 +16,9 @@ from backend.services.novel.plot_thread_service import PlotThreadService
 from backend.services.novel.novel_service import NovelService
 from backend.services.novel.reference_card_service import ReferenceCardService
 from backend.services.novel.reference_card_curation import ReferenceCardCurationService
+from backend.services.novel.emergent_reference_card_candidates import (
+    EmergentReferenceCardCandidateModule,
+)
 from backend.services.novel.volume_service import VolumeService
 from backend.services.generation.prose_runs import ProseRunModule
 from backend.services.interop.card_import_proposal_service import (
@@ -71,6 +74,9 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("restore_reference_card", 1): ReferenceCardService._execute_mutation,
         ("hard_delete_reference_card", 1): ReferenceCardService._execute_mutation,
         ("apply_reference_card_plan", 1): ReferenceCardCurationService._execute_apply,
+        ("apply_emergent_reference_card_candidates", 1): (
+            EmergentReferenceCardCandidateModule._execute_apply
+        ),
         ("apply_card_import_proposal", 1): CardImportProposalService._execute_apply,
         ("apply_agent_revision_proposal", 1): AgentRevisionProposalService._execute_apply,
     }

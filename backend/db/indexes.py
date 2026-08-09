@@ -398,6 +398,42 @@ async def init_reference_card_proposal_indexes():
         logger.error("Failed to initialize reference-card proposal indexes: %s", exc)
 
 
+async def init_emergent_reference_card_candidate_indexes():
+    """Initialize queue, blocker, and exact-name suggestion indexes."""
+    try:
+        collection = get_database()[
+            collections.EMERGENT_REFERENCE_CARD_CANDIDATES
+        ]
+        await collection.create_indexes([
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+                ("updated_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("requires_review_before_next_chapter", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("novel_id", pymongo.ASCENDING),
+                ("card_type", pymongo.ASCENDING),
+                ("normalized_name", pymongo.ASCENDING),
+                ("status", pymongo.ASCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("chapter_id", pymongo.ASCENDING),
+                ("source_mutation_id", pymongo.ASCENDING),
+            ]),
+        ])
+        logger.info("Initialized emergent reference-card candidate indexes.")
+    except Exception as exc:
+        logger.error(
+            "Failed to initialize emergent reference-card candidate indexes: %s",
+            exc,
+        )
+
+
 async def init_card_import_proposal_indexes():
     """Initialize owner-scoped import lookup, duplicate, and retention indexes."""
     try:
@@ -1009,6 +1045,7 @@ async def init_all_indexes():
     await init_chapter_indexes()
     await init_reference_card_indexes()
     await init_reference_card_proposal_indexes()
+    await init_emergent_reference_card_candidate_indexes()
     await init_card_import_proposal_indexes()
     await init_faction_indexes()
     await init_faction_relation_indexes()

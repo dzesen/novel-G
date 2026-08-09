@@ -43,6 +43,10 @@ class JobEngineDeps:
     list_worklist_chapters: Callable[[], Awaitable[List[Dict[str, Any]]]]
     run_chapter: Callable[[str, Dict[str, Any]], Awaitable[ChapterOutcome]]
 
+    inspect_reference_card_blockers: Optional[
+        Callable[[], Awaitable[Dict[str, Any] | None]]
+    ] = None
+
 
 def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
     progress = {
@@ -303,6 +307,32 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
 
             chapters = await deps.list_worklist_chapters()
             chapter = job_planner.first_needing_work(chapters)
+            if (
+                chapter is not None
+                and deps.inspect_reference_card_blockers is not None
+            ):
+                blockers = await deps.inspect_reference_card_blockers()
+                if blockers:
+                    await repo.update_job_fields(job_id, {
+                        "status": "paused",
+                        "pause_reason": "reference_card_review",
+                        "current_chapter_id": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": "reference_card_review",
+                            "message": (
+                                "New reference-card candidates must be reviewed "
+                                "before the next chapter"
+                            ),
+                            "candidate_ids": list(
+                                blockers.get("candidate_ids") or []
+                            ),
+                            "candidate_names": list(
+                                blockers.get("names") or []
+                            ),
+                        },
+                    })
+                    return
             if chapter is None:
                 await repo.update_job_fields(job_id, {
                     "status": "completed", "current_chapter_id": None, "active_slot": None,

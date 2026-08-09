@@ -35,6 +35,7 @@ PLOT_THREAD_EVENTS = "plot_thread_events"
 MANUAL_CORRECTIONS = "manual_corrections"
 STATE_PREVIEWS = "state_previews"
 REFERENCE_CARD_PROPOSALS = "reference_card_proposals"
+EMERGENT_REFERENCE_CARD_CANDIDATES = "emergent_reference_card_candidates"
 CARD_IMPORT_PROPOSALS = "card_import_proposals"
 MUTATION_JOURNALS = "mutation_journals"
 IMAGE_ASSETS = "image_assets"
@@ -65,6 +66,7 @@ ACTIVE_COLLECTIONS = frozenset({
     MANUAL_CORRECTIONS,
     STATE_PREVIEWS,
     REFERENCE_CARD_PROPOSALS,
+    EMERGENT_REFERENCE_CARD_CANDIDATES,
     CARD_IMPORT_PROPOSALS,
     MUTATION_JOURNALS,
     IMAGE_ASSETS,

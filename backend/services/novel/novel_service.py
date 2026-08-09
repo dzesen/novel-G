@@ -191,6 +191,9 @@ class NovelService:
             reference_card_proposals_repo = BaseRepository(
                 collections.REFERENCE_CARD_PROPOSALS
             )
+            emergent_reference_card_candidates_repo = BaseRepository(
+                collections.EMERGENT_REFERENCE_CARD_CANDIDATES
+            )
             card_import_proposals_repo = BaseRepository(
                 collections.CARD_IMPORT_PROPOSALS
             )
@@ -233,6 +236,7 @@ class NovelService:
             stats["manual_corrections_deleted"] = await manual_corrections_repo.hard_delete_many(query, session=session)
             stats["state_previews_deleted"] = await state_previews_repo.hard_delete_many(query, session=session)
             stats["reference_card_proposals_deleted"] = await reference_card_proposals_repo.hard_delete_many(query, session=session)
+            stats["emergent_reference_card_candidates_deleted"] = await emergent_reference_card_candidates_repo.hard_delete_many(query, session=session)
             stats["card_import_proposals_deleted"] = await card_import_proposals_repo.hard_delete_many(query, session=session)
             stats["agent_runs_deleted"] = await agent_runs_repo.hard_delete_many(query, session=session)
             stats["agent_revision_proposals_deleted"] = await agent_revision_proposals_repo.hard_delete_many(query, session=session)

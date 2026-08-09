@@ -15,6 +15,11 @@ from backend.services.novel.reference_card_curation import (
     StaleReferenceCardProposal,
     reference_card_curation_service,
 )
+from backend.services.novel.emergent_reference_card_candidates import (
+    CandidateReviewError,
+    StaleCandidateReview,
+    emergent_reference_card_candidate_module,
+)
 from backend.services.novel.reference_card_service import ReferenceCardService
 from backend.services.novel.character_profile import CharacterProfileSchema
 from backend.api.default_routers.auth_router import require_owned_path_resource
@@ -67,6 +72,22 @@ class ReferenceCardCurationDecision(BaseModel):
 class ReferenceCardCurationApplyRequest(BaseModel):
     acceptance_token: str = Field(min_length=1)
     decisions: List[ReferenceCardCurationDecision] = Field(min_length=1, max_length=30)
+class EmergentReferenceCardDecision(BaseModel):
+    candidate_id: str = Field(min_length=1)
+    action: Literal["create", "merge", "restore_merge", "defer", "ignore"]
+    target_card_id: Optional[str] = None
+    overrides: Dict[str, Any] = Field(default_factory=dict)
+    overwrite_fields: List[str] = Field(default_factory=list)
+
+
+class EmergentReferenceCardApplyRequest(BaseModel):
+    review_digest: str = Field(min_length=1)
+    decisions: List[EmergentReferenceCardDecision] = Field(
+        min_length=1,
+        max_length=100,
+    )
+
+
 
 
 ReferenceCardCurationType = Literal[
@@ -210,6 +231,58 @@ async def apply_reference_card_curation(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+@router.get("/novel/{novel_id}/candidates")
+async def inspect_emergent_reference_card_candidates(novel_id: str):
+    """Inspect persisted candidates without running a model or writing cards."""
+    try:
+        return await emergent_reference_card_candidate_module.inspect(novel_id)
+    except Exception as exc:
+        raise _translate_error(exc) from exc
+
+
+@router.post("/novel/{novel_id}/candidates/apply")
+async def apply_emergent_reference_card_candidates(
+    novel_id: str,
+    req: EmergentReferenceCardApplyRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+):
+    """Apply one explicit human decision for every selected candidate."""
+    try:
+        result = await emergent_reference_card_candidate_module.apply(
+            novel_id=novel_id,
+            actor_id=actor.id,
+            review_digest=req.review_digest,
+            decisions=[
+                item.model_dump(exclude_none=True)
+                for item in req.decisions
+            ],
+        )
+        from backend.services.generation.job_service import GenerationJobService
+
+        result["resumed_job_ids"] = (
+            await GenerationJobService.resume_after_reference_card_review(
+                novel_id
+            )
+        )
+        return result
+    except StaleCandidateReview as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "stale_reference_card_candidate_review",
+                "message": str(exc),
+            },
+        ) from exc
+    except MutationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (CandidateReviewError, InvalidIdError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 
 
 @router.post("/novel/{novel_id}/{card_type}")

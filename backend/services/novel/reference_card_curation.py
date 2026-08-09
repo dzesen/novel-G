@@ -463,6 +463,49 @@ def _prepare_candidates(
     return prepared
 
 
+async def prepare_persisted_reference_card_candidates(
+    novel_id: str,
+    queued_candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reuse curation matching for persisted, human-reviewed candidates."""
+
+    grouped: dict[str, list[Any]] = {group: [] for group in GROUP_TO_TYPE}
+    identities: dict[tuple[str, int], dict[str, Any]] = {}
+    for queued in queued_candidates:
+        card_type = str(queued.get("card_type") or "")
+        if card_type not in TYPE_TO_GROUP:
+            raise ValueError(f"Unsupported reference-card type: {card_type}")
+        group = TYPE_TO_GROUP[card_type]
+        candidate_data = _clean_candidate(
+            card_type,
+            dict(queued.get("candidate_data") or {}),
+        )
+        index = len(grouped[group])
+        grouped[group].append(
+            SCHEMA_BY_TYPE[card_type].model_validate(candidate_data)
+        )
+        identities[(group, index)] = queued
+
+    generated = ReferenceCardCandidatesSchema.model_construct(**grouped)
+    prepared = _prepare_candidates(generated, await _load_cards(novel_id))
+    public: list[dict[str, Any]] = []
+    for group in GROUP_TO_TYPE:
+        for index, candidate in enumerate(prepared[group]):
+            queued = identities[(group, index)]
+            candidate["candidate_id"] = str(queued["candidate_id"])
+            candidate["reserved_card_id"] = str(queued["reserved_card_id"])
+            candidate["queue_status"] = str(queued.get("status") or "pending")
+            candidate["requires_review_before_next_chapter"] = bool(
+                queued.get("requires_review_before_next_chapter")
+            )
+            candidate["evidence"] = deepcopy(queued.get("evidence") or {})
+            candidate["source_chapter_id"] = str(
+                queued.get("chapter_id") or ""
+            )
+            public.append(_public_candidate(candidate))
+    return public
+
+
 def _public_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         key: deepcopy(value)

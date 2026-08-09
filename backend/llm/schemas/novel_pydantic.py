@@ -1,4 +1,8 @@
 from typing import List, Literal, Optional
+from backend.llm.schemas.reference_card_pydantic import (
+    EmergentReferenceCardCandidateSchema,
+)
+
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
@@ -370,6 +374,13 @@ class ChapterOutlineResultSchema(ChapterOutlineAuthoredSchema):
 
     new_threads: List[NewThreadSchema] = Field(
         default_factory=list, max_length=10, description="本章新埋下的伏笔（尚无 id）"
+    )
+    new_reference_card_candidates: List[
+        EmergentReferenceCardCandidateSchema
+    ] = Field(
+        default_factory=list,
+        max_length=10,
+        description="New reference-card candidates without formal card ids",
     )
 
 

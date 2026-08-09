@@ -451,11 +451,19 @@ create_chapter_outline_by_ai:
       {{"kind":"chapter","chapter_id":"<名单中的章节 id>"}}；目标章尚未建立时用
       {{"kind":"planned_ordinal","ordinal":120}}；不确定时为 null。
       这些伏笔尚不存在于名单中，**不要为它们编 id**。
+    - new_reference_card_candidates: declare only important new characters, locations,
+      items, rules, or lore that do not have a formal card id yet. Record only facts
+      confirmed by this outline; do not speculate or invent an internal id.
+      Use card_type character, location, item, rule, or lore and include a short
+      evidence_summary. Set requires_review_before_next_chapter to true only when a
+      later chapter depends on this candidate becoming a formal card. One-off details
+      that will not matter again should not become candidates. Existing roster entries
+      must continue to use their formal ids instead of being declared again.
   chapter_outline_prompt_with_schema_suffix: |
     请严格按提供的 JSON Schema 输出。
   chapter_outline_prompt_without_schema_suffix: |
     请只输出 JSON，形如：
-    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_target":{"kind":"planned_ordinal","ordinal":120},"importance":"sub"}]}
+    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_target":{"kind":"planned_ordinal","ordinal":120},"importance":"sub"}],"new_reference_card_candidates":[{"card_type":"character","name":"...","evidence_summary":"...","requires_review_before_next_chapter":false}]}
     不要输出 JSON 以外的任何内容。
 
 # 章节正文 Prompt 配置

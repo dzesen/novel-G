@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 from backend.services.novel.character_profile import CharacterProfileSchema
@@ -84,6 +84,46 @@ class RuleCandidateSchema(_CardCandidateBase):
 class LoreCandidateSchema(_CardCandidateBase):
     details: LoreDetailsSchema = Field(default_factory=LoreDetailsSchema)
 
+
+
+class EmergentCharacterCandidateSchema(CharacterCandidateSchema):
+    card_type: Literal["character"]
+    requires_review_before_next_chapter: bool = False
+    evidence_summary: str = Field(default="", max_length=500)
+
+
+class EmergentLocationCandidateSchema(LocationCandidateSchema):
+    card_type: Literal["location"]
+    requires_review_before_next_chapter: bool = False
+    evidence_summary: str = Field(default="", max_length=500)
+
+
+class EmergentItemCandidateSchema(ItemCandidateSchema):
+    card_type: Literal["item"]
+    requires_review_before_next_chapter: bool = False
+    evidence_summary: str = Field(default="", max_length=500)
+
+
+class EmergentRuleCandidateSchema(RuleCandidateSchema):
+    card_type: Literal["rule"]
+    requires_review_before_next_chapter: bool = False
+    evidence_summary: str = Field(default="", max_length=500)
+
+
+class EmergentLoreCandidateSchema(LoreCandidateSchema):
+    card_type: Literal["lore"]
+    requires_review_before_next_chapter: bool = False
+    evidence_summary: str = Field(default="", max_length=500)
+
+
+EmergentReferenceCardCandidateSchema = Annotated[
+    EmergentCharacterCandidateSchema
+    | EmergentLocationCandidateSchema
+    | EmergentItemCandidateSchema
+    | EmergentRuleCandidateSchema
+    | EmergentLoreCandidateSchema,
+    Field(discriminator="card_type"),
+]
 
 class ReferenceCardCandidatesSchema(_StrictModel):
     characters: list[CharacterCandidateSchema] = Field(min_length=2, max_length=10)
