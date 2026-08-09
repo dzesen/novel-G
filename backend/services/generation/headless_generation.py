@@ -23,6 +23,7 @@ from backend.llm.schemas.novel_pydantic import (
     MAX_CHAPTER_OUTLINE_SCENES,
 )
 from backend.services.llm.context_builder import (
+    DEFAULT_CONTEXT_TOKEN_BUDGET,
     assemble_context,
     assemble_outline_context,
     fetch_context_inputs,
@@ -174,6 +175,13 @@ def _unknown_outline_prompt_envelope() -> dict[str, Any]:
         "threads_resolved": [],
     }
 
+def _unknown_outline_context_prompt_envelope() -> str:
+    """Reserve the complete prose-context budget at worst-case UTF-8 width."""
+    return (
+        "\U0001f600"
+        * DEFAULT_CONTEXT_TOKEN_BUDGET
+    )
+
 
 async def build_batch_prose_prompt_input_bounds(
     *,
@@ -230,9 +238,9 @@ async def build_batch_prose_prompt_input_bounds(
             # persisted content, so append it only to the measured prompt. If
             # it were inserted into assemble_context it would trip the 8k
             # runtime guard before a real outline even exists.
-            context = assemble_context(context_inputs)
+            assemble_context(context_inputs)
             context_text = "\n\n".join(filter(None, (
-                context.to_prompt_text(),
+                _unknown_outline_context_prompt_envelope(),
                 f"本章细纲：{outline_for_context}",
             )))
         target_words = int(
