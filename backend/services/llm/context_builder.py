@@ -31,6 +31,9 @@ from backend.db.repositories.volume_repository import volume_repo
 from backend.services.novel.chapter_timeline import ChapterTimeline
 from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.db.repositories.worldbook_repository import worldbook_repo
+from backend.services.llm.outline_generation import (
+    CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET,
+)
 
 # 默认上下文预算。写到第 87 章时，"最近 K 章 + 所有活跃伏笔 + 相关卡片"
 # 必然撑爆窗口；没有预算控制，系统会在中后期以"莫名其妙的 API 报错"死掉。
@@ -894,7 +897,10 @@ def outline_selection_roster(
     }
 
 
-def assemble_outline_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -> ChapterContext:
+def assemble_outline_context(
+    inputs: dict,
+    budget: int = CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET,
+) -> ChapterContext:
     """细纲模式装配。纯函数，不碰数据库。
 
     与 assemble_context（正文模式）的差异（设计 §4.2）：
@@ -1250,7 +1256,7 @@ async def build_context(
 async def build_outline_context(
     novel_id: str,
     chapter_id: str,
-    budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+    budget: int = CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET,
 ) -> ChapterContext:
     """细纲模式的取数 + 装配组合入口。"""
     return assemble_outline_context(await fetch_context_inputs(novel_id, chapter_id), budget=budget)

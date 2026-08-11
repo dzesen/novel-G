@@ -7,6 +7,7 @@ from typing import Any
 
 
 CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS = 20_000
+CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET = 20_000
 
 
 def chapter_outline_generation_kwargs(
