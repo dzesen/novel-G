@@ -40,6 +40,9 @@ from backend.services.llm.generation_runtime import (
     WorkflowStepTarget,
     create_generation_runtime,
 )
+from backend.services.llm.outline_generation import (
+    chapter_outline_generation_kwargs,
+)
 from backend.services.novel.state_validation import (
     resolve_outline_character_references,
     resolve_state_character_references,
@@ -446,6 +449,7 @@ async def generate_outline(
         "words_per_chapter": novel.get("words_per_chapter") or 3000,
     }
     gen_kwargs, _runtime_kwargs = _generation_options(generation_params)
+    gen_kwargs = chapter_outline_generation_kwargs(gen_kwargs)
     deps = _deps_for(
         CHAPTER_OUTLINE_WORKFLOW,
         attempt_scope,

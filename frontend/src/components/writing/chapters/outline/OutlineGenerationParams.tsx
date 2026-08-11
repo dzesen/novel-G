@@ -42,9 +42,15 @@ export function toRequestParams(params: GenerationParams): Record<string, unknow
 export default function OutlineGenerationParams({
   value,
   onChange,
+  maxTokensLimit = 200_000,
+  maxTokensEnableValue = 4_096,
+  maxTokensStep = 256,
 }: {
   value: GenerationParams;
   onChange: (next: GenerationParams) => void;
+  maxTokensLimit?: number;
+  maxTokensEnableValue?: number;
+  maxTokensStep?: number;
 }) {
   const t = useTranslations("writing.outline");
   const [open, setOpen] = useState(false);
@@ -86,9 +92,11 @@ export default function OutlineGenerationParams({
             label={t("paramMaxTokens")}
             value={value.max_tokens}
             min={1}
-            max={200000}
-            step={256}
-            onToggle={(enabled) => set("max_tokens", enabled ? 4096 : null)}
+            max={maxTokensLimit}
+            step={maxTokensStep}
+            onToggle={(enabled) =>
+              set("max_tokens", enabled ? maxTokensEnableValue : null)
+            }
             onValueChange={(v) => set("max_tokens", v)}
           />
           <SwitchParam

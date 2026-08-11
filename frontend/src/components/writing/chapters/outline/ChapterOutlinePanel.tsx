@@ -209,7 +209,13 @@ export default function ChapterOutlinePanel({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           <div className="mb-4">
-            <OutlineGenerationParams value={params} onChange={setParams} />
+            <OutlineGenerationParams
+              value={params}
+              onChange={setParams}
+              maxTokensLimit={20_000}
+              maxTokensEnableValue={20_000}
+              maxTokensStep={1}
+            />
           </div>
 
           {roster.error && <Notice tone="warning">{t("rosterLoadFailed", { error: roster.error })}</Notice>}

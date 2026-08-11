@@ -46,6 +46,10 @@ from backend.services.llm.workflow_runner import (
     sse_event,
 )
 from backend.services.llm.generation_runtime import create_workflow_runtime
+from backend.services.llm.outline_generation import (
+    CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS,
+    chapter_outline_generation_kwargs,
+)
 from backend.services.novel.outline_validation import validate_outline_ids
 from backend.services.novel.state_validation import (
     resolve_outline_character_references,
@@ -110,6 +114,11 @@ class VolumeOutlineRequest(GenerationParamsMixin):
 class ChapterOutlineRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
     chapter_id: str = Field(..., min_length=1)
+    max_tokens: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS,
+    )
 
 
 def _extract_chapter_outline(parsed) -> Optional[dict]:
@@ -256,7 +265,9 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
             steps=CHAPTER_OUTLINE_STEPS,
             prompts=_load_prompts().get(CHAPTER_OUTLINE_PROMPT_NAME, {}),
             params=params,
-            gen_kwargs=build_gen_kwargs(req),
+            gen_kwargs=chapter_outline_generation_kwargs(
+                build_gen_kwargs(req)
+            ),
             cached={},
             deps=deps,
             request_id=uuid4().hex[:8],
