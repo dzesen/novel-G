@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 from uuid import uuid4
 
@@ -26,7 +27,6 @@ from backend.services.llm.context_builder import (
     fetch_context_inputs,
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
-from backend.services.llm.prose_runner import stream_prose
 from backend.services.llm.workflow_runner import (
     WorkflowDeps, WorkflowFailed, parse_sse_event, run_workflow, run_workflow_to_result,
 )
@@ -45,10 +45,12 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
+    ChapterGenerationApplicationDeps,
     ChapterGenerationApplicationService,
     CHAPTER_OUTLINE_STEP,
     CHAPTER_OUTLINE_WORKFLOW,
     OutlineGenerationCommand,
+    ProseGenerationCommand,
 )
 from backend.api.llm_routers.prose_router import PROSE_STEP, PROSE_WORKFLOW
 from backend.api.llm_routers.state_router import (
@@ -65,18 +67,12 @@ from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
 )
-from backend.services.generation.prose_generation import execute_prose_plan
-from backend.services.generation.prose_runs import prose_run_module
-from backend.db.repositories.prose_run_repository import prose_run_repo
-from backend.services.novel.chapter_service import ChapterService
 from backend.services.novel.state_proposal import (
     SelectAllPolicy,
     state_proposal_module,
 )
 from backend.services.novel.state_completion import prose_is_eligible_for_state
-from backend.services.novel.state_completion import chapter_content_digest
 from backend.services.novel.style_controls import render_style_controls
-from backend.db.utils import get_utc_now
 
 _GENERATION_OVERRIDE_KEYS = frozenset({
     "temperature",
@@ -114,7 +110,13 @@ def _continuation_policy(
 
 
 def _chapter_generation_service() -> ChapterGenerationApplicationService:
-    return ChapterGenerationApplicationService()
+    production = ChapterGenerationApplicationDeps.production()
+    return ChapterGenerationApplicationService(
+        replace(
+            production,
+            create_runtime=create_generation_runtime,
+        )
+    )
 
 
 def build_prose_base_prompt(
@@ -445,194 +447,23 @@ async def generate_prose(
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
-) -> tuple[str, int, dict, list[dict[str, Any]]]:
-    inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
-    context = assemble_context(inputs)
-    # outline 取 fetch_context_inputs 内部刚刚重新查库得到的版本，不用调用方传入
-    # 的 chapter 参数：chapter_pipeline.run_chapter 的入口快照只用于 skip-existing
-    # 判断，同一轮里若本步之前的 generate_outline/accept_outline 刚写入了 outline，
-    # 调用方那份快照仍是写入前的旧值（该函数文档明确写了"生成函数内部读库看得到
-    # 本轮先前写入"这一契约）。用旧快照会让刚生成、刚接受的细纲的 target_word_count
-    # 被悄悄忽略，退化成小说级默认字数。
-    outline = (inputs.get("chapter") or {}).get("outline") or {}
-    # 与 prose_router.write_chapter_by_ai 的取值方式一致（本章细纲的
-    # target_word_count 优先，其次小说级 words_per_chapter，最后 3000）；
-    # words_per_chapter 是小说级字段，chapter 文档上不存在，见 generate_outline
-    # 同一处注释。
-    novel = await novel_repo.get_novel_by_id(novel_id)
-    words = outline.get("target_word_count") or novel.get("words_per_chapter") or 3000
-    prompt = build_prose_base_prompt(
-        context_text=context.to_prompt_text(),
-        chapter_order=int(chapter.get("order_index") or 0),
-        chapter_title=str(chapter.get("title") or ""),
-        style_controls=novel.get("style_controls"),
-        words_per_chapter=int(words),
+) -> tuple[str, int, dict, list[dict[str, Any]], dict[str, Any]]:
+    result = await _chapter_generation_service().collect(
+        ProseGenerationCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            authority=AcceptanceAuthority.SYSTEM,
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
+        )
     )
-    gen_kwargs, runtime_kwargs = _generation_options(generation_params)
-    continuation_policy = _continuation_policy(generation_params)
-    runtime = create_generation_runtime(
-        attempt_scope=attempt_scope,
-        **runtime_kwargs,
-    )
-    plan = runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP))
-    execution_plan = prose_completion_module.plan(
-        outline=outline,
-        target_word_count=int(words),
-        provider_capability={
-            "max_output_tokens": plan.max_output_tokens,
-            "model": plan.provider_model,
-        },
-        request_overrides=gen_kwargs,
-    )
-    owner_id = str(novel.get("owner_id") or "")
-    if not owner_id:
-        raise ValueError("小说缺少 owner_id，无法创建用户隔离的正文草稿")
-    active = await prose_run_module.inspect_active(
-        owner_id=owner_id,
-        chapter_id=str(chapter["_id"]),
-        outline=outline,
-        context_text=context.to_prompt_text(),
-    )
-    if active is not None:
-        stored_protocol = str(
-            ((active.get("plan") or {}).get("protocol_revision") or "")
-        )
-        if stored_protocol != execution_plan.protocol_revision:
-            # A v2 residue is historical evidence, not a compatible checkpoint.
-            # Preserve it read-only and start a new v3 run instead of borrowing
-            # its per-part continuation count or text identity.
-            await prose_run_repo.mark_status(
-                run_id=str(active["_id"]),
-                owner_id=owner_id,
-                status="stale",
-            )
-            active = None
-        elif active.get("status") == "stale":
-            active = None
-    run_document = await prose_run_module.begin(
-        owner_id=owner_id,
-        novel_id=novel_id,
-        chapter_id=str(chapter["_id"]),
-        outline=outline,
-        context_text=context.to_prompt_text(),
-        plan=execution_plan,
-        provider_plan={
-            "provider_alias": plan.provider_alias,
-            "provider_model": plan.provider_model,
-            "config_revision": plan.config_revision,
-            "thinking_mode": getattr(plan, "thinking_mode", None),
-        },
-        run_id=str(active["_id"]) if active is not None else None,
-        expected_revision=int(active.get("revision") or 0) if active is not None else None,
-        confirm_uncertain_retry=bool(
-            getattr(attempt_scope, "confirm_uncertain_retry", False)
-        ),
-        replace_exhausted=True,
-    )
-    latest_run = run_document
-
-    def stream_call(call_prompt: str, call_kwargs: dict):
-        return runtime.stream_text(plan, call_prompt, **call_kwargs)
-
-    def finish_reason_reader():
-        return runtime.last_finish_reason
-
-    def raw_finish_reason_reader():
-        return getattr(
-            runtime,
-            "last_raw_finish_reason",
-            runtime.last_finish_reason,
-        )
-
-    def usage_reader():
-        attempts = runtime.attempts
-        return attempts[-1].usage if attempts else runtime.usage
-
-    async def on_segment(segment: dict) -> None:
-        nonlocal latest_run
-        lease = latest_run.get("lease") or {}
-        latest_run = await prose_run_repo.append_segment(
-            run_id=str(latest_run["_id"]),
-            owner_id=owner_id,
-            lease_token=str(lease.get("token") or ""),
-            segment=segment,
-        )
-
-    async def on_scene_progress(scene_progress: tuple[dict, ...]) -> None:
-        nonlocal latest_run
-        lease = latest_run.get("lease") or {}
-        latest_run = await prose_run_repo.update_scene_progress(
-            run_id=str(latest_run["_id"]),
-            owner_id=owner_id,
-            lease_token=str(lease.get("token") or ""),
-            scene_progress=[dict(item) for item in scene_progress],
-        )
-
-    try:
-        generated = await execute_prose_plan(
-            plan=execution_plan,
-            outline=outline,
-            base_prompt=prompt,
-            stream_call=stream_call,
-            finish_reason_reader=finish_reason_reader,
-            usage_reader=usage_reader,
-            raw_finish_reason_reader=raw_finish_reason_reader,
-            outline_revision=str(run_document["outline_revision"]),
-            gen_kwargs=gen_kwargs,
-            existing_segments=list(run_document.get("segments") or []),
-            existing_scene_progress=list(run_document.get("scene_progress") or []),
-            confirm_uncertain_retry=bool(
-                getattr(attempt_scope, "confirm_uncertain_retry", False)
-            ),
-            on_segment=on_segment,
-            continuation_policy=continuation_policy,
-            on_scene_progress=on_scene_progress,
-        )
-        run_completion = {
-            **generated.completion.to_dict(),
-            "scene_progress": [dict(item) for item in generated.scene_progress],
-            "pause_reason": generated.pause_reason,
-        }
-        lease = latest_run.get("lease") or {}
-        latest_run = await prose_run_repo.finish(
-            run_id=str(latest_run["_id"]),
-            owner_id=owner_id,
-            lease_token=str(lease.get("token") or ""),
-            status=(
-                "complete"
-                if generated.completion.can_write_formal_prose
-                else generated.completion.status
-            ),
-            completion=run_completion,
-            assembled_text=generated.text,
-        )
-    except BaseException:
-        await prose_run_repo.mark_status(
-            run_id=str(latest_run["_id"]),
-            owner_id=owner_id,
-            status="incomplete",
-        )
-        raise
-    truncation = {
-        "truncated_sections": list(context.truncated_sections),
-        "dropped_item_counts": dict(context.dropped_item_counts),
-    }
-    completion = {
-        **generated.completion.to_dict(),
-        "source_run_id": str(latest_run["_id"]),
-        "scene_progress": [dict(item) for item in generated.scene_progress],
-        "pause_reason": generated.pause_reason,
-        "source_run_revision": int(latest_run.get("revision") or 0),
-        "source_run_digest": chapter_content_digest(generated.text),
-    }
     return (
-        generated.text,
-        generated.usage.total_tokens,
-        truncation,
-        _serialize_attempts(runtime),
-        completion,
+        str(result.value or ""),
+        result.total_tokens,
+        result.truncation,
+        result.attempts,
+        result.completion,
     )
-
 
 async def generate_state(
     novel_id: str,
@@ -819,30 +650,14 @@ async def _outline_already_accepted(chapter_id: str, result: dict) -> None:
     del chapter_id, result
 
 
-async def _write_prose(
+async def _prose_already_accepted(
     chapter_id: str,
     text: str,
     completion: dict[str, Any],
 ) -> None:
-    await ChapterService.update_chapter(
-        chapter_id,
-        {
-            "content": text,
-            "prose_acceptance": {
-                "state": "ai_complete",
-                "content_digest": chapter_content_digest(text),
-                "accepted_at": get_utc_now(),
-                "source": "batch_generation",
-                "source_run_id": completion.get("source_run_id"),
-                "source_run_revision": completion.get(
-                    "source_run_revision"
-                ),
-                "source_run_digest": completion.get("source_run_digest"),
-                "completion_status": completion.get("status"),
-                "finish_reason": completion.get("finish_reason"),
-            },
-        },
-    )
+    """统一应用服务已通过 ProseRun mutation 接受正文。"""
+
+    del chapter_id, text, completion
 
 
 async def _accept_state(chapter_id: str, proposal: dict) -> dict:
@@ -890,7 +705,7 @@ def build_chapter_pipeline_deps(
             generation_params,
         ),
         accept_outline=_outline_already_accepted,
-        write_prose=_write_prose,
+        write_prose=_prose_already_accepted,
         accept_state=_accept_state,
         recalculate_prose_authorization=recalculate_prose_authorization,
     )

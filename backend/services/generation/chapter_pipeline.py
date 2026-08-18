@@ -220,8 +220,9 @@ async def run_chapter(
                 )
                 return outcome
 
-    # 2. 正文。headless 生成先持久化 ProseRun 分段；只有完成契约通过后，
-    # 批量编排才调用 write_prose 写入正式 chapter.content。
+    # 2. 正文。统一应用服务先持久化 ProseRun 分段，并只在完成契约通过后通过
+    # ProseRun.accept mutation 写入正式正文；write_prose 保留为旧管线形状的兼容
+    # 回调，生产装配中是无操作，避免第二条直接写库路径。
     if _has(chapter, "content"):
         outcome.steps_skipped.append("prose")
         outcome.step_outcomes.append(step_outcome("prose", "reused", "existing_current"))
