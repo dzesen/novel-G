@@ -529,6 +529,12 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
                 true,
               )
             }
+            onOpenRunAudit={(chapterId, runId) =>
+              navigateView("auto-book", "generation-runs", {
+                chapter: chapterId,
+                run: runId,
+              })
+            }
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
             onProseOpenRequestConsumed={consumeProseOpen}

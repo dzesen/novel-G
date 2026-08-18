@@ -1470,6 +1470,10 @@
       "cancel": "Cancel",
       "dismiss": "Dismiss",
       "evidenceSceneLocated": "Located scene {scene}; verify the evidence in the chapter outline.",
+      "runAuditTitle": "This prose run is now an audit record",
+      "runAuditBody": "It is no longer opened as an editable draft. Open generation records to inspect its terminal state, calls, and completion gate.",
+      "openRunAudit": "Open generation record",
+      "runLookupFailed": "Could not load prose run {run}: {error}",
       "untitled": "Untitled chapter",
       "createModeTitle": "Save the novel to start writing chapters",
       "createModeDescription": "This novel is still a local creation draft. Save it from Novel Info to unlock the volume tree, autosave, and export tools."

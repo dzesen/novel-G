@@ -116,7 +116,7 @@ export default function AutoBookWorkspace({
         setLoadError(error instanceof Error ? error.message : t("loadFailed"));
       }
     } finally {
-      if (requestId === structureRequestRef.current && !silent) {
+      if (requestId === structureRequestRef.current) {
         setLoading(false);
       }
     }

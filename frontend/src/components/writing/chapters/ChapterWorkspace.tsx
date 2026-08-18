@@ -50,6 +50,7 @@ interface ChapterWorkspaceProps {
   onSceneTargetValidation: (sceneIndex: number, valid: boolean) => void;
   onRunTargetValidation: (runId: string, valid: boolean) => void;
   onRunTargetChange: (runId?: string) => void;
+  onOpenRunAudit: (chapterId: string, runId: string) => void;
   onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
@@ -69,6 +70,7 @@ interface ProseRunLocator {
   run_id: string;
   novel_id: string;
   chapter_id: string;
+  status: string;
 }
 
 type MobileChapterPane = "structure" | "editor";
@@ -87,6 +89,7 @@ export default function ChapterWorkspace({
   onSceneTargetValidation,
   onRunTargetValidation,
   onRunTargetChange,
+  onOpenRunAudit,
   onStartAutoBook,
   proseOpenRequest,
   onProseOpenRequestConsumed,
@@ -134,6 +137,14 @@ export default function ChapterWorkspace({
   const [pendingStateRepairChapterId, setPendingStateRepairChapterId] =
     useState<string | null>(null);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
+  const [runTargetAudit, setRunTargetAudit] =
+    useState<ProseRunLocator | null>(null);
+  const [runTargetLoadError, setRunTargetLoadError] = useState<{
+    chapterId: string;
+    runId: string;
+    message: string;
+  } | null>(null);
+  const [runLookupRevision, setRunLookupRevision] = useState(0);
   const [mobilePane, setMobilePane] =
     useState<MobileChapterPane>("editor");
 
@@ -141,6 +152,7 @@ export default function ChapterWorkspace({
   const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
   const initialVolumeIdRef = useRef(initialVolumeId);
   const initialChapterIdRef = useRef(initialChapterId);
+  const structureRequestRef = useRef(0);
   const loadSequenceRef = useRef(0);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const handledProseOpenRequestRef = useRef<number | null>(null);
@@ -159,6 +171,7 @@ export default function ChapterWorkspace({
 
   const loadStructure = useCallback(async (opts?: { silent?: boolean }) => {
     if (!novelId) return;
+    const requestId = ++structureRequestRef.current;
     if (!opts?.silent) {
       setStructureLoading(true);
       setStructureError("");
@@ -170,6 +183,7 @@ export default function ChapterWorkspace({
         apiGet<ListResponse<ChapterSummary>>(`/api/chapters/novel/${novelId}`),
         apiGet<ListResponse<ChapterSummary>>(`/api/chapters/novel/${novelId}/trash`),
       ]);
+      if (requestId !== structureRequestRef.current) return;
       const nextVolumes = [...volumeResponse.data].sort((a, b) => a.order_index - b.order_index);
       const nextChapters = [...chapterResponse.data].sort((a, b) => a.order_index - b.order_index);
       setVolumes(nextVolumes);
@@ -215,9 +229,13 @@ export default function ChapterWorkspace({
           : nextSelectedChapter?.volume_id ?? nextVolumes[0]?._id ?? null,
       );
     } catch (error) {
-      if (!opts?.silent) setStructureError(error instanceof Error ? error.message : t("loadFailed"));
+      if (requestId === structureRequestRef.current && !opts?.silent) {
+        setStructureError(error instanceof Error ? error.message : t("loadFailed"));
+      }
     } finally {
-      if (!opts?.silent) setStructureLoading(false);
+      if (requestId === structureRequestRef.current) {
+        setStructureLoading(false);
+      }
     }
   }, [
     novelId,
@@ -345,6 +363,18 @@ export default function ChapterWorkspace({
     ) {
       return;
     }
+    setRunTargetAudit((current) =>
+      current?.chapter_id === initialChapterId
+      && current.run_id === initialRunId
+        ? null
+        : current,
+    );
+    setRunTargetLoadError((current) =>
+      current?.chapterId === initialChapterId
+      && current.runId === initialRunId
+        ? null
+        : current,
+    );
     const suppliedRun = proseOpenRequest?.run;
     const suppliedRunId = suppliedRun?.run_id ?? suppliedRun?._id;
     if (
@@ -358,40 +388,97 @@ export default function ChapterWorkspace({
     }
 
     let cancelled = false;
-    void Promise.allSettled([
-      apiGet<ProseRunLocator>(
-        `/api/llm/prose-runs/${encodeURIComponent(initialRunId)}/telemetry`,
-      ),
-      apiGet<LeftoverProseRun[]>(
-        `/api/llm/prose-runs/novel/${novelId}/leftovers`,
-      ),
-    ]).then(([locatorResult, leftoversResult]) => {
-      if (cancelled) return;
-      if (locatorResult.status === "rejected") {
-        if (
-          locatorResult.reason instanceof ApiError
-          && [400, 404].includes(locatorResult.reason.status)
-        ) {
+    void (async () => {
+      let locator: ProseRunLocator;
+      try {
+        locator = await apiGet<ProseRunLocator>(
+          `/api/llm/prose-runs/${encodeURIComponent(initialRunId)}/telemetry`,
+        );
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof ApiError && [400, 404].includes(error.status)) {
           handledInitialRunKeyRef.current = runLookupKey;
           onRunTargetValidation(initialRunId, false);
+          return;
         }
-        // 其他读取失败不是“目标不存在”；保留章节界面供用户刷新重试。
+        setRunTargetLoadError({
+          chapterId: initialChapterId,
+          runId: initialRunId,
+          message: error instanceof Error ? error.message : t("loadFailed"),
+        });
         return;
       }
-      const locator = locatorResult.value;
+      if (cancelled) return;
       const valid = locator.novel_id === novelId
         && locator.chapter_id === initialChapterId
         && locator.run_id === initialRunId;
-      handledInitialRunKeyRef.current = runLookupKey;
       onRunTargetValidation(initialRunId, valid);
-      if (!valid || leftoversResult.status !== "fulfilled") return;
-      const run = leftoversResult.value.find(
+      if (!valid) {
+        handledInitialRunKeyRef.current = runLookupKey;
+        return;
+      }
+
+      if (["active", "complete"].includes(locator.status)) {
+        let currentRun: ProseRunSnapshot | null;
+        try {
+          currentRun = await apiGet<ProseRunSnapshot | null>(
+            `/api/llm/prose-runs/chapter/${encodeURIComponent(initialChapterId)}`,
+          );
+        } catch (error) {
+          if (cancelled) return;
+          setRunTargetLoadError({
+            chapterId: initialChapterId,
+            runId: initialRunId,
+            message: error instanceof Error ? error.message : t("loadFailed"),
+          });
+          return;
+        }
+        if (cancelled) return;
+        handledInitialRunKeyRef.current = runLookupKey;
+        const currentRunId = currentRun?.run_id ?? currentRun?._id;
+        if (currentRun && currentRunId === initialRunId) {
+          setPendingProseOpen({ chapterId: initialChapterId, run: currentRun });
+        } else {
+          // 精确记录在两次读取之间离开 current 集合，仍保留为可审计对象。
+          setRunTargetAudit(locator);
+        }
+        return;
+      }
+
+      if (!["incomplete", "superseded", "stale"].includes(locator.status)) {
+        handledInitialRunKeyRef.current = runLookupKey;
+        setRunTargetAudit(locator);
+        return;
+      }
+
+      let leftovers: LeftoverProseRun[];
+      try {
+        leftovers = await apiGet<LeftoverProseRun[]>(
+          `/api/llm/prose-runs/novel/${novelId}/leftovers`,
+        );
+      } catch (error) {
+        if (cancelled) return;
+        setRunTargetLoadError({
+          chapterId: initialChapterId,
+          runId: initialRunId,
+          message: error instanceof Error ? error.message : t("loadFailed"),
+        });
+        return;
+      }
+      if (cancelled) return;
+      handledInitialRunKeyRef.current = runLookupKey;
+      const run = leftovers.find(
         (item) =>
           (item.run_id === initialRunId || item._id === initialRunId)
           && item.chapter_id === initialChapterId,
       );
-      if (run) setPendingProseOpen({ chapterId: initialChapterId, run });
-    });
+      if (run) {
+        setPendingProseOpen({ chapterId: initialChapterId, run });
+      } else {
+        // 状态可能在两次读取之间结束；精确记录仍保留为可见审计对象。
+        setRunTargetAudit(locator);
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -401,7 +488,9 @@ export default function ChapterWorkspace({
     novelId,
     onRunTargetValidation,
     proseOpenRequest,
+    runLookupRevision,
     structureLoadedNovelId,
+    t,
   ]);
 
   useEffect(() => {
@@ -837,6 +926,16 @@ export default function ChapterWorkspace({
     structure: t("mobileStructure"),
     editor: t("mobileEditor"),
   };
+  const visibleRunTargetAudit =
+    runTargetAudit?.chapter_id === initialChapterId
+    && runTargetAudit?.run_id === initialRunId
+      ? runTargetAudit
+      : null;
+  const visibleRunTargetLoadError =
+    runTargetLoadError?.chapterId === initialChapterId
+    && runTargetLoadError?.runId === initialRunId
+      ? runTargetLoadError
+      : null;
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
@@ -861,6 +960,57 @@ export default function ChapterWorkspace({
           </button>
         ))}
       </nav>
+
+      {visibleRunTargetAudit && initialChapterId && (
+        <div
+          role="status"
+          className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-950 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-100 sm:px-6"
+        >
+          <div className="min-w-0">
+            <p className="font-semibold">{t("runAuditTitle")}</p>
+            <p className="mt-0.5 break-words text-xs leading-5">
+              {t("runAuditBody")}
+            </p>
+            <code className="mt-1 block max-w-full overflow-x-auto text-[11px]">
+              {visibleRunTargetAudit.run_id}
+            </code>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              onOpenRunAudit(initialChapterId, visibleRunTargetAudit.run_id)
+            }
+            className="min-h-9 shrink-0 rounded-md border border-sky-400 bg-white/70 px-3 text-xs font-semibold hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent dark:border-sky-800 dark:bg-sky-950"
+          >
+            {t("openRunAudit")}
+          </button>
+        </div>
+      )}
+
+      {visibleRunTargetLoadError && (
+        <div
+          role="alert"
+          className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200 sm:px-6"
+        >
+          <span className="min-w-0 break-words">
+            {t("runLookupFailed", {
+              run: visibleRunTargetLoadError.runId,
+              error: visibleRunTargetLoadError.message,
+            })}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              handledInitialRunKeyRef.current = null;
+              setRunTargetLoadError(null);
+              setRunLookupRevision((current) => current + 1);
+            }}
+            className="min-h-9 shrink-0 rounded-md border border-red-300 px-3 text-xs font-semibold hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent dark:border-red-800 dark:hover:bg-red-950"
+          >
+            {t("retry")}
+          </button>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
         <div
@@ -972,6 +1122,7 @@ export default function ChapterWorkspace({
             setProseOpen(false);
             setPendingProseOpen(null);
             setInitialProseRun(null);
+            if (initialRunId) onRunTargetChange(undefined);
           }}
           onRunStateChanged={() => onRunTargetChange(undefined)}
           onAccepted={(text, acceptanceState) => {

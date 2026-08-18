@@ -98,7 +98,11 @@ export default function ProsePanel({
   const resumableDraft = Boolean(
     stream.runId
     && stream.runRevision != null
-    && (selectedInitialRun ? selectedInitialRun.can_resume : incomplete),
+    && (
+      selectedInitialRun
+        ? (selectedInitialRun.can_resume ?? incomplete)
+        : incomplete
+    ),
   );
   const reasonCodes = (
     selectedInitialRun?.reason_codes?.length
@@ -207,12 +211,11 @@ export default function ProsePanel({
         stream.text,
         partialAcceptance ? "partial_manual_required" : "ai_complete",
       );
+      onRunStateChanged?.();
       onClose();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
-      if (selectedInitialRun) {
-        onRunStateChanged?.();
-      } else {
+      if (!selectedInitialRun) {
         await restoreActive();
       }
     } finally {

@@ -1470,6 +1470,10 @@
       "cancel": "取消",
       "dismiss": "关闭",
       "evidenceSceneLocated": "已定位到第 {scene} 场；可在章节细纲中核对证据。",
+      "runAuditTitle": "这条正文运行现在是审计记录",
+      "runAuditBody": "它不再作为可编辑草稿打开；可前往生成记录查看终止状态、调用与完成闸门。",
+      "openRunAudit": "打开生成记录",
+      "runLookupFailed": "无法读取正文运行 {run}：{error}",
       "untitled": "未命名章节",
       "createModeTitle": "保存小说后即可开始写章节",
       "createModeDescription": "当前小说仍是本地创建草稿。先在“小说信息”中保存，系统会为正式小说提供卷章目录、自动保存和导出功能。"
