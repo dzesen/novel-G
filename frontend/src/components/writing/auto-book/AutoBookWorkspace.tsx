@@ -140,7 +140,7 @@ export default function AutoBookWorkspace({
             true,
           )
         }
-        onClose={() => onNavigateView("runs")}
+        onClose={() => onNavigateView("runs", {}, true)}
         onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}
         onOpenProseRun={(run) => onOpenWriting(run.chapter_id, run)}
         onStartFreshProse={(chapterId) => onOpenWriting(chapterId, null)}

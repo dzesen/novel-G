@@ -56,10 +56,16 @@ export interface WritingRoute {
   targets: WritingRouteTargets;
 }
 
-export interface InvalidWritingTarget {
-  kind: "area" | "view";
-  value: string;
-}
+export type InvalidWritingTarget =
+  | {
+      kind: "area" | "view";
+      value: string;
+    }
+  | {
+      kind: "target";
+      key: WritingTargetKey;
+      value: string;
+    };
 
 export interface ResolvedWritingRoute {
   route: WritingRoute;
@@ -69,13 +75,31 @@ export interface ResolvedWritingRoute {
   canonicalSearch: string | null;
 }
 
-const REFERENCE_CARD_TYPES = new Set([
+export const WRITING_REFERENCE_CARD_TYPES = [
   "character",
   "location",
   "item",
   "rule",
   "lore",
-]);
+] as const;
+
+const REFERENCE_CARD_TYPES = new Set<string>(WRITING_REFERENCE_CARD_TYPES);
+
+const LEGACY_VIEW_ROUTES: Record<
+  string,
+  Pick<WritingRoute, "area" | "view">
+> = {
+  "novel-info": { area: "blueprint", view: "overview" },
+  "chapter-editor": { area: "writing", view: "chapter" },
+  "agent-studio": { area: "writing", view: "revision" },
+  "reference-cards": { area: "world", view: "library" },
+  "faction-cards": { area: "world", view: "factions" },
+  "relationship-map": { area: "world", view: "relationships" },
+  "plot-threads": { area: "continuity", view: "threads" },
+  "character-memory": { area: "continuity", view: "facts" },
+  "story-health": { area: "continuity", view: "health" },
+  "generation-runs": { area: "auto-book", view: "generation-runs" },
+};
 
 const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey[]>> = {
   blueprint: {
@@ -105,8 +129,8 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
   },
   continuity: {
     overview: ["volume", "chapter", "issue"],
-    facts: ["card", "chapter", "issue"],
-    threads: ["chapter", "issue"],
+    facts: ["card", "chapter", "issue", "run", "suggestion"],
+    threads: ["chapter", "issue", "run", "suggestion"],
     health: ["volume", "chapter", "issue"],
     "state-issues": ["chapter", "issue", "run"],
     proposals: ["chapter", "issue", "run", "suggestion"],
@@ -153,6 +177,47 @@ function collectTargets(
   return targets;
 }
 
+function invalidTargetFromSearch(
+  search: URLSearchParams,
+  area: WritingArea,
+  view: WritingView,
+): InvalidWritingTarget | null {
+  const allowed = new Set(VIEW_TARGETS[area][view] ?? []);
+  for (const key of WRITING_TARGET_KEYS) {
+    if (!allowed.has(key) || !search.has(key)) continue;
+    const rawValue = search.get(key) ?? "";
+    if (normalizedTargetValue(key, rawValue) === null) {
+      return { kind: "target", key, value: rawValue };
+    }
+  }
+  return null;
+}
+
+function invalidTargetDependency(
+  targets: WritingRouteTargets,
+): Extract<InvalidWritingTarget, { kind: "target" }> | null {
+  if (targets.scene && !targets.chapter) {
+    return { kind: "target", key: "scene", value: targets.scene };
+  }
+  if (targets.event && !targets.job) {
+    return { kind: "target", key: "event", value: targets.event };
+  }
+  if (targets.suggestion && !targets.run) {
+    return {
+      kind: "target",
+      key: "suggestion",
+      value: targets.suggestion,
+    };
+  }
+  if (targets.visual === "scene" && !targets.chapter) {
+    return { kind: "target", key: "visual", value: targets.visual };
+  }
+  if (targets.visual === "portrait" && !targets.card) {
+    return { kind: "target", key: "visual", value: targets.visual };
+  }
+  return null;
+}
+
 function serializeRoute(
   route: WritingRoute,
   preservedFrom?: URLSearchParams,
@@ -186,7 +251,7 @@ function resolved(
 
 function invalid(
   fallback: Pick<WritingRoute, "area" | "view">,
-  kind: InvalidWritingTarget["kind"],
+  kind: "area" | "view",
   value: string,
 ): ResolvedWritingRoute {
   return {
@@ -197,6 +262,33 @@ function invalid(
   };
 }
 
+function invalidRouteTarget(
+  area: WritingArea,
+  target: Extract<InvalidWritingTarget, { kind: "target" }>,
+): ResolvedWritingRoute {
+  return {
+    route: {
+      area,
+      view: WRITING_AREA_DEFAULT_VIEWS[area],
+      targets: {},
+    },
+    source: "canonical",
+    invalidTarget: target,
+    canonicalSearch: null,
+  };
+}
+
+function resolveRoute(
+  route: WritingRoute,
+  source: ResolvedWritingRoute["source"],
+  original: URLSearchParams,
+): ResolvedWritingRoute {
+  const dependencyFailure = invalidTargetDependency(route.targets);
+  return dependencyFailure
+    ? invalidRouteTarget(route.area, dependencyFailure)
+    : resolved(route, source, original);
+}
+
 function legacyRoute(
   search: URLSearchParams,
   fallback: Pick<WritingRoute, "area" | "view">,
@@ -205,26 +297,50 @@ function legacyRoute(
   let area: WritingArea;
   let view: WritingView;
 
-  if (legacyView === "generation-runs") {
-    area = "auto-book";
-    view = "generation-runs";
+  if (legacyView !== null) {
+    const mapped = LEGACY_VIEW_ROUTES[legacyView];
+    if (!mapped) return invalid(fallback, "view", legacyView);
+    area = mapped.area;
+    view = mapped.view;
   } else if (search.get("reviewCards") === "1") {
     area = "world";
     view = "candidates";
   } else if (search.get("curateCards") === "1") {
     area = "world";
     view = "curation";
-  } else if (normalizedTargetValue("cardType", search.get("cardType"))) {
+  } else if (search.has("cardType")) {
+    const rawCardType = search.get("cardType") ?? "";
+    if (normalizedTargetValue("cardType", rawCardType) === null) {
+      return invalidRouteTarget("world", {
+        kind: "target",
+        key: "cardType",
+        value: rawCardType,
+      });
+    }
     area = "world";
     view = "library";
-  } else if (legacyView !== null) {
-    return invalid(fallback, "view", legacyView);
   } else {
-    return resolved(
-      { ...fallback, targets: collectTargets(search, fallback.area, fallback.view) },
+    const targetFailure = invalidTargetFromSearch(
+      search,
+      fallback.area,
+      fallback.view,
+    );
+    if (targetFailure?.kind === "target") {
+      return invalidRouteTarget(fallback.area, targetFailure);
+    }
+    return resolveRoute(
+      {
+        ...fallback,
+        targets: collectTargets(search, fallback.area, fallback.view),
+      },
       "default",
       search,
     );
+  }
+
+  const targetFailure = invalidTargetFromSearch(search, area, view);
+  if (targetFailure?.kind === "target") {
+    return invalidRouteTarget(area, targetFailure);
   }
 
   const route: WritingRoute = {
@@ -232,10 +348,14 @@ function legacyRoute(
     view,
     targets: collectTargets(search, area, view),
   };
-  if (area === "world" && !route.targets.cardType) {
+  if (
+    area === "world" &&
+    ["library", "curation", "candidates"].includes(view) &&
+    !route.targets.cardType
+  ) {
     route.targets.cardType = "character";
   }
-  return resolved(route, "legacy", search);
+  return resolveRoute(route, "legacy", search);
 }
 
 export function resolveWritingRoute(
@@ -251,10 +371,26 @@ export function resolveWritingRoute(
   const requestedView =
     search.get("view") ?? WRITING_AREA_DEFAULT_VIEWS[requestedArea];
   if (!isWritingView(requestedArea, requestedView)) {
-    return invalid(fallback, "view", requestedView);
+    return invalid(
+      {
+        area: requestedArea,
+        view: WRITING_AREA_DEFAULT_VIEWS[requestedArea],
+      },
+      "view",
+      requestedView,
+    );
   }
 
-  return resolved(
+  const targetFailure = invalidTargetFromSearch(
+    search,
+    requestedArea,
+    requestedView,
+  );
+  if (targetFailure?.kind === "target") {
+    return invalidRouteTarget(requestedArea, targetFailure);
+  }
+
+  return resolveRoute(
     {
       area: requestedArea,
       view: requestedView,

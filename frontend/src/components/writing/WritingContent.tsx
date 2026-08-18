@@ -2,18 +2,20 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
-import { usePathname, useSearchParams } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { apiGet } from "@/lib/api";
 import {
   buildAreaSearch,
   buildViewSearch,
   defaultWritingRoute,
   resolveWritingRoute,
+  WRITING_AREA_DEFAULT_VIEWS,
+  WRITING_REFERENCE_CARD_TYPES,
+  type InvalidWritingTarget,
   type WritingArea,
   type WritingRouteTargets,
   type WritingView,
 } from "@/lib/writingRoute";
-import type { ContinuityEvidenceReference } from "@/types/agent";
 import type { NovelDetail, ReferenceCardType } from "@/types/novel";
 import WritingNavigation from "./WritingNavigation";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
@@ -37,28 +39,17 @@ interface WritingContentProps {
   novelId?: string;
 }
 
-const REFERENCE_CARD_TYPES: ReferenceCardType[] = [
-  "character",
-  "location",
-  "item",
-  "rule",
-  "lore",
-];
-
 function parseReferenceCardType(value?: string): ReferenceCardType {
-  return REFERENCE_CARD_TYPES.find((cardType) => cardType === value) ?? "character";
+  return (
+    WRITING_REFERENCE_CARD_TYPES.find((cardType) => cardType === value) ??
+    "character"
+  );
 }
 
 function parseSceneIndex(value?: string): number | undefined {
   if (!value) return undefined;
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
-}
-
-function hasLegacyRouteSignal(search: URLSearchParams): boolean {
-  return ["view", "cardType", "curateCards", "reviewCards"].some((key) =>
-    search.has(key),
-  );
 }
 
 interface ViewTab {
@@ -104,32 +95,88 @@ function ViewTabs({
 }
 
 function RouteFailure({
-  kind,
-  value,
+  target,
+  onBack,
   onOpenDefault,
 }: {
-  kind: "area" | "view";
-  value: string;
+  target: InvalidWritingTarget;
+  onBack: () => void;
   onOpenDefault: () => void;
 }) {
   const t = useTranslations("writing.navigation");
+  const kind = target.kind === "target" ? target.key : target.kind;
   return (
     <div className="grid h-full place-items-center overflow-y-auto bg-background px-5 py-10">
       <section className="w-full max-w-xl border-y border-border py-8">
         <h1 className="text-xl font-semibold text-foreground">{t("targetMissingTitle")}</h1>
         <p className="mt-3 text-sm leading-6 text-muted">
-          {t("targetMissingBody", { kind: t(`targetKinds.${kind}`), value })}
+          {t("targetMissingBody", {
+            kind: t(`targetKinds.${kind}`),
+            value: target.value,
+          })}
         </p>
         <code className="mt-4 block overflow-x-auto bg-surface-secondary px-3 py-2 text-xs text-foreground">
-          {value}
+          {target.value}
         </code>
-        <button
-          type="button"
-          onClick={onOpenDefault}
-          className="mt-5 min-h-10 rounded-md bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
-        >
-          {t("openDefault")}
-        </button>
+        <div className="mt-5 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={onOpenDefault}
+            className="min-h-10 rounded-md bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+          >
+            {t("openDefault")}
+          </button>
+          <button
+            type="button"
+            onClick={onBack}
+            className="min-h-10 rounded-md border border-border bg-surface px-4 text-sm font-semibold text-foreground hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            {t("backToSource")}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function NovelLoadFailure({
+  novelId,
+  onRetry,
+  onBackToShelf,
+}: {
+  novelId: string;
+  onRetry: () => void;
+  onBackToShelf: () => void;
+}) {
+  const t = useTranslations("writing.navigation");
+  return (
+    <div className="grid h-[calc(100vh-3.5rem)] place-items-center overflow-y-auto bg-background px-5 py-10">
+      <section className="w-full max-w-xl border-y border-border py-8">
+        <h1 className="text-xl font-semibold text-foreground">
+          {t("novelUnavailableTitle")}
+        </h1>
+        <p className="mt-3 text-sm leading-6 text-muted">
+          {t("novelUnavailableBody")}
+        </p>
+        <code className="mt-4 block overflow-x-auto bg-surface-secondary px-3 py-2 text-xs text-foreground">
+          {novelId}
+        </code>
+        <div className="mt-5 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={onRetry}
+            className="min-h-10 rounded-md bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+          >
+            {t("retry")}
+          </button>
+          <button
+            type="button"
+            onClick={onBackToShelf}
+            className="min-h-10 rounded-md border border-border bg-surface px-4 text-sm font-semibold text-foreground hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          >
+            {t("backToShelf")}
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -167,12 +214,17 @@ function DeferredContinuityView({
 
 export default function WritingContent({ mode, novelId }: WritingContentProps) {
   const t = useTranslations("writing.navigation");
+  const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [novel, setNovel] = useState<NovelDetail | null>(null);
   const [novelLookupComplete, setNovelLookupComplete] = useState(mode === "create");
-  const [evidenceReference, setEvidenceReference] =
-    useState<ContinuityEvidenceReference | null>(null);
+  const [loadedNovelId, setLoadedNovelId] = useState<string | null>(null);
+  const [novelLoadFailed, setNovelLoadFailed] = useState(false);
+  const [novelLoadRevision, setNovelLoadRevision] = useState(0);
+  const [locatedTargetFailure, setLocatedTargetFailure] = useState<
+    Extract<InvalidWritingTarget, { kind: "target" }> | null
+  >(null);
   const [autoBookStartRequest, setAutoBookStartRequest] =
     useState<AutoBookStartRequest | null>(null);
   const [proseOpenRequest, setProseOpenRequest] =
@@ -183,33 +235,46 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     let cancelled = false;
     void apiGet<NovelDetail>(`/api/novels/${novelId}`)
       .then((result) => {
-        if (!cancelled) setNovel(result);
+        if (!cancelled) {
+          setNovel(result);
+          setNovelLoadFailed(false);
+        }
       })
       .catch(() => {
-        if (!cancelled) setNovel(null);
+        if (!cancelled) {
+          setNovel(null);
+          setNovelLoadFailed(true);
+        }
       })
       .finally(() => {
-        if (!cancelled) setNovelLookupComplete(true);
+        if (!cancelled) {
+          setLoadedNovelId(novelId);
+          setNovelLookupComplete(true);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [mode, novelId]);
+  }, [mode, novelId, novelLoadRevision]);
 
   const currentSearch = useMemo(
     () => new URLSearchParams(searchParams.toString()),
     [searchParams],
   );
-  const needsDefaultLookup =
-    mode === "edit" &&
-    !currentSearch.has("area") &&
-    !hasLegacyRouteSignal(currentSearch);
-  const routeReady = !needsDefaultLookup || novelLookupComplete;
+  const routeReady =
+    mode === "create" ||
+    (novelLookupComplete && loadedNovelId === novelId);
   const fallbackRoute = defaultWritingRoute(novel?.stats.chapter_count ?? 1);
   const resolved = useMemo(
     () => resolveWritingRoute(currentSearch, fallbackRoute),
     [currentSearch, fallbackRoute],
   );
+  const { route, invalidTarget } = resolved;
+  const runtimeInvalidTarget =
+    locatedTargetFailure &&
+    route.targets[locatedTargetFailure.key] === locatedTargetFailure.value
+      ? locatedTargetFailure
+      : null;
 
   useEffect(() => {
     if (mode === "create" || !routeReady || !resolved.canonicalSearch) return;
@@ -223,6 +288,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   const pushSearch = useCallback(
     (search: string, replace = false) => {
       const href = search ? `${pathname}?${search}` : pathname;
+      if (`${window.location.pathname}${window.location.search}` === href) return;
       if (replace) window.history.replaceState(null, "", href);
       else window.history.pushState(null, "", href);
     },
@@ -231,7 +297,6 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
 
   const navigateArea = useCallback(
     (area: WritingArea) => {
-      setEvidenceReference(null);
       pushSearch(buildAreaSearch(new URLSearchParams(window.location.search), area));
     },
     [pushSearch],
@@ -244,7 +309,6 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       targets: WritingRouteTargets = {},
       replace = false,
     ) => {
-      setEvidenceReference(null);
       pushSearch(
         buildViewSearch(
           new URLSearchParams(window.location.search),
@@ -260,6 +324,28 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
 
   const consumeAutoBookStart = useCallback(() => setAutoBookStartRequest(null), []);
   const consumeProseOpen = useCallback(() => setProseOpenRequest(null), []);
+  const retryNovelLoad = useCallback(() => {
+    setNovel(null);
+    setNovelLoadFailed(false);
+    setNovelLookupComplete(false);
+    setNovelLoadRevision((current) => current + 1);
+  }, []);
+  const validateChapterTarget = useCallback(
+    (chapterId: string, valid: boolean) => {
+      setLocatedTargetFailure((current) => {
+        if (valid) {
+          return current?.key === "chapter" && current.value === chapterId
+            ? null
+            : current;
+        }
+        if (current?.key === "chapter" && current.value === chapterId) {
+          return current;
+        }
+        return { kind: "target", key: "chapter", value: chapterId };
+      });
+    },
+    [],
+  );
 
   const openAutoBook = useCallback(
     (scope: "volume" | "book", volumeId?: string) => {
@@ -300,7 +386,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     );
   }
 
-  const { route, invalidTarget } = resolved;
+  if (novelLoadFailed || !novel) {
+    const localeRoot = pathname.startsWith("/en") ? "/en" : "/zh";
+    return (
+      <NovelLoadFailure
+        novelId={novelId}
+        onRetry={retryNovelLoad}
+        onBackToShelf={() => router.push(localeRoot)}
+      />
+    );
+  }
+
   const referenceCardType = parseReferenceCardType(route.targets.cardType);
   const writingTabs: ViewTab[] = [
     { view: "chapter", label: t("views.chapter") },
@@ -320,12 +416,20 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   ];
 
   const renderWorkspace = () => {
-    if (invalidTarget) {
+    const failure = invalidTarget ?? runtimeInvalidTarget;
+    if (failure) {
       return (
         <RouteFailure
-          kind={invalidTarget.kind}
-          value={invalidTarget.value}
-          onOpenDefault={() => navigateView("writing", "chapter")}
+          target={failure}
+          onBack={() => router.back()}
+          onOpenDefault={() =>
+            navigateView(
+              route.area,
+              WRITING_AREA_DEFAULT_VIEWS[route.area],
+              {},
+              true,
+            )
+          }
         />
       );
     }
@@ -343,10 +447,12 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
             onNavigateToReferenceCards={() =>
               navigateView("world", "curation", { cardType: "character" })
             }
-            initialChapterId={route.targets.chapter ?? evidenceReference?.chapter_id}
-            initialSceneIndex={
-              parseSceneIndex(route.targets.scene) ?? evidenceReference?.scene_index
+            initialChapterId={route.targets.chapter}
+            initialSceneIndex={parseSceneIndex(route.targets.scene)}
+            onChapterTargetChange={(chapterId) =>
+              navigateView("writing", "chapter", { chapter: chapterId })
             }
+            onChapterTargetValidation={validateChapterTarget}
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
             onProseOpenRequestConsumed={consumeProseOpen}
@@ -358,11 +464,16 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           mode="edit"
           novelId={novelId}
           onNavigateReference={(reference) => {
-            setEvidenceReference(reference);
             if (reference.kind === "fact") {
-              navigateView("continuity", "facts", { chapter: reference.chapter_id });
+              navigateView("continuity", "facts", {
+                chapter: reference.chapter_id,
+                issue: reference.fact_id,
+              });
             } else if (reference.kind === "thread") {
-              navigateView("continuity", "threads", { chapter: reference.chapter_id });
+              navigateView("continuity", "threads", {
+                chapter: reference.chapter_id,
+                issue: reference.thread_id,
+              });
             } else {
               navigateView("writing", "chapter", {
                 chapter: reference.chapter_id,
@@ -437,7 +548,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         <CharacterMemoryWorkspace
           mode="edit"
           novelId={novelId}
-          initialFactId={evidenceReference?.fact_id}
+          initialFactId={route.targets.issue}
         />
       );
     }
@@ -446,7 +557,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         <PlotThreadWorkspace
           mode="edit"
           novelId={novelId}
-          initialThreadId={evidenceReference?.thread_id}
+          initialThreadId={route.targets.issue}
         />
       );
     }
@@ -468,7 +579,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         novelTitle={novel?.title ?? t("untitled")}
         onSelectArea={navigateArea}
       />
-      {route.area === "writing" && !invalidTarget && (
+      {route.area === "writing" && !invalidTarget && !runtimeInvalidTarget && (
         <ViewTabs
           label={t("viewAria")}
           activeView={route.view}
@@ -476,7 +587,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           onSelect={(view) => navigateView("writing", view)}
         />
       )}
-      {route.area === "world" && !invalidTarget && (
+      {route.area === "world" && !invalidTarget && !runtimeInvalidTarget && (
         <ViewTabs
           label={t("viewAria")}
           activeView={route.view}
@@ -486,7 +597,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           }
         />
       )}
-      {route.area === "continuity" && !invalidTarget && (
+      {route.area === "continuity" && !invalidTarget && !runtimeInvalidTarget && (
         <ViewTabs
           label={t("viewAria")}
           activeView={route.view}

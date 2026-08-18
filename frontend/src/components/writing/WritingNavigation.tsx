@@ -145,7 +145,7 @@ export default function WritingNavigation({
 
       <nav
         aria-label={t("supportAria")}
-        className="flex min-w-0 items-center gap-1 overflow-x-auto border-t border-border px-3 py-1.5 sm:px-5"
+        className="flex min-w-0 flex-wrap items-center gap-1 border-t border-border px-3 py-1.5 sm:px-5"
       >
         <span className="hidden shrink-0 pr-1 text-xs font-medium text-muted sm:inline">
           {t("supportLabel")}

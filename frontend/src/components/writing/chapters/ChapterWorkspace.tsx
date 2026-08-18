@@ -34,6 +34,8 @@ interface ChapterWorkspaceProps {
   onNavigateToReferenceCards: () => void;
   initialChapterId?: string;
   initialSceneIndex?: number;
+  onChapterTargetChange: (chapterId: string) => void;
+  onChapterTargetValidation: (chapterId: string, valid: boolean) => void;
   onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
@@ -57,6 +59,8 @@ export default function ChapterWorkspace({
   onNavigateToReferenceCards,
   initialChapterId,
   initialSceneIndex,
+  onChapterTargetChange,
+  onChapterTargetValidation,
   onStartAutoBook,
   proseOpenRequest,
   onProseOpenRequestConsumed,
@@ -106,10 +110,15 @@ export default function ChapterWorkspace({
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
+  const initialChapterIdRef = useRef(initialChapterId);
   const loadSequenceRef = useRef(0);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const handledProseOpenRequestRef = useRef<number | null>(null);
-  const selectChapterRef = useRef<(chapterId: string) => void>(() => undefined);
+  const selectChapterRef = useRef<
+    (chapterId: string, updateRoute?: boolean) => void
+  >(() => undefined);
+
+  initialChapterIdRef.current = initialChapterId;
 
   const wordCount = useMemo(
     () => countChapterWords(draft?.content ?? ""),
@@ -135,25 +144,30 @@ export default function ChapterWorkspace({
       setVolumeTrash(volumeTrashResponse.data);
       setChapters(nextChapters);
       setTrash(trashResponse.data);
-      setSelectedVolumeId((current) => {
-        if (current && nextVolumes.some((volume) => volume._id === current)) return current;
-        const selectedChapter = nextChapters.find(
-          (chapter) => chapter._id === selectedChapterIdRef.current,
-        );
-        return selectedChapter?.volume_id ?? nextVolumes[0]?._id ?? null;
-      });
-      setSelectedChapterId((current) => {
-        if (current && nextChapters.some((chapter) => chapter._id === current)) return current;
-        const firstChapter = nextChapters[0]?._id ?? null;
-        selectedChapterIdRef.current = firstChapter;
-        return firstChapter;
-      });
+      const requestedChapterId = initialChapterIdRef.current;
+      const requestedChapter = requestedChapterId
+        ? nextChapters.find((chapter) => chapter._id === requestedChapterId)
+        : undefined;
+      if (requestedChapterId) {
+        onChapterTargetValidation(requestedChapterId, Boolean(requestedChapter));
+      }
+      const currentChapter = nextChapters.find(
+        (chapter) => chapter._id === selectedChapterIdRef.current,
+      );
+      const nextSelectedChapter = requestedChapterId
+        ? requestedChapter ?? null
+        : currentChapter ?? nextChapters[0] ?? null;
+      selectedChapterIdRef.current = nextSelectedChapter?._id ?? null;
+      setSelectedChapterId(nextSelectedChapter?._id ?? null);
+      setSelectedVolumeId(
+        nextSelectedChapter?.volume_id ?? nextVolumes[0]?._id ?? null,
+      );
     } catch (error) {
       if (!opts?.silent) setStructureError(error instanceof Error ? error.message : t("loadFailed"));
     } finally {
       if (!opts?.silent) setStructureLoading(false);
     }
-  }, [novelId, t]);
+  }, [novelId, onChapterTargetValidation, t]);
 
   const loadChapter = useCallback(async (chapterId: string) => {
     const sequence = ++loadSequenceRef.current;
@@ -210,6 +224,29 @@ export default function ChapterWorkspace({
   useEffect(() => {
     if (mode === "edit") void loadStructure();
   }, [loadStructure, mode]);
+
+  useEffect(() => {
+    if (structureLoading) return;
+    if (initialChapterId) {
+      const exists = chapters.some(
+        (chapter) => chapter._id === initialChapterId,
+      );
+      onChapterTargetValidation(initialChapterId, exists);
+      if (exists && selectedChapterIdRef.current !== initialChapterId) {
+        selectChapterRef.current(initialChapterId, false);
+      }
+      return;
+    }
+    const firstChapterId = chapters[0]?._id;
+    if (firstChapterId && selectedChapterIdRef.current !== firstChapterId) {
+      selectChapterRef.current(firstChapterId, false);
+    }
+  }, [
+    chapters,
+    initialChapterId,
+    onChapterTargetValidation,
+    structureLoading,
+  ]);
 
   useEffect(() => {
     if (
@@ -380,8 +417,15 @@ export default function ChapterWorkspace({
     setSaveState("dirty");
   };
 
-  const selectChapter = (chapterId: string) => {
+  const selectChapter = (chapterId: string, updateRoute = true) => {
     setMobilePane("editor");
+    const chapter = chapters.find((item) => item._id === chapterId);
+    if (!chapter) {
+      onChapterTargetValidation(chapterId, false);
+      return;
+    }
+    onChapterTargetValidation(chapterId, true);
+    if (updateRoute) onChapterTargetChange(chapterId);
     const previousChapterId = selectedChapterIdRef.current;
     if (previousChapterId === chapterId) return;
     if (
@@ -392,8 +436,7 @@ export default function ChapterWorkspace({
     ) {
       void persistDraft(previousChapterId, draft, revisionRef.current);
     }
-    const chapter = chapters.find((item) => item._id === chapterId);
-    if (chapter) setSelectedVolumeId(chapter.volume_id);
+    setSelectedVolumeId(chapter.volume_id);
     setDraft(null);
     setChapterOutline(undefined);
     setUpdatedAt(undefined);
