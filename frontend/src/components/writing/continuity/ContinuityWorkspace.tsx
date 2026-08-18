@@ -9,6 +9,7 @@ import type {
   WritingView,
 } from "@/lib/writingRoute";
 import type { ChapterDetail, VolumeSummary } from "@/types/novel";
+import type { AgentRun } from "@/types/agent";
 import WorkspaceViewTabs, {
   type WorkspaceViewTab,
 } from "../WorkspaceViewTabs";
@@ -41,17 +42,19 @@ type OwnedTargetState<T> =
   | { key: string; status: "ready"; data: T; error: "" }
   | { key: string; status: "error"; data: null; error: string };
 
-function useOwnedTarget<T extends OwnedRecord>({
+function useOwnedTarget<T extends OwnedRecord, TResponse = T>({
   novelId,
   targetKey,
   targetId,
   path,
+  selectRecord,
   onTargetValidation,
 }: {
   novelId: string;
-  targetKey: "chapter" | "volume";
+  targetKey: "chapter" | "volume" | "run";
   targetId?: string;
   path: (id: string) => string;
+  selectRecord?: (response: TResponse) => T;
   onTargetValidation: ContinuityWorkspaceProps["onTargetValidation"];
 }) {
   const [revision, setRevision] = useState(0);
@@ -66,9 +69,12 @@ function useOwnedTarget<T extends OwnedRecord>({
   useEffect(() => {
     if (!targetId) return;
     let cancelled = false;
-    void apiGet<T>(path(targetId))
-      .then((record) => {
+    void apiGet<TResponse>(path(targetId))
+      .then((response) => {
         if (cancelled) return;
+        const record = selectRecord
+          ? selectRecord(response)
+          : response as unknown as T;
         const valid = String(record.novel_id ?? "") === novelId;
         onTargetValidation(targetKey, targetId, valid);
         setState(
@@ -94,7 +100,7 @@ function useOwnedTarget<T extends OwnedRecord>({
     return () => {
       cancelled = true;
     };
-  }, [lookupKey, novelId, onTargetValidation, path, revision, targetId, targetKey]);
+  }, [lookupKey, novelId, onTargetValidation, path, revision, selectRecord, targetId, targetKey]);
 
   const current = state.key === lookupKey
     ? state
@@ -114,6 +120,14 @@ export default function ContinuityWorkspace({
   const continuityT = useTranslations("writing.continuity");
   const chapterPath = useCallback((id: string) => `/api/chapters/${id}`, []);
   const volumePath = useCallback((id: string) => `/api/volumes/${id}`, []);
+  const runPath = useCallback(
+    (id: string) => `/api/agent-tools/runs/${encodeURIComponent(id)}`,
+    [],
+  );
+  const selectAgentRun = useCallback(
+    (response: { run: AgentRun }) => response.run,
+    [],
+  );
   const chapterTarget = useOwnedTarget<ChapterDetail>({
     novelId,
     targetKey: "chapter",
@@ -126,6 +140,14 @@ export default function ContinuityWorkspace({
     targetKey: "volume",
     targetId: targets.volume,
     path: volumePath,
+    onTargetValidation,
+  });
+  const runTarget = useOwnedTarget<AgentRun, { run: AgentRun }>({
+    novelId,
+    targetKey: "run",
+    targetId: targets.run,
+    path: runPath,
+    selectRecord: selectAgentRun,
     onTargetValidation,
   });
   const tabs: WorkspaceViewTab[] = useMemo(
@@ -144,13 +166,12 @@ export default function ContinuityWorkspace({
       : view;
 
   useEffect(() => {
-    if (targets.run) onTargetValidation("run", targets.run, false);
     if (targets.suggestion) {
       onTargetValidation("suggestion", targets.suggestion, false);
     }
-  }, [onTargetValidation, targets.run, targets.suggestion]);
+  }, [onTargetValidation, targets.suggestion]);
 
-  const targetFailure = [chapterTarget, volumeTarget].find(
+  const targetFailure = [chapterTarget, volumeTarget, runTarget].find(
     (target) => target.status === "error",
   );
   if (targetFailure?.status === "error") {
@@ -177,8 +198,10 @@ export default function ContinuityWorkspace({
   if (
     chapterTarget.status === "loading" ||
     volumeTarget.status === "loading" ||
+    runTarget.status === "loading" ||
     chapterTarget.status === "missing" ||
-    volumeTarget.status === "missing"
+    volumeTarget.status === "missing" ||
+    runTarget.status === "missing"
   ) {
     return (
       <div className="grid h-full place-items-center px-6 text-sm text-muted">
@@ -304,11 +327,23 @@ export default function ContinuityWorkspace({
           onTargetValidation("issue", issueId, valid)
         }
         onOpenThread={(threadId) =>
-          onNavigateView("threads", { issue: threadId })
+          onNavigateView("threads", {
+            card: undefined,
+            chapter: undefined,
+            issue: threadId,
+            run: undefined,
+            suggestion: undefined,
+          })
         }
         onOpenChapter={onOpenWriting}
         onOpenCharacterState={(cardId) =>
-          onNavigateView("facts", { card: cardId })
+          onNavigateView("facts", {
+            card: cardId,
+            chapter: undefined,
+            issue: undefined,
+            run: undefined,
+            suggestion: undefined,
+          })
         }
       />
     );
@@ -320,8 +355,28 @@ export default function ContinuityWorkspace({
         label={t("viewAria")}
         activeView={activeView}
         tabs={tabs}
-        onSelect={(nextView) => onNavigateView(nextView)}
+        onSelect={(nextView) =>
+          onNavigateView(nextView, {
+            volume: undefined,
+            chapter: undefined,
+            card: undefined,
+            issue: undefined,
+            run: undefined,
+            suggestion: undefined,
+          })
+        }
       />
+      {runTarget.status === "ready" && (
+        <div
+          data-testid="continuity-run-audit"
+          className="min-w-0 border-b border-border bg-surface-secondary/45 px-4 py-2 text-xs text-muted sm:px-6"
+        >
+          {continuityT("runAudit", {
+            id: runTarget.data.run_id,
+            status: runTarget.data.status,
+          })}
+        </div>
+      )}
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden">{content}</div>
     </div>
   );

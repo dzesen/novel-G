@@ -102,7 +102,12 @@ export default function WorldWorkspace({
         onCardTypeChange={(cardType) =>
           onNavigateView(
             view === "candidates" ? "candidates" : "library",
-            { cardType, card: undefined, visual: undefined },
+            {
+              cardType,
+              card: undefined,
+              candidate: undefined,
+              visual: undefined,
+            },
             true,
           )
         }
@@ -128,7 +133,13 @@ export default function WorldWorkspace({
         onSelect={(nextView) =>
           onNavigateView(
             nextView,
-            nextView === "library" ? { cardType: referenceCardType } : {},
+            {
+              cardType:
+                nextView === "library" ? referenceCardType : undefined,
+              card: undefined,
+              candidate: undefined,
+              visual: undefined,
+            },
           )
         }
       />

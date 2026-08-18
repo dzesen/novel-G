@@ -81,6 +81,7 @@ export default function StateCompletenessAuditPanel({
     query: string;
     message: string;
   } | null>(null);
+  const [requestRevision, setRequestRevision] = useState(0);
   const effectiveScope =
     scope === "volume" && !selectedVolumeId ? "book" : scope;
   const query = buildStateAuditQuery(
@@ -88,8 +89,9 @@ export default function StateCompletenessAuditPanel({
     effectiveScope,
     selectedVolumeId,
   );
-  const report = response?.query === query ? response.report : null;
-  const error = requestError?.query === query ? requestError.message : "";
+  const requestKey = `${query}::${requestRevision}`;
+  const report = response?.query === requestKey ? response.report : null;
+  const error = requestError?.query === requestKey ? requestError.message : "";
   const loading = report === null && !error;
 
   useEffect(() => {
@@ -97,14 +99,14 @@ export default function StateCompletenessAuditPanel({
     void apiGet<StateAuditReport>(query)
       .then((next) => {
         if (!cancelled) {
-          setResponse({ query, report: next });
+          setResponse({ query: requestKey, report: next });
           setRequestError(null);
         }
       })
       .catch((reason) => {
         if (!cancelled) {
           setRequestError({
-            query,
+            query: requestKey,
             message: reason instanceof Error ? reason.message : String(reason),
           });
         }
@@ -112,7 +114,7 @@ export default function StateCompletenessAuditPanel({
     return () => {
       cancelled = true;
     };
-  }, [query]);
+  }, [query, requestKey]);
 
   const visible = useMemo(
     () => visibleAuditChapters(report?.chapters ?? [], issuesOnly),
@@ -210,9 +212,16 @@ export default function StateCompletenessAuditPanel({
           </div>
 
           {error && (
-            <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/35 dark:text-red-200">
-              {error}
-            </p>
+            <div role="alert" className="flex flex-wrap items-center gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/70 dark:bg-red-950/35 dark:text-red-200">
+              <span className="min-w-0 flex-1 break-words">{error}</span>
+              <button
+                type="button"
+                onClick={() => setRequestRevision((value) => value + 1)}
+                className="min-h-9 rounded border border-red-300 px-3 font-medium hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 dark:border-red-800 dark:hover:bg-red-950/60"
+              >
+                {t("retry")}
+              </button>
+            </div>
           )}
           {loading && (
             <div className="grid gap-2" aria-label={t("loading")}>

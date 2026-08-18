@@ -33,6 +33,7 @@ export default function CharacterMemoryWorkspace({
   const t = useTranslations("characterMemory");
   const [states, setStates] = useState<CharacterState[]>([]);
   const [names, setNames] = useState<Record<string, string>>({});
+  const [cardIds, setCardIds] = useState<string[]>([]);
   const [chapters, setChapters] = useState<Array<ChapterSummary & { label: string }>>([]);
   const [error, setError] = useState<string | null>(null);
   const [stateDraft, setStateDraft] = useState<Record<string, { current_state: string; as_of: string }>>({});
@@ -54,6 +55,7 @@ export default function CharacterMemoryWorkspace({
       ]);
       setStates(stateRes.data);
       setNames(Object.fromEntries(cardRes.data.map((c) => [c._id, c.name])));
+      setCardIds(cardRes.data.map((card) => card._id));
       const volumeOrders = Object.fromEntries(volumeRes.data.map((v) => [v._id, v.order_index]));
       setChapters(
         [...chapterRes.data]
@@ -97,14 +99,18 @@ export default function CharacterMemoryWorkspace({
 
   useEffect(() => {
     if (!initialCardId || !loaded) return;
-    const matched = states.some((state) => state.card_id === initialCardId);
+    const matched = cardIds.includes(initialCardId);
     onCardTargetValidation(initialCardId, matched);
     if (matched) {
       document
-        .getElementById(`character-state-${initialCardId}`)
+        .getElementById(
+          states.some((state) => state.card_id === initialCardId)
+            ? `character-state-${initialCardId}`
+            : `character-state-empty-${initialCardId}`,
+        )
         ?.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-  }, [initialCardId, loaded, onCardTargetValidation, states]);
+  }, [cardIds, initialCardId, loaded, onCardTargetValidation, states]);
 
   if (!novelId) {
     return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;
@@ -170,8 +176,36 @@ export default function CharacterMemoryWorkspace({
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto p-6">
       <h2 className="text-lg font-semibold text-foreground">{t("title")}</h2>
-      {error && <div className="rounded border border-red-400 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
-      {states.length === 0 && <div className="text-sm text-muted">{t("empty")}</div>}
+      {error && (
+        <div role="alert" className="flex flex-wrap items-center gap-3 rounded border border-red-400 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <span className="min-w-0 flex-1 break-words">{error}</span>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="min-h-9 rounded border border-red-400 px-3 font-medium hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+          >
+            {t("retry")}
+          </button>
+        </div>
+      )}
+      {loaded && !error && states.length === 0 && initialCardId && cardIds.includes(initialCardId) && (
+        <section
+          id={`character-state-empty-${initialCardId}`}
+          className="rounded-lg border border-accent bg-surface p-4 ring-2 ring-accent/20"
+        >
+          <h3 className="font-medium text-foreground">
+            {t("targetEmptyTitle", {
+              name: names[initialCardId] ?? t("unknownCharacter"),
+            })}
+          </h3>
+          <p className="mt-2 text-sm leading-6 text-muted">
+            {t("targetEmptyBody")}
+          </p>
+        </section>
+      )}
+      {loaded && !error && states.length === 0 && (!initialCardId || !cardIds.includes(initialCardId)) && (
+        <div className="text-sm text-muted">{t("empty")}</div>
+      )}
 
       {states.map((s) => {
         const draft = stateDraft[s.card_id] ?? { current_state: s.current_state, as_of: s.as_of_chapter_id ?? "" };

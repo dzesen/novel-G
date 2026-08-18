@@ -203,7 +203,18 @@ export default function PlotThreadWorkspace({
         </div>
       </div>
 
-      {error && <div className="rounded border border-red-400 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+      {error && (
+        <div role="alert" className="flex flex-wrap items-center gap-3 rounded border border-red-400 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <span className="min-w-0 flex-1 break-words">{error}</span>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="min-h-9 rounded border border-red-400 px-3 font-medium hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+          >
+            {t("retry")}
+          </button>
+        </div>
+      )}
       {unmatchedReferenceReview && (
         <div
           role="status"
