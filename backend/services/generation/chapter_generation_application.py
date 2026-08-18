@@ -22,10 +22,14 @@ from backend.db.utils import to_object_id
 from backend.llm.config import get_llm_config
 from backend.llm.prompts.prompt_selector import (
     CHAPTER_OUTLINE_PROMPT_NAME,
+    OUTLINE_ADHERENCE_PROMPT_NAME,
     PROSE_PROMPT_NAME,
     load_prompt_config,
 )
-from backend.llm.schemas.novel_pydantic import ChapterOutlineResultSchema
+from backend.llm.schemas.novel_pydantic import (
+    ChapterOutlineAdherenceResultSchema,
+    ChapterOutlineResultSchema,
+)
 from backend.llm.models import TokenUsage
 from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
@@ -44,6 +48,9 @@ from backend.services.generation.prose_run_attempt_scope import (
     ProseRunAttemptScope,
 )
 from backend.services.generation.prose_runs import prose_run_module
+from backend.services.generation.outline_adherence import (
+    normalize_outline_adherence,
+)
 from backend.services.llm.context_builder import (
     assemble_context,
     assemble_outline_context,
@@ -52,6 +59,7 @@ from backend.services.llm.context_builder import (
 )
 from backend.services.llm.generation_runtime import (
     AttemptScope,
+    PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
 )
@@ -81,6 +89,8 @@ CHAPTER_OUTLINE_WORKFLOW = "create_chapter_outline_by_ai"
 CHAPTER_OUTLINE_STEP = "chapter_outline"
 PROSE_WORKFLOW = "write_chapter_by_ai"
 PROSE_STEP = "chapter_content"
+STATE_WORKFLOW = "extract_chapter_state_by_ai"
+STATE_STEP = "chapter_state"
 
 CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
@@ -151,6 +161,14 @@ class ProseGenerationCommand:
     token_budget: int | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
+
+
+@dataclass(frozen=True)
+class OutlineAdherenceCommand:
+    novel_id: str
+    chapter_id: str
+    generation_params: Mapping[str, Any] = field(default_factory=dict)
+    attempt_scope: AttemptScope | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +270,18 @@ class _PreparedProse:
     truncation: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _PreparedOutlineAdherence:
+    command: OutlineAdherenceCommand
+    chapter: dict[str, Any]
+    context: Any
+    prompt_plan: PromptPlan
+    gen_kwargs: dict[str, Any]
+    runtime: Any
+    plan: Any
+    truncation: dict[str, Any]
+
+
 class ChapterGenerationApplicationService:
     """所有章节生成消费者共用的深接口。"""
 
@@ -263,7 +293,11 @@ class ChapterGenerationApplicationService:
 
     async def execute(
         self,
-        command: OutlineGenerationCommand | ProseGenerationCommand,
+        command: (
+            OutlineGenerationCommand
+            | ProseGenerationCommand
+            | OutlineAdherenceCommand
+        ),
     ) -> AsyncIterator[ChapterGenerationEvent]:
         """预检命令并返回事件流；预检错误发生在 HTTP 开流之前。"""
 
@@ -273,11 +307,18 @@ class ChapterGenerationApplicationService:
         if isinstance(command, ProseGenerationCommand):
             prepared = await self._prepare_prose(command)
             return self._stream_prose(prepared)
+        if isinstance(command, OutlineAdherenceCommand):
+            prepared = await self._prepare_outline_adherence(command)
+            return self._stream_outline_adherence(prepared)
         raise TypeError(f"unsupported chapter generation command: {type(command)!r}")
 
     async def collect(
         self,
-        command: OutlineGenerationCommand | ProseGenerationCommand,
+        command: (
+            OutlineGenerationCommand
+            | ProseGenerationCommand
+            | OutlineAdherenceCommand
+        ),
     ) -> ChapterGenerationResult:
         """无头消费同一事件流，并把失败终帧恢复成带审计信息的异常。"""
 
@@ -437,6 +478,150 @@ class ChapterGenerationApplicationService:
                 accepted=accepted,
             )
             yield ChapterGenerationEvent(name, cleaned_data, result=result)
+
+    async def _prepare_outline_adherence(
+        self,
+        command: OutlineAdherenceCommand,
+    ) -> _PreparedOutlineAdherence:
+        chapter = await self._deps.chapter_repo.get_chapter_by_id(
+            command.chapter_id
+        )
+        if chapter.get("novel_id") != to_object_id(command.novel_id):
+            raise ValueError("该章节不属于指定小说")
+        content = str(chapter.get("content") or "").strip()
+        if not content:
+            raise ValueError("本章尚无可供细纲符合度检查的正文")
+        if not chapter.get("outline"):
+            raise ValueError("本章尚无可供细纲符合度检查的章节细纲")
+
+        inputs = await self._deps.fetch_context_inputs(
+            command.novel_id,
+            command.chapter_id,
+        )
+        context = self._deps.assemble_context(inputs)
+        prompts = self._deps.load_prompts().get(
+            OUTLINE_ADHERENCE_PROMPT_NAME,
+            {},
+        )
+        prompt_base = prompts["outline_adherence_prompt_base"].format(
+            context=context.to_prompt_text(),
+            chapter_order=int(chapter.get("order_index") or 0),
+            chapter_title=str(chapter.get("title") or ""),
+            chapter_content=content,
+        )
+        prompt_plan = PromptPlan(
+            native_schema_prompt=apply_agent_profile(
+                "continuity_editor",
+                prompt_base
+                + "\n"
+                + prompts["outline_adherence_prompt_with_schema_suffix"],
+            ),
+            prompt_json_prompt=apply_agent_profile(
+                "continuity_editor",
+                prompt_base
+                + "\n"
+                + prompts["outline_adherence_prompt_without_schema_suffix"],
+            ),
+        )
+        generation_values = dict(command.generation_params or {})
+        gen_kwargs = {
+            key: value
+            for key, value in generation_values.items()
+            if key in _GENERATION_OVERRIDE_KEYS and value is not None
+        }
+        runtime_kwargs = (
+            {}
+            if generation_values.get("allow_failure_retry", True)
+            else {"max_provider_retries": 0}
+        )
+        runtime = self._deps.create_runtime(
+            attempt_scope=command.attempt_scope,
+            **runtime_kwargs,
+        )
+        plan = runtime.plan_structured(
+            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        )
+        return _PreparedOutlineAdherence(
+            command=command,
+            chapter=chapter,
+            context=context,
+            prompt_plan=prompt_plan,
+            gen_kwargs=gen_kwargs,
+            runtime=runtime,
+            plan=plan,
+            truncation={
+                "truncated_sections": list(context.truncated_sections),
+                "dropped_item_counts": dict(context.dropped_item_counts),
+            },
+        )
+
+    async def _stream_outline_adherence(
+        self,
+        prepared: _PreparedOutlineAdherence,
+    ) -> AsyncIterator[ChapterGenerationEvent]:
+        if any(prepared.truncation.values()):
+            yield ChapterGenerationEvent("context", prepared.truncation)
+        yield ChapterGenerationEvent(
+            "step",
+            {
+                "step": "outline_adherence",
+                "status": "running",
+                "provider": getattr(prepared.plan, "provider_alias", ""),
+                "model": getattr(prepared.plan, "provider_model", ""),
+                "agent": "continuity_editor",
+            },
+        )
+        try:
+            generated = await prepared.runtime.generate_structured(
+                prepared.plan,
+                ChapterOutlineAdherenceResultSchema,
+                prepared.prompt_plan,
+                **prepared.gen_kwargs,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            usage = _runtime_usage(prepared.runtime)
+            yield ChapterGenerationEvent(
+                "done",
+                {
+                    "success": False,
+                    "failed_step": "outline_adherence",
+                    "error": str(exc),
+                    "usage": usage,
+                    "attempts": _serialize_attempts(prepared.runtime),
+                },
+            )
+            return
+
+        review = normalize_outline_adherence(generated.value.model_dump())
+        usage = generated.usage.model_dump()
+        attempts = _serialize_attempts(prepared.runtime)
+        yield ChapterGenerationEvent(
+            "step",
+            {
+                "step": "outline_adherence",
+                "status": "done",
+                "data": review,
+                "usage": usage,
+            },
+        )
+        result = ChapterGenerationResult(
+            stage=ChapterGenerationStage.OUTLINE_ADHERENCE,
+            value=review,
+            usage=usage,
+            attempts=attempts,
+            truncation=prepared.truncation,
+        )
+        yield ChapterGenerationEvent(
+            "done",
+            {
+                "success": True,
+                "result": {"outline_adherence": review},
+                "usage": usage,
+            },
+            result=result,
+        )
 
     async def _prepare_prose(
         self,
@@ -1088,3 +1273,10 @@ def _serialize_attempts(runtime: Any) -> list[dict[str, Any]]:
             }
         )
     return attempts
+
+
+def _runtime_usage(runtime: Any) -> dict[str, Any]:
+    usage = getattr(runtime, "usage", None)
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    return dict(usage or {})

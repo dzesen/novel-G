@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
@@ -13,14 +12,10 @@ from uuid import uuid4
 
 from backend.llm.prompts.prompt_selector import (
     CHAPTER_STATE_PROMPT_NAME,
-    OUTLINE_ADHERENCE_PROMPT_NAME,
     PROSE_PROMPT_NAME,
     load_prompt_config,
 )
-from backend.llm.schemas.novel_pydantic import (
-    ChapterOutlineAdherenceResultSchema,
-    MAX_CHAPTER_OUTLINE_SCENES,
-)
+from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
 from backend.services.llm.context_builder import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
     assemble_context,
@@ -32,7 +27,6 @@ from backend.services.llm.workflow_runner import (
 )
 from backend.services.llm.generation_runtime import (
     AttemptScope,
-    PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
 )
@@ -49,6 +43,7 @@ from backend.services.generation.chapter_generation_application import (
     ChapterGenerationApplicationService,
     CHAPTER_OUTLINE_STEP,
     CHAPTER_OUTLINE_WORKFLOW,
+    OutlineAdherenceCommand,
     OutlineGenerationCommand,
     ProseGenerationCommand,
 )
@@ -57,9 +52,6 @@ from backend.api.llm_routers.state_router import (
     CHAPTER_STATE_STEPS, STATE_STEP, STATE_WORKFLOW,
 )
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
-from backend.services.generation.outline_adherence import (
-    normalize_outline_adherence,
-)
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
@@ -556,78 +548,20 @@ async def generate_outline_adherence(
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, int, dict, list[dict[str, Any]]]:
-    """在状态回填前审查正文是否落实细纲与当前卷弧线。"""
-
-    chapter_id = str(chapter["_id"])
-    fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-    content = str(fresh_chapter.get("content") or "").strip()
-    if not content:
-        raise ValueError("本章尚无可供细纲符合度检查的正文")
-    if not fresh_chapter.get("outline"):
-        raise ValueError("本章尚无可供细纲符合度检查的章节细纲")
-
-    inputs = await fetch_context_inputs(novel_id, chapter_id)
-    context = assemble_context(inputs)
-    prompts = load_prompt_config().get(OUTLINE_ADHERENCE_PROMPT_NAME, {})
-    prompt_args = {
-        "context": context.to_prompt_text(),
-        "chapter_order": int(fresh_chapter.get("order_index") or 0),
-        "chapter_title": str(fresh_chapter.get("title") or ""),
-        "chapter_content": content,
-    }
-    prompt_base = prompts["outline_adherence_prompt_base"].format(
-        **prompt_args
-    )
-    native_prompt = apply_agent_profile(
-        "continuity_editor",
-        prompt_base
-        + "\n"
-        + prompts["outline_adherence_prompt_with_schema_suffix"],
-    )
-    prompt_json = apply_agent_profile(
-        "continuity_editor",
-        prompt_base
-        + "\n"
-        + prompts["outline_adherence_prompt_without_schema_suffix"],
-    )
-    gen_kwargs, runtime_kwargs = _generation_options(generation_params)
-    runtime = create_generation_runtime(
-        attempt_scope=attempt_scope,
-        **runtime_kwargs,
-    )
-    plan = runtime.plan_structured(
-        WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
-    )
-    try:
-        generated = await runtime.generate_structured(
-            plan,
-            ChapterOutlineAdherenceResultSchema,
-            PromptPlan(
-                native_schema_prompt=native_prompt,
-                prompt_json_prompt=prompt_json,
-            ),
-            **gen_kwargs,
+    result = await _chapter_generation_service().collect(
+        OutlineAdherenceCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
         )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        raise WorkflowFailed(
-            str(exc),
-            usage=runtime.usage.model_dump(),
-            attempts=_serialize_attempts(runtime),
-        ) from exc
-    result = normalize_outline_adherence(generated.value.model_dump())
-    truncation = {
-        "truncated_sections": list(context.truncated_sections),
-        "dropped_item_counts": dict(context.dropped_item_counts),
-    }
-    return (
-        result,
-        generated.usage.total_tokens,
-        truncation,
-        _serialize_attempts(runtime),
     )
-
+    return (
+        dict(result.value or {}),
+        result.total_tokens,
+        result.truncation,
+        result.attempts,
+    )
 
 def _serialize_attempts(runtime) -> list[dict[str, Any]]:
     if runtime is None:
