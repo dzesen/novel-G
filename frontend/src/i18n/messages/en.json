@@ -2283,6 +2283,7 @@
       "deepLinkJobMissing": "The requested generation job is unavailable or was removed.",
       "deepLinkChapterMissing": "The requested chapter is unavailable or was removed.",
       "deepLinkEventMissing": "The requested diagnostic event is unavailable.",
+      "deepLinkRunMissing": "The requested run is unavailable or outside the current audit window.",
       "clearTarget": "Show available records",
       "filtersTitle": "Filters",
       "filterScope": "Scope",

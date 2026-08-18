@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { apiGet } from "@/lib/api";
@@ -8,14 +8,16 @@ import {
   buildAreaSearch,
   buildViewSearch,
   defaultWritingRoute,
+  legacyWritingRouteSignal,
   resolveWritingRoute,
-  WRITING_AREA_DEFAULT_VIEWS,
   WRITING_REFERENCE_CARD_TYPES,
   type InvalidWritingTarget,
   type WritingArea,
   type WritingRouteTargets,
+  type WritingTargetKey,
   type WritingView,
 } from "@/lib/writingRoute";
+import { buildUserStorageKey } from "@/lib/userStorage";
 import type { NovelDetail, ReferenceCardType } from "@/types/novel";
 import WritingNavigation from "./WritingNavigation";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
@@ -229,6 +231,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     useState<AutoBookStartRequest | null>(null);
   const [proseOpenRequest, setProseOpenRequest] =
     useState<ProseOpenRequest | null>(null);
+  const recordedLegacySearchesRef = useRef(new Set<string>());
 
   useEffect(() => {
     if (mode !== "edit" || !novelId) return;
@@ -285,6 +288,44 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     }
   }, [mode, pathname, resolved.canonicalSearch, routeReady]);
 
+  useEffect(() => {
+    if (mode !== "edit" || resolved.source !== "legacy") return;
+    const serializedSearch = currentSearch.toString();
+    if (recordedLegacySearchesRef.current.has(serializedSearch)) return;
+    const signal = legacyWritingRouteSignal(currentSearch);
+    const storageKey = buildUserStorageKey(
+      "migration",
+      "writing-route-compat-v1",
+    );
+    if (!signal || !storageKey) return;
+    try {
+      const stored = window.localStorage.getItem(storageKey);
+      const parsed = stored ? JSON.parse(stored) : {};
+      const counts =
+        parsed && typeof parsed === "object" && parsed.counts
+          ? parsed.counts as Record<string, unknown>
+          : {};
+      const previous = counts[signal];
+      window.localStorage.setItem(
+        storageKey,
+        JSON.stringify({
+          version: 1,
+          counts: {
+            ...counts,
+            [signal]:
+              typeof previous === "number" && Number.isFinite(previous)
+                ? previous + 1
+                : 1,
+          },
+          last_seen_at: new Date().toISOString(),
+        }),
+      );
+      recordedLegacySearchesRef.current.add(serializedSearch);
+    } catch {
+      // 兼容计数只用于迁移观测；浏览器存储不可用时不得阻断写作入口。
+    }
+  }, [currentSearch, mode, resolved.source]);
+
   const pushSearch = useCallback(
     (search: string, replace = false) => {
       const href = search ? `${pathname}?${search}` : pathname;
@@ -296,8 +337,11 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   );
 
   const navigateArea = useCallback(
-    (area: WritingArea) => {
-      pushSearch(buildAreaSearch(new URLSearchParams(window.location.search), area));
+    (area: WritingArea, replace = false) => {
+      pushSearch(
+        buildAreaSearch(new URLSearchParams(window.location.search), area),
+        replace,
+      );
     },
     [pushSearch],
   );
@@ -330,21 +374,31 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     setNovelLookupComplete(false);
     setNovelLoadRevision((current) => current + 1);
   }, []);
-  const validateChapterTarget = useCallback(
-    (chapterId: string, valid: boolean) => {
+  const validateLocatedTarget = useCallback(
+    (key: WritingTargetKey, value: string, valid: boolean) => {
       setLocatedTargetFailure((current) => {
         if (valid) {
-          return current?.key === "chapter" && current.value === chapterId
+          return current?.key === key && current.value === value
             ? null
             : current;
         }
-        if (current?.key === "chapter" && current.value === chapterId) {
+        if (current?.key === key && current.value === value) {
           return current;
         }
-        return { kind: "target", key: "chapter", value: chapterId };
+        return { kind: "target", key, value };
       });
     },
     [],
+  );
+  const validateChapterTarget = useCallback(
+    (chapterId: string, valid: boolean) =>
+      validateLocatedTarget("chapter", chapterId, valid),
+    [validateLocatedTarget],
+  );
+  const validateRunTarget = useCallback(
+    (runId: string, valid: boolean) =>
+      validateLocatedTarget("run", runId, valid),
+    [validateLocatedTarget],
   );
 
   const openAutoBook = useCallback(
@@ -422,14 +476,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         <RouteFailure
           target={failure}
           onBack={() => router.back()}
-          onOpenDefault={() =>
-            navigateView(
-              route.area,
-              WRITING_AREA_DEFAULT_VIEWS[route.area],
-              {},
-              true,
-            )
-          }
+          onOpenDefault={() => navigateArea(route.area, true)}
         />
       );
     }
@@ -449,10 +496,18 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
             }
             initialChapterId={route.targets.chapter}
             initialSceneIndex={parseSceneIndex(route.targets.scene)}
+            initialRunId={route.targets.run}
             onChapterTargetChange={(chapterId) =>
-              navigateView("writing", "chapter", { chapter: chapterId })
+              navigateView("writing", "chapter", {
+                volume: undefined,
+                chapter: chapterId,
+                scene: undefined,
+                run: undefined,
+                visual: undefined,
+              })
             }
             onChapterTargetValidation={validateChapterTarget}
+            onRunTargetValidation={validateRunTarget}
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
             onProseOpenRequestConsumed={consumeProseOpen}
@@ -499,6 +554,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           onNavigateView={(view, targets, replace) =>
             navigateView("auto-book", view, targets, replace)
           }
+          onTargetValidation={validateLocatedTarget}
           onOpenWriting={openWriting}
           onOpenWorld={(view, cardType) =>
             navigateView("world", view, cardType ? { cardType } : {})
@@ -520,11 +576,20 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           mode="edit"
           novelId={novelId}
           cardType={referenceCardType}
+          initialCardId={route.targets.card}
+          initialCandidateId={route.targets.candidate}
+          onTargetValidation={validateLocatedTarget}
+          onCardTargetChange={(cardId) =>
+            navigateView("world", "library", {
+              cardType: referenceCardType,
+              card: cardId,
+            }, true)
+          }
           onCardTypeChange={(cardType) =>
             navigateView(
               "world",
               route.view === "candidates" ? "candidates" : "library",
-              { cardType },
+              { cardType, card: undefined, visual: undefined },
               true,
             )
           }

@@ -21,6 +21,7 @@ export interface GenerationRunsNavigationTarget {
   jobId?: string;
   chapterId?: string;
   eventId?: string;
+  runId?: string;
 }
 
 export interface AttemptSummary {

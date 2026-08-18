@@ -27,6 +27,7 @@ import type { ProseRunSnapshot } from "./prose/useProseStream";
 import { StateBackfillPanel } from "./state/StateBackfillPanel";
 import StateCompletenessAuditPanel from "./state/StateCompletenessAuditPanel";
 import SceneIllustrationPanel from "./SceneIllustrationPanel";
+import type { LeftoverProseRun } from "./batch/batchTypes";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -34,8 +35,10 @@ interface ChapterWorkspaceProps {
   onNavigateToReferenceCards: () => void;
   initialChapterId?: string;
   initialSceneIndex?: number;
+  initialRunId?: string;
   onChapterTargetChange: (chapterId: string) => void;
   onChapterTargetValidation: (chapterId: string, valid: boolean) => void;
+  onRunTargetValidation: (runId: string, valid: boolean) => void;
   onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
@@ -59,8 +62,10 @@ export default function ChapterWorkspace({
   onNavigateToReferenceCards,
   initialChapterId,
   initialSceneIndex,
+  initialRunId,
   onChapterTargetChange,
   onChapterTargetValidation,
+  onRunTargetValidation,
   onStartAutoBook,
   proseOpenRequest,
   onProseOpenRequestConsumed,
@@ -84,6 +89,8 @@ export default function ChapterWorkspace({
   const [chapterOutline, setChapterOutline] = useState<StoredChapterOutline | undefined>();
   const [updatedAt, setUpdatedAt] = useState<string | undefined>();
   const [structureLoading, setStructureLoading] = useState(mode === "edit");
+  const [structureLoadedNovelId, setStructureLoadedNovelId] =
+    useState<string | null>(null);
   const [structureError, setStructureError] = useState("");
   const [structureNotice, setStructureNotice] = useState("");
   const [chapterLoading, setChapterLoading] = useState(false);
@@ -114,6 +121,7 @@ export default function ChapterWorkspace({
   const loadSequenceRef = useRef(0);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const handledProseOpenRequestRef = useRef<number | null>(null);
+  const handledInitialRunIdRef = useRef<string | null>(null);
   const selectChapterRef = useRef<
     (chapterId: string, updateRoute?: boolean) => void
   >(() => undefined);
@@ -141,6 +149,7 @@ export default function ChapterWorkspace({
       const nextVolumes = [...volumeResponse.data].sort((a, b) => a.order_index - b.order_index);
       const nextChapters = [...chapterResponse.data].sort((a, b) => a.order_index - b.order_index);
       setVolumes(nextVolumes);
+      setStructureLoadedNovelId(novelId);
       setVolumeTrash(volumeTrashResponse.data);
       setChapters(nextChapters);
       setTrash(trashResponse.data);
@@ -226,7 +235,7 @@ export default function ChapterWorkspace({
   }, [loadStructure, mode]);
 
   useEffect(() => {
-    if (structureLoading) return;
+    if (structureLoading || structureLoadedNovelId !== novelId) return;
     if (initialChapterId) {
       const exists = chapters.some(
         (chapter) => chapter._id === initialChapterId,
@@ -245,7 +254,66 @@ export default function ChapterWorkspace({
     chapters,
     initialChapterId,
     onChapterTargetValidation,
+    novelId,
+    structureLoadedNovelId,
     structureLoading,
+  ]);
+
+  useEffect(() => {
+    if (!initialRunId) {
+      handledInitialRunIdRef.current = null;
+      return;
+    }
+    if (
+      !initialChapterId ||
+      !novelId ||
+      structureLoadedNovelId !== novelId ||
+      handledInitialRunIdRef.current === initialRunId
+    ) {
+      return;
+    }
+    const suppliedRun = proseOpenRequest?.run;
+    const suppliedRunId = suppliedRun?.run_id ?? suppliedRun?._id;
+    if (
+      suppliedRun &&
+      suppliedRunId === initialRunId &&
+      proseOpenRequest?.chapterId === initialChapterId
+    ) {
+      handledInitialRunIdRef.current = initialRunId;
+      onRunTargetValidation(initialRunId, true);
+      return;
+    }
+
+    let cancelled = false;
+    void apiGet<LeftoverProseRun[]>(
+      `/api/llm/prose-runs/novel/${novelId}/leftovers`,
+    )
+      .then((runs) => {
+        if (cancelled) return;
+        const run = runs.find(
+          (item) =>
+            (item.run_id === initialRunId || item._id === initialRunId) &&
+            item.chapter_id === initialChapterId,
+        );
+        handledInitialRunIdRef.current = initialRunId;
+        onRunTargetValidation(initialRunId, Boolean(run));
+        if (run) {
+          setPendingProseOpen({ chapterId: initialChapterId, run });
+        }
+      })
+      .catch(() => {
+        // 查询失败不是“目标不存在”；保留章节界面供用户重试，而不伪造归属结论。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    initialChapterId,
+    initialRunId,
+    novelId,
+    onRunTargetValidation,
+    proseOpenRequest,
+    structureLoadedNovelId,
   ]);
 
   useEffect(() => {

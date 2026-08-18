@@ -1,22 +1,21 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useRef,
   type KeyboardEvent,
 } from "react";
 import { useTranslations } from "next-intl";
+import {
+  WRITING_REFERENCE_CARD_TYPES,
+  type WritingTargetKey,
+} from "@/lib/writingRoute";
 import type { ReferenceCardType } from "@/types/novel";
 import ReferenceCardsWorkspace from "./ReferenceCardsWorkspace";
 import CandidateReviewWorkspace from "./CandidateReviewWorkspace";
 
-const CARD_TYPES: ReferenceCardType[] = [
-  "character",
-  "location",
-  "item",
-  "rule",
-  "lore",
-];
+const CARD_TYPES: ReferenceCardType[] = [...WRITING_REFERENCE_CARD_TYPES];
 
 type ReferenceCardsTab = ReferenceCardType | "candidates";
 const EDIT_TABS: ReferenceCardsTab[] = [...CARD_TYPES, "candidates"];
@@ -24,6 +23,14 @@ interface ReferenceCardsDestinationProps {
   mode: "create" | "edit";
   novelId?: string;
   cardType: ReferenceCardType;
+  initialCardId?: string;
+  initialCandidateId?: string;
+  onCardTargetChange?: (cardId?: string) => void;
+  onTargetValidation: (
+    key: WritingTargetKey,
+    value: string,
+    valid: boolean,
+  ) => void;
   onCardTypeChange: (cardType: ReferenceCardType) => void;
   openCurationOnMount?: boolean;
   reviewCandidatesOnMount?: boolean;
@@ -35,6 +42,10 @@ export default function ReferenceCardsDestination({
   mode,
   novelId,
   cardType,
+  initialCardId,
+  initialCandidateId,
+  onCardTargetChange,
+  onTargetValidation,
   onCardTypeChange,
   openCurationOnMount = false,
   onCurationOpened,
@@ -46,6 +57,16 @@ export default function ReferenceCardsDestination({
   const tabs = mode === "edit" ? EDIT_TABS : CARD_TYPES;
   const activeTab: ReferenceCardsTab =
     reviewCandidatesOnMount ? "candidates" : cardType;
+  const validateCardTarget = useCallback(
+    (cardId: string, valid: boolean) =>
+      onTargetValidation("card", cardId, valid),
+    [onTargetValidation],
+  );
+  const validateCandidateTarget = useCallback(
+    (candidateId: string, valid: boolean) =>
+      onTargetValidation("candidate", candidateId, valid),
+    [onTargetValidation],
+  );
 
   useEffect(() => {
     const selectedIndex = tabs.indexOf(activeTab);
@@ -130,13 +151,20 @@ export default function ReferenceCardsDestination({
         className="min-h-0 min-w-0 flex-1"
       >
         {activeTab === "candidates" && novelId ? (
-          <CandidateReviewWorkspace novelId={novelId} />
+          <CandidateReviewWorkspace
+            novelId={novelId}
+            initialCandidateId={initialCandidateId}
+            onTargetValidation={validateCandidateTarget}
+          />
         ) : (
           <ReferenceCardsWorkspace
             key={cardType}
             mode={mode}
             novelId={novelId}
             cardType={cardType}
+            initialCardId={initialCardId}
+            onCardTargetChange={onCardTargetChange}
+            onTargetValidation={validateCardTarget}
             openCurationOnMount={openCurationOnMount}
             onCurationOpened={onCurationOpened}
           />

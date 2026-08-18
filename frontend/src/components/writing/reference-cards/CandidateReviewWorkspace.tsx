@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
@@ -21,6 +21,8 @@ interface CandidateDecision {
 
 interface CandidateReviewWorkspaceProps {
   novelId: string;
+  initialCandidateId?: string;
+  onTargetValidation: (candidateId: string, valid: boolean) => void;
 }
 
 const ACTIONS: EmergentReferenceCardDecisionAction[] = [
@@ -104,6 +106,8 @@ function displayValue(value: unknown): string {
 
 export default function CandidateReviewWorkspace({
   novelId,
+  initialCandidateId,
+  onTargetValidation,
 }: CandidateReviewWorkspaceProps) {
   const t = useTranslations("writing.referenceCards.candidateReview");
   const typeT = useTranslations("writing.referenceCards.types");
@@ -114,6 +118,7 @@ export default function CandidateReviewWorkspace({
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const candidateRefs = useRef(new Map<string, HTMLElement>());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -136,6 +141,14 @@ export default function CandidateReviewWorkspace({
         ]),
       );
       setReview(nextReview);
+      if (initialCandidateId) {
+        onTargetValidation(
+          initialCandidateId,
+          nextReview.candidates.some(
+            (candidate) => candidate.candidate_id === initialCandidateId,
+          ),
+        );
+      }
       setCards(responses.flatMap((response) => response.data));
       setDecisions({});
     } catch (reason) {
@@ -143,11 +156,19 @@ export default function CandidateReviewWorkspace({
     } finally {
       setLoading(false);
     }
-  }, [novelId, t]);
+  }, [initialCandidateId, novelId, onTargetValidation, t]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!initialCandidateId || !review) return;
+    const target = candidateRefs.current.get(initialCandidateId);
+    if (!target) return;
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.focus({ preventScroll: true });
+  }, [initialCandidateId, review]);
 
   const cardsByType = useMemo(() => {
     const result = new Map<ReferenceCardType, ReferenceCard[]>();
@@ -322,7 +343,21 @@ export default function CandidateReviewWorkspace({
                 return (
                   <article
                     key={candidate.candidate_id}
-                    className={index ? "border-t border-border p-4 sm:p-6" : "p-4 sm:p-6"}
+                    ref={(element) => {
+                      if (element) {
+                        candidateRefs.current.set(candidate.candidate_id, element);
+                      } else {
+                        candidateRefs.current.delete(candidate.candidate_id);
+                      }
+                    }}
+                    tabIndex={-1}
+                    className={[
+                      "outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent",
+                      index ? "border-t p-4 sm:p-6" : "p-4 sm:p-6",
+                      initialCandidateId === candidate.candidate_id
+                        ? "border-accent bg-accent/5"
+                        : "border-border",
+                    ].join(" ")}
                   >
                     <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
                       <div className="min-w-0">

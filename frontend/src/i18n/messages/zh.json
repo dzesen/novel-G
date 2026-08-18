@@ -2283,6 +2283,7 @@
       "deepLinkJobMissing": "请求的生成作业不存在或已被移除。",
       "deepLinkChapterMissing": "请求的章节不存在或已被移除。",
       "deepLinkEventMissing": "请求的诊断事件不存在。",
+      "deepLinkRunMissing": "请求的运行记录不存在或已超出当前审计窗口。",
       "clearTarget": "查看可用记录",
       "filtersTitle": "筛选",
       "filterScope": "范围",

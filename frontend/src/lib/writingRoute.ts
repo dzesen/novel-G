@@ -101,6 +101,22 @@ const LEGACY_VIEW_ROUTES: Record<
   "generation-runs": { area: "auto-book", view: "generation-runs" },
 };
 
+export function legacyWritingRouteSignal(
+  search: URLSearchParams,
+): string | null {
+  const legacyView = search.get("view");
+  if (legacyView && Object.hasOwn(LEGACY_VIEW_ROUTES, legacyView)) {
+    return `view:${legacyView}`;
+  }
+  if (search.get("reviewCards") === "1") return "reviewCards";
+  if (search.get("curateCards") === "1") return "curateCards";
+  const cardType = search.get("cardType");
+  if (cardType && REFERENCE_CARD_TYPES.has(cardType)) {
+    return `cardType:${cardType}`;
+  }
+  return null;
+}
+
 const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey[]>> = {
   blueprint: {
     overview: [],
@@ -194,8 +210,9 @@ function invalidTargetFromSearch(
 }
 
 function invalidTargetDependency(
-  targets: WritingRouteTargets,
+  route: WritingRoute,
 ): Extract<InvalidWritingTarget, { kind: "target" }> | null {
+  const { targets } = route;
   if (targets.scene && !targets.chapter) {
     return { kind: "target", key: "scene", value: targets.scene };
   }
@@ -208,6 +225,14 @@ function invalidTargetDependency(
       key: "suggestion",
       value: targets.suggestion,
     };
+  }
+  if (
+    route.area === "writing" &&
+    route.view === "chapter" &&
+    targets.run &&
+    !targets.chapter
+  ) {
+    return { kind: "target", key: "run", value: targets.run };
   }
   if (targets.visual === "scene" && !targets.chapter) {
     return { kind: "target", key: "visual", value: targets.visual };
@@ -283,7 +308,7 @@ function resolveRoute(
   source: ResolvedWritingRoute["source"],
   original: URLSearchParams,
 ): ResolvedWritingRoute {
-  const dependencyFailure = invalidTargetDependency(route.targets);
+  const dependencyFailure = invalidTargetDependency(route);
   return dependencyFailure
     ? invalidRouteTarget(route.area, dependencyFailure)
     : resolved(route, source, original);

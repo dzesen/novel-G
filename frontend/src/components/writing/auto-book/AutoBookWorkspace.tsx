@@ -3,7 +3,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { apiGet } from "@/lib/api";
-import type { WritingRouteTargets, WritingView } from "@/lib/writingRoute";
+import type {
+  WritingRouteTargets,
+  WritingTargetKey,
+  WritingView,
+} from "@/lib/writingRoute";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import type { ProseRunSnapshot } from "../chapters/prose/useProseStream";
 import BatchGenerationPanel from "../chapters/batch/BatchGenerationPanel";
@@ -39,6 +43,11 @@ interface AutoBookWorkspaceProps {
     targets?: WritingRouteTargets,
     replace?: boolean,
   ) => void;
+  onTargetValidation: (
+    key: WritingTargetKey,
+    value: string,
+    valid: boolean,
+  ) => void;
   onOpenWriting: (chapterId: string, run?: ProseRunSnapshot | null) => void;
   onOpenWorld: (
     view: "library" | "curation" | "candidates",
@@ -61,6 +70,7 @@ export default function AutoBookWorkspace({
   startRequest,
   onStartRequestConsumed,
   onNavigateView,
+  onTargetValidation,
   onOpenWriting,
   onOpenWorld,
   onOpenContinuity,
@@ -86,10 +96,20 @@ export default function AutoBookWorkspace({
       ]);
       setVolumes(volumeResponse.data);
       setChapters(chapterResponse.data);
+      const requestedVolumeId = targets.volume;
+      const requestedVolumeValid = requestedVolumeId
+        ? volumeResponse.data.some((item) => item._id === requestedVolumeId)
+        : false;
+      if (requestedVolumeId) {
+        onTargetValidation(
+          "volume",
+          requestedVolumeId,
+          requestedVolumeValid,
+        );
+      }
       setSelectedVolumeId((current) => {
-        const requested = targets.volume;
-        if (requested && volumeResponse.data.some((item) => item._id === requested)) {
-          return requested;
+        if (requestedVolumeId) {
+          return requestedVolumeValid ? requestedVolumeId : null;
         }
         if (current && volumeResponse.data.some((item) => item._id === current)) {
           return current;
@@ -101,7 +121,7 @@ export default function AutoBookWorkspace({
     } finally {
       if (!silent) setLoading(false);
     }
-  }, [novelId, t, targets.volume]);
+  }, [novelId, onTargetValidation, t, targets.volume]);
 
   useEffect(() => {
     void loadStructure();
@@ -118,6 +138,7 @@ export default function AutoBookWorkspace({
     jobId: targets.job,
     chapterId: targets.chapter,
     eventId: targets.event,
+    runId: targets.run,
   };
 
   if (view === "generation-runs" || view === "diagnostics") {
@@ -136,6 +157,7 @@ export default function AutoBookWorkspace({
               job: target.jobId,
               chapter: target.chapterId,
               event: target.eventId,
+              run: target.runId,
             },
             true,
           )
@@ -200,7 +222,15 @@ export default function AutoBookWorkspace({
               <select
                 id="auto-book-volume"
                 value={selectedVolumeId ?? ""}
-                onChange={(event) => setSelectedVolumeId(event.target.value || null)}
+                onChange={(event) => {
+                  const volumeId = event.target.value || null;
+                  setSelectedVolumeId(volumeId);
+                  onNavigateView(
+                    view,
+                    { volume: volumeId ?? undefined },
+                    true,
+                  );
+                }}
                 disabled={loading || volumes.length === 0}
                 className="mt-1.5 min-h-10 w-full rounded-md border border-border bg-surface px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-60"
               >

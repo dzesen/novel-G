@@ -394,7 +394,7 @@ export default function GenerationRunsWorkspace({
 
   useEffect(() => {
     headingRef.current?.focus();
-  }, [target.chapterId, target.eventId, target.jobId]);
+  }, [target.chapterId, target.eventId, target.jobId, target.runId]);
 
   const providerOptions = useMemo(() => Array.from(new Set([
     ...jobs.flatMap(providerValues),
@@ -462,10 +462,17 @@ export default function GenerationRunsWorkspace({
   const selectedChapter = target.chapterId
     ? chapters.find((chapter) => chapter._id === target.chapterId) ?? null
     : null;
-  const selectedTelemetry = target.chapterId
-    ? filteredTelemetry.filter((run) => run.chapter_id === target.chapterId)
-    : filteredTelemetry.slice(0, 12);
-  const telemetryFilteredOut = Boolean(target.chapterId)
+  const selectedRun = target.runId
+    ? proseRuns.find((run) => run.run_id === target.runId) ?? null
+    : null;
+  const selectedTelemetry = target.runId
+    ? selectedRun
+      ? [selectedRun]
+      : []
+    : target.chapterId
+      ? filteredTelemetry.filter((run) => run.chapter_id === target.chapterId)
+      : filteredTelemetry.slice(0, 12);
+  const telemetryFilteredOut = !target.runId && Boolean(target.chapterId)
     && proseRuns.some((run) => run.chapter_id === target.chapterId)
     && selectedTelemetry.length === 0;
   const selectedEvent = useMemo(() => {
@@ -481,6 +488,10 @@ export default function GenerationRunsWorkspace({
     && targetsReady
     && Boolean(selectedJob)
     && selectedEvent === null;
+  const missingRun = Boolean(target.runId)
+    && targetsReady
+    && !telemetryError
+    && selectedRun === null;
 
   const control = useCallback(async (
     job: GenerationJob,
@@ -534,10 +545,19 @@ export default function GenerationRunsWorkspace({
   };
 
   const navigationIssues = [
-    missingJob ? t("deepLinkJobMissing") : null,
-    missingChapter ? t("deepLinkChapterMissing") : null,
-    missingEvent ? t("deepLinkEventMissing") : null,
-  ].filter(Boolean);
+    missingJob && target.jobId
+      ? { message: t("deepLinkJobMissing"), value: target.jobId }
+      : null,
+    missingChapter && target.chapterId
+      ? { message: t("deepLinkChapterMissing"), value: target.chapterId }
+      : null,
+    missingEvent && target.eventId
+      ? { message: t("deepLinkEventMissing"), value: target.eventId }
+      : null,
+    missingRun && target.runId
+      ? { message: t("deepLinkRunMissing"), value: target.runId }
+      : null,
+  ].filter((item): item is { message: string; value: string } => Boolean(item));
 
   return (
     <main className="flex h-full min-h-0 flex-col bg-surface" aria-labelledby="generation-runs-title">
@@ -595,7 +615,16 @@ export default function GenerationRunsWorkspace({
             role="alert"
             className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-100"
           >
-            <p>{navigationIssues.join(" ")}</p>
+            <ul className="min-w-0 space-y-1">
+              {navigationIssues.map((issue) => (
+                <li key={`${issue.message}:${issue.value}`} className="min-w-0">
+                  <span>{issue.message}</span>{" "}
+                  <code className="break-all rounded bg-amber-100 px-1 py-0.5 text-xs dark:bg-amber-900/50">
+                    {issue.value}
+                  </code>
+                </li>
+              ))}
+            </ul>
             <button
               type="button"
               onClick={() => onNavigate({})}
@@ -1009,7 +1038,9 @@ export default function GenerationRunsWorkspace({
             {target.chapterId && (
               <button
                 type="button"
-                onClick={() => onNavigate({ jobId: target.jobId })}
+                onClick={() =>
+                  onNavigate({ jobId: target.jobId, runId: target.runId })
+                }
                 className="shrink-0 text-xs font-medium text-accent hover:underline"
               >
                 {t("clearChapter")}
@@ -1031,7 +1062,15 @@ export default function GenerationRunsWorkspace({
           )}
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
             {selectedTelemetry.map((run) => (
-              <article key={run.run_id} className="min-w-0 rounded-md border border-border bg-surface p-3">
+              <article
+                key={run.run_id}
+                className={[
+                  "min-w-0 rounded-md border bg-surface p-3",
+                  target.runId === run.run_id
+                    ? "border-accent ring-1 ring-accent/30"
+                    : "border-border",
+                ].join(" ")}
+              >
                 <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0">
                     <h4 className="truncate text-sm font-medium text-foreground">

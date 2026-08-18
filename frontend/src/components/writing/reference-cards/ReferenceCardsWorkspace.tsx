@@ -18,6 +18,9 @@ interface ReferenceCardsWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
   cardType: ReferenceCardType;
+  initialCardId?: string;
+  onCardTargetChange?: (cardId?: string) => void;
+  onTargetValidation: (cardId: string, valid: boolean) => void;
   openCurationOnMount?: boolean;
   onCurationOpened?: () => void;
 }
@@ -70,6 +73,9 @@ export default function ReferenceCardsWorkspace({
   mode,
   novelId,
   cardType,
+  initialCardId,
+  onCardTargetChange,
+  onTargetValidation,
   openCurationOnMount = false,
   onCurationOpened,
 }: ReferenceCardsWorkspaceProps) {
@@ -144,7 +150,14 @@ export default function ReferenceCardsWorkspace({
         ),
       );
       setFavoritePendingIds(new Set());
+      const requestedCard = initialCardId
+        ? activeResponse.data.find((card) => card._id === initialCardId)
+        : undefined;
+      if (initialCardId) {
+        onTargetValidation(initialCardId, Boolean(requestedCard));
+      }
       setSelectedId((current) => {
+        if (initialCardId) return requestedCard?._id ?? null;
         if (current && activeResponse.data.some((card) => card._id === current)) return current;
         return activeResponse.data[0]?._id ?? null;
       });
@@ -154,7 +167,7 @@ export default function ReferenceCardsWorkspace({
     } finally {
       setLoading(false);
     }
-  }, [cardType, mode, novelId, t]);
+  }, [cardType, initialCardId, mode, novelId, onTargetValidation, t]);
 
   useEffect(() => {
     void loadCards();
@@ -172,6 +185,7 @@ export default function ReferenceCardsWorkspace({
   }, [creating, selectedCard]);
 
   const selectCard = (card: ReferenceCard) => {
+    onCardTargetChange?.(card._id);
     setCreating(false);
     setSelectedId(card._id);
     setDraft(createDraft(card));
@@ -214,6 +228,7 @@ export default function ReferenceCardsWorkspace({
       });
       setCreating(false);
       setSelectedId(saved._id);
+      onCardTargetChange?.(saved._id);
       setDraft(createDraft(saved));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("saveFailed"));
@@ -268,6 +283,7 @@ export default function ReferenceCardsWorkspace({
         return next;
       });
       setSelectedId(remaining[0]?._id ?? null);
+      onCardTargetChange?.(remaining[0]?._id);
       setCreating(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("deleteFailed"));
