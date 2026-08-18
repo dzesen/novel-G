@@ -305,11 +305,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     (key: WritingTargetKey, value: string, valid: boolean) => {
       setLocatedTargetFailure((current) => {
         if (valid) {
-          return current?.key === key && current.value === value
+          return current?.key === key &&
+            current.value === value &&
+            current.routeContext === routeValidationContext
             ? null
             : current;
         }
-        if (current?.key === key && current.value === value) {
+        if (
+          current?.key === key &&
+          current.value === value &&
+          current.routeContext === routeValidationContext
+        ) {
           return current;
         }
         return {
