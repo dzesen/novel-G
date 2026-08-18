@@ -347,12 +347,17 @@ async def run_chapter(
             generated = await deps.generate_state(novel_id, chapter)
             result, dropped, tokens, truncation = generated[:4]
             attempts = generated[4] if len(generated) > 4 else []
+            accepted_report = generated[5] if len(generated) > 5 else None
             _merge_attempts(outcome, attempts)
             outcome.tokens += tokens
             outcome.consistency_issues = list(result.get("consistency_issues", []))
             degraded = _record_reference_drops(outcome, "state", dropped)
             degraded = _record_truncation(outcome, "state", truncation) or degraded
-            report = await deps.accept_state(chapter_id, result)
+            report = (
+                dict(accepted_report)
+                if accepted_report is not None
+                else await deps.accept_state(chapter_id, result)
+            )
             reference_resolution = (
                 (report.get("state_completion") or {}).get(
                     "reference_resolution"

@@ -8,13 +8,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
-from uuid import uuid4
 
-from backend.llm.prompts.prompt_selector import (
-    CHAPTER_STATE_PROMPT_NAME,
-    PROSE_PROMPT_NAME,
-    load_prompt_config,
-)
+from backend.llm.prompts.prompt_selector import PROSE_PROMPT_NAME, load_prompt_config
 from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
 from backend.services.llm.context_builder import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
@@ -23,17 +18,14 @@ from backend.services.llm.context_builder import (
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.workflow_runner import (
-    WorkflowDeps, WorkflowFailed, parse_sse_event, run_workflow, run_workflow_to_result,
+    WorkflowFailed,
+    parse_sse_event,
+    run_workflow,
 )
 from backend.services.llm.generation_runtime import (
     AttemptScope,
     WorkflowStepTarget,
     create_generation_runtime,
-)
-from backend.services.novel.state_validation import (
-    resolve_state_character_references,
-    state_reference_resolution,
-    validate_state_ids,
 )
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.chapter_repository import chapter_repo
@@ -46,11 +38,11 @@ from backend.services.generation.chapter_generation_application import (
     OutlineAdherenceCommand,
     OutlineGenerationCommand,
     ProseGenerationCommand,
+    STATE_STEP,
+    STATE_WORKFLOW,
+    StateGenerationCommand,
 )
 from backend.api.llm_routers.prose_router import PROSE_STEP, PROSE_WORKFLOW
-from backend.api.llm_routers.state_router import (
-    CHAPTER_STATE_STEPS, STATE_STEP, STATE_WORKFLOW,
-)
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
@@ -59,11 +51,6 @@ from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
 )
-from backend.services.novel.state_proposal import (
-    SelectAllPolicy,
-    state_proposal_module,
-)
-from backend.services.novel.state_completion import prose_is_eligible_for_state
 from backend.services.novel.style_controls import render_style_controls
 
 _GENERATION_OVERRIDE_KEYS = frozenset({
@@ -107,6 +94,7 @@ def _chapter_generation_service() -> ChapterGenerationApplicationService:
         replace(
             production,
             create_runtime=create_generation_runtime,
+            run_workflow=run_workflow,
         )
     )
 
@@ -376,21 +364,6 @@ def estimate_worklist_attempt_capacity(
     return max(1, capacity)
 
 
-def _deps_for(
-    workflow_name: str,
-    attempt_scope: AttemptScope | None = None,
-    generation_params: Mapping[str, Any] | None = None,
-) -> WorkflowDeps:
-    del workflow_name
-    _overrides, runtime_kwargs = _generation_options(generation_params)
-    return WorkflowDeps(
-        runtime=create_generation_runtime(
-            attempt_scope=attempt_scope,
-            **runtime_kwargs,
-        ),
-    )
-
-
 async def _consume_prose_frames(frames: AsyncGenerator[str, None]) -> Tuple[str, int]:
     """消费 stream_prose 帧 → (完整正文, total_tokens)；done{success:false} 抛 WorkflowFailed。"""
     async for frame in frames:
@@ -462,85 +435,24 @@ async def generate_state(
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
-) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
-    chapter_id = str(chapter["_id"])
-    fresh_chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-    if not prose_is_eligible_for_state(fresh_chapter):
-        raise ValueError(
-            "本章正文尚未完整接受；请先补写并标记完成，不能执行状态回填"
+) -> tuple[dict, dict, int, dict, list[dict[str, Any]], dict[str, Any]]:
+    result = await _chapter_generation_service().collect(
+        StateGenerationCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            authority=AcceptanceAuthority.SYSTEM,
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
         )
-    generation_snapshot = await state_proposal_module.capture(
-        novel_id,
-        chapter_id,
-        chapter=fresh_chapter,
     )
-    generation_lease = await state_proposal_module.begin(
-        novel_id,
-        chapter_id,
-        snapshot=generation_snapshot,
-        audit={"workflow": STATE_WORKFLOW, "step": STATE_STEP, "mode": "headless"},
+    return (
+        dict(result.value or {}),
+        result.dropped,
+        result.total_tokens,
+        result.truncation,
+        result.attempts,
+        result.acceptance,
     )
-    try:
-        inputs = await fetch_context_inputs(novel_id, chapter_id)
-        context = assemble_context(inputs)
-        roster = inputs["roster"]
-        # 正文必须重新查库取：调用方传入的 chapter 是管线入口快照，只用于
-        # skip-existing；同轮先前步骤可能刚写入正文。
-        params = {
-            "context": context.to_prompt_text(),
-            "chapter_order": int(chapter.get("order_index") or 0),
-            "chapter_title": str(chapter.get("title") or ""),
-            "chapter_content": str(fresh_chapter.get("content") or "").strip(),
-        }
-        gen_kwargs, _runtime_kwargs = _generation_options(generation_params)
-        deps = _deps_for(
-            STATE_WORKFLOW,
-            attempt_scope,
-            generation_params,
-        )
-        await state_proposal_module.ensure_current(generation_snapshot)
-        frames = run_workflow(
-            workflow_name=STATE_WORKFLOW, steps=CHAPTER_STATE_STEPS,
-            prompts=load_prompt_config().get(CHAPTER_STATE_PROMPT_NAME, {}),
-            params=params, gen_kwargs=gen_kwargs, cached={}, deps=deps,
-            request_id=uuid4().hex[:8],
-        )
-        result, tokens = await run_workflow_to_result(STATE_STEP, frames)
-        await state_proposal_module.ensure_current(generation_snapshot)
-        resolved, remapped = resolve_state_character_references(result, roster)
-        cleaned, dropped = validate_state_ids(resolved, roster)
-        attempts = _serialize_attempts(deps.runtime)
-        reference_resolution = state_reference_resolution(
-            result,
-            cleaned,
-            dropped,
-            remapped,
-        )
-        proposal = await state_proposal_module.publish(
-            generation_lease,
-            cleaned,
-            audit={
-                "usage": {"total_tokens": tokens},
-                "attempts": attempts,
-                "reference_resolution": reference_resolution,
-            },
-        )
-        truncation = {
-            "truncated_sections": list(context.truncated_sections),
-            "dropped_item_counts": dict(context.dropped_item_counts),
-        }
-        return proposal, dropped, tokens, truncation, attempts
-    except BaseException as exc:
-        await state_proposal_module.mark_failed(
-            generation_lease,
-            exc,
-            audit={
-                "usage": getattr(exc, "usage", None) or {},
-                "attempts": list(getattr(exc, "attempts", None) or []),
-            },
-        )
-        raise
-
 
 async def generate_outline_adherence(
     novel_id: str,
@@ -594,12 +506,11 @@ async def _prose_already_accepted(
     del chapter_id, text, completion
 
 
-async def _accept_state(chapter_id: str, proposal: dict) -> dict:
-    return await state_proposal_module.run_auto(
-        chapter_id=chapter_id,
-        proposal=proposal,
-        policy=SelectAllPolicy(),
-    )
+async def _state_already_accepted(chapter_id: str, proposal: dict) -> dict:
+    """统一应用服务已通过同一 Proposal 接受路径回填状态。"""
+
+    del chapter_id, proposal
+    return {}
 
 
 def build_chapter_pipeline_deps(
@@ -640,6 +551,6 @@ def build_chapter_pipeline_deps(
         ),
         accept_outline=_outline_already_accepted,
         write_prose=_prose_already_accepted,
-        accept_state=_accept_state,
+        accept_state=_state_already_accepted,
         recalculate_prose_authorization=recalculate_prose_authorization,
     )

@@ -19,9 +19,10 @@ from backend.db.repositories.generation_job_repository import TokenBudgetExceede
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.prose_run_repository import prose_run_repo
 from backend.db.utils import to_object_id
-from backend.llm.config import get_llm_config
+from backend.llm.config import get_llm_config, get_provider_config
 from backend.llm.prompts.prompt_selector import (
     CHAPTER_OUTLINE_PROMPT_NAME,
+    CHAPTER_STATE_PROMPT_NAME,
     OUTLINE_ADHERENCE_PROMPT_NAME,
     PROSE_PROMPT_NAME,
     load_prompt_config,
@@ -29,6 +30,7 @@ from backend.llm.prompts.prompt_selector import (
 from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineAdherenceResultSchema,
     ChapterOutlineResultSchema,
+    ChapterStateResultSchema,
 )
 from backend.llm.models import TokenUsage
 from backend.services.generation.prose_completion import prose_completion_module
@@ -54,6 +56,7 @@ from backend.services.generation.outline_adherence import (
 from backend.services.llm.context_builder import (
     assemble_context,
     assemble_outline_context,
+    estimate_tokens,
     fetch_context_inputs,
     outline_selection_roster,
 )
@@ -65,7 +68,10 @@ from backend.services.llm.generation_runtime import (
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.prose_runner import stream_prose
-from backend.services.llm.workflow_service import get_llm_service_for_step
+from backend.services.llm.workflow_service import (
+    get_llm_service_for_step,
+    resolve_provider_for_step,
+)
 from backend.services.llm.outline_generation import (
     chapter_outline_generation_kwargs,
 )
@@ -77,7 +83,14 @@ from backend.services.llm.workflow_runner import (
     run_workflow,
 )
 from backend.services.novel.chapter_service import ChapterService
-from backend.services.novel.state_completion import chapter_content_digest
+from backend.services.novel.state_completion import (
+    chapter_content_digest,
+    prose_acceptance_state,
+)
+from backend.services.novel.state_proposal import (
+    SelectAllPolicy,
+    state_proposal_module,
+)
 from backend.services.novel.outline_validation import validate_outline_ids
 from backend.services.novel.state_validation import (
     resolve_outline_character_references,
@@ -107,6 +120,20 @@ CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     ),
 )
 
+CHAPTER_STATE_STEPS: tuple[WorkflowStep, ...] = (
+    WorkflowStep(
+        key=STATE_STEP,
+        schema=ChapterStateResultSchema,
+        agent_id="continuity_editor",
+        prompt_args=lambda ctx: {
+            "context": ctx.params["context"],
+            "chapter_order": ctx.params["chapter_order"],
+            "chapter_title": ctx.params["chapter_title"],
+            "chapter_content": ctx.params["chapter_content"],
+        },
+    ),
+)
+
 _GENERATION_OVERRIDE_KEYS = frozenset(
     {
         "temperature",
@@ -131,6 +158,10 @@ class ChapterGenerationStage(str, Enum):
     PROSE = "prose"
     OUTLINE_ADHERENCE = "outline_adherence"
     STATE = "state"
+
+
+class PartialProseRequiresCompletion(ValueError):
+    """正文只接受了部分 AI 结果，状态回填必须硬暂停。"""
 
 
 @dataclass(frozen=True)
@@ -172,6 +203,17 @@ class OutlineAdherenceCommand:
 
 
 @dataclass(frozen=True)
+class StateGenerationCommand:
+    novel_id: str
+    chapter_id: str
+    authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
+    generation_params: Mapping[str, Any] = field(default_factory=dict)
+    attempt_scope: AttemptScope | None = None
+    request_id: str | None = None
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None
+
+
+@dataclass(frozen=True)
 class ChapterGenerationResult:
     stage: ChapterGenerationStage
     value: Any
@@ -181,6 +223,7 @@ class ChapterGenerationResult:
     dropped: dict[str, Any] = field(default_factory=dict)
     remapped: list[dict[str, Any]] = field(default_factory=list)
     completion: dict[str, Any] = field(default_factory=dict)
+    acceptance: dict[str, Any] = field(default_factory=dict)
     accepted: bool = False
 
     @property
@@ -214,6 +257,10 @@ class ChapterGenerationApplicationDeps:
     prose_runs: Any = prose_run_module
     prose_run_repo: Any = prose_run_repo
     create_prose_attempt_scope: Callable[..., Any] = ProseRunAttemptScope
+    state_proposals: Any = state_proposal_module
+    resolve_provider: Callable[[str, str], str] = resolve_provider_for_step
+    get_provider_config: Callable[[str], Any] = get_provider_config
+    estimate_tokens: Callable[[str], int] = estimate_tokens
 
     @classmethod
     def production(cls) -> "ChapterGenerationApplicationDeps":
@@ -237,6 +284,10 @@ class ChapterGenerationApplicationDeps:
             prose_runs=prose_run_module,
             prose_run_repo=prose_run_repo,
             create_prose_attempt_scope=ProseRunAttemptScope,
+            state_proposals=state_proposal_module,
+            resolve_provider=resolve_provider_for_step,
+            get_provider_config=get_provider_config,
+            estimate_tokens=estimate_tokens,
         )
 
 
@@ -282,6 +333,19 @@ class _PreparedOutlineAdherence:
     truncation: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _PreparedState:
+    command: StateGenerationCommand
+    chapter: dict[str, Any]
+    context: Any
+    roster: dict[str, Any]
+    lease: Any
+    params: dict[str, Any]
+    gen_kwargs: dict[str, Any]
+    runtime: Any
+    truncation: dict[str, Any]
+
+
 class ChapterGenerationApplicationService:
     """所有章节生成消费者共用的深接口。"""
 
@@ -297,6 +361,7 @@ class ChapterGenerationApplicationService:
             OutlineGenerationCommand
             | ProseGenerationCommand
             | OutlineAdherenceCommand
+            | StateGenerationCommand
         ),
     ) -> AsyncIterator[ChapterGenerationEvent]:
         """预检命令并返回事件流；预检错误发生在 HTTP 开流之前。"""
@@ -310,6 +375,9 @@ class ChapterGenerationApplicationService:
         if isinstance(command, OutlineAdherenceCommand):
             prepared = await self._prepare_outline_adherence(command)
             return self._stream_outline_adherence(prepared)
+        if isinstance(command, StateGenerationCommand):
+            prepared = await self._prepare_state(command)
+            return self._stream_state(prepared)
         raise TypeError(f"unsupported chapter generation command: {type(command)!r}")
 
     async def collect(
@@ -318,6 +386,7 @@ class ChapterGenerationApplicationService:
             OutlineGenerationCommand
             | ProseGenerationCommand
             | OutlineAdherenceCommand
+            | StateGenerationCommand
         ),
     ) -> ChapterGenerationResult:
         """无头消费同一事件流，并把失败终帧恢复成带审计信息的异常。"""
@@ -478,6 +547,199 @@ class ChapterGenerationApplicationService:
                 accepted=accepted,
             )
             yield ChapterGenerationEvent(name, cleaned_data, result=result)
+
+    async def _prepare_state(
+        self,
+        command: StateGenerationCommand,
+    ) -> _PreparedState:
+        lease = None
+        try:
+            await self._deps.novel_repo.get_novel_by_id(command.novel_id)
+            chapter = await self._deps.chapter_repo.get_chapter_by_id(
+                command.chapter_id
+            )
+            if chapter.get("novel_id") != to_object_id(command.novel_id):
+                raise ValueError("该章节不属于指定小说")
+            content = str(chapter.get("content") or "").strip()
+            if not content:
+                raise ValueError("本章还没有已保存的正文，请先写好并保存正文")
+            if prose_acceptance_state(chapter) == "partial_manual_required":
+                raise PartialProseRequiresCompletion(
+                    "本章正文只接受了部分 AI 结果；请先补写并将章节状态设为完成，"
+                    "再执行状态回填"
+                )
+
+            snapshot = await self._deps.state_proposals.capture(
+                command.novel_id,
+                command.chapter_id,
+                chapter=chapter,
+            )
+            provider_alias = self._deps.resolve_provider(
+                STATE_WORKFLOW,
+                STATE_STEP,
+            )
+            provider_config = self._deps.get_provider_config(provider_alias)
+            lease = await self._deps.state_proposals.begin(
+                command.novel_id,
+                command.chapter_id,
+                snapshot=snapshot,
+                audit={
+                    "workflow": STATE_WORKFLOW,
+                    "step": STATE_STEP,
+                    "provider_alias": provider_alias,
+                    "provider_type": getattr(
+                        provider_config,
+                        "provider_type",
+                        None,
+                    ),
+                    "model": getattr(provider_config, "model", None),
+                    "mode": command.authority.value,
+                },
+            )
+            inputs = await self._deps.fetch_context_inputs(
+                command.novel_id,
+                command.chapter_id,
+            )
+            context = self._deps.assemble_context(inputs)
+            generation_values = dict(command.generation_params or {})
+            reserved_output = int(
+                generation_values.get("max_tokens")
+                or getattr(provider_config, "max_tokens", None)
+                or 4096
+            )
+            estimated_input = self._deps.estimate_tokens(
+                context.to_prompt_text()
+            ) + self._deps.estimate_tokens(content)
+            max_context_tokens = int(
+                getattr(provider_config, "max_context_tokens", 128000)
+            )
+            if estimated_input + reserved_output > max_context_tokens:
+                raise ValueError(
+                    "本章正文与上下文预计超过模型窗口："
+                    f"输入约 {estimated_input} tokens，输出预留 {reserved_output}，"
+                    f"窗口 {max_context_tokens}。"
+                    "请精简上下文或选择更大窗口的模型。"
+                )
+            await self._deps.state_proposals.ensure_current(snapshot)
+
+            gen_kwargs = {
+                key: value
+                for key, value in generation_values.items()
+                if key in _GENERATION_OVERRIDE_KEYS and value is not None
+            }
+            runtime_kwargs = (
+                {}
+                if generation_values.get("allow_failure_retry", True)
+                else {"max_provider_retries": 0}
+            )
+            runtime = self._deps.create_runtime(
+                attempt_scope=command.attempt_scope,
+                **runtime_kwargs,
+            )
+            return _PreparedState(
+                command=command,
+                chapter=chapter,
+                context=context,
+                roster=inputs["roster"],
+                lease=lease,
+                params={
+                    "context": context.to_prompt_text(),
+                    "chapter_order": int(chapter.get("order_index") or 0),
+                    "chapter_title": str(chapter.get("title") or ""),
+                    "chapter_content": content,
+                },
+                gen_kwargs=gen_kwargs,
+                runtime=runtime,
+                truncation={
+                    "truncated_sections": list(context.truncated_sections),
+                    "dropped_item_counts": dict(context.dropped_item_counts),
+                },
+            )
+        except BaseException as exc:
+            if lease is not None:
+                await self._deps.state_proposals.mark_failed(lease, exc)
+            raise
+
+    async def _stream_state(
+        self,
+        prepared: _PreparedState,
+    ) -> AsyncIterator[ChapterGenerationEvent]:
+        if any(prepared.truncation.values()):
+            yield ChapterGenerationEvent("context", prepared.truncation)
+        command = prepared.command
+        frames = self._deps.run_workflow(
+            workflow_name=STATE_WORKFLOW,
+            steps=CHAPTER_STATE_STEPS,
+            prompts=self._deps.load_prompts().get(
+                CHAPTER_STATE_PROMPT_NAME,
+                {},
+            ),
+            params=prepared.params,
+            gen_kwargs=prepared.gen_kwargs,
+            cached={},
+            deps=WorkflowDeps(runtime=prepared.runtime),
+            request_id=command.request_id or uuid4().hex[:8],
+            is_disconnected=command.is_disconnected,
+            log_partial_on_disconnect=self._deps.log_partial_on_disconnect,
+        )
+        preview = self._deps.state_proposals.stream_preview(
+            prepared.lease,
+            frames,
+            roster=prepared.roster,
+            state_step=STATE_STEP,
+        )
+        dropped: dict[str, Any] = {}
+        remapped: list[dict[str, Any]] = []
+        async for frame in preview:
+            parsed = parse_sse_event(frame)
+            if parsed is None:
+                yield ChapterGenerationEvent("keepalive", {})
+                continue
+            name, raw_data = parsed
+            data = dict(raw_data)
+            if name == "id_validation":
+                dropped = dict(data.get("dropped") or {})
+                yield ChapterGenerationEvent(name, data)
+                continue
+            if name == "id_remapping":
+                remapped = list(data.get("remapped") or [])
+                yield ChapterGenerationEvent(name, data)
+                continue
+            proposal = _extract_state_proposal(name, data)
+            if proposal is None:
+                if name == "done" and not data.get("success"):
+                    data.setdefault(
+                        "attempts",
+                        _serialize_attempts(prepared.runtime),
+                    )
+                yield ChapterGenerationEvent(name, data)
+                continue
+
+            if name != "done":
+                yield ChapterGenerationEvent(name, data)
+                continue
+            acceptance: dict[str, Any] = {}
+            accepted = False
+            if command.authority is AcceptanceAuthority.SYSTEM:
+                acceptance = await self._deps.state_proposals.run_auto(
+                    chapter_id=command.chapter_id,
+                    proposal=proposal,
+                    policy=SelectAllPolicy(),
+                )
+                accepted = True
+            usage = dict(data.get("usage") or {})
+            result = ChapterGenerationResult(
+                stage=ChapterGenerationStage.STATE,
+                value=proposal,
+                usage=usage,
+                attempts=_serialize_attempts(prepared.runtime),
+                truncation=prepared.truncation,
+                dropped=dropped,
+                remapped=remapped,
+                acceptance=dict(acceptance or {}),
+                accepted=accepted,
+            )
+            yield ChapterGenerationEvent(name, data, result=result)
 
     async def _prepare_outline_adherence(
         self,
@@ -1239,6 +1501,28 @@ def _extract_outline(name: str, data: Mapping[str, Any]) -> dict[str, Any] | Non
         and isinstance(result.get(CHAPTER_OUTLINE_STEP), dict)
     ):
         return dict(result[CHAPTER_OUTLINE_STEP])
+    return None
+
+
+def _extract_state_proposal(
+    name: str,
+    data: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if (
+        name == "step"
+        and data.get("step") == STATE_STEP
+        and data.get("status") == "done"
+        and isinstance(data.get("data"), dict)
+    ):
+        return dict(data["data"])
+    result = data.get("result")
+    if (
+        name == "done"
+        and data.get("success")
+        and isinstance(result, dict)
+        and isinstance(result.get(STATE_STEP), dict)
+    ):
+        return dict(result[STATE_STEP])
     return None
 
 
