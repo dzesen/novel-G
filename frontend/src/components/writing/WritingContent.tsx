@@ -144,7 +144,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   const [novelLoadFailed, setNovelLoadFailed] = useState(false);
   const [novelLoadRevision, setNovelLoadRevision] = useState(0);
   const [locatedTargetFailure, setLocatedTargetFailure] = useState<
-    Extract<InvalidWritingTarget, { kind: "target" }> | null
+    (Extract<InvalidWritingTarget, { kind: "target" }> & {
+      routeContext: string;
+    }) | null
   >(null);
   const [autoBookStartRequest, setAutoBookStartRequest] =
     useState<AutoBookStartRequest | null>(null);
@@ -192,8 +194,14 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     [currentSearch, fallbackRoute],
   );
   const { route, invalidTarget } = resolved;
+  const routeValidationContext = JSON.stringify([
+    route.area,
+    route.view,
+    route.targets,
+  ]);
   const runtimeInvalidTarget =
     locatedTargetFailure &&
+    locatedTargetFailure.routeContext === routeValidationContext &&
     route.targets[locatedTargetFailure.key] === locatedTargetFailure.value
       ? locatedTargetFailure
       : null;
@@ -304,10 +312,15 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         if (current?.key === key && current.value === value) {
           return current;
         }
-        return { kind: "target", key, value };
+        return {
+          kind: "target",
+          key,
+          value,
+          routeContext: routeValidationContext,
+        };
       });
     },
-    [],
+    [routeValidationContext],
   );
   const validateChapterTarget = useCallback(
     (chapterId: string, valid: boolean) =>
