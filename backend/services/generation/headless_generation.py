@@ -1,8 +1,7 @@
-"""Approach A：无头驱动现有 LLM 工作流，产出结构化结果供批量引擎用（设计 §4.2）。
+"""批量章节生成的无头适配器。
 
-不重构已上线工作流：直接调 run_workflow/stream_prose，内部消费其 SSE 帧取结果，
-再调服务层 accept。装配（fetch_context_inputs / assemble_* / WorkflowDeps）复制自
-outline_router / prose_router / state_router 的开流前设置——那几处是模块级、可复用。
+各步骤逐步迁入统一章节生成应用服务；本模块只把批量任务的授权、尝试作用域与
+结果元组翻译给现有章节管线。
 """
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 from uuid import uuid4
 
 from backend.llm.prompts.prompt_selector import (
-    CHAPTER_OUTLINE_PROMPT_NAME,
     CHAPTER_STATE_PROMPT_NAME,
     OUTLINE_ADHERENCE_PROMPT_NAME,
     PROSE_PROMPT_NAME,
@@ -25,9 +23,7 @@ from backend.llm.schemas.novel_pydantic import (
 from backend.services.llm.context_builder import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
     assemble_context,
-    assemble_outline_context,
     fetch_context_inputs,
-    outline_selection_roster,
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.prose_runner import stream_prose
@@ -40,24 +36,19 @@ from backend.services.llm.generation_runtime import (
     WorkflowStepTarget,
     create_generation_runtime,
 )
-from backend.services.llm.outline_generation import (
-    chapter_outline_generation_kwargs,
-)
 from backend.services.novel.state_validation import (
-    resolve_outline_character_references,
     resolve_state_character_references,
     state_reference_resolution,
     validate_state_ids,
 )
-from backend.services.novel.outline_validation import validate_outline_ids
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.chapter_repository import chapter_repo
-# 步骤表与工作流常量直接借用路由模块（模块级、复用非重构）。
-# 注意：outline_router / state_router 都没有导出标量的 "...STEP" 常量——
-# outline 侧只有步骤表 CHAPTER_OUTLINE_STEPS（单步表，key 用 CHAPTER_OUTLINE_STEPS[0].key
-# 取，不硬编码字面量）；state 侧的标量步骤名叫 STATE_STEP（不是 CHAPTER_STATE_STEP）。
-from backend.api.llm_routers.outline_router import (
-    CHAPTER_OUTLINE_STEPS, CHAPTER_OUTLINE_WORKFLOW,
+from backend.services.generation.chapter_generation_application import (
+    AcceptanceAuthority,
+    ChapterGenerationApplicationService,
+    CHAPTER_OUTLINE_STEP,
+    CHAPTER_OUTLINE_WORKFLOW,
+    OutlineGenerationCommand,
 )
 from backend.api.llm_routers.prose_router import PROSE_STEP, PROSE_WORKFLOW
 from backend.api.llm_routers.state_router import (
@@ -86,9 +77,6 @@ from backend.services.novel.state_completion import prose_is_eligible_for_state
 from backend.services.novel.state_completion import chapter_content_digest
 from backend.services.novel.style_controls import render_style_controls
 from backend.db.utils import get_utc_now
-
-CHAPTER_OUTLINE_STEP = CHAPTER_OUTLINE_STEPS[0].key
-
 
 _GENERATION_OVERRIDE_KEYS = frozenset({
     "temperature",
@@ -123,6 +111,10 @@ def _continuation_policy(
     return ProseContinuationPolicy.from_mapping(
         dict(generation_params or {}).get("prose_continuation_policy")
     )
+
+
+def _chapter_generation_service() -> ChapterGenerationApplicationService:
+    return ChapterGenerationApplicationService()
 
 
 def build_prose_base_prompt(
@@ -429,52 +421,22 @@ async def generate_outline(
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
-    inputs = await fetch_context_inputs(novel_id, str(chapter["_id"]))
-    context = assemble_outline_context(inputs)
-    roster = outline_selection_roster(
-        inputs["roster"],
-        context.selectable_worldbook_card_ids,
+    result = await _chapter_generation_service().collect(
+        OutlineGenerationCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            authority=AcceptanceAuthority.SYSTEM,
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
+        )
     )
-    # words_per_chapter 是小说级字段（chapter 文档上不存在这一字段，见
-    # backend/api/default_routers/novel_router.py 的 NovelBase），故须另取 novel
-    # 文档；与 outline_router.create_chapter_outline_by_ai 的取值方式一致
-    # （novel.get("words_per_chapter") or 3000），不能读 chapter.get(...)——
-    # chapter 上该字段恒为 None，会让批量生成对所有小说都悄悄按 3000 字生成。
-    novel = await novel_repo.get_novel_by_id(novel_id)
-    params = {
-        "context": context.to_prompt_text(),
-        "chapter_order": int(chapter.get("order_index") or 0),
-        "chapter_title": str(chapter.get("title") or ""),
-        "style_controls": render_style_controls(novel.get("style_controls")),
-        "words_per_chapter": novel.get("words_per_chapter") or 3000,
-    }
-    gen_kwargs, _runtime_kwargs = _generation_options(generation_params)
-    gen_kwargs = chapter_outline_generation_kwargs(gen_kwargs)
-    deps = _deps_for(
-        CHAPTER_OUTLINE_WORKFLOW,
-        attempt_scope,
-        generation_params,
-    )
-    frames = run_workflow(
-        workflow_name=CHAPTER_OUTLINE_WORKFLOW, steps=CHAPTER_OUTLINE_STEPS,
-        prompts=load_prompt_config().get(CHAPTER_OUTLINE_PROMPT_NAME, {}),
-        params=params, gen_kwargs=gen_kwargs, cached={}, deps=deps,
-        request_id=uuid4().hex[:8],
-    )
-    result, tokens = await run_workflow_to_result(CHAPTER_OUTLINE_STEP, frames)
-    resolved, remapped = resolve_outline_character_references(result, roster)
-    cleaned, dropped = validate_outline_ids(resolved, roster)
-    truncation = {
-        "truncated_sections": list(context.truncated_sections),
-        "dropped_item_counts": dict(context.dropped_item_counts),
-    }
     return (
-        cleaned,
-        dropped,
-        tokens,
-        truncation,
-        _serialize_attempts(deps.runtime),
-        remapped,
+        result.value,
+        result.dropped,
+        result.total_tokens,
+        result.truncation,
+        result.attempts,
+        result.remapped,
     )
 
 
@@ -851,8 +813,10 @@ def _serialize_attempts(runtime) -> list[dict[str, Any]]:
     ]
 
 
-async def _accept_outline(chapter_id: str, result: dict) -> None:
-    await ChapterService.accept_chapter_outline(chapter_id, result)
+async def _outline_already_accepted(chapter_id: str, result: dict) -> None:
+    """统一应用服务已在 SYSTEM 权限下接受章纲；兼容旧管线回调形状。"""
+
+    del chapter_id, result
 
 
 async def _write_prose(
@@ -925,7 +889,7 @@ def build_chapter_pipeline_deps(
             scope("state"),
             generation_params,
         ),
-        accept_outline=_accept_outline,
+        accept_outline=_outline_already_accepted,
         write_prose=_write_prose,
         accept_state=_accept_state,
         recalculate_prose_authorization=recalculate_prose_authorization,
