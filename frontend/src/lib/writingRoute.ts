@@ -1,0 +1,304 @@
+export const WRITING_AREA_VIEWS = {
+  blueprint: ["overview", "orientation", "story", "volumes", "chapters"],
+  writing: ["chapter", "revision", "agent-suggestion"],
+  "auto-book": ["readiness", "runs", "generation-runs", "diagnostics"],
+  world: ["library", "factions", "relationships", "curation", "candidates"],
+  continuity: [
+    "overview",
+    "facts",
+    "threads",
+    "health",
+    "state-issues",
+    "proposals",
+  ],
+} as const;
+
+export type WritingArea = keyof typeof WRITING_AREA_VIEWS;
+export type WritingView = (typeof WRITING_AREA_VIEWS)[WritingArea][number];
+
+export const WRITING_AREA_DEFAULT_VIEWS = {
+  blueprint: "overview",
+  writing: "chapter",
+  "auto-book": "readiness",
+  world: "library",
+  continuity: "overview",
+} as const satisfies Record<WritingArea, WritingView>;
+
+export const WRITING_TARGET_KEYS = [
+  "volume",
+  "chapter",
+  "scene",
+  "cardType",
+  "card",
+  "candidate",
+  "job",
+  "event",
+  "issue",
+  "run",
+  "suggestion",
+  "visual",
+] as const;
+
+const LEGACY_ROUTE_KEYS = new Set(["curateCards", "reviewCards"]);
+const OWNED_ROUTE_KEYS = new Set<string>([
+  "area",
+  "view",
+  ...WRITING_TARGET_KEYS,
+  ...LEGACY_ROUTE_KEYS,
+]);
+
+export type WritingTargetKey = (typeof WRITING_TARGET_KEYS)[number];
+export type WritingRouteTargets = Partial<Record<WritingTargetKey, string>>;
+
+export interface WritingRoute {
+  area: WritingArea;
+  view: WritingView;
+  targets: WritingRouteTargets;
+}
+
+export interface InvalidWritingTarget {
+  kind: "area" | "view";
+  value: string;
+}
+
+export interface ResolvedWritingRoute {
+  route: WritingRoute;
+  source: "canonical" | "legacy" | "default";
+  invalidTarget: InvalidWritingTarget | null;
+  /** Replacement query without the leading question mark; null means no rewrite. */
+  canonicalSearch: string | null;
+}
+
+const REFERENCE_CARD_TYPES = new Set([
+  "character",
+  "location",
+  "item",
+  "rule",
+  "lore",
+]);
+
+const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey[]>> = {
+  blueprint: {
+    overview: [],
+    orientation: [],
+    story: [],
+    volumes: ["volume"],
+    chapters: ["volume", "chapter"],
+  },
+  writing: {
+    chapter: ["volume", "chapter", "scene", "run", "visual"],
+    revision: ["chapter", "run", "suggestion"],
+    "agent-suggestion": ["chapter", "scene", "run", "suggestion"],
+  },
+  "auto-book": {
+    readiness: ["volume"],
+    runs: ["volume", "chapter", "job"],
+    "generation-runs": ["chapter", "job", "event", "run"],
+    diagnostics: ["chapter", "job", "event"],
+  },
+  world: {
+    library: ["cardType", "card"],
+    factions: ["card"],
+    relationships: ["card"],
+    curation: ["cardType", "card"],
+    candidates: ["cardType", "candidate"],
+  },
+  continuity: {
+    overview: ["volume", "chapter", "issue"],
+    facts: ["card", "chapter", "issue"],
+    threads: ["chapter", "issue"],
+    health: ["volume", "chapter", "issue"],
+    "state-issues": ["chapter", "issue", "run"],
+    proposals: ["chapter", "issue", "run", "suggestion"],
+  },
+};
+
+function isWritingArea(value: string | null): value is WritingArea {
+  return value !== null && Object.hasOwn(WRITING_AREA_VIEWS, value);
+}
+
+function isWritingView(area: WritingArea, value: string): value is WritingView {
+  return (WRITING_AREA_VIEWS[area] as readonly string[]).includes(value);
+}
+
+function normalizedTargetValue(
+  key: WritingTargetKey,
+  value: string | null | undefined,
+): string | null {
+  const normalized = value?.trim() ?? "";
+  if (!normalized || normalized.length > 200) return null;
+  if (key === "cardType" && !REFERENCE_CARD_TYPES.has(normalized)) return null;
+  if (key === "visual" && !["cover", "portrait", "scene"].includes(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function collectTargets(
+  search: URLSearchParams,
+  area: WritingArea,
+  view: WritingView,
+  updates: WritingRouteTargets = {},
+): WritingRouteTargets {
+  const allowed = new Set(VIEW_TARGETS[area][view] ?? []);
+  const targets: WritingRouteTargets = {};
+  for (const key of WRITING_TARGET_KEYS) {
+    if (!allowed.has(key)) continue;
+    const candidate = Object.hasOwn(updates, key)
+      ? updates[key]
+      : search.get(key);
+    const value = normalizedTargetValue(key, candidate);
+    if (value !== null) targets[key] = value;
+  }
+  return targets;
+}
+
+function serializeRoute(
+  route: WritingRoute,
+  preservedFrom?: URLSearchParams,
+): string {
+  const next = new URLSearchParams();
+  next.set("area", route.area);
+  next.set("view", route.view);
+  for (const key of WRITING_TARGET_KEYS) {
+    const value = route.targets[key];
+    if (value) next.set(key, value);
+  }
+  for (const [key, value] of preservedFrom?.entries() ?? []) {
+    if (!OWNED_ROUTE_KEYS.has(key)) next.append(key, value);
+  }
+  return next.toString();
+}
+
+function resolved(
+  route: WritingRoute,
+  source: ResolvedWritingRoute["source"],
+  original: URLSearchParams,
+): ResolvedWritingRoute {
+  const canonical = serializeRoute(route, original);
+  return {
+    route,
+    source,
+    invalidTarget: null,
+    canonicalSearch: canonical === original.toString() ? null : canonical,
+  };
+}
+
+function invalid(
+  fallback: Pick<WritingRoute, "area" | "view">,
+  kind: InvalidWritingTarget["kind"],
+  value: string,
+): ResolvedWritingRoute {
+  return {
+    route: { ...fallback, targets: {} },
+    source: "canonical",
+    invalidTarget: { kind, value },
+    canonicalSearch: null,
+  };
+}
+
+function legacyRoute(
+  search: URLSearchParams,
+  fallback: Pick<WritingRoute, "area" | "view">,
+): ResolvedWritingRoute {
+  const legacyView = search.get("view");
+  let area: WritingArea;
+  let view: WritingView;
+
+  if (legacyView === "generation-runs") {
+    area = "auto-book";
+    view = "generation-runs";
+  } else if (search.get("reviewCards") === "1") {
+    area = "world";
+    view = "candidates";
+  } else if (search.get("curateCards") === "1") {
+    area = "world";
+    view = "curation";
+  } else if (normalizedTargetValue("cardType", search.get("cardType"))) {
+    area = "world";
+    view = "library";
+  } else if (legacyView !== null) {
+    return invalid(fallback, "view", legacyView);
+  } else {
+    return resolved(
+      { ...fallback, targets: collectTargets(search, fallback.area, fallback.view) },
+      "default",
+      search,
+    );
+  }
+
+  const route: WritingRoute = {
+    area,
+    view,
+    targets: collectTargets(search, area, view),
+  };
+  if (area === "world" && !route.targets.cardType) {
+    route.targets.cardType = "character";
+  }
+  return resolved(route, "legacy", search);
+}
+
+export function resolveWritingRoute(
+  search: URLSearchParams,
+  fallback: Pick<WritingRoute, "area" | "view">,
+): ResolvedWritingRoute {
+  const requestedArea = search.get("area");
+  if (requestedArea === null) return legacyRoute(search, fallback);
+  if (!isWritingArea(requestedArea)) {
+    return invalid(fallback, "area", requestedArea);
+  }
+
+  const requestedView =
+    search.get("view") ?? WRITING_AREA_DEFAULT_VIEWS[requestedArea];
+  if (!isWritingView(requestedArea, requestedView)) {
+    return invalid(fallback, "view", requestedView);
+  }
+
+  return resolved(
+    {
+      area: requestedArea,
+      view: requestedView,
+      targets: collectTargets(search, requestedArea, requestedView),
+    },
+    "canonical",
+    search,
+  );
+}
+
+export function defaultWritingRoute(
+  chapterCount: number,
+): Pick<WritingRoute, "area" | "view"> {
+  return chapterCount > 0
+    ? { area: "writing", view: "chapter" }
+    : { area: "blueprint", view: "overview" };
+}
+
+export function buildAreaSearch(
+  _current: URLSearchParams,
+  area: WritingArea,
+): string {
+  return serializeRoute({
+    area,
+    view: WRITING_AREA_DEFAULT_VIEWS[area],
+    targets: {},
+  }, _current);
+}
+
+export function buildViewSearch(
+  current: URLSearchParams,
+  area: WritingArea,
+  view: WritingView,
+  updates: WritingRouteTargets = {},
+): string {
+  if (!isWritingView(area, view)) {
+    throw new Error(`Unsupported writing view: ${area}/${view}`);
+  }
+  return serializeRoute(
+    {
+      area,
+      view,
+      targets: collectTargets(current, area, view, updates),
+    },
+    current,
+  );
+}

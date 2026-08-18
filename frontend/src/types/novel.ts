@@ -634,15 +634,3 @@ export interface WritingDraft extends CreateNovelRequest {
   _rewriteState?: WritingDraftRewriteState;
   card_avatar_proposal_ids?: string[];
 }
-
-/** Writing 侧栏导航项 */
-export type WritingSidebarItem =
-  | "novel-info"
-  | "chapter-editor"
-  | "agent-studio"
-  | "reference-cards"
-  | "faction-cards"
-  | "relationship-map"
-  | "plot-threads"
-  | "story-health"
-  | "character-memory";

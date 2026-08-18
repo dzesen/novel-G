@@ -848,6 +848,67 @@
       "characterMemory": "Character Memory",
       "agentStudio": "Agent Studio"
     },
+    "navigation": {
+      "backToShelf": "Back to bookshelf",
+      "untitled": "Untitled novel",
+      "workspaceHint": "Move from blueprint to a finished book with support close at hand",
+      "primaryAria": "Book completion tasks",
+      "supportAria": "Writing support modules",
+      "supportLabel": "Support",
+      "stage": "Stage {number}",
+      "areas": {
+        "blueprint": { "short": "Blueprint" },
+        "writing": { "short": "Write & revise" },
+        "auto-book": { "short": "Auto-book" },
+        "world": { "short": "World data" },
+        "continuity": { "short": "Continuity & state" }
+      },
+      "viewAria": "Current module view",
+      "views": {
+        "chapter": "Chapter editor",
+        "revision": "Agent Studio",
+        "library": "Library",
+        "factions": "Factions",
+        "relationships": "Relationships",
+        "candidates": "Candidates",
+        "continuityOverview": "Overview",
+        "facts": "Character state & facts",
+        "threads": "Plot threads",
+        "health": "Story health"
+      },
+      "loadingRoute": "Checking the novel structure and default task…",
+      "targetMissingTitle": "This target link cannot be opened",
+      "targetMissingBody": "The {kind} “{value}” is not registered in this workspace. No similar target was substituted and no model call was made.",
+      "targetKinds": {
+        "area": "area",
+        "view": "view"
+      },
+      "openDefault": "Open chapter editor",
+      "continuityTargetTitle": "This state target is not yet connected to the unified view",
+      "continuityTargetBody": "The target link remains intact, but this version will not guess which fact or proposal it means. Open deterministic story health or character state and facts instead.",
+      "openHealth": "Open story health",
+      "openFacts": "Open character state & facts"
+    },
+    "autoBook": {
+      "title": "Auto-book",
+      "description": "Run readiness, budget authorization, volume or whole-book jobs, recovery, and diagnostics in one place. Formal prose still goes through the shared chapter service.",
+      "structureCount": "{volumes} volumes · {chapters} chapters",
+      "viewAria": "Auto-book views",
+      "views": {
+        "readiness": "Readiness & start",
+        "runs": "Runs & recovery",
+        "generation-runs": "Generation records",
+        "diagnostics": "Diagnostics"
+      },
+      "volumeLabel": "Target volume",
+      "noVolumes": "No runnable volume yet",
+      "startVolume": "Generate volume",
+      "startBook": "Generate whole book",
+      "explicitCostHint": "Opening readiness does not call a model. Paid requests begin only after the final start action confirms the budget and call ceiling.",
+      "loadFailed": "Failed to load the volume and chapter structure",
+      "retry": "Retry",
+      "operationAria": "Auto-book runs and recovery"
+    },
     "agentStudio": {
       "eyebrow": "Controlled intelligence",
       "title": "Agent Studio",
@@ -2196,7 +2257,7 @@
     "generationRuns": {
       "title": "Generation runs",
       "description": "Inspect batch jobs and single-chapter prose runs. Records expose operational metadata only; prose and prompts stay private.",
-      "backToEditor": "Back to chapter editor",
+      "backToEditor": "Back to auto-book",
       "refresh": "Refresh",
       "refreshing": "Refreshing…",
       "loading": "Loading generation runs…",

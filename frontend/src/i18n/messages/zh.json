@@ -848,6 +848,67 @@
       "characterMemory": "人物记忆",
       "agentStudio": "Agent 工作台"
     },
+    "navigation": {
+      "backToShelf": "返回书架",
+      "untitled": "未命名小说",
+      "workspaceHint": "从蓝图到成书，支撑资料就近进入",
+      "primaryAria": "成书主任务",
+      "supportAria": "创作支撑模块",
+      "supportLabel": "当前支撑",
+      "stage": "阶段 {number}",
+      "areas": {
+        "blueprint": { "short": "蓝图" },
+        "writing": { "short": "写作与修订" },
+        "auto-book": { "short": "自动成书" },
+        "world": { "short": "世界资料" },
+        "continuity": { "short": "连续性与状态" }
+      },
+      "viewAria": "当前模块视图",
+      "views": {
+        "chapter": "章节编辑",
+        "revision": "Agent 工作台",
+        "library": "资料库",
+        "factions": "势力",
+        "relationships": "关系",
+        "candidates": "资料候选",
+        "continuityOverview": "总览",
+        "facts": "人物状态与事实",
+        "threads": "伏笔",
+        "health": "故事健康"
+      },
+      "loadingRoute": "正在确认小说结构与默认任务…",
+      "targetMissingTitle": "目标链接无法打开",
+      "targetMissingBody": "链接中的{kind}“{value}”不在当前工作台白名单内。系统没有改选相似目标，也没有触发模型调用。",
+      "targetKinds": {
+        "area": "区域",
+        "view": "视图"
+      },
+      "openDefault": "打开章节编辑",
+      "continuityTargetTitle": "该状态目标尚未接入统一视图",
+      "continuityTargetBody": "目标链接已被安全保留，但当前版本不会猜测对应事实或提案。可先查看确定性故事健康或人物状态与事实。",
+      "openHealth": "查看故事健康",
+      "openFacts": "查看人物状态与事实"
+    },
+    "autoBook": {
+      "title": "自动成书",
+      "description": "集中完成预检、预算授权、整卷或整本运行、恢复与诊断。正式正文仍由共享章节服务写入。",
+      "structureCount": "{volumes} 卷 · {chapters} 章",
+      "viewAria": "自动成书视图",
+      "views": {
+        "readiness": "预检与启动",
+        "runs": "运行与恢复",
+        "generation-runs": "生成记录",
+        "diagnostics": "诊断"
+      },
+      "volumeLabel": "目标卷",
+      "noVolumes": "尚无可运行的卷",
+      "startVolume": "生成当前卷",
+      "startBook": "生成整本",
+      "explicitCostHint": "打开预检不会调用模型；只有在预算与调用上限确认后，最终启动动作才会产生付费请求。",
+      "loadFailed": "卷章结构加载失败",
+      "retry": "重试",
+      "operationAria": "自动成书运行与恢复"
+    },
     "agentStudio": {
       "eyebrow": "受控智能协作",
       "title": "Agent 工作台",
@@ -2196,7 +2257,7 @@
     "generationRuns": {
       "title": "生成记录",
       "description": "集中查看批量作业与单章正文运行。这里只展示运行元数据，正文和提示词保持私密。",
-      "backToEditor": "返回章节编辑",
+      "backToEditor": "返回自动成书",
       "refresh": "刷新",
       "refreshing": "正在刷新…",
       "loading": "正在读取生成记录…",

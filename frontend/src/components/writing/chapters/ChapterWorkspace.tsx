@@ -11,9 +11,6 @@ import type {
 } from "@/types/novel";
 import ChapterEditorPane, { type ChapterSaveState } from "./ChapterEditorPane";
 import ChapterNavigator from "./ChapterNavigator";
-import BatchGenerationPanel from "./batch/BatchGenerationPanel";
-import GenerationRunsWorkspace from "./batch/GenerationRunsWorkspace";
-import type { GenerationRunsNavigationTarget } from "./batch/batchTypes";
 import {
   chapterToDraft,
   clearLocalChapterDraft,
@@ -34,37 +31,35 @@ import SceneIllustrationPanel from "./SceneIllustrationPanel";
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
-  onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
-  onNavigateToReferenceCardCandidates: () => void;
-  onNavigateToPlotThreads: () => void;
   initialChapterId?: string;
   initialSceneIndex?: number;
-  generationRunsOpen?: boolean;
-  generationRunsTarget?: GenerationRunsNavigationTarget;
-  onOpenGenerationRuns: (target?: GenerationRunsNavigationTarget) => void;
-  onCloseGenerationRuns: () => void;
+  onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
+  proseOpenRequest?: ProseOpenRequest | null;
+  onProseOpenRequestConsumed: () => void;
+}
+
+export interface ProseOpenRequest {
+  requestId: number;
+  chapterId: string;
+  run: ProseRunSnapshot | null;
 }
 
 interface ListResponse<T> {
   data: T[];
 }
 
-type MobileChapterPane = "structure" | "editor" | "generation";
+type MobileChapterPane = "structure" | "editor";
 
 export default function ChapterWorkspace({
   mode,
   novelId,
-  onNavigateToMemory,
   onNavigateToReferenceCards,
-  onNavigateToReferenceCardCandidates,
-  onNavigateToPlotThreads,
   initialChapterId,
   initialSceneIndex,
-  generationRunsOpen = false,
-  generationRunsTarget = {},
-  onOpenGenerationRuns,
-  onCloseGenerationRuns,
+  onStartAutoBook,
+  proseOpenRequest,
+  onProseOpenRequestConsumed,
 }: ChapterWorkspaceProps) {
   const t = useTranslations("writing.chapterEditor");
   const tOutline = useTranslations("writing.outline");
@@ -101,13 +96,11 @@ export default function ChapterWorkspace({
     chapterId: string;
     run: ProseRunSnapshot | null;
   } | null>(null);
-  const [proseRunsRevision, setProseRunsRevision] = useState(0);
   const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
   const [stateAuditOpen, setStateAuditOpen] = useState(false);
   const [pendingStateRepairChapterId, setPendingStateRepairChapterId] =
     useState<string | null>(null);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
-  const [batchStartScope, setBatchStartScope] = useState<"volume" | "book" | null>(null);
   const [mobilePane, setMobilePane] =
     useState<MobileChapterPane>("editor");
 
@@ -115,6 +108,8 @@ export default function ChapterWorkspace({
   const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
   const loadSequenceRef = useRef(0);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const handledProseOpenRequestRef = useRef<number | null>(null);
+  const selectChapterRef = useRef<(chapterId: string) => void>(() => undefined);
 
   const wordCount = useMemo(
     () => countChapterWords(draft?.content ?? ""),
@@ -415,16 +410,34 @@ export default function ChapterWorkspace({
     selectedChapterIdRef.current = chapterId;
     setSelectedChapterId(chapterId);
   };
+  selectChapterRef.current = selectChapter;
 
-  const queueProsePanel = (
-    chapterId: string,
-    run: ProseRunSnapshot | null,
-  ) => {
-    if (selectedChapterIdRef.current !== chapterId) {
-      selectChapter(chapterId);
+  useEffect(() => {
+    if (
+      !proseOpenRequest
+      || handledProseOpenRequestRef.current === proseOpenRequest.requestId
+    ) {
+      return;
     }
-    setPendingProseOpen({ chapterId, run });
-  };
+    const timer = window.setTimeout(() => {
+      if (handledProseOpenRequestRef.current === proseOpenRequest.requestId) {
+        return;
+      }
+      handledProseOpenRequestRef.current = proseOpenRequest.requestId;
+      if (selectedChapterIdRef.current !== proseOpenRequest.chapterId) {
+        selectChapterRef.current(proseOpenRequest.chapterId);
+      }
+      setPendingProseOpen({
+        chapterId: proseOpenRequest.chapterId,
+        run: proseOpenRequest.run,
+      });
+      onProseOpenRequestConsumed();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [
+    onProseOpenRequestConsumed,
+    proseOpenRequest,
+  ]);
 
   useEffect(() => {
     if (
@@ -615,46 +628,18 @@ export default function ChapterWorkspace({
     );
   }
 
-  if (generationRunsOpen) {
-    return (
-      <GenerationRunsWorkspace
-        novelId={novelId}
-        chapters={chapters}
-        chaptersLoading={structureLoading}
-        volumes={volumes}
-        target={generationRunsTarget}
-        proseRunsRevision={proseRunsRevision}
-        onNavigate={onOpenGenerationRuns}
-        onClose={onCloseGenerationRuns}
-        onJumpToChapter={(chapterId) => {
-          onCloseGenerationRuns();
-          selectChapter(chapterId);
-        }}
-        onOpenProseRun={(run) => {
-          onCloseGenerationRuns();
-          queueProsePanel(run.chapter_id, run);
-        }}
-        onStartFreshProse={(chapterId) => {
-          onCloseGenerationRuns();
-          queueProsePanel(chapterId, null);
-        }}
-      />
-    );
-  }
-
   const mobilePaneLabels: Record<MobileChapterPane, string> = {
     structure: t("mobileStructure"),
     editor: t("mobileEditor"),
-    generation: t("mobileGeneration"),
   };
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
       <nav
         aria-label={t("mobilePaneNavigation")}
-        className="grid shrink-0 grid-cols-3 border-b border-border bg-surface p-1.5 md:hidden"
+        className="grid shrink-0 grid-cols-2 border-b border-border bg-surface p-1.5 md:hidden"
       >
-        {(["structure", "editor", "generation"] as const).map((pane) => (
+        {(["structure", "editor"] as const).map((pane) => (
           <button
             key={pane}
             type="button"
@@ -698,56 +683,21 @@ export default function ChapterWorkspace({
             onBulkDeleteChapters={bulkDeleteChapters}
             onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
             onStartVolumeJob={() => {
-              setBatchStartScope("volume");
-              setMobilePane("generation");
+              onStartAutoBook("volume", selectedVolumeId ?? undefined);
             }}
             onStartBookJob={() => {
-              setBatchStartScope("book");
-              setMobilePane("generation");
+              onStartAutoBook("book");
             }}
             onOpenStateAudit={() => setStateAuditOpen(true)}
           />
         </div>
         <div
           className={[
-            mobilePane === "structure" ? "hidden md:flex" : "flex",
+            mobilePane === "editor" ? "flex" : "hidden md:flex",
             "min-h-0 min-w-0 flex-1 flex-col",
           ].join(" ")}
         >
-          <div
-            className={[
-              mobilePane === "generation" ? "flex" : "hidden md:flex",
-              "min-h-0 flex-1 flex-col overflow-y-auto md:flex-none md:overflow-visible",
-            ].join(" ")}
-          >
-            <BatchGenerationPanel
-          novelId={novelId}
-          selectedVolumeId={selectedVolumeId}
-          volumes={volumes}
-          chapters={chapters}
-          startScope={batchStartScope}
-          onStartClose={() => setBatchStartScope(null)}
-          onJumpToChapter={selectChapter}
-          onQuietRefresh={() => void loadStructure({ silent: true })}
-          onNavigateToMemory={onNavigateToMemory}
-          onNavigateToReferenceCards={onNavigateToReferenceCards}
-          onNavigateToReferenceCardCandidates={
-            onNavigateToReferenceCardCandidates
-          }
-          onNavigateToPlotThreads={onNavigateToPlotThreads}
-          proseRunsRevision={proseRunsRevision}
-          onOpenProseRun={(run) => queueProsePanel(run.chapter_id, run)}
-          onStartFreshProse={(chapterId) => queueProsePanel(chapterId, null)}
-          onOpenGenerationRuns={onOpenGenerationRuns}
-        />
-          </div>
-          <div
-            className={[
-              mobilePane === "editor" ? "flex" : "hidden md:flex",
-              "min-h-0 flex-1 flex-col",
-            ].join(" ")}
-          >
-            <ChapterEditorPane
+          <ChapterEditorPane
           chapterId={selectedChapterId}
           draft={draft}
           wordCount={wordCount}
@@ -776,7 +726,6 @@ export default function ChapterWorkspace({
           hasContent={Boolean(draft?.content?.trim())}
           stateBackfillBlocked={stateBackfillBlocked}
         />
-          </div>
         </div>
       </div>
 
@@ -818,11 +767,8 @@ export default function ChapterWorkspace({
             setProseOpen(false);
             setPendingProseOpen(null);
             setInitialProseRun(null);
-            setProseRunsRevision((current) => current + 1);
           }}
-          onRunStateChanged={() => {
-            setProseRunsRevision((current) => current + 1);
-          }}
+          onRunStateChanged={() => undefined}
           onAccepted={(text, acceptanceState) => {
             // ProseRun accept 已以 mutation 原子写入正式正文；这里同步当前编辑器
             // 草稿，后续自动保存只会幂等写回同一份内容。不能立刻用 loadChapter
