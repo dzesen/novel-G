@@ -67,6 +67,44 @@ export type InvalidWritingTarget =
       value: string;
     };
 
+export type WritingTargetValidationSource = "target" | "chapter-volume";
+
+export type LocatedTargetFailure = Extract<
+  InvalidWritingTarget,
+  { kind: "target" }
+> & {
+  routeContext: string;
+  source: WritingTargetValidationSource;
+};
+
+export interface LocatedTargetValidation {
+  key: WritingTargetKey;
+  value: string;
+  valid: boolean;
+  routeContext: string;
+  source: WritingTargetValidationSource;
+}
+
+export function reduceLocatedTargetFailure(
+  current: LocatedTargetFailure | null,
+  validation: LocatedTargetValidation,
+): LocatedTargetFailure | null {
+  const sameValidation =
+    current?.key === validation.key &&
+    current.value === validation.value &&
+    current.routeContext === validation.routeContext &&
+    current.source === validation.source;
+  if (validation.valid) return sameValidation ? null : current;
+  if (sameValidation) return current;
+  return {
+    kind: "target",
+    key: validation.key,
+    value: validation.value,
+    routeContext: validation.routeContext,
+    source: validation.source,
+  };
+}
+
 export interface ResolvedWritingRoute {
   route: WritingRoute;
   source: "canonical" | "legacy" | "default";

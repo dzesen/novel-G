@@ -9,11 +9,14 @@ import {
   buildViewSearch,
   defaultWritingRoute,
   legacyWritingRouteSignal,
+  reduceLocatedTargetFailure,
   resolveWritingRoute,
   type InvalidWritingTarget,
+  type LocatedTargetFailure,
   type WritingArea,
   type WritingRouteTargets,
   type WritingTargetKey,
+  type WritingTargetValidationSource,
   type WritingView,
 } from "@/lib/writingRoute";
 import { buildUserStorageKey } from "@/lib/userStorage";
@@ -143,11 +146,8 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   const [loadedNovelId, setLoadedNovelId] = useState<string | null>(null);
   const [novelLoadFailed, setNovelLoadFailed] = useState(false);
   const [novelLoadRevision, setNovelLoadRevision] = useState(0);
-  const [locatedTargetFailure, setLocatedTargetFailure] = useState<
-    (Extract<InvalidWritingTarget, { kind: "target" }> & {
-      routeContext: string;
-    }) | null
-  >(null);
+  const [locatedTargetFailure, setLocatedTargetFailure] =
+    useState<LocatedTargetFailure | null>(null);
   const [autoBookStartRequest, setAutoBookStartRequest] =
     useState<AutoBookStartRequest | null>(null);
   const [proseOpenRequest, setProseOpenRequest] =
@@ -302,29 +302,21 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     setNovelLoadRevision((current) => current + 1);
   }, []);
   const validateLocatedTarget = useCallback(
-    (key: WritingTargetKey, value: string, valid: boolean) => {
-      setLocatedTargetFailure((current) => {
-        if (valid) {
-          return current?.key === key &&
-            current.value === value &&
-            current.routeContext === routeValidationContext
-            ? null
-            : current;
-        }
-        if (
-          current?.key === key &&
-          current.value === value &&
-          current.routeContext === routeValidationContext
-        ) {
-          return current;
-        }
-        return {
-          kind: "target",
+    (
+      key: WritingTargetKey,
+      value: string,
+      valid: boolean,
+      source: WritingTargetValidationSource = "target",
+    ) => {
+      setLocatedTargetFailure((current) =>
+        reduceLocatedTargetFailure(current, {
           key,
           value,
+          valid,
           routeContext: routeValidationContext,
-        };
-      });
+          source,
+        }),
+      );
     },
     [routeValidationContext],
   );

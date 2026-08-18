@@ -6,6 +6,7 @@ import { ApiError, apiGet } from "@/lib/api";
 import type {
   WritingRouteTargets,
   WritingTargetKey,
+  WritingTargetValidationSource,
   WritingView,
 } from "@/lib/writingRoute";
 import type { ChapterDetail, VolumeSummary } from "@/types/novel";
@@ -33,6 +34,7 @@ interface ContinuityWorkspaceProps {
     key: WritingTargetKey,
     value: string,
     valid: boolean,
+    source?: WritingTargetValidationSource,
   ) => void;
 }
 
@@ -160,7 +162,12 @@ export default function ContinuityWorkspace({
 
   useEffect(() => {
     if (!targets.chapter || chapterMatchesVolume === null) return;
-    onTargetValidation("chapter", targets.chapter, chapterMatchesVolume);
+    onTargetValidation(
+      "chapter",
+      targets.chapter,
+      chapterMatchesVolume,
+      "chapter-volume",
+    );
   }, [chapterMatchesVolume, onTargetValidation, targets.chapter]);
 
   const tabs: WorkspaceViewTab[] = useMemo(
