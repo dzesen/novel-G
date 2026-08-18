@@ -252,7 +252,12 @@ export default function ContinuityWorkspace({
           }
           onLocate={(chapterId, repair) => {
             if (repair) {
-              onNavigateView("proposals", { chapter: chapterId });
+              onNavigateView("proposals", {
+                chapter: chapterId,
+                issue: undefined,
+                run: undefined,
+                suggestion: undefined,
+              });
             } else {
               onOpenWriting(chapterId);
             }
@@ -313,7 +318,17 @@ export default function ContinuityWorkspace({
           chapterId={targetChapter._id}
           chapterLabel={targetChapter.title}
           closeLabel={continuityT("backToStateIssues")}
-          onClose={() => onNavigateView("state-issues", {}, true)}
+          onClose={() =>
+            onNavigateView(
+              "state-issues",
+              {
+                issue: undefined,
+                run: undefined,
+                suggestion: undefined,
+              },
+              true,
+            )
+          }
           onAccepted={() => undefined}
         />
       );

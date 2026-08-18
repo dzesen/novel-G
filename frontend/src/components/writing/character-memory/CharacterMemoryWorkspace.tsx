@@ -188,7 +188,11 @@ export default function CharacterMemoryWorkspace({
           </button>
         </div>
       )}
-      {loaded && !error && states.length === 0 && initialCardId && cardIds.includes(initialCardId) && (
+      {loaded &&
+        !error &&
+        initialCardId &&
+        cardIds.includes(initialCardId) &&
+        !states.some((state) => state.card_id === initialCardId) && (
         <section
           id={`character-state-empty-${initialCardId}`}
           className="rounded-lg border border-accent bg-surface p-4 ring-2 ring-accent/20"
@@ -202,7 +206,7 @@ export default function CharacterMemoryWorkspace({
             {t("targetEmptyBody")}
           </p>
         </section>
-      )}
+        )}
       {loaded && !error && states.length === 0 && (!initialCardId || !cardIds.includes(initialCardId)) && (
         <div className="text-sm text-muted">{t("empty")}</div>
       )}

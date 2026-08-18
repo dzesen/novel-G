@@ -442,7 +442,12 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
               })
             }
             onOpenStateProposal={(chapterId) =>
-              navigateView("continuity", "proposals", { chapter: chapterId })
+              navigateView("continuity", "proposals", {
+                chapter: chapterId,
+                issue: undefined,
+                run: undefined,
+                suggestion: undefined,
+              })
             }
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
