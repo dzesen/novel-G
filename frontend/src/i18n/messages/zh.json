@@ -1945,6 +1945,8 @@
       "dialogStart": "启动",
       "dialogStarting": "启动中…",
       "dialogCancel": "取消",
+      "jobLookupFailed": "未能读取指定的生成作业。为避免误操作其他作业，当前不会自动切换到最近任务。",
+      "retry": "重试",
       "resumeReadinessTitle": "继续生成前重新确认",
       "resumeReadinessDescription": "拟议的 token 预算或授权版本需要重新确认。下面的检查只读取当前状态，不会调用模型；确认后才会继续生成。",
       "resumeReadinessCurrentUsage": "当前已用 {used} token，另有 {reserved} token 已预留",
@@ -2419,8 +2421,12 @@
         "source": "来自第 {order} 章《{title}》",
         "status": {
           "pending": "待决定",
-          "deferred": "已暂缓"
+          "deferred": "已暂缓",
+          "ignored": "已忽略",
+          "resolved": "已处理",
+          "superseded": "已被后续候选替代"
         },
+        "resolvedReadOnly": "这条候选仍保留为审计记录，但已经退出待审核队列，不能再次应用决定。",
         "noDescription": "章纲只确认了名称，暂无更多事实。",
         "decisionLabel": "本条处理方式",
         "decisionFor": "处理候选“{name}”",

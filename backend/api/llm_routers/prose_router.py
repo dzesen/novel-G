@@ -316,6 +316,23 @@ async def list_prose_run_telemetry(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/prose-runs/{run_id}/telemetry")
+async def inspect_prose_run_telemetry(run_id: str, request: Request):
+    """Inspect one owned prose run even when it is outside the list window."""
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await prose_run_module.inspect_telemetry(
+            owner_id=str(actor.id),
+            run_id=run_id,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get(
     "/prose-runs/novel/{novel_id}/leftovers",
     dependencies=[Depends(require_owned_path_resource)],

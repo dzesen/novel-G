@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
-import { apiGet, apiPost } from "@/lib/api";
+import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
   type GenerationJob,
@@ -22,6 +22,8 @@ import LeftoverProseRuns from "./LeftoverProseRuns";
 
 interface BatchGenerationPanelProps {
   novelId: string;
+  initialJobId?: string;
+  onJobTargetValidation: (jobId: string, valid: boolean) => void;
   selectedVolumeId: string | null;
   volumes: VolumeSummary[];
   chapters: ChapterSummary[];
@@ -41,6 +43,8 @@ interface BatchGenerationPanelProps {
 
 export default function BatchGenerationPanel({
   novelId,
+  initialJobId,
+  onJobTargetValidation,
   selectedVolumeId,
   volumes,
   chapters,
@@ -64,25 +68,59 @@ export default function BatchGenerationPanel({
   const [abortConfirm, setAbortConfirm] = useState(false);
   const [resumeReviewOpen, setResumeReviewOpen] = useState(false);
   const [dismissed, setDismissed] = useState<string | null>(null); // 已关闭的终态作业 id
+  const [jobLookupError, setJobLookupError] = useState("");
+  const [jobLookupRevision, setJobLookupRevision] = useState(0);
 
 
-  // 发现：挂载时列小说作业，收养最近的非终态作业（设计 §5.1）。
+  // 精确 job 深链优先；只有 URL 没指定 job 时才收养最近的非终态作业。
   useEffect(() => {
     let cancelled = false;
+    setJob(null);
+    setDismissed(null);
+    setJobLookupError("");
     void (async () => {
       try {
+        if (initialJobId) {
+          const requested = await apiGet<GenerationJob>(
+            `/api/generation-jobs/${encodeURIComponent(initialJobId)}`,
+          );
+          if (cancelled) return;
+          const valid = requested._id === initialJobId
+            && requested.novel_id === novelId;
+          onJobTargetValidation(initialJobId, valid);
+          if (valid) setJob(requested);
+          return;
+        }
         const jobs = await apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`);
         if (cancelled) return;
         const adopted = jobs
           .filter((j) => !isTerminal(j.status))
           .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
         if (adopted) setJob(adopted);
-      } catch {
-        // 发现失败不致命：仍可手动启动；重新挂载再试。
+      } catch (reason) {
+        if (cancelled) return;
+        if (
+          initialJobId
+          && reason instanceof ApiError
+          && [400, 404].includes(reason.status)
+        ) {
+          onJobTargetValidation(initialJobId, false);
+        } else {
+          setJobLookupError(
+            reason instanceof Error ? reason.message : t("jobLookupFailed"),
+          );
+        }
       }
     })();
     return () => { cancelled = true; };
-  }, [novelId, setJob]);
+  }, [
+    initialJobId,
+    jobLookupRevision,
+    novelId,
+    onJobTargetValidation,
+    setJob,
+    t,
+  ]);
 
   const chapterById = useMemo(() => new Map(chapters.map((c) => [c._id, c])), [chapters]);
   const titleForChapter = (id: string) => chapterById.get(id)?.title ?? id;
@@ -188,6 +226,18 @@ export default function BatchGenerationPanel({
       </button>
     </div>
   );
+  const jobLookupAlert = jobLookupError ? (
+    <div role="alert" className="m-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
+      <span className="min-w-0">{jobLookupError}</span>
+      <button
+        type="button"
+        onClick={() => setJobLookupRevision((current) => current + 1)}
+        className="shrink-0 text-xs font-medium underline underline-offset-2"
+      >
+        {t("retry")}
+      </button>
+    </div>
+  ) : null;
 
   const leftoverPanel = (
     <LeftoverProseRuns
@@ -210,6 +260,7 @@ export default function BatchGenerationPanel({
       <>
         {dialog}
         {resumeDialog}
+        {jobLookupAlert}
         {leftoverPanel}
         {generationRunsEntry}
       </>
@@ -231,6 +282,7 @@ export default function BatchGenerationPanel({
     <>
       {dialog}
       {resumeDialog}
+      {jobLookupAlert}
       {leftoverPanel}
       {!isResumable(job.status) && generationRunsEntry}
 

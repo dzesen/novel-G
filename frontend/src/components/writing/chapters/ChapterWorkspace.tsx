@@ -2,7 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
-import { apiDelete, apiDownload, apiGet, apiPost, apiPut } from "@/lib/api";
+import {
+  ApiError,
+  apiDelete,
+  apiDownload,
+  apiGet,
+  apiPost,
+  apiPut,
+} from "@/lib/api";
 import type {
   ChapterDetail,
   ChapterDraft,
@@ -33,12 +40,16 @@ interface ChapterWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
   onNavigateToReferenceCards: () => void;
+  initialVolumeId?: string;
   initialChapterId?: string;
   initialSceneIndex?: number;
   initialRunId?: string;
   onChapterTargetChange: (chapterId: string) => void;
+  onVolumeTargetValidation: (volumeId: string, valid: boolean) => void;
   onChapterTargetValidation: (chapterId: string, valid: boolean) => void;
+  onSceneTargetValidation: (sceneIndex: number, valid: boolean) => void;
   onRunTargetValidation: (runId: string, valid: boolean) => void;
+  onRunTargetChange: (runId?: string) => void;
   onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
@@ -54,18 +65,28 @@ interface ListResponse<T> {
   data: T[];
 }
 
+interface ProseRunLocator {
+  run_id: string;
+  novel_id: string;
+  chapter_id: string;
+}
+
 type MobileChapterPane = "structure" | "editor";
 
 export default function ChapterWorkspace({
   mode,
   novelId,
   onNavigateToReferenceCards,
+  initialVolumeId,
   initialChapterId,
   initialSceneIndex,
   initialRunId,
   onChapterTargetChange,
+  onVolumeTargetValidation,
   onChapterTargetValidation,
+  onSceneTargetValidation,
   onRunTargetValidation,
+  onRunTargetChange,
   onStartAutoBook,
   proseOpenRequest,
   onProseOpenRequestConsumed,
@@ -95,6 +116,7 @@ export default function ChapterWorkspace({
   const [structureNotice, setStructureNotice] = useState("");
   const [chapterLoading, setChapterLoading] = useState(false);
   const [chapterLoadError, setChapterLoadError] = useState(false);
+  const [loadedChapterId, setLoadedChapterId] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<ChapterSaveState>("idle");
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
@@ -117,15 +139,17 @@ export default function ChapterWorkspace({
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
+  const initialVolumeIdRef = useRef(initialVolumeId);
   const initialChapterIdRef = useRef(initialChapterId);
   const loadSequenceRef = useRef(0);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const handledProseOpenRequestRef = useRef<number | null>(null);
-  const handledInitialRunIdRef = useRef<string | null>(null);
+  const handledInitialRunKeyRef = useRef<string | null>(null);
   const selectChapterRef = useRef<
     (chapterId: string, updateRoute?: boolean) => void
   >(() => undefined);
 
+  initialVolumeIdRef.current = initialVolumeId;
   initialChapterIdRef.current = initialChapterId;
 
   const wordCount = useMemo(
@@ -153,10 +177,21 @@ export default function ChapterWorkspace({
       setVolumeTrash(volumeTrashResponse.data);
       setChapters(nextChapters);
       setTrash(trashResponse.data);
+      const requestedVolumeId = initialVolumeIdRef.current;
+      const requestedVolume = requestedVolumeId
+        ? nextVolumes.find((volume) => volume._id === requestedVolumeId)
+        : undefined;
       const requestedChapterId = initialChapterIdRef.current;
       const requestedChapter = requestedChapterId
         ? nextChapters.find((chapter) => chapter._id === requestedChapterId)
         : undefined;
+      const requestedVolumeValid = Boolean(
+        requestedVolume
+        && (!requestedChapter || requestedChapter.volume_id === requestedVolumeId),
+      );
+      if (requestedVolumeId) {
+        onVolumeTargetValidation(requestedVolumeId, requestedVolumeValid);
+      }
       if (requestedChapterId) {
         onChapterTargetValidation(requestedChapterId, Boolean(requestedChapter));
       }
@@ -165,23 +200,37 @@ export default function ChapterWorkspace({
       );
       const nextSelectedChapter = requestedChapterId
         ? requestedChapter ?? null
-        : currentChapter ?? nextChapters[0] ?? null;
+        : requestedVolumeId
+          ? requestedVolumeValid
+            ? nextChapters.find(
+                (chapter) => chapter.volume_id === requestedVolumeId,
+              ) ?? null
+            : null
+          : currentChapter ?? nextChapters[0] ?? null;
       selectedChapterIdRef.current = nextSelectedChapter?._id ?? null;
       setSelectedChapterId(nextSelectedChapter?._id ?? null);
       setSelectedVolumeId(
-        nextSelectedChapter?.volume_id ?? nextVolumes[0]?._id ?? null,
+        requestedVolumeValid
+          ? requestedVolumeId ?? null
+          : nextSelectedChapter?.volume_id ?? nextVolumes[0]?._id ?? null,
       );
     } catch (error) {
       if (!opts?.silent) setStructureError(error instanceof Error ? error.message : t("loadFailed"));
     } finally {
       if (!opts?.silent) setStructureLoading(false);
     }
-  }, [novelId, onChapterTargetValidation, t]);
+  }, [
+    novelId,
+    onChapterTargetValidation,
+    onVolumeTargetValidation,
+    t,
+  ]);
 
   const loadChapter = useCallback(async (chapterId: string) => {
     const sequence = ++loadSequenceRef.current;
     setChapterLoading(true);
     setChapterLoadError(false);
+    setLoadedChapterId(null);
     try {
       const chapter = await apiGet<ChapterDetail>(`/api/chapters/${chapterId}`);
       if (sequence !== loadSequenceRef.current) return;
@@ -192,11 +241,13 @@ export default function ChapterWorkspace({
       setUpdatedAt(chapter.updated_at);
       setSaveState(localDraft ? "dirty" : "idle");
       setSelectedVolumeId(chapter.volume_id);
+      setLoadedChapterId(chapterId);
     } catch {
       if (sequence === loadSequenceRef.current) {
         setChapterLoadError(true);
         setDraft(null);
         setChapterOutline(undefined);
+        setLoadedChapterId(null);
       }
     } finally {
       if (sequence === loadSequenceRef.current) {
@@ -236,39 +287,61 @@ export default function ChapterWorkspace({
 
   useEffect(() => {
     if (structureLoading || structureLoadedNovelId !== novelId) return;
-    if (initialChapterId) {
-      const exists = chapters.some(
-        (chapter) => chapter._id === initialChapterId,
+    const requestedVolume = initialVolumeId
+      ? volumes.find((volume) => volume._id === initialVolumeId)
+      : undefined;
+    const requestedChapter = initialChapterId
+      ? chapters.find((chapter) => chapter._id === initialChapterId)
+      : undefined;
+    if (initialVolumeId) {
+      const valid = Boolean(
+        requestedVolume
+        && (!requestedChapter || requestedChapter.volume_id === initialVolumeId),
       );
+      onVolumeTargetValidation(initialVolumeId, valid);
+      if (!valid) return;
+    }
+    if (initialChapterId) {
+      const exists = Boolean(requestedChapter);
       onChapterTargetValidation(initialChapterId, exists);
       if (exists && selectedChapterIdRef.current !== initialChapterId) {
         selectChapterRef.current(initialChapterId, false);
       }
       return;
     }
-    const firstChapterId = chapters[0]?._id;
+    const firstChapterId = initialVolumeId
+      ? chapters.find((chapter) => chapter.volume_id === initialVolumeId)?._id
+      : chapters[0]?._id;
+    if (initialVolumeId) setSelectedVolumeId(initialVolumeId);
     if (firstChapterId && selectedChapterIdRef.current !== firstChapterId) {
       selectChapterRef.current(firstChapterId, false);
+    } else if (!firstChapterId && selectedChapterIdRef.current !== null) {
+      selectedChapterIdRef.current = null;
+      setSelectedChapterId(null);
     }
   }, [
     chapters,
     initialChapterId,
+    initialVolumeId,
     onChapterTargetValidation,
+    onVolumeTargetValidation,
     novelId,
     structureLoadedNovelId,
     structureLoading,
+    volumes,
   ]);
 
   useEffect(() => {
     if (!initialRunId) {
-      handledInitialRunIdRef.current = null;
+      handledInitialRunKeyRef.current = null;
       return;
     }
+    const runLookupKey = `${initialChapterId ?? ""}:${initialRunId}`;
     if (
       !initialChapterId ||
       !novelId ||
       structureLoadedNovelId !== novelId ||
-      handledInitialRunIdRef.current === initialRunId
+      handledInitialRunKeyRef.current === runLookupKey
     ) {
       return;
     }
@@ -279,31 +352,46 @@ export default function ChapterWorkspace({
       suppliedRunId === initialRunId &&
       proseOpenRequest?.chapterId === initialChapterId
     ) {
-      handledInitialRunIdRef.current = initialRunId;
+      handledInitialRunKeyRef.current = runLookupKey;
       onRunTargetValidation(initialRunId, true);
       return;
     }
 
     let cancelled = false;
-    void apiGet<LeftoverProseRun[]>(
-      `/api/llm/prose-runs/novel/${novelId}/leftovers`,
-    )
-      .then((runs) => {
-        if (cancelled) return;
-        const run = runs.find(
-          (item) =>
-            (item.run_id === initialRunId || item._id === initialRunId) &&
-            item.chapter_id === initialChapterId,
-        );
-        handledInitialRunIdRef.current = initialRunId;
-        onRunTargetValidation(initialRunId, Boolean(run));
-        if (run) {
-          setPendingProseOpen({ chapterId: initialChapterId, run });
+    void Promise.allSettled([
+      apiGet<ProseRunLocator>(
+        `/api/llm/prose-runs/${encodeURIComponent(initialRunId)}/telemetry`,
+      ),
+      apiGet<LeftoverProseRun[]>(
+        `/api/llm/prose-runs/novel/${novelId}/leftovers`,
+      ),
+    ]).then(([locatorResult, leftoversResult]) => {
+      if (cancelled) return;
+      if (locatorResult.status === "rejected") {
+        if (
+          locatorResult.reason instanceof ApiError
+          && [400, 404].includes(locatorResult.reason.status)
+        ) {
+          handledInitialRunKeyRef.current = runLookupKey;
+          onRunTargetValidation(initialRunId, false);
         }
-      })
-      .catch(() => {
-        // 查询失败不是“目标不存在”；保留章节界面供用户重试，而不伪造归属结论。
-      });
+        // 其他读取失败不是“目标不存在”；保留章节界面供用户刷新重试。
+        return;
+      }
+      const locator = locatorResult.value;
+      const valid = locator.novel_id === novelId
+        && locator.chapter_id === initialChapterId
+        && locator.run_id === initialRunId;
+      handledInitialRunKeyRef.current = runLookupKey;
+      onRunTargetValidation(initialRunId, valid);
+      if (!valid || leftoversResult.status !== "fulfilled") return;
+      const run = leftoversResult.value.find(
+        (item) =>
+          (item.run_id === initialRunId || item._id === initialRunId)
+          && item.chapter_id === initialChapterId,
+      );
+      if (run) setPendingProseOpen({ chapterId: initialChapterId, run });
+    });
     return () => {
       cancelled = true;
     };
@@ -317,18 +405,23 @@ export default function ChapterWorkspace({
   ]);
 
   useEffect(() => {
-    if (
-      initialSceneIndex == null ||
-      !initialChapterId ||
-      !chapterOutline?.scenes?.[initialSceneIndex]
-    ) {
-      return;
-    }
+    if (initialSceneIndex == null || !initialChapterId) return;
+    if (loadedChapterId !== initialChapterId) return;
+    const valid = Boolean(chapterOutline?.scenes?.[initialSceneIndex]);
+    onSceneTargetValidation(initialSceneIndex, valid);
+    if (!valid) return;
     setChapterOutlineOpen(true);
     setStructureNotice(
       t("evidenceSceneLocated", { scene: initialSceneIndex + 1 }),
     );
-  }, [chapterOutline, initialChapterId, initialSceneIndex, t]);
+  }, [
+    chapterOutline,
+    initialChapterId,
+    initialSceneIndex,
+    loadedChapterId,
+    onSceneTargetValidation,
+    t,
+  ]);
 
   useEffect(() => {
     selectedChapterIdRef.current = selectedChapterId;
@@ -336,6 +429,7 @@ export default function ChapterWorkspace({
       void loadChapter(selectedChapterId);
     } else {
       setDraft(null);
+      setLoadedChapterId(null);
       setUpdatedAt(undefined);
       setSaveState("idle");
     }
@@ -879,7 +973,7 @@ export default function ChapterWorkspace({
             setPendingProseOpen(null);
             setInitialProseRun(null);
           }}
-          onRunStateChanged={() => undefined}
+          onRunStateChanged={() => onRunTargetChange(undefined)}
           onAccepted={(text, acceptanceState) => {
             // ProseRun accept 已以 mutation 原子写入正式正文；这里同步当前编辑器
             // 草稿，后续自动保存只会幂等写回同一份内容。不能立刻用 loadChapter

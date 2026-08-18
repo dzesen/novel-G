@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { apiGet } from "@/lib/api";
 import type {
@@ -80,52 +80,72 @@ export default function AutoBookWorkspace({
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [structureLoadedNovelId, setStructureLoadedNovelId] =
+    useState<string | null>(null);
   const [selectedVolumeId, setSelectedVolumeId] = useState<string | null>(
     targets.volume ?? null,
   );
   const [startScope, setStartScope] = useState<"volume" | "book" | null>(null);
   const [proseRunsRevision, setProseRunsRevision] = useState(0);
+  const structureRequestRef = useRef(0);
 
   const loadStructure = useCallback(async (silent = false) => {
-    if (!silent) setLoading(true);
+    const requestId = ++structureRequestRef.current;
+    if (!silent) {
+      setLoading(true);
+      setStructureLoadedNovelId(null);
+    }
     setLoadError("");
     try {
       const [volumeResponse, chapterResponse] = await Promise.all([
         apiGet<ListResponse<VolumeSummary>>(`/api/volumes/novel/${novelId}`),
         apiGet<ListResponse<ChapterSummary>>(`/api/chapters/novel/${novelId}`),
       ]);
+      if (requestId !== structureRequestRef.current) return;
       setVolumes(volumeResponse.data);
       setChapters(chapterResponse.data);
-      const requestedVolumeId = targets.volume;
-      const requestedVolumeValid = requestedVolumeId
-        ? volumeResponse.data.some((item) => item._id === requestedVolumeId)
-        : false;
-      if (requestedVolumeId) {
-        onTargetValidation(
-          "volume",
-          requestedVolumeId,
-          requestedVolumeValid,
-        );
-      }
+      setStructureLoadedNovelId(novelId);
       setSelectedVolumeId((current) => {
-        if (requestedVolumeId) {
-          return requestedVolumeValid ? requestedVolumeId : null;
-        }
         if (current && volumeResponse.data.some((item) => item._id === current)) {
           return current;
         }
         return volumeResponse.data[0]?._id ?? null;
       });
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : t("loadFailed"));
+      if (requestId === structureRequestRef.current) {
+        setLoadError(error instanceof Error ? error.message : t("loadFailed"));
+      }
     } finally {
-      if (!silent) setLoading(false);
+      if (requestId === structureRequestRef.current && !silent) {
+        setLoading(false);
+      }
     }
-  }, [novelId, onTargetValidation, t, targets.volume]);
+  }, [novelId, t]);
 
   useEffect(() => {
     void loadStructure();
   }, [loadStructure]);
+
+  useEffect(() => {
+    if (structureLoadedNovelId !== novelId) return;
+    const requestedVolumeId = targets.volume;
+    if (requestedVolumeId) {
+      const valid = volumes.some((item) => item._id === requestedVolumeId);
+      onTargetValidation("volume", requestedVolumeId, valid);
+      setSelectedVolumeId(valid ? requestedVolumeId : null);
+      return;
+    }
+    setSelectedVolumeId((current) => {
+      if (current && volumes.some((item) => item._id === current)) return current;
+      return volumes[0]?._id ?? null;
+    });
+  }, [
+    novelId,
+    onTargetValidation,
+    structureLoadedNovelId,
+    targets.volume,
+    volumes,
+  ]);
 
   useEffect(() => {
     if (!startRequest) return;
@@ -140,6 +160,11 @@ export default function AutoBookWorkspace({
     eventId: targets.event,
     runId: targets.run,
   };
+  const validateJobTarget = useCallback(
+    (jobId: string, valid: boolean) =>
+      onTargetValidation("job", jobId, valid),
+    [onTargetValidation],
+  );
 
   if (view === "generation-runs" || view === "diagnostics") {
     return (
@@ -147,9 +172,12 @@ export default function AutoBookWorkspace({
         novelId={novelId}
         chapters={chapters}
         chaptersLoading={loading}
+        chaptersError={loadError}
+        onRetryChapters={() => void loadStructure()}
         volumes={volumes}
         target={generationTarget}
         proseRunsRevision={proseRunsRevision}
+        onTargetValidation={onTargetValidation}
         onNavigate={(target) =>
           onNavigateView(
             view,
@@ -278,7 +306,10 @@ export default function AutoBookWorkspace({
 
         <section className="min-w-0 border-t border-border" aria-label={t("operationAria")}>
           <BatchGenerationPanel
+            key={`${novelId}:${targets.job ?? "latest"}`}
             novelId={novelId}
+            initialJobId={targets.job}
+            onJobTargetValidation={validateJobTarget}
             selectedVolumeId={selectedVolumeId}
             volumes={volumes}
             chapters={chapters}

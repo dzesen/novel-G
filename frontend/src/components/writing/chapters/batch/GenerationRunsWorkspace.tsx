@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
-import { apiGet, apiPost } from "@/lib/api";
+import { ApiError, apiGet, apiPost } from "@/lib/api";
+import type { WritingTargetKey } from "@/lib/writingRoute";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
   type GenerationDiagnostic,
@@ -104,9 +105,16 @@ interface GenerationRunsWorkspaceProps {
   novelId: string;
   chapters: ChapterSummary[];
   chaptersLoading: boolean;
+  chaptersError: string;
+  onRetryChapters: () => void;
   volumes: VolumeSummary[];
   target: GenerationRunsNavigationTarget;
   proseRunsRevision: number;
+  onTargetValidation: (
+    key: WritingTargetKey,
+    value: string,
+    valid: boolean,
+  ) => void;
   onNavigate: (target: GenerationRunsNavigationTarget) => void;
   onClose: () => void;
   onJumpToChapter: (chapterId: string) => void;
@@ -308,9 +316,12 @@ export default function GenerationRunsWorkspace({
   novelId,
   chapters,
   chaptersLoading,
+  chaptersError,
+  onRetryChapters,
   volumes,
   target,
   proseRunsRevision,
+  onTargetValidation,
   onNavigate,
   onClose,
   onJumpToChapter,
@@ -322,6 +333,7 @@ export default function GenerationRunsWorkspace({
   const tProse = useTranslations("writing.prose");
   const locale = useLocale();
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const loadRequestRef = useRef(0);
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
   const [diagnostics, setDiagnostics] =
     useState<GenerationDiagnosticsSummary | null>(null);
@@ -331,6 +343,13 @@ export default function GenerationRunsWorkspace({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
+  const [exactRunLookup, setExactRunLookup] = useState<{
+    requestedId: string | null;
+    run: ProseRunTelemetry | null;
+    loading: boolean;
+    error: string | null;
+  }>({ requestedId: null, run: null, loading: false, error: null });
+  const [exactRunLookupRevision, setExactRunLookupRevision] = useState(0);
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>("all");
   const [statusFilter, setStatusFilter] = useState("all");
   const [providerFilter, setProviderFilter] = useState("all");
@@ -353,6 +372,7 @@ export default function GenerationRunsWorkspace({
   };
 
   const load = useCallback(async (initial = false) => {
+    const requestId = ++loadRequestRef.current;
     if (initial) setLoading(true);
     else setRefreshing(true);
     setLoadError(null);
@@ -368,6 +388,7 @@ export default function GenerationRunsWorkspace({
         `/api/llm/prose-runs/novel/${novelId}/telemetry?limit=100`,
       ),
     ]);
+    if (requestId !== loadRequestRef.current) return;
 
     if (jobsResult.status === "fulfilled") {
       setJobs(jobsResult.value);
@@ -391,6 +412,68 @@ export default function GenerationRunsWorkspace({
   useEffect(() => {
     void load(true);
   }, [load, proseRunsRevision]);
+
+  useEffect(() => {
+    const runId = target.runId;
+    if (!runId) {
+      setExactRunLookup({
+        requestedId: null,
+        run: null,
+        loading: false,
+        error: null,
+      });
+      return;
+    }
+
+    let cancelled = false;
+    setExactRunLookup({
+      requestedId: runId,
+      run: null,
+      loading: true,
+      error: null,
+    });
+    void apiGet<ProseRunTelemetry>(
+      `/api/llm/prose-runs/${encodeURIComponent(runId)}/telemetry`,
+    ).then((run) => {
+      if (cancelled) return;
+      const valid = run.run_id === runId
+        && run.novel_id === novelId
+        && (!target.chapterId || run.chapter_id === target.chapterId);
+      onTargetValidation("run", runId, valid);
+      setExactRunLookup({
+        requestedId: runId,
+        run: valid ? run : null,
+        loading: false,
+        error: null,
+      });
+    }).catch((error: unknown) => {
+      if (cancelled) return;
+      if (error instanceof ApiError && [400, 404].includes(error.status)) {
+        onTargetValidation("run", runId, false);
+        setExactRunLookup({
+          requestedId: runId,
+          run: null,
+          loading: false,
+          error: null,
+        });
+        return;
+      }
+      setExactRunLookup({
+        requestedId: runId,
+        run: null,
+        loading: false,
+        error: t("telemetryLoadError"),
+      });
+    });
+    return () => { cancelled = true; };
+  }, [
+    exactRunLookupRevision,
+    novelId,
+    onTargetValidation,
+    t,
+    target.chapterId,
+    target.runId,
+  ]);
 
   useEffect(() => {
     headingRef.current?.focus();
@@ -462,8 +545,12 @@ export default function GenerationRunsWorkspace({
   const selectedChapter = target.chapterId
     ? chapters.find((chapter) => chapter._id === target.chapterId) ?? null
     : null;
+  const exactRun = target.runId
+    && exactRunLookup.requestedId === target.runId
+    ? exactRunLookup.run
+    : null;
   const selectedRun = target.runId
-    ? proseRuns.find((run) => run.run_id === target.runId) ?? null
+    ? exactRun ?? proseRuns.find((run) => run.run_id === target.runId) ?? null
     : null;
   const selectedTelemetry = target.runId
     ? selectedRun
@@ -481,17 +568,38 @@ export default function GenerationRunsWorkspace({
       (event, index) => eventLocator(selectedJob._id, event, index) === target.eventId,
     ) ?? null;
   }, [selectedJob, target.eventId]);
-  const targetsReady = !loading && !chaptersLoading && !loadError;
-  const missingJob = Boolean(target.jobId) && targetsReady && selectedJob === null;
-  const missingChapter = Boolean(target.chapterId) && targetsReady && selectedChapter === null;
-  const missingEvent = Boolean(target.eventId)
-    && targetsReady
-    && Boolean(selectedJob)
-    && selectedEvent === null;
-  const missingRun = Boolean(target.runId)
-    && targetsReady
-    && !telemetryError
-    && selectedRun === null;
+  const missingJob = Boolean(target.jobId)
+    && !loading
+    && !loadError
+    && selectedJob === null;
+
+  useEffect(() => {
+    if (!target.jobId || loading || loadError) return;
+    onTargetValidation("job", target.jobId, selectedJob !== null);
+  }, [loadError, loading, onTargetValidation, selectedJob, target.jobId]);
+
+  useEffect(() => {
+    if (!target.chapterId || chaptersLoading || chaptersError) return;
+    onTargetValidation("chapter", target.chapterId, selectedChapter !== null);
+  }, [
+    chaptersError,
+    chaptersLoading,
+    onTargetValidation,
+    selectedChapter,
+    target.chapterId,
+  ]);
+
+  useEffect(() => {
+    if (!target.eventId || loading || loadError || !selectedJob) return;
+    onTargetValidation("event", target.eventId, selectedEvent !== null);
+  }, [
+    loadError,
+    loading,
+    onTargetValidation,
+    selectedEvent,
+    selectedJob,
+    target.eventId,
+  ]);
 
   const control = useCallback(async (
     job: GenerationJob,
@@ -544,20 +652,22 @@ export default function GenerationRunsWorkspace({
     void control(job, "abort");
   };
 
-  const navigationIssues = [
-    missingJob && target.jobId
-      ? { message: t("deepLinkJobMissing"), value: target.jobId }
-      : null,
-    missingChapter && target.chapterId
-      ? { message: t("deepLinkChapterMissing"), value: target.chapterId }
-      : null,
-    missingEvent && target.eventId
-      ? { message: t("deepLinkEventMissing"), value: target.eventId }
-      : null,
-    missingRun && target.runId
-      ? { message: t("deepLinkRunMissing"), value: target.runId }
-      : null,
-  ].filter((item): item is { message: string; value: string } => Boolean(item));
+  const exactRunPending = Boolean(target.runId)
+    && (
+      exactRunLookup.requestedId !== target.runId
+      || exactRunLookup.loading
+    );
+  const displayedTelemetryError = target.runId
+    ? exactRunLookup.requestedId === target.runId
+      ? exactRunLookup.error
+      : null
+    : telemetryError;
+  const refresh = useCallback(() => {
+    void load();
+    if (target.runId) {
+      setExactRunLookupRevision((current) => current + 1);
+    }
+  }, [load, target.runId]);
 
   return (
     <main className="flex h-full min-h-0 flex-col bg-surface" aria-labelledby="generation-runs-title">
@@ -592,7 +702,7 @@ export default function GenerationRunsWorkspace({
           <div className="flex shrink-0 flex-wrap gap-2">
             <button
               type="button"
-              onClick={() => void load()}
+              onClick={refresh}
               disabled={loading || refreshing}
               className="min-h-9 rounded-md border border-border px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary disabled:cursor-wait disabled:opacity-60"
             >
@@ -610,37 +720,25 @@ export default function GenerationRunsWorkspace({
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
-        {navigationIssues.length > 0 && (
-          <section
-            role="alert"
-            className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-100"
-          >
-            <ul className="min-w-0 space-y-1">
-              {navigationIssues.map((issue) => (
-                <li key={`${issue.message}:${issue.value}`} className="min-w-0">
-                  <span>{issue.message}</span>{" "}
-                  <code className="break-all rounded bg-amber-100 px-1 py-0.5 text-xs dark:bg-amber-900/50">
-                    {issue.value}
-                  </code>
-                </li>
-              ))}
-            </ul>
-            <button
-              type="button"
-              onClick={() => onNavigate({})}
-              className="shrink-0 text-xs font-medium underline underline-offset-2"
-            >
-              {t("clearTarget")}
-            </button>
-          </section>
-        )}
-
         {loadError && (
           <section role="alert" className="mb-4 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
             <p>{loadError}</p>
             <button
               type="button"
               onClick={() => void load()}
+              className="mt-2 text-xs font-medium underline underline-offset-2"
+            >
+              {t("retry")}
+            </button>
+          </section>
+        )}
+
+        {chaptersError && (
+          <section role="alert" className="mb-4 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
+            <p>{chaptersError}</p>
+            <button
+              type="button"
+              onClick={onRetryChapters}
               className="mt-2 text-xs font-medium underline underline-offset-2"
             >
               {t("retry")}
@@ -1047,9 +1145,9 @@ export default function GenerationRunsWorkspace({
               </button>
             )}
           </div>
-          {telemetryError && (
+          {displayedTelemetryError && (
             <p role="alert" className="mt-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
-              {telemetryError}
+              {displayedTelemetryError}
             </p>
           )}
           {telemetryFilteredOut && (
@@ -1057,7 +1155,7 @@ export default function GenerationRunsWorkspace({
               {t("telemetryFilteredOut")}
             </p>
           )}
-          {!telemetryError && selectedTelemetry.length === 0 && (
+          {!displayedTelemetryError && !exactRunPending && selectedTelemetry.length === 0 && (
             <p className="mt-3 text-xs text-muted">{t("telemetryEmpty")}</p>
           )}
           <div className="mt-3 grid gap-3 lg:grid-cols-2">

@@ -233,10 +233,21 @@ async def apply_reference_card_curation(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 @router.get("/novel/{novel_id}/candidates")
-async def inspect_emergent_reference_card_candidates(novel_id: str):
+async def inspect_emergent_reference_card_candidates(
+    novel_id: str,
+    candidate_id: Optional[str] = None,
+):
     """Inspect persisted candidates without running a model or writing cards."""
     try:
-        return await emergent_reference_card_candidate_module.inspect(novel_id)
+        result = await emergent_reference_card_candidate_module.inspect(
+            novel_id,
+            candidate_ids=[candidate_id] if candidate_id else None,
+        )
+        if candidate_id and not result["candidates"]:
+            raise NotFoundError(
+                f"Reference-card candidate not found: {candidate_id}"
+            )
+        return result
     except Exception as exc:
         raise _translate_error(exc) from exc
 

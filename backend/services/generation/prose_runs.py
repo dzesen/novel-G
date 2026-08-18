@@ -654,6 +654,16 @@ class ProseRunModule:
         )
         return [serialize_prose_run_telemetry(run) for run in runs]
 
+    async def inspect_telemetry(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Return one owned run's metadata without exposing prose or prompts."""
+        run = await prose_run_repo.get_run(run_id, owner_id)
+        return serialize_prose_run_telemetry(run)
+
     async def accept(
         self,
         *,

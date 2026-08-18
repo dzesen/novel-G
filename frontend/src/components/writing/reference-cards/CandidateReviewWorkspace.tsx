@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
-import { apiGet, apiPost } from "@/lib/api";
+import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type {
   EmergentReferenceCardApplyResult,
   EmergentReferenceCardCandidate,
@@ -119,13 +119,19 @@ export default function CandidateReviewWorkspace({
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const candidateRefs = useRef(new Map<string, HTMLElement>());
+  const loadRequestRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++loadRequestRef.current;
     setLoading(true);
     setError("");
     try {
       const nextReview = await apiGet<EmergentReferenceCardReview>(
-        `/api/reference-cards/novel/${novelId}/candidates`,
+        `/api/reference-cards/novel/${novelId}/candidates${
+          initialCandidateId
+            ? `?candidate_id=${encodeURIComponent(initialCandidateId)}`
+            : ""
+        }`,
       );
       const cardTypes = Array.from(
         new Set(nextReview.candidates.map((candidate) => candidate.card_type)),
@@ -140,21 +146,26 @@ export default function CandidateReviewWorkspace({
           ),
         ]),
       );
+      if (requestId !== loadRequestRef.current) return;
       setReview(nextReview);
       if (initialCandidateId) {
-        onTargetValidation(
-          initialCandidateId,
-          nextReview.candidates.some(
-            (candidate) => candidate.candidate_id === initialCandidateId,
-          ),
-        );
+        onTargetValidation(initialCandidateId, true);
       }
       setCards(responses.flatMap((response) => response.data));
       setDecisions({});
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t("loadFailed"));
+      if (requestId !== loadRequestRef.current) return;
+      if (
+        initialCandidateId
+        && reason instanceof ApiError
+        && [400, 404].includes(reason.status)
+      ) {
+        onTargetValidation(initialCandidateId, false);
+      } else {
+        setError(reason instanceof Error ? reason.message : t("loadFailed"));
+      }
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestRef.current) setLoading(false);
     }
   }, [initialCandidateId, novelId, onTargetValidation, t]);
 
@@ -179,6 +190,13 @@ export default function CandidateReviewWorkspace({
     });
     return result;
   }, [cards]);
+  const reviewableCandidates = useMemo(
+    () => review?.candidates.filter((candidate) =>
+      candidate.queue_status === "pending"
+      || candidate.queue_status === "deferred"
+    ) ?? [],
+    [review],
+  );
 
   const updateDecision = (
     candidate: EmergentReferenceCardCandidate,
@@ -209,7 +227,7 @@ export default function CandidateReviewWorkspace({
 
   const apply = async () => {
     if (!review) return;
-    const missing = review.candidates.filter((candidate) => {
+    const missing = reviewableCandidates.filter((candidate) => {
       const decision = decisions[candidate.candidate_id];
       if (!decision?.action) return true;
       return (
@@ -231,7 +249,7 @@ export default function CandidateReviewWorkspace({
         `/api/reference-cards/novel/${novelId}/candidates/apply`,
         {
           review_digest: review.review_digest,
-          decisions: review.candidates.map((candidate) => {
+          decisions: reviewableCandidates.map((candidate) => {
             const decision = decisions[candidate.candidate_id];
             return {
               candidate_id: candidate.candidate_id,
@@ -280,7 +298,7 @@ export default function CandidateReviewWorkspace({
           {review && review.candidates.length > 0 && (
             <div className="shrink-0 text-right">
               <p className="text-sm font-semibold tabular-nums text-foreground">
-                {t("pendingCount", { count: review.candidates.length })}
+                {t("pendingCount", { count: reviewableCandidates.length })}
               </p>
               <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
                 {t("blockingCount", { count: review.counts.blocking })}
@@ -405,42 +423,49 @@ export default function CandidateReviewWorkspace({
                       </dl>
                     )}
 
-                    <div className="mt-5">
-                      <p className="text-xs font-semibold text-foreground">
-                        {t("decisionLabel")}
-                      </p>
-                      <div
-                        className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5"
-                        role="group"
-                        aria-label={t("decisionFor", { name: candidate.name })}
-                      >
-                        {ACTIONS.map((action) => (
-                          <button
-                            key={action}
-                            type="button"
-                            aria-pressed={decision.action === action}
-                            onClick={() => updateDecision(candidate, action)}
-                            className={`min-h-11 rounded-lg border px-2 py-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-                              decision.action === action
-                                ? "border-accent bg-accent text-white"
-                                : "border-border bg-background text-muted hover:text-foreground"
-                            }`}
-                          >
-                            {t(`actions.${action}`)}
-                          </button>
-                        ))}
-                      </div>
-                      {(candidate.recommended_target
-                        || candidate.warnings.length > 0) && (
-                        <p className="mt-2 text-xs leading-5 text-muted">
-                          {candidate.recommended_target
-                            ? t("exactMatch", {
-                                name: candidate.recommended_target.name ?? "",
-                              })
-                            : t("possibleMatch")}
+                    {(candidate.queue_status === "pending"
+                      || candidate.queue_status === "deferred") ? (
+                      <div className="mt-5">
+                        <p className="text-xs font-semibold text-foreground">
+                          {t("decisionLabel")}
                         </p>
-                      )}
-                    </div>
+                        <div
+                          className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5"
+                          role="group"
+                          aria-label={t("decisionFor", { name: candidate.name })}
+                        >
+                          {ACTIONS.map((action) => (
+                            <button
+                              key={action}
+                              type="button"
+                              aria-pressed={decision.action === action}
+                              onClick={() => updateDecision(candidate, action)}
+                              className={`min-h-11 rounded-lg border px-2 py-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                                decision.action === action
+                                  ? "border-accent bg-accent text-white"
+                                  : "border-border bg-background text-muted hover:text-foreground"
+                              }`}
+                            >
+                              {t(`actions.${action}`)}
+                            </button>
+                          ))}
+                        </div>
+                        {(candidate.recommended_target
+                          || candidate.warnings.length > 0) && (
+                          <p className="mt-2 text-xs leading-5 text-muted">
+                            {candidate.recommended_target
+                              ? t("exactMatch", {
+                                  name: candidate.recommended_target.name ?? "",
+                                })
+                              : t("possibleMatch")}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="mt-5 rounded-lg border border-border bg-surface-secondary px-3 py-2 text-xs leading-5 text-muted">
+                        {t("resolvedReadOnly")}
+                      </p>
+                    )}
 
                     {(decision.action === "merge"
                       || decision.action === "restore_merge") && (
@@ -560,19 +585,21 @@ export default function CandidateReviewWorkspace({
               })}
             </div>
 
-            <div className="sticky bottom-0 mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm">
-              <p className="text-xs leading-5 text-muted">
-                {t("applyHint")}
-              </p>
-              <Button
-                variant="primary"
-                className="min-h-11 bg-accent px-5 text-white hover:bg-accent-hover"
-                isDisabled={applying}
-                onPress={() => void apply()}
-              >
-                {applying ? t("applying") : t("applyAll")}
-              </Button>
-            </div>
+            {reviewableCandidates.length > 0 && (
+              <div className="sticky bottom-0 mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-border bg-background/95 py-4 backdrop-blur-sm">
+                <p className="text-xs leading-5 text-muted">
+                  {t("applyHint")}
+                </p>
+                <Button
+                  variant="primary"
+                  className="min-h-11 bg-accent px-5 text-white hover:bg-accent-hover"
+                  isDisabled={applying}
+                  onPress={() => void apply()}
+                >
+                  {applying ? t("applying") : t("applyAll")}
+                </Button>
+              </div>
+            )}
           </>
         )}
       </div>

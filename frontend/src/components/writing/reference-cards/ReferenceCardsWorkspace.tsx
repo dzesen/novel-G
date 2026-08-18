@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiDelete, apiGet, apiPatch, apiPost, apiPut } from "@/lib/api";
@@ -101,6 +101,8 @@ export default function ReferenceCardsWorkspace({
   const [favoriteError, setFavoriteError] = useState<string | null>(null);
   const [showCuration, setShowCuration] = useState(false);
   const [showCardImport, setShowCardImport] = useState(false);
+  const [loadedCardScope, setLoadedCardScope] = useState<string | null>(null);
+  const cardsRequestRef = useRef(0);
 
   const selectedCard = useMemo(
     () => cards.find((card) => card._id === selectedId) ?? null,
@@ -132,7 +134,10 @@ export default function ReferenceCardsWorkspace({
 
   const loadCards = useCallback(async () => {
     if (!novelId || mode !== "edit") return;
+    const requestId = ++cardsRequestRef.current;
+    const cardScope = `${novelId}:${cardType}`;
     setLoading(true);
+    setLoadedCardScope(null);
     setError(null);
     setFavoriteError(null);
     try {
@@ -140,6 +145,7 @@ export default function ReferenceCardsWorkspace({
         apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/${cardType}`),
         apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/${cardType}/trash`),
       ]);
+      if (requestId !== cardsRequestRef.current) return;
       setCards(activeResponse.data);
       setTrash(trashResponse.data);
       setFavoriteCardIds(
@@ -150,28 +156,45 @@ export default function ReferenceCardsWorkspace({
         ),
       );
       setFavoritePendingIds(new Set());
-      const requestedCard = initialCardId
-        ? activeResponse.data.find((card) => card._id === initialCardId)
-        : undefined;
-      if (initialCardId) {
-        onTargetValidation(initialCardId, Boolean(requestedCard));
-      }
+      setLoadedCardScope(cardScope);
       setSelectedId((current) => {
-        if (initialCardId) return requestedCard?._id ?? null;
         if (current && activeResponse.data.some((card) => card._id === current)) return current;
         return activeResponse.data[0]?._id ?? null;
       });
       if (!activeResponse.data.length) setDraft(createDraft());
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : t("loadFailed"));
+      if (requestId === cardsRequestRef.current) {
+        setError(reason instanceof Error ? reason.message : t("loadFailed"));
+      }
     } finally {
-      setLoading(false);
+      if (requestId === cardsRequestRef.current) setLoading(false);
     }
-  }, [cardType, initialCardId, mode, novelId, onTargetValidation, t]);
+  }, [cardType, mode, novelId, t]);
 
   useEffect(() => {
     void loadCards();
   }, [loadCards]);
+
+  useEffect(() => {
+    if (!novelId || loadedCardScope !== `${novelId}:${cardType}`) return;
+    if (initialCardId) {
+      const requestedCard = cards.find((card) => card._id === initialCardId);
+      onTargetValidation(initialCardId, Boolean(requestedCard));
+      setSelectedId(requestedCard?._id ?? null);
+      return;
+    }
+    setSelectedId((current) => {
+      if (current && cards.some((card) => card._id === current)) return current;
+      return cards[0]?._id ?? null;
+    });
+  }, [
+    cardType,
+    cards,
+    initialCardId,
+    loadedCardScope,
+    novelId,
+    onTargetValidation,
+  ]);
 
   useEffect(() => {
     if (mode === "edit" && novelId && openCurationOnMount) {

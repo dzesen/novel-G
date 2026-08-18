@@ -395,9 +395,19 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       validateLocatedTarget("chapter", chapterId, valid),
     [validateLocatedTarget],
   );
+  const validateVolumeTarget = useCallback(
+    (volumeId: string, valid: boolean) =>
+      validateLocatedTarget("volume", volumeId, valid),
+    [validateLocatedTarget],
+  );
   const validateRunTarget = useCallback(
     (runId: string, valid: boolean) =>
       validateLocatedTarget("run", runId, valid),
+    [validateLocatedTarget],
+  );
+  const validateSceneTarget = useCallback(
+    (sceneIndex: number, valid: boolean) =>
+      validateLocatedTarget("scene", String(sceneIndex), valid),
     [validateLocatedTarget],
   );
 
@@ -494,6 +504,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
             onNavigateToReferenceCards={() =>
               navigateView("world", "curation", { cardType: "character" })
             }
+            initialVolumeId={route.targets.volume}
             initialChapterId={route.targets.chapter}
             initialSceneIndex={parseSceneIndex(route.targets.scene)}
             initialRunId={route.targets.run}
@@ -507,7 +518,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
               })
             }
             onChapterTargetValidation={validateChapterTarget}
+            onVolumeTargetValidation={validateVolumeTarget}
+            onSceneTargetValidation={validateSceneTarget}
             onRunTargetValidation={validateRunTarget}
+            onRunTargetChange={(runId) =>
+              navigateView(
+                "writing",
+                "chapter",
+                { run: runId },
+                true,
+              )
+            }
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
             onProseOpenRequestConsumed={consumeProseOpen}

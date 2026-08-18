@@ -1945,6 +1945,8 @@
       "dialogStart": "Start",
       "dialogStarting": "Starting…",
       "dialogCancel": "Cancel",
+      "jobLookupFailed": "The requested generation job could not be loaded. To avoid controlling the wrong job, the latest job will not be selected automatically.",
+      "retry": "Retry",
       "resumeReadinessTitle": "Review before resuming",
       "resumeReadinessDescription": "The proposed token budget or authorization version needs a fresh confirmation. This check only reads current state and does not call a model; generation resumes only after confirmation.",
       "resumeReadinessCurrentUsage": "Currently used {used} tokens, with {reserved} more reserved",
@@ -2419,8 +2421,12 @@
         "source": "From chapter {order}, “{title}”",
         "status": {
           "pending": "Needs decision",
-          "deferred": "Deferred"
+          "deferred": "Deferred",
+          "ignored": "Ignored",
+          "resolved": "Resolved",
+          "superseded": "Superseded by a later candidate"
         },
+        "resolvedReadOnly": "This candidate remains available as an audit record, but it has left the review queue and cannot be decided again.",
         "noDescription": "The outline confirmed only the name so far.",
         "decisionLabel": "Decision for this candidate",
         "decisionFor": "Decision for candidate “{name}”",

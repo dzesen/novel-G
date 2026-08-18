@@ -375,7 +375,12 @@ export interface EmergentReferenceCardCandidate
     | ReferenceCardCurationAction
     | "defer"
     | "ignore";
-  queue_status: "pending" | "deferred";
+  queue_status:
+    | "pending"
+    | "deferred"
+    | "ignored"
+    | "resolved"
+    | "superseded";
   requires_review_before_next_chapter: boolean;
   evidence: {
     summary: string;

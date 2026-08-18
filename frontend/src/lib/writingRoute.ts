@@ -132,7 +132,7 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
   },
   "auto-book": {
     readiness: ["volume"],
-    runs: ["volume", "chapter", "job"],
+    runs: ["volume", "job"],
     "generation-runs": ["chapter", "job", "event", "run"],
     diagnostics: ["chapter", "job", "event"],
   },
@@ -167,6 +167,10 @@ function normalizedTargetValue(
 ): string | null {
   const normalized = value?.trim() ?? "";
   if (!normalized || normalized.length > 200) return null;
+  if (key === "scene") {
+    if (!/^(0|[1-9]\d*)$/.test(normalized)) return null;
+    if (!Number.isSafeInteger(Number(normalized))) return null;
+  }
   if (key === "cardType" && !REFERENCE_CARD_TYPES.has(normalized)) return null;
   if (key === "visual" && !["cover", "portrait", "scene"].includes(normalized)) {
     return null;
