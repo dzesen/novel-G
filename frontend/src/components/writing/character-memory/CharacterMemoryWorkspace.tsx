@@ -10,7 +10,10 @@ import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 interface Props {
   mode: "create" | "edit";
   novelId?: string;
+  initialCardId?: string;
   initialFactId?: string;
+  onCardTargetValidation: (cardId: string, valid: boolean) => void;
+  onFactTargetValidation: (factId: string, valid: boolean) => void;
 }
 
 const FACT_KINDS: FactKind[] = ["death", "injury", "identity", "relation", "ability"];
@@ -22,7 +25,10 @@ interface CharacterCard {
 
 export default function CharacterMemoryWorkspace({
   novelId,
+  initialCardId,
   initialFactId,
+  onCardTargetValidation,
+  onFactTargetValidation,
 }: Props) {
   const t = useTranslations("characterMemory");
   const [states, setStates] = useState<CharacterState[]>([]);
@@ -33,10 +39,12 @@ export default function CharacterMemoryWorkspace({
   const [editingFactId, setEditingFactId] = useState<string | null>(null);
   const [factDraft, setFactDraft] = useState<{ fact: string; kind: FactKind; source_chapter_id: string } | null>(null);
   const [confirmDeleteFactId, setConfirmDeleteFactId] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   const load = useCallback(async () => {
     if (!novelId) return;
     setError(null);
+    setLoaded(false);
     try {
       const [stateRes, cardRes, chapterRes, volumeRes] = await Promise.all([
         apiGet<{ data: CharacterState[] }>(`/api/character-states/novel/${novelId}`),
@@ -64,6 +72,7 @@ export default function CharacterMemoryWorkspace({
         }
         return next;
       });
+      setLoaded(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : t("loadError"));
     }
@@ -74,11 +83,28 @@ export default function CharacterMemoryWorkspace({
   }, [load]);
 
   useEffect(() => {
-    if (!initialFactId || states.length === 0) return;
-    document
-      .getElementById(`fact-${initialFactId}`)
-      ?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [initialFactId, states]);
+    if (!initialFactId || !loaded) return;
+    const matched = states.some((state) =>
+      state.permanent_facts.some((fact) => fact.id === initialFactId),
+    );
+    onFactTargetValidation(initialFactId, matched);
+    if (matched) {
+      document
+        .getElementById(`fact-${initialFactId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [initialFactId, loaded, onFactTargetValidation, states]);
+
+  useEffect(() => {
+    if (!initialCardId || !loaded) return;
+    const matched = states.some((state) => state.card_id === initialCardId);
+    onCardTargetValidation(initialCardId, matched);
+    if (matched) {
+      document
+        .getElementById(`character-state-${initialCardId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [initialCardId, loaded, onCardTargetValidation, states]);
 
   if (!novelId) {
     return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;
@@ -150,7 +176,15 @@ export default function CharacterMemoryWorkspace({
       {states.map((s) => {
         const draft = stateDraft[s.card_id] ?? { current_state: s.current_state, as_of: s.as_of_chapter_id ?? "" };
         return (
-          <section key={s._id} className="rounded-lg border border-border bg-surface p-4">
+          <section
+            id={`character-state-${s.card_id}`}
+            key={s._id}
+            className={`rounded-lg border bg-surface p-4 ${
+              initialCardId === s.card_id
+                ? "border-accent ring-2 ring-accent/20"
+                : "border-border"
+            }`}
+          >
             <h3 className="mb-2 font-medium text-foreground">{names[s.card_id] ?? t("unknownCharacter")}</h3>
 
             <div className="mb-3 flex flex-col gap-2">

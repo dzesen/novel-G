@@ -7,6 +7,7 @@ import { referenceCleanupForDisplay } from "../../generationMetadataPresentation
 import {
   auditCategoryTone,
   buildStateAuditQuery,
+  stateAuditIssueId,
   visibleAuditChapters,
 } from "./stateAuditPresentation";
 
@@ -45,7 +46,9 @@ interface StateAuditReport {
 interface StateCompletenessAuditPanelProps {
   novelId: string;
   selectedVolumeId: string | null;
-  onClose: () => void;
+  initialChapterId?: string;
+  initialIssueId?: string;
+  onIssueTargetValidation: (issueId: string, valid: boolean) => void;
   onLocate: (chapterId: string, repair: boolean) => void;
 }
 
@@ -59,7 +62,9 @@ const toneClass = {
 export default function StateCompletenessAuditPanel({
   novelId,
   selectedVolumeId,
-  onClose,
+  initialChapterId,
+  initialIssueId,
+  onIssueTargetValidation,
   onLocate,
 }: StateCompletenessAuditPanelProps) {
   const t = useTranslations("stateAudit");
@@ -67,7 +72,7 @@ export default function StateCompletenessAuditPanel({
   const [scope, setScope] = useState<"book" | "volume">(
     selectedVolumeId ? "volume" : "book",
   );
-  const [issuesOnly, setIssuesOnly] = useState(true);
+  const [issuesOnly, setIssuesOnly] = useState(!initialChapterId);
   const [response, setResponse] = useState<{
     query: string;
     report: StateAuditReport;
@@ -115,53 +120,51 @@ export default function StateCompletenessAuditPanel({
   );
   const legacyCount = report?.counts.unknown_legacy ?? 0;
 
+  useEffect(() => {
+    if (!report || !initialIssueId) return;
+    const matched = report.chapters.find(
+      (chapter) =>
+        stateAuditIssueId(chapter) === initialIssueId &&
+        (!initialChapterId || chapter.chapter_id === initialChapterId),
+    );
+    onIssueTargetValidation(initialIssueId, Boolean(matched));
+    if (matched) {
+      document
+        .getElementById(`state-issue-${matched.chapter_id}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [initialChapterId, initialIssueId, onIssueTargetValidation, report]);
+
+  useEffect(() => {
+    if (!report || !initialChapterId || initialIssueId) return;
+    document
+      .getElementById(`state-issue-${initialChapterId}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [initialChapterId, initialIssueId, report]);
+
   return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/30 px-3 py-4 sm:px-6">
-      <section className="flex max-h-full w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-2xl">
-        <header className="flex flex-col gap-4 border-b border-border px-5 py-4 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-accent">
-              {t("eyebrow")}
-            </p>
-            <h2 className="mt-1 text-lg font-semibold text-foreground">
-              {t("title")}
-            </h2>
-            <p className="mt-1 max-w-2xl text-xs leading-5 text-muted">
-              {t("description")}
-            </p>
+    <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background">
+        <header className="border-b border-border bg-surface px-4 py-4 sm:px-6">
+          <h2 className="text-lg font-semibold text-foreground">
+            {t("title")}
+          </h2>
+          <p className="mt-1 max-w-[72ch] text-sm leading-6 text-muted">
+            {t("description")}
+          </p>
+          <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted">
+            <span>
+              {t("summaryChapters")}: <strong className="tabular-nums text-foreground">{report?.chapter_count ?? "—"}</strong>
+            </span>
+            <span>
+              {t("summaryIssues")}: <strong className="tabular-nums text-amber-700 dark:text-amber-300">{report?.issue_count ?? "—"}</strong>
+            </span>
+            <span>
+              {t("summaryRepair")}: <strong className="tabular-nums text-accent">{report?.repair_queue.length ?? "—"}</strong>
+            </span>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="self-start rounded-lg px-3 py-1.5 text-xs font-medium text-muted hover:bg-surface-secondary hover:text-foreground"
-          >
-            {t("close")}
-          </button>
         </header>
 
-        <div className="border-b border-border bg-surface-secondary/35 px-5 py-4">
-          <div className="grid gap-3 sm:grid-cols-3">
-            <div className="rounded-lg border border-border bg-surface px-3 py-2.5">
-              <p className="text-[11px] text-muted">{t("summaryChapters")}</p>
-              <p className="mt-1 text-xl font-semibold tabular-nums text-foreground">
-                {report?.chapter_count ?? "—"}
-              </p>
-            </div>
-            <div className="rounded-lg border border-border bg-surface px-3 py-2.5">
-              <p className="text-[11px] text-muted">{t("summaryIssues")}</p>
-              <p className="mt-1 text-xl font-semibold tabular-nums text-amber-700 dark:text-amber-300">
-                {report?.issue_count ?? "—"}
-              </p>
-            </div>
-            <div className="rounded-lg border border-border bg-surface px-3 py-2.5">
-              <p className="text-[11px] text-muted">{t("summaryRepair")}</p>
-              <p className="mt-1 text-xl font-semibold tabular-nums text-accent">
-                {report?.repair_queue.length ?? "—"}
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-3 flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 border-b border-border bg-surface-secondary/35 px-4 py-3 sm:px-6">
             <div className="inline-flex rounded-lg border border-border bg-surface p-0.5">
               <button
                 type="button"
@@ -196,10 +199,9 @@ export default function StateCompletenessAuditPanel({
               />
               {t("issuesOnly")}
             </label>
-          </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6">
           <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs leading-5 text-blue-800 dark:border-blue-900/70 dark:bg-blue-950/35 dark:text-blue-200">
             {t("readOnlyNotice")}
             {legacyCount > 0 && (
@@ -229,13 +231,22 @@ export default function StateCompletenessAuditPanel({
             <div className="grid gap-2">
               {visible.map((chapter) => {
                 const tone = auditCategoryTone(chapter.category);
+                const issueId = stateAuditIssueId(chapter);
+                const selected = initialIssueId
+                  ? issueId === initialIssueId
+                  : initialChapterId === chapter.chapter_id;
                 const dropped = referenceCleanupForDisplay(
                   chapter.completion.reference_resolution?.dropped,
                 );
                 return (
                   <article
+                    id={`state-issue-${chapter.chapter_id}`}
                     key={chapter.chapter_id}
-                    className="flex flex-col gap-3 rounded-lg border border-border bg-background px-4 py-3 sm:flex-row sm:items-center"
+                    className={`flex min-w-0 flex-col gap-3 rounded-lg border bg-surface px-4 py-3 sm:flex-row sm:items-center ${
+                      selected
+                        ? "border-accent ring-2 ring-accent/20"
+                        : "border-border"
+                    }`}
                   >
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-medium text-foreground">
@@ -268,7 +279,7 @@ export default function StateCompletenessAuditPanel({
                       onClick={() =>
                         onLocate(chapter.chapter_id, chapter.repair_recommended)
                       }
-                      className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:border-accent hover:text-accent"
+                      className="min-h-10 shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
                     >
                       {chapter.repair_recommended ? t("repair") : t("locate")}
                     </button>
@@ -279,6 +290,5 @@ export default function StateCompletenessAuditPanel({
           )}
         </div>
       </section>
-    </div>
   );
 }

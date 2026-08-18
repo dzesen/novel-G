@@ -31,8 +31,6 @@ import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
 import type { StoredChapterOutline } from "./outline/outlineTypes";
 import ProsePanel from "./prose/ProsePanel";
 import type { ProseRunSnapshot } from "./prose/useProseStream";
-import { StateBackfillPanel } from "./state/StateBackfillPanel";
-import StateCompletenessAuditPanel from "./state/StateCompletenessAuditPanel";
 import SceneIllustrationPanel from "./SceneIllustrationPanel";
 import type { LeftoverProseRun } from "./batch/batchTypes";
 
@@ -51,6 +49,7 @@ interface ChapterWorkspaceProps {
   onRunTargetValidation: (runId: string, valid: boolean) => void;
   onRunTargetChange: (runId?: string) => void;
   onOpenRunAudit: (chapterId: string, runId: string) => void;
+  onOpenStateProposal: (chapterId: string) => void;
   onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
@@ -90,6 +89,7 @@ export default function ChapterWorkspace({
   onRunTargetValidation,
   onRunTargetChange,
   onOpenRunAudit,
+  onOpenStateProposal,
   onStartAutoBook,
   proseOpenRequest,
   onProseOpenRequestConsumed,
@@ -100,7 +100,6 @@ export default function ChapterWorkspace({
   // stateBackfill 是顶层命名空间（不在 writing 之下，见 T6 报告的偏离说明），
   // 必须单独取一份 translator，不能借用上面几个 writing.* 的 t()。
   const tStateBackfill = useTranslations("stateBackfill");
-  const tStateAudit = useTranslations("stateAudit");
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [volumeTrash, setVolumeTrash] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
@@ -132,10 +131,6 @@ export default function ChapterWorkspace({
     chapterId: string;
     run: ProseRunSnapshot | null;
   } | null>(null);
-  const [stateBackfillOpen, setStateBackfillOpen] = useState(false);
-  const [stateAuditOpen, setStateAuditOpen] = useState(false);
-  const [pendingStateRepairChapterId, setPendingStateRepairChapterId] =
-    useState<string | null>(null);
   const [stateBackfillBlocked, setStateBackfillBlocked] = useState("");
   const [runTargetAudit, setRunTargetAudit] =
     useState<ProseRunLocator | null>(null);
@@ -621,29 +616,8 @@ export default function ChapterWorkspace({
       setStateBackfillBlocked(tStateBackfill("needTitleToSave"));
       return;
     }
-    setStateBackfillOpen(true);
-  }, [flushDraft, tStateBackfill]);
-
-  useEffect(() => {
-    if (
-      !pendingStateRepairChapterId ||
-      selectedChapterId !== pendingStateRepairChapterId ||
-      chapterLoading ||
-      !draft
-    ) {
-      return;
-    }
-    setPendingStateRepairChapterId(null);
-    setStructureNotice(tStateAudit("repairLocated"));
-    void openStateBackfill();
-  }, [
-    chapterLoading,
-    draft,
-    openStateBackfill,
-    pendingStateRepairChapterId,
-    selectedChapterId,
-    tStateAudit,
-  ]);
+    if (selectedChapterId) onOpenStateProposal(selectedChapterId);
+  }, [flushDraft, onOpenStateProposal, selectedChapterId, tStateBackfill]);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -699,7 +673,6 @@ export default function ChapterWorkspace({
     setPendingProseOpen(null);
     setChapterOutlineOpen(false);
     setSceneIllustrationOpen(false);
-    setStateBackfillOpen(false);
     setStateBackfillBlocked("");
     selectedChapterIdRef.current = chapterId;
     setSelectedChapterId(chapterId);
@@ -799,7 +772,6 @@ export default function ChapterWorkspace({
     setProseOpen(false);
     setChapterOutlineOpen(false);
     setSceneIllustrationOpen(false);
-    setStateBackfillOpen(false);
     setStateBackfillBlocked("");
   };
 
@@ -1043,7 +1015,6 @@ export default function ChapterWorkspace({
             onStartBookJob={() => {
               onStartAutoBook("book");
             }}
-            onOpenStateAudit={() => setStateAuditOpen(true)}
           />
         </div>
         <div
@@ -1155,31 +1126,6 @@ export default function ChapterWorkspace({
             onOpenCharacterCards={onNavigateToReferenceCards}
           />
         )}
-
-      {stateBackfillOpen && novelId && selectedChapterId && (
-        <StateBackfillPanel
-          novelId={novelId}
-          chapterId={selectedChapterId}
-          onClose={() => setStateBackfillOpen(false)}
-          onAccepted={() => {
-            // 摘要已由后端写库；回读章节列表让摘要与字数显示跟上。
-            void loadStructure();
-          }}
-        />
-      )}
-
-      {stateAuditOpen && novelId && (
-        <StateCompletenessAuditPanel
-          novelId={novelId}
-          selectedVolumeId={selectedVolumeId}
-          onClose={() => setStateAuditOpen(false)}
-          onLocate={(chapterId, repair) => {
-            setStateAuditOpen(false);
-            if (repair) setPendingStateRepairChapterId(chapterId);
-            selectChapter(chapterId);
-          }}
-        />
-      )}
 
       {structureNotice && (
         <div role="status" className="absolute bottom-4 left-1/2 z-30 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-3 rounded-lg border border-green-300 bg-green-50 px-4 py-2.5 text-sm text-green-800 shadow-lg dark:border-green-900 dark:bg-green-950 dark:text-green-200">

@@ -10,7 +10,6 @@ import {
   defaultWritingRoute,
   legacyWritingRouteSignal,
   resolveWritingRoute,
-  WRITING_REFERENCE_CARD_TYPES,
   type InvalidWritingTarget,
   type WritingArea,
   type WritingRouteTargets,
@@ -18,8 +17,11 @@ import {
   type WritingView,
 } from "@/lib/writingRoute";
 import { buildUserStorageKey } from "@/lib/userStorage";
-import type { NovelDetail, ReferenceCardType } from "@/types/novel";
+import type { NovelDetail } from "@/types/novel";
 import WritingNavigation from "./WritingNavigation";
+import WorkspaceViewTabs, {
+  type WorkspaceViewTab,
+} from "./WorkspaceViewTabs";
 import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
 import ChapterWorkspace, {
   type ProseOpenRequest,
@@ -28,72 +30,19 @@ import type { ProseRunSnapshot } from "./chapters/prose/useProseStream";
 import AutoBookWorkspace, {
   type AutoBookStartRequest,
 } from "./auto-book/AutoBookWorkspace";
-import ReferenceCardsDestination from "./reference-cards/ReferenceCardsDestination";
-import FactionCardsWorkspace from "./factions/FactionCardsWorkspace";
-import RelationshipWorkspace from "./relationships/RelationshipWorkspace";
-import PlotThreadWorkspace from "./plot-threads/PlotThreadWorkspace";
-import CharacterMemoryWorkspace from "./character-memory/CharacterMemoryWorkspace";
-import StoryHealthWorkspace from "./story-health/StoryHealthWorkspace";
 import AgentStudioWorkspace from "./agents/AgentStudioWorkspace";
+import WorldWorkspace from "./world/WorldWorkspace";
+import ContinuityWorkspace from "./continuity/ContinuityWorkspace";
 
 interface WritingContentProps {
   mode: "create" | "edit";
   novelId?: string;
 }
 
-function parseReferenceCardType(value?: string): ReferenceCardType {
-  return (
-    WRITING_REFERENCE_CARD_TYPES.find((cardType) => cardType === value) ??
-    "character"
-  );
-}
-
 function parseSceneIndex(value?: string): number | undefined {
   if (!value) return undefined;
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
-}
-
-interface ViewTab {
-  view: WritingView;
-  label: string;
-}
-
-function ViewTabs({
-  label,
-  activeView,
-  tabs,
-  onSelect,
-}: {
-  label: string;
-  activeView: WritingView;
-  tabs: ViewTab[];
-  onSelect: (view: WritingView) => void;
-}) {
-  return (
-    <nav
-      aria-label={label}
-      className="flex shrink-0 gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-1.5 sm:px-5"
-    >
-      {tabs.map((tab) => (
-        <button
-          key={tab.view}
-          type="button"
-          onClick={() => onSelect(tab.view)}
-          aria-current={activeView === tab.view ? "page" : undefined}
-          className={[
-            "min-h-9 shrink-0 rounded-md px-3 text-xs font-medium transition-colors",
-            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
-            activeView === tab.view
-              ? "bg-accent/10 text-accent"
-              : "text-muted hover:bg-surface-secondary hover:text-foreground",
-          ].join(" ")}
-        >
-          {tab.label}
-        </button>
-      ))}
-    </nav>
-  );
 }
 
 function RouteFailure({
@@ -177,36 +126,6 @@ function NovelLoadFailure({
             className="min-h-10 rounded-md border border-border bg-surface px-4 text-sm font-semibold text-foreground hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           >
             {t("backToShelf")}
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function DeferredContinuityView({
-  onOpenHealth,
-  onOpenFacts,
-}: {
-  onOpenHealth: () => void;
-  onOpenFacts: () => void;
-}) {
-  const t = useTranslations("writing.navigation");
-  return (
-    <div className="grid h-full place-items-center overflow-y-auto bg-background px-5 py-10">
-      <section className="w-full max-w-xl border-y border-border py-8">
-        <h1 className="text-xl font-semibold text-foreground">
-          {t("continuityTargetTitle")}
-        </h1>
-        <p className="mt-3 text-sm leading-6 text-muted">
-          {t("continuityTargetBody")}
-        </p>
-        <div className="mt-5 flex flex-wrap gap-2">
-          <button type="button" onClick={onOpenHealth} className="min-h-10 rounded-md bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
-            {t("openHealth")}
-          </button>
-          <button type="button" onClick={onOpenFacts} className="min-h-10 rounded-md border border-border bg-surface px-4 text-sm font-semibold text-foreground hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
-            {t("openFacts")}
           </button>
         </div>
       </section>
@@ -461,22 +380,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     );
   }
 
-  const referenceCardType = parseReferenceCardType(route.targets.cardType);
-  const writingTabs: ViewTab[] = [
+  const writingTabs: WorkspaceViewTab[] = [
     { view: "chapter", label: t("views.chapter") },
     { view: "revision", label: t("views.revision") },
-  ];
-  const worldTabs: ViewTab[] = [
-    { view: "library", label: t("views.library") },
-    { view: "factions", label: t("views.factions") },
-    { view: "relationships", label: t("views.relationships") },
-    { view: "candidates", label: t("views.candidates") },
-  ];
-  const continuityTabs: ViewTab[] = [
-    { view: "overview", label: t("views.continuityOverview") },
-    { view: "facts", label: t("views.facts") },
-    { view: "threads", label: t("views.threads") },
-    { view: "health", label: t("views.health") },
   ];
 
   const renderWorkspace = () => {
@@ -535,6 +441,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
                 run: runId,
               })
             }
+            onOpenStateProposal={(chapterId) =>
+              navigateView("continuity", "proposals", { chapter: chapterId })
+            }
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
             onProseOpenRequestConsumed={consumeProseOpen}
@@ -592,74 +501,28 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     }
 
     if (route.area === "world") {
-      if (route.view === "factions") {
-        return <FactionCardsWorkspace mode="edit" novelId={novelId} />;
-      }
-      if (route.view === "relationships") {
-        return <RelationshipWorkspace mode="edit" novelId={novelId} />;
-      }
       return (
-        <ReferenceCardsDestination
-          mode="edit"
+        <WorldWorkspace
           novelId={novelId}
-          cardType={referenceCardType}
-          initialCardId={route.targets.card}
-          initialCandidateId={route.targets.candidate}
+          view={route.view}
+          targets={route.targets}
+          onNavigateView={(view, targets, replace) =>
+            navigateView("world", view, targets, replace)
+          }
           onTargetValidation={validateLocatedTarget}
-          onCardTargetChange={(cardId) =>
-            navigateView("world", "library", {
-              cardType: referenceCardType,
-              card: cardId,
-            }, true)
-          }
-          onCardTypeChange={(cardType) =>
-            navigateView(
-              "world",
-              route.view === "candidates" ? "candidates" : "library",
-              { cardType, card: undefined, visual: undefined },
-              true,
-            )
-          }
-          openCurationOnMount={route.view === "curation"}
-          onCurationOpened={() => undefined}
-          reviewCandidatesOnMount={route.view === "candidates"}
-          onCandidateReviewChange={(open) =>
-            navigateView(
-              "world",
-              open ? "candidates" : "library",
-              { cardType: referenceCardType },
-              true,
-            )
-          }
         />
       );
-    }
-
-    if (route.view === "facts") {
-      return (
-        <CharacterMemoryWorkspace
-          mode="edit"
-          novelId={novelId}
-          initialFactId={route.targets.issue}
-        />
-      );
-    }
-    if (route.view === "threads") {
-      return (
-        <PlotThreadWorkspace
-          mode="edit"
-          novelId={novelId}
-          initialThreadId={route.targets.issue}
-        />
-      );
-    }
-    if (route.view === "overview" || route.view === "health") {
-      return <StoryHealthWorkspace mode="edit" novelId={novelId} />;
     }
     return (
-      <DeferredContinuityView
-        onOpenHealth={() => navigateView("continuity", "health")}
-        onOpenFacts={() => navigateView("continuity", "facts")}
+      <ContinuityWorkspace
+        novelId={novelId}
+        view={route.view}
+        targets={route.targets}
+        onNavigateView={(view, targets, replace) =>
+          navigateView("continuity", view, targets, replace)
+        }
+        onOpenWriting={(chapterId) => openWriting(chapterId)}
+        onTargetValidation={validateLocatedTarget}
       />
     );
   };
@@ -672,29 +535,11 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         onSelectArea={navigateArea}
       />
       {route.area === "writing" && !invalidTarget && !runtimeInvalidTarget && (
-        <ViewTabs
+        <WorkspaceViewTabs
           label={t("viewAria")}
           activeView={route.view}
           tabs={writingTabs}
           onSelect={(view) => navigateView("writing", view)}
-        />
-      )}
-      {route.area === "world" && !invalidTarget && !runtimeInvalidTarget && (
-        <ViewTabs
-          label={t("viewAria")}
-          activeView={route.view}
-          tabs={worldTabs}
-          onSelect={(view) =>
-            navigateView("world", view, { cardType: referenceCardType })
-          }
-        />
-      )}
-      {route.area === "continuity" && !invalidTarget && !runtimeInvalidTarget && (
-        <ViewTabs
-          label={t("viewAria")}
-          activeView={route.view}
-          tabs={continuityTabs}
-          onSelect={(view) => navigateView("continuity", view)}
         />
       )}
       <main className="min-h-0 min-w-0 flex-1 overflow-hidden">

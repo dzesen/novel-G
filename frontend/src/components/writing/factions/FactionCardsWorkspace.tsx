@@ -20,6 +20,8 @@ import type {
 interface FactionCardsWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
+  initialFactionId?: string;
+  onTargetValidation: (factionId: string, valid: boolean) => void;
 }
 
 type FactionCategory = "core" | "volume" | "local" | "trash";
@@ -201,7 +203,12 @@ function mergeUniqueByKey<T>(current: T[], incoming: T[], getKey: (item: T) => s
  * Returns:
  *   势力卡模块 React 节点。
  */
-export default function FactionCardsWorkspace({ mode, novelId }: FactionCardsWorkspaceProps) {
+export default function FactionCardsWorkspace({
+  mode,
+  novelId,
+  initialFactionId,
+  onTargetValidation,
+}: FactionCardsWorkspaceProps) {
   const t = useTranslations("writing.factions");
   const [activeCategory, setActiveCategory] = useState<FactionCategory>("core");
   const [factions, setFactions] = useState<CoreFaction[]>([]);
@@ -214,6 +221,7 @@ export default function FactionCardsWorkspace({ mode, novelId }: FactionCardsWor
   const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [actionId, setActionId] = useState("");
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
 
   const canUseSavedNovel = mode === "edit" && Boolean(novelId);
@@ -257,6 +265,7 @@ export default function FactionCardsWorkspace({ mode, novelId }: FactionCardsWor
       setFactions(mergeUniqueByKey([], factionRes.data.map((item, index) => createFactionDraft(item, index)), getFactionRenderKey));
       setRelations(mergeUniqueByKey([], relationRes.data, getRelationRenderKey));
       setTrashFactions(mergeUniqueByKey([], trashRes.data.map((item, index) => createFactionDraft(item, index)), getFactionRenderKey));
+      setLoaded(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -269,6 +278,22 @@ export default function FactionCardsWorkspace({ mode, novelId }: FactionCardsWor
       loadData();
     }
   }, [canUseSavedNovel, loadData]);
+
+  useEffect(() => {
+    if (!initialFactionId || !loaded) return;
+    const matched = factions.find(
+      (faction) =>
+        faction.faction_id === initialFactionId ||
+        faction._id === initialFactionId,
+    );
+    onTargetValidation(initialFactionId, Boolean(matched));
+    if (matched) {
+      setActiveCategory("core");
+      document
+        .getElementById(`faction-${getFactionRenderKey(matched)}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [factions, initialFactionId, loaded, onTargetValidation]);
 
   const handleGenerate = async () => {
     if (!novelId || !canGenerateCoreFactions) return;
@@ -568,6 +593,10 @@ export default function FactionCardsWorkspace({ mode, novelId }: FactionCardsWor
                         <FactionCard
                           key={getFactionRenderKey(faction)}
                           faction={faction}
+                          selected={
+                            initialFactionId === faction.faction_id ||
+                            initialFactionId === faction._id
+                          }
                           onEdit={() => handleOpenEdit(faction)}
                           onDelete={() => setDeleteIntent({ mode: "soft", faction })}
                           t={t}
@@ -818,17 +847,26 @@ function EditorModal({
 
 function FactionCard({
   faction,
+  selected,
   onEdit,
   onDelete,
   t,
 }: {
   faction: CoreFaction;
+  selected: boolean;
   onEdit: () => void;
   onDelete: () => void;
   t: ReturnType<typeof useTranslations>;
 }) {
   return (
-    <article className="rounded-md border border-border bg-surface p-4">
+    <article
+      id={`faction-${getFactionRenderKey(faction)}`}
+      className={`rounded-md border bg-surface p-4 ${
+        selected
+          ? "border-accent ring-2 ring-accent/20"
+          : "border-border"
+      }`}
+    >
       <div className="mb-3 flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h4 className="truncate text-sm font-semibold text-foreground">{faction.name}</h4>

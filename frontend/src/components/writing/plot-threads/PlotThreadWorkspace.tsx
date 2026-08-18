@@ -21,6 +21,7 @@ interface Props {
   mode: "create" | "edit";
   novelId?: string;
   initialThreadId?: string;
+  onTargetValidation: (threadId: string, valid: boolean) => void;
 }
 
 const STATUS_VALUES: ThreadStatus[] = ["planted", "developing", "resolved", "abandoned"];
@@ -29,6 +30,7 @@ const IMPORTANCE_VALUES: ThreadImportance[] = ["main", "sub"];
 export default function PlotThreadWorkspace({
   novelId,
   initialThreadId,
+  onTargetValidation,
 }: Props) {
   const t = useTranslations("plotThreads");
   const metadataT = useTranslations("writing.generationMetadata");
@@ -41,10 +43,12 @@ export default function PlotThreadWorkspace({
   const [draft, setDraft] = useState<ThreadDraft | null>(null);
   const [creating, setCreating] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   const load = useCallback(async () => {
     if (!novelId) return;
     setError(null);
+    setLoaded(false);
     setUnmatchedReferenceReview(null);
     try {
       const [res, chapterRes, volumeRes, jobs] = await Promise.all([
@@ -75,6 +79,7 @@ export default function PlotThreadWorkspace({
           .sort((a, b) => (volumeOrders[a.volume_id] ?? 0) - (volumeOrders[b.volume_id] ?? 0) || a.order_index - b.order_index)
           .map((chapter) => ({ ...chapter, label: `第${volumeOrders[chapter.volume_id] ?? "?"}卷·第${chapter.order_index}章 ${chapter.title}` })),
       );
+      setLoaded(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : t("loadError"));
     }
@@ -85,11 +90,15 @@ export default function PlotThreadWorkspace({
   }, [load]);
 
   useEffect(() => {
-    if (!initialThreadId || threads.length === 0) return;
-    document
-      .getElementById(`thread-${initialThreadId}`)
-      ?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [initialThreadId, threads]);
+    if (!initialThreadId || !loaded) return;
+    const matched = threads.some((thread) => thread._id === initialThreadId);
+    onTargetValidation(initialThreadId, matched);
+    if (matched) {
+      document
+        .getElementById(`thread-${initialThreadId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [initialThreadId, loaded, onTargetValidation, threads]);
 
   if (!novelId) {
     return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;

@@ -872,6 +872,7 @@
         "relationships": "Relationships",
         "candidates": "Candidates",
         "continuityOverview": "Overview",
+        "stateIssues": "State issues",
         "facts": "Character state & facts",
         "threads": "Plot threads",
         "health": "Story health"
@@ -904,6 +905,17 @@
       "continuityTargetBody": "The target link remains intact, but this version will not guess which fact or proposal it means. Open deterministic story health or character state and facts instead.",
       "openHealth": "Open story health",
       "openFacts": "Open character state & facts"
+    },
+    "continuity": {
+      "locatingTarget": "Checking the continuity target…",
+      "targetLoadFailed": "The continuity target is temporarily unavailable",
+      "proposalNeedsChapterTitle": "Choose a chapter for state backfill",
+      "proposalNeedsChapterBody": "A state proposal must be tied to one chapter with saved formal prose. Choose a suggested rerun from the state-issue list.",
+      "proposalNeedsProseTitle": "This chapter has no prose available for state backfill",
+      "proposalNeedsProseBody": "Return to the chapter, finish and save its prose, then generate a state proposal here. Opening this page does not call a model.",
+      "openStateIssues": "Open state issues",
+      "openWriting": "Open chapter writing",
+      "backToStateIssues": "Back to state issues"
     },
     "autoBook": {
       "title": "Auto-book",
@@ -3082,6 +3094,12 @@
     "unavailable": "No reliable data",
     "chapterPosition": "Vol. {volume} · Ch. {chapter} {title}",
     "readOnlyNote": "This panel only runs deterministic queries and surfaces reminders. It makes no LLM calls and never writes or repairs data automatically.",
+    "actions": {
+      "column": "Action",
+      "openThread": "Manage thread",
+      "openCharacterState": "Open character state",
+      "openChapter": "Open chapter"
+    },
     "summary": {
       "dueThreads": "Due threads {count}",
       "absentCharacters": "Characters currently absent {count}",
@@ -3241,6 +3259,8 @@
     "accepting": "Writing…",
     "stalePreview": "The state preview is missing valid confirmation data. Regenerate it before accepting.",
     "running": "Reading the prose and extracting state…",
+    "emptyTitle": "No state proposal has been generated",
+    "emptyDescription": "Opening this page does not call a model. “Start backfill” reads this chapter and creates a preview; formal state changes are written only after you accept the selected items.",
     "summaryLabel": "Chapter summary",
     "charactersLabel": "Character states",
     "currentStateLabel": "Current state",
@@ -3276,7 +3296,7 @@
     "scopeBook": "Whole book",
     "scopeVolume": "Current volume",
     "issuesOnly": "Show attention items only",
-    "readOnlyNotice": "This is a read-only list. “Rerun backfill” only locates the chapter and opens the existing state workflow; prose and summaries are not rewritten.",
+    "readOnlyNotice": "This is a read-only list. “Rerun backfill” only opens that chapter's state-proposal flow; generation still requires an explicit click and prose is not rewritten.",
     "legacyNotice": "{count} chapter(s) contain legacy data without enough evidence and are shown for manual review only.",
     "loading": "Auditing state completeness",
     "emptyTitle": "No attention items in this scope",

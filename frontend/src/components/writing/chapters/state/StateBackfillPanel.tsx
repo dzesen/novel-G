@@ -22,6 +22,8 @@ import type {
 interface StateBackfillPanelProps {
   novelId: string;
   chapterId: string;
+  chapterLabel?: string;
+  closeLabel?: string;
   onClose: () => void;
   onAccepted: () => void;
 }
@@ -44,11 +46,13 @@ const NEED_CONTENT_BACKEND_MESSAGE = "本章还没有已保存的正文，请先
  * 不同）与 `useRoster`（id → 名称），不新写一套事件机——`useOutlineStream` 内的
  * `runIdRef` 陈旧守卫是修过 Critical 的既有正确性保障。
  *
- * 本组件是独立单元，尚未挂进 ChapterWorkspace/ChapterNavigator（属于后续任务）。
+ * 本组件由连续性与状态模块持有；章节编辑器只负责保存当前草稿并导航到这里。
  */
 export function StateBackfillPanel({
   novelId,
   chapterId,
+  chapterLabel,
+  closeLabel,
   onClose,
   onAccepted,
 }: StateBackfillPanelProps) {
@@ -197,13 +201,18 @@ export function StateBackfillPanel({
     : false;
 
   return (
-    <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/25 px-4 py-6">
-      <div className="flex max-h-full w-full max-w-5xl flex-col rounded-md border border-border bg-surface shadow-lg">
-        <header className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
+    <div
+      data-testid="state-proposal-workspace"
+      className="flex h-full min-h-0 min-w-0 flex-col bg-background"
+    >
+        <header className="flex flex-col gap-3 border-b border-border bg-surface px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-6">
           <div className="min-w-0">
             <h3 className="text-base font-semibold text-foreground">{t("title")}</h3>
+            {chapterLabel && (
+              <p className="mt-1 truncate text-xs text-muted">{chapterLabel}</p>
+            )}
           </div>
-          <div className="flex shrink-0 gap-2">
+          <div className="flex shrink-0 flex-wrap gap-2">
             {stream.status === "running" ? (
               <Button variant="outline" size="sm" onPress={stream.cancel}>
                 {t("cancel")}
@@ -220,12 +229,12 @@ export function StateBackfillPanel({
               </Button>
             )}
             <Button variant="ghost" size="sm" onPress={onClose} isDisabled={accepting}>
-              {t("close")}
+              {closeLabel ?? t("close")}
             </Button>
           </div>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6">
           {roster.error && <Notice tone="warning">{roster.error}</Notice>}
 
           {/* context / id_remapping / id_validation 都先于结果帧到达并即时可见。 */}
@@ -267,6 +276,17 @@ export function StateBackfillPanel({
 
           {stream.status === "running" && !result && (
             <p className="py-10 text-center text-sm text-muted">{t("running")}</p>
+          )}
+
+          {stream.status !== "running" && !result && !stream.error && (
+            <div className="flex min-h-48 flex-col items-center justify-center px-4 text-center">
+              <p className="text-sm font-medium text-foreground">
+                {t("emptyTitle")}
+              </p>
+              <p className="mt-2 max-w-[60ch] text-xs leading-5 text-muted">
+                {t("emptyDescription")}
+              </p>
+            </div>
           )}
 
           {result && (
@@ -402,7 +422,7 @@ export function StateBackfillPanel({
           )}
         </div>
 
-        <footer className="flex justify-end gap-2 border-t border-border px-5 py-3">
+        <footer className="flex justify-end gap-2 border-t border-border bg-surface px-4 py-3 sm:px-6">
           <Button
             variant="primary"
             size="sm"
@@ -413,7 +433,6 @@ export function StateBackfillPanel({
             {accepting ? t("accepting") : t("accept")}
           </Button>
         </footer>
-      </div>
     </div>
   );
 }

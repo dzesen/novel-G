@@ -8,6 +8,8 @@ import type { CoreFaction, FactionRelation, FactionRelationType } from "@/types/
 interface RelationshipWorkspaceProps {
   mode: "create" | "edit";
   novelId?: string;
+  initialRelationId?: string;
+  onTargetValidation: (relationId: string, valid: boolean) => void;
 }
 
 const EDGE_COLORS: Record<FactionRelationType, string> = {
@@ -21,7 +23,12 @@ const EDGE_COLORS: Record<FactionRelationType, string> = {
   historical_enemy: "#9f1239",
 };
 
-export default function RelationshipWorkspace({ mode, novelId }: RelationshipWorkspaceProps) {
+export default function RelationshipWorkspace({
+  mode,
+  novelId,
+  initialRelationId,
+  onTargetValidation,
+}: RelationshipWorkspaceProps) {
   const t = useTranslations("writing.relationshipMap");
   const tf = useTranslations("writing.factions");
   const [factions, setFactions] = useState<CoreFaction[]>([]);
@@ -29,6 +36,7 @@ export default function RelationshipWorkspace({ mode, novelId }: RelationshipWor
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   const relationLabels: Record<FactionRelationType, string> = useMemo(() => ({
     hostile: tf("relationTypes.hostile"),
@@ -44,6 +52,7 @@ export default function RelationshipWorkspace({ mode, novelId }: RelationshipWor
   const load = useCallback(async () => {
     if (mode !== "edit" || !novelId) return;
     setLoading(true);
+    setLoaded(false);
     setError(null);
     try {
       const [factionResponse, relationResponse] = await Promise.all([
@@ -52,7 +61,12 @@ export default function RelationshipWorkspace({ mode, novelId }: RelationshipWor
       ]);
       setFactions(factionResponse.data);
       setRelations(relationResponse.data);
-      setSelectedId(relationResponse.data[0]?.relation_id ?? relationResponse.data[0]?._id ?? null);
+      setSelectedId(
+        relationResponse.data[0]?.relation_id ??
+          relationResponse.data[0]?._id ??
+          null,
+      );
+      setLoaded(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("loadFailed"));
     } finally {
@@ -61,6 +75,23 @@ export default function RelationshipWorkspace({ mode, novelId }: RelationshipWor
   }, [mode, novelId, t]);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    if (!initialRelationId || !loaded) return;
+    const matched = relations.find(
+      (relation) =>
+        relation.relation_id === initialRelationId ||
+        relation._id === initialRelationId,
+    );
+    onTargetValidation(initialRelationId, Boolean(matched));
+    if (matched) {
+      const key = matched.relation_id ?? matched._id ?? initialRelationId;
+      setSelectedId(key);
+      document
+        .getElementById(`relation-${key}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [initialRelationId, loaded, onTargetValidation, relations]);
 
   const nodes = useMemo(() => {
     const centerX = 430;
@@ -149,7 +180,7 @@ export default function RelationshipWorkspace({ mode, novelId }: RelationshipWor
               const sourceName = relation.source_faction_name ?? nodeById.get(relation.source_faction_id)?.faction.name ?? tf("unknownFaction");
               const targetName = relation.target_faction_name ?? nodeById.get(relation.target_faction_id)?.faction.name ?? tf("unknownFaction");
               return (
-                <button key={key} type="button" onClick={() => setSelectedId(key)} className={`mb-2 w-full rounded-lg border p-3 text-left transition-colors ${key === selectedId ? "border-accent bg-accent/8" : "border-border hover:bg-surface-secondary"}`}>
+                <button id={`relation-${key}`} key={key} type="button" onClick={() => setSelectedId(key)} className={`mb-2 w-full rounded-lg border p-3 text-left transition-colors ${key === selectedId ? "border-accent bg-accent/8" : "border-border hover:bg-surface-secondary"}`}>
                   <div className="flex items-center justify-between gap-2 text-sm font-medium text-foreground"><span>{sourceName} → {targetName}</span><span className="shrink-0 text-xs" style={{ color: EDGE_COLORS[relation.relation_type] }}>{relationLabels[relation.relation_type]}</span></div>
                   <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted">{relation.current_state || relation.core_conflict || t("noDescription")}</p>
                 </button>

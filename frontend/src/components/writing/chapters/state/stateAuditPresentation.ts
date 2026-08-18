@@ -26,6 +26,14 @@ export function visibleAuditChapters<T extends StateAuditChapterLike>(
   return chapters.filter((chapter) => !HEALTHY_CATEGORIES.has(chapter.category));
 }
 
+export function stateAuditIssueId(
+  chapter: StateAuditChapterLike,
+): string | null {
+  return HEALTHY_CATEGORIES.has(chapter.category)
+    ? null
+    : `state-completeness:${chapter.chapter_id}`;
+}
+
 export function auditCategoryTone(category: string): StateAuditTone {
   if (
     category === "degraded_all_character_updates_dropped" ||

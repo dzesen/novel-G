@@ -872,6 +872,7 @@
         "relationships": "关系",
         "candidates": "资料候选",
         "continuityOverview": "总览",
+        "stateIssues": "状态问题",
         "facts": "人物状态与事实",
         "threads": "伏笔",
         "health": "故事健康"
@@ -904,6 +905,17 @@
       "continuityTargetBody": "目标链接已被安全保留，但当前版本不会猜测对应事实或提案。可先查看确定性故事健康或人物状态与事实。",
       "openHealth": "查看故事健康",
       "openFacts": "查看人物状态与事实"
+    },
+    "continuity": {
+      "locatingTarget": "正在核对连续性目标…",
+      "targetLoadFailed": "连续性目标暂时无法读取",
+      "proposalNeedsChapterTitle": "请先选择需要回填状态的章节",
+      "proposalNeedsChapterBody": "状态提案必须绑定一章已保存的正式正文；可从状态问题清单选择建议重新回填的章节。",
+      "proposalNeedsProseTitle": "本章还没有可用于状态回填的正文",
+      "proposalNeedsProseBody": "先返回章节完成并保存正文，再由这里生成状态提案。打开本页不会调用模型。",
+      "openStateIssues": "查看状态问题",
+      "openWriting": "打开章节写作",
+      "backToStateIssues": "返回状态问题"
     },
     "autoBook": {
       "title": "自动成书",
@@ -3082,6 +3094,12 @@
     "unavailable": "暂无可靠数据",
     "chapterPosition": "第{volume}卷·第{chapter}章 {title}",
     "readOnlyNote": "本面板只做确定性查询与提示，不会发起 LLM 调用，也不会自动写入或修复任何数据。",
+    "actions": {
+      "column": "处理",
+      "openThread": "管理伏笔",
+      "openCharacterState": "查看人物状态",
+      "openChapter": "打开章节"
+    },
     "summary": {
       "dueThreads": "到期伏笔 {count}",
       "absentCharacters": "当前缺席角色 {count}",
@@ -3241,6 +3259,8 @@
     "accepting": "写入中…",
     "stalePreview": "状态预览缺少有效确认凭据，请重新生成后再接受。",
     "running": "正在读正文并回填状态…",
+    "emptyTitle": "状态提案尚未生成",
+    "emptyDescription": "打开本页不会调用模型。点击“开始回填”后才会读取本章正文并生成预览；只有接受所选内容后才写入正式状态。",
     "summaryLabel": "本章摘要",
     "charactersLabel": "角色状态",
     "currentStateLabel": "当下状态",
@@ -3276,7 +3296,7 @@
     "scopeBook": "整本",
     "scopeVolume": "当前卷",
     "issuesOnly": "仅显示需关注项",
-    "readOnlyNotice": "这是只读清单。点击“重新回填”只会定位章节并打开现有状态回填流程，正文与摘要不会被重写。",
+    "readOnlyNotice": "这是只读清单。点击“重新回填”只会打开该章的状态提案流程；生成前仍需明确点击，正文不会被重写。",
     "legacyNotice": "其中 {count} 章为证据不足的旧数据，仅提示人工复核。",
     "loading": "正在审计状态完整性",
     "emptyTitle": "当前范围没有需关注的问题",

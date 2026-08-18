@@ -12,10 +12,16 @@ import type {
   StoryHealthReport,
   VolumeWordCountHealth,
 } from "@/types/storyHealth";
+import { storyHealthIssueTargets } from "./storyHealthPresentation";
 
 interface Props {
   mode: "create" | "edit";
   novelId?: string;
+  initialIssueId?: string;
+  onIssueTargetValidation: (issueId: string, valid: boolean) => void;
+  onOpenThread: (threadId: string) => void;
+  onOpenChapter: (chapterId: string) => void;
+  onOpenCharacterState: (cardId: string) => void;
 }
 
 const DUE_BADGE_CLASSES: Record<StoryHealthDueState, string> = {
@@ -39,7 +45,14 @@ const DEVIATION_BADGE_CLASSES: Record<StoryHealthDeviationState, string> = {
   no_chapters: "bg-surface-secondary text-muted",
 };
 
-export default function StoryHealthWorkspace({ novelId }: Props) {
+export default function StoryHealthWorkspace({
+  novelId,
+  initialIssueId,
+  onIssueTargetValidation,
+  onOpenThread,
+  onOpenChapter,
+  onOpenCharacterState,
+}: Props) {
   const t = useTranslations("storyHealth");
   const locale = useLocale();
   const [report, setReport] = useState<StoryHealthReport | null>(null);
@@ -70,10 +83,6 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
-
-  if (!novelId) {
-    return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;
-  }
 
   const positionLabel = (position: StoryHealthChapterPosition | null) => {
     if (!position) return t("unmappedPosition");
@@ -106,6 +115,27 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
     ? report.summary.due_plot_thread_count +
       report.summary.overdue_plot_thread_count
     : 0;
+  const issueTargets = useMemo(
+    () => (report ? storyHealthIssueTargets(report) : []),
+    [report],
+  );
+
+  useEffect(() => {
+    if (!report || !initialIssueId) return;
+    const matched = issueTargets.some(
+      (target) => target.issueId === initialIssueId,
+    );
+    onIssueTargetValidation(initialIssueId, matched);
+    if (matched) {
+      document
+        .getElementById(initialIssueId)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [initialIssueId, issueTargets, onIssueTargetValidation, report]);
+
+  if (!novelId) {
+    return <div className="p-6 text-sm text-muted">{t("needNovel")}</div>;
+  }
 
   return (
     <div className="h-full overflow-y-auto">
@@ -228,11 +258,22 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
                         <th scope="col" className="px-4 py-3 font-medium">
                           {t("plotThreads.columns.due")}
                         </th>
+                        <th scope="col" className="px-4 py-3 font-medium">
+                          {t("actions.column")}
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
-                      {report.plot_threads.map((thread) => (
-                        <tr key={thread.thread_id}>
+                      {report.plot_threads.map((thread) => {
+                        const issueId = thread.attention_required
+                          ? `story-health:thread:${thread.thread_id}`
+                          : undefined;
+                        return (
+                        <tr
+                          id={issueId}
+                          key={thread.thread_id}
+                          className={initialIssueId === issueId ? "bg-accent/8" : undefined}
+                        >
                           <td className="px-4 py-3">
                             <div className="font-medium text-foreground">
                               {thread.name}
@@ -262,8 +303,18 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
                               {dueLabel(thread)}
                             </span>
                           </td>
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => onOpenThread(thread.thread_id)}
+                              className="min-h-9 whitespace-nowrap rounded-md border border-border px-3 text-xs font-medium text-foreground hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            >
+                              {t("actions.openThread")}
+                            </button>
+                          </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -305,11 +356,22 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
                         <th scope="col" className="px-4 py-3 font-medium">
                           {t("characters.columns.lastPresent")}
                         </th>
+                        <th scope="col" className="px-4 py-3 font-medium">
+                          {t("actions.column")}
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
-                      {report.character_absences.map((character) => (
-                        <tr key={character.card_id}>
+                      {report.character_absences.map((character) => {
+                        const issueId = character.currently_absent
+                          ? `story-health:character:${character.card_id}`
+                          : undefined;
+                        return (
+                        <tr
+                          id={issueId}
+                          key={character.card_id}
+                          className={initialIssueId === issueId ? "bg-accent/8" : undefined}
+                        >
                           <td className="px-4 py-3">
                             <span className="font-medium text-foreground">
                               {character.name}
@@ -337,8 +399,18 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
                               ? t("characters.neverPresent")
                               : positionLabel(character.last_present_at)}
                           </td>
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => onOpenCharacterState(character.card_id)}
+                              className="min-h-9 whitespace-nowrap rounded-md border border-border px-3 text-xs font-medium text-foreground hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                            >
+                              {t("actions.openCharacterState")}
+                            </button>
+                          </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -369,6 +441,7 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
                   rows={report.word_counts.volumes}
                   locale={locale}
                   t={t}
+                  initialIssueId={initialIssueId}
                 />
                 <WordCountTable
                   title={t("wordCounts.writtenChapters")}
@@ -376,6 +449,8 @@ export default function StoryHealthWorkspace({ novelId }: Props) {
                   rows={writtenChapters}
                   locale={locale}
                   t={t}
+                  initialIssueId={initialIssueId}
+                  onOpenChapter={onOpenChapter}
                 />
               </div>
             </section>
@@ -398,6 +473,8 @@ interface WordCountTableProps {
   rows: WordCountRow[];
   locale: string;
   t: ReturnType<typeof useTranslations<"storyHealth">>;
+  initialIssueId?: string;
+  onOpenChapter?: (chapterId: string) => void;
 }
 
 function WordCountTable({
@@ -406,6 +483,8 @@ function WordCountTable({
   rows,
   locale,
   t,
+  initialIssueId,
+  onOpenChapter,
 }: WordCountTableProps) {
   const numberFormatter = new Intl.NumberFormat(locale);
   const percentFormatter = new Intl.NumberFormat(locale, {
@@ -437,12 +516,25 @@ function WordCountTable({
                 <th scope="col" className="px-4 py-3 font-medium">
                   {t("wordCounts.columns.deviation")}
                 </th>
+                {onOpenChapter && (
+                  <th scope="col" className="px-4 py-3 font-medium">
+                    {t("actions.column")}
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {rows.map((row) => (
+              {rows.map((row) => {
+                const issueId = row.attention_required
+                  ? isVolume(row)
+                    ? `story-health:volume:${row.volume_id}`
+                    : `story-health:chapter:${row.chapter_id}`
+                  : undefined;
+                return (
                 <tr
+                  id={issueId}
                   key={isVolume(row) ? row.volume_id : row.chapter_id}
+                  className={initialIssueId === issueId ? "bg-accent/8" : undefined}
                 >
                   <td className="px-4 py-3">
                     <div className="font-medium text-foreground">
@@ -487,8 +579,20 @@ function WordCountTable({
                           })}
                     </span>
                   </td>
+                  {onOpenChapter && !isVolume(row) && (
+                    <td className="px-4 py-3">
+                      <button
+                        type="button"
+                        onClick={() => onOpenChapter(row.chapter_id)}
+                        className="min-h-9 whitespace-nowrap rounded-md border border-border px-3 text-xs font-medium text-foreground hover:border-accent hover:text-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      >
+                        {t("actions.openChapter")}
+                      </button>
+                    </td>
+                  )}
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
