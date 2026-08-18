@@ -148,7 +148,7 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
     facts: ["card", "chapter", "issue", "run", "suggestion"],
     threads: ["chapter", "issue", "run", "suggestion"],
     health: ["volume", "chapter", "issue"],
-    "state-issues": ["chapter", "issue", "run"],
+    "state-issues": ["volume", "chapter", "issue", "run"],
     proposals: ["chapter", "issue", "run", "suggestion"],
   },
 };
