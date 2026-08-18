@@ -1,5 +1,11 @@
 import type { WritingDraft } from "@/types/novel";
-import { buildUserStorageKey } from "@/lib/userStorage";
+import { buildUserStorageKey } from "./userStorage.ts";
+import { isWritingDraft } from "./novelCreationDraft.ts";
+
+export interface StoredWritingDraft {
+  draftId: string;
+  draft: WritingDraft;
+}
 
 function draftKey(draftId: string): string | null {
   return buildUserStorageKey("draft", draftId);
@@ -21,13 +27,26 @@ function createDraftId(): string {
   return `${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 
-function getCurrentDraftId(): string | null {
+function getCurrentDraftIds(): string[] {
+  const result: string[] = [];
   try {
     const key = currentDraftKey();
-    return key ? localStorage.getItem(key) : null;
+    const localValue = key ? localStorage.getItem(key) : null;
+    if (localValue) result.push(localValue);
   } catch {
-    return null;
+    // localStorage 不可用时继续读取 sessionStorage。
   }
+
+  try {
+    const key = currentDraftKey();
+    const sessionValue = key ? sessionStorage.getItem(key) : null;
+    if (sessionValue && !result.includes(sessionValue)) {
+      result.push(sessionValue);
+    }
+  } catch {
+    // ignore
+  }
+  return result;
 }
 
 function parseDraft(raw: string | null): WritingDraft | null {
@@ -37,29 +56,44 @@ function parseDraft(raw: string | null): WritingDraft | null {
 
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      return parsed as WritingDraft;
-    }
+    return isWritingDraft(parsed) ? parsed : null;
   } catch {
     return null;
   }
+}
 
-  return null;
+function loadExactWritingDraft(draftId: string): WritingDraft | null {
+  const key = draftKey(draftId);
+  if (!key) return null;
+
+  try {
+    const draft = parseDraft(localStorage.getItem(key));
+    if (draft) return draft;
+  } catch {
+    // localStorage 不可用时继续读取 sessionStorage。
+  }
+
+  try {
+    return parseDraft(sessionStorage.getItem(key));
+  } catch {
+    return null;
+  }
 }
 
 function persistWritingDraft(draft: WritingDraft, draftId: string): void {
   const serialized = JSON.stringify(draft);
+  const itemKey = draftKey(draftId);
+  const currentKey = currentDraftKey();
+  if (!itemKey || !currentKey) return;
 
   try {
-    const itemKey = draftKey(draftId);
-    const currentKey = currentDraftKey();
-    if (!itemKey || !currentKey) return;
     localStorage.setItem(itemKey, serialized);
     localStorage.setItem(currentKey, draftId);
+    return;
   } catch {
     try {
-      const sessionKey = fallbackDraftKey();
-      if (sessionKey) sessionStorage.setItem(sessionKey, serialized);
+      sessionStorage.setItem(itemKey, serialized);
+      sessionStorage.setItem(currentKey, draftId);
     } catch {
       // ignore
     }
@@ -92,33 +126,31 @@ export function saveWritingDraft(draft: WritingDraft): string {
  *   找到的创建草稿；不存在或解析失败时返回 null。
  */
 export function loadWritingDraft(draftId?: string): WritingDraft | null {
-  const candidateKeys: string[] = [];
   if (draftId) {
-    const key = draftKey(draftId);
-    if (key) candidateKeys.push(key);
+    return loadExactWritingDraft(draftId);
   }
 
-  try {
-    const currentKey = currentDraftKey();
-    const currentDraftId = currentKey ? localStorage.getItem(currentKey) : null;
-    if (currentDraftId) {
-      const key = draftKey(currentDraftId);
-      if (key) candidateKeys.push(key);
-    }
+  return loadCurrentWritingDraft()?.draft ?? null;
+}
 
-    for (const key of Array.from(new Set(candidateKeys))) {
-      const draft = parseDraft(localStorage.getItem(key));
-      if (draft) {
-        return draft;
-      }
-    }
-  } catch {
-    // localStorage 不可用时继续尝试旧的 sessionStorage 草稿。
+/** 返回可恢复的当前草稿及其稳定 ID。 */
+export function loadCurrentWritingDraft(): StoredWritingDraft | null {
+  for (const currentDraftId of getCurrentDraftIds()) {
+    const draft = loadExactWritingDraft(currentDraftId);
+    if (draft) return { draftId: currentDraftId, draft };
   }
 
   try {
     const sessionKey = fallbackDraftKey();
-    return sessionKey ? parseDraft(sessionStorage.getItem(sessionKey)) : null;
+    const legacyDraft = sessionKey
+      ? parseDraft(sessionStorage.getItem(sessionKey))
+      : null;
+    if (!legacyDraft) return null;
+
+    const draftId = createDraftId();
+    persistWritingDraft(legacyDraft, draftId);
+    if (sessionKey) sessionStorage.removeItem(sessionKey);
+    return { draftId, draft: legacyDraft };
   } catch {
     return null;
   }
@@ -138,17 +170,31 @@ export function updateWritingDraft(
   draftId: string | undefined,
   updater: (draft: WritingDraft) => WritingDraft,
 ): WritingDraft | null {
-  const currentDraftId = draftId || getCurrentDraftId() || undefined;
-  const currentDraft = loadWritingDraft(currentDraftId);
+  const storedDraft = draftId
+    ? { draftId, draft: loadExactWritingDraft(draftId) }
+    : loadCurrentWritingDraft();
 
-  if (!currentDraft) {
+  if (!storedDraft?.draft) {
     return null;
   }
 
-  const nextDraft = updater(currentDraft);
+  const nextDraft = updater(storedDraft.draft);
   // 创建态所有临时 UI 状态都跟随草稿 ID 写回，刷新后才能恢复对话和版本栈。
-  persistWritingDraft(nextDraft, currentDraftId || createDraftId());
+  persistWritingDraft(nextDraft, storedDraft.draftId);
   return nextDraft;
+}
+
+function clearStorageDraft(storage: Storage, draftId?: string): void {
+  const currentKey = currentDraftKey();
+  const currentDraftId = currentKey ? storage.getItem(currentKey) : null;
+  const targetDraftId = draftId || currentDraftId;
+  if (targetDraftId) {
+    const key = draftKey(targetDraftId);
+    if (key) storage.removeItem(key);
+  }
+  if (!draftId || currentDraftId === draftId) {
+    if (currentKey) storage.removeItem(currentKey);
+  }
 }
 
 /**
@@ -162,21 +208,13 @@ export function updateWritingDraft(
  */
 export function clearWritingDraft(draftId?: string): void {
   try {
-    if (draftId) {
-      const key = draftKey(draftId);
-      if (key) localStorage.removeItem(key);
-    }
-
-    const currentKey = currentDraftKey();
-    const currentDraftId = currentKey ? localStorage.getItem(currentKey) : null;
-    if (!draftId || currentDraftId === draftId) {
-      if (currentKey) localStorage.removeItem(currentKey);
-    }
+    clearStorageDraft(localStorage, draftId);
   } catch {
     // 清理失败不应阻塞页面跳转或小说保存。
   }
 
   try {
+    clearStorageDraft(sessionStorage, draftId);
     const sessionKey = fallbackDraftKey();
     if (sessionKey) sessionStorage.removeItem(sessionKey);
   } catch {

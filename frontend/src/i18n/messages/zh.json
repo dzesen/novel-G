@@ -634,6 +634,7 @@
     "deletedAt": "删除时间",
     "goWriting": "进入创作页",
     "aiCompleteRedirect": "AI 生成完成，正在跳转到创作页...",
+    "draftRedirect": "正在打开可编辑的书籍蓝图…",
     "coverAssetMissing": "封面素材缺失"
   },
   "novel": {
@@ -711,6 +712,35 @@
     "createSuccess": "小说创建成功！",
     "createFailed": "创建失败",
     "back": "返回书架",
+    "entry": {
+      "eyebrow": "统一建书入口",
+      "title": "选择建书方式",
+      "aiTitle": "用 AI 创意建立蓝图",
+      "description": "三种方式只决定蓝图如何起步；进入下一页后都可逐项修改，最后由你确认建书。",
+      "sharedDraftHint": "离开蓝图页不会丢失内容；返回这里可继续或明确丢弃当前草稿。",
+      "backToMethods": "返回方式选择",
+      "recoveryEyebrow": "可继续的蓝图草稿",
+      "untitledDraft": "未命名蓝图",
+      "continueDraft": "继续编辑",
+      "discardDraft": "丢弃草稿",
+      "method": {
+        "blank": {
+          "eyebrow": "不调用模型",
+          "title": "空白蓝图",
+          "description": "从空白表单开始，自己填写故事方向、规模与文风。"
+        },
+        "ai": {
+          "eyebrow": "分步生成",
+          "title": "AI 创意",
+          "description": "输入一个想法，明确发起模型调用后生成可编辑的蓝图初稿。"
+        },
+        "cards": {
+          "eyebrow": "导入并审核",
+          "title": "酒馆卡驱动",
+          "description": "先逐项确认角色卡与世界卡的入库决策，再生成同一蓝图草稿。"
+        }
+      }
+    },
     "director": {
       "title": "创意总监（可选）",
       "description": "先生成 3 个可比较的长篇方向，由你确认后再进入原有四步建书。默认关闭；启用后会产生额外模型用量，格式修复时可能追加请求。",
@@ -1101,13 +1131,26 @@
       }
     },
     "novelInfo": {
-      "createTitle": "创建新小说",
-      "createDescription": "以下信息由 AI 生成，你可以复核和调整后保存创建。",
+      "createTitle": "确认书籍蓝图",
+      "createDescription": {
+        "blank": "这是空白蓝图。填写必要信息后，由你执行最终确认。",
+        "ai_idea": "AI 只提供蓝图初稿；请逐项复核和调整，再由你执行最终确认。",
+        "tavern_cards": "卡片映射决策和创意方向已汇入蓝图；请复核后执行最终确认。",
+        "legacy": "请复核并补全这份蓝图，再由你执行最终确认。"
+      },
+      "origin": {
+        "blank": "起点：空白蓝图",
+        "ai_idea": "起点：AI 创意",
+        "tavern_cards": "起点：酒馆卡驱动",
+        "legacy": "起点：旧版创建草稿"
+      },
       "editTitle": "小说信息",
-      "noDraft": "未找到创建草稿，请从书架页发起 AI 创作。",
-      "saveCreate": "保存并创建小说",
-      "saveOnly": "仅保存",
-      "saveAndCurate": "保存并整理资料卡",
+      "noDraftTitle": "这个蓝图链接已失效",
+      "noDraft": "没有找到链接指向的草稿。你可以立即建立空白蓝图，或返回统一入口选择其他方式。",
+      "startBlankDraft": "建立空白蓝图",
+      "chooseCreationMethod": "选择其他建书方式",
+      "backToMethods": "返回方式选择",
+      "confirmBlueprint": "确认蓝图并创建小说",
       "creating": "创建中...",
       "createSuccess": "小说创建成功！",
       "createFailed": "创建失败",

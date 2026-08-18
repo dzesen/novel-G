@@ -12,6 +12,7 @@ import {
   stageCardAvatarHandoff,
 } from "@/lib/cardAvatarHandoff";
 import { cardImportErrorMessage } from "@/lib/cardImportErrors";
+import { createGeneratedWritingDraft } from "@/lib/novelCreationDraft";
 import { saveWritingDraft } from "@/lib/writingDraft";
 import type {
   AICreateResponse,
@@ -20,7 +21,6 @@ import type {
   CardImportDecision,
   CardImportDirectionReference,
   CardImportProposal,
-  WritingDraft,
 } from "@/types/novel";
 import type { CreativeDirectionSelection } from "@/types/agent";
 import { referenceMatchKind } from "../writing/generationMetadataPresentation";
@@ -258,35 +258,18 @@ export default function CardDrivenCreatePanel({
       setError(t("directionBindingMissing"));
       return;
     }
-    const meta = result.novel_meta;
-    const plot = result.expand_idea?.plot ?? result.extract_idea.plot ?? "";
-    const draft: WritingDraft = {
-      _fromAI: true,
-      title: meta.title,
-      subtitle: meta.subtitle,
-      genre: result.extract_idea.genre,
-      tags: meta.tags,
-      introduction: meta.introduction,
-      summary: meta.summary,
-      core_seed: result.core_seed.core_seed,
-      worldview: meta.worldview,
-      writing_style: meta.writing_style,
-      narrative_pov: meta.narrative_pov,
-      era_background: meta.era_background,
-      plot,
-      tone: result.extract_idea.tone,
-      target_audience: result.extract_idea.target_audience,
-      core_idea: result.extract_idea.core_idea,
-      number_of_chapters: chapters,
-      words_per_chapter: wordsPerChapter,
-      creation_mode: "ai",
-      creative_direction: creativeDirection,
-      card_creation_id: newCreationId(),
-      card_imports: creationSelections,
-      card_avatar_proposal_ids: proposals
+    const draft = createGeneratedWritingDraft({
+      result,
+      chapters,
+      wordsPerChapter,
+      creativeDirection,
+      origin: "tavern_cards",
+      cardCreationId: newCreationId(),
+      cardImports: creationSelections,
+      cardAvatarProposalIds: proposals
         .filter((proposal) => proposal.avatar_preview?.importable)
         .map((proposal) => proposal.proposal_id),
-    };
+    });
     const draftId = saveWritingDraft(draft);
     clearAICreateCache();
     setRedirecting(true);
@@ -323,7 +306,7 @@ export default function CardDrivenCreatePanel({
               size="sm"
               onPress={() => void discardAndCancel()}
             >
-              {tc("back")}
+              {tc("entry.backToMethods")}
             </Button>
           </div>
         </Card.Header>
@@ -331,7 +314,7 @@ export default function CardDrivenCreatePanel({
         <Card.Content className="flex-1 overflow-y-auto">
           {redirecting ? (
             <div className="flex items-center justify-center h-32">
-              <p className="text-sm text-muted">{tb("aiCompleteRedirect")}</p>
+              <p className="text-sm text-muted">{tb("draftRedirect")}</p>
             </div>
           ) : stage === "upload" ? (
             <div className="space-y-5 p-1">

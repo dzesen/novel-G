@@ -21,7 +21,6 @@ import {
   type GenerationStepKind,
   type ReferenceCleanupPresentation,
   type ReferenceRemapPresentation,
-// @ts-expect-error Node's strip-types test runner requires the source extension.
 } from "../../generationMetadataPresentation.ts";
 
 export interface StepBadge {

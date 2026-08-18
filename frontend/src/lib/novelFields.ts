@@ -1,3 +1,8 @@
+import {
+  MAX_WORDS_PER_CHAPTER,
+  MIN_WORDS_PER_CHAPTER,
+} from "@/lib/novelCreationLimits";
+
 export type SectionKey = "basic" | "creative" | "scale" | "content" | "style";
 
 export type NovelInfoFieldType =
@@ -11,6 +16,8 @@ export type NovelInfoFieldType =
 export interface NovelInfoFieldDef {
   key: string;
   type: NovelInfoFieldType;
+  min?: number;
+  max?: number;
   options?: { value: string; labelKey: string }[];
 }
 
@@ -35,8 +42,13 @@ export const SECTION_FIELDS: Record<SectionKey, NovelInfoFieldDef[]> = {
     { key: "target_audience", type: "text" },
   ],
   scale: [
-    { key: "number_of_chapters", type: "number" },
-    { key: "words_per_chapter", type: "number" },
+    { key: "number_of_chapters", type: "number", min: 1, max: 10000 },
+    {
+      key: "words_per_chapter",
+      type: "number",
+      min: MIN_WORDS_PER_CHAPTER,
+      max: MAX_WORDS_PER_CHAPTER,
+    },
   ],
   content: [
     { key: "introduction", type: "textarea" },

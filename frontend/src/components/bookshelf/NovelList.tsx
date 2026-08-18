@@ -13,7 +13,6 @@ interface NovelListProps {
   loading: boolean;
   onSelect: (id: string) => void;
   onNewNovel: () => void;
-  onCardDrivenNovel: () => void;
   onOpenTrash: () => void;
 }
 
@@ -23,7 +22,6 @@ export default function NovelList({
   loading,
   onSelect,
   onNewNovel,
-  onCardDrivenNovel,
   onOpenTrash,
 }: NovelListProps) {
   const t = useTranslations("bookshelf");
@@ -64,29 +62,6 @@ export default function NovelList({
           </svg>
         </Button>
       </div>
-      <Button
-        variant="secondary"
-        className="w-full shrink-0"
-        onPress={onCardDrivenNovel}
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H18" />
-          <path d="M8 5h11v14H8z" />
-          <path d="m12 9 3 3-3 3" />
-        </svg>
-        {t("newFromTavernCards")}
-      </Button>
-
       {/* Novel Count */}
       {!loading && novels.length > 0 && (
         <p className="text-xs text-muted px-1">

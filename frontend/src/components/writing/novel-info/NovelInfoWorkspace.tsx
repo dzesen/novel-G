@@ -19,6 +19,7 @@ import {
   CardAvatarSourceUnavailable,
   isPermanentCardAvatarTransferFailure,
 } from "@/lib/cardAvatarTransfer";
+import { createBlankWritingDraft } from "@/lib/novelCreationDraft";
 import type {
   CreateNovelRequest,
   NovelDetail,
@@ -26,7 +27,12 @@ import type {
   WritingDraft,
   WritingDraftRewriteState,
 } from "@/types/novel";
-import { clearWritingDraft, loadWritingDraft, updateWritingDraft } from "@/lib/writingDraft";
+import {
+  clearWritingDraft,
+  loadWritingDraft,
+  saveWritingDraft,
+  updateWritingDraft,
+} from "@/lib/writingDraft";
 import { normalizeRewriteState } from "@/lib/rewriteDraftState";
 import NovelInfoSection, { type SectionKey } from "./NovelInfoSection";
 import NovelRewriteAssistant from "./NovelRewriteAssistant";
@@ -130,13 +136,13 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
   }, [mode, loadNovel, draftId]);
 
   /* create novel */
-  const handleCreate = async (openCardCuration: boolean) => {
+  const handleCreate = async () => {
     let createdNovelId: string | null = null;
     try {
       setCreating(true);
       const sourceDraft = data as Partial<WritingDraft>;
       const payload: CreateNovelRequest = {
-        title: String(data.title || ""),
+        title: String(data.title || "").trim(),
         subtitle: data.subtitle ? String(data.subtitle) : undefined,
         genre: data.genre ? String(data.genre) : undefined,
         tags: Array.isArray(data.tags) ? data.tags : undefined,
@@ -218,10 +224,6 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       destinationParams.delete("draft");
       destinationParams.delete("cardType");
       destinationParams.delete("curateCards");
-      if (openCardCuration) {
-        destinationParams.set("cardType", "character");
-        destinationParams.set("curateCards", "1");
-      }
       const destinationSearch = destinationParams.toString();
       router.push(
         `/${locale}/writing/${res.id}${
@@ -263,14 +265,18 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
     }));
   };
 
-  const discardCreateDraft = async () => {
-    const avatarProposalIds =
-      (data as Partial<WritingDraft>).card_avatar_proposal_ids ?? [];
-    await deleteCardAvatarHandoffs(avatarProposalIds).catch(
-      () => undefined,
+  const returnToCreationMethods = () => {
+    router.push(`/${locale}?create=1`);
+  };
+
+  const recoverWithBlankDraft = () => {
+    const draft = createBlankWritingDraft();
+    const nextDraftId = saveWritingDraft(draft);
+    setData(draft as unknown as Record<string, unknown>);
+    setNoDraft(false);
+    router.replace(
+      `/${locale}/writing/new?draft=${encodeURIComponent(nextDraftId)}`,
     );
-    clearWritingDraft(draftId);
-    router.push(`/${locale}`);
   };
 
   /* danger confirm promise */
@@ -308,20 +314,27 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
 
   if (mode === "create" && noDraft) {
     return (
-      <div className="flex flex-col items-center justify-center h-64 gap-3">
-        <p className="text-muted">{tw("noDraft")}</p>
-        <Button
-          variant="outline"
-          onPress={() => {
-            clearWritingDraft(draftId);
-            router.push(`/${locale}`);
-          }}
-        >
-          {twd("backToCreate")}
-        </Button>
+      <div className="flex h-64 flex-col items-center justify-center gap-3 px-5 text-center">
+        <h2 className="text-lg font-semibold text-foreground">
+          {tw("noDraftTitle")}
+        </h2>
+        <p className="max-w-lg text-sm leading-6 text-muted">
+          {tw("noDraft")}
+        </p>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button variant="primary" onPress={recoverWithBlankDraft}>
+            {tw("startBlankDraft")}
+          </Button>
+          <Button variant="outline" onPress={returnToCreationMethods}>
+            {tw("chooseCreationMethod")}
+          </Button>
+        </div>
       </div>
     );
   }
+
+  const creationOrigin =
+    (data as Partial<WritingDraft>)._creationOrigin ?? "legacy";
 
   return (
     <div className="flex flex-col h-full">
@@ -357,7 +370,14 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
           {mode === "create" ? tw("createTitle") : tw("editTitle")}
         </h2>
         {mode === "create" && (
-          <p className="text-sm text-muted mt-1">{tw("createDescription")}</p>
+          <>
+            <p className="mt-1 text-sm text-muted">
+              {tw(`createDescription.${creationOrigin}`)}
+            </p>
+            <p className="mt-2 text-xs font-medium text-accent">
+              {tw(`origin.${creationOrigin}`)}
+            </p>
+          </>
         )}
       </div>
 
@@ -406,24 +426,17 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         <StickyActionBar>
           <Button
             variant="ghost"
-            onPress={() => void discardCreateDraft()}
+            onPress={returnToCreationMethods}
           >
-            {twd("backToCreate")}
-          </Button>
-          <Button
-            variant="outline"
-            onPress={() => void handleCreate(false)}
-            isDisabled={creating || !data.title}
-          >
-            {creating ? tw("creating") : tw("saveOnly")}
+            {tw("backToMethods")}
           </Button>
           <Button
             variant="primary"
-            onPress={() => void handleCreate(true)}
-            isDisabled={creating || !data.title}
+            onPress={() => void handleCreate()}
+            isDisabled={creating || !String(data.title || "").trim()}
             className="bg-accent text-white hover:bg-accent-hover"
           >
-            {creating ? tw("creating") : tw("saveAndCurate")}
+            {creating ? tw("creating") : tw("confirmBlueprint")}
           </Button>
         </StickyActionBar>
       )}

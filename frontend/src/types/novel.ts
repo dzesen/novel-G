@@ -626,9 +626,11 @@ export type AICreateCachedSteps = Partial<{
   novel_meta: AICreateResponse["novel_meta"];
 }>;
 
-/** AI 创建草稿，用于本地存储传递到 Writing 创建态 */
+/** 统一建书草稿，用于三种入口向 Writing 蓝图确认页传递数据。 */
 export interface WritingDraft extends CreateNovelRequest {
   _fromAI?: boolean;
+  _draftSchemaVersion?: 1;
+  _creationOrigin?: "blank" | "ai_idea" | "tavern_cards";
   _rewriteState?: WritingDraftRewriteState;
   card_avatar_proposal_ids?: string[];
 }

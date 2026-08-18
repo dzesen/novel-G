@@ -404,7 +404,8 @@ export default function NovelInfoSection({
             className="w-full rounded-lg border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
             value={val != null ? Number(val) : ""}
             onChange={(e) => updateField(f.key, e.target.value ? Number(e.target.value) : undefined)}
-            min={0}
+            min={f.min}
+            max={f.max}
           />
         </div>
       );
