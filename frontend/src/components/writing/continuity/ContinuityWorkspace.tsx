@@ -150,6 +150,19 @@ export default function ContinuityWorkspace({
     selectRecord: selectAgentRun,
     onTargetValidation,
   });
+  const chapterMatchesVolume =
+    targets.chapter &&
+    targets.volume &&
+    chapterTarget.status === "ready" &&
+    volumeTarget.status === "ready"
+      ? chapterTarget.data.volume_id === volumeTarget.data._id
+      : null;
+
+  useEffect(() => {
+    if (!targets.chapter || chapterMatchesVolume === null) return;
+    onTargetValidation("chapter", targets.chapter, chapterMatchesVolume);
+  }, [chapterMatchesVolume, onTargetValidation, targets.chapter]);
+
   const tabs: WorkspaceViewTab[] = useMemo(
     () => [
       { view: "overview", label: t("views.continuityOverview") },
