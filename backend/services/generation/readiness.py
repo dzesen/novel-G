@@ -651,6 +651,8 @@ class GenerationReadinessModule:
         supplied_digest: str | None,
         acknowledged_warning_codes: Iterable[str],
     ) -> dict[str, Any]:
+        if report.get("version") != 2:
+            raise StaleReadiness("生成前检查版本无效，请重新检查后再启动")
         current_digest = str(report.get("digest") or "")
         automatic_confirmation_required = any(
             item.get("code") == "automatic_continuations_require_confirmation"
@@ -682,6 +684,7 @@ class GenerationReadinessModule:
             raise ReadinessBlocked(f"以下警告需要明确确认: {', '.join(required)}")
 
         return {
+            "version": 2,
             "digest": current_digest,
             "acknowledged_warning_codes": acknowledged,
             "issues": list(report.get("issues") or []),
