@@ -5,12 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
 
 from backend.api.default_routers.agent_router import get_agent_catalog
 from backend.api.default_routers.auth_router import require_authenticated_request
 from backend.api.llm_routers._common import (
-    GenerationParamsMixin,
     build_gen_kwargs,
     build_runtime_kwargs,
 )
@@ -23,6 +21,10 @@ from backend.services.auth.novel_access_service import (
     get_novel_access_service,
 )
 from backend.services.llm.agent_catalog import AgentCatalog
+from backend.services.llm.agent_capability_contracts import (
+    RewriteChapterSceneRequest,
+    SceneSnapshot,
+)
 from backend.services.llm.agent_orchestrator import (
     AgentOrchestrator,
     SceneRewriteResult,
@@ -46,25 +48,6 @@ router = APIRouter(
 
 SCENE_AGENT_WORKFLOW = "rewrite_chapter_scene_by_agent"
 SCENE_AGENT_STEP = "scene_rewrite"
-
-
-class SceneSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    summary: str = Field(min_length=1, max_length=1200)
-    purpose: str = Field(min_length=1, max_length=600)
-
-
-class RewriteChapterSceneRequest(GenerationParamsMixin):
-    model_config = ConfigDict(extra="forbid")
-
-    novel_id: str = Field(min_length=1)
-    chapter_id: str = Field(min_length=1)
-    scene_index: int = Field(ge=0)
-    base_scene: SceneSnapshot
-    scene: SceneSnapshot
-    agent_id: str = Field(default="scene_balanced", min_length=1)
-    instruction: str = Field(default="", max_length=1200)
 
 
 def _scene_prompt(

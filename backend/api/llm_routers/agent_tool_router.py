@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.api.default_routers.agent_router import get_agent_catalog
 from backend.api.default_routers.auth_router import require_authenticated_request
 from backend.api.llm_routers._common import (
-    GenerationParamsMixin,
     build_gen_kwargs,
     build_runtime_kwargs,
 )
@@ -23,6 +21,16 @@ from backend.services.auth.novel_access_service import (
     get_novel_access_service,
 )
 from backend.services.llm.agent_catalog import AgentCatalog
+from backend.services.llm.agent_capability_contracts import (
+    AgentScopeRequest,
+    CardImportDirectionReference,
+    ContinuityReviewRequest,
+    CreativeDirectorRequest,
+    CreativeInspirationRequest,
+    IllustrationPromptRequest,
+    StyleConsistencyRequest,
+    VolumeRetrospectiveRequest,
+)
 from backend.services.llm.agent_context import (
     AgentScope,
     StaleAgentContext,
@@ -53,7 +61,6 @@ from backend.services.llm.generation_runtime import (
     create_generation_runtime,
 )
 from backend.services.interop.card_import_proposal_service import (
-    DIRECTION_CONTEXT_MAX_PROPOSALS,
     CardImportProposalError,
     StaleCardImportProposal,
     card_import_proposal_service,
@@ -79,99 +86,6 @@ ILLUSTRATION_PROMPT_STEP = "illustration_prompt"
 VOLUME_RETROSPECTIVE_WORKFLOW = "volume_retrospective_by_agent"
 VOLUME_RETROSPECTIVE_STEP = "review"
 logger = logging.getLogger(__name__)
-
-
-class AgentScopeRequest(GenerationParamsMixin):
-    model_config = ConfigDict(extra="forbid")
-
-    novel_id: str = Field(min_length=1)
-    scope: Literal["novel", "volume", "chapter"] = "novel"
-    volume_id: str | None = None
-    chapter_id: str | None = None
-    agent_id: str = Field(min_length=1)
-    instruction: str = Field(default="", max_length=2000)
-
-
-class CreativeInspirationRequest(AgentScopeRequest):
-    question: str = Field(min_length=2, max_length=2000)
-    constraints: str = Field(default="", max_length=2000)
-    idea_count: int = Field(default=4, ge=2, le=8)
-
-
-class CardImportDirectionReference(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    proposal_id: str = Field(min_length=1, max_length=64)
-    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-
-
-class CreativeDirectorRequest(GenerationParamsMixin):
-    """Inputs available before a novel resource exists."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    user_idea: str = Field(default="", max_length=8000)
-    number_of_chapters: int = Field(default=100, ge=1, le=1000)
-    words_per_chapter: int = Field(default=3000, ge=500, le=50000)
-    agent_id: str = Field(min_length=1, max_length=120)
-    instruction: str = Field(default="", max_length=2000)
-    direction_count: int = Field(default=3, ge=2, le=4)
-    card_imports: list[CardImportDirectionReference] = Field(
-        default_factory=list,
-        max_length=DIRECTION_CONTEXT_MAX_PROPOSALS,
-    )
-
-    @model_validator(mode="after")
-    def validate_creation_source(self):
-        if len(self.user_idea.strip()) < 2 and not self.card_imports:
-            raise ValueError(
-                "Creative Director requires a user idea or reviewed card imports"
-            )
-        return self
-
-
-class ContinuityReviewRequest(AgentScopeRequest):
-    focus: str = Field(default="", max_length=2000)
-
-
-class StyleConsistencyRequest(AgentScopeRequest):
-    scope: Literal["chapter", "volume"]
-    focus: str = Field(default="", max_length=2000)
-
-
-class IllustrationPromptRequest(AgentScopeRequest):
-    scope: Literal["character", "novel", "chapter"] = "novel"
-    volume_id: None = None
-    character_card_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=64,
-    )
-    target_model: str = Field(default="", max_length=200)
-    focus: str = Field(default="", max_length=2000)
-
-    @model_validator(mode="after")
-    def validate_target_identifiers(self):
-        if self.scope == "character":
-            if not self.character_card_id or self.chapter_id:
-                raise ValueError(
-                    "character scope requires only character_card_id"
-                )
-        elif self.scope == "chapter":
-            if not self.chapter_id or self.character_card_id:
-                raise ValueError(
-                    "chapter scope requires only chapter_id"
-                )
-        elif self.character_card_id or self.chapter_id:
-            raise ValueError("novel scope does not accept target IDs")
-        return self
-
-
-class VolumeRetrospectiveRequest(AgentScopeRequest):
-    scope: Literal["volume"] = "volume"
-    volume_id: str = Field(min_length=1)
-    chapter_id: None = None
-    focus: str = Field(default="", max_length=2000)
 
 
 def get_agent_run_store() -> AgentRunStore:
