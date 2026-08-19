@@ -18,7 +18,9 @@ from backend.services.generation.chapter_finalization import (
     build_chapter_finalization_authorization,
 )
 from backend.services.generation.chapter_candidate_authorization import (
+    CANDIDATE_PIPELINE_REVISION,
     build_chapter_candidate_repair_authorization,
+    parse_candidate_repair_authorization,
 )
 from backend.services.generation.prose_continuation import (
     SCENE_DIVERGENCE_STOP_FACTOR,
@@ -384,37 +386,34 @@ class GenerationReadinessModule:
                 )
             )
             if has_work and self._deps.plan_candidate_repairs is not None:
-                candidate_repair_authorization = dict(
-                    self._deps.plan_candidate_repairs(
-                        chapters,
-                        authorization_revision,
-                        int(
-                            finalization_authorization[
-                                "max_repair_cycles"
-                            ]
-                        ),
-                        generation_params,
+                candidate_repair_authorization = (
+                    parse_candidate_repair_authorization(
+                        self._deps.plan_candidate_repairs(
+                            chapters,
+                            authorization_revision,
+                            int(
+                                finalization_authorization[
+                                    "max_repair_cycles"
+                                ]
+                            ),
+                            generation_params,
+                        )
                     )
                 )
-                repair_attempts = candidate_repair_authorization.get(
-                    "maximum_provider_attempts_total"
+                repair_attempts = (
+                    candidate_repair_authorization.maximum_provider_attempts_total
                 )
-                if (
-                    isinstance(repair_attempts, bool)
-                    or not isinstance(repair_attempts, int)
-                    or repair_attempts < 0
-                ):
-                    raise ValueError(
-                        "candidate repair attempt bound is invalid"
-                    )
                 planning = {
                     **planning,
                     "attempt_capacity": int(
                         planning.get("attempt_capacity") or 0
                     )
                     + repair_attempts,
+                    "chapter_candidate_pipeline_revision": (
+                        CANDIDATE_PIPELINE_REVISION
+                    ),
                     "chapter_candidate_repair_authorization": (
-                        candidate_repair_authorization
+                        candidate_repair_authorization.model_dump(mode="json")
                     ),
                 }
         except ContextBudgetError as exc:
@@ -517,6 +516,51 @@ class GenerationReadinessModule:
             "prose_continuation_authorization": prose_authorization,
             "chapter_finalization_authorization": finalization_authorization,
         }
+        raw_candidate_authorization = planning.get(
+            "chapter_candidate_repair_authorization"
+        )
+        if isinstance(raw_candidate_authorization, Mapping):
+            candidate_authorization = parse_candidate_repair_authorization(
+                raw_candidate_authorization
+            )
+            repair_token_bound = candidate_authorization.maximum_tokens_total
+            planning = {
+                **planning,
+                "candidate_repair_budget_coverage": {
+                    "schema_version": "candidate_repair_budget_coverage.v1",
+                    "maximum_tokens_total": repair_token_bound,
+                    "token_budget": token_budget,
+                    "covers_full_repair_authority": bool(
+                        token_budget is not None
+                        and token_budget >= repair_token_bound
+                    ),
+                },
+            }
+            if repair_token_bound > 0 and token_budget is None:
+                issues.append(
+                    _issue(
+                        "candidate_repairs_require_token_budget",
+                        "blocked",
+                        details={"maximum_tokens_total": repair_token_bound},
+                        action_codes=["set_token_budget"],
+                    )
+                )
+            elif (
+                repair_token_bound > 0
+                and token_budget is not None
+                and token_budget < repair_token_bound
+            ):
+                issues.append(
+                    _issue(
+                        "candidate_repair_budget_may_pause",
+                        "warning",
+                        details={
+                            "maximum_tokens_total": repair_token_bound,
+                            "token_budget": token_budget,
+                        },
+                        action_codes=["review_token_budget"],
+                    )
+                )
         automatic_requested = bool(
             continuation_policy.permits_automatic_continuation
             and prose_authorization.get("max_base_calls")
@@ -559,7 +603,7 @@ class GenerationReadinessModule:
                 )
 
         snapshot = {
-            "version": 1,
+            "version": 2,
             "novel_id": str(novel_id),
             "scope": scope,
             "volume_id": str(volume_id) if volume_id else None,

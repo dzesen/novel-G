@@ -5,11 +5,26 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 from backend.services.agent_runtime.contracts import (
+    AgentRuntimeLimits,
     PlannerDescriptor,
+    RuntimeChangeClass,
+    RuntimeEffectClass,
+    RuntimeProposalKind,
     RuntimeToolDescriptor,
+    RuntimeToolReference,
     runtime_tool_descriptor_snapshot,
 )
 from backend.services.generation.chapter_finalization import (
@@ -24,6 +39,8 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v1"
 )
+CANDIDATE_PIPELINE_REVISION = 1
+CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v1"
 PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
 PROSE_REMEDIATION_MAX_STEPS = 3
 PROSE_REMEDIATION_MAX_PLANNER_CALLS = 3
@@ -32,6 +49,223 @@ PROSE_REMEDIATION_DEADLINE_SECONDS = 300
 PROSE_REMEDIATION_MAX_PREDISPATCH_RETRIES = 2
 PROSE_REMEDIATION_MAX_PLANNER_REPAIRS = 1
 PROSE_REMEDIATION_MAX_TOOL_RETRIES = 1
+
+_PositiveInt = Annotated[StrictInt, Field(ge=1)]
+_NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
+_Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class _ClosedAuthorizationModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class RuntimeToolDescriptorSnapshot(_ClosedAuthorizationModel):
+    schema_version: Literal["agent_runtime_tool_descriptor.v1"]
+    reference: RuntimeToolReference
+    label: str = Field(min_length=1, max_length=240)
+    input_schema_digest: _Sha256
+    output_schema_digest: _Sha256
+    scope_kinds: tuple[str, ...] = Field(min_length=1, max_length=16)
+    effect_class: RuntimeEffectClass
+    proposal_kinds: tuple[RuntimeProposalKind, ...] = ()
+    change_classes: tuple[RuntimeChangeClass, ...] = ()
+    max_paid_attempts_per_call: _NonNegativeInt
+    max_tokens_per_call: _NonNegativeInt
+    implementation_revision: str = Field(min_length=1, max_length=240)
+    context_policy_revision: str = Field(min_length=1, max_length=240)
+    external_data_categories: tuple[str, ...] = Field(max_length=32)
+    idempotent: StrictBool
+
+
+class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
+    schema_version: Literal["candidate_structured_generation_plan.v1"]
+    workflow: str = Field(min_length=1, max_length=160)
+    step: str = Field(min_length=1, max_length=160)
+    provider_alias: str = Field(min_length=1, max_length=160)
+    provider_model: str = Field(min_length=1, max_length=240)
+    structured_output_mode: Literal[
+        "prompt_json",
+        "json_object",
+        "schema_enforced",
+    ]
+    reviewer_alias: str | None = Field(default=None, min_length=1, max_length=160)
+    timeout_seconds: _PositiveInt | None = None
+    config_revision: str = Field(min_length=1, max_length=240)
+    capability_snapshot: str = Field(min_length=1, max_length=240)
+    generation_params_digest: _Sha256
+    max_paid_attempts_per_call: _PositiveInt
+    max_output_tokens_per_attempt: _PositiveInt
+    max_context_tokens: _PositiveInt
+    max_tokens_per_call: _PositiveInt
+
+    @model_validator(mode="after")
+    def validate_token_bound(self) -> "CandidateStructuredGenerationPlan":
+        expected = self.max_paid_attempts_per_call * (
+            self.max_context_tokens + self.max_output_tokens_per_attempt
+        )
+        if self.max_tokens_per_call != expected:
+            raise ValueError("structured generation token bound changed")
+        return self
+
+
+class ProseRemediationAuthorization(_ClosedAuthorizationModel):
+    scope_kind: Literal["chapter_prose_candidate"]
+    registry_revision: str = Field(min_length=1, max_length=240)
+    allowed_tools: tuple[RuntimeToolReference, ...] = Field(min_length=2, max_length=2)
+    allowed_effects: tuple[RuntimeEffectClass, ...] = Field(min_length=2, max_length=2)
+    allowed_change_classes: tuple[RuntimeChangeClass, ...] = Field(
+        min_length=1,
+        max_length=1,
+    )
+    allowed_external_data_categories: tuple[str, ...] = Field(max_length=32)
+    limits: AgentRuntimeLimits
+    planner: PlannerDescriptor
+    tools: tuple[RuntimeToolDescriptorSnapshot, ...] = Field(
+        min_length=2,
+        max_length=2,
+    )
+
+    @model_validator(mode="after")
+    def validate_runtime_contract(self) -> "ProseRemediationAuthorization":
+        from backend.services.generation.prose_remediation_runtime import (
+            ADHERENCE_TOOL,
+            REWRITE_TOOL,
+        )
+
+        expected_references = (REWRITE_TOOL, ADHERENCE_TOOL)
+        if self.allowed_tools != expected_references:
+            raise ValueError("candidate remediation tool allowlist changed")
+        if tuple(item.reference for item in self.tools) != expected_references:
+            raise ValueError("candidate remediation Tool snapshots changed")
+        if any(self.scope_kind not in item.scope_kinds for item in self.tools):
+            raise ValueError("candidate remediation Tool scope changed")
+        expected_effects = tuple(
+            _ordered_union(tuple(item.effect_class for item in self.tools))
+        )
+        expected_changes = tuple(
+            _ordered_union(*tuple(item.change_classes for item in self.tools))
+        )
+        expected_external = tuple(
+            _ordered_union(
+                self.planner.external_data_categories,
+                tuple(
+                    category
+                    for item in self.tools
+                    for category in item.external_data_categories
+                ),
+            )
+        )
+        if self.allowed_effects != expected_effects:
+            raise ValueError("candidate remediation effect allowlist changed")
+        if self.allowed_change_classes != expected_changes:
+            raise ValueError("candidate remediation change allowlist changed")
+        if self.allowed_external_data_categories != expected_external:
+            raise ValueError("candidate remediation external-data allowlist changed")
+
+        maximum_tool_paid = max(
+            item.max_paid_attempts_per_call for item in self.tools
+        )
+        maximum_tool_tokens = max(item.max_tokens_per_call for item in self.tools)
+        expected_paid = (
+            PROSE_REMEDIATION_MAX_PLANNER_CALLS
+            * self.planner.max_paid_attempts_per_call
+            + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_paid
+        )
+        expected_tokens = (
+            PROSE_REMEDIATION_MAX_PLANNER_CALLS
+            * self.planner.max_tokens_per_call
+            + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_tokens
+        )
+        expected_limits = AgentRuntimeLimits(
+            max_steps=PROSE_REMEDIATION_MAX_STEPS,
+            max_planner_calls=PROSE_REMEDIATION_MAX_PLANNER_CALLS,
+            max_tool_calls=PROSE_REMEDIATION_MAX_TOOL_CALLS,
+            max_paid_attempts=expected_paid,
+            token_budget=expected_tokens,
+            deadline_seconds=PROSE_REMEDIATION_DEADLINE_SECONDS,
+            max_predispatch_retries=PROSE_REMEDIATION_MAX_PREDISPATCH_RETRIES,
+            max_planner_repairs=PROSE_REMEDIATION_MAX_PLANNER_REPAIRS,
+            max_tool_retries=PROSE_REMEDIATION_MAX_TOOL_RETRIES,
+        )
+        if self.limits != expected_limits:
+            raise ValueError("candidate remediation Runtime limits changed")
+        return self
+
+
+class CandidateRepairAuthorization(_ClosedAuthorizationModel):
+    schema_version: Literal["chapter_candidate_repair_authorization.v1"]
+    authorization_revision: _PositiveInt
+    eligible_chapter_count: _NonNegativeInt
+    eligible_chapter_ids_digest: _Sha256
+    max_repair_cycles_per_chapter: Annotated[
+        StrictInt,
+        Field(ge=0, le=MAX_FINALIZATION_REPAIR_CYCLES),
+    ]
+    maximum_provider_attempts_per_cycle: _NonNegativeInt
+    maximum_provider_attempts_total: _NonNegativeInt
+    maximum_tokens_per_cycle: _NonNegativeInt
+    maximum_tokens_total: _NonNegativeInt
+    prose_remediation: ProseRemediationAuthorization | None
+    adherence_review: CandidateStructuredGenerationPlan | None
+    state_repair: CandidateStructuredGenerationPlan | None
+
+    @model_validator(mode="after")
+    def validate_derived_bounds(self) -> "CandidateRepairAuthorization":
+        inactive = (
+            self.eligible_chapter_count == 0
+            or self.max_repair_cycles_per_chapter == 0
+        )
+        adapters = (
+            self.prose_remediation,
+            self.adherence_review,
+            self.state_repair,
+        )
+        if inactive:
+            if any(item is not None for item in adapters) or any(
+                (
+                    self.maximum_provider_attempts_per_cycle,
+                    self.maximum_provider_attempts_total,
+                    self.maximum_tokens_per_cycle,
+                    self.maximum_tokens_total,
+                )
+            ):
+                raise ValueError("inactive candidate repair authority is not empty")
+            return self
+        if any(item is None for item in adapters):
+            raise ValueError("candidate repair authority is incomplete")
+        assert self.prose_remediation is not None
+        assert self.adherence_review is not None
+        assert self.state_repair is not None
+        expected_attempts = max(
+            self.prose_remediation.limits.max_paid_attempts
+            + self.adherence_review.max_paid_attempts_per_call,
+            self.state_repair.max_paid_attempts_per_call,
+        )
+        expected_tokens = max(
+            self.prose_remediation.limits.token_budget
+            + self.adherence_review.max_tokens_per_call,
+            self.state_repair.max_tokens_per_call,
+        )
+        multiplier = (
+            self.eligible_chapter_count * self.max_repair_cycles_per_chapter
+        )
+        if (
+            self.maximum_provider_attempts_per_cycle != expected_attempts
+            or self.maximum_provider_attempts_total != multiplier * expected_attempts
+            or self.maximum_tokens_per_cycle != expected_tokens
+            or self.maximum_tokens_total != multiplier * expected_tokens
+        ):
+            raise ValueError("candidate repair aggregate bounds changed")
+        return self
+
+
+def parse_candidate_repair_authorization(
+    value: Mapping[str, Any],
+) -> CandidateRepairAuthorization:
+    try:
+        return CandidateRepairAuthorization.model_validate(value)
+    except ValidationError as exc:
+        raise ValueError("candidate repair authorization is invalid") from exc
 
 
 def _strict_positive_int(value: Any, *, field: str) -> int:
@@ -155,14 +389,13 @@ def _structured_plan_projection(
             timeout_seconds,
             field="candidate repair timeout",
         )
-    context_tokens = plan.max_context_tokens
-    if context_tokens is not None:
-        context_tokens = _strict_positive_int(
-            context_tokens,
-            field="candidate repair context-token bound",
-        )
+    context_tokens = _strict_positive_int(
+        plan.max_context_tokens,
+        field="candidate repair context-token bound",
+    )
+    maximum_tokens = paid_attempts * (context_tokens + output_tokens)
     return {
-        "schema_version": "candidate_structured_generation_plan.v1",
+        "schema_version": CANDIDATE_STRUCTURED_PLAN_SCHEMA,
         "workflow": workflow,
         "step": step,
         "provider_alias": provider_alias,
@@ -178,6 +411,7 @@ def _structured_plan_projection(
         "max_paid_attempts_per_call": paid_attempts,
         "max_output_tokens_per_attempt": output_tokens,
         "max_context_tokens": context_tokens,
+        "max_tokens_per_call": maximum_tokens,
     }
 
 
@@ -246,14 +480,16 @@ def build_chapter_candidate_repair_authorization(
         "max_repair_cycles_per_chapter": cycles,
     }
     if not eligible_ids or cycles == 0:
-        return {
+        return CandidateRepairAuthorization.model_validate({
             **base,
             "maximum_provider_attempts_per_cycle": 0,
             "maximum_provider_attempts_total": 0,
+            "maximum_tokens_per_cycle": 0,
+            "maximum_tokens_total": 0,
             "prose_remediation": None,
             "adherence_review": None,
             "state_repair": None,
-        }
+        }).model_dump(mode="json")
 
     if (
         remediation_bundle is None
@@ -336,6 +572,13 @@ def build_chapter_candidate_repair_authorization(
         int(state_projection["max_paid_attempts_per_call"]),
     )
     maximum_total = len(eligible_ids) * cycles * maximum_per_cycle
+    maximum_tokens_per_cycle = max(
+        prose_token_bound + int(adherence_projection["max_tokens_per_call"]),
+        int(state_projection["max_tokens_per_call"]),
+    )
+    maximum_tokens_total = (
+        len(eligible_ids) * cycles * maximum_tokens_per_cycle
+    )
 
     planner_external = tuple(planner.external_data_categories)
     tool_external = tuple(
@@ -343,10 +586,12 @@ def build_chapter_candidate_repair_authorization(
         for descriptor in tools
         for item in descriptor.external_data_categories
     )
-    return {
+    return CandidateRepairAuthorization.model_validate({
         **base,
         "maximum_provider_attempts_per_cycle": maximum_per_cycle,
         "maximum_provider_attempts_total": maximum_total,
+        "maximum_tokens_per_cycle": maximum_tokens_per_cycle,
+        "maximum_tokens_total": maximum_tokens_total,
         "prose_remediation": {
             "scope_kind": PROSE_REMEDIATION_SCOPE_KIND,
             "registry_revision": str(
@@ -383,32 +628,72 @@ def build_chapter_candidate_repair_authorization(
         },
         "adherence_review": adherence_projection,
         "state_repair": state_projection,
-    }
+    }).model_dump(mode="json")
 
 
 def authorized_candidate_repair_attempt_slots(
     readiness: Mapping[str, Any],
     *,
     chapter_id: str,
+    generation_params: Mapping[str, Any] | None = None,
 ) -> int:
     """Return one chapter's frozen repair slots, rejecting worklist drift."""
     normalized_chapter_id = str(chapter_id or "")
     if not normalized_chapter_id:
         raise ValueError("candidate repair chapter id is required")
+    if readiness.get("version") != 2:
+        raise ValueError("candidate repair readiness version is invalid")
     planning = readiness.get("planning")
     if not isinstance(planning, Mapping):
         raise ValueError("generation readiness planning is missing")
+    if planning.get("chapter_candidate_pipeline_revision") != (
+        CANDIDATE_PIPELINE_REVISION
+    ):
+        raise ValueError("candidate pipeline authorization revision is invalid")
     raw_authorization = planning.get(
         "chapter_candidate_repair_authorization"
     )
     if not isinstance(raw_authorization, Mapping):
         raise ValueError("generation readiness has no candidate repair authority")
-    authorization = dict(raw_authorization)
+    authorization = parse_candidate_repair_authorization(raw_authorization)
+
+    from backend.services.generation.chapter_finalization import (
+        build_chapter_finalization_authorization,
+    )
+    from backend.services.generation.chapter_generation_application import (
+        OUTLINE_ADHERENCE_STEP,
+        PROSE_REMEDIATION_WORKFLOW,
+        STATE_STEP,
+        STATE_WORKFLOW,
+    )
+
+    expected_finalization = build_chapter_finalization_authorization(
+        authorization_revision=authorization.authorization_revision,
+        max_repair_cycles=authorization.max_repair_cycles_per_chapter,
+    )
+    raw_finalization = planning.get("chapter_finalization_authorization")
     if (
-        authorization.get("schema_version")
-        != CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA
+        not isinstance(raw_finalization, Mapping)
+        or dict(raw_finalization) != expected_finalization
     ):
-        raise ValueError("candidate repair authorization schema is invalid")
+        raise ValueError("candidate repair and finalization authority diverged")
+    if authorization.adherence_review is not None and (
+        authorization.adherence_review.workflow != PROSE_REMEDIATION_WORKFLOW
+        or authorization.adherence_review.step != OUTLINE_ADHERENCE_STEP
+    ):
+        raise ValueError("candidate adherence workflow identity changed")
+    if authorization.state_repair is not None and (
+        authorization.state_repair.workflow != STATE_WORKFLOW
+        or authorization.state_repair.step != STATE_STEP
+    ):
+        raise ValueError("candidate state workflow identity changed")
+    generation_digest = _mapping_digest(generation_params)
+    for plan in (
+        authorization.adherence_review,
+        authorization.state_repair,
+    ):
+        if plan is not None and plan.generation_params_digest != generation_digest:
+            raise ValueError("candidate repair generation parameters changed")
 
     work = readiness.get("work")
     raw_snapshots = work.get("chapters") if isinstance(work, Mapping) else None
@@ -430,30 +715,15 @@ def authorized_candidate_repair_attempt_slots(
     if normalized_chapter_id not in snapshots:
         raise ValueError("chapter is outside the frozen generation worklist")
 
-    frozen_count = _strict_non_negative_int(
-        authorization.get("eligible_chapter_count"),
-        field="candidate repair eligible chapter count",
-    )
+    frozen_count = authorization.eligible_chapter_count
     if (
         frozen_count != len(eligible_ids)
-        or str(authorization.get("eligible_chapter_ids_digest") or "")
+        or authorization.eligible_chapter_ids_digest
         != _chapter_ids_digest(tuple(eligible_ids))
     ):
         raise ValueError("candidate repair worklist digest changed")
-    cycles = _strict_non_negative_int(
-        authorization.get("max_repair_cycles_per_chapter"),
-        field="candidate repair cycle bound",
-    )
-    per_cycle = _strict_non_negative_int(
-        authorization.get("maximum_provider_attempts_per_cycle"),
-        field="candidate repair per-cycle attempt bound",
-    )
-    total = _strict_non_negative_int(
-        authorization.get("maximum_provider_attempts_total"),
-        field="candidate repair total attempt bound",
-    )
-    if total != frozen_count * cycles * per_cycle:
-        raise ValueError("candidate repair total attempt bound changed")
+    cycles = authorization.max_repair_cycles_per_chapter
+    per_cycle = authorization.maximum_provider_attempts_per_cycle
     if snapshots[normalized_chapter_id].get("has_content") is True:
         return 0
     return cycles * per_cycle

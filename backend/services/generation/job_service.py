@@ -14,6 +14,7 @@ from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
 from backend.services.generation.chapter_pipeline import run_chapter
 from backend.services.generation.chapter_candidate_authorization import (
+    CANDIDATE_PIPELINE_REVISION,
     authorized_candidate_repair_attempt_slots,
 )
 from backend.services.generation.attempt_scope import JobAttemptScope
@@ -120,16 +121,22 @@ def _estimate_authorized_chapter_attempt_slots(
     )
     readiness = job.get("readiness")
     planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
-    if (
-        not isinstance(planning, Mapping)
-        or "chapter_candidate_repair_authorization" not in planning
-    ):
+    if not isinstance(planning, Mapping):
         # Jobs created before the candidate-first authorization continue under
         # their original capacity and execution path.
         return base_slots
+    pipeline_revision = planning.get("chapter_candidate_pipeline_revision")
+    has_authorization = "chapter_candidate_repair_authorization" in planning
+    if pipeline_revision is None and not has_authorization:
+        return base_slots
+    if pipeline_revision != CANDIDATE_PIPELINE_REVISION:
+        raise ValueError("candidate pipeline authorization revision is invalid")
+    if not has_authorization:
+        raise ValueError("generation readiness has no candidate repair authority")
     repair_slots = authorized_candidate_repair_attempt_slots(
         readiness,
         chapter_id=str(chapter.get("_id") or ""),
+        generation_params=generation_params,
     )
     return base_slots + repair_slots
 

@@ -39,6 +39,8 @@ from backend.services.generation.chapter_generation_application import (
     CHAPTER_OUTLINE_WORKFLOW,
     OutlineAdherenceCommand,
     OutlineGenerationCommand,
+    OUTLINE_ADHERENCE_STEP,
+    PROSE_REMEDIATION_WORKFLOW,
     ProseCandidateSource,
     ProseGenerationCommand,
     STATE_STEP,
@@ -348,10 +350,13 @@ def estimate_chapter_attempt_slots(
         )
         not in REUSABLE_STATE_COMPLETION_STATUSES
     ):
-        # 细纲符合度审查与状态回填共用 continuity Provider，但各自是一次
-        # 独立的结构化语义调用，容量必须分别预留。
+        # 细纲符合度审查与状态回填是两个独立 workflow；即便当前恰好
+        # 选择同一 Provider，也必须按各自冻结 plan 预留。
         slots += runtime.plan_structured(
-            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+            WorkflowStepTarget(
+                PROSE_REMEDIATION_WORKFLOW,
+                OUTLINE_ADHERENCE_STEP,
+            )
         ).max_semantic_attempts
         slots += runtime.plan_structured(
             WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
@@ -368,7 +373,10 @@ def estimate_worklist_attempt_capacity(
     _overrides, runtime_kwargs = _generation_options(generation_params)
     runtime = create_generation_runtime(**runtime_kwargs)
     adherence_recheck_slots = runtime.plan_structured(
-        WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        WorkflowStepTarget(
+            PROSE_REMEDIATION_WORKFLOW,
+            OUTLINE_ADHERENCE_STEP,
+        )
     ).max_semantic_attempts
     capacity = sum(
         estimate_chapter_attempt_slots(chapter, generation_params)
