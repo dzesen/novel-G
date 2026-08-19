@@ -52,30 +52,37 @@ _OPENAI_ENDPOINT_SUFFIXES: tuple[tuple[str, ...], ...] = (
 )
 
 
-def _validation_error_raw_output(error: ValidationError) -> str:
-    """Recover the response value that the SDK already handed to Pydantic."""
-    for item in error.errors(
-        include_url=False,
-        include_context=False,
-        include_input=True,
-    ):
-        if "input" not in item:
-            continue
-        value = item["input"]
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        if isinstance(value, str):
-            return value
-        try:
-            return json.dumps(
-                value,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        except (TypeError, ValueError):
-            return ""
-    return ""
+def _raw_openai_message_content(raw_response: Any) -> str:
+    """Read the complete assistant content before the SDK's local parser runs."""
+    try:
+        payload = raw_response.http_response.json()
+    except (AttributeError, TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return ""
 
 
 def _trim_openai_endpoint_suffixes(segments: list[str]) -> list[str]:
@@ -248,14 +255,29 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         try:
             params = self._build_params(request)
-            resp = await self._client.beta.chat.completions.parse(
-                **params,
-                response_format=schema,
+            raw_response = await (
+                self._client.beta.chat.completions.with_raw_response.parse(
+                    **params,
+                    response_format=schema,
+                )
             )
+        except Exception as exc:
+            if is_schema_protocol_unsupported(exc):
+                mapped = LLMSchemaUnsupportedError(
+                    str(exc), provider=self.provider_name, model=model
+                )
+                log_llm_error(mapped, provider=self.provider_name, model=model)
+                raise mapped from exc
+            mapped = self._map_error(exc, model)
+            log_llm_error(mapped, provider=self.provider_name, model=model)
+            raise mapped from exc
+
+        try:
+            resp = raw_response.parse()
         except ValidationError as exc:
             mapped = LLMStructuredValidationError(
                 "Provider 已返回，但结构化输出未通过本地 Schema 校验",
-                raw_output=_validation_error_raw_output(exc),
+                raw_output=_raw_openai_message_content(raw_response),
                 provider=self.provider_name,
                 model=model,
             )

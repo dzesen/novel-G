@@ -780,7 +780,7 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r5-{call.revision[:20]}"
+                f"prose-remediation-planner-r6-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
@@ -1709,7 +1709,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r5-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r6-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1733,7 +1733,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r5-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r6-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1748,7 +1748,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r5-"
+            "prose-remediation-tools-r6-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
