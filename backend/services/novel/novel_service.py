@@ -201,6 +201,18 @@ class NovelService:
             agent_revision_proposals_repo = BaseRepository(
                 collections.AGENT_REVISION_PROPOSALS
             )
+            agent_runtime_readiness_repo = BaseRepository(
+                collections.AGENT_RUNTIME_READINESS
+            )
+            agent_runtime_runs_repo = BaseRepository(
+                collections.AGENT_RUNTIME_RUNS
+            )
+            agent_runtime_steps_repo = BaseRepository(
+                collections.AGENT_RUNTIME_STEPS
+            )
+            agent_runtime_events_repo = BaseRepository(
+                collections.AGENT_RUNTIME_EVENTS
+            )
             mutation_journals_repo = BaseRepository(collections.MUTATION_JOURNALS)
             image_assets_repo = BaseRepository(collections.IMAGE_ASSETS)
             image_jobs_repo = BaseRepository(collections.IMAGE_JOBS)
@@ -240,6 +252,10 @@ class NovelService:
             stats["card_import_proposals_deleted"] = await card_import_proposals_repo.hard_delete_many(query, session=session)
             stats["agent_runs_deleted"] = await agent_runs_repo.hard_delete_many(query, session=session)
             stats["agent_revision_proposals_deleted"] = await agent_revision_proposals_repo.hard_delete_many(query, session=session)
+            stats["agent_runtime_readiness_deleted"] = await agent_runtime_readiness_repo.hard_delete_many(query, session=session)
+            stats["agent_runtime_runs_deleted"] = await agent_runtime_runs_repo.hard_delete_many(query, session=session)
+            stats["agent_runtime_steps_deleted"] = await agent_runtime_steps_repo.hard_delete_many(query, session=session)
+            stats["agent_runtime_events_deleted"] = await agent_runtime_events_repo.hard_delete_many(query, session=session)
             stats["mutation_journals_deleted"] = await mutation_journals_repo.hard_delete_many(query, session=session)
             # Deliberately retain content-addressed files. A later backup restore
             # can bring this metadata back; slice 4 reports the resulting orphans.

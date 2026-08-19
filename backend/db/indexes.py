@@ -200,6 +200,79 @@ async def init_agent_workbench_indexes():
         logger.error("初始化 Agent 工作台索引失败：%s", exc)
 
 
+async def init_agent_runtime_indexes():
+    """初始化有界 Agent Runtime 的授权、运行、步骤与事件索引。"""
+    try:
+        db = get_database()
+        await db[collections.AGENT_RUNTIME_READINESS].create_indexes([
+            pymongo.IndexModel([
+                ("owner_id", pymongo.ASCENDING),
+                ("novel_id", pymongo.ASCENDING),
+                ("created_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel(
+                [("expires_at", pymongo.ASCENDING)],
+                expireAfterSeconds=0,
+                name="agent_runtime_readiness_expiry_ttl",
+            ),
+        ])
+        await db[collections.AGENT_RUNTIME_RUNS].create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("start_request_id", pymongo.ASCENDING),
+                ],
+                unique=True,
+                name="agent_runtime_start_idempotent",
+            ),
+            pymongo.IndexModel([
+                ("owner_id", pymongo.ASCENDING),
+                ("novel_id", pymongo.ASCENDING),
+                ("created_at", pymongo.DESCENDING),
+            ]),
+            pymongo.IndexModel([
+                ("status", pymongo.ASCENDING),
+                ("lease.expires_at", pymongo.ASCENDING),
+            ]),
+        ])
+        await db[collections.AGENT_RUNTIME_STEPS].create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("run_id", pymongo.ASCENDING),
+                    ("ordinal", pymongo.ASCENDING),
+                ],
+                unique=True,
+                name="agent_runtime_step_ordinal_unique",
+            ),
+            pymongo.IndexModel([
+                ("owner_id", pymongo.ASCENDING),
+                ("novel_id", pymongo.ASCENDING),
+                ("created_at", pymongo.ASCENDING),
+            ]),
+        ])
+        await db[collections.AGENT_RUNTIME_EVENTS].create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("run_id", pymongo.ASCENDING),
+                    ("sequence", pymongo.ASCENDING),
+                ],
+                unique=True,
+                name="agent_runtime_event_sequence_unique",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("run_id", pymongo.ASCENDING),
+                    ("event_key", pymongo.ASCENDING),
+                ],
+                unique=True,
+                name="agent_runtime_event_key_unique",
+            ),
+        ])
+        logger.info("成功初始化有界 Agent Runtime 索引。")
+    except Exception as exc:
+        logger.error("初始化有界 Agent Runtime 索引失败：%s", exc)
+
+
 async def init_volume_indexes():
     """初始化volumes集合的索引。"""
     try:
@@ -1040,6 +1113,7 @@ async def init_all_indexes():
     await init_identity_indexes()
     await init_agent_definition_indexes()
     await init_agent_workbench_indexes()
+    await init_agent_runtime_indexes()
     await init_novel_indexes()
     await init_volume_indexes()
     await init_chapter_indexes()

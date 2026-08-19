@@ -23,6 +23,10 @@ CHARACTER_STATES = "character_states"
 AGENT_DEFINITIONS = "agent_definitions"
 AGENT_RUNS = "agent_runs"
 AGENT_REVISION_PROPOSALS = "agent_revision_proposals"
+AGENT_RUNTIME_READINESS = "agent_runtime_readiness"
+AGENT_RUNTIME_RUNS = "agent_runtime_runs"
+AGENT_RUNTIME_STEPS = "agent_runtime_steps"
+AGENT_RUNTIME_EVENTS = "agent_runtime_events"
 
 # 批量生成作业（阶段 3）。注意与遗留幽灵 GENERATION_TASKS 撞名但**不同集合**：
 # 本集合有写入方（作业引擎），generation_tasks 无。级联 stats key 用规则名
@@ -58,6 +62,10 @@ ACTIVE_COLLECTIONS = frozenset({
     AGENT_DEFINITIONS,
     AGENT_RUNS,
     AGENT_REVISION_PROPOSALS,
+    AGENT_RUNTIME_READINESS,
+    AGENT_RUNTIME_RUNS,
+    AGENT_RUNTIME_STEPS,
+    AGENT_RUNTIME_EVENTS,
     GENERATION_JOBS,
     PROSE_RUNS,
     CHAPTER_STATE_DELTAS,
