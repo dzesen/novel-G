@@ -36,6 +36,7 @@ from backend.services.agent_runtime.contracts import (
     PlannerDecision,
     PlannerInput,
     PlannerResult,
+    RuntimeCallUsage,
     RuntimeObservation,
     RuntimeToolContext,
     RuntimeToolDescriptor,
@@ -75,6 +76,7 @@ REPLAN_FEEDBACK_REASONS = frozenset({
     "scope_reference_invalid",
     "tool_input_invalid",
     "tool_output_invalid",
+    "tool_result_invalid",
 })
 
 
@@ -155,6 +157,7 @@ def _validation_evidence(
     check_by_reason = {
         "tool_input_invalid": "tool_input_schema",
         "tool_output_invalid": "tool_output_schema",
+        "tool_result_invalid": "tool_result_envelope",
         "scope_reference_invalid": "scope_reference",
     }
     check = check_by_reason.get(reason_code)
@@ -173,6 +176,8 @@ def _validation_evidence(
         contract_digest = str(descriptor.get(digest_field) or "")
         if len(contract_digest) != 64:
             raise ValueError("frozen Tool Schema digest is invalid")
+    elif reason_code == "tool_result_invalid":
+        contract_digest = _schema_digest(RuntimeToolResult)
     return {
         "schema_version": "agent_runtime_validation_evidence.v1",
         "check": check,
@@ -180,6 +185,45 @@ def _validation_evidence(
         "subject_digest": _digest(subject),
         "contract_digest": contract_digest,
         "authorization_digest": str(authorization_digest),
+    }
+
+
+def _invalid_tool_result_validation_subject(
+    raw_result: Any,
+    error: Exception,
+) -> dict[str, Any]:
+    if isinstance(raw_result, Mapping):
+        response_kind = "mapping"
+    elif isinstance(raw_result, (list, tuple)):
+        response_kind = "sequence"
+    elif raw_result is None or isinstance(raw_result, (str, int, float, bool)):
+        response_kind = "scalar"
+    else:
+        response_kind = "object"
+    error_codes: list[str] = []
+    errors = getattr(error, "errors", None)
+    if callable(errors):
+        try:
+            details = errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            )
+        except (TypeError, ValueError):
+            details = []
+        for detail in details:
+            if not isinstance(detail, Mapping):
+                continue
+            code = str(detail.get("type") or "").strip()[:80]
+            if code and code not in error_codes:
+                error_codes.append(code)
+            if len(error_codes) == 16:
+                break
+    if not error_codes:
+        error_codes.append("contract_validation_failed")
+    return {
+        "response_kind": response_kind,
+        "error_codes": error_codes,
     }
 
 
@@ -1537,7 +1581,10 @@ class AgentRuntime:
                         validation_subject = decision.arguments or {}
                     elif reason_code == "scope_reference_invalid":
                         validation_subject = decision.scope.model_dump(mode="json")
-                    elif reason_code == "tool_output_invalid":
+                    elif reason_code in {
+                        "tool_output_invalid",
+                        "tool_result_invalid",
+                    }:
                         settled_tool_attempts = [
                             item
                             for item in attempts_by_step.get(step_id, [])
@@ -1546,9 +1593,14 @@ class AgentRuntime:
                             and isinstance(item.get("result_checkpoint"), Mapping)
                         ]
                         if settled_tool_attempts:
+                            result_checkpoint = settled_tool_attempts[-1][
+                                "result_checkpoint"
+                            ]
                             validation_subject = (
-                                settled_tool_attempts[-1]["result_checkpoint"]
-                            ).get("data")
+                                result_checkpoint.get("data")
+                                if reason_code == "tool_output_invalid"
+                                else result_checkpoint.get("validation_subject")
+                            )
                     try:
                         expected_validation_evidence = _validation_evidence(
                             reason_code=reason_code,
@@ -1567,7 +1619,10 @@ class AgentRuntime:
                             != expected_validation_evidence
                         ):
                             add_violation("policy_decision_mismatch")
-                    if reason_code != "tool_output_invalid":
+                    if reason_code not in {
+                        "tool_output_invalid",
+                        "tool_result_invalid",
+                    }:
                         expected_policy = {
                             "allowed": False,
                             "reason_code": reason_code,
@@ -1650,7 +1705,10 @@ class AgentRuntime:
                         )
                         dispatched = positions_by_type.get("tool_dispatched", [])
                         observed = positions_by_type.get("tool_observed", [])
-                        expected_dispatched = feedback_reason == "tool_output_invalid"
+                        expected_dispatched = feedback_reason in {
+                            "tool_output_invalid",
+                            "tool_result_invalid",
+                        }
                         if (
                             not isinstance(observation, Mapping)
                             or dict(observation)
@@ -3519,7 +3577,6 @@ class AgentRuntime:
                     lease_epoch=lease_epoch,
                     authorization=authorization,
                 )
-                result = RuntimeToolResult.model_validate(raw_result)
             except _DeadlineExceeded:
                 await self._mark_uncertain(
                     run_id=run_id,
@@ -3564,6 +3621,64 @@ class AgentRuntime:
                     now=_aware(self._clock()),
                 )
                 return False
+            try:
+                result = RuntimeToolResult.model_validate(raw_result)
+            except Exception as error:
+                validation_subject = _invalid_tool_result_validation_subject(
+                    raw_result,
+                    error,
+                )
+                settled_attempt = await self._settle_runtime_call(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    usage={},
+                    result_checkpoint={
+                        "schema_version": (
+                            "agent_runtime_invalid_tool_result_checkpoint.v1"
+                        ),
+                        "validation_subject": validation_subject,
+                    },
+                    now=_aware(self._clock()),
+                )
+                if self._deadline_is_exceeded(authorization):
+                    await self._fail_step_and_run(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=step_id,
+                        expected_step_status="executing",
+                        reason_code="deadline_exceeded",
+                        now=_aware(self._clock()),
+                    )
+                    return False
+                charged_usage = RuntimeCallUsage.model_validate(
+                    settled_attempt.get("usage") or {}
+                )
+                await self._complete_dispatched_tool_replan_feedback(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    reason_code="tool_result_invalid",
+                    usage=charged_usage,
+                    validation_evidence=_validation_evidence(
+                        reason_code="tool_result_invalid",
+                        decision=decision,
+                        authorization=authorization,
+                        authorization_digest=authorization_digest,
+                        subject=validation_subject,
+                    ),
+                    now=_aware(self._clock()),
+                )
+                return True
             if result.status == "uncertain":
                 await self._mark_uncertain(
                     run_id=run_id,
@@ -3657,14 +3772,15 @@ class AgentRuntime:
         try:
             validated_output = descriptor.output_schema.model_validate(result.data)
         except Exception:
-            await self._complete_tool_output_replan_feedback(
+            await self._complete_dispatched_tool_replan_feedback(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
-                result=result,
+                reason_code="tool_output_invalid",
+                usage=result.usage,
                 validation_evidence=_validation_evidence(
                     reason_code="tool_output_invalid",
                     decision=decision,
@@ -3995,8 +4111,8 @@ class AgentRuntime:
         usage: Mapping[str, Any],
         result_checkpoint: Mapping[str, Any],
         now: datetime,
-    ) -> None:
-        await self._repository.settle_call(
+    ) -> dict[str, Any]:
+        settled_attempt = await self._repository.settle_call(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
@@ -4014,6 +4130,7 @@ class AgentRuntime:
             step_id=step_id,
             now=now,
         )
+        return settled_attempt
 
     async def _record_step_planned(
         self,
@@ -4115,7 +4232,7 @@ class AgentRuntime:
             now=now,
         )
 
-    async def _complete_tool_output_replan_feedback(
+    async def _complete_dispatched_tool_replan_feedback(
         self,
         *,
         run_id: str,
@@ -4124,10 +4241,13 @@ class AgentRuntime:
         lease_epoch: int,
         step_id: str,
         ordinal: int,
-        result: RuntimeToolResult,
+        reason_code: str,
+        usage: RuntimeCallUsage,
         validation_evidence: Mapping[str, Any],
         now: datetime,
     ) -> None:
+        if reason_code not in {"tool_output_invalid", "tool_result_invalid"}:
+            raise ValueError("unsupported dispatched Tool validation feedback")
         await self._repository.transition_step(
             run_id=run_id,
             owner_id=owner_id,
@@ -4137,9 +4257,9 @@ class AgentRuntime:
             expected="executing",
             status="observed",
             fields={
-                "observation": _replan_feedback("tool_output_invalid"),
+                "observation": _replan_feedback(reason_code),
                 "validation_evidence": dict(validation_evidence),
-                "usage_delta": result.usage.model_dump(mode="json"),
+                "usage_delta": usage.model_dump(mode="json"),
             },
             now=now,
         )
