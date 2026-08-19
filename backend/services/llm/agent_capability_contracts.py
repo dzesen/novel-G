@@ -6,7 +6,6 @@ from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from backend.api.llm_routers._common import GenerationParamsMixin
 from backend.llm.models import TokenUsage
 from backend.services.interop.card_import_proposal_service import (
     DIRECTION_CONTEXT_MAX_PROPOSALS,
@@ -20,6 +19,7 @@ from backend.services.llm.agent_orchestrator import (
     StyleConsistencyResult,
     VolumeRetrospectiveResult,
 )
+from backend.services.llm.generation_params import GenerationParamsMixin
 
 
 class AgentScopeRequest(GenerationParamsMixin):

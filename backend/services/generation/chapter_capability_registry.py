@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from backend.services.generation.chapter_generation_application import (
@@ -45,6 +46,12 @@ from backend.services.llm.generation_runtime import (
 
 _STRUCTURED_FALLBACK_ATTEMPTS = 4
 _FALLBACK_OUTPUT_TOKENS = 20_000
+
+
+@dataclass(frozen=True)
+class PreparedChapterCapability:
+    service: ChapterGenerationApplicationService
+    value: Any
 
 
 def _positive_int(value: Any) -> int | None:
@@ -94,10 +101,10 @@ async def _execute_chapter_generation(
         | ProseGenerationCommand
         | StateGenerationCommand
     ),
-    service: ChapterGenerationApplicationService,
+    prepared: PreparedChapterCapability,
     _call: CapabilityCall,
 ) -> ChapterGenerationResult:
-    return await service.collect(command)
+    return await prepared.service.collect_prepared(prepared.value)
 
 
 async def _stream_chapter_generation(
@@ -107,10 +114,10 @@ async def _stream_chapter_generation(
         | ProseGenerationCommand
         | StateGenerationCommand
     ),
-    service: ChapterGenerationApplicationService,
+    prepared: PreparedChapterCapability,
     _call: CapabilityCall,
 ):
-    return await service.execute(command)
+    return await prepared.service.execute_prepared(prepared.value)
 
 
 def _outline_budget(command: OutlineGenerationCommand) -> CapabilityBudget:
@@ -249,16 +256,20 @@ def build_chapter_capability_registry(
 ) -> CapabilityRegistry:
     """Bind production or fake chapter adapters to the canonical contract."""
 
-    async def provide_service(
-        _command: (
+    async def prepare_context(
+        command: (
             OutlineGenerationCommand
             | OutlineAdherenceCommand
             | ProseGenerationCommand
             | StateGenerationCommand
         ),
         _call: CapabilityCall,
-    ) -> ChapterGenerationApplicationService:
-        return service_factory()
+    ) -> PreparedChapterCapability:
+        service = service_factory()
+        return PreparedChapterCapability(
+            service=service,
+            value=await service.prepare(command),
+        )
 
     return CapabilityRegistry(
         (
@@ -273,7 +284,7 @@ def build_chapter_capability_registry(
                 output_schema=ChapterGenerationResult,
                 context_provider=ContextProvider(
                     policy_id="chapter_context:hard_contracts",
-                    provide=provide_service,
+                    provide=prepare_context,
                 ),
                 handler=CapabilityHandler(
                     execute=_execute_chapter_generation,
@@ -299,7 +310,7 @@ def build_chapter_capability_registry(
                 output_schema=ChapterGenerationResult,
                 context_provider=ContextProvider(
                     policy_id="chapter_context:hard_contracts",
-                    provide=provide_service,
+                    provide=prepare_context,
                 ),
                 handler=CapabilityHandler(
                     execute=_execute_chapter_generation,
@@ -325,7 +336,7 @@ def build_chapter_capability_registry(
                 output_schema=ChapterGenerationResult,
                 context_provider=ContextProvider(
                     policy_id="chapter_context:state_evidence",
-                    provide=provide_service,
+                    provide=prepare_context,
                 ),
                 handler=CapabilityHandler(
                     execute=_execute_chapter_generation,
@@ -351,7 +362,7 @@ def build_chapter_capability_registry(
                 output_schema=ChapterGenerationResult,
                 context_provider=ContextProvider(
                     policy_id="chapter_context:outline_adherence",
-                    provide=provide_service,
+                    provide=prepare_context,
                 ),
                 handler=CapabilityHandler(
                     execute=_execute_chapter_generation,

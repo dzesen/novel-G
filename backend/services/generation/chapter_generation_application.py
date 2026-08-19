@@ -350,6 +350,14 @@ class _PreparedState:
     truncation: dict[str, Any]
 
 
+ChapterGenerationPrepared = (
+    _PreparedOutline
+    | _PreparedProse
+    | _PreparedOutlineAdherence
+    | _PreparedState
+)
+
+
 class ChapterGenerationApplicationService:
     """所有章节生成消费者共用的深接口。"""
 
@@ -370,19 +378,47 @@ class ChapterGenerationApplicationService:
     ) -> AsyncIterator[ChapterGenerationEvent]:
         """预检命令并返回事件流；预检错误发生在 HTTP 开流之前。"""
 
+        prepared = await self.prepare(command)
+        return await self.execute_prepared(prepared)
+
+    async def prepare(
+        self,
+        command: (
+            OutlineGenerationCommand
+            | ProseGenerationCommand
+            | OutlineAdherenceCommand
+            | StateGenerationCommand
+        ),
+    ) -> ChapterGenerationPrepared:
+        """Resolve the real chapter context before a capability is dispatched."""
+
         if isinstance(command, OutlineGenerationCommand):
-            prepared = await self._prepare_outline(command)
-            return self._stream_outline(prepared)
+            return await self._prepare_outline(command)
         if isinstance(command, ProseGenerationCommand):
-            prepared = await self._prepare_prose(command)
-            return self._stream_prose(prepared)
+            return await self._prepare_prose(command)
         if isinstance(command, OutlineAdherenceCommand):
-            prepared = await self._prepare_outline_adherence(command)
-            return self._stream_outline_adherence(prepared)
+            return await self._prepare_outline_adherence(command)
         if isinstance(command, StateGenerationCommand):
-            prepared = await self._prepare_state(command)
-            return self._stream_state(prepared)
+            return await self._prepare_state(command)
         raise TypeError(f"unsupported chapter generation command: {type(command)!r}")
+
+    async def execute_prepared(
+        self,
+        prepared: ChapterGenerationPrepared,
+    ) -> AsyncIterator[ChapterGenerationEvent]:
+        """Execute an already resolved context without reading it again."""
+
+        if isinstance(prepared, _PreparedOutline):
+            return self._stream_outline(prepared)
+        if isinstance(prepared, _PreparedProse):
+            return self._stream_prose(prepared)
+        if isinstance(prepared, _PreparedOutlineAdherence):
+            return self._stream_outline_adherence(prepared)
+        if isinstance(prepared, _PreparedState):
+            return self._stream_state(prepared)
+        raise TypeError(
+            f"unsupported prepared chapter context: {type(prepared)!r}"
+        )
 
     async def collect(
         self,
@@ -395,7 +431,16 @@ class ChapterGenerationApplicationService:
     ) -> ChapterGenerationResult:
         """无头消费同一事件流，并把失败终帧恢复成带审计信息的异常。"""
 
-        execution = await self.execute(command)
+        prepared = await self.prepare(command)
+        return await self.collect_prepared(prepared)
+
+    async def collect_prepared(
+        self,
+        prepared: ChapterGenerationPrepared,
+    ) -> ChapterGenerationResult:
+        """Collect a prepared execution without rebuilding mutable context."""
+
+        execution = await self.execute_prepared(prepared)
         failure: dict[str, Any] | None = None
         async for event in execution:
             if event.result is not None:

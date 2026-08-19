@@ -42,6 +42,7 @@ def build_application_capability_registry(
     agent_access: Any | None = None,
     agent_catalog: Any | None = None,
     agent_runs: Any | None = None,
+    agent_application: Any | None = None,
 ) -> CapabilityRegistry:
     """Compose core, internal, and Agent tools without duplicating metadata."""
 
@@ -49,6 +50,7 @@ def build_application_capability_registry(
         service_factory=chapter_service_factory,
     )
     agents = build_agent_capability_registry(
+        application=agent_application,
         access=agent_access,
         catalog=agent_catalog,
         runs=agent_runs,

@@ -5,61 +5,22 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, Field
-
-GEN_PARAM_KEYS: tuple[str, ...] = (
-    "temperature",
-    "top_p",
-    "max_tokens",
-    "presence_penalty",
-    "frequency_penalty",
-    "system_prompt",
+from backend.services.llm.generation_params import (
+    GEN_PARAM_KEYS,
+    GenerationParamsMixin,
+    build_gen_kwargs,
+    build_runtime_kwargs,
 )
 
-
-class GenerationParamsMixin(BaseModel):
-    """可选生成参数。前端不传的键整个不出现在请求体里，由配置默认值兜底。"""
-
-    temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    top_p: Optional[float] = Field(default=None, ge=0, le=1)
-    max_tokens: Optional[int] = Field(default=None, gt=0)
-    presence_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
-    frequency_penalty: Optional[float] = Field(default=None, ge=-2, le=2)
-    system_prompt: Optional[str] = Field(default=None)
-    allow_failure_retry: bool = Field(
-        default=True,
-        description="是否允许沿用 Provider 配置进行传输层失败自动重试",
-    )
-
-
-def build_gen_kwargs(req: Any) -> dict:
-    """从请求中提取非空的生成参数，用于传入 LLMService。
-
-    Args:
-        req: 任何带有这六个属性的请求对象。
-
-    Returns:
-        只含非 None 值的关键字参数字典。
-    """
-    kwargs: dict = {}
-    for key in GEN_PARAM_KEYS:
-        val = getattr(req, key, None)
-        if val is not None:
-            kwargs[key] = val
-    return kwargs
-
-
-def build_runtime_kwargs(req: Any) -> dict[str, int]:
-    """根据请求决定是否禁用 Provider 传输层自动重试。
-
-    ``allow_failure_retry=True`` 保持既有行为，由 Provider 的 ``max_retries``
-    配置决定实际次数；显式关闭时只覆盖本次请求，不修改持久化配置。
-    """
-    if getattr(req, "allow_failure_retry", True):
-        return {}
-    return {"max_provider_retries": 0}
+__all__ = [
+    "GEN_PARAM_KEYS",
+    "GenerationParamsMixin",
+    "build_gen_kwargs",
+    "build_runtime_kwargs",
+    "safe_novel_text",
+]
 
 
 def safe_novel_text(novel: dict, field: str, fallback: str = "未提供") -> str:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
@@ -23,6 +22,11 @@ from backend.services.llm.agent_capability_contracts import (
     VolumeRetrospectiveRequest,
     VolumeRetrospectiveResponse,
 )
+from backend.services.llm.agent_capability_application import (
+    AGENT_WORKFLOW_TARGETS,
+    AgentCapabilityApplication,
+    PreparedAgentCapability,
+)
 from backend.services.llm.capability_registry import (
     CapabilityBudget,
     CapabilityCall,
@@ -39,69 +43,8 @@ from backend.services.llm.generation_runtime import (
     create_generation_runtime,
 )
 
-
-AGENT_WORKFLOW_TARGETS: dict[str, WorkflowStepTarget] = {
-    "scene_rewrite": WorkflowStepTarget(
-        "rewrite_chapter_scene_by_agent",
-        "scene_rewrite",
-    ),
-    "novel_direction": WorkflowStepTarget(
-        "creative_direction_by_agent",
-        "direction",
-    ),
-    "creative_inspiration": WorkflowStepTarget(
-        "creative_inspiration_by_agent",
-        "inspiration",
-    ),
-    "continuity_review": WorkflowStepTarget(
-        "continuity_review_by_agent",
-        "review",
-    ),
-    "style_consistency": WorkflowStepTarget(
-        "style_consistency_by_agent",
-        "review",
-    ),
-    "illustration_prompt": WorkflowStepTarget(
-        "illustration_prompt_by_agent",
-        "illustration_prompt",
-    ),
-    "volume_retrospective": WorkflowStepTarget(
-        "volume_retrospective_by_agent",
-        "review",
-    ),
-}
-
 _FALLBACK_STRUCTURED_ATTEMPTS = 4
 _FALLBACK_OUTPUT_TOKENS = 20_000
-
-
-@dataclass(frozen=True)
-class AgentCapabilityDependencies:
-    actor: Any
-    access: Any
-    catalog: Any
-    runs: Any
-    profile: Any
-
-
-class _PinnedAgentCatalog:
-    """Keep handler execution on the profile resolved for its budget plan."""
-
-    def __init__(self, profile: Any) -> None:
-        self._profile = profile
-
-    async def resolve_profile(
-        self,
-        _actor: Any,
-        *,
-        agent_id: str,
-        capability: str | None = None,
-    ) -> Any:
-        if agent_id != self._profile.agent_id:
-            raise ValueError("Agent profile changed after capability planning")
-        if capability and capability not in self._profile.capabilities:
-            raise ValueError("Agent capability changed after capability planning")
-        return self._profile
 
 
 def _positive_int(value: Any) -> int | None:
@@ -117,7 +60,7 @@ def _positive_int(value: Any) -> int | None:
 def _budget_estimator(target: WorkflowStepTarget):
     def estimate(
         request: BaseModel,
-        dependencies: AgentCapabilityDependencies,
+        dependencies: PreparedAgentCapability,
         _call: CapabilityCall,
     ) -> CapabilityBudget:
         allow_retry = bool(
@@ -181,184 +124,57 @@ def _preview_audit(result: BaseModel) -> dict[str, Any]:
     }
 
 
-async def _execute_scene_rewrite(
-    request: RewriteChapterSceneRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> SceneRewriteResponse:
-    from backend.api.llm_routers.scene_agent_router import (
-        _execute_scene_rewrite_capability,
+def _application_handler(
+    application: AgentCapabilityApplication,
+    capability: str,
+):
+    async def execute(
+        request: BaseModel,
+        prepared: PreparedAgentCapability,
+        call: CapabilityCall,
+    ) -> BaseModel:
+        return await application.execute(
+            capability,
+            request,
+            prepared,
+            call,
+        )
+
+    execute.__name__ = (
+        "_execute_creative_direction"
+        if capability == "novel_direction"
+        else f"_execute_{capability}"
     )
-
-    result = await _execute_scene_rewrite_capability(
-        request,
-        actor=dependencies.actor,
-        access=dependencies.access,
-        catalog=dependencies.catalog,
-    )
-    return SceneRewriteResponse.model_validate(result)
-
-
-async def _execute_creative_direction(
-    request: CreativeDirectorRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> CreativeDirectionResponse:
-    from backend.api.llm_routers.agent_tool_router import (
-        _execute_creative_direction_capability,
-    )
-
-    result = await _execute_creative_direction_capability(
-        request,
-        actor=dependencies.actor,
-        catalog=dependencies.catalog,
-    )
-    return CreativeDirectionResponse.model_validate(result)
-
-
-async def _execute_creative_inspiration(
-    request: CreativeInspirationRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> CreativeInspirationResponse:
-    from backend.api.llm_routers.agent_tool_router import (
-        _execute_creative_inspiration_capability,
-    )
-
-    result = await _execute_creative_inspiration_capability(
-        request,
-        actor=dependencies.actor,
-        access=dependencies.access,
-        catalog=dependencies.catalog,
-        runs=dependencies.runs,
-    )
-    return CreativeInspirationResponse.model_validate(result)
-
-
-async def _execute_continuity_review(
-    request: ContinuityReviewRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> ContinuityReviewResponse:
-    from backend.api.llm_routers.agent_tool_router import (
-        _execute_continuity_review_capability,
-    )
-
-    result = await _execute_continuity_review_capability(
-        request,
-        actor=dependencies.actor,
-        access=dependencies.access,
-        catalog=dependencies.catalog,
-        runs=dependencies.runs,
-    )
-    return ContinuityReviewResponse.model_validate(result)
-
-
-async def _execute_style_consistency(
-    request: StyleConsistencyRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> StyleConsistencyResponse:
-    from backend.api.llm_routers.agent_tool_router import (
-        _execute_style_consistency_capability,
-    )
-
-    result = await _execute_style_consistency_capability(
-        request,
-        actor=dependencies.actor,
-        access=dependencies.access,
-        catalog=dependencies.catalog,
-        runs=dependencies.runs,
-    )
-    return StyleConsistencyResponse.model_validate(result)
-
-
-async def _execute_illustration_prompt(
-    request: IllustrationPromptRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> IllustrationPromptResponse:
-    from backend.api.llm_routers.agent_tool_router import (
-        _execute_illustration_prompt_capability,
-    )
-
-    result = await _execute_illustration_prompt_capability(
-        request,
-        actor=dependencies.actor,
-        access=dependencies.access,
-        catalog=dependencies.catalog,
-        runs=dependencies.runs,
-    )
-    return IllustrationPromptResponse.model_validate(result)
-
-
-async def _execute_volume_retrospective(
-    request: VolumeRetrospectiveRequest,
-    dependencies: AgentCapabilityDependencies,
-    _call: CapabilityCall,
-) -> VolumeRetrospectiveResponse:
-    from backend.api.llm_routers.agent_tool_router import (
-        _execute_volume_retrospective_capability,
-    )
-
-    result = await _execute_volume_retrospective_capability(
-        request,
-        actor=dependencies.actor,
-        access=dependencies.access,
-        catalog=dependencies.catalog,
-        runs=dependencies.runs,
-    )
-    return VolumeRetrospectiveResponse.model_validate(result)
+    return execute
 
 
 def build_agent_capability_registry(
     *,
+    application: AgentCapabilityApplication | Any | None = None,
     access: Any | None = None,
     catalog: Any | None = None,
     runs: Any | None = None,
 ) -> CapabilityRegistry:
     """Build Agent definitions with production or HTTP-injected adapters."""
 
-    def provide_dependencies_for(capability: str):
-        async def provide_dependencies(
+    resolved_application = application or AgentCapabilityApplication(
+        access=access,
+        catalog=catalog,
+        runs=runs,
+    )
+
+    def prepare_context_for(capability: str):
+        async def prepare_context(
             request: BaseModel,
             call: CapabilityCall,
-        ) -> AgentCapabilityDependencies:
-            if call.actor is None:
-                raise ValueError(
-                    "Agent capabilities require an authenticated actor"
-                )
-            resolved_access = access
-            resolved_catalog = catalog
-            resolved_runs = runs
-            if resolved_access is None:
-                from backend.services.auth.novel_access_service import (
-                    get_novel_access_service,
-                )
-
-                resolved_access = get_novel_access_service()
-            if resolved_catalog is None:
-                from backend.services.llm.agent_catalog import agent_catalog
-
-                resolved_catalog = agent_catalog
-            if resolved_runs is None:
-                from backend.services.llm.agent_run import agent_run_store
-
-                resolved_runs = agent_run_store
-            profile = await resolved_catalog.resolve_profile(
-                call.actor,
-                agent_id=str(getattr(request, "agent_id", "")),
-                capability=capability,
-            )
-            return AgentCapabilityDependencies(
-                actor=call.actor,
-                access=resolved_access,
-                catalog=_PinnedAgentCatalog(profile),
-                runs=resolved_runs,
-                profile=profile,
+        ) -> PreparedAgentCapability:
+            return await resolved_application.prepare(
+                capability,
+                request,
+                call,
             )
 
-        return provide_dependencies
+        return prepare_context
 
     specifications = (
         (
@@ -369,7 +185,6 @@ def build_agent_capability_registry(
             RewriteChapterSceneRequest,
             SceneRewriteResponse,
             "chapter_context:scene_snapshot",
-            _execute_scene_rewrite,
         ),
         (
             "novel_direction",
@@ -379,7 +194,6 @@ def build_agent_capability_registry(
             CreativeDirectorRequest,
             CreativeDirectionResponse,
             "creation_input:user_brief",
-            _execute_creative_direction,
         ),
         (
             "creative_inspiration",
@@ -389,7 +203,6 @@ def build_agent_capability_registry(
             CreativeInspirationRequest,
             CreativeInspirationResponse,
             "agent_context:bounded_evidence",
-            _execute_creative_inspiration,
         ),
         (
             "continuity_review",
@@ -399,7 +212,6 @@ def build_agent_capability_registry(
             ContinuityReviewRequest,
             ContinuityReviewResponse,
             "agent_context:bounded_evidence",
-            _execute_continuity_review,
         ),
         (
             "style_consistency",
@@ -409,7 +221,6 @@ def build_agent_capability_registry(
             StyleConsistencyRequest,
             StyleConsistencyResponse,
             "agent_context:bounded_evidence",
-            _execute_style_consistency,
         ),
         (
             "illustration_prompt",
@@ -419,7 +230,6 @@ def build_agent_capability_registry(
             IllustrationPromptRequest,
             IllustrationPromptResponse,
             "agent_context:bounded_evidence",
-            _execute_illustration_prompt,
         ),
         (
             "volume_retrospective",
@@ -429,7 +239,6 @@ def build_agent_capability_registry(
             VolumeRetrospectiveRequest,
             VolumeRetrospectiveResponse,
             "agent_context:bounded_evidence",
-            _execute_volume_retrospective,
         ),
     )
     return CapabilityRegistry(
@@ -445,9 +254,14 @@ def build_agent_capability_registry(
                 output_schema=output_schema,
                 context_provider=ContextProvider(
                     policy_id=context_policy,
-                    provide=provide_dependencies_for(capability),
+                    provide=prepare_context_for(capability),
                 ),
-                handler=CapabilityHandler(execute=handler),
+                handler=CapabilityHandler(
+                    execute=_application_handler(
+                        resolved_application,
+                        capability,
+                    )
+                ),
                 side_effect_policy=SideEffectPolicy.PREVIEW_ONLY,
                 allowed_tools=(),
                 budget_estimator=_budget_estimator(
@@ -464,7 +278,6 @@ def build_agent_capability_registry(
                 input_schema,
                 output_schema,
                 context_policy,
-                handler,
             ) in specifications
         )
     )
