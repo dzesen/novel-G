@@ -84,6 +84,7 @@ class CandidateUnattributedUsageReason(StrEnum):
     AGGREGATE_USAGE_INVALID = "aggregate_usage_invalid"
     AGGREGATE_RESIDUAL_UNATTRIBUTED = "aggregate_residual_unattributed"
     CHARGED_ATTEMPT_USAGE_MISSING = "charged_attempt_usage_missing"
+    ATTEMPT_LEDGER_CONFLICT = "attempt_ledger_conflict"
     USAGE_PROJECTION_OVERFLOW = "usage_projection_overflow"
     RELEASED_PREDISPATCH_USAGE_INVALID = (
         "released_predispatch_usage_invalid"
@@ -121,6 +122,7 @@ class CandidateUnattributedUsageSummary(_RepairContract):
     reason: CandidateUnattributedUsageReason
     usage: CandidateUsageSummary
     is_lower_bound: bool = False
+    is_complete: bool = True
 
 
 class CandidateAttemptSummary(_RepairContract):
@@ -168,6 +170,12 @@ class _UsageProjectionOverflow(_EvidenceProjectionError):
     pass
 
 
+class _IncompleteAggregateUsageProjectionError(_EvidenceProjectionError):
+    def __init__(self, message: str, *, is_lower_bound: bool) -> None:
+        super().__init__(message)
+        self.is_lower_bound = is_lower_bound
+
+
 class _UnattributedUsageProjectionError(_EvidenceProjectionError):
     def __init__(
         self,
@@ -177,17 +185,21 @@ class _UnattributedUsageProjectionError(_EvidenceProjectionError):
         usage: CandidateUsageSummary,
         attempts: tuple[CandidateAttemptSummary, ...],
         is_lower_bound: bool = False,
+        is_complete: bool = True,
     ) -> None:
         super().__init__(message)
         self.reason = reason
         self.usage = usage
         self.attempts = attempts
         self.is_lower_bound = is_lower_bound
+        self.is_complete = is_complete
 
 
 def _strict_token_count(value: Any, *, field: str) -> int:
-    if type(value) is not int or value < 0 or value > _MAX_TOKEN_COUNT:
+    if type(value) is not int or value < 0:
         raise _EvidenceProjectionError(f"{field} 不是有效的有界 Token 用量")
+    if value > _MAX_TOKEN_COUNT:
+        raise _UsageProjectionOverflow(f"{field} 超过 V1 Token 用量上限")
     return value
 
 
@@ -235,7 +247,7 @@ def _usage_summary(
     )
     total_tokens = max(supplied_total, input_tokens + output_tokens)
     if total_tokens > _MAX_TOKEN_COUNT:
-        raise _EvidenceProjectionError("Token 用量证据超过 V1 上限")
+        raise _UsageProjectionOverflow("Token 用量证据超过 V1 上限")
     return CandidateUsageSummary(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -396,6 +408,28 @@ def _usage_component_floor(value: Any) -> CandidateUsageSummary:
 def _project_aggregate_usage(
     value: Any,
 ) -> tuple[CandidateUsageSummary, _EvidenceProjectionError | None]:
+    raw = _as_mapping(value)
+    if "usage_is_complete" in raw or "usage_is_lower_bound" in raw:
+        is_complete = raw.get("usage_is_complete")
+        is_lower_bound = raw.get("usage_is_lower_bound")
+        if type(is_complete) is not bool or type(is_lower_bound) is not bool:
+            return (
+                _usage_component_floor(raw),
+                _EvidenceProjectionError("Token 用量完整性标记无效"),
+            )
+        if is_lower_bound and is_complete:
+            return (
+                _usage_component_floor(raw),
+                _EvidenceProjectionError("完整 Token 用量不能标记为下界"),
+            )
+        if not is_complete:
+            return (
+                _usage_component_floor(raw),
+                _IncompleteAggregateUsageProjectionError(
+                    "Token 用量不是精确完整投影",
+                    is_lower_bound=is_lower_bound,
+                ),
+            )
     try:
         return _usage_summary(value, aggregate=True), None
     except _UsageProjectionOverflow:
@@ -413,6 +447,7 @@ def _usage_overflow_error(
         usage=CandidateUsageSummary(total_tokens=_MAX_TOKEN_COUNT),
         attempts=(),
         is_lower_bound=True,
+        is_complete=False,
     )
 
 
@@ -465,13 +500,12 @@ def _project_attempt_batch_with_aggregate(
             )
         except _UsageProjectionOverflow as overflow:
             raise _usage_overflow_error(str(overflow)) from overflow
-        if unattributed_usage.total_tokens == 0:
-            raise
         raise _UnattributedUsageProjectionError(
             str(exc),
             reason=CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID,
             usage=unattributed_usage,
             attempts=(),
+            is_complete=False,
         ) from exc
 
 
@@ -493,6 +527,12 @@ def _invalid_aggregate_error(
         reason=CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID,
         usage=usage,
         attempts=attempts,
+        is_lower_bound=(
+            error.is_lower_bound
+            if isinstance(error, _IncompleteAggregateUsageProjectionError)
+            else False
+        ),
+        is_complete=False,
     )
 
 
@@ -500,23 +540,7 @@ def _effective_usage(
     aggregate: CandidateUsageSummary,
     attempts: tuple[CandidateAttemptSummary, ...],
 ) -> CandidateUsageSummary:
-    attempt_input = sum(item.usage.input_tokens for item in attempts)
-    attempt_output = sum(item.usage.output_tokens for item in attempts)
-    attempt_total = sum(item.usage.total_tokens for item in attempts)
-    input_tokens = max(aggregate.input_tokens, attempt_input)
-    output_tokens = max(aggregate.output_tokens, attempt_output)
-    total_tokens = max(
-        aggregate.total_tokens,
-        attempt_total,
-        input_tokens + output_tokens,
-    )
-    if total_tokens > _MAX_TOKEN_COUNT:
-        raise _EvidenceProjectionError("调用 Token 用量超过 V1 上限")
-    return CandidateUsageSummary(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=total_tokens,
-    )
+    return _conservative_usage_max(aggregate, _summed_usage(attempts))
 
 
 def _usage_residual(
@@ -528,7 +552,7 @@ def _usage_residual(
     total_tokens = max(
         0,
         usage.total_tokens - accounted.total_tokens,
-        input_tokens + output_tokens,
+        _checked_token_add(input_tokens, output_tokens),
     )
     return CandidateUsageSummary(
         input_tokens=input_tokens,
@@ -540,14 +564,26 @@ def _usage_residual(
 def _summed_usage(
     attempts: tuple[CandidateAttemptSummary, ...],
 ) -> CandidateUsageSummary:
-    input_tokens = sum(item.usage.input_tokens for item in attempts)
-    output_tokens = sum(item.usage.output_tokens for item in attempts)
+    input_tokens = 0
+    output_tokens = 0
+    supplied_total = 0
+    for attempt in attempts:
+        input_tokens = _checked_token_add(
+            input_tokens,
+            attempt.usage.input_tokens,
+        )
+        output_tokens = _checked_token_add(
+            output_tokens,
+            attempt.usage.output_tokens,
+        )
+        supplied_total = _checked_token_add(
+            supplied_total,
+            attempt.usage.total_tokens,
+        )
     total_tokens = max(
-        sum(item.usage.total_tokens for item in attempts),
-        input_tokens + output_tokens,
+        supplied_total,
+        _checked_token_add(input_tokens, output_tokens),
     )
-    if total_tokens > _MAX_TOKEN_COUNT:
-        raise _EvidenceProjectionError("调用 Token 用量超过 V1 上限")
     return CandidateUsageSummary(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -561,12 +597,14 @@ def _unattributed_usage_error(
     reason: CandidateUnattributedUsageReason,
     aggregate: CandidateUsageSummary,
     attempts: tuple[CandidateAttemptSummary, ...],
+    is_complete: bool = True,
 ) -> _UnattributedUsageProjectionError:
     return _UnattributedUsageProjectionError(
         message,
         reason=reason,
         usage=_effective_usage(aggregate, attempts),
         attempts=attempts,
+        is_complete=is_complete,
     )
 
 
@@ -618,6 +656,7 @@ def _attribute_aggregate_usage(
             ),
             aggregate=aggregate,
             attempts=attempts,
+            is_complete=False,
         )
     residual = _usage_residual(aggregate, _summed_usage(attempts))
     unreported_indexes = [
@@ -652,20 +691,29 @@ def _project_result_evidence(
 ) -> tuple[CandidateUsageSummary, tuple[CandidateAttemptSummary, ...]]:
     try:
         aggregate, aggregate_error = _project_aggregate_usage(result.usage)
+        attempts = _project_attempt_batch_with_aggregate(
+            result.attempts,
+            aggregate,
+        )
+        if isinstance(
+            aggregate_error,
+            _IncompleteAggregateUsageProjectionError,
+        ):
+            raise _invalid_aggregate_error(
+                aggregate_error,
+                aggregate_floor=aggregate,
+                attempts=attempts,
+            ) from aggregate_error
+        attempts = _attribute_aggregate_usage(aggregate, attempts)
+        if aggregate_error is not None:
+            raise _invalid_aggregate_error(
+                aggregate_error,
+                aggregate_floor=aggregate,
+                attempts=attempts,
+            ) from aggregate_error
+        return _effective_usage(aggregate, attempts), attempts
     except _UsageProjectionOverflow as overflow:
         raise _usage_overflow_error(str(overflow)) from overflow
-    attempts = _project_attempt_batch_with_aggregate(
-        result.attempts,
-        aggregate,
-    )
-    if aggregate_error is not None:
-        raise _invalid_aggregate_error(
-            aggregate_error,
-            aggregate_floor=aggregate,
-            attempts=attempts,
-        ) from aggregate_error
-    attempts = _attribute_aggregate_usage(aggregate, attempts)
-    return _effective_usage(aggregate, attempts), attempts
 
 
 def _sanitize_generation_result(
@@ -819,6 +867,29 @@ class ChapterCandidatePipelineProgress:
     state_proposal_id: str | None = None
 
 
+def _exception_usage_projection(
+    progress: ChapterCandidatePipelineProgress,
+) -> dict[str, int | bool]:
+    return {
+        "total_tokens": progress.tokens,
+        "usage_is_complete": all(
+            item.is_complete for item in progress.unattributed_usage
+        ),
+        "usage_is_lower_bound": any(
+            item.is_lower_bound for item in progress.unattributed_usage
+        ),
+    }
+
+
+def _exception_unattributed_usage_projection(
+    progress: ChapterCandidatePipelineProgress,
+) -> list[dict[str, Any]]:
+    return [
+        item.model_dump(mode="json")
+        for item in progress.unattributed_usage
+    ]
+
+
 class ChapterCandidatePipelineBlocked(ValueError):
     """A candidate gate failed before the formal chapter commit."""
 
@@ -841,8 +912,12 @@ class ChapterCandidatePipelineBlocked(ValueError):
         return [item.model_dump(mode="json") for item in self.progress.attempts]
 
     @property
-    def usage(self) -> dict[str, int]:
-        return {"total_tokens": self.progress.tokens}
+    def usage(self) -> dict[str, int | bool]:
+        return _exception_usage_projection(self.progress)
+
+    @property
+    def unattributed_usage(self) -> list[dict[str, Any]]:
+        return _exception_unattributed_usage_projection(self.progress)
 
 
 class ChapterCandidatePipelineDependencyFailed(RuntimeError):
@@ -858,8 +933,12 @@ class ChapterCandidatePipelineDependencyFailed(RuntimeError):
         return [item.model_dump(mode="json") for item in self.progress.attempts]
 
     @property
-    def usage(self) -> dict[str, int]:
-        return {"total_tokens": self.progress.tokens}
+    def usage(self) -> dict[str, int | bool]:
+        return _exception_usage_projection(self.progress)
+
+    @property
+    def unattributed_usage(self) -> list[dict[str, Any]]:
+        return _exception_unattributed_usage_projection(self.progress)
 
 
 @dataclass(frozen=True)
@@ -971,50 +1050,68 @@ class _PipelineTrace:
         self.completed_steps.append(step)
 
     def record_failure(self, exc: Exception) -> None:
-        raw_attempts = getattr(exc, "attempts", None)
         outcome = getattr(exc, "outcome", None)
-        if not isinstance(raw_attempts, (list, tuple)) and outcome is not None:
-            raw_attempts = getattr(outcome, "attempts", None)
         try:
-            if raw_attempts is None:
-                raw_attempt_values: tuple[Any, ...] = ()
-            elif isinstance(raw_attempts, (list, tuple)):
-                if len(raw_attempts) > _MAX_PIPELINE_ATTEMPTS:
-                    raise _EvidenceProjectionError(
-                        "失败调用证据超过 V1 上限"
-                    )
-                raw_attempt_values = tuple(raw_attempts)
-            else:
-                raise _EvidenceProjectionError("失败调用证据格式无效")
             raw_usage = getattr(exc, "usage", None)
             usage_mapping = _as_mapping(raw_usage)
             if not usage_mapping and outcome is not None:
                 outcome_tokens = getattr(outcome, "tokens", None)
                 if type(outcome_tokens) is int:
                     usage_mapping = {"total_tokens": outcome_tokens}
-            try:
-                aggregate, aggregate_error = _project_aggregate_usage(
-                    usage_mapping
+            aggregate, aggregate_error = _project_aggregate_usage(
+                usage_mapping
+            )
+            raw_attempts = getattr(exc, "attempts", None)
+            if raw_attempts is None and outcome is not None:
+                raw_attempts = getattr(outcome, "attempts", None)
+            if raw_attempts is None:
+                raw_attempt_values: tuple[Any, ...] = ()
+            elif isinstance(raw_attempts, (list, tuple)):
+                if len(raw_attempts) > _MAX_PIPELINE_ATTEMPTS:
+                    raise _UnattributedUsageProjectionError(
+                        "失败调用证据超过 V1 上限",
+                        reason=(
+                            CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
+                        ),
+                        usage=aggregate,
+                        attempts=(),
+                        is_complete=aggregate_error is None,
+                    )
+                raw_attempt_values = tuple(raw_attempts)
+            else:
+                raise _UnattributedUsageProjectionError(
+                    "失败调用证据格式无效",
+                    reason=(
+                        CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
+                    ),
+                    usage=aggregate,
+                    attempts=(),
+                    is_complete=aggregate_error is None,
                 )
-            except _UsageProjectionOverflow as overflow:
-                raise _usage_overflow_error(str(overflow)) from overflow
             summaries = _project_attempt_batch_with_aggregate(
                 raw_attempt_values,
                 aggregate,
             )
-            if aggregate_error is not None:
+            if isinstance(
+                aggregate_error,
+                _IncompleteAggregateUsageProjectionError,
+            ):
                 raise _invalid_aggregate_error(
                     aggregate_error,
                     aggregate_floor=aggregate,
                     attempts=summaries,
                 ) from aggregate_error
             summaries = _attribute_aggregate_usage(aggregate, summaries)
+            if aggregate_error is not None:
+                raise _invalid_aggregate_error(
+                    aggregate_error,
+                    aggregate_floor=aggregate,
+                    attempts=summaries,
+                ) from aggregate_error
             usage = _effective_usage(aggregate, summaries)
+            self._record_evidence(usage, summaries)
             raw_truncations = getattr(exc, "truncations", None)
-            if (
-                not isinstance(raw_truncations, (list, tuple))
-                and outcome is not None
-            ):
+            if raw_truncations is None and outcome is not None:
                 raw_truncations = getattr(outcome, "truncations", None)
             if raw_truncations is None:
                 raw_truncation_values: tuple[Any, ...] = ()
@@ -1045,8 +1142,13 @@ class _PipelineTrace:
                 raise _EvidenceProjectionError(
                     "候选管线累计截断证据超过 V1 上限"
                 )
-            self._record_evidence(usage, summaries)
             self.truncations.extend(projected_truncations)
+        except _UsageProjectionOverflow as overflow:
+            projection_error = _usage_overflow_error(str(overflow))
+            self._record_unattributed_usage(projection_error)
+            raise ChapterCandidatePipelineBlocked(
+                f"候选管线调用证据冲突或无效：{projection_error}"
+            ) from overflow
         except _EvidenceProjectionError as projection_error:
             if isinstance(
                 projection_error,
@@ -1062,15 +1164,22 @@ class _PipelineTrace:
         error: _UnattributedUsageProjectionError,
     ) -> None:
         if error.is_lower_bound:
-            if self.unattributed_usage:
+            if any(item.is_lower_bound for item in self.unattributed_usage):
+                self.tokens = _MAX_TOKEN_COUNT
+                return
+            if (
+                len(self.unattributed_usage)
+                >= _MAX_PIPELINE_UNATTRIBUTED_USAGE
+            ):
                 raise _EvidenceProjectionError(
-                    "候选管线未归属用量下界重复溢出"
+                    "候选管线未归属用量证据超过 V1 上限"
                 )
             self.unattributed_usage.append(
                 CandidateUnattributedUsageSummary(
                     reason=error.reason,
                     usage=error.usage,
                     is_lower_bound=True,
+                    is_complete=False,
                 )
             )
             self.tokens = _MAX_TOKEN_COUNT
@@ -1081,8 +1190,17 @@ class _PipelineTrace:
             for item in error.attempts
             if known.get(item.attempt_id) == item
         )
-        residual = _usage_residual(error.usage, _summed_usage(duplicates))
-        if residual.total_tokens == 0:
+        try:
+            residual = _usage_residual(
+                error.usage,
+                _summed_usage(duplicates),
+            )
+        except _UsageProjectionOverflow as overflow:
+            self._record_unattributed_usage(
+                _usage_overflow_error(str(overflow))
+            )
+            return
+        if residual.total_tokens == 0 and error.is_complete:
             return
         if (
             len(self.unattributed_usage)
@@ -1091,18 +1209,25 @@ class _PipelineTrace:
             raise _EvidenceProjectionError(
                 "候选管线未归属用量证据超过 V1 上限"
             )
-        if self.tokens + residual.total_tokens > _MAX_TOKEN_COUNT:
-            raise _EvidenceProjectionError(
-                "候选管线累计 Token 用量超过 V1 上限"
+        try:
+            next_tokens = _checked_token_add(
+                self.tokens,
+                residual.total_tokens,
             )
+        except _UsageProjectionOverflow as overflow:
+            self._record_unattributed_usage(
+                _usage_overflow_error(str(overflow))
+            )
+            return
         self.unattributed_usage.append(
             CandidateUnattributedUsageSummary(
                 reason=error.reason,
                 usage=residual,
                 is_lower_bound=False,
+                is_complete=error.is_complete,
             )
         )
-        self.tokens += residual.total_tokens
+        self.tokens = next_tokens
 
     def _ensure_attempt_capacity(self, additional: int) -> None:
         if len(self.attempts) + additional > _MAX_PIPELINE_ATTEMPTS:
@@ -1112,6 +1237,7 @@ class _PipelineTrace:
 
     def _classify_attempts(
         self,
+        usage: CandidateUsageSummary,
         summaries: tuple[CandidateAttemptSummary, ...],
     ) -> tuple[
         tuple[CandidateAttemptSummary, ...],
@@ -1120,17 +1246,27 @@ class _PipelineTrace:
         known = {item.attempt_id: item for item in self.attempts}
         new: list[CandidateAttemptSummary] = []
         duplicates: list[CandidateAttemptSummary] = []
+        conflicting_existing: list[CandidateAttemptSummary] = []
         for summary in summaries:
             existing = known.get(summary.attempt_id)
             if existing is None:
-                known[summary.attempt_id] = summary
                 new.append(summary)
             elif existing == summary:
                 duplicates.append(summary)
             else:
-                raise _EvidenceProjectionError(
-                    "同一 attempt_id 的持久调用证据冲突"
-                )
+                conflicting_existing.append(existing)
+        if conflicting_existing:
+            accounted = _summed_usage(
+                tuple(duplicates) + tuple(conflicting_existing)
+            )
+            raise _UnattributedUsageProjectionError(
+                "同一 attempt_id 的持久调用证据冲突",
+                reason=(
+                    CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
+                ),
+                usage=_usage_residual(usage, accounted),
+                attempts=(),
+            )
         return tuple(new), tuple(duplicates)
 
     def _record_evidence(
@@ -1138,15 +1274,15 @@ class _PipelineTrace:
         usage: CandidateUsageSummary,
         summaries: tuple[CandidateAttemptSummary, ...],
     ) -> None:
-        new, duplicates = self._classify_attempts(summaries)
-        additional = self._additional_tokens(usage, new, duplicates)
+        try:
+            new, duplicates = self._classify_attempts(usage, summaries)
+            additional = self._additional_tokens(usage, new, duplicates)
+            next_tokens = _checked_token_add(self.tokens, additional)
+        except _UsageProjectionOverflow as overflow:
+            raise _usage_overflow_error(str(overflow)) from overflow
         self._ensure_attempt_capacity(len(new))
-        if self.tokens + additional > _MAX_TOKEN_COUNT:
-            raise _EvidenceProjectionError(
-                "候选管线累计 Token 用量超过 V1 上限"
-            )
         self.attempts.extend(new)
-        self.tokens += additional
+        self.tokens = next_tokens
 
     @staticmethod
     def _additional_tokens(
@@ -1154,11 +1290,12 @@ class _PipelineTrace:
         new: tuple[CandidateAttemptSummary, ...],
         duplicates: tuple[CandidateAttemptSummary, ...],
     ) -> int:
-        new_tokens = sum(item.usage.total_tokens for item in new)
-        duplicate_tokens = sum(
-            item.usage.total_tokens for item in duplicates
+        new_tokens = _summed_usage(new).total_tokens
+        duplicate_tokens = _summed_usage(duplicates).total_tokens
+        accounted_tokens = _checked_token_add(
+            new_tokens,
+            duplicate_tokens,
         )
-        accounted_tokens = new_tokens + duplicate_tokens
         if usage.total_tokens != accounted_tokens:
             raise _EvidenceProjectionError(
                 "聚合 Token 用量无法归属到 attempt 账本"
