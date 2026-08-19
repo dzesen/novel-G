@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import json
 from typing import Any, Literal, Mapping, Sequence
@@ -188,8 +189,13 @@ EVENT_PAYLOAD_MODELS: dict[str, type[_EventPayload]] = {
 }
 
 STEP_TRANSITIONS: dict[str, frozenset[str]] = {
-    "planning": frozenset({"policy_checked", "paused", "failed"}),
-    "policy_checked": frozenset({"executing", "observed", "paused", "failed"}),
+    "planning": frozenset({"policy_checked", "completed", "paused", "failed"}),
+    "policy_checked": frozenset({
+        "executing",
+        "observed",
+        "paused",
+        "failed",
+    }),
     "executing": frozenset({"observed", "paused", "failed"}),
     "observed": frozenset({"completed", "paused", "failed"}),
     "paused": frozenset({
@@ -222,6 +228,12 @@ class AgentRuntimeBudgetExceeded(ValueError):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = str(reason_code)
         super().__init__(self.reason_code)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeBinding:
+    run: dict[str, Any]
+    replayed: bool
 
 
 def _required_object_id(value: str | ObjectId | None, field: str) -> ObjectId:
@@ -357,7 +369,7 @@ class AgentRuntimeRepository:
         digest: str,
         start_request_id: str,
         now: datetime,
-    ) -> dict[str, Any]:
+    ) -> AgentRuntimeBinding:
         if not str(start_request_id).strip():
             raise ValueError("start_request_id is required")
         readiness_object_id = _required_object_id(readiness_id, "readiness_id")
@@ -376,7 +388,7 @@ class AgentRuntimeRepository:
                 raise AgentRuntimeReadinessConflict(
                     "start_request_id already belongs to another readiness"
                 )
-            return existing
+            return AgentRuntimeBinding(run=existing, replayed=True)
 
         proposed_run_id = ObjectId()
         bound = await self.readiness.find_one_and_update(
@@ -488,35 +500,137 @@ class AgentRuntimeRepository:
             "is_deleted": False,
             "deleted_at": None,
         }
+        if replay_object_id is not None:
+            replay_source = await self.runs.find_one({
+                "_id": replay_object_id,
+                "owner_id": owner_object_id,
+                "novel_id": novel_object_id,
+                "status": {"$in": ["completed", "failed", "cancelled"]},
+                "has_uncertain_attempts": {"$ne": True},
+                "authorization.goal": authorization.get("goal"),
+                "authorization.scope": authorization.get("scope"),
+                "is_deleted": False,
+                "$or": [
+                    {"lease": None},
+                    {"lease": {"$exists": False}},
+                    {"lease.expires_at": {"$lte": now}},
+                ],
+            })
+            if replay_source is None:
+                raise AgentRuntimeReadinessConflict(
+                    "replay source changed before readiness binding"
+                )
+
         if predecessor_object_id is not None:
-            predecessor = await self.runs.find_one_and_update(
-                {
-                    "_id": predecessor_object_id,
-                    "owner_id": owner_object_id,
-                    "novel_id": novel_object_id,
-                    "status": "paused",
-                    "successor_run_id": None,
-                    "authorization.goal": authorization.get("goal"),
-                    "authorization.scope": authorization.get("scope"),
-                    "is_deleted": False,
-                },
-                {"$set": {
-                    "status": "superseded",
-                    "successor_run_id": run_id,
-                    "termination": {
-                        "status": "superseded",
-                        "category": "superseded",
-                        "reason_code": "continued_by_successor",
-                        "resumable": False,
-                        "occurred_at": now,
-                        "step_id": None,
-                        "detail_code": "continued_by_successor",
-                    },
-                    "updated_at": now,
-                }},
-                return_document=ReturnDocument.AFTER,
+            if not isinstance(lineage, Mapping):
+                raise AgentRuntimeReadinessConflict(
+                    "predecessor readiness is missing its lineage checkpoint"
+                )
+            try:
+                predecessor_epoch = int(lineage["predecessor_lease_epoch"])
+            except (KeyError, TypeError, ValueError):
+                raise AgentRuntimeReadinessConflict(
+                    "predecessor readiness has an invalid lineage checkpoint"
+                )
+            predecessor_snapshot = await self.runs.find_one({
+                "_id": predecessor_object_id,
+                "owner_id": owner_object_id,
+                "novel_id": novel_object_id,
+                "authorization.goal": authorization.get("goal"),
+                "authorization.scope": authorization.get("scope"),
+                "is_deleted": False,
+            })
+            already_superseded = bool(
+                predecessor_snapshot
+                and predecessor_snapshot.get("status") == "superseded"
+                and predecessor_snapshot.get("successor_run_id") == run_id
+                and int(predecessor_snapshot.get("lease_epoch") or 0)
+                == predecessor_epoch + 1
             )
+            if predecessor_snapshot is None or (
+                (
+                    predecessor_snapshot.get("status") != "paused"
+                    or int(predecessor_snapshot.get("lease_epoch") or 0)
+                    != predecessor_epoch
+                )
+                and not already_superseded
+            ):
+                raise AgentRuntimeReadinessConflict(
+                    "predecessor changed before successor binding"
+                )
+
+            predecessor = predecessor_snapshot if already_superseded else None
+            fenced_step: dict[str, Any] | None = None
+            successor_epoch = predecessor_epoch + 1
+            predecessor_step_id = predecessor_snapshot.get("active_step_id")
+            fence_worker_id = f"successor:{run_id}"
+            if not already_superseded and predecessor_step_id:
+                try:
+                    fenced_step = await self._adopt_step_lease(
+                        run=predecessor_snapshot,
+                        step_id=str(predecessor_step_id),
+                        worker_id=fence_worker_id,
+                        expected_lease_epoch=predecessor_epoch,
+                        lease_epoch=successor_epoch,
+                        now=now,
+                        expires_at=now,
+                    )
+                except AgentRuntimeStateConflict as exc:
+                    raise AgentRuntimeReadinessConflict(
+                        "predecessor has an active resume during successor binding"
+                    ) from exc
+
+            if not already_superseded:
+                predecessor = await self.runs.find_one_and_update(
+                    {
+                        "_id": predecessor_object_id,
+                        "owner_id": owner_object_id,
+                        "novel_id": novel_object_id,
+                        "status": "paused",
+                        "successor_run_id": None,
+                        "active_step_id": predecessor_step_id,
+                        "lease_epoch": predecessor_epoch,
+                        "has_uncertain_attempts": {"$ne": True},
+                        "authorization.goal": authorization.get("goal"),
+                        "authorization.scope": authorization.get("scope"),
+                        "is_deleted": False,
+                        "$or": [
+                            {"lease": None},
+                            {"lease": {"$exists": False}},
+                            {"lease.expires_at": {"$lte": now}},
+                        ],
+                    },
+                    {"$set": {
+                        "status": "superseded",
+                        "successor_run_id": run_id,
+                        "lease": None,
+                        "lease_epoch": successor_epoch,
+                        "termination": {
+                            "status": "superseded",
+                            "category": "superseded",
+                            "reason_code": "continued_by_successor",
+                            "resumable": False,
+                            "occurred_at": now,
+                            "step_id": None,
+                            "detail_code": "continued_by_successor",
+                        },
+                        "updated_at": now,
+                    }},
+                    return_document=ReturnDocument.AFTER,
+                )
             if predecessor is None:
+                if (
+                    fenced_step is not None
+                    and fenced_step.get("status") not in {"completed", "failed"}
+                ):
+                    await self._rollback_step_handoff(
+                        run=predecessor_snapshot,
+                        step_id=str(predecessor_step_id),
+                        worker_id=fence_worker_id,
+                        lease_epoch=successor_epoch,
+                        previous_epoch=predecessor_epoch,
+                        now=now,
+                    )
                 current_predecessor = await self.runs.find_one({
                     "_id": predecessor_object_id,
                     "owner_id": owner_object_id,
@@ -527,30 +641,17 @@ class AgentRuntimeRepository:
                     and current_predecessor.get("status") == "superseded"
                     and current_predecessor.get("successor_run_id") == run_id
                 ):
-                    await self.readiness.update_one(
-                        {
-                            "_id": readiness_object_id,
-                            "status": "bound",
-                            "bound_run_id": run_id,
-                            "start_request_id": str(start_request_id),
-                        },
-                        {"$set": {
-                            "status": "inspected",
-                            "bound_run_id": None,
-                            "start_request_id": None,
-                            "bound_at": None,
-                            "updated_at": now,
-                        }},
-                    )
                     raise AgentRuntimeReadinessConflict(
                         "predecessor changed before successor binding"
                     )
+        created_run = False
         try:
-            await self.runs.update_one(
+            inserted = await self.runs.update_one(
                 {"_id": run_id},
                 {"$setOnInsert": run_document},
                 upsert=True,
             )
+            created_run = inserted.upserted_id is not None
         except DuplicateKeyError:
             pass
         stored = await self.runs.find_one({"_id": run_id, "is_deleted": False})
@@ -567,7 +668,7 @@ class AgentRuntimeRepository:
             or stored.get("authorization_digest") != str(digest)
         ):
             raise AgentRuntimeReadinessConflict("bound run identity does not match")
-        return stored
+        return AgentRuntimeBinding(run=stored, replayed=not created_run)
 
     async def get_run_owned(self, *, run_id: str, owner_id: str) -> dict[str, Any]:
         document = await self.runs.find_one({

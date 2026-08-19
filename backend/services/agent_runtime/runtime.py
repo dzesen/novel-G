@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from bson import ObjectId
 
+from backend.db.errors import NotFoundError
 from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeBudgetExceeded,
     AgentRuntimeReadinessConflict,
@@ -69,6 +70,10 @@ LINEAGE_LIMIT_FIELDS = (
     "max_paid_attempts",
     "token_budget",
 )
+REPLAN_FEEDBACK_REASONS = frozenset({
+    "scope_reference_invalid",
+    "tool_input_invalid",
+})
 
 
 class _UncertainDispatchedCall(RuntimeError):
@@ -76,6 +81,10 @@ class _UncertainDispatchedCall(RuntimeError):
 
 
 class _DeadlineExceeded(RuntimeError):
+    pass
+
+
+class _ReplanAfterFeedback(RuntimeError):
     pass
 
 
@@ -130,6 +139,30 @@ def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _replan_feedback(reason_code: str) -> dict[str, Any]:
+    if reason_code not in REPLAN_FEEDBACK_REASONS:
+        raise ValueError(f"unsupported Agent replan feedback: {reason_code}")
+    return {
+        "schema_version": "agent_runtime_replan_feedback.v1",
+        "status": "replan_required",
+        "reason_code": reason_code,
+        "planner_view": {
+            "status": "replan_required",
+            "reason_code": reason_code,
+        },
+    }
+
+
+def _is_replan_feedback(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    reason_code = str(value.get("reason_code") or "")
+    try:
+        return dict(value) == _replan_feedback(reason_code)
+    except ValueError:
+        return False
+
+
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -182,6 +215,48 @@ def _termination_event_projection(
     return event_key, event_type, {
         "status": status,
         "reason_code": reason_code,
+    }
+
+
+def _policy_event_projection(
+    *,
+    ordinal: int,
+    decision: PlannerDecision,
+    policy_decision: Mapping[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    return f"step-{ordinal}-policy", "policy_decided", {
+        "ordinal": ordinal,
+        "allowed": bool(policy_decision.get("allowed")),
+        "decision_kind": decision.kind,
+        "policy_digest": _digest(policy_decision),
+    }
+
+
+def _tool_observed_event_projection(
+    *,
+    ordinal: int,
+    observation: Mapping[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    validated = RuntimeObservation.model_validate(observation)
+    return f"step-{ordinal}-tool-observed", "tool_observed", {
+        "ordinal": ordinal,
+        "status": validated.status,
+        "code": validated.code,
+        "observation_digest": _digest(observation),
+    }
+
+
+def _step_completed_event_projection(
+    *,
+    ordinal: int,
+    step: Mapping[str, Any],
+    kind: Literal["finish", "tool"],
+) -> tuple[str, str, dict[str, Any]]:
+    return f"step-{ordinal}-completed", "step_completed", {
+        "ordinal": ordinal,
+        "status": "completed",
+        "kind": kind,
+        "step_digest": _digest(_step_audit_projection(step)),
     }
 
 
@@ -377,6 +452,10 @@ class AgentRuntime:
             raise AgentRuntimeReadinessConflict(
                 "lineage source does not match novel, goal, and scope"
             )
+        if source.get("has_uncertain_attempts") is True:
+            raise AgentRuntimeReadinessConflict(
+                "lineage source has an unresolved uncertain paid attempt"
+            )
 
         source_steps = await self._repository.list_steps_owned(
             run_id=source_id,
@@ -429,6 +508,7 @@ class AgentRuntime:
             "root_run_id": root_run_id,
             "predecessor_run_id": str(source["_id"]),
             "predecessor_input_digest": source_input_digest,
+            "predecessor_lease_epoch": int(source.get("lease_epoch") or 0),
             "cumulative_actual_usage": cumulative_actual,
             "new_authorized_upper_bound": {
                 field: int(new_limits.get(field) or 0)
@@ -474,14 +554,17 @@ class AgentRuntime:
         start_request_id: str,
     ) -> AgentRunView:
         now = _aware(self._clock())
-        run = await self._repository.bind_readiness(
+        binding = await self._repository.bind_readiness(
             readiness_id=readiness_id,
             owner_id=str(owner_id),
             digest=digest,
             start_request_id=start_request_id,
             now=now,
         )
+        run = binding.run
         run_id = str(run["_id"])
+        if binding.replayed:
+            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         if run.get("predecessor_run_id"):
             predecessor_id = str(run["predecessor_run_id"])
             await self._event(
@@ -681,16 +764,16 @@ class AgentRuntime:
                 )
                 policy_decision = step.get("policy_decision")
                 if isinstance(policy_decision, Mapping):
+                    event_key, event_type, event_payload = _policy_event_projection(
+                        ordinal=ordinal,
+                        decision=decision,
+                        policy_decision=policy_decision,
+                    )
                     await self._event(
                         run_id=run_id,
-                        event_key=f"step-{ordinal}-policy",
-                        event_type="policy_decided",
-                        payload={
-                            "ordinal": ordinal,
-                            "allowed": bool(policy_decision.get("allowed")),
-                            "decision_kind": decision.kind,
-                            "policy_digest": _digest(policy_decision),
-                        },
+                        event_key=event_key,
+                        event_type=event_type,
+                        payload=event_payload,
                         step_id=step_id,
                         now=now,
                     )
@@ -716,33 +799,36 @@ class AgentRuntime:
                 decision is not None
                 and decision.kind == "call_tool"
                 and isinstance(observation, Mapping)
+                and not _is_replan_feedback(observation)
             ):
-                validated = RuntimeObservation.model_validate(observation)
+                event_key, event_type, event_payload = (
+                    _tool_observed_event_projection(
+                        ordinal=ordinal,
+                        observation=observation,
+                    )
+                )
                 await self._event(
                     run_id=run_id,
-                    event_key=f"step-{ordinal}-tool-observed",
-                    event_type="tool_observed",
-                    payload={
-                        "ordinal": ordinal,
-                        "status": validated.status,
-                        "code": validated.code,
-                        "observation_digest": _digest(observation),
-                    },
+                    event_key=event_key,
+                    event_type=event_type,
+                    payload=event_payload,
                     step_id=step_id,
                     now=now,
                 )
             if step.get("status") == "completed" and decision is not None:
                 kind = "finish" if decision.kind == "propose_finish" else "tool"
+                event_key, event_type, event_payload = (
+                    _step_completed_event_projection(
+                        ordinal=ordinal,
+                        step=step,
+                        kind=kind,
+                    )
+                )
                 await self._event(
                     run_id=run_id,
-                    event_key=f"step-{ordinal}-completed",
-                    event_type="step_completed",
-                    payload={
-                        "ordinal": ordinal,
-                        "status": "completed",
-                        "kind": kind,
-                        "step_digest": _digest(_step_audit_projection(step)),
-                    },
+                    event_key=event_key,
+                    event_type=event_type,
+                    payload=event_payload,
                     step_id=step_id,
                     now=now,
                 )
@@ -1220,6 +1306,8 @@ class AgentRuntime:
                         add_violation("planner_decision_mismatch")
 
                 stored_policy = step.get("policy_decision")
+                stored_observation = step.get("observation")
+                has_replan_feedback = _is_replan_feedback(stored_observation)
                 expected_policy: dict[str, Any] | None = None
                 policy_rejected = False
                 if decision.kind == "propose_finish":
@@ -1249,6 +1337,29 @@ class AgentRuntime:
                         except (AgentRuntimePolicyViolation, ValueError):
                             policy_rejected = True
 
+                if expected_policy is not None and has_replan_feedback:
+                    reason_code = str(
+                        (stored_observation or {}).get("reason_code") or ""
+                    )
+                    if reason_code == "tool_input_invalid":
+                        try:
+                            runtime_descriptor = self._tools.describe(decision.tool)
+                        except ValueError:
+                            add_violation("policy_decision_mismatch")
+                        else:
+                            try:
+                                runtime_descriptor.input_schema.model_validate(
+                                    decision.arguments or {}
+                                )
+                            except ValueError:
+                                pass
+                            else:
+                                add_violation("policy_decision_mismatch")
+                    expected_policy = {
+                        "allowed": False,
+                        "reason_code": reason_code,
+                    }
+
                 if policy_rejected:
                     if not (
                         isinstance(stored_policy, Mapping)
@@ -1265,13 +1376,15 @@ class AgentRuntime:
                     policy_payload = events_by_type["policy_decided"][0].get(
                         "payload"
                     ) or {}
-                    if (
-                        policy_payload.get("decision_kind") != decision.kind
-                        or policy_payload.get("allowed")
-                        != bool((stored_policy or {}).get("allowed"))
-                        or policy_payload.get("policy_digest")
-                        != _digest(stored_policy or {})
-                    ):
+                    if isinstance(stored_policy, Mapping):
+                        expected_policy_payload = _policy_event_projection(
+                            ordinal=ordinal,
+                            decision=decision,
+                            policy_decision=stored_policy,
+                        )[2]
+                    else:
+                        expected_policy_payload = None
+                    if policy_payload != expected_policy_payload:
                         add_violation("policy_decision_mismatch")
                     if (
                         planned_positions
@@ -1307,15 +1420,27 @@ class AgentRuntime:
                                 != _digest(invocation)
                             ):
                                 add_violation("tool_invocation_mismatch")
-                    elif str(step.get("status") or "") in {
-                        "executing",
-                        "observed",
-                        "completed",
-                    }:
+                    elif (
+                        str(step.get("status") or "") in {
+                            "executing",
+                            "observed",
+                            "completed",
+                        }
+                        and not has_replan_feedback
+                    ):
                         add_violation("tool_invocation_mismatch")
 
-                    observation = step.get("observation")
-                    if isinstance(observation, Mapping):
+                    observation = stored_observation
+                    if has_replan_feedback:
+                        if (
+                            not isinstance(observation, Mapping)
+                            or dict(observation)
+                            != _replan_feedback(str(observation.get("reason_code") or ""))
+                            or positions_by_type.get("tool_dispatched")
+                            or positions_by_type.get("tool_observed")
+                        ):
+                            add_violation("observation_mismatch")
+                    elif isinstance(observation, Mapping):
                         try:
                             validated_observation = RuntimeObservation.model_validate(
                                 observation
@@ -1342,14 +1467,13 @@ class AgentRuntime:
                                 observed_payload = observed_events[0].get(
                                     "payload"
                                 ) or {}
-                                if (
-                                    observed_payload.get("status")
-                                    != validated_observation.status
-                                    or observed_payload.get("code")
-                                    != validated_observation.code
-                                    or observed_payload.get("observation_digest")
-                                    != _digest(observation)
-                                ):
+                                expected_observed_payload = (
+                                    _tool_observed_event_projection(
+                                        ordinal=ordinal,
+                                        observation=observation,
+                                    )[2]
+                                )
+                                if observed_payload != expected_observed_payload:
                                     add_violation("observation_mismatch")
                         except Exception:
                             add_violation("observation_mismatch")
@@ -1403,16 +1527,17 @@ class AgentRuntime:
                 completed_payload = events_by_type["step_completed"][0].get(
                     "payload"
                 ) or {}
-                expected_kind = (
+                expected_kind: Literal["finish", "tool"] = (
                     "finish"
                     if decision is not None and decision.kind == "propose_finish"
                     else "tool"
                 )
-                if (
-                    completed_payload.get("kind") != expected_kind
-                    or completed_payload.get("step_digest")
-                    != _digest(_step_audit_projection(step))
-                ):
+                expected_completed_payload = _step_completed_event_projection(
+                    ordinal=ordinal,
+                    step=step,
+                    kind=expected_kind,
+                )[2]
+                if completed_payload != expected_completed_payload:
                     add_violation("step_status_mismatch")
 
             persisted_step_status = str(step.get("status") or "")
@@ -1659,8 +1784,6 @@ class AgentRuntime:
             return run
         active_step_id = str(run.get("active_step_id") or "")
         if not active_step_id:
-            if run.get("status") != "running":
-                return run
             steps = await self._repository.list_steps_owned(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1668,21 +1791,85 @@ class AgentRuntime:
             if not steps:
                 return run
             latest = steps[-1]
-            if (
-                latest.get("status") != "failed"
-                or int(latest.get("ordinal") or 0)
-                != int(run.get("next_ordinal") or 0) - 1
-            ):
+            if int(latest.get("ordinal") or 0) != int(run.get("next_ordinal") or 0) - 1:
                 return run
-            reason_code = str(latest.get("failure_reason") or "")
+            latest_status = str(latest.get("status") or "")
+            latest_decision = dict(latest.get("planner_decision") or {})
+            latest_completion = dict(
+                (latest.get("observation") or {}).get("completion") or {}
+            )
+            if (
+                latest_status == "completed"
+                and latest_decision.get("kind") == "propose_finish"
+                and latest_completion.get("satisfied") is True
+            ):
+                status = "completed"
+                reason_code = "goal_satisfied"
+            elif latest_status == "failed":
+                status = "failed"
+                reason_code = str(latest.get("failure_reason") or "")
+                if not reason_code:
+                    raise AgentRuntimeStateConflict(
+                        "failed Agent step is missing its termination reason"
+                    )
+            else:
+                return run
+            termination_event_key, _, _ = _termination_event_projection(
+                status=status,
+                reason_code=reason_code,
+                lease_epoch=lease_epoch,
+            )
+            return await self._repository.set_run_status(
+                run_id=run_id,
+                owner_id=owner_id,
+                expected=(str(run.get("status") or ""),),
+                status=status,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+                fields={
+                    "termination": _termination_projection(
+                        status=status,
+                        reason_code=reason_code,
+                        now=now,
+                        step_id=str(latest["step_id"]),
+                    ),
+                    "termination_event_key": termination_event_key,
+                },
+            )
+        step = await self._repository.get_step_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+            step_id=active_step_id,
+        )
+        step_status = str(step.get("status") or "")
+        if step_status == "failed":
+            reason_code = str(step.get("failure_reason") or "")
             if not reason_code:
                 raise AgentRuntimeStateConflict(
                     "failed Agent step is missing its termination reason"
                 )
+            cleared = await self._repository.clear_active_step(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=active_step_id,
+                now=now,
+            )
+            if not cleared:
+                raise AgentRuntimeStateConflict(
+                    "failed Agent step could not be cleared during recovery"
+                )
+            termination_event_key, _, _ = _termination_event_projection(
+                status="failed",
+                reason_code=reason_code,
+                lease_epoch=lease_epoch,
+            )
             return await self._repository.set_run_status(
                 run_id=run_id,
                 owner_id=owner_id,
-                expected=("running",),
+                expected=(str(run.get("status") or ""),),
                 status="failed",
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
@@ -1692,17 +1879,28 @@ class AgentRuntime:
                         status="failed",
                         reason_code=reason_code,
                         now=now,
-                        step_id=str(latest["step_id"]),
+                        step_id=active_step_id,
                     ),
-                    "termination_event_key": f"run-failed-{reason_code}",
+                    "termination_event_key": termination_event_key,
                 },
             )
-        step = await self._repository.get_step_owned(
-            run_id=run_id,
-            owner_id=owner_id,
-            step_id=active_step_id,
-        )
-        if step.get("status") != "paused" or run.get("status") == "paused":
+        if (
+            run.get("status") == "paused"
+            and step_status in {"planning", "policy_checked", "executing", "observed"}
+            and step.get("pause_reason") is None
+            and step.get("paused_from_status") is None
+        ):
+            return await self._repository.set_run_status(
+                run_id=run_id,
+                owner_id=owner_id,
+                expected=("paused",),
+                status="running",
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+                fields={"termination": None, "termination_event_key": None},
+            )
+        if step_status != "paused" or run.get("status") == "paused":
             return run
         reason_code = str(step.get("pause_reason") or "")
         if not reason_code:
@@ -1925,18 +2123,18 @@ class AgentRuntime:
                         if decision.get("kind") == "propose_finish"
                         else "tool"
                     )
+                    event_key, event_type, event_payload = (
+                        _step_completed_event_projection(
+                            ordinal=ordinal,
+                            step=active_step,
+                            kind=kind,
+                        )
+                    )
                     await self._event(
                         run_id=run_id,
-                        event_key=f"step-{ordinal}-completed",
-                        event_type="step_completed",
-                        payload={
-                            "ordinal": ordinal,
-                            "status": "completed",
-                            "kind": kind,
-                            "step_digest": _digest(
-                                _step_audit_projection(active_step)
-                            ),
-                        },
+                        event_key=event_key,
+                        event_type=event_type,
+                        payload=event_payload,
                         step_id=active_step_id,
                         now=now,
                     )
@@ -2015,16 +2213,19 @@ class AgentRuntime:
             )
             step_id = str(step["step_id"])
             ordinal = int(step["ordinal"])
-            prepared = await self._prepare_step_decision(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                lease_epoch=lease_epoch,
-                step=step,
-                authorization=authorization,
-                authorization_digest=authorization_digest,
-                observations=observations,
-            )
+            try:
+                prepared = await self._prepare_step_decision(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step=step,
+                    authorization=authorization,
+                    authorization_digest=authorization_digest,
+                    observations=observations,
+                )
+            except _ReplanAfterFeedback:
+                continue
             if prepared is None:
                 return
             decision, descriptor, payload = prepared
@@ -2177,23 +2378,18 @@ class AgentRuntime:
             )
             return None
 
+        descriptor: RuntimeToolDescriptor | None = None
+        payload: Any | None = None
         try:
             if decision.kind == "call_tool":
                 assert decision.tool is not None and decision.scope is not None
                 descriptor = self._tools.describe(decision.tool)
-                payload, policy_decision = self._policy_gate.authorize_tool(
+                policy_decision = self._policy_gate.authorize_tool_snapshot(
                     authorization=authorization,
                     decision=decision,
-                    descriptor=descriptor,
-                )
-                await self._scope_validator(
-                    owner_id=owner_id,
-                    novel_id=str(authorization["novel_id"]),
-                    scope=decision.scope,
+                    descriptor=_tool_snapshot(descriptor),
                 )
             else:
-                descriptor = None
-                payload = None
                 policy_decision = {
                     "allowed": True,
                     "reason_code": "finish_proposal_allowed",
@@ -2218,16 +2414,16 @@ class AgentRuntime:
                 },
                 now=_aware(self._clock()),
             )
+            event_key, event_type, event_payload = _policy_event_projection(
+                ordinal=ordinal,
+                decision=decision,
+                policy_decision=policy_decision,
+            )
             await self._event(
                 run_id=run_id,
-                event_key=f"step-{ordinal}-policy",
-                event_type="policy_decided",
-                payload={
-                    "ordinal": ordinal,
-                    "allowed": False,
-                    "decision_kind": decision.kind,
-                    "policy_digest": _digest(policy_decision),
-                },
+                event_key=event_key,
+                event_type=event_type,
+                payload=event_payload,
                 step_id=step_id,
                 now=_aware(self._clock()),
             )
@@ -2251,6 +2447,58 @@ class AgentRuntime:
             )
             return None
 
+        if decision.kind == "call_tool":
+            assert descriptor is not None and decision.scope is not None
+            try:
+                payload = descriptor.input_schema.model_validate(decision.arguments or {})
+            except ValueError:
+                if step_status != "planning":
+                    await self._fail_step_and_run(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=step_id,
+                        expected_step_status=step_status,
+                        reason_code="invariant_violation",
+                        now=_aware(self._clock()),
+                    )
+                    return None
+                await self._complete_replan_feedback(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    expected_step_status=step_status,
+                    decision=decision,
+                    reason_code="tool_input_invalid",
+                    now=_aware(self._clock()),
+                )
+                raise _ReplanAfterFeedback()
+            if step_status == "planning":
+                try:
+                    await self._scope_validator(
+                        owner_id=owner_id,
+                        novel_id=str(authorization["novel_id"]),
+                        scope=decision.scope,
+                    )
+                except (NotFoundError, ValueError):
+                    await self._complete_replan_feedback(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=step_id,
+                        ordinal=ordinal,
+                        expected_step_status=step_status,
+                        decision=decision,
+                        reason_code="scope_reference_invalid",
+                        now=_aware(self._clock()),
+                    )
+                    raise _ReplanAfterFeedback()
+
         if step_status == "planning":
             await self._repository.transition_step(
                 run_id=run_id,
@@ -2266,16 +2514,16 @@ class AgentRuntime:
                 },
                 now=_aware(self._clock()),
             )
+            event_key, event_type, event_payload = _policy_event_projection(
+                ordinal=ordinal,
+                decision=decision,
+                policy_decision=policy_decision,
+            )
             await self._event(
                 run_id=run_id,
-                event_key=f"step-{ordinal}-policy",
-                event_type="policy_decided",
-                payload={
-                    "ordinal": ordinal,
-                    "allowed": True,
-                    "decision_kind": decision.kind,
-                    "policy_digest": _digest(policy_decision),
-                },
+                event_key=event_key,
+                event_type=event_type,
+                payload=event_payload,
                 step_id=step_id,
                 now=_aware(self._clock()),
             )
@@ -2356,7 +2604,7 @@ class AgentRuntime:
                     call_key=str(latest["call_key"]),
                     now=_aware(self._clock()),
                 )
-                raise
+                raise _UncertainDispatchedCall()
             if recovered is None:
                 await self._mark_uncertain(
                     run_id=run_id,
@@ -2485,7 +2733,7 @@ class AgentRuntime:
                 call_key=call_key,
                 now=_aware(self._clock()),
             )
-            raise
+            raise _UncertainDispatchedCall()
         except Exception:
             await self._mark_uncertain(
                 run_id=run_id,
@@ -2780,14 +3028,14 @@ class AgentRuntime:
                     call_key=call_key,
                     now=_aware(self._clock()),
                 )
-                await self._fail_step_and_run(
+                await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
                     lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
-                    reason_code="deadline_exceeded",
+                    reason_code="uncertain_paid_attempt",
                     now=_aware(self._clock()),
                 )
                 return False
@@ -2957,14 +3205,14 @@ class AgentRuntime:
                     call_key=call_key,
                     now=_aware(self._clock()),
                 )
-                await self._fail_step_and_run(
+                await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
                     lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="executing",
-                    reason_code="deadline_exceeded",
+                    reason_code="uncertain_paid_attempt",
                     now=_aware(self._clock()),
                 )
                 return False
@@ -3127,16 +3375,15 @@ class AgentRuntime:
             },
             now=_aware(self._clock()),
         )
+        event_key, event_type, event_payload = _tool_observed_event_projection(
+            ordinal=ordinal,
+            observation=observation,
+        )
         await self._event(
             run_id=run_id,
-            event_key=f"step-{ordinal}-tool-observed",
-            event_type="tool_observed",
-            payload={
-                "ordinal": ordinal,
-                "status": result.status,
-                "code": result.code,
-                "observation_digest": _digest(observation),
-            },
+            event_key=event_key,
+            event_type=event_type,
+            payload=event_payload,
             step_id=step_id,
             now=_aware(self._clock()),
         )
@@ -3402,6 +3649,82 @@ class AgentRuntime:
             now=now,
         )
 
+    async def _complete_replan_feedback(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        step_id: str,
+        ordinal: int,
+        expected_step_status: str,
+        decision: PlannerDecision,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        policy_decision = {
+            "allowed": False,
+            "reason_code": reason_code,
+        }
+        completed_step = await self._repository.transition_step(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            expected=expected_step_status,
+            status="completed",
+            fields={
+                "planner_decision": decision.model_dump(mode="json"),
+                "policy_decision": policy_decision,
+                "observation": _replan_feedback(reason_code),
+            },
+            now=now,
+        )
+        cleared = await self._repository.clear_active_step(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            now=now,
+        )
+        if not cleared:
+            raise AgentRuntimeStateConflict(
+                "replan feedback step could not be cleared"
+            )
+        policy_event_key, policy_event_type, policy_event_payload = (
+            _policy_event_projection(
+                ordinal=ordinal,
+                decision=decision,
+                policy_decision=policy_decision,
+            )
+        )
+        await self._event(
+            run_id=run_id,
+            event_key=policy_event_key,
+            event_type=policy_event_type,
+            payload=policy_event_payload,
+            step_id=step_id,
+            now=now,
+        )
+        completed_event_key, completed_event_type, completed_event_payload = (
+            _step_completed_event_projection(
+                ordinal=ordinal,
+                step=completed_step,
+                kind="tool",
+            )
+        )
+        await self._event(
+            run_id=run_id,
+            event_key=completed_event_key,
+            event_type=completed_event_type,
+            payload=completed_event_payload,
+            step_id=step_id,
+            now=now,
+        )
+
     async def _mark_uncertain(
         self,
         *,
@@ -3441,7 +3764,7 @@ class AgentRuntime:
         lease_epoch: int,
         step_id: str,
         ordinal: int,
-        kind: str,
+        kind: Literal["finish", "tool"],
         now: datetime,
     ) -> None:
         completed_step = await self._repository.transition_step(
@@ -3463,18 +3786,16 @@ class AgentRuntime:
             step_id=step_id,
             now=now,
         )
+        event_key, event_type, event_payload = _step_completed_event_projection(
+            ordinal=ordinal,
+            step=completed_step,
+            kind=kind,
+        )
         await self._event(
             run_id=run_id,
-            event_key=f"step-{ordinal}-completed",
-            event_type="step_completed",
-            payload={
-                "ordinal": ordinal,
-                "status": "completed",
-                "kind": kind,
-                "step_digest": _digest(
-                    _step_audit_projection(completed_step)
-                ),
-            },
+            event_key=event_key,
+            event_type=event_type,
+            payload=event_payload,
             step_id=step_id,
             now=now,
         )
