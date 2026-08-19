@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from pydantic import BaseModel
@@ -12,13 +13,13 @@ from pydantic import BaseModel
 CapabilitySource = Literal["http", "job_engine", "agent_runtime", "test"]
 
 
-class SideEffectPolicy(str):
+class SideEffectPolicy(StrEnum):
     PREVIEW_ONLY = "preview_only"
     ACCEPT_REQUIRED = "accept_required"
     SYSTEM_WRITE = "system_write"
 
 
-class RevisionPolicy(str):
+class RevisionPolicy(StrEnum):
     READ_ONLY = "read_only"
     RECHECK_BEFORE_ACCEPT = "recheck_before_accept"
     SYSTEM_WRITE_ADVANCES = "system_write_advances"
@@ -98,6 +99,30 @@ class CapabilityDefinition:
             raise TypeError("output_schema must be a Pydantic model")
         if self.handler.stream is not None and self.event_schema is None:
             raise ValueError("stream handlers require an event_schema")
+        if len(set(self.allowed_tools)) != len(self.allowed_tools):
+            raise ValueError("allowed tool ids must be unique")
+
+    def public_view(self) -> dict[str, Any]:
+        """Project display metadata from the executable runtime contract."""
+
+        return {
+            "capability": self.capability,
+            "version": self.version,
+            "label": self.label,
+            "description": self.description,
+            "customizable": self.customizable,
+            "preview_only": (
+                self.side_effect_policy is SideEffectPolicy.PREVIEW_ONLY
+            ),
+            "scope_options": list(self.scope_options),
+            "input_contract": self.input_schema.__name__,
+            "output_contract": self.output_schema.__name__,
+            "context_policy": self.context_provider.policy_id,
+            "side_effect_policy": self.side_effect_policy.value,
+            "handler_id": self.handler.handler_id,
+            "allowed_tools": list(self.allowed_tools),
+            "revision_policy": self.revision_policy.value,
+        }
 
 
 @dataclass(frozen=True)
@@ -115,6 +140,18 @@ class CapabilityStream:
     budget: CapabilityBudget
     context_policy: str
     handler_id: str
+
+
+@dataclass(frozen=True)
+class ToolReference:
+    name: str
+    version: int
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("tool name cannot be empty")
+        if self.version < 1:
+            raise ValueError("tool version must be positive")
 
 
 class CapabilityRegistry:
@@ -135,6 +172,9 @@ class CapabilityRegistry:
             return self._by_id[capability]
         except KeyError as exc:
             raise ValueError(f"unknown capability: {capability}") from exc
+
+    def list(self) -> tuple[CapabilityDefinition, ...]:
+        return self._definitions
 
     async def execute(
         self,
@@ -185,4 +225,60 @@ class CapabilityRegistry:
             budget=budget,
             context_policy=definition.context_provider.policy_id,
             handler_id=definition.handler.handler_id,
+        )
+
+
+class ToolRegistry:
+    """Agent Runtime adapter over an exact, frozen capability allowlist."""
+
+    def __init__(
+        self,
+        capabilities: CapabilityRegistry,
+        *,
+        allowed: tuple[ToolReference, ...],
+    ) -> None:
+        if len(set(allowed)) != len(allowed):
+            raise ValueError("authorized tool references must be unique")
+        for reference in allowed:
+            definition = capabilities.get(reference.name)
+            if definition.version != reference.version:
+                raise ValueError(
+                    "authorized tool version does not match registry: "
+                    f"{reference.name}@{reference.version}"
+                )
+        self._capabilities = capabilities
+        self._allowed = frozenset(allowed)
+
+    def list(self) -> tuple[CapabilityDefinition, ...]:
+        return tuple(
+            self._capabilities.get(reference.name)
+            for reference in sorted(
+                self._allowed,
+                key=lambda item: (item.name, item.version),
+            )
+        )
+
+    async def execute(
+        self,
+        reference: ToolReference,
+        payload: BaseModel | Mapping[str, Any],
+        *,
+        call: CapabilityCall,
+    ) -> CapabilityExecution:
+        if call.source != "agent_runtime":
+            raise ValueError("ToolRegistry only accepts agent_runtime calls")
+        if reference not in self._allowed:
+            raise ValueError(
+                f"tool is not authorized: {reference.name}@{reference.version}"
+            )
+        definition = self._capabilities.get(reference.name)
+        if definition.version != reference.version:
+            raise ValueError(
+                f"tool version is not authorized: "
+                f"{reference.name}@{reference.version}"
+            )
+        return await self._capabilities.execute(
+            reference.name,
+            payload,
+            call=call,
         )
