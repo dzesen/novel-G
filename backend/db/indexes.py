@@ -45,22 +45,35 @@ async def _migrate_agent_runtime_readiness_ttl(
     """Move readiness expiry off the authorization deadline field.
 
     Bound readiness envelopes must remain available as the durable reservation for
-    a start_request_id, even after their original inspection deadline.
+    a start_request_id, even after their original inspection deadline.  Normalize
+    documents as well as the index so upgrades remain correct whether the old or
+    new index already exists.
     """
     name = "agent_runtime_readiness_expiry_ttl"
     existing = (await collection.index_information()).get(name)
-    if existing is None:
-        return
-    key = list(existing.get("key") or [])
-    expire_after = existing.get("expireAfterSeconds")
-    if key == [("ttl_expires_at", 1)] and expire_after == 0:
-        return
-    if key != [("expires_at", 1)] or expire_after != 0:
-        raise RuntimeError(
-            "Agent Runtime readiness TTL index has unexpected options"
-        )
-    await collection.drop_index(name)
-    logger.info("已迁移 Agent Runtime readiness TTL 索引。")
+    if existing is not None:
+        key = list(existing.get("key") or [])
+        expire_after = existing.get("expireAfterSeconds")
+        if key == [("expires_at", 1)] and expire_after == 0:
+            await collection.drop_index(name)
+            logger.info("已迁移 Agent Runtime readiness TTL 索引。")
+        elif key != [("ttl_expires_at", 1)] or expire_after != 0:
+            raise RuntimeError(
+                "Agent Runtime readiness TTL index has unexpected options"
+            )
+
+    await collection.update_many(
+        {"status": "bound", "ttl_expires_at": {"$exists": True}},
+        {"$unset": {"ttl_expires_at": ""}},
+    )
+    await collection.update_many(
+        {
+            "status": {"$in": ["inspected", "expired"]},
+            "ttl_expires_at": {"$exists": False},
+            "expires_at": {"$type": "date"},
+        },
+        [{"$set": {"ttl_expires_at": "$expires_at"}}],
+    )
 
 
 async def init_novel_indexes():
