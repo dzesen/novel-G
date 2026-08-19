@@ -58,6 +58,25 @@ class OutlineIssueCategory(StrEnum):
 _OUTLINE_ISSUE_CATEGORIES = frozenset(OutlineIssueCategory)
 
 
+class CandidateAttemptPhase(StrEnum):
+    PRIMARY = "primary"
+    SCHEMA_FALLBACK = "schema_fallback"
+    REPAIR = "repair"
+    REVIEWER = "reviewer"
+    TEXT = "text"
+    UNKNOWN = "unknown"
+
+
+class CandidateAttemptState(StrEnum):
+    ACCOUNTED = "accounted"
+    SETTLED = "settled"
+    RELEASED_PRE_DISPATCH = "released_pre_dispatch"
+    UNCERTAIN = "uncertain"
+    RESOLVED_RETRY = "resolved_retry"
+    RESOLVED_SKIP = "resolved_skip"
+    UNKNOWN = "unknown"
+
+
 class _RepairContract(BaseModel):
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -79,23 +98,8 @@ class CandidateAttemptSummary(_RepairContract):
     )
     attempt_id: str = Field(min_length=1, max_length=128)
     provider_alias: str = Field(default="unreported", min_length=1, max_length=64)
-    phase: Literal[
-        "primary",
-        "schema_fallback",
-        "repair",
-        "reviewer",
-        "text",
-        "unknown",
-    ] = "unknown"
-    state: Literal[
-        "accounted",
-        "settled",
-        "released_pre_dispatch",
-        "uncertain",
-        "resolved_retry",
-        "resolved_skip",
-        "unknown",
-    ] = "unknown"
+    phase: CandidateAttemptPhase = CandidateAttemptPhase.UNKNOWN
+    state: CandidateAttemptState = CandidateAttemptState.UNKNOWN
     usage: CandidateUsageSummary = Field(default_factory=CandidateUsageSummary)
 
 
@@ -125,27 +129,65 @@ def _bounded_non_negative_int(value: Any, *, maximum: int) -> int:
     return min(value, maximum)
 
 
-def _usage_summary(value: Any) -> CandidateUsageSummary:
-    raw = _as_mapping(value)
-    input_tokens = _bounded_non_negative_int(
-        raw.get("input_tokens"),
-        maximum=_MAX_TOKEN_COUNT,
+class _EvidenceProjectionError(ValueError):
+    pass
+
+
+def _strict_token_count(value: Any, *, field: str) -> int:
+    if type(value) is not int or value < 0 or value > _MAX_TOKEN_COUNT:
+        raise _EvidenceProjectionError(f"{field} 不是有效的有界 Token 用量")
+    return value
+
+
+def _usage_summary(
+    value: Any,
+    *,
+    aggregate: bool = False,
+) -> CandidateUsageSummary:
+    if value is None:
+        raw: Mapping[str, Any] = {}
+    else:
+        raw = _as_mapping(value)
+        if not raw and value not in ({},):
+            raise _EvidenceProjectionError("Token 用量证据格式无效")
+    present = {
+        field
+        for field in ("input_tokens", "output_tokens", "total_tokens")
+        if field in raw
+    }
+    if not present:
+        if aggregate:
+            raise _EvidenceProjectionError("聚合 Token 用量证据缺失")
+        return CandidateUsageSummary()
+    if not aggregate and present != {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }:
+        raise _EvidenceProjectionError("Token 用量证据不完整")
+    if aggregate and "total_tokens" not in present:
+        raise _EvidenceProjectionError("聚合 Token 用量证据不完整")
+    input_tokens = (
+        _strict_token_count(raw["input_tokens"], field="input_tokens")
+        if "input_tokens" in present
+        else 0
     )
-    output_tokens = _bounded_non_negative_int(
-        raw.get("output_tokens"),
-        maximum=_MAX_TOKEN_COUNT,
+    output_tokens = (
+        _strict_token_count(raw["output_tokens"], field="output_tokens")
+        if "output_tokens" in present
+        else 0
     )
-    supplied_total = _bounded_non_negative_int(
-        raw.get("total_tokens"),
-        maximum=_MAX_TOKEN_COUNT,
+    supplied_total = _strict_token_count(
+        raw["total_tokens"],
+        field="total_tokens",
     )
+    total_tokens = max(supplied_total, input_tokens + output_tokens)
+    if total_tokens > _MAX_TOKEN_COUNT:
+        raise _EvidenceProjectionError("Token 用量证据超过 V1 上限")
     return CandidateUsageSummary(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        total_tokens=min(
-            _MAX_TOKEN_COUNT,
-            max(supplied_total, input_tokens + output_tokens),
-        ),
+        total_tokens=total_tokens,
     )
 
 
@@ -166,29 +208,31 @@ def _safe_identifier(value: Any, *, maximum: int) -> str:
 
 def _attempt_summary(value: Any) -> CandidateAttemptSummary:
     raw = _as_mapping(value)
+    if not raw:
+        raise _EvidenceProjectionError("调用证据格式无效")
+    attempt_id = _safe_identifier(raw.get("attempt_id"), maximum=128)
+    if attempt_id == "unreported":
+        raise _EvidenceProjectionError("调用证据缺少稳定 attempt_id")
     raw_phase = raw.get("phase")
-    phase = (
-        raw_phase
-        if raw_phase
-        in {"primary", "schema_fallback", "repair", "reviewer", "text"}
-        else "unknown"
-    )
+    try:
+        phase = (
+            CandidateAttemptPhase(raw_phase)
+            if isinstance(raw_phase, str)
+            else CandidateAttemptPhase.UNKNOWN
+        )
+    except ValueError:
+        phase = CandidateAttemptPhase.UNKNOWN
     raw_state = raw.get("state")
-    state = (
-        raw_state
-        if raw_state
-        in {
-            "accounted",
-            "settled",
-            "released_pre_dispatch",
-            "uncertain",
-            "resolved_retry",
-            "resolved_skip",
-        }
-        else "unknown"
-    )
+    try:
+        state = (
+            CandidateAttemptState(raw_state)
+            if isinstance(raw_state, str)
+            else CandidateAttemptState.UNKNOWN
+        )
+    except ValueError:
+        state = CandidateAttemptState.UNKNOWN
     return CandidateAttemptSummary(
-        attempt_id=_safe_identifier(raw.get("attempt_id"), maximum=128),
+        attempt_id=attempt_id,
         provider_alias=_safe_identifier(
             raw.get("provider_alias") or raw.get("provider"),
             maximum=64,
@@ -227,20 +271,67 @@ def _truncation_counts(value: Any) -> tuple[int, int]:
     return section_count, dropped_count
 
 
+def _project_attempt_batch(
+    attempts: list[Any] | tuple[Any, ...],
+) -> tuple[CandidateAttemptSummary, ...]:
+    if len(attempts) > _MAX_PIPELINE_ATTEMPTS:
+        raise _EvidenceProjectionError("调用证据超过 V1 上限")
+    projected: dict[str, CandidateAttemptSummary] = {}
+    ordered: list[CandidateAttemptSummary] = []
+    for raw_attempt in attempts:
+        summary = _attempt_summary(raw_attempt)
+        existing = projected.get(summary.attempt_id)
+        if existing is None:
+            projected[summary.attempt_id] = summary
+            ordered.append(summary)
+        elif existing != summary:
+            raise _EvidenceProjectionError("同一 attempt_id 的调用证据冲突")
+    return tuple(ordered)
+
+
+def _effective_usage(
+    aggregate: CandidateUsageSummary,
+    attempts: tuple[CandidateAttemptSummary, ...],
+) -> CandidateUsageSummary:
+    attempt_input = sum(item.usage.input_tokens for item in attempts)
+    attempt_output = sum(item.usage.output_tokens for item in attempts)
+    attempt_total = sum(item.usage.total_tokens for item in attempts)
+    input_tokens = max(aggregate.input_tokens, attempt_input)
+    output_tokens = max(aggregate.output_tokens, attempt_output)
+    total_tokens = max(
+        aggregate.total_tokens,
+        attempt_total,
+        input_tokens + output_tokens,
+    )
+    if total_tokens > _MAX_TOKEN_COUNT:
+        raise _EvidenceProjectionError("调用 Token 用量超过 V1 上限")
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _project_result_evidence(
+    result: ChapterGenerationResult,
+) -> tuple[CandidateUsageSummary, tuple[CandidateAttemptSummary, ...]]:
+    attempts = _project_attempt_batch(tuple(result.attempts))
+    aggregate = _usage_summary(result.usage, aggregate=True)
+    return _effective_usage(aggregate, attempts), attempts
+
+
 def _sanitize_generation_result(
     result: ChapterGenerationResult,
 ) -> ChapterGenerationResult:
-    if len(result.attempts) > _MAX_PIPELINE_ATTEMPTS:
-        raise ValueError("repair receipt attempt evidence exceeds the V1 bound")
+    usage, attempts = _project_result_evidence(result)
     truncated_section_count, dropped_item_count = _truncation_counts(
         result.truncation
     )
     return result.model_copy(
         update={
-            "usage": _usage_summary(result.usage).model_dump(mode="json"),
+            "usage": usage.model_dump(mode="json"),
             "attempts": [
-                _attempt_summary(item).model_dump(mode="json")
-                for item in result.attempts
+                item.model_dump(mode="json") for item in attempts
             ],
             "truncation": {
                 "truncated_section_count": truncated_section_count,
@@ -509,15 +600,13 @@ class _PipelineTrace:
     state_proposal_id: str | None = None
 
     def record(self, step: str, result: ChapterGenerationResult) -> None:
-        usage = _usage_summary(result.usage)
-        if len(result.attempts) > _MAX_PIPELINE_ATTEMPTS:
+        try:
+            usage, summaries = _project_result_evidence(result)
+            self._record_evidence(usage, summaries)
+        except _EvidenceProjectionError as exc:
             raise ChapterCandidatePipelineBlocked(
-                "候选管线调用证据超过 V1 上限"
-            )
-        summaries = [_attempt_summary(item) for item in result.attempts]
-        self._ensure_attempt_capacity(len(summaries))
-        self.tokens = min(_MAX_TOKEN_COUNT, self.tokens + usage.total_tokens)
-        self.attempts.extend(summaries)
+                f"候选管线调用证据无效：{exc}"
+            ) from exc
         truncation = _truncation(step, result)
         if truncation is not None:
             if len(self.truncations) >= _MAX_PIPELINE_TRUNCATIONS:
@@ -532,41 +621,35 @@ class _PipelineTrace:
         outcome = getattr(exc, "outcome", None)
         if not isinstance(raw_attempts, (list, tuple)) and outcome is not None:
             raw_attempts = getattr(outcome, "attempts", None)
-        if (
-            isinstance(raw_attempts, (list, tuple))
-            and len(raw_attempts) > _MAX_PIPELINE_ATTEMPTS
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线失败调用证据超过 V1 上限"
-            )
-        summaries = [
-            _attempt_summary(item)
-            for item in (
-                raw_attempts if isinstance(raw_attempts, (list, tuple)) else ()
-            )
-        ]
-        known_ids = {item.attempt_id for item in self.attempts}
-        new_summaries = [
-            item for item in summaries if item.attempt_id not in known_ids
-        ]
-        self._ensure_attempt_capacity(len(new_summaries))
-        self.attempts.extend(new_summaries)
-
-        usage = _usage_summary(getattr(exc, "usage", None))
-        if usage.total_tokens == 0 and outcome is not None:
-            usage = CandidateUsageSummary(
-                total_tokens=_bounded_non_negative_int(
-                    getattr(outcome, "tokens", None),
-                    maximum=_MAX_TOKEN_COUNT,
-                )
-            )
-        attempt_tokens = sum(item.usage.total_tokens for item in new_summaries)
-        failure_tokens = (
-            max(usage.total_tokens, attempt_tokens)
-            if new_summaries or not summaries
-            else 0
+        raw_attempt_values = (
+            tuple(raw_attempts)
+            if isinstance(raw_attempts, (list, tuple))
+            else ()
         )
-        self.tokens = min(_MAX_TOKEN_COUNT, self.tokens + failure_tokens)
+        try:
+            summaries = _project_attempt_batch(raw_attempt_values)
+            raw_usage = getattr(exc, "usage", None)
+            usage_mapping = _as_mapping(raw_usage)
+            if not usage_mapping and outcome is not None:
+                outcome_tokens = getattr(outcome, "tokens", None)
+                if type(outcome_tokens) is int:
+                    usage_mapping = {"total_tokens": outcome_tokens}
+            if usage_mapping:
+                aggregate = _usage_summary(usage_mapping, aggregate=True)
+            elif summaries and any(
+                item.usage.total_tokens == 0 for item in summaries
+            ):
+                raise _EvidenceProjectionError(
+                    "付费调用缺少完整 Token 用量证据"
+                )
+            else:
+                aggregate = CandidateUsageSummary()
+            usage = _effective_usage(aggregate, summaries)
+            self._record_evidence(usage, summaries)
+        except _EvidenceProjectionError as projection_error:
+            raise ChapterCandidatePipelineBlocked(
+                f"候选管线调用证据冲突或无效：{projection_error}"
+            ) from projection_error
 
         raw_truncations = getattr(exc, "truncations", None)
         if not isinstance(raw_truncations, (list, tuple)) and outcome is not None:
@@ -594,6 +677,59 @@ class _PipelineTrace:
             raise ChapterCandidatePipelineBlocked(
                 "候选管线调用证据超过 V1 上限"
             )
+
+    def _classify_attempts(
+        self,
+        summaries: tuple[CandidateAttemptSummary, ...],
+    ) -> tuple[
+        tuple[CandidateAttemptSummary, ...],
+        tuple[CandidateAttemptSummary, ...],
+    ]:
+        known = {item.attempt_id: item for item in self.attempts}
+        new: list[CandidateAttemptSummary] = []
+        duplicates: list[CandidateAttemptSummary] = []
+        for summary in summaries:
+            existing = known.get(summary.attempt_id)
+            if existing is None:
+                known[summary.attempt_id] = summary
+                new.append(summary)
+            elif existing == summary:
+                duplicates.append(summary)
+            else:
+                raise _EvidenceProjectionError(
+                    "同一 attempt_id 的持久调用证据冲突"
+                )
+        return tuple(new), tuple(duplicates)
+
+    def _record_evidence(
+        self,
+        usage: CandidateUsageSummary,
+        summaries: tuple[CandidateAttemptSummary, ...],
+    ) -> None:
+        new, duplicates = self._classify_attempts(summaries)
+        additional = self._additional_tokens(usage, new, duplicates)
+        self._ensure_attempt_capacity(len(new))
+        if self.tokens + additional > _MAX_TOKEN_COUNT:
+            raise _EvidenceProjectionError(
+                "候选管线累计 Token 用量超过 V1 上限"
+            )
+        self.attempts.extend(new)
+        self.tokens += additional
+
+    @staticmethod
+    def _additional_tokens(
+        usage: CandidateUsageSummary,
+        new: tuple[CandidateAttemptSummary, ...],
+        duplicates: tuple[CandidateAttemptSummary, ...],
+    ) -> int:
+        if not new:
+            return 0
+        new_tokens = sum(item.usage.total_tokens for item in new)
+        duplicate_tokens = sum(
+            item.usage.total_tokens for item in duplicates
+        )
+        unassigned_tokens = max(0, usage.total_tokens - duplicate_tokens)
+        return max(new_tokens, unassigned_tokens)
 
     def snapshot(self) -> ChapterCandidatePipelineProgress:
         source = self.source
