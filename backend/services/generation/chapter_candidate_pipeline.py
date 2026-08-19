@@ -20,6 +20,10 @@ from backend.services.generation.chapter_finalization import (
 from backend.services.generation.headless_generation import (
     GeneratedProseCandidate,
 )
+from backend.services.generation.outline_adherence import (
+    OutlineAdherenceValidationError,
+    validate_complete_outline_adherence,
+)
 from backend.services.generation.prose_runs import chapter_content_digest
 
 
@@ -1519,57 +1523,17 @@ def _adherence_matches_source(
 def _validate_adherence_gate(
     adherence: Mapping[str, Any],
     chapter: Mapping[str, Any],
-) -> None:
-    if adherence.get("verdict") != "pass":
-        raise ChapterCandidatePipelineBlocked("正文候选未精确通过章纲符合度")
-    issues = adherence.get("issues")
-    if not isinstance(issues, list) or issues:
-        raise ChapterCandidatePipelineBlocked("章纲符合度仍包含偏离问题")
+) -> dict[str, Any]:
     outline = chapter.get("outline")
-    scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
-    coverage = adherence.get("scene_coverage")
-    if (
-        not isinstance(scenes, list)
-        or not scenes
-        or not isinstance(coverage, list)
-        or len(coverage) != len(scenes)
-    ):
-        raise ChapterCandidatePipelineBlocked("章纲符合度没有覆盖全部场景")
-    scene_indexes: list[int] = []
-    for item in coverage:
-        if not isinstance(item, Mapping):
-            raise ChapterCandidatePipelineBlocked("章纲场景覆盖证据格式无效")
-        scene_index = item.get("scene_index")
-        if type(scene_index) is not int or item.get("status") != "covered":
-            raise ChapterCandidatePipelineBlocked("章纲场景尚未全部落实")
-        scene_indexes.append(scene_index)
-    if (
-        len(set(scene_indexes)) != len(scene_indexes)
-        or set(scene_indexes) != set(range(1, len(scenes) + 1))
-    ):
-        raise ChapterCandidatePipelineBlocked("章纲场景覆盖不是完整唯一集合")
-
-
-def _adherence_metadata(adherence: Mapping[str, Any]) -> dict[str, Any]:
-    issues = list(adherence.get("issues") or [])
-    categories = sorted(
-        {
-            str(item.get("category"))
-            for item in issues
-            if isinstance(item, Mapping) and item.get("category")
-        }
-    )
-    return {
-        "verdict": "pass",
-        "scene_count": len(list(adherence.get("scene_coverage") or [])),
-        "issue_count": len(issues),
-        "issue_categories": categories,
-        "source_prose_run_id": adherence["source_prose_run_id"],
-        "source_prose_run_revision": adherence[
-            "source_prose_run_revision"
-        ],
-        "source_content_digest": adherence["source_content_digest"],
-    }
+    if not isinstance(outline, Mapping):
+        raise ChapterCandidatePipelineBlocked("章节缺少有效章纲")
+    try:
+        return validate_complete_outline_adherence(
+            adherence,
+            outline=outline,
+        )
+    except OutlineAdherenceValidationError as exc:
+        raise ChapterCandidatePipelineBlocked(str(exc)) from exc
 
 
 def _strict_repair_limit(value: Any) -> int:
@@ -1985,7 +1949,10 @@ class ChapterCandidatePipeline:
                     "章纲符合度没有绑定正文候选"
                 )
             try:
-                _validate_adherence_gate(adherence, chapter)
+                adherence_metadata = _validate_adherence_gate(
+                    adherence,
+                    chapter,
+                )
             except ChapterCandidatePipelineBlocked as gate_error:
                 if last_repair_kept_digest:
                     raise ChapterCandidatePipelineBlocked(
@@ -2086,7 +2053,7 @@ class ChapterCandidatePipeline:
             tokens=progress.tokens,
             attempts=progress.attempts,
             truncations=progress.truncations,
-            outline_adherence=_adherence_metadata(adherence),
+            outline_adherence=adherence_metadata,
             consistency_issues=consistency_issues,
             prose_run_id=source.source_run_id,
             prose_run_revision=source.source_run_revision,

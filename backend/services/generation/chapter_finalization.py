@@ -10,8 +10,12 @@ from typing import Any, Mapping
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.db.mutation import MutationCommand, MutationRecorder, commit_mutation
+from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.generation_job_repository import generation_job_repo
-from backend.services.generation.outline_adherence import is_material_deviation
+from backend.services.generation.outline_adherence import (
+    OutlineAdherenceValidationError,
+    validate_complete_outline_adherence,
+)
 from backend.services.generation.prose_runs import ProseRunModule, prose_run_module
 from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.derived_stats import derived_stats
@@ -96,6 +100,7 @@ def build_chapter_finalization_authorization(
 @dataclass(frozen=True)
 class ChapterFinalizationDeps:
     job_repo: Any = generation_job_repo
+    chapter_repo: Any = chapter_repo
     prose_runs: Any = prose_run_module
     state_proposals: Any = state_proposal_module
     state_service: Any = ChapterStateService
@@ -189,6 +194,11 @@ class ChapterFinalizationService:
             novel_id=prose_command.novel_id,
             chapter_id=chapter_id,
         )
+        chapter = await self._deps.chapter_repo.get_chapter_by_id(chapter_id)
+        if str(chapter.get("novel_id") or "") != str(prose_command.novel_id):
+            raise ChapterFinalizationDenied(
+                "正式提交章节不属于正文候选所在小说"
+            )
         state_payload, state_metadata, proposal_claim = (
             await self._deps.state_proposals.prepare_policy_decision(
                 chapter_id=chapter_id,
@@ -216,11 +226,12 @@ class ChapterFinalizationService:
                 "正文候选与状态候选不属于同一小说"
             )
 
-        self._validate_gates(
+        adherence_metadata = self._validate_gates(
             prose_command=prose_command,
             state_command=state_command,
             evidence=evidence,
             authorization=stored_authorization,
+            chapter=chapter,
         )
         expected_revision = int(
             prose_command.payload["captured_narrative_revision"]
@@ -260,7 +271,10 @@ class ChapterFinalizationService:
                     **authorization.model_dump(),
                     "snapshot": deepcopy(stored_authorization),
                 },
-                "evidence": evidence.model_dump(mode="json"),
+                "evidence": {
+                    "outline_adherence": adherence_metadata,
+                    "repair_cycles_used": evidence.repair_cycles_used,
+                },
                 "prose_command": _serialize_subcommand(prose_command),
                 "state_command": _serialize_subcommand(state_command),
             },
@@ -316,7 +330,8 @@ class ChapterFinalizationService:
         state_command: MutationCommand,
         evidence: ChapterFinalizationEvidence,
         authorization: Mapping[str, Any],
-    ) -> None:
+        chapter: Mapping[str, Any],
+    ) -> dict[str, Any]:
         completion = dict(prose_command.payload.get("completion") or {})
         if (
             completion.get("can_write_formal_prose") is not True
@@ -324,8 +339,16 @@ class ChapterFinalizationService:
         ):
             raise ChapterFinalizationDenied("正文候选未通过完整性闸门")
         adherence = dict(evidence.outline_adherence or {})
-        if not adherence or is_material_deviation(adherence):
-            raise ChapterFinalizationDenied("正文候选未通过细纲符合度闸门")
+        outline = chapter.get("outline")
+        if not isinstance(outline, Mapping):
+            raise ChapterFinalizationDenied("正式提交章节缺少有效章纲")
+        try:
+            adherence_metadata = validate_complete_outline_adherence(
+                adherence,
+                outline=outline,
+            )
+        except OutlineAdherenceValidationError as exc:
+            raise ChapterFinalizationDenied(str(exc)) from exc
         if (
             str(adherence.get("source_prose_run_id") or "")
             != str(prose_command.payload["run_id"])
@@ -395,6 +418,7 @@ class ChapterFinalizationService:
             != str(prose_command.payload["text_digest"])
         ):
             raise ChapterFinalizationDenied("状态候选没有绑定当前正文候选")
+        return adherence_metadata
 
     @staticmethod
     async def _execute_finalize(session: Any, mutation: MutationRecorder) -> dict[str, Any]:
