@@ -545,53 +545,35 @@ def _compatible_ledger_sealed_step_completed_payloads(
     attempts: list[Mapping[str, Any]],
     markerful_call_keys: set[str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    payloads = [
+    projected_attempts: list[Mapping[str, Any]] = attempts
+    if markerful_call_keys is not None:
+        projected_attempts = []
+        for attempt in attempts:
+            projected_attempt = dict(attempt)
+            if str(projected_attempt.get("call_key") or "") not in (
+                markerful_call_keys
+            ):
+                projected_attempt.pop("accounting_revision", None)
+            projected_attempts.append(projected_attempt)
+    return (
         _ledger_sealed_step_completed_event_projection(
             ordinal=ordinal,
             step=step,
             kind=kind,
-            attempts=attempts,
-        )[2]
-    ]
-    if markerful_call_keys is not None:
-        mixed_attempts: list[dict[str, Any]] = []
-        marker_removed = False
-        for attempt in attempts:
-            mixed_attempt = dict(attempt)
-            if (
-                str(mixed_attempt.get("call_key") or "")
-                not in markerful_call_keys
-                and mixed_attempt.pop("accounting_revision", None) is not None
-            ):
-                marker_removed = True
-            mixed_attempts.append(mixed_attempt)
-        if marker_removed:
-            mixed_payload = _ledger_sealed_step_completed_event_projection(
-                ordinal=ordinal,
-                step=step,
-                kind=kind,
-                attempts=mixed_attempts,
-            )[2]
-            if mixed_payload not in payloads:
-                payloads.append(mixed_payload)
+            attempts=projected_attempts,
+        )[2],
+    )
 
-    markerless_attempts: list[dict[str, Any]] = []
-    marker_removed = False
-    for attempt in attempts:
-        markerless_attempt = dict(attempt)
-        if markerless_attempt.pop("accounting_revision", None) is not None:
-            marker_removed = True
-        markerless_attempts.append(markerless_attempt)
-    if marker_removed:
-        markerless_payload = _ledger_sealed_step_completed_event_projection(
-            ordinal=ordinal,
-            step=step,
-            kind=kind,
-            attempts=markerless_attempts,
-        )[2]
-        if markerless_payload not in payloads:
-            payloads.append(markerless_payload)
-    return tuple(payloads)
+
+def _strict_event_sequence(event: Mapping[str, Any]) -> int:
+    sequence = event.get("sequence")
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 1
+    ):
+        raise ValueError("Agent event sequence must be a positive integer")
+    return sequence
 
 
 def _accounting_marker_call_keys_before_event(
@@ -600,14 +582,20 @@ def _accounting_marker_call_keys_before_event(
     event_by_key: Mapping[str, Mapping[str, Any]],
     boundary_event: Mapping[str, Any],
 ) -> set[str]:
-    boundary_sequence = int(boundary_event.get("sequence") or 0)
+    boundary_sequence = _strict_event_sequence(boundary_event)
     markerful_call_keys: set[str] = set()
     for attempt in attempts:
         call_key = str(attempt.get("call_key") or "")
+        if (
+            attempt.get("state") == "released_pre_dispatch"
+            and attempt.get("accounting_revision") == 1
+        ):
+            markerful_call_keys.add(call_key)
+            continue
         accounted_event = event_by_key.get(f"{call_key}-accounted-v1")
         if (
             accounted_event is not None
-            and int(accounted_event.get("sequence") or 0) < boundary_sequence
+            and _strict_event_sequence(accounted_event) < boundary_sequence
         ):
             markerful_call_keys.add(call_key)
     return markerful_call_keys
@@ -1756,8 +1744,12 @@ class AgentRuntime:
         if [int(item["ordinal"]) for item in steps] != list(range(len(steps))):
             add_violation("step_ordinal_mismatch")
 
-        sequences = [int(item["sequence"]) for item in events]
-        if any(
+        try:
+            sequences = [_strict_event_sequence(item) for item in events]
+        except ValueError:
+            add_violation("event_sequence_mismatch")
+            sequences = []
+        if sequences and any(
             current <= previous
             for previous, current in zip(sequences, sequences[1:])
         ):
@@ -2440,22 +2432,26 @@ class AgentRuntime:
                 compatible_completed_payloads = [expected_completed_payload]
                 if accounting_revision == 0:
                     completed_event = events_by_type["step_completed"][0]
-                    markerful_call_keys = (
-                        _accounting_marker_call_keys_before_event(
-                            attempts=attempts_by_step.get(step_id, []),
-                            event_by_key=event_by_key,
-                            boundary_event=completed_event,
+                    try:
+                        markerful_call_keys = (
+                            _accounting_marker_call_keys_before_event(
+                                attempts=attempts_by_step.get(step_id, []),
+                                event_by_key=event_by_key,
+                                boundary_event=completed_event,
+                            )
                         )
-                    )
-                    compatible_completed_payloads.extend(
-                        _compatible_ledger_sealed_step_completed_payloads(
-                            ordinal=ordinal,
-                            step=step,
-                            kind=expected_kind,
-                            attempts=attempts_by_step.get(step_id, []),
-                            markerful_call_keys=markerful_call_keys,
+                    except ValueError:
+                        add_violation("event_sequence_mismatch")
+                    else:
+                        compatible_completed_payloads.extend(
+                            _compatible_ledger_sealed_step_completed_payloads(
+                                ordinal=ordinal,
+                                step=step,
+                                kind=expected_kind,
+                                attempts=attempts_by_step.get(step_id, []),
+                                markerful_call_keys=markerful_call_keys,
+                            )
                         )
-                    )
                 if completed_payload not in compatible_completed_payloads:
                     add_violation("step_status_mismatch")
 
