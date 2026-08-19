@@ -80,6 +80,7 @@ class CandidateAttemptState(StrEnum):
 
 class CandidateUnattributedUsageReason(StrEnum):
     MISSING_ATTEMPT_IDENTITY = "missing_attempt_identity"
+    ATTEMPT_EVIDENCE_INVALID = "attempt_evidence_invalid"
     AGGREGATE_RESIDUAL_UNATTRIBUTED = "aggregate_residual_unattributed"
     CHARGED_ATTEMPT_USAGE_MISSING = "charged_attempt_usage_missing"
     RELEASED_PREDISPATCH_USAGE_INVALID = (
@@ -331,6 +332,23 @@ def _project_attempt_batch(
     return tuple(ordered)
 
 
+def _project_attempt_batch_with_aggregate(
+    attempts: list[Any] | tuple[Any, ...],
+    aggregate: CandidateUsageSummary,
+) -> tuple[CandidateAttemptSummary, ...]:
+    try:
+        return _project_attempt_batch(attempts)
+    except _EvidenceProjectionError as exc:
+        if aggregate.total_tokens == 0:
+            raise
+        raise _UnattributedUsageProjectionError(
+            str(exc),
+            reason=CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID,
+            usage=aggregate,
+            attempts=(),
+        ) from exc
+
+
 def _effective_usage(
     aggregate: CandidateUsageSummary,
     attempts: tuple[CandidateAttemptSummary, ...],
@@ -485,8 +503,11 @@ def _attribute_aggregate_usage(
 def _project_result_evidence(
     result: ChapterGenerationResult,
 ) -> tuple[CandidateUsageSummary, tuple[CandidateAttemptSummary, ...]]:
-    attempts = _project_attempt_batch(tuple(result.attempts))
     aggregate = _usage_summary(result.usage, aggregate=True)
+    attempts = _project_attempt_batch_with_aggregate(
+        tuple(result.attempts),
+        aggregate,
+    )
     attempts = _attribute_aggregate_usage(aggregate, attempts)
     return _effective_usage(aggregate, attempts), attempts
 
@@ -809,7 +830,6 @@ class _PipelineTrace:
                 raw_attempt_values = tuple(raw_attempts)
             else:
                 raise _EvidenceProjectionError("失败调用证据格式无效")
-            summaries = _project_attempt_batch(raw_attempt_values)
             raw_usage = getattr(exc, "usage", None)
             usage_mapping = _as_mapping(raw_usage)
             if not usage_mapping and outcome is not None:
@@ -818,14 +838,18 @@ class _PipelineTrace:
                     usage_mapping = {"total_tokens": outcome_tokens}
             if usage_mapping:
                 aggregate = _usage_summary(usage_mapping, aggregate=True)
-            elif summaries and any(
+            else:
+                aggregate = CandidateUsageSummary()
+            summaries = _project_attempt_batch_with_aggregate(
+                raw_attempt_values,
+                aggregate,
+            )
+            if not usage_mapping and summaries and any(
                 item.usage.total_tokens == 0 for item in summaries
             ):
                 raise _EvidenceProjectionError(
                     "付费调用缺少完整 Token 用量证据"
                 )
-            else:
-                aggregate = CandidateUsageSummary()
             summaries = _attribute_aggregate_usage(aggregate, summaries)
             usage = _effective_usage(aggregate, summaries)
             raw_truncations = getattr(exc, "truncations", None)
