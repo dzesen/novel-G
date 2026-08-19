@@ -332,6 +332,65 @@ def _project_attempt_batch(
     return tuple(ordered)
 
 
+def _conservative_usage_max(
+    left: CandidateUsageSummary,
+    right: CandidateUsageSummary,
+) -> CandidateUsageSummary:
+    input_tokens = max(left.input_tokens, right.input_tokens)
+    output_tokens = max(left.output_tokens, right.output_tokens)
+    total_tokens = min(
+        _MAX_TOKEN_COUNT,
+        max(
+            left.total_tokens,
+            right.total_tokens,
+            input_tokens + output_tokens,
+        ),
+    )
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _bounded_unattributed_attempt_usage(
+    attempts: list[Any] | tuple[Any, ...],
+) -> CandidateUsageSummary:
+    if len(attempts) > _MAX_PIPELINE_ATTEMPTS:
+        return CandidateUsageSummary()
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    for raw_attempt in attempts:
+        raw = _as_mapping(raw_attempt)
+        if not raw:
+            continue
+        try:
+            usage = _usage_summary(raw.get("usage"))
+        except _EvidenceProjectionError:
+            continue
+        input_tokens = min(
+            _MAX_TOKEN_COUNT,
+            input_tokens + usage.input_tokens,
+        )
+        output_tokens = min(
+            _MAX_TOKEN_COUNT,
+            output_tokens + usage.output_tokens,
+        )
+        total_tokens = min(
+            _MAX_TOKEN_COUNT,
+            total_tokens + usage.total_tokens,
+        )
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=min(
+            _MAX_TOKEN_COUNT,
+            max(total_tokens, input_tokens + output_tokens),
+        ),
+    )
+
+
 def _project_attempt_batch_with_aggregate(
     attempts: list[Any] | tuple[Any, ...],
     aggregate: CandidateUsageSummary,
@@ -339,12 +398,16 @@ def _project_attempt_batch_with_aggregate(
     try:
         return _project_attempt_batch(attempts)
     except _EvidenceProjectionError as exc:
-        if aggregate.total_tokens == 0:
+        unattributed_usage = _conservative_usage_max(
+            aggregate,
+            _bounded_unattributed_attempt_usage(attempts),
+        )
+        if unattributed_usage.total_tokens == 0:
             raise
         raise _UnattributedUsageProjectionError(
             str(exc),
             reason=CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID,
-            usage=aggregate,
+            usage=unattributed_usage,
             attempts=(),
         ) from exc
 
@@ -505,7 +568,7 @@ def _project_result_evidence(
 ) -> tuple[CandidateUsageSummary, tuple[CandidateAttemptSummary, ...]]:
     aggregate = _usage_summary(result.usage, aggregate=True)
     attempts = _project_attempt_batch_with_aggregate(
-        tuple(result.attempts),
+        result.attempts,
         aggregate,
     )
     attempts = _attribute_aggregate_usage(aggregate, attempts)
