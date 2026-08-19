@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
+from itertools import islice
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -21,18 +23,13 @@ from backend.services.generation.headless_generation import (
 from backend.services.generation.prose_runs import chapter_content_digest
 
 
-_OUTLINE_ISSUE_CATEGORIES = frozenset({
-    "scene_coverage",
-    "scene_order",
-    "core_conflict",
-    "ending_hook",
-    "unplanned_major_event",
-    "volume_arc",
-})
 _MAX_REPAIR_SCENE_INDEXES = 20
 _MAX_REPAIR_CARD_IDS = 20
 _MAX_REPAIR_CARD_ID_LENGTH = 64
 _MAX_DROPPED_REFERENCE_COUNT = 1_000
+_MAX_PIPELINE_ATTEMPTS = 512
+_MAX_PIPELINE_TRUNCATIONS = 32
+_MAX_TOKEN_COUNT = 1_000_000_000
 
 PROSE_REPAIR_REQUEST_SCHEMA = "prose_candidate_repair_request.v1"
 PROSE_REPAIR_RECEIPT_SCHEMA = "prose_candidate_repair_receipt.v1"
@@ -43,76 +40,22 @@ ProseRepairReason = Literal[
     "completion_contract_failed",
     "outline_adherence_failed",
 ]
-OutlineIssueCategory = Literal[
-    "scene_coverage",
-    "scene_order",
-    "core_conflict",
-    "ending_hook",
-    "unplanned_major_event",
-    "volume_arc",
-]
 StateRepairReason = Literal[
     "consistency_conflict",
     "invalid_internal_reference",
 ]
 
 
-@dataclass(frozen=True)
-class ChapterCandidatePipelineProgress:
-    """Metadata-only evidence retained when a candidate pipeline stops."""
-
-    tokens: int = 0
-    attempts: tuple[dict[str, Any], ...] = ()
-    truncations: tuple[dict[str, Any], ...] = ()
-    completed_steps: tuple[str, ...] = ()
-    repair_cycles_used: int = 0
-    prose_run_id: str | None = None
-    prose_run_revision: int | None = None
-    prose_content_digest: str | None = None
-    state_proposal_id: str | None = None
+class OutlineIssueCategory(StrEnum):
+    SCENE_COVERAGE = "scene_coverage"
+    SCENE_ORDER = "scene_order"
+    CORE_CONFLICT = "core_conflict"
+    ENDING_HOOK = "ending_hook"
+    UNPLANNED_MAJOR_EVENT = "unplanned_major_event"
+    VOLUME_ARC = "volume_arc"
 
 
-class ChapterCandidatePipelineBlocked(ValueError):
-    """A candidate gate failed before the formal chapter commit."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: str = "candidate_gate_blocked",
-        progress: ChapterCandidatePipelineProgress | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.progress = progress or ChapterCandidatePipelineProgress()
-
-    def attach_progress(self, progress: ChapterCandidatePipelineProgress) -> None:
-        self.progress = progress
-
-    @property
-    def attempts(self) -> list[dict[str, Any]]:
-        return [dict(item) for item in self.progress.attempts]
-
-    @property
-    def usage(self) -> dict[str, int]:
-        return {"total_tokens": self.progress.tokens}
-
-
-class ChapterCandidatePipelineDependencyFailed(RuntimeError):
-    """A non-retryable dependency stop with all prior bounded evidence attached."""
-
-    def __init__(self, progress: ChapterCandidatePipelineProgress) -> None:
-        super().__init__("候选管线依赖调用硬暂停")
-        self.code = "candidate_dependency_failed"
-        self.progress = progress
-
-    @property
-    def attempts(self) -> list[dict[str, Any]]:
-        return [dict(item) for item in self.progress.attempts]
-
-    @property
-    def usage(self) -> dict[str, int]:
-        return {"total_tokens": self.progress.tokens}
+_OUTLINE_ISSUE_CATEGORIES = frozenset(OutlineIssueCategory)
 
 
 class _RepairContract(BaseModel):
@@ -124,11 +67,214 @@ class _RepairContract(BaseModel):
     )
 
 
+class CandidateUsageSummary(_RepairContract):
+    input_tokens: int = Field(default=0, ge=0, le=_MAX_TOKEN_COUNT)
+    output_tokens: int = Field(default=0, ge=0, le=_MAX_TOKEN_COUNT)
+    total_tokens: int = Field(default=0, ge=0, le=_MAX_TOKEN_COUNT)
+
+
+class CandidateAttemptSummary(_RepairContract):
+    schema_version: Literal["chapter_candidate_attempt.v1"] = (
+        "chapter_candidate_attempt.v1"
+    )
+    attempt_id: str = Field(min_length=1, max_length=128)
+    provider_alias: str = Field(default="unreported", min_length=1, max_length=64)
+    phase: Literal[
+        "primary",
+        "schema_fallback",
+        "repair",
+        "reviewer",
+        "text",
+        "unknown",
+    ] = "unknown"
+    state: Literal[
+        "accounted",
+        "settled",
+        "released_pre_dispatch",
+        "uncertain",
+        "resolved_retry",
+        "resolved_skip",
+        "unknown",
+    ] = "unknown"
+    usage: CandidateUsageSummary = Field(default_factory=CandidateUsageSummary)
+
+
+class CandidateTruncationSummary(_RepairContract):
+    schema_version: Literal["chapter_candidate_truncation.v1"] = (
+        "chapter_candidate_truncation.v1"
+    )
+    step: str = Field(min_length=1, max_length=64)
+    truncated_section_count: int = Field(ge=0, le=100)
+    dropped_item_count: int = Field(ge=0, le=10_000)
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        projected = dump()
+        if isinstance(projected, Mapping):
+            return projected
+    return {}
+
+
+def _bounded_non_negative_int(value: Any, *, maximum: int) -> int:
+    if type(value) is not int or value < 0:
+        return 0
+    return min(value, maximum)
+
+
+def _usage_summary(value: Any) -> CandidateUsageSummary:
+    raw = _as_mapping(value)
+    input_tokens = _bounded_non_negative_int(
+        raw.get("input_tokens"),
+        maximum=_MAX_TOKEN_COUNT,
+    )
+    output_tokens = _bounded_non_negative_int(
+        raw.get("output_tokens"),
+        maximum=_MAX_TOKEN_COUNT,
+    )
+    supplied_total = _bounded_non_negative_int(
+        raw.get("total_tokens"),
+        maximum=_MAX_TOKEN_COUNT,
+    )
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=min(
+            _MAX_TOKEN_COUNT,
+            max(supplied_total, input_tokens + output_tokens),
+        ),
+    )
+
+
+_SAFE_IDENTIFIER_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+)
+
+
+def _safe_identifier(value: Any, *, maximum: int) -> str:
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= maximum
+        and all(character in _SAFE_IDENTIFIER_CHARACTERS for character in value)
+    ):
+        return value
+    return "unreported"
+
+
+def _attempt_summary(value: Any) -> CandidateAttemptSummary:
+    raw = _as_mapping(value)
+    raw_phase = raw.get("phase")
+    phase = (
+        raw_phase
+        if raw_phase
+        in {"primary", "schema_fallback", "repair", "reviewer", "text"}
+        else "unknown"
+    )
+    raw_state = raw.get("state")
+    state = (
+        raw_state
+        if raw_state
+        in {
+            "accounted",
+            "settled",
+            "released_pre_dispatch",
+            "uncertain",
+            "resolved_retry",
+            "resolved_skip",
+        }
+        else "unknown"
+    )
+    return CandidateAttemptSummary(
+        attempt_id=_safe_identifier(raw.get("attempt_id"), maximum=128),
+        provider_alias=_safe_identifier(
+            raw.get("provider_alias") or raw.get("provider"),
+            maximum=64,
+        ),
+        phase=phase,
+        state=state,
+        usage=_usage_summary(raw.get("usage")),
+    )
+
+
+def _truncation_counts(value: Any) -> tuple[int, int]:
+    raw = _as_mapping(value)
+    if "truncated_section_count" in raw or "dropped_item_count" in raw:
+        return (
+            _bounded_non_negative_int(
+                raw.get("truncated_section_count"),
+                maximum=100,
+            ),
+            _bounded_non_negative_int(
+                raw.get("dropped_item_count"),
+                maximum=10_000,
+            ),
+        )
+    sections = raw.get("truncated_sections")
+    raw_counts = raw.get("dropped_item_counts")
+    section_count = min(100, len(sections)) if isinstance(sections, list) else 0
+    dropped_count = 0
+    if isinstance(raw_counts, Mapping):
+        dropped_count = min(
+            10_000,
+            sum(
+                _bounded_non_negative_int(count, maximum=10_000)
+                for count in islice(raw_counts.values(), 100)
+            ),
+        )
+    return section_count, dropped_count
+
+
+def _sanitize_generation_result(
+    result: ChapterGenerationResult,
+) -> ChapterGenerationResult:
+    if len(result.attempts) > _MAX_PIPELINE_ATTEMPTS:
+        raise ValueError("repair receipt attempt evidence exceeds the V1 bound")
+    truncated_section_count, dropped_item_count = _truncation_counts(
+        result.truncation
+    )
+    return result.model_copy(
+        update={
+            "usage": _usage_summary(result.usage).model_dump(mode="json"),
+            "attempts": [
+                _attempt_summary(item).model_dump(mode="json")
+                for item in result.attempts
+            ],
+            "truncation": {
+                "truncated_section_count": truncated_section_count,
+                "dropped_item_count": dropped_item_count,
+            },
+        },
+        deep=True,
+    )
+
+
+class _RepairReceipt(_RepairContract):
+    generation: ChapterGenerationResult
+
+    @field_validator("generation")
+    @classmethod
+    def sanitize_generation(
+        cls,
+        value: ChapterGenerationResult,
+    ) -> ChapterGenerationResult:
+        return _sanitize_generation_result(value)
+
+
 class ProseCandidateRepairRequest(_RepairContract):
     schema_version: Literal["prose_candidate_repair_request.v1"] = (
         PROSE_REPAIR_REQUEST_SCHEMA
     )
     cycle: int = Field(ge=1, le=MAX_FINALIZATION_REPAIR_CYCLES)
+    source_run_id: str = Field(min_length=1, max_length=128)
+    source_run_revision: int = Field(ge=0)
+    source_content_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     trigger: Literal["completion", "outline_adherence"]
     reason_codes: tuple[ProseRepairReason, ...] = Field(
         min_length=1,
@@ -160,11 +306,10 @@ class ProseCandidateRepairRequest(_RepairContract):
         return value
 
 
-class ProseCandidateRepairReceipt(_RepairContract):
+class ProseCandidateRepairReceipt(_RepairReceipt):
     schema_version: Literal["prose_candidate_repair_receipt.v1"] = (
         PROSE_REPAIR_RECEIPT_SCHEMA
     )
-    generation: ChapterGenerationResult
     source: ProseCandidateSource
 
 
@@ -174,6 +319,13 @@ class StateCandidateRepairRequest(_RepairContract):
     )
     cycle: int = Field(ge=1, le=MAX_FINALIZATION_REPAIR_CYCLES)
     proposal_id: str = Field(min_length=1, max_length=128)
+    source_run_id: str = Field(min_length=1, max_length=128)
+    source_run_revision: int = Field(ge=0)
+    source_content_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     reason_codes: tuple[StateRepairReason, ...] = Field(
         min_length=1,
         max_length=2,
@@ -206,11 +358,68 @@ class StateCandidateRepairRequest(_RepairContract):
         return value
 
 
-class StateCandidateRepairReceipt(_RepairContract):
+class StateCandidateRepairReceipt(_RepairReceipt):
     schema_version: Literal["state_candidate_repair_receipt.v1"] = (
         STATE_REPAIR_RECEIPT_SCHEMA
     )
-    generation: ChapterGenerationResult
+
+
+@dataclass(frozen=True)
+class ChapterCandidatePipelineProgress:
+    """Metadata-only evidence retained when a candidate pipeline stops."""
+
+    tokens: int = 0
+    attempts: tuple[CandidateAttemptSummary, ...] = ()
+    truncations: tuple[CandidateTruncationSummary, ...] = ()
+    completed_steps: tuple[str, ...] = ()
+    repair_cycles_used: int = 0
+    prose_run_id: str | None = None
+    prose_run_revision: int | None = None
+    prose_content_digest: str | None = None
+    state_proposal_id: str | None = None
+
+
+class ChapterCandidatePipelineBlocked(ValueError):
+    """A candidate gate failed before the formal chapter commit."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "candidate_gate_blocked",
+        progress: ChapterCandidatePipelineProgress | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.progress = progress or ChapterCandidatePipelineProgress()
+
+    def attach_progress(self, progress: ChapterCandidatePipelineProgress) -> None:
+        self.progress = progress
+
+    @property
+    def attempts(self) -> list[dict[str, Any]]:
+        return [item.model_dump(mode="json") for item in self.progress.attempts]
+
+    @property
+    def usage(self) -> dict[str, int]:
+        return {"total_tokens": self.progress.tokens}
+
+
+class ChapterCandidatePipelineDependencyFailed(RuntimeError):
+    """A non-retryable dependency stop with all prior bounded evidence attached."""
+
+    def __init__(self, progress: ChapterCandidatePipelineProgress) -> None:
+        super().__init__("候选管线依赖调用硬暂停")
+        self.code = "candidate_dependency_failed"
+        self.progress = progress
+
+    @property
+    def attempts(self) -> list[dict[str, Any]]:
+        return [item.model_dump(mode="json") for item in self.progress.attempts]
+
+    @property
+    def usage(self) -> dict[str, int]:
+        return {"total_tokens": self.progress.tokens}
 
 
 @dataclass(frozen=True)
@@ -241,8 +450,8 @@ class ChapterCandidatePipelineDeps:
     repair_prose_candidate: Callable[
         [
             str,
-            dict[str, Any],
-            ProseCandidateSource,
+            str,
+            str,
             ProseCandidateRepairRequest,
         ],
         Awaitable[ProseCandidateRepairReceipt],
@@ -250,8 +459,8 @@ class ChapterCandidatePipelineDeps:
     repair_state_candidate: Callable[
         [
             str,
-            dict[str, Any],
-            ProseCandidateSource,
+            str,
+            str,
             StateCandidateRepairRequest,
         ],
         Awaitable[StateCandidateRepairReceipt],
@@ -261,8 +470,8 @@ class ChapterCandidatePipelineDeps:
 @dataclass(frozen=True)
 class ChapterCandidatePipelineResult:
     tokens: int
-    attempts: tuple[dict[str, Any], ...]
-    truncations: tuple[dict[str, Any], ...]
+    attempts: tuple[CandidateAttemptSummary, ...]
+    truncations: tuple[CandidateTruncationSummary, ...]
     outline_adherence: dict[str, Any]
     consistency_issues: tuple[dict[str, Any], ...]
     prose_run_id: str
@@ -276,47 +485,123 @@ class ChapterCandidatePipelineResult:
 def _truncation(
     step: str,
     result: ChapterGenerationResult,
-) -> dict[str, Any] | None:
-    value = dict(result.truncation or {})
-    if not (
-        list(value.get("truncated_sections") or [])
-        or dict(value.get("dropped_item_counts") or {})
-    ):
+) -> CandidateTruncationSummary | None:
+    truncated_section_count, dropped_item_count = _truncation_counts(
+        result.truncation
+    )
+    if not truncated_section_count and not dropped_item_count:
         return None
-    return {"step": step, **value}
+    return CandidateTruncationSummary(
+        step=step,
+        truncated_section_count=truncated_section_count,
+        dropped_item_count=dropped_item_count,
+    )
 
 
 @dataclass
 class _PipelineTrace:
-    recorded_results: list[tuple[str, ChapterGenerationResult]] = field(
-        default_factory=list
-    )
+    tokens: int = 0
+    attempts: list[CandidateAttemptSummary] = field(default_factory=list)
+    truncations: list[CandidateTruncationSummary] = field(default_factory=list)
+    completed_steps: list[str] = field(default_factory=list)
     repair_cycles_used: int = 0
     source: ProseCandidateSource | None = None
     state_proposal_id: str | None = None
 
     def record(self, step: str, result: ChapterGenerationResult) -> None:
-        self.recorded_results.append((step, result))
+        usage = _usage_summary(result.usage)
+        if len(result.attempts) > _MAX_PIPELINE_ATTEMPTS:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线调用证据超过 V1 上限"
+            )
+        summaries = [_attempt_summary(item) for item in result.attempts]
+        self._ensure_attempt_capacity(len(summaries))
+        self.tokens = min(_MAX_TOKEN_COUNT, self.tokens + usage.total_tokens)
+        self.attempts.extend(summaries)
+        truncation = _truncation(step, result)
+        if truncation is not None:
+            if len(self.truncations) >= _MAX_PIPELINE_TRUNCATIONS:
+                raise ChapterCandidatePipelineBlocked(
+                    "候选管线截断证据超过 V1 上限"
+                )
+            self.truncations.append(truncation)
+        self.completed_steps.append(step)
+
+    def record_failure(self, exc: Exception) -> None:
+        raw_attempts = getattr(exc, "attempts", None)
+        outcome = getattr(exc, "outcome", None)
+        if not isinstance(raw_attempts, (list, tuple)) and outcome is not None:
+            raw_attempts = getattr(outcome, "attempts", None)
+        if (
+            isinstance(raw_attempts, (list, tuple))
+            and len(raw_attempts) > _MAX_PIPELINE_ATTEMPTS
+        ):
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线失败调用证据超过 V1 上限"
+            )
+        summaries = [
+            _attempt_summary(item)
+            for item in (
+                raw_attempts if isinstance(raw_attempts, (list, tuple)) else ()
+            )
+        ]
+        known_ids = {item.attempt_id for item in self.attempts}
+        new_summaries = [
+            item for item in summaries if item.attempt_id not in known_ids
+        ]
+        self._ensure_attempt_capacity(len(new_summaries))
+        self.attempts.extend(new_summaries)
+
+        usage = _usage_summary(getattr(exc, "usage", None))
+        if usage.total_tokens == 0 and outcome is not None:
+            usage = CandidateUsageSummary(
+                total_tokens=_bounded_non_negative_int(
+                    getattr(outcome, "tokens", None),
+                    maximum=_MAX_TOKEN_COUNT,
+                )
+            )
+        attempt_tokens = sum(item.usage.total_tokens for item in new_summaries)
+        failure_tokens = (
+            max(usage.total_tokens, attempt_tokens)
+            if new_summaries or not summaries
+            else 0
+        )
+        self.tokens = min(_MAX_TOKEN_COUNT, self.tokens + failure_tokens)
+
+        raw_truncations = getattr(exc, "truncations", None)
+        if not isinstance(raw_truncations, (list, tuple)) and outcome is not None:
+            raw_truncations = getattr(outcome, "truncations", None)
+        for raw in (
+            raw_truncations
+            if isinstance(raw_truncations, (list, tuple))
+            else ()
+        ):
+            truncated_count, dropped_count = _truncation_counts(raw)
+            if not truncated_count and not dropped_count:
+                continue
+            if len(self.truncations) >= _MAX_PIPELINE_TRUNCATIONS:
+                break
+            self.truncations.append(
+                CandidateTruncationSummary(
+                    step="dependency_failure",
+                    truncated_section_count=truncated_count,
+                    dropped_item_count=dropped_count,
+                )
+            )
+
+    def _ensure_attempt_capacity(self, additional: int) -> None:
+        if len(self.attempts) + additional > _MAX_PIPELINE_ATTEMPTS:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线调用证据超过 V1 上限"
+            )
 
     def snapshot(self) -> ChapterCandidatePipelineProgress:
         source = self.source
-        truncations = tuple(
-            value
-            for step, result in self.recorded_results
-            for value in (_truncation(step, result),)
-            if value is not None
-        )
         return ChapterCandidatePipelineProgress(
-            tokens=sum(
-                result.total_tokens for _step, result in self.recorded_results
-            ),
-            attempts=tuple(
-                dict(attempt)
-                for _step, result in self.recorded_results
-                for attempt in result.attempts
-            ),
-            truncations=truncations,
-            completed_steps=tuple(step for step, _result in self.recorded_results),
+            tokens=self.tokens,
+            attempts=tuple(self.attempts),
+            truncations=tuple(self.truncations),
+            completed_steps=tuple(self.completed_steps),
             repair_cycles_used=self.repair_cycles_used,
             prose_run_id=source.source_run_id if source is not None else None,
             prose_run_revision=(
@@ -436,9 +721,12 @@ def _completion_repair_request(
 ) -> ProseCandidateRepairRequest:
     return ProseCandidateRepairRequest(
         cycle=cycle,
+        source_run_id=source.source_run_id,
+        source_run_revision=source.source_run_revision,
+        source_content_digest=source.source_content_digest,
         trigger="completion",
         reason_codes=("completion_contract_failed",),
-        issue_categories=("scene_coverage",),
+        issue_categories=(OutlineIssueCategory.SCENE_COVERAGE,),
         scene_indexes=_outline_scene_indexes(chapter),
     )
 
@@ -446,20 +734,21 @@ def _completion_repair_request(
 def _adherence_repair_request(
     *,
     cycle: int,
+    source: ProseCandidateSource,
     adherence: Mapping[str, Any],
     chapter: Mapping[str, Any],
 ) -> ProseCandidateRepairRequest:
-    categories: list[str] = []
+    categories: list[OutlineIssueCategory] = []
     issues = adherence.get("issues")
     if isinstance(issues, list):
-        categories.extend(
-            str(item.get("category"))
-            for item in issues
-            if (
-                isinstance(item, Mapping)
-                and item.get("category") in _OUTLINE_ISSUE_CATEGORIES
-            )
-        )
+        for item in issues:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                category = OutlineIssueCategory(str(item.get("category") or ""))
+            except ValueError:
+                continue
+            categories.append(category)
     expected_indexes = set(_outline_scene_indexes(chapter))
     covered_indexes: set[int] = set()
     repair_indexes: set[int] = set()
@@ -477,13 +766,17 @@ def _adherence_repair_request(
                 repair_indexes.add(index)
     repair_indexes.update(expected_indexes - covered_indexes)
     if repair_indexes:
-        categories.append("scene_coverage")
+        categories.append(OutlineIssueCategory.SCENE_COVERAGE)
     stable_categories = tuple(dict.fromkeys(categories))
     return ProseCandidateRepairRequest(
         cycle=cycle,
+        source_run_id=source.source_run_id,
+        source_run_revision=source.source_run_revision,
+        source_content_digest=source.source_content_digest,
         trigger="outline_adherence",
         reason_codes=("outline_adherence_failed",),
-        issue_categories=stable_categories or ("scene_coverage",),
+        issue_categories=stable_categories
+        or (OutlineIssueCategory.SCENE_COVERAGE,),
         scene_indexes=tuple(sorted(repair_indexes)),
     )
 
@@ -503,6 +796,8 @@ def _state_repair_request(
     *,
     cycle: int,
     proposal_id: str,
+    source: ProseCandidateSource,
+    declared_card_ids: frozenset[str],
     state: Mapping[str, Any],
     dropped: Mapping[str, Any],
 ) -> StateCandidateRepairRequest:
@@ -516,6 +811,7 @@ def _state_repair_request(
         if (
             isinstance(card_id, str)
             and 0 < len(card_id) <= _MAX_REPAIR_CARD_ID_LENGTH
+            and card_id in declared_card_ids
         )
     }))
     dropped_count = _dropped_reference_count(dropped)
@@ -527,12 +823,36 @@ def _state_repair_request(
     return StateCandidateRepairRequest(
         cycle=cycle,
         proposal_id=proposal_id,
+        source_run_id=source.source_run_id,
+        source_run_revision=source.source_run_revision,
+        source_content_digest=source.source_content_digest,
         reason_codes=tuple(reason_codes),
         consistency_issue_count=(
             len(issues) if isinstance(raw_issues, list) else 1
         ),
         affected_card_ids=card_ids,
         dropped_reference_count=dropped_count,
+    )
+
+
+def _declared_character_card_ids(
+    chapter: Mapping[str, Any],
+) -> frozenset[str]:
+    outline = chapter.get("outline")
+    raw_ids = (
+        outline.get("present_character_card_ids")
+        if isinstance(outline, Mapping)
+        else None
+    )
+    if not isinstance(raw_ids, list):
+        return frozenset()
+    return frozenset(
+        card_id
+        for card_id in raw_ids[:_MAX_REPAIR_CARD_IDS]
+        if (
+            isinstance(card_id, str)
+            and 0 < len(card_id) <= _MAX_REPAIR_CARD_ID_LENGTH
+        )
     )
 
 
@@ -632,8 +952,9 @@ class ChapterCandidatePipeline:
     async def _apply_prose_repair(
         self,
         *,
+        owner_id: str | None,
         novel_id: str,
-        chapter: dict[str, Any],
+        chapter_id: str,
         source: ProseCandidateSource,
         request: ProseCandidateRepairRequest,
         trace: _PipelineTrace,
@@ -642,10 +963,14 @@ class ChapterCandidatePipeline:
         if repair is None:
             raise ChapterCandidatePipelineBlocked("正文候选没有授权修复入口")
         trace.repair_cycles_used = request.cycle
+        if not isinstance(owner_id, str) or not owner_id:
+            raise ChapterCandidatePipelineBlocked(
+                "自动修复缺少 owner-scoped 身份"
+            )
         receipt = await repair(
+            owner_id,
             novel_id,
-            chapter,
-            source,
+            chapter_id,
             request,
         )
         if not isinstance(receipt, ProseCandidateRepairReceipt):
@@ -670,6 +995,7 @@ class ChapterCandidatePipeline:
     async def run(
         self,
         *,
+        owner_id: str | None = None,
         novel_id: str,
         chapter: dict[str, Any],
         max_repair_cycles: int = 0,
@@ -679,6 +1005,7 @@ class ChapterCandidatePipeline:
         try:
             return await self._run(
                 novel_id=novel_id,
+                owner_id=owner_id,
                 chapter=chapter,
                 repair_limit=repair_limit,
                 trace=trace,
@@ -687,6 +1014,11 @@ class ChapterCandidatePipeline:
             exc.attach_progress(trace.snapshot())
             raise
         except Exception as exc:
+            try:
+                trace.record_failure(exc)
+            except ChapterCandidatePipelineBlocked as projection_error:
+                projection_error.attach_progress(trace.snapshot())
+                raise projection_error from exc
             raise ChapterCandidatePipelineDependencyFailed(
                 trace.snapshot()
             ) from exc
@@ -694,12 +1026,15 @@ class ChapterCandidatePipeline:
     async def _run(
         self,
         *,
+        owner_id: str | None,
         novel_id: str,
         chapter: dict[str, Any],
         repair_limit: int,
         trace: _PipelineTrace,
     ) -> ChapterCandidatePipelineResult:
-
+        chapter_id = str(chapter.get("_id") or "")
+        if not chapter_id:
+            raise ChapterCandidatePipelineBlocked("章节候选缺少内部章节 ID")
         generated = await self._deps.generate_prose_candidate(novel_id, chapter)
         trace.record("prose", generated.generation)
         _prose, source = _validate_prose_candidate(generated)
@@ -724,8 +1059,9 @@ class ChapterCandidatePipeline:
                 )
                 source, last_repair_kept_digest = (
                     await self._apply_prose_repair(
+                        owner_id=owner_id,
                         novel_id=novel_id,
-                        chapter=chapter,
+                        chapter_id=chapter_id,
                         source=source,
                         request=_completion_repair_request(
                             cycle=cycle,
@@ -780,11 +1116,13 @@ class ChapterCandidatePipeline:
                 )
                 source, last_repair_kept_digest = (
                     await self._apply_prose_repair(
+                        owner_id=owner_id,
                         novel_id=novel_id,
-                        chapter=chapter,
+                        chapter_id=chapter_id,
                         source=source,
                         request=_adherence_repair_request(
                             cycle=cycle,
+                            source=source,
                             adherence=adherence,
                             chapter=chapter,
                         ),
@@ -819,14 +1157,20 @@ class ChapterCandidatePipeline:
             request = _state_repair_request(
                 cycle=cycle,
                 proposal_id=proposal_id,
+                source=source,
+                declared_card_ids=_declared_character_card_ids(chapter),
                 state=state,
                 dropped=dropped,
             )
             trace.repair_cycles_used = cycle
+            if not isinstance(owner_id, str) or not owner_id:
+                raise ChapterCandidatePipelineBlocked(
+                    "自动修复缺少 owner-scoped 身份"
+                )
             receipt = await self._deps.repair_state_candidate(
+                owner_id,
                 novel_id,
-                chapter,
-                source,
+                chapter_id,
                 request,
             )
             if not isinstance(receipt, StateCandidateRepairReceipt):
