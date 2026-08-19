@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -30,6 +31,14 @@ from backend.services.agent_runtime.contracts import (
 from backend.services.generation.chapter_finalization import (
     MAX_FINALIZATION_REPAIR_CYCLES,
 )
+from backend.services.generation.provider_budget import (
+    ProviderBudgetBound,
+    max_provider_bounds,
+    merge_provider_bounds,
+    scale_provider_bounds,
+    structured_call_budget,
+    structured_provider_bounds,
+)
 from backend.services.llm.generation_runtime import (
     GenerationPlan,
     WorkflowStepTarget,
@@ -37,10 +46,10 @@ from backend.services.llm.generation_runtime import (
 
 
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_repair_authorization.v1"
+    "chapter_candidate_repair_authorization.v2"
 )
-CANDIDATE_PIPELINE_REVISION = 1
-CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v1"
+CANDIDATE_PIPELINE_REVISION = 2
+CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v2"
 PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
 PROSE_REMEDIATION_MAX_STEPS = 3
 PROSE_REMEDIATION_MAX_PLANNER_CALLS = 3
@@ -78,7 +87,7 @@ class RuntimeToolDescriptorSnapshot(_ClosedAuthorizationModel):
 
 
 class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
-    schema_version: Literal["candidate_structured_generation_plan.v1"]
+    schema_version: Literal["candidate_structured_generation_plan.v2"]
     workflow: str = Field(min_length=1, max_length=160)
     step: str = Field(min_length=1, max_length=160)
     provider_alias: str = Field(min_length=1, max_length=160)
@@ -95,13 +104,15 @@ class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
     generation_params_digest: _Sha256
     max_paid_attempts_per_call: _PositiveInt
     max_output_tokens_per_attempt: _PositiveInt
-    max_context_tokens: _PositiveInt
+    max_context_tokens: _PositiveInt | None
+    max_input_tokens_per_attempt: _PositiveInt
     max_tokens_per_call: _PositiveInt
 
     @model_validator(mode="after")
     def validate_token_bound(self) -> "CandidateStructuredGenerationPlan":
         expected = self.max_paid_attempts_per_call * (
-            self.max_context_tokens + self.max_output_tokens_per_attempt
+            self.max_input_tokens_per_attempt
+            + self.max_output_tokens_per_attempt
         )
         if self.max_tokens_per_call != expected:
             raise ValueError("structured generation token bound changed")
@@ -124,6 +135,9 @@ class ProseRemediationAuthorization(_ClosedAuthorizationModel):
         min_length=2,
         max_length=2,
     )
+    planner_generation: CandidateStructuredGenerationPlan
+    rewrite_generation: CandidateStructuredGenerationPlan
+    adherence_generation: CandidateStructuredGenerationPlan
 
     @model_validator(mode="after")
     def validate_runtime_contract(self) -> "ProseRemediationAuthorization":
@@ -161,27 +175,14 @@ class ProseRemediationAuthorization(_ClosedAuthorizationModel):
             raise ValueError("candidate remediation change allowlist changed")
         if self.allowed_external_data_categories != expected_external:
             raise ValueError("candidate remediation external-data allowlist changed")
-
-        maximum_tool_paid = max(
-            item.max_paid_attempts_per_call for item in self.tools
-        )
-        maximum_tool_tokens = max(item.max_tokens_per_call for item in self.tools)
-        expected_paid = (
-            PROSE_REMEDIATION_MAX_PLANNER_CALLS
-            * self.planner.max_paid_attempts_per_call
-            + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_paid
-        )
-        expected_tokens = (
-            PROSE_REMEDIATION_MAX_PLANNER_CALLS
-            * self.planner.max_tokens_per_call
-            + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_tokens
-        )
+        _validate_remediation_generation_plans(self)
+        bounds = _prose_remediation_bounds(self)
         expected_limits = AgentRuntimeLimits(
             max_steps=PROSE_REMEDIATION_MAX_STEPS,
             max_planner_calls=PROSE_REMEDIATION_MAX_PLANNER_CALLS,
             max_tool_calls=PROSE_REMEDIATION_MAX_TOOL_CALLS,
-            max_paid_attempts=expected_paid,
-            token_budget=expected_tokens,
+            max_paid_attempts=bounds.paid_attempts,
+            token_budget=bounds.tokens,
             deadline_seconds=PROSE_REMEDIATION_DEADLINE_SECONDS,
             max_predispatch_retries=PROSE_REMEDIATION_MAX_PREDISPATCH_RETRIES,
             max_planner_repairs=PROSE_REMEDIATION_MAX_PLANNER_REPAIRS,
@@ -192,8 +193,16 @@ class ProseRemediationAuthorization(_ClosedAuthorizationModel):
         return self
 
 
+class CandidateProviderBudgetBound(_ClosedAuthorizationModel):
+    provider_alias: str = Field(min_length=1, max_length=160)
+    maximum_paid_attempts_per_cycle: _NonNegativeInt
+    maximum_paid_attempts_total: _NonNegativeInt
+    maximum_tokens_per_cycle: _NonNegativeInt
+    maximum_tokens_total: _NonNegativeInt
+
+
 class CandidateRepairAuthorization(_ClosedAuthorizationModel):
-    schema_version: Literal["chapter_candidate_repair_authorization.v1"]
+    schema_version: Literal["chapter_candidate_repair_authorization.v2"]
     authorization_revision: _PositiveInt
     eligible_chapter_count: _NonNegativeInt
     eligible_chapter_ids_digest: _Sha256
@@ -205,6 +214,7 @@ class CandidateRepairAuthorization(_ClosedAuthorizationModel):
     maximum_provider_attempts_total: _NonNegativeInt
     maximum_tokens_per_cycle: _NonNegativeInt
     maximum_tokens_total: _NonNegativeInt
+    provider_bounds: tuple[CandidateProviderBudgetBound, ...]
     prose_remediation: ProseRemediationAuthorization | None
     adherence_review: CandidateStructuredGenerationPlan | None
     state_repair: CandidateStructuredGenerationPlan | None
@@ -228,7 +238,7 @@ class CandidateRepairAuthorization(_ClosedAuthorizationModel):
                     self.maximum_tokens_per_cycle,
                     self.maximum_tokens_total,
                 )
-            ):
+            ) or self.provider_bounds:
                 raise ValueError("inactive candidate repair authority is not empty")
             return self
         if any(item is None for item in adapters):
@@ -236,27 +246,187 @@ class CandidateRepairAuthorization(_ClosedAuthorizationModel):
         assert self.prose_remediation is not None
         assert self.adherence_review is not None
         assert self.state_repair is not None
-        expected_attempts = max(
-            self.prose_remediation.limits.max_paid_attempts
-            + self.adherence_review.max_paid_attempts_per_call,
-            self.state_repair.max_paid_attempts_per_call,
-        )
-        expected_tokens = max(
-            self.prose_remediation.limits.token_budget
-            + self.adherence_review.max_tokens_per_call,
-            self.state_repair.max_tokens_per_call,
+        cycle_bounds = _candidate_cycle_bounds(
+            self.prose_remediation,
+            self.adherence_review,
+            self.state_repair,
         )
         multiplier = (
             self.eligible_chapter_count * self.max_repair_cycles_per_chapter
         )
         if (
-            self.maximum_provider_attempts_per_cycle != expected_attempts
-            or self.maximum_provider_attempts_total != multiplier * expected_attempts
-            or self.maximum_tokens_per_cycle != expected_tokens
-            or self.maximum_tokens_total != multiplier * expected_tokens
+            self.maximum_provider_attempts_per_cycle
+            != cycle_bounds.paid_attempts
+            or self.maximum_provider_attempts_total
+            != multiplier * cycle_bounds.paid_attempts
+            or self.maximum_tokens_per_cycle != cycle_bounds.tokens
+            or self.maximum_tokens_total != multiplier * cycle_bounds.tokens
         ):
             raise ValueError("candidate repair aggregate bounds changed")
+        expected_provider_bounds = tuple(
+            CandidateProviderBudgetBound(
+                provider_alias=bound.provider_alias,
+                maximum_paid_attempts_per_cycle=bound.paid_attempts,
+                maximum_paid_attempts_total=bound.paid_attempts * multiplier,
+                maximum_tokens_per_cycle=bound.tokens,
+                maximum_tokens_total=bound.tokens * multiplier,
+            )
+            for bound in cycle_bounds.provider_bounds
+        )
+        if self.provider_bounds != expected_provider_bounds:
+            raise ValueError("candidate repair Provider bounds changed")
         return self
+
+
+@dataclass(frozen=True)
+class _BudgetBounds:
+    paid_attempts: int
+    tokens: int
+    provider_bounds: tuple[ProviderBudgetBound, ...]
+
+
+def _projection_provider_bounds(
+    plan: CandidateStructuredGenerationPlan,
+) -> tuple[ProviderBudgetBound, ...]:
+    return structured_provider_bounds(
+        provider_alias=plan.provider_alias,
+        reviewer_alias=plan.reviewer_alias,
+        max_paid_attempts=plan.max_paid_attempts_per_call,
+        input_tokens_per_attempt=plan.max_input_tokens_per_attempt,
+        output_tokens_per_attempt=plan.max_output_tokens_per_attempt,
+    )
+
+
+def _prose_remediation_bounds(
+    authorization: ProseRemediationAuthorization,
+) -> _BudgetBounds:
+    paid_attempts, tokens = _prose_descriptor_totals(
+        authorization.planner,
+        authorization.tools,
+    )
+    planner_bounds = scale_provider_bounds(
+        _projection_provider_bounds(authorization.planner_generation),
+        PROSE_REMEDIATION_MAX_PLANNER_CALLS,
+    )
+    rewrite_bounds = scale_provider_bounds(
+        _projection_provider_bounds(authorization.rewrite_generation),
+        PROSE_REMEDIATION_MAX_TOOL_CALLS,
+    )
+    adherence_bounds = scale_provider_bounds(
+        _projection_provider_bounds(authorization.adherence_generation),
+        PROSE_REMEDIATION_MAX_TOOL_CALLS,
+    )
+    return _BudgetBounds(
+        paid_attempts=paid_attempts,
+        tokens=tokens,
+        provider_bounds=merge_provider_bounds(
+            planner_bounds,
+            max_provider_bounds(rewrite_bounds, adherence_bounds),
+        ),
+    )
+
+
+def _prose_descriptor_totals(
+    planner: PlannerDescriptor,
+    tools: Sequence[RuntimeToolDescriptor | RuntimeToolDescriptorSnapshot],
+) -> tuple[int, int]:
+    maximum_tool_paid = max(
+        item.max_paid_attempts_per_call for item in tools
+    )
+    maximum_tool_tokens = max(item.max_tokens_per_call for item in tools)
+    return (
+        PROSE_REMEDIATION_MAX_PLANNER_CALLS
+        * planner.max_paid_attempts_per_call
+        + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_paid,
+        PROSE_REMEDIATION_MAX_PLANNER_CALLS * planner.max_tokens_per_call
+        + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_tokens,
+    )
+
+
+def _candidate_cycle_bounds(
+    prose_remediation: ProseRemediationAuthorization,
+    adherence_review: CandidateStructuredGenerationPlan,
+    state_repair: CandidateStructuredGenerationPlan,
+) -> _BudgetBounds:
+    prose = _prose_remediation_bounds(prose_remediation)
+    adherence_provider = _projection_provider_bounds(adherence_review)
+    state_provider = _projection_provider_bounds(state_repair)
+    prose_branch = _BudgetBounds(
+        paid_attempts=(
+            prose.paid_attempts
+            + adherence_review.max_paid_attempts_per_call
+        ),
+        tokens=(
+            prose.tokens + adherence_review.max_tokens_per_call
+        ),
+        provider_bounds=merge_provider_bounds(
+            prose.provider_bounds,
+            adherence_provider,
+        ),
+    )
+    state_branch = _BudgetBounds(
+        paid_attempts=state_repair.max_paid_attempts_per_call,
+        tokens=state_repair.max_tokens_per_call,
+        provider_bounds=state_provider,
+    )
+    return _BudgetBounds(
+        paid_attempts=max(
+            prose_branch.paid_attempts,
+            state_branch.paid_attempts,
+        ),
+        tokens=max(prose_branch.tokens, state_branch.tokens),
+        provider_bounds=max_provider_bounds(
+            prose_branch.provider_bounds,
+            state_branch.provider_bounds,
+        ),
+    )
+
+
+def _validate_remediation_generation_plans(
+    authorization: ProseRemediationAuthorization,
+) -> None:
+    from backend.services.generation.prose_remediation_runtime import (
+        OUTLINE_ADHERENCE_STEP,
+        PROSE_CANDIDATE_REWRITE_STEP,
+        PROSE_REMEDIATION_WORKFLOW,
+        REMEDIATION_PLANNER_STEP,
+    )
+
+    plans = (
+        authorization.planner_generation,
+        authorization.rewrite_generation,
+        authorization.adherence_generation,
+    )
+    targets = (
+        (PROSE_REMEDIATION_WORKFLOW, REMEDIATION_PLANNER_STEP),
+        (PROSE_REMEDIATION_WORKFLOW, PROSE_CANDIDATE_REWRITE_STEP),
+        (PROSE_REMEDIATION_WORKFLOW, OUTLINE_ADHERENCE_STEP),
+    )
+    if tuple((item.workflow, item.step) for item in plans) != targets:
+        raise ValueError("candidate remediation generation targets changed")
+    if any(item.generation_params_digest != _mapping_digest(None) for item in plans):
+        raise ValueError("candidate remediation internal parameters changed")
+    planner_plan = authorization.planner_generation
+    if (
+        planner_plan.provider_alias != authorization.planner.provider_alias
+        or planner_plan.provider_model != authorization.planner.provider_model
+        or planner_plan.max_paid_attempts_per_call
+        != authorization.planner.max_paid_attempts_per_call
+        or planner_plan.max_tokens_per_call
+        != authorization.planner.max_tokens_per_call
+    ):
+        raise ValueError("candidate remediation Planner plan changed")
+    for descriptor, plan in zip(
+        authorization.tools,
+        (authorization.rewrite_generation, authorization.adherence_generation),
+        strict=True,
+    ):
+        if (
+            plan.max_paid_attempts_per_call
+            != descriptor.max_paid_attempts_per_call
+            or plan.max_tokens_per_call != descriptor.max_tokens_per_call
+        ):
+            raise ValueError("candidate remediation Tool Provider plan changed")
 
 
 def parse_candidate_repair_authorization(
@@ -350,6 +520,8 @@ def _structured_plan_projection(
     workflow: str,
     step: str,
     generation_params: Mapping[str, Any] | None,
+    input_token_bound: int | None = None,
+    output_token_bound: int | None = None,
 ) -> dict[str, Any]:
     if not isinstance(plan, GenerationPlan):
         raise ValueError("candidate repair GenerationPlan is invalid")
@@ -374,14 +546,15 @@ def _structured_plan_projection(
         )
     ):
         raise ValueError("candidate repair GenerationPlan identity is incomplete")
-    paid_attempts = _strict_positive_int(
-        plan.max_semantic_attempts,
-        field="candidate repair paid-attempt bound",
-    )
     raw_max_tokens = dict(generation_params or {}).get("max_tokens")
-    output_tokens = _strict_positive_int(
-        raw_max_tokens if raw_max_tokens is not None else plan.max_output_tokens,
-        field="candidate repair output-token bound",
+    budget = structured_call_budget(
+        plan,
+        input_token_bound=input_token_bound,
+        output_token_bound=(
+            output_token_bound
+            if output_token_bound is not None
+            else raw_max_tokens
+        ),
     )
     timeout_seconds = plan.timeout_seconds
     if timeout_seconds is not None:
@@ -389,11 +562,6 @@ def _structured_plan_projection(
             timeout_seconds,
             field="candidate repair timeout",
         )
-    context_tokens = _strict_positive_int(
-        plan.max_context_tokens,
-        field="candidate repair context-token bound",
-    )
-    maximum_tokens = paid_attempts * (context_tokens + output_tokens)
     return {
         "schema_version": CANDIDATE_STRUCTURED_PLAN_SCHEMA,
         "workflow": workflow,
@@ -408,11 +576,58 @@ def _structured_plan_projection(
         "config_revision": config_revision,
         "capability_snapshot": capability_snapshot,
         "generation_params_digest": _mapping_digest(generation_params),
-        "max_paid_attempts_per_call": paid_attempts,
-        "max_output_tokens_per_attempt": output_tokens,
-        "max_context_tokens": context_tokens,
-        "max_tokens_per_call": maximum_tokens,
+        "max_paid_attempts_per_call": budget.max_paid_attempts,
+        "max_output_tokens_per_attempt": (
+            budget.max_output_tokens_per_attempt
+        ),
+        "max_context_tokens": budget.max_context_tokens,
+        "max_input_tokens_per_attempt": (
+            budget.max_input_tokens_per_attempt
+        ),
+        "max_tokens_per_call": budget.max_tokens_per_call,
     }
+
+
+def _runtime_call_projection(
+    call: Any,
+    descriptor: PlannerDescriptor | RuntimeToolDescriptor,
+    *,
+    workflow: str,
+    step: str,
+) -> dict[str, Any]:
+    plan = getattr(call, "plan", None)
+    if not isinstance(plan, GenerationPlan):
+        raise ValueError("candidate remediation Provider plan is missing")
+    attempts = _strict_positive_int(
+        getattr(call, "max_paid_attempts", None),
+        field="candidate remediation paid-attempt bound",
+    )
+    output_tokens = _strict_positive_int(
+        getattr(call, "output_token_bound", None),
+        field="candidate remediation output-token bound",
+    )
+    descriptor_attempts = _strict_positive_int(
+        descriptor.max_paid_attempts_per_call,
+        field="candidate remediation descriptor paid-attempt bound",
+    )
+    descriptor_tokens = _strict_positive_int(
+        descriptor.max_tokens_per_call,
+        field="candidate remediation descriptor token bound",
+    )
+    if attempts != descriptor_attempts or descriptor_tokens % attempts:
+        raise ValueError("candidate remediation descriptor budget changed")
+    input_tokens = descriptor_tokens // attempts - output_tokens
+    projection = _structured_plan_projection(
+        plan,
+        workflow=workflow,
+        step=step,
+        generation_params=None,
+        input_token_bound=input_tokens,
+        output_token_bound=output_tokens,
+    )
+    if projection["max_tokens_per_call"] != descriptor_tokens:
+        raise ValueError("candidate remediation descriptor token bound changed")
+    return projection
 
 
 def _production_remediation_inputs() -> tuple[Any, GenerationPlan, GenerationPlan]:
@@ -486,6 +701,7 @@ def build_chapter_candidate_repair_authorization(
             "maximum_provider_attempts_total": 0,
             "maximum_tokens_per_cycle": 0,
             "maximum_tokens_total": 0,
+            "provider_bounds": [],
             "prose_remediation": None,
             "adherence_review": None,
             "state_repair": None,
@@ -512,8 +728,16 @@ def build_chapter_candidate_repair_authorization(
 
     from backend.services.generation.prose_remediation_runtime import (
         ADHERENCE_TOOL,
+        PROSE_CANDIDATE_REWRITE_STEP,
         REMEDIATION_SCOPE_KIND,
+        REMEDIATION_PLANNER_STEP,
         REWRITE_TOOL,
+    )
+    from backend.services.generation.chapter_generation_application import (
+        OUTLINE_ADHERENCE_STEP,
+        PROSE_REMEDIATION_WORKFLOW,
+        STATE_STEP,
+        STATE_WORKFLOW,
     )
 
     if REMEDIATION_SCOPE_KIND != PROSE_REMEDIATION_SCOPE_KIND:
@@ -530,54 +754,43 @@ def build_chapter_candidate_repair_authorization(
     ):
         raise ValueError("candidate remediation tool registry drifted")
 
-    maximum_tool_paid = max(
-        descriptor.max_paid_attempts_per_call for descriptor in tools
+    prose_paid_attempts, prose_token_bound = _prose_descriptor_totals(
+        planner,
+        tools,
     )
-    maximum_tool_tokens = max(
-        descriptor.max_tokens_per_call for descriptor in tools
+    planner_generation = _runtime_call_projection(
+        remediation_bundle.planner_call,
+        planner,
+        workflow=PROSE_REMEDIATION_WORKFLOW,
+        step=REMEDIATION_PLANNER_STEP,
     )
-    prose_paid_attempts = (
-        PROSE_REMEDIATION_MAX_PLANNER_CALLS
-        * planner.max_paid_attempts_per_call
-        + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_paid
+    rewrite_generation = _runtime_call_projection(
+        remediation_bundle.rewrite_call,
+        tools[0],
+        workflow=PROSE_REMEDIATION_WORKFLOW,
+        step=PROSE_CANDIDATE_REWRITE_STEP,
     )
-    prose_token_bound = (
-        PROSE_REMEDIATION_MAX_PLANNER_CALLS * planner.max_tokens_per_call
-        + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_tokens
-    )
-    from backend.services.generation.chapter_generation_application import (
-        OUTLINE_ADHERENCE_STEP,
-        PROSE_REMEDIATION_WORKFLOW,
-        STATE_STEP,
-        STATE_WORKFLOW,
-    )
-    adherence_projection = _structured_plan_projection(
-        adherence_plan,
+    adherence_generation = _runtime_call_projection(
+        remediation_bundle.adherence_call,
+        tools[1],
         workflow=PROSE_REMEDIATION_WORKFLOW,
         step=OUTLINE_ADHERENCE_STEP,
-        generation_params=generation_params,
     )
-    state_projection = _structured_plan_projection(
-        state_plan,
-        workflow=STATE_WORKFLOW,
-        step=STATE_STEP,
-        generation_params=generation_params,
+    adherence_projection = CandidateStructuredGenerationPlan.model_validate(
+        _structured_plan_projection(
+            adherence_plan,
+            workflow=PROSE_REMEDIATION_WORKFLOW,
+            step=OUTLINE_ADHERENCE_STEP,
+            generation_params=generation_params,
+        )
     )
-    # A prose repair is not trusted on the Agent's own review alone. The
-    # deterministic candidate pipeline always performs one fresh, exact-source
-    # adherence review before it may advance to state extraction.
-    maximum_per_cycle = max(
-        prose_paid_attempts
-        + int(adherence_projection["max_paid_attempts_per_call"]),
-        int(state_projection["max_paid_attempts_per_call"]),
-    )
-    maximum_total = len(eligible_ids) * cycles * maximum_per_cycle
-    maximum_tokens_per_cycle = max(
-        prose_token_bound + int(adherence_projection["max_tokens_per_call"]),
-        int(state_projection["max_tokens_per_call"]),
-    )
-    maximum_tokens_total = (
-        len(eligible_ids) * cycles * maximum_tokens_per_cycle
+    state_projection = CandidateStructuredGenerationPlan.model_validate(
+        _structured_plan_projection(
+            state_plan,
+            workflow=STATE_WORKFLOW,
+            step=STATE_STEP,
+            generation_params=generation_params,
+        )
     )
 
     planner_external = tuple(planner.external_data_categories)
@@ -586,13 +799,8 @@ def build_chapter_candidate_repair_authorization(
         for descriptor in tools
         for item in descriptor.external_data_categories
     )
-    return CandidateRepairAuthorization.model_validate({
-        **base,
-        "maximum_provider_attempts_per_cycle": maximum_per_cycle,
-        "maximum_provider_attempts_total": maximum_total,
-        "maximum_tokens_per_cycle": maximum_tokens_per_cycle,
-        "maximum_tokens_total": maximum_tokens_total,
-        "prose_remediation": {
+    prose_authorization = ProseRemediationAuthorization.model_validate(
+        {
             "scope_kind": PROSE_REMEDIATION_SCOPE_KIND,
             "registry_revision": str(
                 remediation_bundle.tools.registry_revision
@@ -625,7 +833,41 @@ def build_chapter_candidate_repair_authorization(
             },
             "planner": _planner_projection(planner),
             "tools": [_tool_projection(descriptor) for descriptor in tools],
-        },
+            "planner_generation": planner_generation,
+            "rewrite_generation": rewrite_generation,
+            "adherence_generation": adherence_generation,
+        }
+    )
+    # A prose repair is not trusted on the Agent's own review alone. The
+    # deterministic candidate pipeline always performs one fresh, exact-source
+    # adherence review before it may advance to state extraction.
+    cycle_bounds = _candidate_cycle_bounds(
+        prose_authorization,
+        adherence_projection,
+        state_projection,
+    )
+    multiplier = len(eligible_ids) * cycles
+    return CandidateRepairAuthorization.model_validate({
+        **base,
+        "maximum_provider_attempts_per_cycle": cycle_bounds.paid_attempts,
+        "maximum_provider_attempts_total": (
+            multiplier * cycle_bounds.paid_attempts
+        ),
+        "maximum_tokens_per_cycle": cycle_bounds.tokens,
+        "maximum_tokens_total": multiplier * cycle_bounds.tokens,
+        "provider_bounds": [
+            {
+                "provider_alias": bound.provider_alias,
+                "maximum_paid_attempts_per_cycle": bound.paid_attempts,
+                "maximum_paid_attempts_total": (
+                    multiplier * bound.paid_attempts
+                ),
+                "maximum_tokens_per_cycle": bound.tokens,
+                "maximum_tokens_total": multiplier * bound.tokens,
+            }
+            for bound in cycle_bounds.provider_bounds
+        ],
+        "prose_remediation": prose_authorization,
         "adherence_review": adherence_projection,
         "state_repair": state_projection,
     }).model_dump(mode="json")
@@ -641,7 +883,12 @@ def authorized_candidate_repair_attempt_slots(
     normalized_chapter_id = str(chapter_id or "")
     if not normalized_chapter_id:
         raise ValueError("candidate repair chapter id is required")
-    if readiness.get("version") != 2:
+    readiness_version = readiness.get("version")
+    if (
+        isinstance(readiness_version, bool)
+        or not isinstance(readiness_version, int)
+        or readiness_version != 2
+    ):
         raise ValueError("candidate repair readiness version is invalid")
     planning = readiness.get("planning")
     if not isinstance(planning, Mapping):

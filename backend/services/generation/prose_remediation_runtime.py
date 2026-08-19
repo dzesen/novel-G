@@ -2403,6 +2403,9 @@ class ProseRemediationRuntimeBundle:
     planner: ProseRemediationPlanner
     tools: ProseRemediationToolRegistry
     completion_policy: ProseRemediationCompletionPolicy
+    planner_call: FrozenStructuredCall
+    rewrite_call: FrozenStructuredCall
+    adherence_call: FrozenStructuredCall
 
 
 def _production_call(step_name: str) -> FrozenStructuredCall:
@@ -2470,4 +2473,7 @@ def build_prose_remediation_runtime(
         planner=planner,
         tools=tools,
         completion_policy=completion,
+        planner_call=planner_generation,
+        rewrite_call=rewrite_generation,
+        adherence_call=adherence_generation,
     )

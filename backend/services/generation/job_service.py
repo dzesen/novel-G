@@ -126,6 +126,11 @@ def _estimate_authorized_chapter_attempt_slots(
         return base_slots
     readiness_version = readiness.get("version")
     planning = readiness.get("planning")
+    if readiness_version is not None and (
+        isinstance(readiness_version, bool)
+        or not isinstance(readiness_version, int)
+    ):
+        raise ValueError("generation readiness version is invalid")
     if readiness_version not in (None, 1, 2):
         raise ValueError("generation readiness version is invalid")
     if readiness_version == 2 and not isinstance(planning, Mapping):

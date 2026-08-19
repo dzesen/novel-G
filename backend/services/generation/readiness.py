@@ -31,6 +31,12 @@ from backend.services.generation.prose_token_bounds import (
     positive_token_limit,
     v3_output_token_bound,
 )
+from backend.services.generation.provider_budget import (
+    ProviderBudgetBound,
+    merge_provider_bounds,
+    scale_provider_bounds,
+    structured_call_budget,
+)
 from backend.services.llm.context_builder import ContextBudgetError
 
 
@@ -63,6 +69,99 @@ class ReadinessDeps:
         [list[dict[str, Any]], int, int, Mapping[str, Any] | None],
         Mapping[str, Any],
     ] | None = None
+
+
+@dataclass(frozen=True)
+class _BaseGenerationBudget:
+    maximum_provider_attempts_total: int
+    maximum_tokens_total: int
+    token_bound_known: bool
+    provider_bounds: tuple[ProviderBudgetBound, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "base_generation_budget.v1",
+            "maximum_provider_attempts_total": (
+                self.maximum_provider_attempts_total
+            ),
+            "maximum_tokens_total": self.maximum_tokens_total,
+            "token_bound_known": self.token_bound_known,
+            "provider_bounds": [
+                {
+                    "provider_alias": bound.provider_alias,
+                    "maximum_paid_attempts_total": bound.paid_attempts,
+                    "maximum_tokens_total": bound.tokens,
+                }
+                for bound in self.provider_bounds
+            ],
+        }
+
+
+def _strict_non_negative_budget_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _parse_base_generation_budget(value: Any) -> _BaseGenerationBudget:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "maximum_provider_attempts_total",
+        "maximum_tokens_total",
+        "token_bound_known",
+        "provider_bounds",
+    }:
+        raise ValueError("base generation budget is invalid")
+    if value.get("schema_version") != "base_generation_budget.v1":
+        raise ValueError("base generation budget version is invalid")
+    token_bound_known = value.get("token_bound_known")
+    if not isinstance(token_bound_known, bool):
+        raise ValueError("base generation token-bound status is invalid")
+    raw_bounds = value.get("provider_bounds")
+    if not isinstance(raw_bounds, list):
+        raise ValueError("base generation Provider bounds are invalid")
+    bounds: list[ProviderBudgetBound] = []
+    for raw in raw_bounds:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "provider_alias",
+            "maximum_paid_attempts_total",
+            "maximum_tokens_total",
+        }:
+            raise ValueError("base generation Provider bound is invalid")
+        bounds.append(
+            ProviderBudgetBound(
+                provider_alias=str(raw.get("provider_alias") or ""),
+                paid_attempts=_strict_non_negative_budget_int(
+                    raw.get("maximum_paid_attempts_total"),
+                    field="base Provider paid-attempt bound",
+                ),
+                tokens=_strict_non_negative_budget_int(
+                    raw.get("maximum_tokens_total"),
+                    field="base Provider token bound",
+                ),
+            )
+        )
+    normalized = merge_provider_bounds(bounds)
+    if len(normalized) != len(bounds):
+        raise ValueError("base generation Provider aliases are duplicated")
+    attempts = _strict_non_negative_budget_int(
+        value.get("maximum_provider_attempts_total"),
+        field="base generation paid-attempt bound",
+    )
+    tokens = _strict_non_negative_budget_int(
+        value.get("maximum_tokens_total"),
+        field="base generation token bound",
+    )
+    if attempts != sum(item.paid_attempts for item in normalized):
+        raise ValueError("base generation paid-attempt total changed")
+    if tokens != sum(item.tokens for item in normalized):
+        raise ValueError("base generation token total changed")
+    return _BaseGenerationBudget(
+        maximum_provider_attempts_total=attempts,
+        maximum_tokens_total=tokens,
+        token_bound_known=token_bound_known,
+        provider_bounds=normalized,
+    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -403,19 +502,113 @@ class GenerationReadinessModule:
                 repair_attempts = (
                     candidate_repair_authorization.maximum_provider_attempts_total
                 )
+                base_budget = _parse_base_generation_budget(
+                    planning.get("base_generation_budget")
+                )
+                base_attempt_capacity = _strict_non_negative_budget_int(
+                    planning.get("attempt_capacity"),
+                    field="base generation attempt capacity",
+                )
+                if (
+                    base_attempt_capacity
+                    != base_budget.maximum_provider_attempts_total
+                ):
+                    raise ValueError("base generation attempt capacity changed")
+                candidate_provider_bounds = tuple(
+                    ProviderBudgetBound(
+                        provider_alias=item.provider_alias,
+                        paid_attempts=item.maximum_paid_attempts_total,
+                        tokens=item.maximum_tokens_total,
+                    )
+                    for item in candidate_repair_authorization.provider_bounds
+                )
+                full_provider_bounds = merge_provider_bounds(
+                    base_budget.provider_bounds,
+                    candidate_provider_bounds,
+                )
+                full_token_bound = (
+                    base_budget.maximum_tokens_total
+                    + candidate_repair_authorization.maximum_tokens_total
+                )
+                full_attempt_bound = base_attempt_capacity + repair_attempts
                 planning = {
                     **planning,
-                    "attempt_capacity": int(
-                        planning.get("attempt_capacity") or 0
-                    )
-                    + repair_attempts,
+                    "attempt_capacity": full_attempt_bound,
+                    "providers": [
+                        item.provider_alias for item in full_provider_bounds
+                    ],
                     "chapter_candidate_pipeline_revision": (
                         CANDIDATE_PIPELINE_REVISION
                     ),
                     "chapter_candidate_repair_authorization": (
                         candidate_repair_authorization.model_dump(mode="json")
                     ),
+                    "batch_generation_budget_coverage": {
+                        "schema_version": (
+                            "batch_generation_budget_coverage.v1"
+                        ),
+                        "base_generation_maximum_tokens": (
+                            base_budget.maximum_tokens_total
+                        ),
+                        "candidate_repair_maximum_tokens": (
+                            candidate_repair_authorization.maximum_tokens_total
+                        ),
+                        "maximum_tokens_total": full_token_bound,
+                        "maximum_provider_attempts_total": full_attempt_bound,
+                        "provider_bounds": [
+                            {
+                                "provider_alias": item.provider_alias,
+                                "maximum_paid_attempts_total": (
+                                    item.paid_attempts
+                                ),
+                                "maximum_tokens_total": item.tokens,
+                            }
+                            for item in full_provider_bounds
+                        ],
+                        "token_bound_known": base_budget.token_bound_known,
+                        "token_budget": token_budget,
+                        "covers_full_job_authority": bool(
+                            base_budget.token_bound_known
+                            and token_budget is not None
+                            and token_budget >= full_token_bound
+                        ),
+                    },
                 }
+                if not base_budget.token_bound_known:
+                    issues.append(
+                        _issue(
+                            "batch_generation_token_bound_unproven",
+                            "blocked",
+                            action_codes=["review_provider_settings"],
+                        )
+                    )
+                if full_token_bound > 0 and token_budget is None:
+                    issues.append(
+                        _issue(
+                            "batch_generation_requires_token_budget",
+                            "blocked",
+                            details={
+                                "maximum_tokens_total": full_token_bound
+                            },
+                            action_codes=["set_token_budget"],
+                        )
+                    )
+                elif (
+                    full_token_bound > 0
+                    and token_budget is not None
+                    and token_budget < full_token_bound
+                ):
+                    issues.append(
+                        _issue(
+                            "batch_generation_budget_may_pause",
+                            "warning",
+                            details={
+                                "maximum_tokens_total": full_token_bound,
+                                "token_budget": token_budget,
+                            },
+                            action_codes=["review_token_budget"],
+                        )
+                    )
         except ContextBudgetError as exc:
             planning = {
                 "attempt_capacity": 0,
@@ -516,51 +709,6 @@ class GenerationReadinessModule:
             "prose_continuation_authorization": prose_authorization,
             "chapter_finalization_authorization": finalization_authorization,
         }
-        raw_candidate_authorization = planning.get(
-            "chapter_candidate_repair_authorization"
-        )
-        if isinstance(raw_candidate_authorization, Mapping):
-            candidate_authorization = parse_candidate_repair_authorization(
-                raw_candidate_authorization
-            )
-            repair_token_bound = candidate_authorization.maximum_tokens_total
-            planning = {
-                **planning,
-                "candidate_repair_budget_coverage": {
-                    "schema_version": "candidate_repair_budget_coverage.v1",
-                    "maximum_tokens_total": repair_token_bound,
-                    "token_budget": token_budget,
-                    "covers_full_repair_authority": bool(
-                        token_budget is not None
-                        and token_budget >= repair_token_bound
-                    ),
-                },
-            }
-            if repair_token_bound > 0 and token_budget is None:
-                issues.append(
-                    _issue(
-                        "candidate_repairs_require_token_budget",
-                        "blocked",
-                        details={"maximum_tokens_total": repair_token_bound},
-                        action_codes=["set_token_budget"],
-                    )
-                )
-            elif (
-                repair_token_bound > 0
-                and token_budget is not None
-                and token_budget < repair_token_bound
-            ):
-                issues.append(
-                    _issue(
-                        "candidate_repair_budget_may_pause",
-                        "warning",
-                        details={
-                            "maximum_tokens_total": repair_token_bound,
-                            "token_budget": token_budget,
-                        },
-                        action_codes=["review_token_budget"],
-                    )
-                )
         automatic_requested = bool(
             continuation_policy.permits_automatic_continuation
             and prose_authorization.get("max_base_calls")
@@ -651,7 +799,12 @@ class GenerationReadinessModule:
         supplied_digest: str | None,
         acknowledged_warning_codes: Iterable[str],
     ) -> dict[str, Any]:
-        if report.get("version") != 2:
+        readiness_version = report.get("version")
+        if (
+            isinstance(readiness_version, bool)
+            or not isinstance(readiness_version, int)
+            or readiness_version != 2
+        ):
             raise StaleReadiness("生成前检查版本无效，请重新检查后再启动")
         current_digest = str(report.get("digest") or "")
         automatic_confirmation_required = any(
@@ -738,6 +891,87 @@ async def _prepare_generation_params(
             )
         ),
     }
+
+
+def _base_structured_generation_budget(
+    chapters: list[dict[str, Any]],
+    generation_params: Mapping[str, Any] | None,
+) -> _BaseGenerationBudget:
+    from backend.services.generation.headless_generation import (
+        CHAPTER_OUTLINE_STEP,
+        CHAPTER_OUTLINE_WORKFLOW,
+        OUTLINE_ADHERENCE_STEP,
+        PROSE_REMEDIATION_WORKFLOW,
+        STATE_STEP,
+        STATE_WORKFLOW,
+    )
+    from backend.services.llm.generation_runtime import (
+        WorkflowStepTarget,
+        create_generation_runtime,
+    )
+
+    values = dict(generation_params or {})
+    runtime_kwargs = (
+        {} if values.get("allow_failure_retry", True)
+        else {"max_provider_retries": 0}
+    )
+    runtime = create_generation_runtime(**runtime_kwargs)
+    outline_count = sum(not chapter.get("outline") for chapter in chapters)
+    state_count = sum(
+        str((chapter.get("state_completion") or {}).get("status") or "missing")
+        not in REUSABLE_STATE_COMPLETION_STATUSES
+        for chapter in chapters
+    )
+    raw_output_bound = values.get("max_tokens")
+    calls: list[tuple[Any, int]] = []
+    if outline_count:
+        calls.append((
+            runtime.plan_structured(
+                WorkflowStepTarget(
+                    CHAPTER_OUTLINE_WORKFLOW,
+                    CHAPTER_OUTLINE_STEP,
+                )
+            ),
+            outline_count,
+        ))
+    if state_count:
+        calls.extend((
+            (
+                runtime.plan_structured(
+                    WorkflowStepTarget(
+                        PROSE_REMEDIATION_WORKFLOW,
+                        OUTLINE_ADHERENCE_STEP,
+                    )
+                ),
+                state_count * 2,
+            ),
+            (
+                runtime.plan_structured(
+                    WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+                ),
+                state_count,
+            ),
+        ))
+    provider_bounds: tuple[ProviderBudgetBound, ...] = ()
+    maximum_attempts = 0
+    maximum_tokens = 0
+    for plan, multiplier in calls:
+        call_budget = structured_call_budget(
+            plan,
+            output_token_bound=raw_output_bound,
+        )
+        provider_bounds = merge_provider_bounds(
+            provider_bounds,
+            scale_provider_bounds(call_budget.provider_bounds, multiplier),
+        )
+        maximum_attempts += call_budget.max_paid_attempts * multiplier
+        maximum_tokens += call_budget.max_tokens_per_call * multiplier
+    return _BaseGenerationBudget(
+        maximum_provider_attempts_total=maximum_attempts,
+        maximum_tokens_total=maximum_tokens,
+        token_bound_known=True,
+        provider_bounds=provider_bounds,
+    )
 
 
 def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
@@ -885,13 +1119,21 @@ def _plan_work_with_prose_continuation(
 
     base = _plan_work(chapters)
     values = dict(generation_params or {})
+    structured_budget = _base_structured_generation_budget(chapters, values)
     chapters_needing_prose = [
         chapter for chapter in chapters if not _has_text(chapter, "content")
     ]
     strategy = dict(base.get("prose_strategy") or {})
     if not chapters_needing_prose:
+        attempt_capacity = estimate_worklist_attempt_capacity(chapters, values)
         return {
             **base,
+            "attempt_capacity": attempt_capacity,
+            "providers": [
+                item.provider_alias
+                for item in structured_budget.provider_bounds
+            ],
+            "base_generation_budget": structured_budget.to_dict(),
             "generation_params_digest": _digest(values),
             "prose_strategy": {
                 **strategy,
@@ -1035,13 +1277,46 @@ def _plan_work_with_prose_continuation(
         maximum_base_calls * conservative_base_token_bound
         + maximum_automatic_calls * conservative_continuation_token_bound
     )
+    prose_token_bound_known = conservative_token_bound > 0
+    prose_provider_bound = ProviderBudgetBound(
+        provider_alias=str(prose_plan.provider_alias or ""),
+        paid_attempts=maximum_logical_calls,
+        tokens=(
+            conservative_total_token_bound
+            if prose_token_bound_known
+            else 0
+        ),
+    )
+    combined_provider_bounds = merge_provider_bounds(
+        structured_budget.provider_bounds,
+        (prose_provider_bound,),
+    )
+    base_generation_budget = _BaseGenerationBudget(
+        maximum_provider_attempts_total=(
+            structured_budget.maximum_provider_attempts_total
+            + maximum_logical_calls
+        ),
+        maximum_tokens_total=(
+            structured_budget.maximum_tokens_total
+            + conservative_total_token_bound
+        ),
+        token_bound_known=(
+            structured_budget.token_bound_known and prose_token_bound_known
+        ),
+        provider_bounds=combined_provider_bounds,
+    )
+    attempt_capacity = estimate_worklist_attempt_capacity(chapters, values)
     maximum_call_target_words = max(
         maximum_base_call_target_words,
         policy.continuation_target_words,
     )
     return {
         **base,
-        "attempt_capacity": estimate_worklist_attempt_capacity(chapters, values),
+        "attempt_capacity": attempt_capacity,
+        "providers": [
+            item.provider_alias for item in combined_provider_bounds
+        ],
+        "base_generation_budget": base_generation_budget.to_dict(),
         "generation_params_digest": _digest(values),
         "prose_strategy": {
             **strategy,
@@ -1074,7 +1349,7 @@ def _plan_work_with_prose_continuation(
             "conservative_continuation_token_bound": conservative_continuation_token_bound,
             "conservative_token_bound": conservative_token_bound,
             "conservative_total_token_bound": conservative_total_token_bound,
-            "token_bound_known": conservative_token_bound > 0,
+            "token_bound_known": prose_token_bound_known,
         },
     }
 
