@@ -1,7 +1,8 @@
 """Persisted, user-owned prose drafts and segment checkpoints."""
 from __future__ import annotations
 
-from datetime import timedelta
+import hashlib
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from pymongo.errors import DuplicateKeyError
 from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
+from backend.db.mongo import get_database
 from backend.db.repositories.generation_job_repository import (
     TokenBudgetExceeded,
     TokenBudgetUnbounded,
@@ -687,8 +689,28 @@ class ProseRunRepository(BaseRepository):
         result = await self.collection.update_one(query, update)
         return result.modified_count == 1
 
+    @property
+    def remediation_receipts(self):
+        return get_database()[collections.PROSE_REMEDIATION_RECEIPTS]
+
     @staticmethod
-    def _matching_remediation_receipt(
+    def _remediation_receipt_id(
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        idempotency_key: str,
+    ) -> str:
+        identity = "\x1f".join((
+            str(owner_id),
+            str(novel_id),
+            str(run_id),
+            str(idempotency_key),
+        ))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _matching_legacy_remediation_receipt(
         document: dict[str, Any],
         *,
         idempotency_key: str,
@@ -714,6 +736,164 @@ class ProseRunRepository(BaseRepository):
                 "同一正文修复幂等键对应了不同的候选输入"
             )
 
+    @staticmethod
+    def _validate_remediation_receipt_scope(
+        receipt: dict[str, Any],
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        source_revision: int | None = None,
+    ) -> None:
+        if (
+            str(receipt.get("prose_run_id") or "") != str(run_id)
+            or str(receipt.get("owner_id") or "") != str(owner_id)
+            or str(receipt.get("novel_id") or "") != str(novel_id)
+            or receipt.get("is_deleted") is True
+        ):
+            raise StaleProseRun("正文修复回执不属于当前授权作用域")
+        if (
+            source_revision is not None
+            and int(receipt.get("source_revision") or 0)
+            != int(source_revision)
+        ):
+            raise StaleProseRun("正文修复回执的来源版本不一致")
+
+    async def _owned_remediation_run(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+    ) -> dict[str, Any]:
+        document = await self.collection.find_one({
+            "_id": to_object_id(run_id),
+            "owner_id": to_object_id(owner_id),
+            "novel_id": to_object_id(novel_id),
+            "is_deleted": False,
+        })
+        if document is None:
+            raise NotFoundError("正文草稿不存在")
+        return document
+
+    async def _migrate_legacy_remediation_receipt(
+        self,
+        *,
+        document: dict[str, Any],
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> dict[str, Any] | None:
+        """Lazily preserve receipts written by the preceding embedded format."""
+        legacy = self._matching_legacy_remediation_receipt(
+            document,
+            idempotency_key=idempotency_key,
+        )
+        if legacy is None:
+            return None
+        self._validate_remediation_receipt_digest(
+            legacy,
+            request_digest=request_digest,
+        )
+        now = get_utc_now()
+        receipt_id = self._remediation_receipt_id(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+        )
+        migrated = {
+            **legacy,
+            "_id": receipt_id,
+            "owner_id": to_object_id(owner_id),
+            "novel_id": to_object_id(novel_id),
+            "prose_run_id": to_object_id(run_id),
+            "idempotency_key": str(idempotency_key),
+            "request_digest": str(request_digest),
+            "state": str(legacy.get("state") or "completed"),
+            "created_at": legacy.get("created_at") or now,
+            "updated_at": legacy.get("updated_at") or now,
+            "is_deleted": False,
+        }
+        await self.remediation_receipts.update_one(
+            {"_id": receipt_id},
+            {"$setOnInsert": migrated},
+            upsert=True,
+        )
+        return await self.remediation_receipts.find_one({"_id": receipt_id})
+
+    @staticmethod
+    def _latest_remediation_receipt(
+        document: dict[str, Any],
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> dict[str, Any] | None:
+        latest = dict(
+            (document.get("remediation") or {}).get("latest_receipt") or {}
+        )
+        if (
+            latest.get("schema_version")
+            != "prose_remediation_receipt_pointer.v1"
+            or str(latest.get("idempotency_key") or "")
+            != str(idempotency_key)
+            or str(latest.get("request_digest") or "")
+            != str(request_digest)
+            or not isinstance(latest.get("result_projection"), dict)
+        ):
+            return None
+        return latest
+
+    async def _repair_remediation_receipt_from_pointer(
+        self,
+        *,
+        document: dict[str, Any],
+        receipt: dict[str, Any],
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> dict[str, Any]:
+        if str(receipt.get("state") or "") == "completed":
+            return receipt
+        latest = self._latest_remediation_receipt(
+            document,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        if latest is None:
+            return receipt
+        await self.remediation_receipts.update_one(
+            {
+                "_id": receipt["_id"],
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "prose_run_id": to_object_id(run_id),
+                "request_digest": str(request_digest),
+                "state": {"$in": ["reserved", "dispatched"]},
+            },
+            {
+                "$set": {
+                    "state": "completed",
+                    "result_revision": int(latest["result_revision"]),
+                    "result_projection": dict(latest["result_projection"]),
+                    "completed_at": latest.get("completed_at")
+                    or get_utc_now(),
+                    "updated_at": get_utc_now(),
+                },
+                "$unset": {"claim_expires_at": ""},
+            },
+        )
+        repaired = await self.remediation_receipts.find_one({
+            "_id": receipt["_id"],
+        })
+        if repaired is None:
+            raise StaleProseRun("正文修复回执恢复后丢失")
+        return repaired
+
     async def claim_remediation_receipt(
         self,
         *,
@@ -725,14 +905,24 @@ class ProseRunRepository(BaseRepository):
         source_revision: int,
         claim_token: str,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-        """Claim one rewrite before Provider dispatch.
-
-        The claim lives in the same ProseRun document as the eventual receipt,
-        so two workers cannot both miss recovery and then both start a paid
-        rewrite for the same idempotency key.
-        """
+        """Claim one durable rewrite identity before Provider dispatch."""
         now = get_utc_now()
+        document = await self._owned_remediation_run(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
+        receipt_id = self._remediation_receipt_id(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+        )
         claim = {
+            "_id": receipt_id,
+            "owner_id": to_object_id(owner_id),
+            "novel_id": to_object_id(novel_id),
+            "prose_run_id": to_object_id(run_id),
             "idempotency_key": str(idempotency_key),
             "request_digest": str(request_digest),
             "source_revision": int(source_revision),
@@ -741,91 +931,83 @@ class ProseRunRepository(BaseRepository):
             "claim_expires_at": now + timedelta(seconds=30),
             "created_at": now,
             "updated_at": now,
-        }
-        document = await self.collection.find_one_and_update(
-            {
-                "_id": to_object_id(run_id),
-                "owner_id": to_object_id(owner_id),
-                "novel_id": to_object_id(novel_id),
-                "is_deleted": False,
-                "remediation_receipts.idempotency_key": {
-                    "$ne": str(idempotency_key)
-                },
-            },
-            {
-                "$push": {"remediation_receipts": claim},
-                "$set": {"updated_at": now},
-            },
-            return_document=ReturnDocument.AFTER,
-        )
-        if document is not None:
-            return "claimed", document, claim
-
-        current = await self.collection.find_one({
-            "_id": to_object_id(run_id),
-            "owner_id": to_object_id(owner_id),
-            "novel_id": to_object_id(novel_id),
             "is_deleted": False,
-        })
-        if current is None:
-            raise NotFoundError("正文草稿不存在")
-        receipt = self._matching_remediation_receipt(
-            current,
+        }
+        receipt = await self._migrate_legacy_remediation_receipt(
+            document=document,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
             idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
         if receipt is None:
+            receipt = await self.remediation_receipts.find_one_and_update(
+                {"_id": receipt_id},
+                {"$setOnInsert": claim},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+        if receipt is None:
             raise StaleProseRun("正文修复回执占用失败")
+        self._validate_remediation_receipt_scope(
+            receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            source_revision=source_revision,
+        )
         self._validate_remediation_receipt_digest(
             receipt,
             request_digest=request_digest,
         )
+        receipt = await self._repair_remediation_receipt_from_pointer(
+            document=document,
+            receipt=receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
         state = str(receipt.get("state") or "completed")
         if state == "completed":
-            return "completed", current, receipt
+            return "completed", document, receipt
+        if (
+            state == "reserved"
+            and str(receipt.get("claim_token") or "") == str(claim_token)
+        ):
+            return "claimed", document, receipt
         if state == "reserved":
             expires_at = receipt.get("claim_expires_at")
             if expires_at is not None and expires_at <= now:
-                reclaimed = await self.collection.find_one_and_update(
+                reclaimed = await self.remediation_receipts.find_one_and_update(
                     {
-                        "_id": to_object_id(run_id),
+                        "_id": receipt_id,
                         "owner_id": to_object_id(owner_id),
                         "novel_id": to_object_id(novel_id),
+                        "prose_run_id": to_object_id(run_id),
                         "is_deleted": False,
-                        "remediation_receipts": {
-                            "$elemMatch": {
-                                "idempotency_key": str(idempotency_key),
-                                "request_digest": str(request_digest),
-                                "state": "reserved",
-                                "claim_token": str(
-                                    receipt.get("claim_token") or ""
-                                ),
-                                "claim_expires_at": expires_at,
-                            }
-                        },
+                        "idempotency_key": str(idempotency_key),
+                        "request_digest": str(request_digest),
+                        "state": "reserved",
+                        "claim_token": str(receipt.get("claim_token") or ""),
+                        "claim_expires_at": expires_at,
                     },
                     {
                         "$set": {
-                            "remediation_receipts.$.claim_token": str(
-                                claim_token
-                            ),
-                            "remediation_receipts.$.claim_expires_at": (
+                            "claim_token": str(claim_token),
+                            "claim_expires_at": (
                                 now + timedelta(seconds=30)
                             ),
-                            "remediation_receipts.$.updated_at": now,
                             "updated_at": now,
                         }
                     },
                     return_document=ReturnDocument.AFTER,
                 )
                 if reclaimed is not None:
-                    refreshed = self._matching_remediation_receipt(
-                        reclaimed,
-                        idempotency_key=idempotency_key,
-                    )
-                    if refreshed is None:
-                        raise StaleProseRun("正文修复回执占用后丢失")
-                    return "claimed", reclaimed, refreshed
-        return f"in_progress_{state}", current, receipt
+                    return "claimed", document, reclaimed
+        return f"in_progress_{state}", document, receipt
 
     async def mark_remediation_receipt_dispatched(
         self,
@@ -839,34 +1021,33 @@ class ProseRunRepository(BaseRepository):
     ) -> None:
         """Freeze that the claimed logical rewrite has reached Provider."""
         now = get_utc_now()
-        document = await self.collection.find_one_and_update(
+        receipt = await self.remediation_receipts.find_one_and_update(
             {
-                "_id": to_object_id(run_id),
+                "_id": self._remediation_receipt_id(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    idempotency_key=idempotency_key,
+                ),
                 "owner_id": to_object_id(owner_id),
                 "novel_id": to_object_id(novel_id),
+                "prose_run_id": to_object_id(run_id),
                 "is_deleted": False,
-                "remediation_receipts": {
-                    "$elemMatch": {
-                        "idempotency_key": str(idempotency_key),
-                        "request_digest": str(request_digest),
-                        "state": "reserved",
-                        "claim_token": str(claim_token),
-                    }
-                },
+                "idempotency_key": str(idempotency_key),
+                "request_digest": str(request_digest),
+                "state": "reserved",
+                "claim_token": str(claim_token),
             },
             {
                 "$set": {
-                    "remediation_receipts.$.state": "dispatched",
-                    "remediation_receipts.$.updated_at": now,
+                    "state": "dispatched",
                     "updated_at": now,
                 },
-                "$unset": {
-                    "remediation_receipts.$.claim_expires_at": "",
-                },
+                "$unset": {"claim_expires_at": ""},
             },
             return_document=ReturnDocument.AFTER,
         )
-        if document is None:
+        if receipt is None:
             raise StaleProseRun("正文修复 Provider 派发权已经失效")
 
     async def complete_remediation_receipt(
@@ -882,52 +1063,58 @@ class ProseRunRepository(BaseRepository):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Persist a known Tool result that did not mutate the candidate."""
         now = get_utc_now()
-        document = await self.collection.find_one_and_update(
+        raw_result_revision = result_projection.get("resource_revision")
+        try:
+            result_revision = int(raw_result_revision)
+        except (TypeError, ValueError):
+            result_revision = 0
+        receipt_id = self._remediation_receipt_id(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+        )
+        receipt = await self.remediation_receipts.find_one_and_update(
             {
-                "_id": to_object_id(run_id),
+                "_id": receipt_id,
                 "owner_id": to_object_id(owner_id),
                 "novel_id": to_object_id(novel_id),
+                "prose_run_id": to_object_id(run_id),
                 "is_deleted": False,
-                "remediation_receipts": {
-                    "$elemMatch": {
-                        "idempotency_key": str(idempotency_key),
-                        "request_digest": str(request_digest),
-                        "state": {"$in": ["reserved", "dispatched"]},
-                        "claim_token": str(claim_token),
-                    }
-                },
+                "idempotency_key": str(idempotency_key),
+                "request_digest": str(request_digest),
+                "state": {"$in": ["reserved", "dispatched"]},
+                "claim_token": str(claim_token),
             },
             {
                 "$set": {
-                    "remediation_receipts.$.state": "completed",
-                    "remediation_receipts.$.result_projection": dict(
-                        result_projection
-                    ),
-                    "remediation_receipts.$.completed_at": now,
-                    "remediation_receipts.$.updated_at": now,
+                    "state": "completed",
+                    "result_revision": result_revision,
+                    "result_projection": dict(result_projection),
+                    "completed_at": now,
                     "updated_at": now,
                 },
-                "$unset": {
-                    "remediation_receipts.$.claim_expires_at": "",
-                },
+                "$unset": {"claim_expires_at": ""},
             },
             return_document=ReturnDocument.AFTER,
         )
-        if document is None:
-            document = await self.collection.find_one({
-                "_id": to_object_id(run_id),
-                "owner_id": to_object_id(owner_id),
-                "novel_id": to_object_id(novel_id),
-                "is_deleted": False,
+        if receipt is None:
+            receipt = await self.remediation_receipts.find_one({
+                "_id": receipt_id,
             })
-        if document is None:
-            raise NotFoundError("正文草稿不存在")
-        receipt = self._matching_remediation_receipt(
-            document,
-            idempotency_key=idempotency_key,
+        document = await self._owned_remediation_run(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
         )
         if receipt is None:
             raise StaleProseRun("正文修复回执不存在")
+        self._validate_remediation_receipt_scope(
+            receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
         self._validate_remediation_receipt_digest(
             receipt,
             request_digest=request_digest,
@@ -950,32 +1137,120 @@ class ProseRunRepository(BaseRepository):
         request_digest: str,
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """Recover one proposal-only rewrite without reading Agent events."""
-        document = await self.collection.find_one(
-            {
-                "_id": to_object_id(run_id),
-                "owner_id": to_object_id(owner_id),
-                "novel_id": to_object_id(novel_id),
-                "is_deleted": False,
-                "remediation_receipts": {
-                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
-                }
-            }
-        )
-        if document is None:
+        try:
+            document = await self._owned_remediation_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
+            )
+        except NotFoundError:
             return None
-        receipt = self._matching_remediation_receipt(
-            document,
-            idempotency_key=idempotency_key,
-        )
+        receipt = await self.remediation_receipts.find_one({
+            "_id": self._remediation_receipt_id(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                idempotency_key=idempotency_key,
+            )
+        })
+        if receipt is None:
+            receipt = await self._migrate_legacy_remediation_receipt(
+                document=document,
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+            )
         if receipt is None:
             return None
+        self._validate_remediation_receipt_scope(
+            receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
         self._validate_remediation_receipt_digest(
             receipt,
+            request_digest=request_digest,
+        )
+        receipt = await self._repair_remediation_receipt_from_pointer(
+            document=document,
+            receipt=receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
             request_digest=request_digest,
         )
         if str(receipt.get("state") or "completed") != "completed":
             return None
         return document, receipt
+
+    async def acquire_remediation_write_fence(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        expected_revision: int,
+        expected_narrative_revision: int,
+        fence_token: str,
+        expires_at: datetime,
+    ) -> None:
+        """Fence the ProseRun so an expired Novel fence can revoke old writers."""
+        if not fence_token:
+            raise ValueError("fence_token is required")
+        now = get_utc_now()
+        document = await self.collection.find_one_and_update(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "is_deleted": False,
+                "status": "complete",
+                "revision": int(expected_revision),
+                "narrative_revision": int(expected_narrative_revision),
+                "$or": [
+                    {"remediation_write_fence": {"$exists": False}},
+                    {"remediation_write_fence": None},
+                    {"remediation_write_fence.expires_at": {"$lte": now}},
+                    {"remediation_write_fence.token": str(fence_token)},
+                ],
+            },
+            {
+                "$set": {
+                    "remediation_write_fence": {
+                        "token": str(fence_token),
+                        "expires_at": expires_at,
+                    },
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is None:
+            raise StaleProseRun("正文候选写入栅栏已经失效")
+
+    async def release_remediation_write_fence(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        fence_token: str,
+    ) -> None:
+        if not fence_token:
+            return
+        await self.collection.update_one(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "remediation_write_fence.token": str(fence_token),
+            },
+            {"$unset": {"remediation_write_fence": ""}},
+        )
 
     async def apply_remediation_candidate(
         self,
@@ -996,32 +1271,42 @@ class ProseRunRepository(BaseRepository):
         target_issue_categories: list[str],
         target_scene_indexes: list[int],
         result_projection: dict[str, Any],
+        write_fence_token: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """CAS one temporary prose candidate and its crash-recovery receipt."""
-        existing = await self.collection.find_one(
-            {
-                "_id": to_object_id(run_id),
-                "owner_id": to_object_id(owner_id),
-                "novel_id": to_object_id(novel_id),
-                "is_deleted": False,
-                "remediation_receipts": {
-                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
-                },
-            }
-        )
-        if existing is not None:
-            existing_receipt = self._matching_remediation_receipt(
-                existing,
+        """CAS one temporary candidate and publish one bounded receipt pointer."""
+        receipt = await self.remediation_receipts.find_one({
+            "_id": self._remediation_receipt_id(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
                 idempotency_key=idempotency_key,
             )
-            if existing_receipt is None:
-                raise StaleProseRun("正文修复 receipt 已损坏")
-            self._validate_remediation_receipt_digest(
-                existing_receipt,
-                request_digest=request_digest,
+        })
+        if receipt is None:
+            raise StaleProseRun("正文修复 receipt 不存在")
+        self._validate_remediation_receipt_scope(
+            receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            source_revision=expected_revision,
+        )
+        self._validate_remediation_receipt_digest(
+            receipt,
+            request_digest=request_digest,
+        )
+        if str(receipt.get("state") or "") == "completed":
+            existing = await self._owned_remediation_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
             )
-            if str(existing_receipt.get("state") or "completed") == "completed":
-                return existing, existing_receipt
+            return existing, receipt
+        if (
+            str(receipt.get("state") or "") != "dispatched"
+            or str(receipt.get("claim_token") or "") != str(claim_token)
+        ):
+            raise StaleProseRun("正文修复 Provider 派发权已经失效")
 
         now = get_utc_now()
         next_revision = int(expected_revision) + 1
@@ -1036,18 +1321,12 @@ class ProseRunRepository(BaseRepository):
                 "assembled_text": str(expected_text),
                 "narrative_revision": int(expected_narrative_revision),
                 "outline_revision": str(expected_outline_revision),
+                "remediation_write_fence.token": str(write_fence_token),
+                "remediation_write_fence.expires_at": {"$gt": now},
                 "$or": [
                     {"lease": None},
                     {"lease": {"$exists": False}},
                 ],
-                "remediation_receipts": {
-                    "$elemMatch": {
-                        "idempotency_key": str(idempotency_key),
-                        "request_digest": str(request_digest),
-                        "state": "dispatched",
-                        "claim_token": str(claim_token),
-                    }
-                },
             },
             {
                 "$set": {
@@ -1072,57 +1351,57 @@ class ProseRunRepository(BaseRepository):
                             target_issue_categories
                         ),
                         "target_scene_indexes": list(target_scene_indexes),
+                        "latest_receipt": {
+                            "schema_version": (
+                                "prose_remediation_receipt_pointer.v1"
+                            ),
+                            "idempotency_key": str(idempotency_key),
+                            "request_digest": str(request_digest),
+                            "claim_token": str(claim_token),
+                            "source_revision": int(expected_revision),
+                            "result_revision": next_revision,
+                            "result_projection": dict(result_projection),
+                            "completed_at": now,
+                        },
                         "verification": None,
                         "updated_at": now,
                     },
-                    "remediation_receipts.$.state": "completed",
-                    "remediation_receipts.$.source_revision": int(
-                        expected_revision
-                    ),
-                    "remediation_receipts.$.result_revision": next_revision,
-                    "remediation_receipts.$.result_projection": dict(
-                        result_projection
-                    ),
-                    "remediation_receipts.$.completed_at": now,
-                    "remediation_receipts.$.updated_at": now,
                 },
                 "$inc": {"revision": 1},
             },
             return_document=ReturnDocument.AFTER,
         )
         if document is not None:
-            receipt = self._matching_remediation_receipt(
-                document,
+            return await self.complete_remediation_receipt(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
                 idempotency_key=idempotency_key,
-            )
-            if receipt is None:
-                raise StaleProseRun("正文修复回执落库后丢失")
-            return document, receipt
-
-        recovered = await self.collection.find_one(
-            {
-                "_id": to_object_id(run_id),
-                "owner_id": to_object_id(owner_id),
-                "novel_id": to_object_id(novel_id),
-                "is_deleted": False,
-                "remediation_receipts": {
-                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
-                },
-            }
-        )
-        if recovered is not None:
-            recovered_receipt = self._matching_remediation_receipt(
-                recovered,
-                idempotency_key=idempotency_key,
-            )
-            if recovered_receipt is None:
-                raise StaleProseRun("正文修复 receipt 已损坏")
-            self._validate_remediation_receipt_digest(
-                recovered_receipt,
                 request_digest=request_digest,
+                claim_token=claim_token,
+                result_projection=result_projection,
             )
-            if str(recovered_receipt.get("state") or "completed") == "completed":
-                return recovered, recovered_receipt
+
+        recovered = await self._owned_remediation_run(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
+        latest = self._latest_remediation_receipt(
+            recovered,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        if latest is not None:
+            return await self.complete_remediation_receipt(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                claim_token=claim_token,
+                result_projection=result_projection,
+            )
         raise StaleProseRun(
             "正文候选已被其他运行修改，当前修复结果不能覆盖"
         )
@@ -1140,6 +1419,7 @@ class ProseRunRepository(BaseRepository):
         expected_narrative_revision: int,
         expected_outline_revision: str,
         completion: dict[str, Any],
+        write_fence_token: str,
     ) -> dict[str, Any]:
         """Unlock one exact temporary candidate after its bound review passes."""
         now = get_utc_now()
@@ -1161,6 +1441,8 @@ class ProseRunRepository(BaseRepository):
                 "assembled_text": str(expected_text),
                 "narrative_revision": int(expected_narrative_revision),
                 "outline_revision": str(expected_outline_revision),
+                "remediation_write_fence.token": str(write_fence_token),
+                "remediation_write_fence.expires_at": {"$gt": now},
                 "remediation.schema_version": "prose_run_remediation.v1",
                 "remediation.latest_revision": int(expected_revision),
                 "remediation.latest_content_digest": str(

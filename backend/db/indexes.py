@@ -766,6 +766,39 @@ async def init_prose_run_indexes():
         raise
 
 
+async def init_prose_remediation_receipt_indexes():
+    """Initialize the durable idempotency ledger for paid prose rewrites."""
+    try:
+        collection = get_database()[collections.PROSE_REMEDIATION_RECEIPTS]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", 1),
+                    ("novel_id", 1),
+                    ("prose_run_id", 1),
+                    ("idempotency_key", 1),
+                ],
+                unique=True,
+                name="prose_remediation_receipt_identity",
+            ),
+            pymongo.IndexModel([
+                ("prose_run_id", 1),
+                ("state", 1),
+                ("updated_at", -1),
+            ]),
+            pymongo.IndexModel([("claim_expires_at", 1)]),
+        ])
+        logger.info("Initialized prose_remediation_receipts indexes.")
+    except Exception as exc:
+        logger.error(
+            "Failed to initialize prose_remediation_receipts indexes: %s",
+            exc,
+        )
+        # Paid idempotency depends on the exact unique identity. Starting
+        # without it can duplicate Provider calls, so this index is fail-closed.
+        raise
+
+
 async def init_image_asset_indexes():
     """Initialize owner isolation, idempotency, and listing indexes."""
     try:
@@ -1194,6 +1227,7 @@ async def init_all_indexes():
     await init_character_state_indexes()
     await init_generation_job_indexes()
     await init_prose_run_indexes()
+    await init_prose_remediation_receipt_indexes()
     await init_image_asset_indexes()
     await init_character_visual_profile_indexes()
     await init_illustration_brief_indexes()

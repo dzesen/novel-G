@@ -22,6 +22,7 @@ from backend.llm.models import TokenUsage
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 from backend.config.workflow_catalog import get_workflow_step_definition
 from backend.services.generation.prose_token_bounds import (
+    conservative_prompt_input_bound,
     conservative_runtime_token_bound,
 )
 
@@ -105,6 +106,12 @@ class StaleGenerationPlan(RuntimeError):
 
 class UnsupportedStructuredMode(LLMSchemaUnsupportedError):
     """Adapter 明确报告当前结构化模式不受支持，可安全降级。"""
+
+
+class ConservativeGenerationBoundExceeded(ValueError):
+    """A nested structured call would exceed its caller-frozen reservation."""
+
+    provider_request_not_dispatched = True
 
 
 @dataclass(frozen=True)
@@ -494,11 +501,45 @@ class GenerationRuntime:
         plan: GenerationPlan,
         schema: type[BaseModel],
         prompts: PromptPlan,
+        *,
+        max_conservative_input_tokens: int | None = None,
+        max_conservative_total_tokens: int | None = None,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         attempt_offset = len(self.attempts)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
         terminal_adapter = adapter
+        reserved_conservative_tokens = 0
+
+        def bounded_reservation(prompt: str) -> int | None:
+            nonlocal reserved_conservative_tokens
+            input_tokens = conservative_prompt_input_bound(
+                prompt=prompt,
+                system_prompt=str(gen_kwargs.get("system_prompt") or ""),
+            )
+            if (
+                max_conservative_input_tokens is not None
+                and input_tokens > int(max_conservative_input_tokens)
+            ):
+                raise ConservativeGenerationBoundExceeded(
+                    "structured repair input exceeds the frozen per-attempt bound"
+                )
+            bound = self._conservative_token_bound(plan, prompt, gen_kwargs)
+            if bound is None and max_conservative_total_tokens is not None:
+                raise ConservativeGenerationBoundExceeded(
+                    "structured call has no conservative output bound"
+                )
+            if bound is not None:
+                next_total = reserved_conservative_tokens + int(bound)
+                if (
+                    max_conservative_total_tokens is not None
+                    and next_total > int(max_conservative_total_tokens)
+                ):
+                    raise ConservativeGenerationBoundExceeded(
+                        "structured repair attempts exceed the frozen total bound"
+                    )
+                reserved_conservative_tokens = next_total
+            return bound
 
         async def primary_call() -> Any:
             if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED:
@@ -515,9 +556,7 @@ class GenerationRuntime:
             )
             produced = await self._paid_call(
                 plan, plan.provider_alias, "primary", adapter, primary_call,
-                self._conservative_token_bound(
-                    plan, primary_prompt, gen_kwargs
-                ),
+                bounded_reservation(primary_prompt),
             )
         except LLMStructuredValidationError as error:
             # 调用已产生可计费用量；保留原始内容，进入同 Provider 的唯一纠错尝试。
@@ -535,9 +574,7 @@ class GenerationRuntime:
                 "schema_fallback",
                 adapter,
                 fallback_call,
-                self._conservative_token_bound(
-                    plan, prompts.prompt_json_prompt, gen_kwargs
-                ),
+                bounded_reservation(prompts.prompt_json_prompt),
             )
         try:
             value = produced if isinstance(produced, BaseModel) else _parse_structured_text(str(produced), schema)
@@ -553,9 +590,7 @@ class GenerationRuntime:
 
             repaired = await self._paid_call(
                 plan, plan.provider_alias, "repair", adapter, repair_call,
-                self._conservative_token_bound(
-                    plan, repair_prompt, gen_kwargs
-                ),
+                bounded_reservation(repair_prompt),
             )
             try:
                 value = _parse_structured_text(str(repaired), schema)
@@ -572,9 +607,7 @@ class GenerationRuntime:
 
                 value = await self._paid_call(
                     plan, plan.reviewer_alias, "reviewer", reviewer, review_call,
-                    self._conservative_token_bound(
-                        plan, repair_prompt, gen_kwargs
-                    ),
+                    bounded_reservation(repair_prompt),
                 )
 
         attempts = self.attempts[attempt_offset:]

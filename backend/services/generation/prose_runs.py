@@ -679,6 +679,8 @@ class ProseRunModule:
         partial_acknowledgement: bool,
     ) -> MutationCommand:
         run = await prose_run_repo.get_run(run_id, owner_id)
+        if run.get("remediation_write_fence"):
+            raise ValueError("正文候选正在提交修复检查，请稍后重试")
         if int(run.get("revision") or 0) != int(expected_revision):
             raise ValueError("正文草稿版本已经变化，请刷新后再接受")
         if str(run.get("chapter_id")) != str(chapter_id):

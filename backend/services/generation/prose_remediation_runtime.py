@@ -105,6 +105,23 @@ OutlineIssueCategory = Literal[
 ]
 
 
+def _blocked_error_summary(
+    operation: Literal["rewrite", "adherence"],
+    code: Literal["resource_stale", "manual_approval_required"],
+) -> str:
+    summaries = {
+        ("rewrite", "resource_stale"): "正文候选已变化，不能写入本次改写。",
+        ("rewrite", "manual_approval_required"): (
+            "正文改写上下文超过安全预算，需要人工精简。"
+        ),
+        ("adherence", "resource_stale"): "正文候选已变化，不能复用本次复检。",
+        ("adherence", "manual_approval_required"): (
+            "正文复检上下文超过安全预算，需要人工精简。"
+        ),
+    }
+    return summaries[(operation, code)]
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -242,6 +259,8 @@ class FrozenStructuredCall:
         self,
         schema: type[BaseModel],
         prompts: PromptPlan,
+        *,
+        input_token_bound: int | None = None,
         **generation_kwargs: Any,
     ) -> Any:
         generation_kwargs = dict(generation_kwargs)
@@ -255,6 +274,22 @@ class FrozenStructuredCall:
             or requested_max_tokens > self.output_token_bound
         ):
             raise ValueError("structured call exceeds its frozen output bound")
+        actual_input_bound = max(
+            conservative_prompt_input_bound(
+                prompt=prompts.native_schema_prompt,
+                system_prompt=str(generation_kwargs.get("system_prompt") or ""),
+            ),
+            conservative_prompt_input_bound(
+                prompt=prompts.prompt_json_prompt,
+                system_prompt=str(generation_kwargs.get("system_prompt") or ""),
+            ),
+        )
+        frozen_input_bound = int(input_token_bound or actual_input_bound)
+        if frozen_input_bound < actual_input_bound:
+            raise ValueError("structured call exceeds its frozen input bound")
+        fallback_tokens_per_attempt = (
+            frozen_input_bound + self.output_token_bound
+        )
         attempt_offset = len(tuple(getattr(self.runtime, "attempts", ()) or ()))
         uncertain_before = int(
             getattr(self.runtime, "uncertain_attempt_count", 0) or 0
@@ -264,6 +299,10 @@ class FrozenStructuredCall:
                 self.plan,
                 schema,
                 prompts,
+                max_conservative_input_tokens=frozen_input_bound,
+                max_conservative_total_tokens=self.max_total_token_bound(
+                    frozen_input_bound
+                ),
                 **generation_kwargs,
             )
         except Exception as exc:
@@ -274,6 +313,9 @@ class FrozenStructuredCall:
                 usage=_runtime_attempt_usage(
                     self.runtime,
                     attempt_offset=attempt_offset,
+                    fallback_tokens_per_attempt=(
+                        fallback_tokens_per_attempt
+                    ),
                 ),
                 uncertain=uncertain_after > uncertain_before,
             ) from exc
@@ -289,6 +331,12 @@ class FrozenStructuredCall:
             int(self.plan.max_output_tokens or _FALLBACK_OUTPUT_TOKENS),
         )
 
+    def max_total_token_bound(self, input_token_bound: int) -> int:
+        """Cover every primary/fallback/repair/reviewer request in one call."""
+        return self.max_paid_attempts * (
+            max(1, int(input_token_bound)) + self.output_token_bound
+        )
+
     @property
     def revision(self) -> str:
         payload = {
@@ -300,6 +348,7 @@ class FrozenStructuredCall:
             "reviewer_alias": self.plan.reviewer_alias,
             "max_semantic_attempts": self.plan.max_semantic_attempts,
             "max_output_tokens": self.plan.max_output_tokens,
+            "frozen_budget_protocol": "nested-structured-total-r1",
         }
         encoded = json.dumps(
             payload,
@@ -310,20 +359,56 @@ class FrozenStructuredCall:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _runtime_usage(generated: Any) -> RuntimeCallUsage:
-    raw_usage = getattr(generated, "usage", None)
-    if hasattr(raw_usage, "model_dump"):
-        usage = raw_usage.model_dump()
-    elif isinstance(raw_usage, Mapping):
-        usage = dict(raw_usage)
-    else:
-        usage = {}
-    attempts = tuple(getattr(generated, "attempts", ()) or ())
+def _attempt_usage_projection(
+    attempts: tuple[Any, ...],
+    *,
+    fallback_tokens_per_attempt: int,
+) -> RuntimeCallUsage:
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    for attempt in attempts:
+        raw_usage = getattr(attempt, "usage", None)
+        if hasattr(raw_usage, "model_dump"):
+            usage = raw_usage.model_dump()
+        elif isinstance(raw_usage, Mapping):
+            usage = dict(raw_usage)
+        else:
+            usage = {
+                "input_tokens": getattr(raw_usage, "input_tokens", 0),
+                "output_tokens": getattr(raw_usage, "output_tokens", 0),
+                "total_tokens": getattr(raw_usage, "total_tokens", 0),
+            }
+        observed_input = max(0, int(usage.get("input_tokens") or 0))
+        observed_output = max(0, int(usage.get("output_tokens") or 0))
+        observed_total = max(
+            max(0, int(usage.get("total_tokens") or 0)),
+            observed_input + observed_output,
+        )
+        input_tokens += observed_input
+        output_tokens += observed_output
+        total_tokens += (
+            observed_total
+            if observed_total > 0
+            else int(fallback_tokens_per_attempt)
+        )
     return RuntimeCallUsage(
         paid_attempts=len(attempts),
-        input_tokens=max(0, int(usage.get("input_tokens") or 0)),
-        output_tokens=max(0, int(usage.get("output_tokens") or 0)),
-        total_tokens=max(0, int(usage.get("total_tokens") or 0)),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _runtime_usage(
+    generated: Any,
+    *,
+    fallback_tokens_per_attempt: int,
+) -> RuntimeCallUsage:
+    attempts = tuple(getattr(generated, "attempts", ()) or ())
+    return _attempt_usage_projection(
+        attempts,
+        fallback_tokens_per_attempt=fallback_tokens_per_attempt,
     )
 
 
@@ -331,29 +416,12 @@ def _runtime_attempt_usage(
     runtime: Any,
     *,
     attempt_offset: int,
+    fallback_tokens_per_attempt: int,
 ) -> RuntimeCallUsage:
     attempts = tuple(getattr(runtime, "attempts", ()) or ())[attempt_offset:]
-    usages = [
-        getattr(item, "usage", None)
-        for item in attempts
-    ]
-    return RuntimeCallUsage(
-        paid_attempts=len(attempts),
-        input_tokens=sum(
-            max(0, int(getattr(item, "input_tokens", 0) or 0))
-            for item in usages
-            if item is not None
-        ),
-        output_tokens=sum(
-            max(0, int(getattr(item, "output_tokens", 0) or 0))
-            for item in usages
-            if item is not None
-        ),
-        total_tokens=sum(
-            max(0, int(getattr(item, "total_tokens", 0) or 0))
-            for item in usages
-            if item is not None
-        ),
+    return _attempt_usage_projection(
+        attempts,
+        fallback_tokens_per_attempt=fallback_tokens_per_attempt,
     )
 
 
@@ -695,13 +763,13 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r2-{call.revision[:20]}"
+                f"prose-remediation-planner-r3-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
             max_paid_attempts_per_call=call.max_paid_attempts,
-            max_tokens_per_call=(
-                _PLANNER_INPUT_TOKEN_BOUND + call.output_token_bound
+            max_tokens_per_call=call.max_total_token_bound(
+                _PLANNER_INPUT_TOKEN_BOUND
             ),
             external_data_categories=(
                 "chapter_prose_candidate_metadata",
@@ -733,6 +801,7 @@ class ProseRemediationPlanner:
                         idempotency_key.encode("utf-8")
                     ).hexdigest(),
                 },
+                input_token_bound=_PLANNER_INPUT_TOKEN_BOUND,
             )
         except _FrozenStructuredCallFailure as failure:
             if failure.uncertain:
@@ -743,7 +812,12 @@ class ProseRemediationPlanner:
             ) from failure
         return PlannerResult(
             decision=PlannerDecision.model_validate(generated.value),
-            usage=_runtime_usage(generated),
+            usage=_runtime_usage(
+                generated,
+                fallback_tokens_per_attempt=(
+                    _PLANNER_INPUT_TOKEN_BOUND + self._call.output_token_bound
+                ),
+            ),
         )
 
     async def recover(self, *, idempotency_key: str) -> None:
@@ -818,7 +892,7 @@ class ProseRemediationToolApplication:
             resource_revision=str(payload.expected_revision),
             resource_digest=payload.expected_content_digest,
             usage=usage or RuntimeCallUsage(),
-            error_summary="复检 Provider 输出未通过完整场景证据校验。",
+            error_summary=_blocked_error_summary("rewrite", code),
         )
 
     @staticmethod
@@ -857,7 +931,7 @@ class ProseRemediationToolApplication:
             resource_revision=str(payload.expected_revision),
             resource_digest=payload.expected_content_digest,
             usage=usage or RuntimeCallUsage(),
-            error_summary="改写 Provider 输出未通过正文候选 Schema 校验。",
+            error_summary=_blocked_error_summary("adherence", code),
         )
 
     @staticmethod
@@ -1120,13 +1194,20 @@ class ProseRemediationToolApplication:
                     "runtime": "bounded_agent_v1",
                     "tool": REWRITE_TOOL.name,
                 },
+                input_token_bound=_TOOL_INPUT_TOKEN_BOUND,
             )
         except _FrozenStructuredCallFailure as failure:
             return self._generation_failure_result(
                 operation="rewrite",
                 failure=failure,
             )
-        usage = _runtime_usage(generated)
+        usage = _runtime_usage(
+            generated,
+            fallback_tokens_per_attempt=(
+                _TOOL_INPUT_TOKEN_BOUND
+                + self._rewrite_call.output_token_bound
+            ),
+        )
         try:
             output = RewrittenProseProviderOutput.model_validate(
                 generated.value
@@ -1154,6 +1235,10 @@ class ProseRemediationToolApplication:
         fatal_completion_reasons = set(draft_completion.reason_codes) - {
             "scenes_incomplete"
         }
+        if draft_completion.finish_reason != "stop":
+            fatal_completion_reasons.add(
+                f"finish_reason_{draft_completion.finish_reason}"
+            )
         if fatal_completion_reasons:
             return RuntimeToolResult(
                 status="retryable_error",
@@ -1229,47 +1314,96 @@ class ProseRemediationToolApplication:
         )
         fence_token = f"prose-remediation-rewrite:{receipt_claim_token}"
         try:
-            await narrative_revision_store.acquire_write_fence(
+            fence_expires_at = await narrative_revision_store.acquire_write_fence(
                 context.novel_id,
                 expected_revision=int(run["narrative_revision"]),
                 fence_token=fence_token,
+                resource_kind="prose_run",
+                resource_id=data.prose_run_id,
             )
             try:
-                current_run, _current_chapter, current_text = (
-                    await self._candidate_snapshot(
-                        context=context,
-                        expected_revision=payload.expected_revision,
-                        expected_content_digest=payload.expected_content_digest,
-                    )
+                await self._deps.prose_runs.acquire_remediation_write_fence(
+                    run_id=data.prose_run_id,
+                    owner_id=context.owner_id,
+                    novel_id=context.novel_id,
+                    expected_revision=payload.expected_revision,
+                    expected_narrative_revision=int(run["narrative_revision"]),
+                    fence_token=fence_token,
+                    expires_at=fence_expires_at,
                 )
-                stored_completion = {
-                    **dict(current_run.get("completion") or {}),
-                    **locked_completion,
-                }
-                stored_document, stored_receipt = (
-                    await self._deps.prose_runs.apply_remediation_candidate(
+                try:
+                    current_run, _current_chapter, current_text = (
+                        await self._candidate_snapshot(
+                            context=context,
+                            expected_revision=payload.expected_revision,
+                            expected_content_digest=payload.expected_content_digest,
+                        )
+                    )
+                    stored_completion = {
+                        **dict(current_run.get("completion") or {}),
+                        **locked_completion,
+                    }
+                    # Renew both halves immediately before the candidate CAS.
+                    # An expired formal writer revokes the ProseRun token first,
+                    # so an old holder cannot commit after revision advancement.
+                    fence_expires_at = (
+                        await narrative_revision_store.acquire_write_fence(
+                            context.novel_id,
+                            expected_revision=int(
+                                current_run["narrative_revision"]
+                            ),
+                            fence_token=fence_token,
+                            resource_kind="prose_run",
+                            resource_id=data.prose_run_id,
+                        )
+                    )
+                    await self._deps.prose_runs.acquire_remediation_write_fence(
                         run_id=data.prose_run_id,
                         owner_id=context.owner_id,
                         novel_id=context.novel_id,
                         expected_revision=payload.expected_revision,
-                        expected_text=current_text,
                         expected_narrative_revision=int(
                             current_run["narrative_revision"]
                         ),
-                        expected_outline_revision=str(
-                            current_run["outline_revision"]
-                        ),
-                        idempotency_key=idempotency_key,
-                        request_digest=request_digest,
-                        claim_token=receipt_claim_token,
-                        assembled_text=output.prose,
-                        source_content_digest=payload.expected_content_digest,
-                        completion=stored_completion,
-                        target_issue_categories=list(payload.issue_categories),
-                        target_scene_indexes=list(payload.scene_indexes),
-                        result_projection=result.model_dump(mode="json"),
+                        fence_token=fence_token,
+                        expires_at=fence_expires_at,
                     )
-                )
+                    stored_document, stored_receipt = (
+                        await self._deps.prose_runs.apply_remediation_candidate(
+                            run_id=data.prose_run_id,
+                            owner_id=context.owner_id,
+                            novel_id=context.novel_id,
+                            expected_revision=payload.expected_revision,
+                            expected_text=current_text,
+                            expected_narrative_revision=int(
+                                current_run["narrative_revision"]
+                            ),
+                            expected_outline_revision=str(
+                                current_run["outline_revision"]
+                            ),
+                            idempotency_key=idempotency_key,
+                            request_digest=request_digest,
+                            claim_token=receipt_claim_token,
+                            assembled_text=output.prose,
+                            source_content_digest=(
+                                payload.expected_content_digest
+                            ),
+                            completion=stored_completion,
+                            target_issue_categories=list(
+                                payload.issue_categories
+                            ),
+                            target_scene_indexes=list(payload.scene_indexes),
+                            result_projection=result.model_dump(mode="json"),
+                            write_fence_token=fence_token,
+                        )
+                    )
+                finally:
+                    await self._deps.prose_runs.release_remediation_write_fence(
+                        run_id=data.prose_run_id,
+                        owner_id=context.owner_id,
+                        novel_id=context.novel_id,
+                        fence_token=fence_token,
+                    )
             finally:
                 await narrative_revision_store.release_write_fence(
                     context.novel_id,
@@ -1366,13 +1500,20 @@ class ProseRemediationToolApplication:
                     "runtime": "bounded_agent_v1",
                     "tool": ADHERENCE_TOOL.name,
                 },
+                input_token_bound=_TOOL_INPUT_TOKEN_BOUND,
             )
         except _FrozenStructuredCallFailure as failure:
             return self._generation_failure_result(
                 operation="adherence",
                 failure=failure,
             )
-        usage = _runtime_usage(generated)
+        usage = _runtime_usage(
+            generated,
+            fallback_tokens_per_attempt=(
+                _TOOL_INPUT_TOKEN_BOUND
+                + self._adherence_call.output_token_bound
+            ),
+        )
         try:
             provider_review = RemediationAdherenceProviderOutput.model_validate(
                 generated.value
@@ -1547,11 +1688,11 @@ class ProseRemediationToolRegistry:
                 proposal_kinds=("chapter_prose_candidate",),
                 change_classes=("temporary_candidate",),
                 max_paid_attempts_per_call=rewrite_call.max_paid_attempts,
-                max_tokens_per_call=(
-                    _TOOL_INPUT_TOKEN_BOUND + rewrite_call.output_token_bound
+                max_tokens_per_call=rewrite_call.max_total_token_bound(
+                    _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r2-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r3-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1571,11 +1712,11 @@ class ProseRemediationToolRegistry:
                 proposal_kinds=(),
                 change_classes=(),
                 max_paid_attempts_per_call=adherence_call.max_paid_attempts,
-                max_tokens_per_call=(
-                    _TOOL_INPUT_TOKEN_BOUND + adherence_call.output_token_bound
+                max_tokens_per_call=adherence_call.max_total_token_bound(
+                    _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r2-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r3-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1590,7 +1731,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r2-"
+            "prose-remediation-tools-r3-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
@@ -1628,7 +1769,7 @@ class ProseRemediationToolRegistry:
             claim_state = ""
             claim_document: Mapping[str, Any] | None = None
             claim_receipt: Mapping[str, Any] | None = None
-            for _ in range(101):
+            while True:
                 claim_state, claim_document, claim_receipt = (
                     await self._prose_runs.claim_remediation_receipt(
                         run_id=context.scope.object_id,
@@ -1642,7 +1783,18 @@ class ProseRemediationToolRegistry:
                 )
                 if claim_state in {"claimed", "completed"}:
                     break
-                await asyncio.sleep(0.05)
+                if claim_state not in {
+                    "in_progress_reserved",
+                    "in_progress_dispatched",
+                }:
+                    raise StaleProseRun(
+                        "正文修复幂等回执进入未知状态"
+                    )
+                # The enclosing AgentRuntime owns the deadline. A normal slow
+                # Provider must not be reclassified as unknown after an
+                # arbitrary local polling window; cancellation/deadline will
+                # instead preserve the dispatched uncertainty checkpoint.
+                await asyncio.sleep(0.1)
             if claim_state == "completed":
                 assert claim_document is not None
                 assert claim_receipt is not None
@@ -1651,29 +1803,6 @@ class ProseRemediationToolRegistry:
                     receipt=claim_receipt,
                     context=context,
                     payload=normalized,
-                )
-            if claim_state != "claimed":
-                provider_unknown = claim_state == "in_progress_dispatched"
-                return RuntimeToolResult(
-                    status=("uncertain" if provider_unknown else "retryable_error"),
-                    code=(
-                        "rewrite_provider_result_unknown"
-                        if provider_unknown
-                        else "rewrite_idempotency_claim_busy"
-                    ),
-                    planner_view={
-                        "candidate_revision": normalized.expected_revision,
-                        "content_digest": normalized.expected_content_digest,
-                        "known_outcome": not provider_unknown,
-                    },
-                    audit_view={
-                        "prose_run_id": context.scope.object_id,
-                        "idempotency_state": claim_state,
-                        **({} if provider_unknown else _NO_PROVIDER_DISPATCH),
-                    },
-                    resource_revision=str(normalized.expected_revision),
-                    resource_digest=normalized.expected_content_digest,
-                    error_summary="相同正文修复正在由另一执行者处理。",
                 )
             result = await self._application.rewrite(
                 normalized,
@@ -1848,7 +1977,11 @@ class ProseRemediationCompletionPolicy:
                     outline_revision=str(candidate["outline_revision"]),
                     expected_outline_revision=str(candidate["outline_revision"]),
                 )
-                if not completion.can_write_formal_prose:
+                if (
+                    completion.finish_reason != "stop"
+                    or completion.status != "complete"
+                    or not completion.can_write_formal_prose
+                ):
                     raise ValueError(
                         "verified candidate did not pass prose completion"
                     )
@@ -1975,58 +2108,108 @@ class ProseRemediationCompletionMaterializer:
         candidate = await self._prose_runs.get_run(prose_run_id, owner_id)
         expected_narrative_revision = int(candidate["narrative_revision"])
         fence_token = f"prose-remediation-verify:{run_id}:{uuid4()}"
-        await narrative_revision_store.acquire_write_fence(
+        fence_expires_at = await narrative_revision_store.acquire_write_fence(
             novel_id,
             expected_revision=expected_narrative_revision,
             fence_token=fence_token,
+            resource_kind="prose_run",
+            resource_id=prose_run_id,
         )
         try:
-            candidate = await self._prose_runs.get_run(prose_run_id, owner_id)
-            chapter = await self._chapters.get_chapter_by_id(
-                str(candidate["chapter_id"])
-            )
-            text = _validate_candidate_snapshot(
-                run=candidate,
-                chapter=chapter,
-                novel_id=novel_id,
-                expected_revision=candidate_revision,
-                expected_content_digest=content_digest,
-                allow_unverified_remediation=True,
-            )
-            plan = _execution_plan(candidate)
-            completion = prose_completion_module.inspect(
-                text=text,
-                plan=plan,
-                finish_reason=str(
-                    (candidate.get("completion") or {}).get("finish_reason")
-                    or "unreported"
-                ),
-                raw_finish_reason=str(
-                    (candidate.get("completion") or {}).get(
-                        "raw_finish_reason"
-                    )
-                    or "unreported"
-                ),
-                completed_scene_indexes=range(plan.scene_count),
-                outline_revision=str(candidate["outline_revision"]),
-                expected_outline_revision=str(candidate["outline_revision"]),
-            )
-            if not completion.can_write_formal_prose:
-                raise StaleProseRun(
-                    "复检通过的正文候选未通过完整性闸门"
-                )
-            await self._prose_runs.verify_remediation_candidate(
+            await self._prose_runs.acquire_remediation_write_fence(
                 run_id=prose_run_id,
                 owner_id=owner_id,
                 novel_id=novel_id,
-                agent_run_id=run_id,
                 expected_revision=candidate_revision,
-                expected_text=text,
-                expected_content_digest=content_digest,
                 expected_narrative_revision=expected_narrative_revision,
-                expected_outline_revision=str(candidate["outline_revision"]),
-                completion=completion.to_dict(),
+                fence_token=fence_token,
+                expires_at=fence_expires_at,
             )
+            try:
+                candidate = await self._prose_runs.get_run(
+                    prose_run_id, owner_id
+                )
+                chapter = await self._chapters.get_chapter_by_id(
+                    str(candidate["chapter_id"])
+                )
+                text = _validate_candidate_snapshot(
+                    run=candidate,
+                    chapter=chapter,
+                    novel_id=novel_id,
+                    expected_revision=candidate_revision,
+                    expected_content_digest=content_digest,
+                    allow_unverified_remediation=True,
+                )
+                plan = _execution_plan(candidate)
+                completion = prose_completion_module.inspect(
+                    text=text,
+                    plan=plan,
+                    finish_reason=str(
+                        (candidate.get("completion") or {}).get(
+                            "finish_reason"
+                        )
+                        or "unreported"
+                    ),
+                    raw_finish_reason=str(
+                        (candidate.get("completion") or {}).get(
+                            "raw_finish_reason"
+                        )
+                        or "unreported"
+                    ),
+                    completed_scene_indexes=range(plan.scene_count),
+                    outline_revision=str(candidate["outline_revision"]),
+                    expected_outline_revision=str(
+                        candidate["outline_revision"]
+                    ),
+                )
+                if (
+                    completion.finish_reason != "stop"
+                    or completion.status != "complete"
+                    or not completion.can_write_formal_prose
+                ):
+                    raise StaleProseRun(
+                        "复检通过的正文候选未通过完整性闸门"
+                    )
+                fence_expires_at = (
+                    await narrative_revision_store.acquire_write_fence(
+                        novel_id,
+                        expected_revision=expected_narrative_revision,
+                        fence_token=fence_token,
+                        resource_kind="prose_run",
+                        resource_id=prose_run_id,
+                    )
+                )
+                await self._prose_runs.acquire_remediation_write_fence(
+                    run_id=prose_run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    expected_revision=candidate_revision,
+                    expected_narrative_revision=expected_narrative_revision,
+                    fence_token=fence_token,
+                    expires_at=fence_expires_at,
+                )
+                await self._prose_runs.verify_remediation_candidate(
+                    run_id=prose_run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    agent_run_id=run_id,
+                    expected_revision=candidate_revision,
+                    expected_text=text,
+                    expected_content_digest=content_digest,
+                    expected_narrative_revision=expected_narrative_revision,
+                    expected_outline_revision=str(
+                        candidate["outline_revision"]
+                    ),
+                    completion=completion.to_dict(),
+                    write_fence_token=fence_token,
+                )
+            finally:
+                await self._prose_runs.release_remediation_write_fence(
+                    run_id=prose_run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    fence_token=fence_token,
+                )
         finally:
             await narrative_revision_store.release_write_fence(
                 novel_id,

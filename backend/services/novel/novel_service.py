@@ -183,6 +183,9 @@ class NovelService:
             character_states_repo = BaseRepository(collections.CHARACTER_STATES)
             generation_jobs_repo = BaseRepository(collections.GENERATION_JOBS)
             prose_runs_repo = BaseRepository(collections.PROSE_RUNS)
+            prose_remediation_receipts_repo = BaseRepository(
+                collections.PROSE_REMEDIATION_RECEIPTS
+            )
             chapter_state_deltas_repo = BaseRepository(collections.CHAPTER_STATE_DELTAS)
             character_state_snapshots_repo = BaseRepository(collections.CHARACTER_STATE_SNAPSHOTS)
             plot_thread_events_repo = BaseRepository(collections.PLOT_THREAD_EVENTS)
@@ -242,6 +245,11 @@ class NovelService:
             stats["character_states_deleted"] = await character_states_repo.hard_delete_many(query, session=session)
             stats["generation_jobs_deleted"] = await generation_jobs_repo.hard_delete_many(query, session=session)
             stats["prose_runs_deleted"] = await prose_runs_repo.hard_delete_many(query, session=session)
+            stats["prose_remediation_receipts_deleted"] = (
+                await prose_remediation_receipts_repo.hard_delete_many(
+                    query, session=session
+                )
+            )
             stats["chapter_state_deltas_deleted"] = await chapter_state_deltas_repo.hard_delete_many(query, session=session)
             stats["character_state_snapshots_deleted"] = await character_state_snapshots_repo.hard_delete_many(query, session=session)
             stats["plot_thread_events_deleted"] = await plot_thread_events_repo.hard_delete_many(query, session=session)
