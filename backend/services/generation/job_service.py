@@ -13,6 +13,9 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
 from backend.services.generation.chapter_pipeline import run_chapter
+from backend.services.generation.chapter_candidate_authorization import (
+    authorized_candidate_repair_attempt_slots,
+)
 from backend.services.generation.attempt_scope import JobAttemptScope
 from backend.services.generation.headless_generation import (
     build_chapter_pipeline_deps,
@@ -103,6 +106,32 @@ def _authorization_scope_increases(
         for field in _AUTHORIZATION_SCOPE_FIELDS
         if candidate_scope[field] > authorized_scope[field]
     ]
+
+
+def _estimate_authorized_chapter_attempt_slots(
+    job: Mapping[str, Any],
+    chapter: Mapping[str, Any],
+    generation_params: Mapping[str, Any] | None,
+) -> int:
+    """Size one chapter reservation from the already-confirmed readiness."""
+    base_slots = estimate_chapter_attempt_slots(
+        dict(chapter),
+        generation_params,
+    )
+    readiness = job.get("readiness")
+    planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
+    if (
+        not isinstance(planning, Mapping)
+        or "chapter_candidate_repair_authorization" not in planning
+    ):
+        # Jobs created before the candidate-first authorization continue under
+        # their original capacity and execution path.
+        return base_slots
+    repair_slots = authorized_candidate_repair_attempt_slots(
+        readiness,
+        chapter_id=str(chapter.get("_id") or ""),
+    )
+    return base_slots + repair_slots
 
 
 def _new_job_doc(
@@ -352,7 +381,11 @@ class GenerationJobService:
             generation_params = dict(
                 current_job.get("generation_params") or {}
             )
-            slots = estimate_chapter_attempt_slots(chapter, generation_params)
+            slots = _estimate_authorized_chapter_attempt_slots(
+                current_job,
+                chapter,
+                generation_params,
+            )
             await generation_job_repo.reserve_attempts(job_id, chapter_id, slots)
             outline_deviation_policy = validate_outline_deviation_policy(
                 current_job.get("outline_deviation_policy")

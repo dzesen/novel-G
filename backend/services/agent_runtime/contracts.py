@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import re
 from typing import Any, Literal
@@ -175,6 +176,42 @@ class RuntimeToolDescriptor:
             self.proposal_kinds or self.change_classes
         ):
             raise ValueError("read tools cannot declare proposal or change classes")
+
+
+def runtime_tool_descriptor_snapshot(
+    descriptor: RuntimeToolDescriptor,
+) -> dict[str, Any]:
+    """Project the one canonical persisted identity of a runtime Tool."""
+    if not isinstance(descriptor, RuntimeToolDescriptor):
+        raise ValueError("runtime tool descriptor is invalid")
+
+    def schema_digest(schema: type[BaseModel]) -> str:
+        encoded = json.dumps(
+            schema.model_json_schema(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    return {
+        "schema_version": descriptor.schema_version,
+        "reference": descriptor.reference.model_dump(mode="json"),
+        "label": descriptor.label,
+        "input_schema_digest": schema_digest(descriptor.input_schema),
+        "output_schema_digest": schema_digest(descriptor.output_schema),
+        "scope_kinds": list(descriptor.scope_kinds),
+        "effect_class": descriptor.effect_class,
+        "proposal_kinds": list(descriptor.proposal_kinds),
+        "change_classes": list(descriptor.change_classes),
+        "max_paid_attempts_per_call": descriptor.max_paid_attempts_per_call,
+        "max_tokens_per_call": descriptor.max_tokens_per_call,
+        "implementation_revision": descriptor.implementation_revision,
+        "context_policy_revision": descriptor.context_policy_revision,
+        "external_data_categories": list(descriptor.external_data_categories),
+        "idempotent": descriptor.idempotent,
+    }
 
 
 class PlannerDecision(_StrictModel):

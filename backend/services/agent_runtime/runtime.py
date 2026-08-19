@@ -51,6 +51,7 @@ from backend.services.agent_runtime.contracts import (
     V1_RUNTIME_CHANGE_CLASSES,
     V1_RUNTIME_EFFECT_CLASSES,
     V1_RUNTIME_PROPOSAL_KINDS,
+    runtime_tool_descriptor_snapshot,
 )
 from backend.services.agent_runtime.policy import (
     AgentRuntimePolicyViolation,
@@ -160,23 +161,7 @@ def _requires_attempt_accounting(
 
 
 def _tool_snapshot(descriptor: RuntimeToolDescriptor) -> dict[str, Any]:
-    return {
-        "schema_version": descriptor.schema_version,
-        "reference": descriptor.reference.model_dump(mode="json"),
-        "label": descriptor.label,
-        "input_schema_digest": _schema_digest(descriptor.input_schema),
-        "output_schema_digest": _schema_digest(descriptor.output_schema),
-        "scope_kinds": list(descriptor.scope_kinds),
-        "effect_class": descriptor.effect_class,
-        "proposal_kinds": list(descriptor.proposal_kinds),
-        "change_classes": list(descriptor.change_classes),
-        "max_paid_attempts_per_call": descriptor.max_paid_attempts_per_call,
-        "max_tokens_per_call": descriptor.max_tokens_per_call,
-        "implementation_revision": descriptor.implementation_revision,
-        "context_policy_revision": descriptor.context_policy_revision,
-        "external_data_categories": list(descriptor.external_data_categories),
-        "idempotent": descriptor.idempotent,
-    }
+    return runtime_tool_descriptor_snapshot(descriptor)
 
 
 def _frozen_tool_snapshot(

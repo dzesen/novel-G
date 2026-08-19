@@ -17,6 +17,9 @@ from backend.services.generation.job_planner import (
 from backend.services.generation.chapter_finalization import (
     build_chapter_finalization_authorization,
 )
+from backend.services.generation.chapter_candidate_authorization import (
+    build_chapter_candidate_repair_authorization,
+)
 from backend.services.generation.prose_continuation import (
     SCENE_DIVERGENCE_STOP_FACTOR,
     ProseContinuationPolicy,
@@ -53,6 +56,10 @@ class ReadinessDeps:
     prepare_generation_params: Callable[
         [str, list[dict[str, Any]], ProseContinuationPolicy, Mapping[str, Any] | None],
         Awaitable[Mapping[str, Any] | None],
+    ] | None = None
+    plan_candidate_repairs: Callable[
+        [list[dict[str, Any]], int, int, Mapping[str, Any] | None],
+        Mapping[str, Any],
     ] | None = None
 
 
@@ -371,6 +378,45 @@ class GenerationReadinessModule:
                 "config_revision": "",
                 "capability_snapshot": "",
             }
+            finalization_authorization = (
+                build_chapter_finalization_authorization(
+                    authorization_revision=authorization_revision,
+                )
+            )
+            if has_work and self._deps.plan_candidate_repairs is not None:
+                candidate_repair_authorization = dict(
+                    self._deps.plan_candidate_repairs(
+                        chapters,
+                        authorization_revision,
+                        int(
+                            finalization_authorization[
+                                "max_repair_cycles"
+                            ]
+                        ),
+                        generation_params,
+                    )
+                )
+                repair_attempts = candidate_repair_authorization.get(
+                    "maximum_provider_attempts_total"
+                )
+                if (
+                    isinstance(repair_attempts, bool)
+                    or not isinstance(repair_attempts, int)
+                    or repair_attempts < 0
+                ):
+                    raise ValueError(
+                        "candidate repair attempt bound is invalid"
+                    )
+                planning = {
+                    **planning,
+                    "attempt_capacity": int(
+                        planning.get("attempt_capacity") or 0
+                    )
+                    + repair_attempts,
+                    "chapter_candidate_repair_authorization": (
+                        candidate_repair_authorization
+                    ),
+                }
         except ContextBudgetError as exc:
             planning = {
                 "attempt_capacity": 0,
@@ -992,5 +1038,6 @@ generation_readiness_module = GenerationReadinessModule(
         inspect_active_proposal=_inspect_active_proposal,
         plan_work=_plan_work_with_prose_continuation,
         prepare_generation_params=_prepare_generation_params,
+        plan_candidate_repairs=build_chapter_candidate_repair_authorization,
     )
 )
