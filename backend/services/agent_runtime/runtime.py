@@ -124,6 +124,34 @@ def _schema_digest(schema: type) -> str:
     return _digest(schema.model_json_schema())
 
 
+def _attempt_accounting_revision(authorization: Mapping[str, Any]) -> Literal[0, 1]:
+    raw_revision = authorization.get("attempt_accounting_revision", 0)
+    if (
+        isinstance(raw_revision, bool)
+        or not isinstance(raw_revision, int)
+        or raw_revision not in {0, 1}
+    ):
+        raise ValueError("attempt accounting revision is unknown")
+    return raw_revision
+
+
+def _requires_attempt_accounting(
+    *,
+    authorization_revision: Literal[0, 1],
+    attempt: Mapping[str, Any],
+) -> bool:
+    raw_revision = attempt.get("accounting_revision")
+    if raw_revision is None:
+        return authorization_revision == 1
+    if (
+        isinstance(raw_revision, bool)
+        or not isinstance(raw_revision, int)
+        or raw_revision != 1
+    ):
+        raise ValueError("attempt accounting revision is unknown")
+    return True
+
+
 def _tool_snapshot(descriptor: RuntimeToolDescriptor) -> dict[str, Any]:
     return {
         "schema_version": descriptor.schema_version,
@@ -484,6 +512,26 @@ def _step_completed_event_projection(
     }
 
 
+def _ledger_sealed_step_completed_event_projection(
+    *,
+    ordinal: int,
+    step: Mapping[str, Any],
+    kind: Literal["finish", "tool"],
+    attempts: list[Mapping[str, Any]],
+) -> tuple[str, str, dict[str, Any]]:
+    legacy_projection = _step_audit_projection(step)
+    legacy_projection["attempt_ledger_digest"] = _digest([
+        project_agent_runtime_attempt_ledger_entry(attempt)
+        for attempt in attempts
+    ])
+    return f"step-{ordinal}-completed", "step_completed", {
+        "ordinal": ordinal,
+        "status": "completed",
+        "kind": kind,
+        "step_digest": _digest(legacy_projection),
+    }
+
+
 def _attempt_accounted_event_projection(
     *,
     ordinal: int,
@@ -695,6 +743,12 @@ class AgentRuntime:
             owner_id=owner_id,
         )
         source_authorization = dict(source.get("authorization") or {})
+        try:
+            _attempt_accounting_revision(source_authorization)
+        except ValueError as exc:
+            raise AgentRuntimeReadinessConflict(
+                "lineage source has an unknown attempt accounting revision"
+            ) from exc
         if (
             str(source.get("novel_id")) != request.novel_id
             or source_authorization.get("goal") != request.goal
@@ -1150,9 +1204,21 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
         )
-        attempt_accounting_required = int(
-            (run.get("authorization") or {}).get("attempt_accounting_revision") or 0
-        ) == 1
+        events = await self._repository.list_events_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        event_by_key = {
+            str(event.get("event_key") or ""): event for event in events
+        }
+        try:
+            accounting_revision = _attempt_accounting_revision(
+                run.get("authorization") or {}
+            )
+        except ValueError as exc:
+            raise AgentRuntimeStateConflict(
+                "attempt accounting revision is unknown"
+            ) from exc
         await self._event(
             run_id=run_id,
             event_key="run-created",
@@ -1176,11 +1242,27 @@ class AgentRuntime:
                 now=now,
             )
 
-        attempts_by_step, _, attempts_valid = _persisted_attempts(run, steps)
+        attempts_by_step, persisted_attempts, attempts_valid = _persisted_attempts(
+            run,
+            steps,
+        )
         if not attempts_valid:
             raise AgentRuntimeStateConflict(
                 "Agent attempt ledger cannot repair its audit projection"
             )
+        try:
+            accounting_call_keys = {
+                str(attempt.get("call_key") or "")
+                for attempt in persisted_attempts
+                if _requires_attempt_accounting(
+                    authorization_revision=accounting_revision,
+                    attempt=attempt,
+                )
+            }
+        except ValueError as exc:
+            raise AgentRuntimeStateConflict(
+                "attempt accounting revision is unknown"
+            ) from exc
 
         for step in steps:
             step_id = str(step["step_id"])
@@ -1200,7 +1282,10 @@ class AgentRuntime:
                     attempt=attempt,
                     decision=None,
                     invocation=None,
-                    record_accounting=attempt_accounting_required,
+                    record_accounting=(
+                        str(attempt.get("call_key") or "")
+                        in accounting_call_keys
+                    ),
                     now=now,
                 )
 
@@ -1246,7 +1331,10 @@ class AgentRuntime:
                     attempt=attempt,
                     decision=decision,
                     invocation=invocation,
-                    record_accounting=attempt_accounting_required,
+                    record_accounting=(
+                        str(attempt.get("call_key") or "")
+                        in accounting_call_keys
+                    ),
                     now=now,
                 )
 
@@ -1280,6 +1368,23 @@ class AgentRuntime:
                         kind=kind,
                     )
                 )
+                existing = event_by_key.get(event_key)
+                if existing is not None and accounting_revision == 0:
+                    legacy_payload = _ledger_sealed_step_completed_event_projection(
+                        ordinal=ordinal,
+                        step=step,
+                        kind=kind,
+                        attempts=attempts,
+                    )[2]
+                    if (
+                        existing.get("schema_version")
+                        == "agent_runtime_event.v1"
+                        and existing.get("type") == event_type
+                        and str(existing.get("step_id") or "") == step_id
+                        and (existing.get("payload") or {})
+                        in (event_payload, legacy_payload)
+                    ):
+                        continue
                 await self._event(
                     run_id=run_id,
                     event_key=event_key,
@@ -1472,9 +1577,11 @@ class AgentRuntime:
             != str(run.get("authorization_digest") or "")
         ):
             add_violation("authorization_digest_mismatch")
-        attempt_accounting_required = (
-            int(authorization.get("attempt_accounting_revision") or 0) == 1
-        )
+        try:
+            accounting_revision = _attempt_accounting_revision(authorization)
+        except ValueError:
+            add_violation("authorization_revision_mismatch")
+            accounting_revision = 1
 
         if [int(item["ordinal"]) for item in steps] != list(range(len(steps))):
             add_violation("step_ordinal_mismatch")
@@ -1640,9 +1747,16 @@ class AgentRuntime:
                 elif state in {"uncertain", "resolved_retry", "resolved_skip"}:
                     chain.append(f"{call_key}-uncertain")
                 accounted_key = f"{call_key}-accounted-v1"
+                try:
+                    accounting_required = _requires_attempt_accounting(
+                        authorization_revision=accounting_revision,
+                        attempt=attempt,
+                    )
+                except ValueError:
+                    add_violation("attempt_event_identity_mismatch")
+                    accounting_required = True
                 if state in {"settled", "resolved_retry", "resolved_skip"} and (
-                    attempt_accounting_required
-                    or accounted_key in actual_attempt_keys
+                    accounting_required or accounted_key in actual_attempt_keys
                 ):
                     chain.append(accounted_key)
                 expected_attempt_keys.extend(chain)
@@ -2139,7 +2253,17 @@ class AgentRuntime:
                     step=step,
                     kind=expected_kind,
                 )[2]
-                if completed_payload != expected_completed_payload:
+                compatible_completed_payloads = [expected_completed_payload]
+                if accounting_revision == 0:
+                    compatible_completed_payloads.append(
+                        _ledger_sealed_step_completed_event_projection(
+                            ordinal=ordinal,
+                            step=step,
+                            kind=expected_kind,
+                            attempts=attempts_by_step.get(step_id, []),
+                        )[2]
+                    )
+                if completed_payload not in compatible_completed_payloads:
                     add_violation("step_status_mismatch")
 
             persisted_step_status = str(step.get("status") or "")
@@ -2816,10 +2940,12 @@ class AgentRuntime:
     ) -> None:
         if authorization.get("schema_version") != "agent_runtime_authorization.v1":
             raise AgentRuntimeStateConflict("authorization schema version is unknown")
-        if int(authorization.get("attempt_accounting_revision") or 0) not in {0, 1}:
+        try:
+            _attempt_accounting_revision(authorization)
+        except ValueError as exc:
             raise AgentRuntimeStateConflict(
                 "attempt accounting revision is unknown"
-            )
+            ) from exc
         if _digest(dict(authorization)) != authorization_digest:
             raise AgentRuntimeStateConflict("authorization digest no longer matches")
         if authorization.get("planner") != self._planner.descriptor.model_dump(mode="json"):
@@ -2955,16 +3081,44 @@ class AgentRuntime:
                     now=now,
                 )
                 return
-            active_has_unknown_dispatch = any(
-                isinstance(attempt, Mapping)
-                and attempt.get("step_id") == active_step_id
-                and attempt.get("state") in {"dispatched", "uncertain"}
-                for attempt in run.get("attempts") or []
-            )
-            if not active_has_unknown_dispatch and not await self._revision_matches(
+            if not await self._revision_matches(
                 owner_id=owner_id,
                 authorization=authorization,
             ):
+                if active_step_id:
+                    unresolved = [
+                        attempt
+                        for attempt in run.get("attempts") or []
+                        if isinstance(attempt, Mapping)
+                        and attempt.get("step_id") == active_step_id
+                        and attempt.get("state") in {"dispatched", "uncertain"}
+                    ]
+                    reason_code = "concurrent_narrative_change"
+                    if unresolved:
+                        attempt = unresolved[-1]
+                        if attempt.get("state") == "dispatched":
+                            await self._mark_uncertain(
+                                run_id=run_id,
+                                owner_id=owner_id,
+                                worker_id=worker_id,
+                                lease_epoch=lease_epoch,
+                                step_id=active_step_id,
+                                ordinal=int(active_step.get("ordinal") or 0),
+                                call_key=str(attempt["call_key"]),
+                                now=now,
+                            )
+                        reason_code = "uncertain_paid_attempt"
+                    await self._pause_step_and_run(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=active_step_id,
+                        expected_step_status=active_status,
+                        reason_code=reason_code,
+                        now=now,
+                    )
+                    return
                 await self._terminate(
                     run_id=run_id,
                     owner_id=owner_id,

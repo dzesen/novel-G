@@ -61,6 +61,7 @@ class _AttemptLedgerEntry(BaseModel):
     ]
     conservative_paid_attempts: int = Field(ge=0, le=10_000)
     conservative_tokens: int = Field(ge=0, le=1_000_000_000)
+    accounting_revision: Literal[1] | None = None
     usage: _AttemptLedgerUsage | None = None
     release_reason: str | None = Field(default=None, min_length=1, max_length=160)
     uncertain_reason: str | None = Field(default=None, min_length=1, max_length=160)
@@ -330,6 +331,13 @@ def project_agent_runtime_attempt_ledger_entry(
 ) -> dict[str, Any]:
     """Project one terminal call attempt into its bounded audit record."""
     try:
+        raw_accounting_revision = attempt.get("accounting_revision")
+        if raw_accounting_revision is not None and (
+            isinstance(raw_accounting_revision, bool)
+            or not isinstance(raw_accounting_revision, int)
+            or raw_accounting_revision != 1
+        ):
+            raise ValueError("attempt accounting revision is unknown")
         candidate = {
             "schema_version": "agent_runtime_attempt_ledger.v1",
             "call_key": str(attempt.get("call_key") or ""),
@@ -341,12 +349,18 @@ def project_agent_runtime_attempt_ledger_entry(
             "conservative_tokens": int(
                 attempt.get("conservative_tokens") or 0
             ),
+            "accounting_revision": raw_accounting_revision,
             "usage": deepcopy(attempt.get("usage")),
             "release_reason": attempt.get("release_reason"),
             "uncertain_reason": attempt.get("uncertain_reason"),
             "resolution_action": attempt.get("resolution_action"),
         }
-        return _AttemptLedgerEntry.model_validate(candidate).model_dump(mode="json")
+        projected = _AttemptLedgerEntry.model_validate(candidate).model_dump(
+            mode="json"
+        )
+        if projected["accounting_revision"] is None:
+            del projected["accounting_revision"]
+        return projected
     except (TypeError, ValueError, ValidationError) as exc:
         raise ValueError("Agent attempt cannot enter the terminal ledger") from exc
 
@@ -1167,6 +1181,7 @@ class AgentRuntimeRepository:
             "state": "reserved",
             "conservative_paid_attempts": paid_bound,
             "conservative_tokens": token_bound,
+            "accounting_revision": 1,
             "reserved_at": now,
             "dispatched_at": None,
             "settled_at": None,
@@ -1321,6 +1336,7 @@ class AgentRuntimeRepository:
                 },
                 "$set": {
                     "attempts.$[attempt].state": "settled",
+                    "attempts.$[attempt].accounting_revision": 1,
                     "attempts.$[attempt].usage": charged_usage,
                     "attempts.$[attempt].result_checkpoint": checkpoint,
                     "attempts.$[attempt].settled_at": now,
@@ -1626,6 +1642,7 @@ class AgentRuntimeRepository:
                 },
                 "$set": {
                     "attempts.$[attempt].state": target_state,
+                    "attempts.$[attempt].accounting_revision": 1,
                     "attempts.$[attempt].usage": charged_usage,
                     "attempts.$[attempt].resolved_at": now,
                     "attempts.$[attempt].resolution_action": action,
