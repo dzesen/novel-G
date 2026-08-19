@@ -21,6 +21,10 @@ from backend.services.auth.novel_access_service import (
     get_novel_access_service,
 )
 from backend.services.llm.agent_catalog import AgentCatalog
+from backend.services.llm.agent_capability_registry import (
+    AGENT_WORKFLOW_TARGETS,
+    build_agent_capability_registry,
+)
 from backend.services.llm.agent_capability_contracts import (
     AgentScopeRequest,
     CardImportDirectionReference,
@@ -55,9 +59,9 @@ from backend.services.llm.agent_orchestrator import (
     VolumeRetrospectiveResult,
 )
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
+from backend.services.llm.capability_registry import CapabilityCall
 from backend.services.llm.generation_runtime import (
     PromptPlan,
-    WorkflowStepTarget,
     create_generation_runtime,
 )
 from backend.services.interop.card_import_proposal_service import (
@@ -73,18 +77,6 @@ router = APIRouter(
     dependencies=[Depends(require_authenticated_request)],
 )
 
-CREATIVE_WORKFLOW = "creative_inspiration_by_agent"
-CREATIVE_STEP = "inspiration"
-CREATIVE_DIRECTION_WORKFLOW = "creative_direction_by_agent"
-CREATIVE_DIRECTION_STEP = "direction"
-CONTINUITY_WORKFLOW = "continuity_review_by_agent"
-CONTINUITY_STEP = "review"
-STYLE_CONSISTENCY_WORKFLOW = "style_consistency_by_agent"
-STYLE_CONSISTENCY_STEP = "review"
-ILLUSTRATION_PROMPT_WORKFLOW = "illustration_prompt_by_agent"
-ILLUSTRATION_PROMPT_STEP = "illustration_prompt"
-VOLUME_RETROSPECTIVE_WORKFLOW = "volume_retrospective_by_agent"
-VOLUME_RETROSPECTIVE_STEP = "review"
 logger = logging.getLogger(__name__)
 
 
@@ -678,8 +670,7 @@ async def _record_run_failure(
         logger.exception("Failed to persist Agent run failure for %s", run_id)
 
 
-@router.post("/creative-director")
-async def generate_creative_direction(
+async def _execute_creative_direction_capability(
     request: CreativeDirectorRequest,
     actor: Actor = Depends(require_authenticated_request),
     catalog: AgentCatalog = Depends(get_agent_catalog),
@@ -705,10 +696,7 @@ async def generate_creative_direction(
         runtime = create_generation_runtime(**build_runtime_kwargs(request))
         generated = await AgentOrchestrator(runtime).generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(
-                CREATIVE_DIRECTION_WORKFLOW,
-                CREATIVE_DIRECTION_STEP,
-            ),
+            target=AGENT_WORKFLOW_TARGETS["novel_direction"],
             schema=CreativeDirectionResult,
             prompts=PromptPlan(
                 native_schema_prompt=_creative_direction_prompt(
@@ -775,8 +763,7 @@ async def generate_creative_direction(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/agent-inspiration")
-async def generate_agent_inspiration(
+async def _execute_creative_inspiration_capability(
     request: CreativeInspirationRequest,
     actor: Actor = Depends(require_authenticated_request),
     access: NovelAccessService = Depends(get_novel_access_service),
@@ -806,7 +793,7 @@ async def generate_agent_inspiration(
         orchestrator = AgentOrchestrator(runtime)
         generated = await orchestrator.generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(CREATIVE_WORKFLOW, CREATIVE_STEP),
+            target=AGENT_WORKFLOW_TARGETS["creative_inspiration"],
             schema=CreativeInspirationResult,
             prompts=PromptPlan(
                 native_schema_prompt=_creative_prompt(
@@ -877,8 +864,192 @@ async def generate_agent_inspiration(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _agent_capability_registry(*, access=None, catalog=None, runs=None):
+    return build_agent_capability_registry(
+        access=access,
+        catalog=catalog,
+        runs=runs,
+    )
+
+
+@router.post("/creative-director")
+async def generate_creative_direction(
+    request: CreativeDirectorRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+) -> dict[str, Any]:
+    try:
+        execution = await _agent_capability_registry(
+            catalog=catalog,
+        ).execute(
+            "novel_direction",
+            request,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
+    except HTTPException:
+        raise
+    except (
+        CardImportProposalError,
+        StaleCardImportProposal,
+        NotFoundError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "[creative_director] failed agent_id=%s",
+            request.agent_id,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-inspiration")
+async def generate_agent_inspiration(
+    request: CreativeInspirationRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    try:
+        execution = await _agent_capability_registry(
+            access=access,
+            catalog=catalog,
+            runs=runs,
+        ).execute(
+            "creative_inspiration",
+            request,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
+    except HTTPException:
+        raise
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/agent-continuity-review")
 async def generate_agent_continuity_review(
+    request: ContinuityReviewRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    try:
+        execution = await _agent_capability_registry(
+            access=access,
+            catalog=catalog,
+            runs=runs,
+        ).execute(
+            "continuity_review",
+            request,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
+    except HTTPException:
+        raise
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-style-consistency")
+async def generate_agent_style_consistency(
+    request: StyleConsistencyRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    try:
+        execution = await _agent_capability_registry(
+            access=access,
+            catalog=catalog,
+            runs=runs,
+        ).execute(
+            "style_consistency",
+            request,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
+    except HTTPException:
+        raise
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-illustration-prompt")
+async def generate_agent_illustration_prompt(
+    request: IllustrationPromptRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    try:
+        execution = await _agent_capability_registry(
+            access=access,
+            catalog=catalog,
+            runs=runs,
+        ).execute(
+            "illustration_prompt",
+            request,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
+    except HTTPException:
+        raise
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/agent-volume-retrospective")
+async def generate_agent_volume_retrospective(
+    request: VolumeRetrospectiveRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+    runs: AgentRunStore = Depends(get_agent_run_store),
+) -> dict[str, Any]:
+    try:
+        execution = await _agent_capability_registry(
+            access=access,
+            catalog=catalog,
+            runs=runs,
+        ).execute(
+            "volume_retrospective",
+            request,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
+    except HTTPException:
+        raise
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+async def _execute_continuity_review_capability(
     request: ContinuityReviewRequest,
     actor: Actor = Depends(require_authenticated_request),
     access: NovelAccessService = Depends(get_novel_access_service),
@@ -908,7 +1079,7 @@ async def generate_agent_continuity_review(
         orchestrator = AgentOrchestrator(runtime)
         generated = await orchestrator.generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(CONTINUITY_WORKFLOW, CONTINUITY_STEP),
+            target=AGENT_WORKFLOW_TARGETS["continuity_review"],
             schema=ContinuityReviewResult,
             prompts=PromptPlan(
                 native_schema_prompt=_continuity_prompt(
@@ -978,8 +1149,7 @@ async def generate_agent_continuity_review(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/agent-style-consistency")
-async def generate_agent_style_consistency(
+async def _execute_style_consistency_capability(
     request: StyleConsistencyRequest,
     actor: Actor = Depends(require_authenticated_request),
     access: NovelAccessService = Depends(get_novel_access_service),
@@ -1009,10 +1179,7 @@ async def generate_agent_style_consistency(
         runtime = create_generation_runtime(**build_runtime_kwargs(request))
         generated = await AgentOrchestrator(runtime).generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(
-                STYLE_CONSISTENCY_WORKFLOW,
-                STYLE_CONSISTENCY_STEP,
-            ),
+            target=AGENT_WORKFLOW_TARGETS["style_consistency"],
             schema=StyleConsistencyResult,
             prompts=PromptPlan(
                 native_schema_prompt=_style_consistency_prompt(
@@ -1086,8 +1253,7 @@ async def generate_agent_style_consistency(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/agent-illustration-prompt")
-async def generate_agent_illustration_prompt(
+async def _execute_illustration_prompt_capability(
     request: IllustrationPromptRequest,
     actor: Actor = Depends(require_authenticated_request),
     access: NovelAccessService = Depends(get_novel_access_service),
@@ -1119,10 +1285,7 @@ async def generate_agent_illustration_prompt(
         runtime = create_generation_runtime(**build_runtime_kwargs(request))
         generated = await AgentOrchestrator(runtime).generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(
-                ILLUSTRATION_PROMPT_WORKFLOW,
-                ILLUSTRATION_PROMPT_STEP,
-            ),
+            target=AGENT_WORKFLOW_TARGETS["illustration_prompt"],
             schema=IllustrationPromptResult,
             prompts=PromptPlan(
                 native_schema_prompt=_illustration_prompt(
@@ -1193,8 +1356,7 @@ async def generate_agent_illustration_prompt(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.post("/agent-volume-retrospective")
-async def generate_agent_volume_retrospective(
+async def _execute_volume_retrospective_capability(
     request: VolumeRetrospectiveRequest,
     actor: Actor = Depends(require_authenticated_request),
     access: NovelAccessService = Depends(get_novel_access_service),
@@ -1226,10 +1388,7 @@ async def generate_agent_volume_retrospective(
         runtime = create_generation_runtime(**build_runtime_kwargs(request))
         generated = await AgentOrchestrator(runtime).generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(
-                VOLUME_RETROSPECTIVE_WORKFLOW,
-                VOLUME_RETROSPECTIVE_STEP,
-            ),
+            target=AGENT_WORKFLOW_TARGETS["volume_retrospective"],
             schema=VolumeRetrospectiveResult,
             prompts=PromptPlan(
                 native_schema_prompt=_volume_retrospective_prompt(

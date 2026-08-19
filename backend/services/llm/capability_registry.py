@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import StrEnum
+from inspect import isawaitable
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from pydantic import BaseModel
@@ -36,6 +37,8 @@ class CapabilityCall:
 class CapabilityBudget:
     max_paid_attempts: int
     max_output_tokens: int
+    provider_alias: str | None = None
+    provider_model: str | None = None
 
     def __post_init__(self) -> None:
         if self.max_paid_attempts < 0:
@@ -83,7 +86,10 @@ class CapabilityDefinition:
     handler: CapabilityHandler
     side_effect_policy: SideEffectPolicy
     allowed_tools: tuple[str, ...]
-    budget_estimator: Callable[[BaseModel], CapabilityBudget]
+    budget_estimator: Callable[
+        [BaseModel, Any, CapabilityCall],
+        CapabilityBudget | Awaitable[CapabilityBudget],
+    ]
     revision_policy: RevisionPolicy
     audit_projector: Callable[[BaseModel], Mapping[str, Any]]
     event_schema: type[BaseModel] | None = None
@@ -176,6 +182,19 @@ class CapabilityRegistry:
     def list(self) -> tuple[CapabilityDefinition, ...]:
         return self._definitions
 
+    @staticmethod
+    async def _estimate_budget(
+        definition: CapabilityDefinition,
+        request: BaseModel,
+        context: Any,
+        call: CapabilityCall,
+    ) -> CapabilityBudget:
+        candidate = definition.budget_estimator(request, context, call)
+        budget = await candidate if isawaitable(candidate) else candidate
+        if not isinstance(budget, CapabilityBudget):
+            raise TypeError("budget_estimator must return CapabilityBudget")
+        return budget
+
     async def execute(
         self,
         capability: str,
@@ -185,10 +204,13 @@ class CapabilityRegistry:
     ) -> CapabilityExecution:
         definition = self.get(capability)
         request = definition.input_schema.model_validate(payload)
-        budget = definition.budget_estimator(request)
-        if not isinstance(budget, CapabilityBudget):
-            raise TypeError("budget_estimator must return CapabilityBudget")
         context = await definition.context_provider.provide(request, call)
+        budget = await self._estimate_budget(
+            definition,
+            request,
+            context,
+            call,
+        )
         raw_result = await definition.handler.execute(request, context, call)
         result = definition.output_schema.model_validate(raw_result)
         return CapabilityExecution(
@@ -210,10 +232,13 @@ class CapabilityRegistry:
         if definition.handler.stream is None or definition.event_schema is None:
             raise ValueError(f"capability is not streamable: {capability}")
         request = definition.input_schema.model_validate(payload)
-        budget = definition.budget_estimator(request)
-        if not isinstance(budget, CapabilityBudget):
-            raise TypeError("budget_estimator must return CapabilityBudget")
         context = await definition.context_provider.provide(request, call)
+        budget = await self._estimate_budget(
+            definition,
+            request,
+            context,
+            call,
+        )
         raw_events = await definition.handler.stream(request, context, call)
 
         async def validated_events() -> AsyncIterator[BaseModel]:
@@ -236,15 +261,26 @@ class ToolRegistry:
         capabilities: CapabilityRegistry,
         *,
         allowed: tuple[ToolReference, ...],
+        allowed_side_effects: tuple[SideEffectPolicy, ...] = (
+            SideEffectPolicy.PREVIEW_ONLY,
+        ),
     ) -> None:
         if len(set(allowed)) != len(allowed):
             raise ValueError("authorized tool references must be unique")
+        if len(set(allowed_side_effects)) != len(allowed_side_effects):
+            raise ValueError("authorized side effects must be unique")
         for reference in allowed:
             definition = capabilities.get(reference.name)
             if definition.version != reference.version:
                 raise ValueError(
                     "authorized tool version does not match registry: "
                     f"{reference.name}@{reference.version}"
+                )
+            if definition.side_effect_policy not in allowed_side_effects:
+                raise ValueError(
+                    "tool side effect is not authorized: "
+                    f"{reference.name}@{reference.version} "
+                    f"uses {definition.side_effect_policy.value}"
                 )
         self._capabilities = capabilities
         self._allowed = frozenset(allowed)

@@ -224,6 +224,13 @@ def _chapter_audit(result: ChapterGenerationResult) -> dict[str, Any]:
     }
 
 
+def _contextual_budget(estimator):
+    def estimate(command, _context, _call):
+        return estimator(command)
+
+    return estimate
+
+
 def build_chapter_capability_registry(
     *,
     service_factory: Callable[[], ChapterGenerationApplicationService],
@@ -274,7 +281,9 @@ def build_chapter_capability_registry(
                 ),
                 side_effect_policy=SideEffectPolicy.ACCEPT_REQUIRED,
                 allowed_tools=(),
-                budget_estimator=outline_budget_estimator,
+                budget_estimator=_contextual_budget(
+                    outline_budget_estimator
+                ),
                 revision_policy=RevisionPolicy.RECHECK_BEFORE_ACCEPT,
                 audit_projector=_chapter_audit,
                 event_schema=ChapterGenerationEvent,
@@ -298,7 +307,9 @@ def build_chapter_capability_registry(
                 ),
                 side_effect_policy=SideEffectPolicy.SYSTEM_WRITE,
                 allowed_tools=(),
-                budget_estimator=prose_budget_estimator,
+                budget_estimator=_contextual_budget(
+                    prose_budget_estimator
+                ),
                 revision_policy=RevisionPolicy.SYSTEM_WRITE_ADVANCES,
                 audit_projector=_chapter_audit,
                 event_schema=ChapterGenerationEvent,
@@ -322,7 +333,9 @@ def build_chapter_capability_registry(
                 ),
                 side_effect_policy=SideEffectPolicy.ACCEPT_REQUIRED,
                 allowed_tools=(),
-                budget_estimator=state_budget_estimator,
+                budget_estimator=_contextual_budget(
+                    state_budget_estimator
+                ),
                 revision_policy=RevisionPolicy.RECHECK_BEFORE_ACCEPT,
                 audit_projector=_chapter_audit,
                 event_schema=ChapterGenerationEvent,
@@ -346,7 +359,9 @@ def build_chapter_capability_registry(
                 ),
                 side_effect_policy=SideEffectPolicy.PREVIEW_ONLY,
                 allowed_tools=(),
-                budget_estimator=adherence_budget_estimator,
+                budget_estimator=_contextual_budget(
+                    adherence_budget_estimator
+                ),
                 revision_policy=RevisionPolicy.READ_ONLY,
                 audit_projector=_chapter_audit,
                 event_schema=ChapterGenerationEvent,

@@ -21,6 +21,10 @@ from backend.services.auth.novel_access_service import (
     get_novel_access_service,
 )
 from backend.services.llm.agent_catalog import AgentCatalog
+from backend.services.llm.agent_capability_registry import (
+    AGENT_WORKFLOW_TARGETS,
+    build_agent_capability_registry,
+)
 from backend.services.llm.agent_capability_contracts import (
     RewriteChapterSceneRequest,
     SceneSnapshot,
@@ -36,19 +40,15 @@ from backend.services.llm.context_builder import (
 )
 from backend.services.llm.generation_runtime import (
     PromptPlan,
-    WorkflowStepTarget,
     create_generation_runtime,
 )
+from backend.services.llm.capability_registry import CapabilityCall
 
 router = APIRouter(
     prefix="/api/llm",
     tags=["llm-agents"],
     dependencies=[Depends(require_authenticated_request)],
 )
-
-SCENE_AGENT_WORKFLOW = "rewrite_chapter_scene_by_agent"
-SCENE_AGENT_STEP = "scene_rewrite"
-
 
 def _scene_prompt(
     *,
@@ -105,8 +105,7 @@ async def list_scene_agents(
     }
 
 
-@router.post("/rewrite-chapter-scene")
-async def rewrite_chapter_scene(
+async def _execute_scene_rewrite_capability(
     req: RewriteChapterSceneRequest,
     actor: Actor = Depends(require_authenticated_request),
     access: NovelAccessService = Depends(get_novel_access_service),
@@ -161,7 +160,7 @@ async def rewrite_chapter_scene(
         )
         generated = await orchestrator.generate_structured(
             profile=profile,
-            target=WorkflowStepTarget(SCENE_AGENT_WORKFLOW, SCENE_AGENT_STEP),
+            target=AGENT_WORKFLOW_TARGETS["scene_rewrite"],
             schema=SceneRewriteResult,
             prompts=PromptPlan(
                 native_schema_prompt=native_prompt,
@@ -179,6 +178,40 @@ async def rewrite_chapter_scene(
                 "dropped_item_counts": context.dropped_item_counts,
             },
         }
+    except HTTPException:
+        raise
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError, ContextBudgetError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _agent_capability_registry(*, access, catalog):
+    return build_agent_capability_registry(
+        access=access,
+        catalog=catalog,
+    )
+
+
+@router.post("/rewrite-chapter-scene")
+async def rewrite_chapter_scene(
+    req: RewriteChapterSceneRequest,
+    actor: Actor = Depends(require_authenticated_request),
+    access: NovelAccessService = Depends(get_novel_access_service),
+    catalog: AgentCatalog = Depends(get_agent_catalog),
+):
+    try:
+        execution = await _agent_capability_registry(
+            access=access,
+            catalog=catalog,
+        ).execute(
+            "scene_rewrite",
+            req,
+            call=CapabilityCall(source="http", actor=actor),
+        )
+        return execution.value.model_dump()
     except HTTPException:
         raise
     except NotFoundError as exc:
