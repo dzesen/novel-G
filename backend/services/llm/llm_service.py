@@ -119,6 +119,12 @@ class LLMService:
         self._last_raw_finish_reason = raw_finish_reason
         self._last_finish_reason = normalize_finish_reason(raw_finish_reason)
 
+    def _begin_request(self) -> None:
+        """Clear per-request projections before a reused instance dispatches."""
+        self._last_usage = TokenUsage()
+        self._last_finish_reason = "unreported"
+        self._last_raw_finish_reason = "unreported"
+
     def _make_request(
         self,
         prompt: str,
@@ -140,6 +146,7 @@ class LLMService:
         **kwargs: Any,
     ) -> str:
         """普通文本生成，返回纯文本内容；用量见 last_usage。"""
+        self._begin_request()
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.text_generate(request)
@@ -154,6 +161,7 @@ class LLMService:
         **kwargs: Any,
     ) -> BaseModel:
         """结构化生成，返回解析后的 Pydantic 模型实例；用量见 last_usage。"""
+        self._begin_request()
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.schema_generate(request, schema)
@@ -175,6 +183,7 @@ class LLMService:
         **kwargs: Any,
     ) -> str:
         """请求 Provider 的 JSON Object 模式并返回原始 JSON 文本。"""
+        self._begin_request()
         request = self._make_request(
             prompt,
             system_prompt,
@@ -197,9 +206,8 @@ class LLMService:
         用量只在流末尾到达，故 last_usage 需在生成器耗尽后读取；
         中途 break 或 provider 不报用量时，它保持零值。
         """
+        self._begin_request()
         request = self._make_request(prompt, system_prompt, **kwargs)
-        self._last_finish_reason = "unreported"
-        self._last_raw_finish_reason = "unreported"
         try:
             async with _provider_request_slot(self._provider_name, self._max_concurrency):
                 async for chunk in self._client.stream_text(

@@ -295,7 +295,7 @@ class FrozenStructuredCall:
             getattr(self.runtime, "uncertain_attempt_count", 0) or 0
         )
         try:
-            return await self.runtime.generate_structured(
+            generated = await self.runtime.generate_structured(
                 self.plan,
                 schema,
                 prompts,
@@ -305,7 +305,24 @@ class FrozenStructuredCall:
                 ),
                 **generation_kwargs,
             )
+            uncertain_after = int(
+                getattr(self.runtime, "uncertain_attempt_count", 0) or 0
+            )
+            if uncertain_after > uncertain_before:
+                raise _FrozenStructuredCallFailure(
+                    usage=_runtime_attempt_usage(
+                        self.runtime,
+                        attempt_offset=attempt_offset,
+                        fallback_tokens_per_attempt=(
+                            fallback_tokens_per_attempt
+                        ),
+                    ),
+                    uncertain=True,
+                )
+            return generated
         except Exception as exc:
+            if isinstance(exc, _FrozenStructuredCallFailure):
+                raise
             uncertain_after = int(
                 getattr(self.runtime, "uncertain_attempt_count", 0) or 0
             )
@@ -389,8 +406,12 @@ def _attempt_usage_projection(
         output_tokens += observed_output
         total_tokens += (
             observed_total
-            if observed_total > 0
-            else int(fallback_tokens_per_attempt)
+            if (
+                observed_input > 0
+                and observed_output > 0
+                and observed_total >= observed_input + observed_output
+            )
+            else max(observed_total, int(fallback_tokens_per_attempt))
         )
     return RuntimeCallUsage(
         paid_attempts=len(attempts),
@@ -1749,6 +1770,88 @@ class ProseRemediationToolRegistry:
         except KeyError as exc:
             raise ValueError(f"unknown prose remediation tool: {reference}") from exc
 
+    async def _claim_rewrite_execution(
+        self,
+        *,
+        payload: RewriteProseCandidateInput,
+        context: RuntimeToolContext,
+        idempotency_key: str,
+        request_digest: str,
+        wait_for_dispatched: bool,
+    ) -> tuple[str, Mapping[str, Any], Mapping[str, Any], str] | None:
+        claim_token = str(uuid4())
+        while True:
+            claim_state, document, receipt = (
+                await self._prose_runs.claim_remediation_receipt(
+                    run_id=context.scope.object_id,
+                    owner_id=context.owner_id,
+                    novel_id=context.novel_id,
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                    source_revision=payload.expected_revision,
+                    claim_token=claim_token,
+                )
+            )
+            if claim_state in {"claimed", "completed"}:
+                return claim_state, document, receipt, claim_token
+            if claim_state == "in_progress_dispatched" and not (
+                wait_for_dispatched
+            ):
+                # Only this state proves the inner Provider request may have
+                # crossed its dispatch boundary without a result projection.
+                return None
+            if claim_state not in {
+                "in_progress_reserved",
+                "in_progress_dispatched",
+            }:
+                raise StaleProseRun("正文修复幂等回执进入未知状态")
+            # The enclosing AgentRuntime owns the deadline. A live reserved
+            # owner may still finish; after its claim expires this caller
+            # atomically takes over without issuing a duplicate Provider call.
+            await asyncio.sleep(0.1)
+
+    async def _finish_rewrite_execution(
+        self,
+        *,
+        claim: tuple[str, Mapping[str, Any], Mapping[str, Any], str],
+        payload: RewriteProseCandidateInput,
+        context: RuntimeToolContext,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> RuntimeToolResult:
+        claim_state, document, receipt, claim_token = claim
+        if claim_state == "completed":
+            return _validated_rewrite_receipt_result(
+                document=document,
+                receipt=receipt,
+                context=context,
+                payload=payload,
+            )
+        result = await self._application.rewrite(
+            payload,
+            context=context,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            receipt_claim_token=claim_token,
+        )
+        stored_document, stored_receipt = (
+            await self._prose_runs.complete_remediation_receipt(
+                run_id=context.scope.object_id,
+                owner_id=context.owner_id,
+                novel_id=context.novel_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                claim_token=claim_token,
+                result_projection=result.model_dump(mode="json"),
+            )
+        )
+        return _validated_rewrite_receipt_result(
+            document=stored_document,
+            receipt=stored_receipt,
+            context=context,
+            payload=payload,
+        )
+
     async def execute(
         self,
         reference: RuntimeToolReference,
@@ -1765,68 +1868,20 @@ class ProseRemediationToolRegistry:
                 context=context,
                 payload=normalized,
             )
-            claim_token = str(uuid4())
-            claim_state = ""
-            claim_document: Mapping[str, Any] | None = None
-            claim_receipt: Mapping[str, Any] | None = None
-            while True:
-                claim_state, claim_document, claim_receipt = (
-                    await self._prose_runs.claim_remediation_receipt(
-                        run_id=context.scope.object_id,
-                        owner_id=context.owner_id,
-                        novel_id=context.novel_id,
-                        idempotency_key=idempotency_key,
-                        request_digest=request_digest,
-                        source_revision=normalized.expected_revision,
-                        claim_token=claim_token,
-                    )
-                )
-                if claim_state in {"claimed", "completed"}:
-                    break
-                if claim_state not in {
-                    "in_progress_reserved",
-                    "in_progress_dispatched",
-                }:
-                    raise StaleProseRun(
-                        "正文修复幂等回执进入未知状态"
-                    )
-                # The enclosing AgentRuntime owns the deadline. A normal slow
-                # Provider must not be reclassified as unknown after an
-                # arbitrary local polling window; cancellation/deadline will
-                # instead preserve the dispatched uncertainty checkpoint.
-                await asyncio.sleep(0.1)
-            if claim_state == "completed":
-                assert claim_document is not None
-                assert claim_receipt is not None
-                return _validated_rewrite_receipt_result(
-                    document=claim_document,
-                    receipt=claim_receipt,
-                    context=context,
-                    payload=normalized,
-                )
-            result = await self._application.rewrite(
-                normalized,
+            claim = await self._claim_rewrite_execution(
+                payload=normalized,
                 context=context,
                 idempotency_key=idempotency_key,
                 request_digest=request_digest,
-                receipt_claim_token=claim_token,
+                wait_for_dispatched=True,
             )
-            stored_document, stored_receipt = (
-                await self._prose_runs.complete_remediation_receipt(
-                    run_id=context.scope.object_id,
-                    owner_id=context.owner_id,
-                    novel_id=context.novel_id,
-                    idempotency_key=idempotency_key,
-                    request_digest=request_digest,
-                    claim_token=claim_token,
-                    result_projection=result.model_dump(mode="json"),
-                )
-            )
-            return _validated_rewrite_receipt_result(
-                document=stored_document,
-                receipt=stored_receipt,
-                context=context,
+            assert claim is not None
+            return await self._finish_rewrite_execution(
+                claim=claim,
                 payload=normalized,
+                context=context,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
             )
         if reference == ADHERENCE_TOOL:
             return await self._application.check(
@@ -1857,21 +1912,21 @@ class ProseRemediationToolRegistry:
             context=context,
             payload=normalized,
         )
-        recovered = await self._prose_runs.find_remediation_receipt(
-            run_id=context.scope.object_id,
-            owner_id=context.owner_id,
-            novel_id=context.novel_id,
+        claim = await self._claim_rewrite_execution(
+            payload=normalized,
+            context=context,
             idempotency_key=idempotency_key,
             request_digest=request_digest,
+            wait_for_dispatched=False,
         )
-        if recovered is None:
+        if claim is None:
             return None
-        document, receipt = recovered
-        return _validated_rewrite_receipt_result(
-            document=document,
-            receipt=receipt,
-            context=context,
+        return await self._finish_rewrite_execution(
+            claim=claim,
             payload=normalized,
+            context=context,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
 
 

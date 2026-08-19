@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from typing import Any
 
 from backend.db import collections
@@ -679,8 +680,40 @@ class ProseRunModule:
         partial_acknowledgement: bool,
     ) -> MutationCommand:
         run = await prose_run_repo.get_run(run_id, owner_id)
-        if run.get("remediation_write_fence"):
-            raise ValueError("正文候选正在提交修复检查，请稍后重试")
+        fence = dict(run.get("remediation_write_fence") or {})
+        if fence:
+            expires_at = fence.get("expires_at")
+            if (
+                not str(fence.get("token") or "")
+                or not isinstance(expires_at, datetime)
+                or expires_at > get_utc_now()
+            ):
+                raise ValueError("正文候选正在提交修复检查，请稍后重试")
+            released = (
+                await prose_run_repo.release_expired_remediation_write_fence(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    novel_id=str(run["novel_id"]),
+                    fence_token=str(fence["token"]),
+                    expires_at=expires_at,
+                )
+            )
+            if not released:
+                run = await prose_run_repo.get_run(run_id, owner_id)
+                current_fence = dict(
+                    run.get("remediation_write_fence") or {}
+                )
+                current_expiry = current_fence.get("expires_at")
+                if (
+                    current_fence
+                    and (
+                        not isinstance(current_expiry, datetime)
+                        or current_expiry > get_utc_now()
+                    )
+                ):
+                    raise ValueError(
+                        "正文候选正在提交修复检查，请稍后重试"
+                    )
         if int(run.get("revision") or 0) != int(expected_revision):
             raise ValueError("正文草稿版本已经变化，请刷新后再接受")
         if str(run.get("chapter_id")) != str(chapter_id):

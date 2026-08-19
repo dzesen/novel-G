@@ -825,23 +825,52 @@ class ProseRunRepository(BaseRepository):
         return await self.remediation_receipts.find_one({"_id": receipt_id})
 
     @staticmethod
+    def _remediation_receipt_pointer(
+        document: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        raw_latest = (document.get("remediation") or {}).get(
+            "latest_receipt"
+        )
+        if raw_latest in (None, {}):
+            return None
+        if not isinstance(raw_latest, dict):
+            raise StaleProseRun("正文修复回执指针格式无效")
+        latest = dict(raw_latest)
+        try:
+            source_revision = int(latest.get("source_revision"))
+            result_revision = int(latest.get("result_revision"))
+        except (TypeError, ValueError) as exc:
+            raise StaleProseRun("正文修复回执指针版本无效") from exc
+        if (
+            latest.get("schema_version")
+            != "prose_remediation_receipt_pointer.v1"
+            or not str(latest.get("idempotency_key") or "")
+            or not str(latest.get("request_digest") or "")
+            or not isinstance(latest.get("result_projection"), dict)
+            or source_revision <= 0
+            or result_revision <= 0
+        ):
+            raise StaleProseRun("正文修复回执指针证据不完整")
+        latest["source_revision"] = source_revision
+        latest["result_revision"] = result_revision
+        return latest
+
+    @classmethod
     def _latest_remediation_receipt(
+        cls,
         document: dict[str, Any],
         *,
         idempotency_key: str,
         request_digest: str,
     ) -> dict[str, Any] | None:
-        latest = dict(
-            (document.get("remediation") or {}).get("latest_receipt") or {}
-        )
+        latest = cls._remediation_receipt_pointer(document)
+        if latest is None:
+            return None
         if (
-            latest.get("schema_version")
-            != "prose_remediation_receipt_pointer.v1"
-            or str(latest.get("idempotency_key") or "")
+            str(latest.get("idempotency_key") or "")
             != str(idempotency_key)
             or str(latest.get("request_digest") or "")
             != str(request_digest)
-            or not isinstance(latest.get("result_projection"), dict)
         ):
             return None
         return latest
@@ -894,6 +923,60 @@ class ProseRunRepository(BaseRepository):
             raise StaleProseRun("正文修复回执恢复后丢失")
         return repaired
 
+    async def _drain_latest_remediation_receipt(
+        self,
+        *,
+        document: dict[str, Any],
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+    ) -> dict[str, Any] | None:
+        """Close the current pointer before a later rewrite can replace it."""
+        latest = self._remediation_receipt_pointer(document)
+        if latest is None:
+            return None
+        idempotency_key = str(latest["idempotency_key"])
+        request_digest = str(latest["request_digest"])
+        receipt = await self.remediation_receipts.find_one({
+            "_id": self._remediation_receipt_id(
+                run_id=run_id,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                idempotency_key=idempotency_key,
+            )
+        })
+        if receipt is None:
+            raise StaleProseRun("正文修复回执指针缺少持久回执")
+        self._validate_remediation_receipt_scope(
+            receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            source_revision=int(latest["source_revision"]),
+        )
+        self._validate_remediation_receipt_digest(
+            receipt,
+            request_digest=request_digest,
+        )
+        receipt = await self._repair_remediation_receipt_from_pointer(
+            document=document,
+            receipt=receipt,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        if (
+            str(receipt.get("state") or "") != "completed"
+            or int(receipt.get("result_revision") or 0)
+            != int(latest["result_revision"])
+            or dict(receipt.get("result_projection") or {})
+            != dict(latest["result_projection"])
+        ):
+            raise StaleProseRun("正文修复回执指针尚未闭合")
+        return latest
+
     async def claim_remediation_receipt(
         self,
         *,
@@ -908,6 +991,12 @@ class ProseRunRepository(BaseRepository):
         """Claim one durable rewrite identity before Provider dispatch."""
         now = get_utc_now()
         document = await self._owned_remediation_run(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
+        await self._drain_latest_remediation_receipt(
+            document=document,
             run_id=run_id,
             owner_id=owner_id,
             novel_id=novel_id,
@@ -1252,6 +1341,37 @@ class ProseRunRepository(BaseRepository):
             {"$unset": {"remediation_write_fence": ""}},
         )
 
+    async def release_expired_remediation_write_fence(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        fence_token: str,
+        expires_at: datetime,
+    ) -> bool:
+        """Revoke only the exact expired resource token observed by a writer."""
+        if not fence_token or not isinstance(expires_at, datetime):
+            return False
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "remediation_write_fence.token": str(fence_token),
+                "$and": [
+                    {"remediation_write_fence.expires_at": expires_at},
+                    {
+                        "remediation_write_fence.expires_at": {
+                            "$lte": get_utc_now()
+                        }
+                    },
+                ],
+            },
+            {"$unset": {"remediation_write_fence": ""}},
+        )
+        return result.modified_count == 1
+
     async def apply_remediation_candidate(
         self,
         *,
@@ -1274,13 +1394,14 @@ class ProseRunRepository(BaseRepository):
         write_fence_token: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """CAS one temporary candidate and publish one bounded receipt pointer."""
+        receipt_id = self._remediation_receipt_id(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+        )
         receipt = await self.remediation_receipts.find_one({
-            "_id": self._remediation_receipt_id(
-                run_id=run_id,
-                owner_id=owner_id,
-                novel_id=novel_id,
-                idempotency_key=idempotency_key,
-            )
+            "_id": receipt_id
         })
         if receipt is None:
             raise StaleProseRun("正文修复 receipt 不存在")
@@ -1295,13 +1416,22 @@ class ProseRunRepository(BaseRepository):
             receipt,
             request_digest=request_digest,
         )
+        current_document = await self._owned_remediation_run(
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
+        previous_pointer = await self._drain_latest_remediation_receipt(
+            document=current_document,
+            run_id=run_id,
+            owner_id=owner_id,
+            novel_id=novel_id,
+        )
+        receipt = await self.remediation_receipts.find_one({"_id": receipt_id})
+        if receipt is None:
+            raise StaleProseRun("正文修复 receipt 不存在")
         if str(receipt.get("state") or "") == "completed":
-            existing = await self._owned_remediation_run(
-                run_id=run_id,
-                owner_id=owner_id,
-                novel_id=novel_id,
-            )
-            return existing, receipt
+            return current_document, receipt
         if (
             str(receipt.get("state") or "") != "dispatched"
             or str(receipt.get("claim_token") or "") != str(claim_token)
@@ -1310,24 +1440,53 @@ class ProseRunRepository(BaseRepository):
 
         now = get_utc_now()
         next_revision = int(expected_revision) + 1
-        document = await self.collection.find_one_and_update(
-            {
-                "_id": to_object_id(run_id),
-                "owner_id": to_object_id(owner_id),
-                "novel_id": to_object_id(novel_id),
-                "is_deleted": False,
-                "status": "complete",
-                "revision": int(expected_revision),
-                "assembled_text": str(expected_text),
-                "narrative_revision": int(expected_narrative_revision),
-                "outline_revision": str(expected_outline_revision),
-                "remediation_write_fence.token": str(write_fence_token),
-                "remediation_write_fence.expires_at": {"$gt": now},
+        query: dict[str, Any] = {
+            "_id": to_object_id(run_id),
+            "owner_id": to_object_id(owner_id),
+            "novel_id": to_object_id(novel_id),
+            "is_deleted": False,
+            "status": "complete",
+            "revision": int(expected_revision),
+            "assembled_text": str(expected_text),
+            "narrative_revision": int(expected_narrative_revision),
+            "outline_revision": str(expected_outline_revision),
+            "remediation_write_fence.token": str(write_fence_token),
+            "remediation_write_fence.expires_at": {"$gt": now},
+            "$or": [
+                {"lease": None},
+                {"lease": {"$exists": False}},
+            ],
+        }
+        if previous_pointer is None:
+            query["$and"] = [{
                 "$or": [
-                    {"lease": None},
-                    {"lease": {"$exists": False}},
-                ],
-            },
+                    {"remediation.latest_receipt": {"$exists": False}},
+                    {"remediation.latest_receipt": None},
+                ]
+            }]
+        else:
+            query.update({
+                "remediation.latest_receipt.schema_version": (
+                    "prose_remediation_receipt_pointer.v1"
+                ),
+                "remediation.latest_receipt.idempotency_key": str(
+                    previous_pointer["idempotency_key"]
+                ),
+                "remediation.latest_receipt.request_digest": str(
+                    previous_pointer["request_digest"]
+                ),
+                "remediation.latest_receipt.source_revision": int(
+                    previous_pointer["source_revision"]
+                ),
+                "remediation.latest_receipt.result_revision": int(
+                    previous_pointer["result_revision"]
+                ),
+                "remediation.latest_receipt.result_projection": dict(
+                    previous_pointer["result_projection"]
+                ),
+            })
+        document = await self.collection.find_one_and_update(
+            query,
             {
                 "$set": {
                     "assembled_text": str(assembled_text),

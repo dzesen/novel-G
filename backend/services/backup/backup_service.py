@@ -87,8 +87,8 @@ BACKUP_COLLECTIONS = (
     PLOT_THREADS,
     CHARACTER_STATES,
     GENERATION_JOBS,
-    PROSE_RUNS,
     PROSE_REMEDIATION_RECEIPTS,
+    PROSE_RUNS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,
     PLOT_THREAD_EVENTS,
@@ -104,6 +104,143 @@ BACKUP_COLLECTIONS = (
     ILLUSTRATION_BRIEFS,
     ILLUSTRATION_RUNS,
 )
+
+
+def _remediation_receipt_pointer(document: Dict[str, Any]) -> Dict[str, Any] | None:
+    raw_pointer = (document.get("remediation") or {}).get("latest_receipt")
+    if raw_pointer in (None, {}):
+        return None
+    if not isinstance(raw_pointer, dict):
+        raise ValueError("Backup found an invalid prose remediation receipt pointer")
+    pointer = dict(raw_pointer)
+    try:
+        source_revision = int(pointer.get("source_revision"))
+        result_revision = int(pointer.get("result_revision"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Backup found an invalid prose remediation receipt revision"
+        ) from exc
+    if (
+        pointer.get("schema_version")
+        != "prose_remediation_receipt_pointer.v1"
+        or not str(pointer.get("idempotency_key") or "")
+        or not str(pointer.get("request_digest") or "")
+        or not isinstance(pointer.get("result_projection"), dict)
+        or source_revision <= 0
+        or result_revision <= 0
+    ):
+        raise ValueError("Backup found an incomplete prose remediation receipt pointer")
+    return pointer
+
+
+def _receipt_matches_pointer(
+    receipt: Dict[str, Any],
+    *,
+    run: Dict[str, Any],
+    pointer: Dict[str, Any],
+) -> bool:
+    return bool(
+        receipt.get("is_deleted") is not True
+        and receipt.get("owner_id") == run.get("owner_id")
+        and receipt.get("novel_id") == run.get("novel_id")
+        and receipt.get("prose_run_id") == run.get("_id")
+        and str(receipt.get("idempotency_key") or "")
+        == str(pointer.get("idempotency_key") or "")
+        and str(receipt.get("request_digest") or "")
+        == str(pointer.get("request_digest") or "")
+        and int(receipt.get("source_revision") or 0)
+        == int(pointer.get("source_revision") or 0)
+        and str(receipt.get("state") or "")
+        in {"reserved", "dispatched", "completed"}
+    )
+
+
+def _validate_remediation_receipt_snapshot(
+    captured: Dict[str, list[dict]],
+) -> None:
+    receipts = captured.get(PROSE_REMEDIATION_RECEIPTS, [])
+    for run in captured.get(PROSE_RUNS, []):
+        pointer = _remediation_receipt_pointer(run)
+        if pointer is None:
+            continue
+        receipt = next(
+            (
+                item
+                for item in receipts
+                if _receipt_matches_pointer(item, run=run, pointer=pointer)
+            ),
+            None,
+        )
+        if receipt is None:
+            raise ValueError(
+                "Backup is missing the receipt referenced by a prose run"
+            )
+        if str(receipt.get("state") or "") == "completed" and (
+            int(receipt.get("result_revision") or 0)
+            != int(pointer.get("result_revision") or 0)
+            or dict(receipt.get("result_projection") or {})
+            != dict(pointer["result_projection"])
+        ):
+            raise ValueError(
+                "Backup contains a prose remediation receipt projection conflict"
+            )
+
+
+async def _supplement_remediation_receipt_snapshot(
+    db: Any,
+    captured: Dict[str, list[dict]],
+) -> None:
+    """Ensure every captured prose pointer has its recoverable receipt."""
+    receipts = captured.setdefault(PROSE_REMEDIATION_RECEIPTS, [])
+    receipts_by_id = {
+        receipt.get("_id"): receipt
+        for receipt in receipts
+        if receipt.get("_id") is not None
+    }
+    for run in captured.get(PROSE_RUNS, []):
+        pointer = _remediation_receipt_pointer(run)
+        if pointer is None:
+            continue
+        receipt = next(
+            (
+                item
+                for item in receipts
+                if _receipt_matches_pointer(item, run=run, pointer=pointer)
+            ),
+            None,
+        )
+        if receipt is None:
+            receipt = await db[PROSE_REMEDIATION_RECEIPTS].find_one({
+                "owner_id": run.get("owner_id"),
+                "novel_id": run.get("novel_id"),
+                "prose_run_id": run.get("_id"),
+                "idempotency_key": str(pointer["idempotency_key"]),
+                "request_digest": str(pointer["request_digest"]),
+                "is_deleted": False,
+            })
+        if receipt is None or not _receipt_matches_pointer(
+            receipt,
+            run=run,
+            pointer=pointer,
+        ):
+            raise ValueError(
+                "Backup could not capture the receipt referenced by a prose run"
+            )
+        if str(receipt.get("state") or "") == "completed" and (
+            int(receipt.get("result_revision") or 0)
+            != int(pointer.get("result_revision") or 0)
+            or dict(receipt.get("result_projection") or {})
+            != dict(pointer["result_projection"])
+        ):
+            raise ValueError(
+                "Backup found a prose remediation receipt projection conflict"
+            )
+        receipt_id = receipt.get("_id")
+        if receipt_id not in receipts_by_id:
+            copied = dict(receipt)
+            receipts.append(copied)
+            receipts_by_id[receipt_id] = copied
+    _validate_remediation_receipt_snapshot(captured)
 
 
 def _utc_now() -> datetime:
@@ -139,6 +276,7 @@ async def create_backup_snapshot() -> Dict[str, Any]:
     collections: Dict[str, list[dict]] = {}
     for collection_name in BACKUP_COLLECTIONS:
         collections[collection_name] = await db[collection_name].find({}).to_list(length=None)
+    await _supplement_remediation_receipt_snapshot(db, collections)
     return {
         "format": BACKUP_FORMAT,
         "version": BACKUP_VERSION,
@@ -177,6 +315,7 @@ def validate_backup_payload(payload: Any) -> Dict[str, Any]:
     for name, documents in collections.items():
         if not isinstance(documents, list) or any(not isinstance(item, dict) for item in documents):
             raise ValueError(f"Backup collection '{name}' must contain a document list")
+    _validate_remediation_receipt_snapshot(collections)
     return payload
 
 
@@ -328,6 +467,7 @@ async def build_novel_backup(novel_id: str) -> Dict[str, Any]:
         exported[collection_name] = await db[collection_name].find(
             {"novel_id": novel["_id"]}
         ).to_list(length=None)
+    await _supplement_remediation_receipt_snapshot(db, exported)
     return {
         "format": BACKUP_FORMAT,
         "version": BACKUP_VERSION,

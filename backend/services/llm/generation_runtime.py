@@ -292,6 +292,59 @@ def _add_usage(items: tuple[AttemptUsage, ...]) -> TokenUsage:
     )
 
 
+def _usage_snapshot(value: Any) -> TokenUsage:
+    """Copy one adapter usage projection without retaining mutable state."""
+    if isinstance(value, TokenUsage):
+        return value.model_copy()
+    if hasattr(value, "model_dump"):
+        return TokenUsage.model_validate(value.model_dump())
+    if isinstance(value, Mapping):
+        return TokenUsage.model_validate(dict(value))
+    return TokenUsage()
+
+
+def _usage_delta(before: TokenUsage, after: TokenUsage) -> TokenUsage:
+    """Return only usage produced after the current paid-attempt boundary."""
+    return TokenUsage(
+        input_tokens=max(0, after.input_tokens - before.input_tokens),
+        output_tokens=max(0, after.output_tokens - before.output_tokens),
+        total_tokens=max(0, after.total_tokens - before.total_tokens),
+    )
+
+
+def _usage_has_any_value(usage: TokenUsage) -> bool:
+    return bool(
+        usage.total_tokens or usage.input_tokens or usage.output_tokens
+    )
+
+
+def _usage_is_complete(usage: TokenUsage) -> bool:
+    """A zero component is indistinguishable from an omitted Provider field."""
+    return bool(
+        usage.input_tokens > 0
+        and usage.output_tokens > 0
+        and usage.total_tokens >= usage.input_tokens + usage.output_tokens
+    )
+
+
+def _conservative_attempt_usage(
+    usage: TokenUsage,
+    conservative_tokens: int | None,
+) -> TokenUsage:
+    """Never let a partial Provider receipt understate a frozen attempt."""
+    if _usage_is_complete(usage) or conservative_tokens is None:
+        return usage
+    return TokenUsage(
+        input_tokens=max(0, usage.input_tokens),
+        output_tokens=max(0, usage.output_tokens),
+        total_tokens=max(
+            max(0, usage.total_tokens),
+            max(0, usage.input_tokens) + max(0, usage.output_tokens),
+            int(conservative_tokens),
+        ),
+    )
+
+
 class GenerationRuntime:
     """结构化生成的唯一执行入口；调用前计划、每次付费前复核。"""
 
@@ -477,6 +530,7 @@ class GenerationRuntime:
             phase,
             conservative_tokens,
         )
+        total_before = _usage_snapshot(getattr(adapter, "total_usage", None))
         try:
             value = await call()
         except asyncio.CancelledError:
@@ -486,14 +540,38 @@ class GenerationRuntime:
             if bool(getattr(exc, "provider_request_not_dispatched", False)):
                 await self._release_pre_dispatch(attempt_id, str(exc))
                 raise
-            usage = getattr(adapter, "last_usage", None) or TokenUsage()
-            if usage.total_tokens or usage.input_tokens or usage.output_tokens:
-                await self._attempt_scope.account(attempt_id, usage)
+            total_after = _usage_snapshot(
+                getattr(adapter, "total_usage", None)
+            )
+            usage = _usage_delta(total_before, total_after)
+            response_is_known = isinstance(
+                exc,
+                (LLMSchemaUnsupportedError, LLMStructuredValidationError),
+            )
+            if response_is_known and not _usage_has_any_value(usage):
+                # These exceptions are raised only after a concrete Provider
+                # response. Generic timeout/network errors deliberately may
+                # not reuse a previous call's last_usage projection.
+                usage = _usage_snapshot(getattr(adapter, "last_usage", None))
+            if _usage_has_any_value(usage) or response_is_known:
+                await self._attempt_scope.account(
+                    attempt_id,
+                    _conservative_attempt_usage(
+                        usage,
+                        conservative_tokens,
+                    ),
+                )
             else:
                 await self._attempt_scope.mark_uncertain(attempt_id, "request failed without usage")
             raise
-        usage = getattr(adapter, "last_usage", None) or TokenUsage()
-        await self._attempt_scope.account(attempt_id, usage)
+        total_after = _usage_snapshot(getattr(adapter, "total_usage", None))
+        usage = _usage_delta(total_before, total_after)
+        if not _usage_has_any_value(usage):
+            usage = _usage_snapshot(getattr(adapter, "last_usage", None))
+        await self._attempt_scope.account(
+            attempt_id,
+            _conservative_attempt_usage(usage, conservative_tokens),
+        )
         return value
 
     async def generate_structured(
