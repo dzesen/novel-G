@@ -695,6 +695,9 @@ class AgentRuntime:
             "predecessor_run_id": str(source["_id"]),
             "predecessor_input_digest": source_input_digest,
             "predecessor_lease_epoch": int(source.get("lease_epoch") or 0),
+            "predecessor_pause_event_key": str(
+                source.get("termination_event_key") or ""
+            ),
             "cumulative_actual_usage": cumulative_actual,
             "new_authorized_upper_bound": {
                 field: int(new_limits.get(field) or 0)

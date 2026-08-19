@@ -621,8 +621,9 @@ class AgentRuntimeRepository:
                 pause_event_key = str(
                     predecessor_snapshot.get("termination_event_key") or ""
                 )
-                expected_pause_event_key = (
-                    f"run-paused-{predecessor_reason}-{predecessor_epoch}"
+                expected_pause_event_key = str(
+                    lineage.get("predecessor_pause_event_key")
+                    or f"run-paused-{predecessor_reason}-{predecessor_epoch}"
                 )
                 pause_step_id = (
                     str(predecessor_termination["step_id"])
@@ -1270,14 +1271,6 @@ class AgentRuntimeRepository:
                 "lease.worker_id": str(worker_id),
                 "lease.expires_at": {"$gt": now},
                 "lease_epoch": int(lease_epoch),
-                "attempts": {"$elemMatch": {
-                    "step_id": str(step_id),
-                    "state": {"$in": [
-                        "settled",
-                        "resolved_retry",
-                        "resolved_skip",
-                    ]},
-                }},
                 "is_deleted": False,
             },
             {
