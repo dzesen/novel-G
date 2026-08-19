@@ -25,10 +25,65 @@ EVENT_NAMESPACE = UUID("814b1e75-93a6-49da-903c-03de77a202c6")
 CALL_NAMESPACE = UUID("73998e71-c0cf-4a99-91a8-8a01ad636aa9")
 MAX_EVENT_PAYLOAD_BYTES = 16_384
 SUCCESSOR_HANDOFF_TTL_SECONDS = 30
+# Per step: 20 planner repairs + the accepted plan, 20 tool retries + the
+# accepted result, and 20 pre-dispatch releases for each adapter kind.
+MAX_ATTEMPT_LEDGER_ENTRIES_PER_STEP = 82
 
 
 class _EventPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _AttemptLedgerUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    paid_attempts: int = Field(ge=0, le=10_000)
+    input_tokens: int = Field(ge=0, le=1_000_000_000)
+    output_tokens: int = Field(ge=0, le=1_000_000_000)
+    total_tokens: int = Field(ge=0, le=1_000_000_000)
+
+
+class _AttemptLedgerEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["agent_runtime_attempt_ledger.v1"] = (
+        "agent_runtime_attempt_ledger.v1"
+    )
+    call_key: str = Field(min_length=1, max_length=240)
+    kind: Literal["planner", "tool"]
+    state: Literal[
+        "settled",
+        "released_pre_dispatch",
+        "resolved_retry",
+        "resolved_skip",
+    ]
+    conservative_paid_attempts: int = Field(ge=0, le=10_000)
+    conservative_tokens: int = Field(ge=0, le=1_000_000_000)
+    usage: _AttemptLedgerUsage | None = None
+    release_reason: str | None = Field(default=None, min_length=1, max_length=160)
+    uncertain_reason: str | None = Field(default=None, min_length=1, max_length=160)
+    resolution_action: Literal["retry", "skip"] | None = None
+
+    @model_validator(mode="after")
+    def validate_state_projection(self) -> "_AttemptLedgerEntry":
+        if self.state == "settled":
+            if self.usage is None or any((
+                self.release_reason,
+                self.resolution_action,
+            )):
+                raise ValueError("settled attempt ledger projection is invalid")
+        elif self.state == "released_pre_dispatch":
+            if self.release_reason is None or self.usage is not None:
+                raise ValueError("released attempt ledger projection is invalid")
+        else:
+            expected_action = "retry" if self.state == "resolved_retry" else "skip"
+            if (
+                self.usage is None
+                or self.uncertain_reason is None
+                or self.resolution_action != expected_action
+            ):
+                raise ValueError("resolved attempt ledger projection is invalid")
+        return self
 
 
 class _ReadyEventPayload(_EventPayload):
@@ -260,6 +315,32 @@ def project_agent_runtime_event_payload(
         raise ValueError(
             f"Agent event payload is invalid for '{event_type}'"
         ) from exc
+
+
+def project_agent_runtime_attempt_ledger_entry(
+    attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project one terminal call attempt into its bounded audit record."""
+    try:
+        candidate = {
+            "schema_version": "agent_runtime_attempt_ledger.v1",
+            "call_key": str(attempt.get("call_key") or ""),
+            "kind": attempt.get("kind"),
+            "state": attempt.get("state"),
+            "conservative_paid_attempts": int(
+                attempt.get("conservative_paid_attempts") or 0
+            ),
+            "conservative_tokens": int(
+                attempt.get("conservative_tokens") or 0
+            ),
+            "usage": deepcopy(attempt.get("usage")),
+            "release_reason": attempt.get("release_reason"),
+            "uncertain_reason": attempt.get("uncertain_reason"),
+            "resolution_action": attempt.get("resolution_action"),
+        }
+        return _AttemptLedgerEntry.model_validate(candidate).model_dump(mode="json")
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ValueError("Agent attempt cannot enter the terminal ledger") from exc
 
 
 def _event_matches(
@@ -1252,7 +1333,7 @@ class AgentRuntimeRepository:
             raise AgentRuntimeStateConflict("settled Agent call was not found")
         return settled
 
-    async def compact_step_call_checkpoints(
+    async def archive_step_call_attempts(
         self,
         *,
         run_id: str,
@@ -1262,35 +1343,119 @@ class AgentRuntimeRepository:
         step_id: str,
         now: datetime,
     ) -> None:
-        """Drop recoverable call payloads after the step becomes authoritative."""
-        result = await self.runs.update_one(
-            {
-                "_id": _required_object_id(run_id, "run_id"),
-                "owner_id": _required_object_id(owner_id, "owner_id"),
-                "status": {"$in": ["running", "paused"]},
-                "lease.worker_id": str(worker_id),
-                "lease.expires_at": {"$gt": now},
-                "lease_epoch": int(lease_epoch),
-                "is_deleted": False,
-            },
-            {
-                "$set": {
-                    "attempts.$[attempt].result_checkpoint": None,
-                    "updated_at": now,
-                }
-            },
-            array_filters=[{
-                "attempt.step_id": str(step_id),
-                "attempt.state": {"$in": [
-                    "settled",
-                    "resolved_retry",
-                    "resolved_skip",
-                ]},
-            }],
-        )
-        if result.matched_count != 1:
+        """Move one terminal step's attempts into its bounded audit ledger.
+
+        The step write precedes the run-array pull deliberately.  A crash between
+        them leaves duplicate evidence that a later call merges by call_key before
+        retrying the pull; audit readers apply the same merge rule.
+        """
+        run_object_id = _required_object_id(run_id, "run_id")
+        owner_object_id = _required_object_id(owner_id, "owner_id")
+        run_filter = {
+            "_id": run_object_id,
+            "owner_id": owner_object_id,
+            "status": {"$in": ["running", "paused"]},
+            "lease.worker_id": str(worker_id),
+            "lease.expires_at": {"$gt": now},
+            "lease_epoch": int(lease_epoch),
+            "is_deleted": False,
+        }
+        run = await self.runs.find_one(run_filter)
+        if run is None:
             raise AgentRuntimeStateConflict(
-                "completed Agent step checkpoints could not be compacted"
+                "terminal Agent step attempts could not be archived"
+            )
+        step = await self.steps.find_one({
+            "_id": str(step_id),
+            "run_id": run_object_id,
+            "owner_id": owner_object_id,
+            "status": {"$in": ["completed", "failed"]},
+            "is_deleted": False,
+        })
+        if step is None:
+            raise AgentRuntimeStateConflict(
+                "only a terminal Agent step can archive call attempts"
+            )
+
+        raw_ledger = step.get("attempt_ledger")
+        if raw_ledger is None:
+            raw_ledger = []
+        if not isinstance(raw_ledger, list):
+            raise AgentRuntimeStateConflict("Agent step attempt ledger is invalid")
+        merged: list[dict[str, Any]] = []
+        positions: dict[str, int] = {}
+        try:
+            for raw_entry in raw_ledger:
+                if not isinstance(raw_entry, Mapping):
+                    raise ValueError("attempt ledger entry must be an object")
+                projected = project_agent_runtime_attempt_ledger_entry(raw_entry)
+                if dict(raw_entry) != projected:
+                    raise ValueError("attempt ledger entry is not canonical")
+                call_key = str(projected["call_key"])
+                if call_key in positions:
+                    raise ValueError("attempt ledger call_key is duplicated")
+                positions[call_key] = len(merged)
+                merged.append(projected)
+
+            for raw_attempt in run.get("attempts") or []:
+                if (
+                    not isinstance(raw_attempt, Mapping)
+                    or raw_attempt.get("step_id") != str(step_id)
+                ):
+                    continue
+                projected = project_agent_runtime_attempt_ledger_entry(raw_attempt)
+                call_key = str(projected["call_key"])
+                previous_position = positions.get(call_key)
+                if previous_position is None:
+                    positions[call_key] = len(merged)
+                    merged.append(projected)
+                elif merged[previous_position] != projected:
+                    raise ValueError("attempt ledger overlaps with different evidence")
+        except (TypeError, ValueError) as exc:
+            raise AgentRuntimeStateConflict(
+                "Agent step attempt ledger evidence is invalid"
+            ) from exc
+        if len(merged) > MAX_ATTEMPT_LEDGER_ENTRIES_PER_STEP:
+            raise AgentRuntimeStateConflict(
+                "Agent step attempt ledger exceeds the Runtime v1 bound"
+            )
+
+        step_filter: dict[str, Any] = {
+            "_id": str(step_id),
+            "run_id": run_object_id,
+            "owner_id": owner_object_id,
+            "status": {"$in": ["completed", "failed"]},
+            "is_deleted": False,
+        }
+        if "attempt_ledger" in step:
+            step_filter["attempt_ledger"] = raw_ledger
+        else:
+            step_filter["attempt_ledger"] = {"$exists": False}
+        ledger_result = await self.steps.update_one(
+            step_filter,
+            {"$set": {"attempt_ledger": merged, "updated_at": now}},
+        )
+        if ledger_result.matched_count != 1:
+            current_step = await self.get_step_owned(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+            )
+            if current_step.get("attempt_ledger") != merged:
+                raise AgentRuntimeStateConflict(
+                    "Agent step attempt ledger changed concurrently"
+                )
+
+        pull_result = await self.runs.update_one(
+            run_filter,
+            {
+                "$pull": {"attempts": {"step_id": str(step_id)}},
+                "$set": {"updated_at": now},
+            },
+        )
+        if pull_result.matched_count != 1:
+            raise AgentRuntimeStateConflict(
+                "terminal Agent step attempt archive lost its run lease"
             )
 
     async def release_call_pre_dispatch(
@@ -1929,6 +2094,7 @@ class AgentRuntimeRepository:
             "tool_invocation": None,
             "observation": None,
             "usage_delta": {},
+            "attempt_ledger": [],
             "revision_before": run.get("expected_narrative_revision"),
             "revision_after": run.get("expected_narrative_revision"),
             "lease": deepcopy(run.get("lease")),

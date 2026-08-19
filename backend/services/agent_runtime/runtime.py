@@ -22,6 +22,7 @@ from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeRepository,
     AgentRuntimeStateConflict,
     agent_runtime_repository,
+    project_agent_runtime_attempt_ledger_entry,
     project_agent_runtime_event_payload,
 )
 from backend.services.agent_runtime.contracts import (
@@ -306,6 +307,84 @@ def _is_replan_feedback(value: Any) -> bool:
         return dict(value) == _replan_feedback(reason_code)
     except ValueError:
         return False
+
+
+def _persisted_attempts(
+    run: Mapping[str, Any],
+    steps: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], bool]:
+    """Merge archived ledgers with active attempts across the crash overlap."""
+    attempts_by_step: dict[str, list[dict[str, Any]]] = {}
+    positions: dict[tuple[str, str], int] = {}
+    valid = True
+    known_step_ids = {str(step.get("step_id") or "") for step in steps}
+
+    for step in steps:
+        step_id = str(step.get("step_id") or "")
+        raw_ledger = step.get("attempt_ledger")
+        if raw_ledger is None:
+            raw_ledger = []
+        if not step_id or not isinstance(raw_ledger, list):
+            valid = False
+            continue
+        projected_step = attempts_by_step.setdefault(step_id, [])
+        for raw_entry in raw_ledger:
+            if not isinstance(raw_entry, Mapping):
+                valid = False
+                continue
+            try:
+                entry = project_agent_runtime_attempt_ledger_entry(raw_entry)
+            except ValueError:
+                valid = False
+                continue
+            if dict(raw_entry) != entry:
+                valid = False
+            call_key = str(entry["call_key"])
+            identity = (step_id, call_key)
+            if identity in positions:
+                valid = False
+                continue
+            positions[identity] = len(projected_step)
+            projected_step.append({"step_id": step_id, **entry})
+
+    for raw_attempt in run.get("attempts") or []:
+        if not isinstance(raw_attempt, Mapping):
+            valid = False
+            continue
+        attempt = dict(raw_attempt)
+        step_id = str(attempt.get("step_id") or "")
+        call_key = str(attempt.get("call_key") or "")
+        if not step_id or not call_key or step_id not in known_step_ids:
+            valid = False
+            continue
+        projected_step = attempts_by_step.setdefault(step_id, [])
+        identity = (step_id, call_key)
+        previous_position = positions.get(identity)
+        if previous_position is None:
+            positions[identity] = len(projected_step)
+            projected_step.append(attempt)
+            continue
+        try:
+            projected = project_agent_runtime_attempt_ledger_entry(attempt)
+            archived_projection = project_agent_runtime_attempt_ledger_entry(
+                projected_step[previous_position]
+            )
+        except ValueError:
+            valid = False
+            continue
+        if archived_projection != projected:
+            valid = False
+            continue
+        # Prefer the live copy until phase two pulls it: it retains the result
+        # checkpoint needed to repair an event lost in the same crash.
+        projected_step[previous_position] = attempt
+
+    ordered_attempts = [
+        attempt
+        for step in steps
+        for attempt in attempts_by_step.get(str(step.get("step_id") or ""), [])
+    ]
+    return attempts_by_step, ordered_attempts, valid
 
 
 def _aware(value: datetime) -> datetime:
@@ -996,6 +1075,13 @@ class AgentRuntime:
             return await self._run_view(run_id=run_id, owner_id=owner_id)
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
+            await self._archive_terminal_step_attempts(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+            )
             await self._repair_checkpoint_projection(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1058,13 +1144,11 @@ class AgentRuntime:
                 now=now,
             )
 
-        attempts_by_step: dict[str, list[dict[str, Any]]] = {}
-        for raw_attempt in run.get("attempts") or []:
-            if isinstance(raw_attempt, Mapping) and raw_attempt.get("step_id"):
-                attempts_by_step.setdefault(
-                    str(raw_attempt["step_id"]),
-                    [],
-                ).append(dict(raw_attempt))
+        attempts_by_step, _, attempts_valid = _persisted_attempts(run, steps)
+        if not attempts_valid:
+            raise AgentRuntimeStateConflict(
+                "Agent attempt ledger cannot repair its audit projection"
+            )
 
         for step in steps:
             step_id = str(step["step_id"])
@@ -1353,18 +1437,11 @@ class AgentRuntime:
             add_violation("event_sequence_mismatch")
 
         step_by_id = {str(item["step_id"]): item for item in steps}
-        attempts_by_step: dict[str, list[dict[str, Any]]] = {}
-        for raw_attempt in run.get("attempts") or []:
-            if not isinstance(raw_attempt, Mapping):
-                add_violation("attempt_event_identity_mismatch")
-                continue
-            attempt = dict(raw_attempt)
-            attempt_step_id = str(attempt.get("step_id") or "")
-            call_key = str(attempt.get("call_key") or "")
-            if not attempt_step_id or not call_key:
-                add_violation("attempt_event_identity_mismatch")
-                continue
-            attempts_by_step.setdefault(attempt_step_id, []).append(attempt)
+        attempts_by_step, persisted_attempts, attempts_valid = (
+            _persisted_attempts(run, steps)
+        )
+        if not attempts_valid:
+            add_violation("attempt_event_identity_mismatch")
         event_positions_by_step: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
         derived_status = "ready"
         run_event_started = False
@@ -1555,6 +1632,51 @@ class AgentRuntime:
                 )
                 if effective_status != "planning" and not failed_before_decision:
                     add_violation("planner_decision_mismatch")
+
+            for attempt in attempts_by_step.get(step_id, []):
+                kind = str(attempt.get("kind") or "")
+                expected_descriptor: Mapping[str, Any] | None = None
+                if kind == "planner" and isinstance(
+                    authorization.get("planner"), Mapping
+                ):
+                    expected_descriptor = authorization["planner"]
+                elif (
+                    kind == "tool"
+                    and decision is not None
+                    and decision.kind == "call_tool"
+                    and decision.tool is not None
+                ):
+                    try:
+                        expected_descriptor = _frozen_tool_snapshot(
+                            authorization,
+                            decision.tool,
+                        )
+                    except ValueError:
+                        expected_descriptor = None
+                if expected_descriptor is None or (
+                    int(attempt.get("conservative_paid_attempts") or 0)
+                    != int(expected_descriptor.get("max_paid_attempts_per_call") or 0)
+                    or int(attempt.get("conservative_tokens") or 0)
+                    != int(expected_descriptor.get("max_tokens_per_call") or 0)
+                ):
+                    add_violation("attempt_budget_mismatch")
+                state = str(attempt.get("state") or "")
+                raw_usage = attempt.get("usage")
+                if state in {"settled", "resolved_retry", "resolved_skip"}:
+                    try:
+                        charged = RuntimeCallUsage.model_validate(raw_usage)
+                    except Exception:
+                        add_violation("attempt_budget_mismatch")
+                    else:
+                        if (
+                            charged.paid_attempts
+                            > int(attempt.get("conservative_paid_attempts") or 0)
+                            or charged.total_tokens
+                            > int(attempt.get("conservative_tokens") or 0)
+                        ):
+                            add_violation("attempt_budget_mismatch")
+                elif raw_usage is not None:
+                    add_violation("attempt_budget_mismatch")
 
             planned_positions = positions_by_type.get("step_planned", [])
             policy_positions = positions_by_type.get("policy_decided", [])
@@ -1970,7 +2092,7 @@ class AgentRuntime:
                 replayed_observations.append(planner_view)
 
         attempts = [
-            item for item in run.get("attempts") or []
+            item for item in persisted_attempts
             if item.get("state") != "released_pre_dispatch"
         ]
         accounted = [
@@ -2005,6 +2127,14 @@ class AgentRuntime:
         persisted_usage = AgentRuntimeUsage.model_validate(run.get("usage") or {})
         if derived_usage != persisted_usage:
             add_violation("usage_mismatch")
+        limits = dict(authorization.get("limits") or {})
+        if any((
+            derived_usage.planner_calls > int(limits.get("max_planner_calls") or 0),
+            derived_usage.tool_calls > int(limits.get("max_tool_calls") or 0),
+            derived_usage.paid_attempts > int(limits.get("max_paid_attempts") or 0),
+            derived_usage.total_tokens > int(limits.get("token_budget") or 0),
+        )):
+            add_violation("usage_limit_exceeded")
         termination = run.get("termination")
         if isinstance(termination, Mapping):
             if termination.get("status") != run.get("status"):
@@ -2045,6 +2175,50 @@ class AgentRuntime:
             source_input_digest=self._source_input_digest(run, steps),
         )
 
+    async def _archive_terminal_step_attempts(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> None:
+        """Lazily migrate legacy and crash-overlap attempts behind one seam."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        attempt_step_ids = {
+            str(item.get("step_id") or "")
+            for item in run.get("attempts") or []
+            if isinstance(item, Mapping)
+        }
+        steps = await self._repository.list_steps_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        active_step_id = str(run.get("active_step_id") or "")
+        for step in steps:
+            step_id = str(step.get("step_id") or "")
+            if (
+                step.get("status") not in {"completed", "failed"}
+                or step_id == active_step_id
+                or (
+                    "attempt_ledger" in step
+                    and step_id not in attempt_step_ids
+                )
+            ):
+                continue
+            await self._repository.archive_step_call_attempts(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                now=now,
+            )
+
     async def _execute_owned_run(
         self,
         *,
@@ -2074,6 +2248,13 @@ class AgentRuntime:
         )
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
+            await self._archive_terminal_step_attempts(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+            )
             run = await self._repair_checkpoint_projection(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -2225,7 +2406,7 @@ class AgentRuntime:
                     )
             else:
                 return run
-            await self._repository.compact_step_call_checkpoints(
+            await self._repository.archive_step_call_attempts(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
@@ -2279,7 +2460,7 @@ class AgentRuntime:
             and (step.get("planner_decision") or {}).get("kind") == "propose_finish"
             and completion.get("satisfied") is True
         ):
-            await self._repository.compact_step_call_checkpoints(
+            await self._repository.archive_step_call_attempts(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
@@ -2328,7 +2509,7 @@ class AgentRuntime:
                 raise AgentRuntimeStateConflict(
                     "failed Agent step is missing its termination reason"
                 )
-            await self._repository.compact_step_call_checkpoints(
+            await self._repository.archive_step_call_attempts(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
@@ -2576,7 +2757,7 @@ class AgentRuntime:
                 )
                 active_status = str(active_step.get("status") or "")
                 if active_status in {"completed", "failed"}:
-                    await self._repository.compact_step_call_checkpoints(
+                    await self._repository.archive_step_call_attempts(
                         run_id=run_id,
                         owner_id=owner_id,
                         worker_id=worker_id,
@@ -4352,7 +4533,7 @@ class AgentRuntime:
             },
             now=now,
         )
-        await self._repository.compact_step_call_checkpoints(
+        await self._repository.archive_step_call_attempts(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
@@ -4498,7 +4679,7 @@ class AgentRuntime:
             fields={},
             now=now,
         )
-        await self._repository.compact_step_call_checkpoints(
+        await self._repository.archive_step_call_attempts(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
@@ -4693,6 +4874,14 @@ class AgentRuntime:
             expected=expected_step_status,
             status="failed",
             fields={"failure_reason": reason_code},
+            now=now,
+        )
+        await self._repository.archive_step_call_attempts(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
             now=now,
         )
         await self._repository.clear_active_step(
