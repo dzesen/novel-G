@@ -420,24 +420,18 @@ def _project_aggregate_usage(
     value: Any,
 ) -> tuple[CandidateUsageSummary, _EvidenceProjectionError | None]:
     raw = _as_mapping(value)
-    raw_kind = raw.get("usage_evidence_kind")
-    if raw_kind is not None:
+    declared_kinds: list[CandidateUsageEvidenceKind] = []
+    if "usage_evidence_kind" in raw:
         try:
-            evidence_kind = CandidateUsageEvidenceKind(raw_kind)
+            declared_kinds.append(
+                CandidateUsageEvidenceKind(raw.get("usage_evidence_kind"))
+            )
         except (TypeError, ValueError):
             return (
                 _usage_component_floor(raw),
                 _EvidenceProjectionError("Token 用量完整性标记无效"),
             )
-        if evidence_kind is not CandidateUsageEvidenceKind.EXACT:
-            return (
-                _usage_component_floor(raw),
-                _IncompleteAggregateUsageProjectionError(
-                    "Token 用量不是精确完整投影",
-                    evidence_kind=evidence_kind,
-                ),
-            )
-    elif "usage_is_complete" in raw or "usage_is_lower_bound" in raw:
+    if "usage_is_complete" in raw or "usage_is_lower_bound" in raw:
         is_complete = raw.get("usage_is_complete")
         is_lower_bound = raw.get("usage_is_lower_bound")
         if type(is_complete) is not bool or type(is_lower_bound) is not bool:
@@ -450,18 +444,33 @@ def _project_aggregate_usage(
                 _usage_component_floor(raw),
                 _EvidenceProjectionError("完整 Token 用量不能标记为下界"),
             )
-        if not is_complete:
-            return (
-                _usage_component_floor(raw),
-                _IncompleteAggregateUsageProjectionError(
-                    "Token 用量不是精确完整投影",
-                    evidence_kind=(
-                        CandidateUsageEvidenceKind.LOWER_BOUND
-                        if is_lower_bound
-                        else CandidateUsageEvidenceKind.INCOMPLETE
-                    ),
-                ),
+        declared_kinds.append(
+            CandidateUsageEvidenceKind.EXACT
+            if is_complete
+            else (
+                CandidateUsageEvidenceKind.LOWER_BOUND
+                if is_lower_bound
+                else CandidateUsageEvidenceKind.INCOMPLETE
             )
+        )
+    if len(set(declared_kinds)) > 1:
+        return (
+            _usage_component_floor(raw),
+            _IncompleteAggregateUsageProjectionError(
+                "新旧 Token 用量完整性标记相互冲突",
+                evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+            ),
+        )
+    if declared_kinds and (
+        declared_kinds[0] is not CandidateUsageEvidenceKind.EXACT
+    ):
+        return (
+            _usage_component_floor(raw),
+            _IncompleteAggregateUsageProjectionError(
+                "Token 用量不是精确完整投影",
+                evidence_kind=declared_kinds[0],
+            ),
+        )
     try:
         return _usage_summary(value, aggregate=True), None
     except _UsageProjectionOverflow:
@@ -714,6 +723,8 @@ def _unattributed_usage_error(
 def _attribute_aggregate_usage(
     aggregate: CandidateUsageSummary,
     attempts: tuple[CandidateAttemptSummary, ...],
+    *,
+    aggregate_evidence_kind: CandidateUsageEvidenceKind,
 ) -> tuple[CandidateAttemptSummary, ...]:
     if not attempts:
         if aggregate.total_tokens:
@@ -724,6 +735,7 @@ def _attribute_aggregate_usage(
                 ),
                 aggregate=aggregate,
                 attempts=attempts,
+                evidence_kind=aggregate_evidence_kind,
             )
         return attempts
     released_with_usage = [
@@ -742,6 +754,10 @@ def _attribute_aggregate_usage(
             ),
             aggregate=aggregate,
             attempts=attempts,
+            evidence_kind=_merge_usage_evidence_kind(
+                aggregate_evidence_kind,
+                CandidateUsageEvidenceKind.INCOMPLETE,
+            ),
         )
     charged_without_usage = [
         item
@@ -759,7 +775,10 @@ def _attribute_aggregate_usage(
             ),
             aggregate=aggregate,
             attempts=attempts,
-            evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+            evidence_kind=_merge_usage_evidence_kind(
+                aggregate_evidence_kind,
+                CandidateUsageEvidenceKind.INCOMPLETE,
+            ),
         )
     residual = _usage_residual(aggregate, _summed_usage(attempts))
     unreported_indexes = [
@@ -780,6 +799,7 @@ def _attribute_aggregate_usage(
             ),
             aggregate=aggregate,
             attempts=attempts,
+            evidence_kind=aggregate_evidence_kind,
         )
     target = unreported_indexes[0]
     projected = list(attempts)
@@ -813,7 +833,13 @@ def _project_result_evidence(
                 aggregate_floor=aggregate,
                 attempts=attempts,
             ) from aggregate_error
-        attempts = _attribute_aggregate_usage(aggregate, attempts)
+        attempts = _attribute_aggregate_usage(
+            aggregate,
+            attempts,
+            aggregate_evidence_kind=_aggregate_usage_evidence_kind(
+                aggregate_error
+            ),
+        )
         if aggregate_error is not None:
             raise _invalid_aggregate_error(
                 aggregate_error,
@@ -1224,7 +1250,11 @@ class _PipelineTrace:
                     aggregate_floor=aggregate,
                     attempts=summaries,
                 ) from aggregate_error
-            summaries = _attribute_aggregate_usage(aggregate, summaries)
+            summaries = _attribute_aggregate_usage(
+                aggregate,
+                summaries,
+                aggregate_evidence_kind=aggregate_kind,
+            )
             if aggregate_error is not None:
                 raise _invalid_aggregate_error(
                     aggregate_error,
