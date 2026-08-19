@@ -29,12 +29,14 @@ def conservative_prompt_input_bound(
     *,
     prompt: str,
     system_prompt: str = "",
+    additional_request_payload: str = "",
 ) -> int:
     """Return the input portion of one conservative Provider reservation."""
     return max(
         1,
         len(str(prompt or "").encode("utf-8"))
         + len(str(system_prompt or "").encode("utf-8"))
+        + len(str(additional_request_payload or "").encode("utf-8"))
         + PROVIDER_SYSTEM_FRAMING_TOKEN_ALLOWANCE,
     )
 
@@ -44,6 +46,7 @@ def conservative_runtime_token_bound(
     output_token_bound: Any,
     prompt: str,
     system_prompt: str = "",
+    additional_request_payload: str = "",
 ) -> int | None:
     """Return the exact conservative formula used before Provider dispatch."""
     output_limit = positive_token_limit(output_token_bound)
@@ -55,6 +58,7 @@ def conservative_runtime_token_bound(
         + conservative_prompt_input_bound(
             prompt=prompt,
             system_prompt=system_prompt,
+            additional_request_payload=additional_request_payload,
         ),
     )
 

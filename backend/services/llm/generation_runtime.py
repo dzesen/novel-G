@@ -33,6 +33,9 @@ class StructuredOutputMode(str, Enum):
     SCHEMA_ENFORCED = "schema_enforced"
 
 
+STRUCTURED_REQUEST_BUDGET_PROTOCOL = "structured_request_budget.v2"
+
+
 def _redacted_config_revision(
     config: dict[str, Any],
     *,
@@ -481,6 +484,8 @@ class GenerationRuntime:
         plan: GenerationPlan,
         prompt: str,
         gen_kwargs: Mapping[str, Any],
+        *,
+        additional_request_payload: str = "",
     ) -> int | None:
         output_limit = _positive_int(gen_kwargs.get("max_tokens"))
         if output_limit is None:
@@ -489,6 +494,7 @@ class GenerationRuntime:
             output_token_bound=output_limit,
             prompt=prompt,
             system_prompt=str(gen_kwargs.get("system_prompt") or ""),
+            additional_request_payload=additional_request_payload,
         )
 
     async def _claim_paid_attempt(
@@ -614,11 +620,25 @@ class GenerationRuntime:
                 + int(effective_output_tokens)
             )
 
-        def bounded_reservation(prompt: str) -> int | None:
+        schema_request_payload = json.dumps(
+            schema.model_json_schema(),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+
+        def bounded_reservation(
+            prompt: str,
+            *,
+            includes_native_schema: bool = False,
+        ) -> int | None:
             nonlocal reserved_conservative_tokens
+            additional_request_payload = (
+                schema_request_payload if includes_native_schema else ""
+            )
             input_tokens = conservative_prompt_input_bound(
                 prompt=prompt,
                 system_prompt=str(request_kwargs.get("system_prompt") or ""),
+                additional_request_payload=additional_request_payload,
             )
             if (
                 max_conservative_input_tokens is not None
@@ -631,6 +651,7 @@ class GenerationRuntime:
                 plan,
                 prompt,
                 request_kwargs,
+                additional_request_payload=additional_request_payload,
             )
             if bound is None and max_conservative_total_tokens is not None:
                 raise ConservativeGenerationBoundExceeded(
@@ -673,7 +694,12 @@ class GenerationRuntime:
             )
             produced = await self._paid_call(
                 plan, plan.provider_alias, "primary", adapter, primary_call,
-                bounded_reservation(primary_prompt),
+                bounded_reservation(
+                    primary_prompt,
+                    includes_native_schema=(
+                        plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
+                    ),
+                ),
             )
         except LLMStructuredValidationError as error:
             # 调用已产生可计费用量；保留原始内容，进入同 Provider 的唯一纠错尝试。
@@ -734,7 +760,10 @@ class GenerationRuntime:
 
                 value = await self._paid_call(
                     plan, plan.reviewer_alias, "reviewer", reviewer, review_call,
-                    bounded_reservation(repair_prompt),
+                    bounded_reservation(
+                        repair_prompt,
+                        includes_native_schema=True,
+                    ),
                 )
 
         attempts = self.attempts[attempt_offset:]

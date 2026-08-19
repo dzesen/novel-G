@@ -41,15 +41,16 @@ from backend.services.generation.provider_budget import (
 )
 from backend.services.llm.generation_runtime import (
     GenerationPlan,
+    STRUCTURED_REQUEST_BUDGET_PROTOCOL,
     WorkflowStepTarget,
 )
 
 
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_repair_authorization.v2"
+    "chapter_candidate_repair_authorization.v3"
 )
-CANDIDATE_PIPELINE_REVISION = 2
-CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v2"
+CANDIDATE_PIPELINE_REVISION = 3
+CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
 PROSE_REMEDIATION_MAX_STEPS = 3
 PROSE_REMEDIATION_MAX_PLANNER_CALLS = 3
@@ -87,7 +88,8 @@ class RuntimeToolDescriptorSnapshot(_ClosedAuthorizationModel):
 
 
 class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
-    schema_version: Literal["candidate_structured_generation_plan.v2"]
+    schema_version: Literal["candidate_structured_generation_plan.v3"]
+    runtime_budget_protocol: Literal["structured_request_budget.v2"]
     workflow: str = Field(min_length=1, max_length=160)
     step: str = Field(min_length=1, max_length=160)
     provider_alias: str = Field(min_length=1, max_length=160)
@@ -202,7 +204,7 @@ class CandidateProviderBudgetBound(_ClosedAuthorizationModel):
 
 
 class CandidateRepairAuthorization(_ClosedAuthorizationModel):
-    schema_version: Literal["chapter_candidate_repair_authorization.v2"]
+    schema_version: Literal["chapter_candidate_repair_authorization.v3"]
     authorization_revision: _PositiveInt
     eligible_chapter_count: _NonNegativeInt
     eligible_chapter_ids_digest: _Sha256
@@ -589,6 +591,7 @@ def _structured_plan_projection(
         )
     return {
         "schema_version": CANDIDATE_STRUCTURED_PLAN_SCHEMA,
+        "runtime_budget_protocol": STRUCTURED_REQUEST_BUDGET_PROTOCOL,
         "workflow": workflow,
         "step": step,
         "provider_alias": provider_alias,
