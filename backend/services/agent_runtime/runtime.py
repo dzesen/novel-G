@@ -56,6 +56,12 @@ TERMINAL_RUN_STATUSES = frozenset({
     "cancelled",
     "superseded",
 })
+RESUMABLE_PAUSE_REASONS = frozenset({
+    "authorization_required",
+    "manual_approval_required",
+    "concurrent_narrative_change",
+    "uncertain_paid_attempt",
+})
 LINEAGE_LIMIT_FIELDS = (
     "max_steps",
     "max_planner_calls",
@@ -128,6 +134,55 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _termination_projection(
+    *,
+    status: str,
+    reason_code: str,
+    now: datetime,
+    step_id: str | None,
+) -> dict[str, Any]:
+    category_by_status = {
+        "completed": "success",
+        "paused": "pause",
+        "failed": "failure",
+        "cancelled": "cancelled",
+        "superseded": "superseded",
+    }
+    try:
+        category = category_by_status[status]
+    except KeyError as exc:
+        raise ValueError(f"unsupported Agent termination status: {status}") from exc
+    return {
+        "status": status,
+        "category": category,
+        "reason_code": reason_code,
+        "resumable": bool(
+            status == "paused" and reason_code in RESUMABLE_PAUSE_REASONS
+        ),
+        "occurred_at": now,
+        "step_id": step_id,
+        "detail_code": reason_code,
+    }
+
+
+def _termination_event_projection(
+    *,
+    status: str,
+    reason_code: str,
+    lease_epoch: int,
+) -> tuple[str, str, dict[str, Any]]:
+    event_type = "run_paused" if status == "paused" else "run_terminated"
+    event_key = (
+        f"run-paused-{reason_code}-{int(lease_epoch)}"
+        if status == "paused"
+        else f"run-{status}-{reason_code}"
+    )
+    return event_key, event_type, {
+        "status": status,
+        "reason_code": reason_code,
+    }
 
 
 class AgentRuntime:
@@ -496,6 +551,7 @@ class AgentRuntime:
             owner_id=str(owner_id),
             resumed=True,
             uncertain_action=uncertain_action,
+            conditions_confirmed=conditions_confirmed,
         )
 
     async def cancel(self, *, owner_id: str, run_id: str) -> AgentRunView:
@@ -555,10 +611,6 @@ class AgentRuntime:
             owner_id=owner_id,
         )
         steps = await self._repository.list_steps_owned(
-            run_id=run_id,
-            owner_id=owner_id,
-        )
-        existing_events = await self._repository.list_events_owned(
             run_id=run_id,
             owner_id=owner_id,
         )
@@ -706,21 +758,16 @@ class AgentRuntime:
             else None
         )
         if status == "paused":
-            if any(
-                event.get("type") == "run_paused"
-                and (event.get("payload") or {}).get("status") == status
-                and (event.get("payload") or {}).get("reason_code") == reason_code
-                for event in existing_events
-            ):
-                return
+            projected_key, event_type, event_payload = _termination_event_projection(
+                status=status,
+                reason_code=reason_code,
+                lease_epoch=int(run.get("lease_epoch") or 0),
+            )
             await self._event(
                 run_id=run_id,
-                event_key=(
-                    f"run-paused-{reason_code}-"
-                    f"{int(run.get('lease_epoch') or 0)}"
-                ),
-                event_type="run_paused",
-                payload={"status": status, "reason_code": reason_code},
+                event_key=str(run.get("termination_event_key") or projected_key),
+                event_type=event_type,
+                payload=event_payload,
                 step_id=termination_step_id,
                 now=now,
             )
@@ -738,11 +785,16 @@ class AgentRuntime:
                 now=now,
             )
         elif status in {"completed", "failed", "cancelled"}:
+            event_key, event_type, event_payload = _termination_event_projection(
+                status=status,
+                reason_code=reason_code,
+                lease_epoch=int(run.get("lease_epoch") or 0),
+            )
             await self._event(
                 run_id=run_id,
-                event_key=f"run-{status}-{reason_code}",
-                event_type="run_terminated",
-                payload={"status": status, "reason_code": reason_code},
+                event_key=event_key,
+                event_type=event_type,
+                payload=event_payload,
                 step_id=termination_step_id,
                 now=now,
             )
@@ -1379,7 +1431,7 @@ class AgentRuntime:
                     and (event.get("payload") or {}).get("status") == "failed"
                     for event in events
                 )
-                if derived_step_status != "failed" and not matching_failure:
+                if not matching_failure:
                     add_violation("step_status_mismatch")
             elif persisted_step_status != derived_step_status:
                 add_violation("step_status_mismatch")
@@ -1467,6 +1519,7 @@ class AgentRuntime:
         owner_id: str,
         resumed: bool,
         uncertain_action: Literal["retry", "skip"] | None = None,
+        conditions_confirmed: bool = False,
     ) -> AgentRunView:
         run = await self._repository.get_run_owned(
             run_id=run_id,
@@ -1488,13 +1541,33 @@ class AgentRuntime:
         )
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
-            if resumed:
-                await self._repair_projection_audit(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    now=now,
-                )
+            run = await self._repair_checkpoint_projection(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+            )
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=owner_id,
+                now=now,
+            )
+            if run.get("status") in TERMINAL_RUN_STATUSES:
+                return await self._run_view(run_id=run_id, owner_id=owner_id)
             if run.get("status") == "paused":
+                reason_code = str(
+                    (run.get("termination") or {}).get("reason_code") or ""
+                )
+                if reason_code == "uncertain_paid_attempt" and uncertain_action is None:
+                    return await self._run_view(run_id=run_id, owner_id=owner_id)
+                if reason_code in {
+                    "authorization_required",
+                    "manual_approval_required",
+                } and not conditions_confirmed:
+                    return await self._run_view(run_id=run_id, owner_id=owner_id)
+                if reason_code not in RESUMABLE_PAUSE_REASONS:
+                    return await self._run_view(run_id=run_id, owner_id=owner_id)
                 should_continue = await self._resume_paused_checkpoint(
                     run=run,
                     run_id=run_id,
@@ -1514,7 +1587,7 @@ class AgentRuntime:
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
                 now=now,
-                fields={"termination": None},
+                fields={"termination": None, "termination_event_key": None},
             )
             if not resumed:
                 await self._event(
@@ -1568,6 +1641,99 @@ class AgentRuntime:
             )
         return await self._run_view(run_id=run_id, owner_id=owner_id)
 
+    async def _repair_checkpoint_projection(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Finish a run projection whose active step checkpoint committed first."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        if run.get("status") in TERMINAL_RUN_STATUSES:
+            return run
+        active_step_id = str(run.get("active_step_id") or "")
+        if not active_step_id:
+            if run.get("status") != "running":
+                return run
+            steps = await self._repository.list_steps_owned(
+                run_id=run_id,
+                owner_id=owner_id,
+            )
+            if not steps:
+                return run
+            latest = steps[-1]
+            if (
+                latest.get("status") != "failed"
+                or int(latest.get("ordinal") or 0)
+                != int(run.get("next_ordinal") or 0) - 1
+            ):
+                return run
+            reason_code = str(latest.get("failure_reason") or "")
+            if not reason_code:
+                raise AgentRuntimeStateConflict(
+                    "failed Agent step is missing its termination reason"
+                )
+            return await self._repository.set_run_status(
+                run_id=run_id,
+                owner_id=owner_id,
+                expected=("running",),
+                status="failed",
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+                fields={
+                    "termination": _termination_projection(
+                        status="failed",
+                        reason_code=reason_code,
+                        now=now,
+                        step_id=str(latest["step_id"]),
+                    ),
+                    "termination_event_key": f"run-failed-{reason_code}",
+                },
+            )
+        step = await self._repository.get_step_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+            step_id=active_step_id,
+        )
+        if step.get("status") != "paused" or run.get("status") == "paused":
+            return run
+        reason_code = str(step.get("pause_reason") or "")
+        if not reason_code:
+            raise AgentRuntimeStateConflict(
+                "paused Agent step is missing its termination reason"
+            )
+        pause_epoch = int(step.get("pause_lease_epoch") or lease_epoch)
+        pause_event_key, _, _ = _termination_event_projection(
+            status="paused",
+            reason_code=reason_code,
+            lease_epoch=pause_epoch,
+        )
+        return await self._repository.set_run_status(
+            run_id=run_id,
+            owner_id=owner_id,
+            expected=(str(run.get("status") or ""),),
+            status="paused",
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            now=now,
+            fields={
+                "termination": _termination_projection(
+                    status="paused",
+                    reason_code=reason_code,
+                    now=now,
+                    step_id=active_step_id,
+                ),
+                "termination_event_key": pause_event_key,
+            },
+        )
+
     async def _resume_paused_checkpoint(
         self,
         *,
@@ -1599,24 +1765,45 @@ class AgentRuntime:
         if termination.get("reason_code") == "uncertain_paid_attempt":
             if uncertain_action is None:
                 return False
-            uncertain = [
+            unresolved = [
                 dict(item)
                 for item in run.get("attempts") or []
-                if isinstance(item, Mapping) and item.get("state") == "uncertain"
+                if (
+                    isinstance(item, Mapping)
+                    and item.get("step_id") == step_id
+                    and item.get("state") == "uncertain"
+                )
             ]
-            if len(uncertain) != 1:
+            resolved = [
+                dict(item)
+                for item in run.get("attempts") or []
+                if (
+                    isinstance(item, Mapping)
+                    and item.get("step_id") == step_id
+                    and item.get("state") in {"resolved_retry", "resolved_skip"}
+                )
+            ]
+            if len(unresolved) == 1:
+                attempt = unresolved[0]
+                await self._repository.resolve_uncertain_call(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    call_key=str(attempt["call_key"]),
+                    action=uncertain_action,
+                    now=now,
+                )
+            elif not unresolved and resolved:
+                attempt = resolved[-1]
+                if attempt.get("state") != f"resolved_{uncertain_action}":
+                    raise AgentRuntimeStateConflict(
+                        "uncertain Agent call was resolved with another action"
+                    )
+            else:
                 raise AgentRuntimeStateConflict(
                     "uncertain pause must reference exactly one frozen attempt"
                 )
-            await self._repository.resolve_uncertain_call(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                lease_epoch=lease_epoch,
-                call_key=str(uncertain[0]["call_key"]),
-                action=uncertain_action,
-                now=now,
-            )
             if uncertain_action == "skip":
                 await self._fail_step_and_run(
                     run_id=run_id,
@@ -1627,7 +1814,7 @@ class AgentRuntime:
                     expected_step_status="paused",
                     reason_code=(
                         "planner_output_exhausted"
-                        if uncertain[0].get("kind") == "planner"
+                        if attempt.get("kind") == "planner"
                         else "tool_failure_exhausted"
                     ),
                     now=now,
@@ -2027,6 +2214,7 @@ class AgentRuntime:
                 fields={
                     "planner_decision": decision.model_dump(mode="json"),
                     "policy_decision": policy_decision,
+                    "failure_reason": "policy_violation",
                 },
                 now=_aware(self._clock()),
             )
@@ -3423,6 +3611,7 @@ class AgentRuntime:
             fields={
                 "pause_reason": reason_code,
                 "paused_from_status": expected_step_status,
+                "pause_lease_epoch": int(lease_epoch),
             },
             now=now,
         )
@@ -3491,36 +3680,17 @@ class AgentRuntime:
         now: datetime,
         step_id: str | None = None,
     ) -> None:
-        category_by_status = {
-            "completed": "success",
-            "paused": "pause",
-            "failed": "failure",
-            "cancelled": "cancelled",
-            "superseded": "superseded",
-        }
-        try:
-            category = category_by_status[status]
-        except KeyError as exc:
-            raise ValueError(f"unsupported Agent termination status: {status}") from exc
-        termination = {
-            "status": status,
-            "category": category,
-            "reason_code": reason_code,
-            "resumable": bool(
-                status == "paused"
-                and reason_code in {
-                    "authorization_required",
-                    "manual_approval_required",
-                    "concurrent_narrative_change",
-                    "uncertain_paid_attempt",
-                }
-            ),
-            "occurred_at": now,
-            "step_id": step_id,
-            "detail_code": reason_code,
-        }
-        event_type = "run_terminated" if status != "paused" else "run_paused"
-        event_payload = {"status": status, "reason_code": reason_code}
+        termination = _termination_projection(
+            status=status,
+            reason_code=reason_code,
+            now=now,
+            step_id=step_id,
+        )
+        event_key, event_type, event_payload = _termination_event_projection(
+            status=status,
+            reason_code=reason_code,
+            lease_epoch=lease_epoch,
+        )
         project_agent_runtime_event_payload(event_type, event_payload)
         await self._repository.set_run_status(
             run_id=run_id,
@@ -3530,15 +3700,14 @@ class AgentRuntime:
             worker_id=worker_id,
             lease_epoch=lease_epoch,
             now=now,
-            fields={"termination": termination},
+            fields={
+                "termination": termination,
+                "termination_event_key": event_key,
+            },
         )
         await self._event(
             run_id=run_id,
-            event_key=(
-                f"run-paused-{reason_code}-{lease_epoch}"
-                if status == "paused"
-                else f"run-{status}-{reason_code}"
-            ),
+            event_key=event_key,
             event_type=event_type,
             payload=event_payload,
             step_id=step_id,

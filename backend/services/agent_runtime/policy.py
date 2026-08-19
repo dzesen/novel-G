@@ -22,12 +22,7 @@ from backend.services.agent_runtime.contracts import (
 _URI_RE = re.compile(
     r"[A-Za-z][A-Za-z0-9+.-]{0,31}:(?://|[^\s\"'<>])[^\s\"'<>]*"
 )
-_WINDOWS_PATH_RE = re.compile(
-    r"(?:^|[\s=,;\"'(<\[])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]*"
-)
-_LOCAL_PATH_RE = re.compile(
-    r"(?:^|[\s=,;\"'(<\[])(?:/[^/\s][^\s\"'<>]*|\.\.?[\\/][^\s\"'<>]+)"
-)
+_PATH_SEPARATOR_RE = re.compile(r"[\\/]")
 
 
 class AgentRuntimePolicyViolation(ValueError):
@@ -38,7 +33,7 @@ def _contains_forbidden_location(value: Any) -> bool:
     if isinstance(value, str):
         return any(
             pattern.search(value)
-            for pattern in (_URI_RE, _WINDOWS_PATH_RE, _LOCAL_PATH_RE)
+            for pattern in (_URI_RE, _PATH_SEPARATOR_RE)
         )
     if isinstance(value, Mapping):
         return any(

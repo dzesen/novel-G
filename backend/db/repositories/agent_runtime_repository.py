@@ -478,6 +478,7 @@ class AgentRuntimeRepository:
             "lease": None,
             "lease_epoch": 0,
             "termination": None,
+            "termination_event_key": None,
             "predecessor_run_id": predecessor_object_id,
             "replay_of_run_id": replay_object_id,
             "lineage_root_run_id": lineage_root_object_id,
@@ -662,6 +663,7 @@ class AgentRuntimeRepository:
                     {"$set": {
                         "status": "cancelled",
                         "termination": current_termination,
+                        "termination_event_key": None,
                         "lease": None,
                         "has_uncertain_attempts": {
                             "$anyElementTrue": {
@@ -1145,11 +1147,49 @@ class AgentRuntimeRepository:
     ) -> dict[str, Any]:
         if expires_at <= now:
             raise ValueError("lease expiry must be in the future")
+        run_object_id = _required_object_id(run_id, "run_id")
+        owner_object_id = _required_object_id(owner_id, "owner_id")
+        current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        if current.get("status") not in {"ready", "running", "paused"}:
+            raise AgentRuntimeLeaseUnavailable("Agent run cannot be leased")
+        lease = dict(current.get("lease") or {})
+        if (
+            lease
+            and lease.get("worker_id") != str(worker_id)
+            and lease.get("expires_at") > now
+        ):
+            raise AgentRuntimeLeaseUnavailable("Agent run has another active lease")
+
+        previous_epoch = int(current.get("lease_epoch") or 0)
+        next_epoch = previous_epoch + 1
+        active_step_id = current.get("active_step_id")
+        adopted: dict[str, Any] | None = None
+        if active_step_id:
+            try:
+                adopted = await self._adopt_step_lease(
+                    run=current,
+                    step_id=str(active_step_id),
+                    worker_id=str(worker_id),
+                    expected_lease_epoch=previous_epoch,
+                    lease_epoch=next_epoch,
+                    now=now,
+                    expires_at=expires_at,
+                )
+            except AgentRuntimeStateConflict as exc:
+                latest = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+                if latest.get("status") not in {"ready", "running", "paused"}:
+                    raise AgentRuntimeLeaseUnavailable(
+                        "Agent run changed while its step was fenced"
+                    ) from exc
+                raise
+
         document = await self.runs.find_one_and_update(
             {
-                "_id": _required_object_id(run_id, "run_id"),
-                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "_id": run_object_id,
+                "owner_id": owner_object_id,
                 "status": {"$in": ["ready", "running", "paused"]},
+                "active_step_id": active_step_id,
+                "lease_epoch": previous_epoch,
                 "is_deleted": False,
                 "$or": [
                     {"lease": None},
@@ -1158,67 +1198,58 @@ class AgentRuntimeRepository:
                     {"lease.worker_id": str(worker_id)},
                 ],
             },
-            {
-                "$set": {
-                    "lease": {
-                        "worker_id": str(worker_id),
-                        "heartbeat_at": now,
-                        "expires_at": expires_at,
-                    },
-                    "updated_at": now,
+            {"$set": {
+                "lease": {
+                    "worker_id": str(worker_id),
+                    "heartbeat_at": now,
+                    "expires_at": expires_at,
                 },
-                "$inc": {"lease_epoch": 1},
-            },
+                "lease_epoch": next_epoch,
+                "updated_at": now,
+            }},
             return_document=ReturnDocument.AFTER,
         )
-        if document is None:
-            raise AgentRuntimeLeaseUnavailable("Agent run has another active lease")
-        active_step_id = document.get("active_step_id")
-        if active_step_id:
-            try:
-                adopted = await self._adopt_step_lease(
-                    run=document,
-                    step_id=str(active_step_id),
-                    worker_id=str(worker_id),
-                    lease_epoch=int(document.get("lease_epoch") or 0),
-                    now=now,
-                    expires_at=expires_at,
-                )
-                confirmed = await self.runs.find_one({
-                    "_id": document["_id"],
-                    "owner_id": document["owner_id"],
-                    "status": {"$in": ["ready", "running", "paused"]},
-                    "active_step_id": str(active_step_id),
-                    "lease.worker_id": str(worker_id),
-                    "lease.expires_at": {"$gt": now},
-                    "lease_epoch": int(document.get("lease_epoch") or 0),
-                    "is_deleted": False,
-                })
-                if confirmed is None:
-                    if adopted.get("status") not in {"completed", "failed"}:
-                        await self._revoke_step_lease(
-                            run=document,
-                            step_id=str(active_step_id),
-                            worker_id=str(worker_id),
-                            lease_epoch=int(document.get("lease_epoch") or 0),
-                            now=now,
-                        )
-                    raise AgentRuntimeLeaseUnavailable(
-                        "Agent run lease changed while its step was adopted"
-                    )
-            except Exception:
-                await self.runs.update_one(
-                    {
-                        "_id": document["_id"],
-                        "owner_id": document["owner_id"],
-                        "lease.worker_id": str(worker_id),
-                        "lease_epoch": int(document.get("lease_epoch") or 0),
-                        "is_deleted": False,
-                    },
-                    {"$set": {"lease": None, "updated_at": now}},
-                )
-                raise
-        return document
+        if document is not None:
+            return document
+        if (
+            adopted is not None
+            and adopted.get("status") not in {"completed", "failed"}
+        ):
+            await self._rollback_step_handoff(
+                run=current,
+                step_id=str(active_step_id),
+                worker_id=str(worker_id),
+                lease_epoch=next_epoch,
+                previous_epoch=previous_epoch,
+                now=now,
+            )
+        raise AgentRuntimeLeaseUnavailable("Agent run lease changed during handoff")
+
+    async def _rollback_step_handoff(
+        self,
+        *,
+        run: Mapping[str, Any],
+        step_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        previous_epoch: int,
+        now: datetime,
+    ) -> None:
+        await self.steps.update_one(
+            {
+                "_id": str(step_id),
+                "run_id": run["_id"],
+                "owner_id": run["owner_id"],
+                "lease.worker_id": str(worker_id),
+                "lease_epoch": int(lease_epoch),
+                "is_deleted": False,
+            },
+            {"$set": {
+                "lease": None,
+                "lease_epoch": int(previous_epoch),
+                "updated_at": now,
+            }},
+        )
 
     async def _revoke_step_lease(
         self,
@@ -1247,6 +1278,7 @@ class AgentRuntimeRepository:
         run: Mapping[str, Any],
         step_id: str,
         worker_id: str,
+        expected_lease_epoch: int,
         lease_epoch: int,
         now: datetime,
         expires_at: datetime,
@@ -1260,12 +1292,25 @@ class AgentRuntimeRepository:
                 "status": {"$nin": ["completed", "failed"]},
                 "is_deleted": False,
                 "$or": [
-                    {"lease": None},
-                    {"lease": {"$exists": False}},
-                    {"lease.expires_at": {"$lte": now}},
                     {
+                        "lease_epoch": int(expected_lease_epoch),
+                        "lease": None,
+                    },
+                    {
+                        "lease_epoch": int(expected_lease_epoch),
+                        "lease": {"$exists": False},
+                    },
+                    {
+                        "lease_epoch": int(expected_lease_epoch),
+                        "lease.expires_at": {"$lte": now},
+                    },
+                    {
+                        "lease_epoch": int(expected_lease_epoch),
                         "lease.worker_id": str(worker_id),
+                    },
+                    {
                         "lease_epoch": int(lease_epoch),
+                        "lease.expires_at": {"$lte": now},
                     },
                 ],
             },
@@ -1418,10 +1463,32 @@ class AgentRuntimeRepository:
                     run=run,
                     step_id=str(step["step_id"]),
                     worker_id=str(worker_id),
+                    expected_lease_epoch=int(lease_epoch),
                     lease_epoch=int(lease_epoch),
                     now=now,
                     expires_at=lease.get("expires_at"),
                 )
+                confirmed = await self.runs.find_one({
+                    "_id": run_object_id,
+                    "owner_id": owner_object_id,
+                    "status": "running",
+                    "active_step_id": str(step["step_id"]),
+                    "lease.worker_id": str(worker_id),
+                    "lease.expires_at": {"$gt": now},
+                    "lease_epoch": int(lease_epoch),
+                    "is_deleted": False,
+                })
+                if confirmed is None:
+                    await self._revoke_step_lease(
+                        run=run,
+                        step_id=str(step["step_id"]),
+                        worker_id=str(worker_id),
+                        lease_epoch=int(lease_epoch),
+                        now=now,
+                    )
+                    raise AgentRuntimeStateConflict(
+                        "Agent run lease changed while its step was claimed"
+                    )
                 return adopted
             return step
 
@@ -1517,6 +1584,7 @@ class AgentRuntimeRepository:
             "revision_after": run.get("expected_narrative_revision"),
             "lease": deepcopy(run.get("lease")),
             "lease_epoch": int(run.get("lease_epoch") or 0),
+            "pause_lease_epoch": None,
             "created_at": created_at,
             "updated_at": created_at,
             "is_deleted": False,
