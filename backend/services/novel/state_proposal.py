@@ -95,6 +95,10 @@ class StateGenerationSnapshot:
     content_digest: str
     narrative_revision: int
     captured_at: datetime
+    source_content_digest: str | None = None
+    source_prose_run_id: str | None = None
+    source_prose_run_revision: int | None = None
+    source_prose_acceptance_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,10 @@ class StateProposalModule:
         chapter_id: str,
         *,
         chapter: dict[str, Any] | None = None,
+        source_content_digest: str | None = None,
+        source_prose_run_id: str | None = None,
+        source_prose_run_revision: int | None = None,
+        source_prose_acceptance_state: str | None = None,
     ) -> StateGenerationSnapshot:
         captured_chapter = chapter or await chapter_repo.get_chapter_by_id(chapter_id)
         if str(captured_chapter.get("novel_id")) != str(novel_id):
@@ -155,6 +163,22 @@ class StateProposalModule:
             content_digest=_content_digest(captured_chapter),
             narrative_revision=await narrative_revision_store.current(novel_id),
             captured_at=get_utc_now(),
+            source_content_digest=(
+                str(source_content_digest) if source_content_digest else None
+            ),
+            source_prose_run_id=(
+                str(source_prose_run_id) if source_prose_run_id else None
+            ),
+            source_prose_run_revision=(
+                int(source_prose_run_revision)
+                if source_prose_run_revision is not None
+                else None
+            ),
+            source_prose_acceptance_state=(
+                str(source_prose_acceptance_state)
+                if source_prose_acceptance_state
+                else None
+            ),
         )
 
     async def ensure_current(self, snapshot: StateGenerationSnapshot) -> None:
@@ -203,6 +227,12 @@ class StateProposalModule:
                 "content_digest": active_snapshot.content_digest,
                 "state_revision": active_snapshot.narrative_revision,
                 "narrative_revision": active_snapshot.narrative_revision,
+                "source_content_digest": active_snapshot.source_content_digest,
+                "source_prose_run_id": active_snapshot.source_prose_run_id,
+                "source_prose_run_revision": active_snapshot.source_prose_run_revision,
+                "source_prose_acceptance_state": (
+                    active_snapshot.source_prose_acceptance_state
+                ),
                 "generation_captured_at": active_snapshot.captured_at,
                 "generation_started_at": now,
                 "generation_audit": deepcopy(audit or {}),
@@ -248,6 +278,7 @@ class StateProposalModule:
         token_payload = (
             f"{lease.proposal_id}:{lease.snapshot.content_digest}:"
             f"{lease.snapshot.narrative_revision}:{candidate_digest}:"
+            f"{lease.snapshot.source_content_digest or ''}:"
             f"{int(expires_at.replace(tzinfo=timezone.utc).timestamp())}"
         )
         token = hmac.new(
@@ -605,10 +636,18 @@ class StateProposalModule:
                 "human_reviewed" if policy_name == "human_review" else "auto_accepted"
             ),
             "state_completion": {
-                "source_content_digest": chapter_content_digest(
-                    chapter.get("content") or ""
+                "source_content_digest": (
+                    proposal.get("source_content_digest")
+                    or chapter_content_digest(chapter.get("content") or "")
                 ),
-                "source_prose_acceptance_state": prose_acceptance_state(chapter),
+                "source_prose_acceptance_state": (
+                    proposal.get("source_prose_acceptance_state")
+                    or prose_acceptance_state(chapter)
+                ),
+                "source_prose_run_id": proposal.get("source_prose_run_id"),
+                "source_prose_run_revision": proposal.get(
+                    "source_prose_run_revision"
+                ),
                 "reference_resolution": deepcopy(
                     (proposal.get("generation_audit") or {}).get(
                         "reference_resolution"

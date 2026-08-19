@@ -155,6 +155,25 @@ class AcceptanceAuthority(str, Enum):
     SYSTEM = "system"
 
 
+class AcceptanceTiming(str, Enum):
+    """决定已通过生成闸门的候选何时进入正式数据。"""
+
+    IMMEDIATE = "immediate"
+    DEFERRED = "deferred"
+
+
+class ProseCandidateSource(BaseModel):
+    """供后续只读检查使用的、可追溯到 ProseRun 的正文候选。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str = ModelField(min_length=1)
+    source_run_id: str = ModelField(min_length=1)
+    source_run_revision: int = ModelField(ge=0)
+    source_content_digest: str = ModelField(min_length=64, max_length=64)
+    completion: Mapping[str, Any]
+
+
 class ChapterGenerationStage(str, Enum):
     OUTLINE = "outline"
     PROSE = "prose"
@@ -184,6 +203,7 @@ class ProseGenerationCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
     authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
+    acceptance_timing: AcceptanceTiming = AcceptanceTiming.IMMEDIATE
     owner_id: str | None = None
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
@@ -203,14 +223,17 @@ class OutlineAdherenceCommand(_ChapterGenerationCommand):
     chapter_id: str
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
+    prose_candidate: ProseCandidateSource | None = None
 
 
 class StateGenerationCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
     authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
+    acceptance_timing: AcceptanceTiming = AcceptanceTiming.IMMEDIATE
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
+    prose_candidate: ProseCandidateSource | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
@@ -616,10 +639,17 @@ class ChapterGenerationApplicationService:
             )
             if chapter.get("novel_id") != to_object_id(command.novel_id):
                 raise ValueError("该章节不属于指定小说")
-            content = str(chapter.get("content") or "").strip()
+            candidate = command.prose_candidate
+            content = (
+                candidate.text
+                if candidate is not None
+                else str(chapter.get("content") or "")
+            ).strip()
             if not content:
                 raise ValueError("本章还没有已保存的正文，请先写好并保存正文")
-            if prose_acceptance_state(chapter) == "partial_manual_required":
+            if candidate is not None:
+                self._validate_prose_candidate(candidate)
+            elif prose_acceptance_state(chapter) == "partial_manual_required":
                 raise PartialProseRequiresCompletion(
                     "本章正文只接受了部分 AI 结果；请先补写并将章节状态设为完成，"
                     "再执行状态回填"
@@ -629,6 +659,22 @@ class ChapterGenerationApplicationService:
                 command.novel_id,
                 command.chapter_id,
                 chapter=chapter,
+                source_content_digest=(
+                    candidate.source_content_digest
+                    if candidate is not None
+                    else None
+                ),
+                source_prose_run_id=(
+                    candidate.source_run_id if candidate is not None else None
+                ),
+                source_prose_run_revision=(
+                    candidate.source_run_revision
+                    if candidate is not None
+                    else None
+                ),
+                source_prose_acceptance_state=(
+                    "ai_complete" if candidate is not None else None
+                ),
             )
             provider_alias = self._deps.resolve_provider(
                 STATE_WORKFLOW,
@@ -779,7 +825,10 @@ class ChapterGenerationApplicationService:
                 continue
             acceptance: dict[str, Any] = {}
             accepted = False
-            if command.authority is AcceptanceAuthority.SYSTEM:
+            if (
+                command.authority is AcceptanceAuthority.SYSTEM
+                and command.acceptance_timing is AcceptanceTiming.IMMEDIATE
+            ):
                 acceptance = await self._deps.state_proposals.run_auto(
                     chapter_id=command.chapter_id,
                     proposal=proposal,
@@ -813,7 +862,14 @@ class ChapterGenerationApplicationService:
         )
         if chapter.get("novel_id") != to_object_id(command.novel_id):
             raise ValueError("该章节不属于指定小说")
-        content = str(chapter.get("content") or "").strip()
+        candidate = command.prose_candidate
+        content = (
+            candidate.text
+            if candidate is not None
+            else str(chapter.get("content") or "")
+        ).strip()
+        if candidate is not None:
+            self._validate_prose_candidate(candidate)
         if not content:
             raise ValueError("本章尚无可供细纲符合度检查的正文")
         if not chapter.get("outline"):
@@ -879,6 +935,19 @@ class ChapterGenerationApplicationService:
                 "dropped_item_counts": dict(context.dropped_item_counts),
             },
         )
+
+    @staticmethod
+    def _validate_prose_candidate(candidate: ProseCandidateSource) -> None:
+        if chapter_content_digest(candidate.text) != candidate.source_content_digest:
+            raise ValueError("正文候选摘要与候选内容不一致")
+        completion = dict(candidate.completion or {})
+        if (
+            completion.get("can_write_formal_prose") is not True
+            or str(completion.get("status") or "") != "complete"
+        ):
+            raise PartialProseRequiresCompletion(
+                "正文候选尚未通过完整性闸门，不能用于后续检查"
+            )
 
     async def _stream_outline_adherence(
         self,
@@ -1407,6 +1476,7 @@ class ChapterGenerationApplicationService:
                 accepted = False
                 if (
                     command.authority is AcceptanceAuthority.SYSTEM
+                    and command.acceptance_timing is AcceptanceTiming.IMMEDIATE
                     and generated.completion.can_write_formal_prose
                 ):
                     if latest_run is None or owner_id is None:
