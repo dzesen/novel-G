@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from bson import ObjectId
@@ -63,6 +65,10 @@ LINEAGE_LIMIT_FIELDS = (
 
 
 class _UncertainDispatchedCall(RuntimeError):
+    pass
+
+
+class _DeadlineExceeded(RuntimeError):
     pass
 
 
@@ -428,18 +434,39 @@ class AgentRuntime:
             resumed=False,
         )
 
-    async def resume(self, *, owner_id: str, run_id: str) -> AgentRunView:
+    async def resume(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        uncertain_action: Literal["retry", "skip"] | None = None,
+        conditions_confirmed: bool = False,
+    ) -> AgentRunView:
         """Recover a crashed run using only its frozen authorization snapshot."""
         run = await self._repository.get_run_owned(
             run_id=run_id,
             owner_id=str(owner_id),
         )
-        if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
+        if run.get("status") in TERMINAL_RUN_STATUSES:
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+        if run.get("status") == "paused":
+            termination = dict(run.get("termination") or {})
+            reason_code = str(termination.get("reason_code") or "")
+            if reason_code == "uncertain_paid_attempt" and uncertain_action is None:
+                return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+            if reason_code in {"authorization_required", "manual_approval_required"}:
+                if not conditions_confirmed:
+                    return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+            elif reason_code not in {
+                "uncertain_paid_attempt",
+                "concurrent_narrative_change",
+            }:
+                return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         return await self._execute_owned_run(
             run_id=run_id,
             owner_id=str(owner_id),
             resumed=True,
+            uncertain_action=uncertain_action,
         )
 
     async def cancel(self, *, owner_id: str, run_id: str) -> AgentRunView:
@@ -450,13 +477,32 @@ class AgentRuntime:
         )
         if run.get("status") in TERMINAL_RUN_STATUSES:
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
-        await self._terminate(
+        now = _aware(self._clock())
+        await self._repository.cancel_run(
             run_id=run_id,
             owner_id=str(owner_id),
-            status="cancelled",
-            reason_code="cancelled_by_user",
+            termination={
+                "status": "cancelled",
+                "category": "cancelled",
+                "reason_code": "cancelled_by_user",
+                "resumable": False,
+                "occurred_at": now,
+                "step_id": (
+                    str(run["active_step_id"])
+                    if run.get("active_step_id")
+                    else None
+                ),
+                "detail_code": "cancelled_by_user",
+            },
+            now=now,
+        )
+        await self._event(
+            run_id=run_id,
+            event_key="run-cancelled-cancelled_by_user",
+            event_type="run_terminated",
+            payload={"status": "cancelled", "reason_code": "cancelled_by_user"},
             step_id=(str(run["active_step_id"]) if run.get("active_step_id") else None),
-            now=_aware(self._clock()),
+            now=now,
         )
         return await self._run_view(run_id=run_id, owner_id=str(owner_id))
 
@@ -546,6 +592,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         resumed: bool,
+        uncertain_action: Literal["retry", "skip"] | None = None,
     ) -> AgentRunView:
         run = await self._repository.get_run_owned(
             run_id=run_id,
@@ -558,20 +605,36 @@ class AgentRuntime:
         now = _aware(self._clock())
 
         worker_id = uuid4().hex
-        await self._repository.acquire_lease(
+        leased = await self._repository.acquire_lease(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
             now=now,
             expires_at=now + timedelta(seconds=self._lease_seconds),
         )
+        lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
+            if run.get("status") == "paused":
+                should_continue = await self._resume_paused_checkpoint(
+                    run=run,
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    uncertain_action=uncertain_action,
+                    now=now,
+                )
+                if not should_continue:
+                    return await self._run_view(run_id=run_id, owner_id=owner_id)
             await self._repository.set_run_status(
                 run_id=run_id,
                 owner_id=owner_id,
-                expected=("ready", "running"),
+                expected=("ready", "running", "paused"),
                 status="running",
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 now=now,
+                fields={"termination": None},
             )
             if not resumed:
                 await self._event(
@@ -599,15 +662,104 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
             )
+        except AgentRuntimeStateConflict:
+            current = await self._repository.get_run_owned(
+                run_id=run_id,
+                owner_id=owner_id,
+            )
+            if (
+                current.get("status") == "running"
+                and int(current.get("lease_epoch") or 0) == lease_epoch
+            ):
+                raise
         finally:
             await self._repository.release_lease(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 now=_aware(self._clock()),
             )
         return await self._run_view(run_id=run_id, owner_id=owner_id)
+
+    async def _resume_paused_checkpoint(
+        self,
+        *,
+        run: Mapping[str, Any],
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        uncertain_action: Literal["retry", "skip"] | None,
+        now: datetime,
+    ) -> bool:
+        step_id = str(run.get("active_step_id") or "")
+        termination = dict(run.get("termination") or {})
+        if not step_id:
+            if termination.get("reason_code") == "concurrent_narrative_change":
+                return True
+            raise AgentRuntimeStateConflict("paused Agent run has no active step")
+        step = await self._repository.get_step_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+            step_id=step_id,
+        )
+        if step.get("status") != "paused":
+            raise AgentRuntimeStateConflict("paused Agent run checkpoint is inconsistent")
+        paused_from = str(step.get("paused_from_status") or "")
+        if paused_from not in {"planning", "policy_checked", "executing", "observed"}:
+            raise AgentRuntimeStateConflict("paused Agent step has no resumable checkpoint")
+
+        if termination.get("reason_code") == "uncertain_paid_attempt":
+            if uncertain_action is None:
+                return False
+            uncertain = [
+                dict(item)
+                for item in run.get("attempts") or []
+                if isinstance(item, Mapping) and item.get("state") == "uncertain"
+            ]
+            if len(uncertain) != 1:
+                raise AgentRuntimeStateConflict(
+                    "uncertain pause must reference exactly one frozen attempt"
+                )
+            await self._repository.resolve_uncertain_call(
+                run_id=run_id,
+                owner_id=owner_id,
+                call_key=str(uncertain[0]["call_key"]),
+                action=uncertain_action,
+                now=now,
+            )
+            if uncertain_action == "skip":
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status="paused",
+                    reason_code=(
+                        "planner_output_exhausted"
+                        if uncertain[0].get("kind") == "planner"
+                        else "tool_failure_exhausted"
+                    ),
+                    now=now,
+                )
+                return False
+
+        await self._repository.transition_step(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            expected="paused",
+            status=paused_from,
+            fields={"pause_reason": None, "paused_from_status": None},
+            now=now,
+        )
+        return True
 
     def _verify_runtime_snapshot(
         self,
@@ -645,6 +797,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
     ) -> None:
         while True:
             run = await self._repository.get_run_owned(
@@ -656,11 +809,85 @@ class AgentRuntime:
             authorization = dict(run.get("authorization") or {})
             authorization_digest = str(run["authorization_digest"])
             now = _aware(self._clock())
+            active_step_id = str(run.get("active_step_id") or "")
+            if active_step_id:
+                active_step = await self._repository.get_step_owned(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=active_step_id,
+                )
+                active_status = str(active_step.get("status") or "")
+                if active_status in {"completed", "failed"}:
+                    cleared = await self._repository.clear_active_step(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=active_step_id,
+                        now=now,
+                    )
+                    if not cleared:
+                        raise AgentRuntimeStateConflict(
+                            "terminal active Agent step could not be cleared"
+                        )
+                    ordinal = int(active_step.get("ordinal") or 0)
+                    if active_status == "failed":
+                        await self._terminate(
+                            run_id=run_id,
+                            owner_id=owner_id,
+                            worker_id=worker_id,
+                            lease_epoch=lease_epoch,
+                            status="failed",
+                            reason_code=str(
+                                active_step.get("failure_reason")
+                                or "invariant_violation"
+                            ),
+                            step_id=active_step_id,
+                            now=now,
+                        )
+                        return
+                    decision = dict(active_step.get("planner_decision") or {})
+                    kind = (
+                        "finish"
+                        if decision.get("kind") == "propose_finish"
+                        else "tool"
+                    )
+                    await self._event(
+                        run_id=run_id,
+                        event_key=f"step-{ordinal}-completed",
+                        event_type="step_completed",
+                        payload={
+                            "ordinal": ordinal,
+                            "status": "completed",
+                            "kind": kind,
+                        },
+                        step_id=active_step_id,
+                        now=now,
+                    )
+                    completion = dict(
+                        (active_step.get("observation") or {}).get("completion")
+                        or {}
+                    )
+                    if kind == "finish" and completion.get("satisfied") is True:
+                        await self._terminate(
+                            run_id=run_id,
+                            owner_id=owner_id,
+                            worker_id=worker_id,
+                            lease_epoch=lease_epoch,
+                            status="completed",
+                            reason_code="goal_satisfied",
+                            step_id=active_step_id,
+                            now=now,
+                        )
+                        return
+                    continue
             deadline_at = datetime.fromisoformat(str(authorization["deadline_at"]))
             if now >= _aware(deadline_at):
                 await self._terminate(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     status="failed",
                     reason_code="deadline_exceeded",
                     now=now,
@@ -673,6 +900,8 @@ class AgentRuntime:
                 await self._terminate(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     status="paused",
                     reason_code="concurrent_narrative_change",
                     now=now,
@@ -687,6 +916,8 @@ class AgentRuntime:
                 await self._terminate(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     status="failed",
                     reason_code="max_steps_exhausted",
                     now=now,
@@ -701,6 +932,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 now=now,
                 observation_cursor=len(observations),
                 observation_digest=_digest(observations),
@@ -720,6 +952,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step=step,
                 authorization=authorization,
                 authorization_digest=authorization_digest,
@@ -735,6 +968,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     authorization=authorization,
@@ -756,10 +990,12 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 decision=decision,
                 observations=observations,
+                authorization=authorization,
                 step_status=(
                     "policy_checked"
                     if str(step["status"]) == "planning"
@@ -775,6 +1011,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step: Mapping[str, Any],
         authorization: Mapping[str, Any],
         authorization_digest: str,
@@ -789,6 +1026,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     authorization=authorization,
@@ -799,6 +1037,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="planning",
                     reason_code="budget_exhausted",
@@ -809,9 +1049,23 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="planning",
                     reason_code="uncertain_paid_attempt",
+                    now=_aware(self._clock()),
+                )
+                return None
+            except _DeadlineExceeded:
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status="planning",
+                    reason_code="deadline_exceeded",
                     now=_aware(self._clock()),
                 )
                 return None
@@ -820,6 +1074,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="planning",
                     reason_code="planner_output_exhausted",
@@ -835,6 +1090,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
                     reason_code="invariant_violation",
@@ -845,6 +1101,8 @@ class AgentRuntime:
             await self._terminate(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 status="failed",
                 reason_code="invariant_violation",
                 step_id=step_id,
@@ -876,6 +1134,9 @@ class AgentRuntime:
         except (AgentRuntimePolicyViolation, ValueError, AssertionError):
             await self._repository.transition_step(
                 run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected=step_status,
                 status="failed",
@@ -892,12 +1153,15 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 now=_aware(self._clock()),
             )
             await self._terminate(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 status="failed",
                 reason_code="policy_violation",
                 step_id=step_id,
@@ -908,6 +1172,9 @@ class AgentRuntime:
         if step_status == "planning":
             await self._repository.transition_step(
                 run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected="planning",
                 status="policy_checked",
@@ -937,6 +1204,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         ordinal: int,
         authorization: Mapping[str, Any],
@@ -948,6 +1216,7 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             now=now,
         )
         descriptor = self._planner.descriptor
@@ -962,6 +1231,8 @@ class AgentRuntime:
             await self._repository.release_call_pre_dispatch(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 call_key=str(latest["call_key"]),
                 reason="process_interrupted_before_dispatch",
                 now=now,
@@ -978,15 +1249,37 @@ class AgentRuntime:
             if latest.get("state") == "uncertain":
                 raise _UncertainDispatchedCall()
             recover = getattr(self._planner, "recover", None)
-            recovered = (
-                await recover(idempotency_key=f"{run_id}:{step_id}:planner")
-                if callable(recover)
-                else None
-            )
+            try:
+                recovered = (
+                    await self._await_adapter(
+                        recover(idempotency_key=f"{run_id}:{step_id}:planner"),
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        authorization=authorization,
+                    )
+                    if callable(recover)
+                    else None
+                )
+            except _DeadlineExceeded:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    now=_aware(self._clock()),
+                )
+                raise
             if recovered is None:
                 await self._mark_uncertain(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=str(latest["call_key"]),
@@ -997,6 +1290,8 @@ class AgentRuntime:
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 call_key=str(latest["call_key"]),
@@ -1004,6 +1299,7 @@ class AgentRuntime:
                 usage=result.usage.model_dump(mode="python"),
                 now=now,
             )
+            self._raise_if_deadline_exceeded(authorization)
             await self._record_step_planned(
                 run_id=run_id,
                 step_id=step_id,
@@ -1032,6 +1328,7 @@ class AgentRuntime:
                     raise AgentRuntimeStateConflict("planner repairs are exhausted")
             else:
                 result = PlannerResult.model_validate(checkpoint)
+                self._raise_if_deadline_exceeded(authorization)
                 await self._record_step_planned(
                     run_id=run_id,
                     step_id=step_id,
@@ -1041,6 +1338,7 @@ class AgentRuntime:
                 )
                 return result
 
+        self._raise_if_deadline_exceeded(authorization)
         call_key = (
             base_call_key
             if not attempts
@@ -1050,6 +1348,7 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             call_key=call_key,
             call_kind="planner",
@@ -1069,25 +1368,47 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             call_key=call_key,
             now=now,
         )
         try:
-            raw_result = await self._planner.plan(
-                PlannerInput(
-                    goal=str(authorization["goal"]),
-                    scope=AgentScope.model_validate(authorization["scope"]),
-                    ordinal=ordinal,
-                    allowed_tools=tuple(authorization.get("tools") or []),
-                    observations=tuple(observations),
-                    authorization_digest=authorization_digest,
+            raw_result = await self._await_adapter(
+                self._planner.plan(
+                    PlannerInput(
+                        goal=str(authorization["goal"]),
+                        scope=AgentScope.model_validate(authorization["scope"]),
+                        ordinal=ordinal,
+                        allowed_tools=tuple(authorization.get("tools") or []),
+                        observations=tuple(observations),
+                        authorization_digest=authorization_digest,
+                    ),
+                    idempotency_key=f"{run_id}:{step_id}:planner",
                 ),
-                idempotency_key=f"{run_id}:{step_id}:planner",
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                authorization=authorization,
             )
+        except _DeadlineExceeded:
+            await self._mark_uncertain(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=call_key,
+                now=_aware(self._clock()),
+            )
+            raise
         except Exception:
             await self._mark_uncertain(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 call_key=call_key,
@@ -1100,6 +1421,8 @@ class AgentRuntime:
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 call_key=call_key,
@@ -1107,10 +1430,12 @@ class AgentRuntime:
                 result_checkpoint={"error_code": "planner_output_invalid"},
                 now=_aware(self._clock()),
             )
+            self._raise_if_deadline_exceeded(authorization)
             return await self._plan(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 authorization=authorization,
@@ -1120,6 +1445,8 @@ class AgentRuntime:
         await self._settle_runtime_call(
             run_id=run_id,
             owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             ordinal=ordinal,
             call_key=call_key,
@@ -1127,6 +1454,7 @@ class AgentRuntime:
             result_checkpoint=result.model_dump(mode="json"),
             now=_aware(self._clock()),
         )
+        self._raise_if_deadline_exceeded(authorization)
         await self._record_step_planned(
             run_id=run_id,
             step_id=step_id,
@@ -1142,6 +1470,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         ordinal: int,
         authorization: Mapping[str, Any],
@@ -1152,11 +1481,24 @@ class AgentRuntime:
         step_status: str,
     ) -> bool:
         now = _aware(self._clock())
+        if self._deadline_is_exceeded(authorization):
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="deadline_exceeded",
+                now=now,
+            )
+            return False
         if step_status == "observed":
             await self._complete_observed_step(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 kind="tool",
@@ -1168,6 +1510,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status=step_status,
                 reason_code="invariant_violation",
@@ -1181,6 +1524,8 @@ class AgentRuntime:
             await self._pause_step_and_run(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status=step_status,
                 reason_code="concurrent_narrative_change",
@@ -1191,6 +1536,7 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             now=now,
         )
         assert decision.tool is not None and decision.scope is not None
@@ -1211,6 +1557,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="executing",
                     reason_code="invariant_violation",
@@ -1228,6 +1575,8 @@ class AgentRuntime:
             await self._repository.release_call_pre_dispatch(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 call_key=str(latest["call_key"]),
                 reason="process_interrupted_before_dispatch",
                 now=now,
@@ -1243,6 +1592,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status=step_status,
                 reason_code="tool_failure_exhausted",
@@ -1258,6 +1608,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
                     reason_code="invariant_violation",
@@ -1284,6 +1635,7 @@ class AgentRuntime:
                         run_id=run_id,
                         owner_id=owner_id,
                         worker_id=worker_id,
+                        lease_epoch=lease_epoch,
                         step_id=step_id,
                         expected_step_status=step_status,
                         reason_code="tool_failure_exhausted",
@@ -1302,6 +1654,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
                     reason_code="uncertain_paid_attempt",
@@ -1309,15 +1663,46 @@ class AgentRuntime:
                 )
                 return False
             try:
-                recovered = await self._tools.recover(
-                    idempotency_key=invocation["idempotency_key"],
+                recovered = await self._await_adapter(
+                    self._tools.recover(
+                        idempotency_key=invocation["idempotency_key"],
+                    ),
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    authorization=authorization,
                 )
+            except _DeadlineExceeded:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=_aware(self._clock()),
+                )
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="deadline_exceeded",
+                    now=_aware(self._clock()),
+                )
+                return False
             except Exception:
                 recovered = None
             if recovered is None:
                 await self._mark_uncertain(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=call_key,
@@ -1326,6 +1711,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
                     reason_code="uncertain_paid_attempt",
@@ -1337,6 +1724,8 @@ class AgentRuntime:
                 await self._mark_uncertain(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=call_key,
@@ -1345,6 +1734,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
                     reason_code="uncertain_paid_attempt",
@@ -1354,6 +1745,8 @@ class AgentRuntime:
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 call_key=call_key,
@@ -1373,6 +1766,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     call_key=call_key,
                     call_kind="tool",
@@ -1384,6 +1778,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
                     reason_code="budget_exhausted",
@@ -1401,6 +1797,9 @@ class AgentRuntime:
             if step_status == "policy_checked":
                 await self._repository.transition_step(
                     run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected="policy_checked",
                     status="executing",
@@ -1412,6 +1811,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 call_key=call_key,
                 now=now,
             )
@@ -1424,24 +1824,55 @@ class AgentRuntime:
                 now=now,
             )
             try:
-                raw_result = await self._tools.execute(
-                    decision.tool,
-                    payload,
-                    context=RuntimeToolContext(
-                        owner_id=owner_id,
-                        novel_id=str(authorization["novel_id"]),
-                        run_id=run_id,
-                        step_id=step_id,
-                        scope=decision.scope,
-                        authorization_digest=authorization_digest,
+                raw_result = await self._await_adapter(
+                    self._tools.execute(
+                        decision.tool,
+                        payload,
+                        context=RuntimeToolContext(
+                            owner_id=owner_id,
+                            novel_id=str(authorization["novel_id"]),
+                            run_id=run_id,
+                            step_id=step_id,
+                            scope=decision.scope,
+                            authorization_digest=authorization_digest,
+                        ),
+                        idempotency_key=invocation["idempotency_key"],
                     ),
-                    idempotency_key=invocation["idempotency_key"],
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    authorization=authorization,
                 )
                 result = RuntimeToolResult.model_validate(raw_result)
+            except _DeadlineExceeded:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=_aware(self._clock()),
+                )
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="deadline_exceeded",
+                    now=_aware(self._clock()),
+                )
+                return False
             except Exception:
                 await self._mark_uncertain(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=call_key,
@@ -1450,6 +1881,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="executing",
                     reason_code="uncertain_paid_attempt",
@@ -1460,6 +1893,8 @@ class AgentRuntime:
                 await self._mark_uncertain(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=call_key,
@@ -1468,6 +1903,8 @@ class AgentRuntime:
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="executing",
                     reason_code="uncertain_paid_attempt",
@@ -1477,6 +1914,8 @@ class AgentRuntime:
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 call_key=call_key,
@@ -1489,6 +1928,7 @@ class AgentRuntime:
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     ordinal=ordinal,
                     authorization=authorization,
@@ -1505,6 +1945,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 ordinal=ordinal,
                 authorization=authorization,
@@ -1518,9 +1959,23 @@ class AgentRuntime:
             await self._pause_step_and_run(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status="executing",
                 reason_code="uncertain_paid_attempt",
+                now=_aware(self._clock()),
+            )
+            return False
+        if self._deadline_is_exceeded(authorization):
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status="executing",
+                reason_code="deadline_exceeded",
                 now=_aware(self._clock()),
             )
             return False
@@ -1531,6 +1986,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status="executing",
                 reason_code="invariant_violation",
@@ -1558,6 +2014,9 @@ class AgentRuntime:
         ).model_dump(mode="json")
         await self._repository.transition_step(
             run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             expected="executing",
             status="observed",
@@ -1583,6 +2042,8 @@ class AgentRuntime:
             await self._pause_step_and_run(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status="observed",
                 reason_code="authorization_required",
@@ -1594,6 +2055,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status="observed",
                 reason_code="tool_failure_exhausted",
@@ -1604,6 +2066,7 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             ordinal=ordinal,
             kind="tool",
@@ -1617,15 +2080,32 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         ordinal: int,
         decision: PlannerDecision,
         observations: list[dict[str, Any]],
+        authorization: Mapping[str, Any],
         step_status: str,
     ) -> bool:
+        if self._deadline_is_exceeded(authorization):
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="deadline_exceeded",
+                now=_aware(self._clock()),
+            )
+            return True
         if step_status == "policy_checked":
             await self._repository.transition_step(
                 run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected="policy_checked",
                 status="executing",
@@ -1635,29 +2115,65 @@ class AgentRuntime:
             step_status = "executing"
         if step_status == "executing":
             try:
+                run_snapshot = await self._repository.get_run_owned(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                )
                 completion = CompletionDecision.model_validate(
-                    await self._completion_policy.evaluate(
-                        run=await self._repository.get_run_owned(
-                            run_id=run_id,
-                            owner_id=owner_id,
+                    await self._await_adapter(
+                        self._completion_policy.evaluate(
+                            run=run_snapshot,
+                            observations=observations,
+                            proposal=decision.model_dump(mode="json"),
                         ),
-                        observations=observations,
-                        proposal=decision.model_dump(mode="json"),
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        authorization=authorization,
                     )
                 )
+            except _DeadlineExceeded:
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="deadline_exceeded",
+                    now=_aware(self._clock()),
+                )
+                return True
             except Exception:
                 await self._fail_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
+                    lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status="executing",
                     reason_code="invariant_violation",
                     now=_aware(self._clock()),
                 )
                 return True
+            if self._deadline_is_exceeded(authorization):
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="deadline_exceeded",
+                    now=_aware(self._clock()),
+                )
+                return True
             await self._repository.transition_step(
                 run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected="executing",
                 status="observed",
@@ -1682,6 +2198,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status=step_status,
                 reason_code="invariant_violation",
@@ -1693,6 +2210,7 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             ordinal=ordinal,
             kind="finish",
@@ -1703,6 +2221,8 @@ class AgentRuntime:
         await self._terminate(
             run_id=run_id,
             owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             status="completed",
             reason_code="goal_satisfied",
             step_id=step_id,
@@ -1730,6 +2250,8 @@ class AgentRuntime:
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         step_id: str,
         ordinal: int,
         call_key: str,
@@ -1740,6 +2262,8 @@ class AgentRuntime:
         await self._repository.settle_call(
             run_id=run_id,
             owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             call_key=call_key,
             usage=usage,
             result_checkpoint=result_checkpoint,
@@ -1777,6 +2301,8 @@ class AgentRuntime:
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         step_id: str,
         ordinal: int,
         call_key: str,
@@ -1785,6 +2311,8 @@ class AgentRuntime:
         await self._repository.mark_call_uncertain(
             run_id=run_id,
             owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             call_key=call_key,
             reason="dispatch_outcome_unknown",
             now=now,
@@ -1804,6 +2332,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         ordinal: int,
         kind: str,
@@ -1811,6 +2340,9 @@ class AgentRuntime:
     ) -> None:
         await self._repository.transition_step(
             run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             expected="observed",
             status="completed",
@@ -1821,6 +2353,7 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             now=now,
         )
@@ -1844,6 +2377,17 @@ class AgentRuntime:
             novel_id=str(authorization["novel_id"]),
         ))
         return current == int(authorization["baseline_narrative_revision"])
+
+    def _deadline_is_exceeded(self, authorization: Mapping[str, Any]) -> bool:
+        deadline = datetime.fromisoformat(str(authorization["deadline_at"]))
+        return _aware(self._clock()) >= _aware(deadline)
+
+    def _raise_if_deadline_exceeded(
+        self,
+        authorization: Mapping[str, Any],
+    ) -> None:
+        if self._deadline_is_exceeded(authorization):
+            raise _DeadlineExceeded()
 
     async def _planner_observations(
         self,
@@ -1871,23 +2415,73 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         now: datetime,
     ) -> None:
         ok = await self._repository.heartbeat_lease(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             now=now,
             expires_at=now + timedelta(seconds=self._lease_seconds),
         )
         if not ok:
             raise AgentRuntimeStateConflict("Agent Runtime lease expired")
 
+    async def _await_adapter(
+        self,
+        operation: Any,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        authorization: Mapping[str, Any],
+    ) -> Any:
+        """Keep the lease alive while an adapter awaits and fence late results."""
+        self._raise_if_deadline_exceeded(authorization)
+        task = asyncio.create_task(operation)
+        interval = max(0.05, min(float(self._lease_seconds) / 3.0, 5.0))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=interval)
+                if done:
+                    result = task.result()
+                    await self._heartbeat(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        now=_aware(self._clock()),
+                    )
+                    return result
+                if self._deadline_is_exceeded(authorization):
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                    raise _DeadlineExceeded()
+                await self._heartbeat(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    now=_aware(self._clock()),
+                )
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            raise
+
     async def _pause_step_and_run(
         self,
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         step_id: str,
         expected_step_status: str,
         reason_code: str,
@@ -1895,15 +2489,23 @@ class AgentRuntime:
     ) -> None:
         await self._repository.transition_step(
             run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             expected=expected_step_status,
             status="paused",
-            fields={"pause_reason": reason_code},
+            fields={
+                "pause_reason": reason_code,
+                "paused_from_status": expected_step_status,
+            },
             now=now,
         )
         await self._terminate(
             run_id=run_id,
             owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             status="paused",
             reason_code=reason_code,
             step_id=step_id,
@@ -1916,6 +2518,7 @@ class AgentRuntime:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         expected_step_status: str,
         reason_code: str,
@@ -1923,6 +2526,9 @@ class AgentRuntime:
     ) -> None:
         await self._repository.transition_step(
             run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             expected=expected_step_status,
             status="failed",
@@ -1933,12 +2539,15 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
+            lease_epoch=lease_epoch,
             step_id=step_id,
             now=now,
         )
         await self._terminate(
             run_id=run_id,
             owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             status="failed",
             reason_code=reason_code,
             step_id=step_id,
@@ -1950,6 +2559,8 @@ class AgentRuntime:
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         status: str,
         reason_code: str,
         now: datetime,
@@ -1975,6 +2586,8 @@ class AgentRuntime:
                 and reason_code in {
                     "authorization_required",
                     "manual_approval_required",
+                    "concurrent_narrative_change",
+                    "uncertain_paid_attempt",
                 }
             ),
             "occurred_at": now,
@@ -1986,6 +2599,8 @@ class AgentRuntime:
             owner_id=owner_id,
             expected=("ready", "running", "paused"),
             status=status,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
             now=now,
             fields={"termination": termination},
         )

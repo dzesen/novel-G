@@ -41,7 +41,13 @@ STEP_TRANSITIONS: dict[str, frozenset[str]] = {
     "policy_checked": frozenset({"executing", "observed", "paused", "failed"}),
     "executing": frozenset({"observed", "paused", "failed"}),
     "observed": frozenset({"completed", "paused", "failed"}),
-    "paused": frozenset({"planning", "policy_checked", "executing", "failed"}),
+    "paused": frozenset({
+        "planning",
+        "policy_checked",
+        "executing",
+        "observed",
+        "failed",
+    }),
     "completed": frozenset(),
     "failed": frozenset(),
 }
@@ -407,6 +413,8 @@ class AgentRuntimeRepository:
         owner_id: str,
         expected: Sequence[str],
         status: str,
+        worker_id: str,
+        lease_epoch: int,
         now: datetime,
         fields: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -417,6 +425,9 @@ class AgentRuntimeRepository:
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
                 "status": {"$in": [str(item) for item in expected]},
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
             },
             {"$set": update},
@@ -426,12 +437,66 @@ class AgentRuntimeRepository:
             raise AgentRuntimeStateConflict("Agent run status changed concurrently")
         return document
 
+    async def cancel_run(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        termination: Mapping[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Atomically cancel a run, invalidate its lease, and freeze in-flight calls."""
+        current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        if current.get("status") in {"completed", "failed", "cancelled", "superseded"}:
+            return current
+        has_dispatched = any(
+            isinstance(item, Mapping) and item.get("state") == "dispatched"
+            for item in current.get("attempts") or []
+        )
+        update: dict[str, Any] = {
+            "$set": {
+                "status": "cancelled",
+                "termination": deepcopy(dict(termination)),
+                "lease": None,
+                "has_uncertain_attempts": has_dispatched
+                or bool(current.get("has_uncertain_attempts")),
+                "updated_at": now,
+            },
+            "$inc": {"lease_epoch": 1},
+        }
+        array_filters = None
+        if has_dispatched:
+            update["$set"].update({
+                "attempts.$[attempt].state": "uncertain",
+                "attempts.$[attempt].uncertain_reason": "cancelled_while_dispatched",
+                "attempts.$[attempt].uncertain_at": now,
+            })
+            array_filters = [{"attempt.state": "dispatched"}]
+        document = await self.runs.find_one_and_update(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": {"$in": ["ready", "running", "paused"]},
+                "is_deleted": False,
+            },
+            update,
+            array_filters=array_filters,
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is not None:
+            return document
+        current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        if current.get("status") == "cancelled":
+            return current
+        raise AgentRuntimeStateConflict("Agent run cancellation changed concurrently")
+
     async def reserve_call(
         self,
         *,
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         call_key: str,
         call_kind: str,
@@ -459,6 +524,8 @@ class AgentRuntimeRepository:
         lease = run.get("lease") or {}
         if lease.get("worker_id") != str(worker_id) or lease.get("expires_at") <= now:
             raise AgentRuntimeLeaseUnavailable("Agent run lease is unavailable")
+        if int(run.get("lease_epoch") or 0) != int(lease_epoch):
+            raise AgentRuntimeLeaseUnavailable("Agent run lease epoch is stale")
 
         limits = dict((run.get("authorization") or {}).get("limits") or {})
         usage = dict(run.get("usage") or {})
@@ -501,6 +568,7 @@ class AgentRuntimeRepository:
                 "status": "running",
                 "lease.worker_id": str(worker_id),
                 "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
                 "attempts.call_key": {"$ne": str(call_key)},
                 f"usage.{call_field}": current_calls,
@@ -533,6 +601,7 @@ class AgentRuntimeRepository:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         call_key: str,
         now: datetime,
     ) -> dict[str, Any]:
@@ -543,6 +612,7 @@ class AgentRuntimeRepository:
                 "status": "running",
                 "lease.worker_id": str(worker_id),
                 "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "attempts": {"$elemMatch": {
                     "call_key": str(call_key),
                     "state": "reserved",
@@ -572,6 +642,8 @@ class AgentRuntimeRepository:
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         call_key: str,
         usage: Mapping[str, Any],
         now: datetime,
@@ -615,6 +687,10 @@ class AgentRuntimeRepository:
             {
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "running",
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "attempts": {"$elemMatch": {
                     "call_key": str(call_key),
                     "state": "dispatched",
@@ -659,6 +735,8 @@ class AgentRuntimeRepository:
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         call_key: str,
         reason: str,
         now: datetime,
@@ -682,6 +760,10 @@ class AgentRuntimeRepository:
             {
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "running",
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "attempts": {"$elemMatch": {
                     "call_key": str(call_key),
                     "state": "reserved",
@@ -713,6 +795,8 @@ class AgentRuntimeRepository:
         *,
         run_id: str,
         owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         call_key: str,
         reason: str,
         now: datetime,
@@ -722,6 +806,10 @@ class AgentRuntimeRepository:
             {
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "running",
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "attempts": {"$elemMatch": {
                     "call_key": str(call_key),
                     "state": "dispatched",
@@ -744,6 +832,78 @@ class AgentRuntimeRepository:
         run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
         attempt = _attempt_by_key(run, call_key)
         return bool(attempt and attempt.get("state") == "uncertain")
+
+    async def resolve_uncertain_call(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        call_key: str,
+        action: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Charge a frozen unknown attempt once after explicit user resolution."""
+        if action not in {"retry", "skip"}:
+            raise ValueError("uncertain action must be retry or skip")
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        attempt = _attempt_by_key(run, call_key)
+        if attempt is None:
+            raise AgentRuntimeStateConflict("uncertain Agent call was not found")
+        target_state = f"resolved_{action}"
+        if attempt.get("state") == target_state:
+            return attempt
+        if attempt.get("state") != "uncertain":
+            raise AgentRuntimeStateConflict("Agent call is not uncertain")
+        paid_bound = int(attempt.get("conservative_paid_attempts") or 0)
+        token_bound = int(attempt.get("conservative_tokens") or 0)
+        charged_usage = {
+            "paid_attempts": paid_bound,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": token_bound,
+        }
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "paused",
+                "attempts": {"$elemMatch": {
+                    "call_key": str(call_key),
+                    "state": "uncertain",
+                }},
+                "paid_attempts_reserved": {"$gte": paid_bound},
+                "tokens_reserved": {"$gte": token_bound},
+                "is_deleted": False,
+            },
+            {
+                "$inc": {
+                    "paid_attempts_reserved": -paid_bound,
+                    "tokens_reserved": -token_bound,
+                    "usage.paid_attempts": paid_bound,
+                    "usage.total_tokens": token_bound,
+                },
+                "$set": {
+                    "attempts.$[attempt].state": target_state,
+                    "attempts.$[attempt].usage": charged_usage,
+                    "attempts.$[attempt].resolved_at": now,
+                    "attempts.$[attempt].resolution_action": action,
+                    "has_uncertain_attempts": False,
+                    "updated_at": now,
+                },
+            },
+            array_filters=[{"attempt.call_key": str(call_key)}],
+        )
+        if result.modified_count != 1:
+            current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+            resolved = _attempt_by_key(current, call_key)
+            if resolved is not None and resolved.get("state") == target_state:
+                return resolved
+            raise AgentRuntimeStateConflict("uncertain Agent call resolution changed")
+        current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        resolved = _attempt_by_key(current, call_key)
+        if resolved is None:
+            raise AgentRuntimeStateConflict("resolved Agent call was not found")
+        return resolved
 
     async def acquire_lease(
         self,
@@ -792,6 +952,7 @@ class AgentRuntimeRepository:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         now: datetime,
         expires_at: datetime,
     ) -> bool:
@@ -799,8 +960,10 @@ class AgentRuntimeRepository:
             {
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "running",
                 "lease.worker_id": str(worker_id),
                 "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
             },
             {"$set": {
@@ -817,6 +980,7 @@ class AgentRuntimeRepository:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         now: datetime,
     ) -> bool:
         result = await self.runs.update_one(
@@ -824,6 +988,7 @@ class AgentRuntimeRepository:
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
                 "lease.worker_id": str(worker_id),
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
             },
             {"$set": {"lease": None, "updated_at": now}},
@@ -836,6 +1001,7 @@ class AgentRuntimeRepository:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         now: datetime,
         observation_cursor: int,
         observation_digest: str,
@@ -845,7 +1011,24 @@ class AgentRuntimeRepository:
         run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
         seed = deepcopy(run.get("active_step_seed"))
         if run.get("active_step_id") and isinstance(seed, Mapping):
-            return await self._upsert_step_from_seed(run, dict(seed))
+            step = await self._upsert_step_from_seed(run, dict(seed))
+            if step.get("status") not in {"completed", "failed"}:
+                adopted = await self.steps.find_one_and_update(
+                    {
+                        "_id": str(step["step_id"]),
+                        "run_id": run_object_id,
+                        "status": {"$nin": ["completed", "failed"]},
+                        "is_deleted": False,
+                    },
+                    {"$set": {"lease_epoch": int(lease_epoch), "updated_at": now}},
+                    return_document=ReturnDocument.AFTER,
+                )
+                if adopted is None:
+                    raise AgentRuntimeStateConflict(
+                        "active Agent step could not adopt the current lease"
+                    )
+                return adopted
+            return step
 
         ordinal = int(run.get("next_ordinal") or 0)
         step_id = uuid5(STEP_NAMESPACE, f"{run_id}:{ordinal}").hex
@@ -865,6 +1048,7 @@ class AgentRuntimeRepository:
                 "next_ordinal": ordinal,
                 "lease.worker_id": str(worker_id),
                 "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
             },
             {
@@ -883,7 +1067,16 @@ class AgentRuntimeRepository:
             if current.get("active_step_id") and isinstance(current_seed, Mapping):
                 return await self._upsert_step_from_seed(current, dict(current_seed))
             raise AgentRuntimeStateConflict("Agent step could not be claimed")
-        return await self._upsert_step_from_seed(claimed, seed)
+        step = await self._upsert_step_from_seed(claimed, seed)
+        await self.steps.update_one(
+            {"_id": str(step["step_id"]), "is_deleted": False},
+            {"$set": {"lease_epoch": int(lease_epoch), "updated_at": now}},
+        )
+        return await self.get_step_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+            step_id=str(step["step_id"]),
+        )
 
     async def _upsert_step_from_seed(
         self,
@@ -910,6 +1103,7 @@ class AgentRuntimeRepository:
             "usage_delta": {},
             "revision_before": run.get("expected_narrative_revision"),
             "revision_after": run.get("expected_narrative_revision"),
+            "lease_epoch": int(run.get("lease_epoch") or 0),
             "created_at": created_at,
             "updated_at": created_at,
             "is_deleted": False,
@@ -929,6 +1123,9 @@ class AgentRuntimeRepository:
         self,
         *,
         run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
         step_id: str,
         expected: str,
         status: str,
@@ -944,11 +1141,33 @@ class AgentRuntimeRepository:
             raise ValueError(f"Agent step identity fields are immutable: {sorted(overlap)}")
         update = deepcopy(dict(fields))
         update.update({"status": str(status), "updated_at": now})
+        lease = await self.runs.find_one({
+            "_id": _required_object_id(run_id, "run_id"),
+            "owner_id": _required_object_id(owner_id, "owner_id"),
+            "status": {"$in": ["running", "paused"]},
+            "lease.worker_id": str(worker_id),
+            "lease.expires_at": {"$gt": now},
+            "lease_epoch": int(lease_epoch),
+            "is_deleted": False,
+        })
+        if lease is None:
+            raise AgentRuntimeStateConflict("Agent step lease fence is stale")
+        if str(expected) == "paused":
+            await self.steps.update_one(
+                {
+                    "_id": str(step_id),
+                    "run_id": _required_object_id(run_id, "run_id"),
+                    "status": "paused",
+                    "is_deleted": False,
+                },
+                {"$set": {"lease_epoch": int(lease_epoch), "updated_at": now}},
+            )
         document = await self.steps.find_one_and_update(
             {
                 "_id": str(step_id),
                 "run_id": _required_object_id(run_id, "run_id"),
                 "status": str(expected),
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
             },
             {"$set": update},
@@ -964,6 +1183,7 @@ class AgentRuntimeRepository:
         run_id: str,
         owner_id: str,
         worker_id: str,
+        lease_epoch: int,
         step_id: str,
         now: datetime,
     ) -> bool:
@@ -980,7 +1200,10 @@ class AgentRuntimeRepository:
                 "_id": _required_object_id(run_id, "run_id"),
                 "owner_id": _required_object_id(owner_id, "owner_id"),
                 "active_step_id": str(step_id),
+                "status": {"$in": ["running", "paused"]},
                 "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
                 "is_deleted": False,
             },
             {"$set": {
