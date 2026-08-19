@@ -139,10 +139,15 @@ def _requires_attempt_accounting(
     *,
     authorization_revision: Literal[0, 1],
     attempt: Mapping[str, Any],
+    is_live: bool = False,
 ) -> bool:
     raw_revision = attempt.get("accounting_revision")
     if raw_revision is None:
-        return authorization_revision == 1
+        return authorization_revision == 1 or (
+            is_live
+            and attempt.get("state")
+            in {"settled", "resolved_retry", "resolved_skip"}
+        )
     if (
         isinstance(raw_revision, bool)
         or not isinstance(raw_revision, int)
@@ -550,6 +555,35 @@ def _attempt_accounted_event_projection(
             "state": state,
             "attempt_digest": _digest(projected),
         },
+    )
+
+
+def _attempt_accounted_event_matches(
+    existing: Mapping[str, Any],
+    *,
+    step_id: str,
+    ordinal: int,
+    attempt: Mapping[str, Any],
+) -> bool:
+    _, event_type, current_payload = _attempt_accounted_event_projection(
+        ordinal=ordinal,
+        attempt=attempt,
+    )
+    compatible_payloads = [current_payload]
+    if attempt.get("accounting_revision") == 1:
+        legacy_attempt = dict(attempt)
+        legacy_attempt.pop("accounting_revision")
+        compatible_payloads.append(
+            _attempt_accounted_event_projection(
+                ordinal=ordinal,
+                attempt=legacy_attempt,
+            )[2]
+        )
+    return bool(
+        existing.get("schema_version") == "agent_runtime_event.v1"
+        and existing.get("type") == event_type
+        and str(existing.get("step_id") or "") == step_id
+        and (existing.get("payload") or {}) in compatible_payloads
     )
 
 
@@ -1158,6 +1192,13 @@ class AgentRuntime:
             return await self._run_view(run_id=run_id, owner_id=owner_id)
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
+            await self._repository.require_live_attempt_accounting(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+            )
             await self._archive_terminal_step_attempts(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1250,6 +1291,11 @@ class AgentRuntime:
             raise AgentRuntimeStateConflict(
                 "Agent attempt ledger cannot repair its audit projection"
             )
+        live_attempt_call_keys = {
+            str(attempt.get("call_key") or "")
+            for attempt in run.get("attempts") or []
+            if isinstance(attempt, Mapping)
+        }
         try:
             accounting_call_keys = {
                 str(attempt.get("call_key") or "")
@@ -1257,6 +1303,10 @@ class AgentRuntime:
                 if _requires_attempt_accounting(
                     authorization_revision=accounting_revision,
                     attempt=attempt,
+                    is_live=(
+                        str(attempt.get("call_key") or "")
+                        in live_attempt_call_keys
+                    ),
                 )
             }
         except ValueError as exc:
@@ -1275,6 +1325,10 @@ class AgentRuntime:
                 attempt for attempt in attempts if attempt.get("kind") == "tool"
             ]
             for attempt in planner_attempts:
+                call_key = str(attempt.get("call_key") or "")
+                existing_accounting = event_by_key.get(
+                    f"{call_key}-accounted-v1"
+                )
                 await self._repair_attempt_events(
                     run_id=run_id,
                     step_id=step_id,
@@ -1283,8 +1337,16 @@ class AgentRuntime:
                     decision=None,
                     invocation=None,
                     record_accounting=(
-                        str(attempt.get("call_key") or "")
-                        in accounting_call_keys
+                        call_key in accounting_call_keys
+                        and (
+                            existing_accounting is None
+                            or not _attempt_accounted_event_matches(
+                                existing_accounting,
+                                step_id=step_id,
+                                ordinal=ordinal,
+                                attempt=attempt,
+                            )
+                        )
                     ),
                     now=now,
                 )
@@ -1324,6 +1386,10 @@ class AgentRuntime:
                 else None
             )
             for attempt in tool_attempts:
+                call_key = str(attempt.get("call_key") or "")
+                existing_accounting = event_by_key.get(
+                    f"{call_key}-accounted-v1"
+                )
                 await self._repair_attempt_events(
                     run_id=run_id,
                     step_id=step_id,
@@ -1332,8 +1398,16 @@ class AgentRuntime:
                     decision=decision,
                     invocation=invocation,
                     record_accounting=(
-                        str(attempt.get("call_key") or "")
-                        in accounting_call_keys
+                        call_key in accounting_call_keys
+                        and (
+                            existing_accounting is None
+                            or not _attempt_accounted_event_matches(
+                                existing_accounting,
+                                step_id=step_id,
+                                ordinal=ordinal,
+                                attempt=attempt,
+                            )
+                        )
                     ),
                     now=now,
                 )
@@ -1369,14 +1443,16 @@ class AgentRuntime:
                     )
                 )
                 existing = event_by_key.get(event_key)
-                if existing is not None and accounting_revision == 0:
+                if accounting_revision == 0:
                     legacy_payload = _ledger_sealed_step_completed_event_projection(
                         ordinal=ordinal,
                         step=step,
                         kind=kind,
                         attempts=attempts,
                     )[2]
-                    if (
+                    if existing is None:
+                        event_payload = legacy_payload
+                    elif (
                         existing.get("schema_version")
                         == "agent_runtime_event.v1"
                         and existing.get("type") == event_type
@@ -1599,6 +1675,11 @@ class AgentRuntime:
         )
         if not attempts_valid:
             add_violation("attempt_event_identity_mismatch")
+        live_attempt_call_keys = {
+            str(attempt.get("call_key") or "")
+            for attempt in run.get("attempts") or []
+            if isinstance(attempt, Mapping)
+        }
         event_positions_by_step: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
         derived_status = "ready"
         run_event_started = False
@@ -1751,6 +1832,7 @@ class AgentRuntime:
                     accounting_required = _requires_attempt_accounting(
                         authorization_revision=accounting_revision,
                         attempt=attempt,
+                        is_live=call_key in live_attempt_call_keys,
                     )
                 except ValueError:
                     add_violation("attempt_event_identity_mismatch")
@@ -1791,7 +1873,14 @@ class AgentRuntime:
                     and chain_positions[0] <= prior_attempt_position
                 ):
                     add_violation("step_event_order_mismatch")
-                prior_attempt_position = chain_positions[-1]
+                core_positions = [
+                    event_position_by_key[key]
+                    for key in chain
+                    if key in event_position_by_key
+                    and not key.endswith("-accounted-v1")
+                ]
+                if core_positions:
+                    prior_attempt_position = core_positions[-1]
 
             decision: PlannerDecision | None = None
             try:
@@ -1860,11 +1949,12 @@ class AgentRuntime:
                     accounted_key = f"{attempt['call_key']}-accounted-v1"
                     accounted_event = event_by_key.get(accounted_key)
                     if accounted_event is not None:
-                        expected_payload = _attempt_accounted_event_projection(
+                        if not _attempt_accounted_event_matches(
+                            accounted_event,
+                            step_id=step_id,
                             ordinal=ordinal,
                             attempt=attempt,
-                        )[2]
-                        if (accounted_event.get("payload") or {}) != expected_payload:
+                        ):
                             add_violation("attempt_ledger_mismatch")
 
             planned_positions = positions_by_type.get("step_planned", [])
@@ -2473,6 +2563,13 @@ class AgentRuntime:
         )
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
+            await self._repository.require_live_attempt_accounting(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+            )
             await self._archive_terminal_step_attempts(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -3086,12 +3183,16 @@ class AgentRuntime:
                 authorization=authorization,
             ):
                 if active_step_id:
-                    unresolved = [
+                    active_attempts = [
                         attempt
                         for attempt in run.get("attempts") or []
                         if isinstance(attempt, Mapping)
                         and attempt.get("step_id") == active_step_id
-                        and attempt.get("state") in {"dispatched", "uncertain"}
+                    ]
+                    unresolved = [
+                        attempt
+                        for attempt in active_attempts
+                        if attempt.get("state") in {"dispatched", "uncertain"}
                     ]
                     reason_code = "concurrent_narrative_change"
                     if unresolved:
@@ -3108,6 +3209,27 @@ class AgentRuntime:
                                 now=now,
                             )
                         reason_code = "uncertain_paid_attempt"
+                    else:
+                        for attempt in active_attempts:
+                            if attempt.get("state") != "reserved":
+                                continue
+                            released = (
+                                await self._repository.release_call_pre_dispatch(
+                                    run_id=run_id,
+                                    owner_id=owner_id,
+                                    worker_id=worker_id,
+                                    lease_epoch=lease_epoch,
+                                    call_key=str(attempt["call_key"]),
+                                    reason=(
+                                        "narrative_revision_changed_before_dispatch"
+                                    ),
+                                    now=now,
+                                )
+                            )
+                            if not released:
+                                raise AgentRuntimeStateConflict(
+                                    "pre-dispatch Agent call could not be released"
+                                )
                     await self._pause_step_and_run(
                         run_id=run_id,
                         owner_id=owner_id,

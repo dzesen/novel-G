@@ -30,6 +30,11 @@ SUCCESSOR_HANDOFF_TTL_SECONDS = 30
 # call counters, so each adapter kind can additionally retain 20 such entries.
 # These values mirror the V1 schema maxima and are locked by a contract test.
 MAX_ATTEMPT_LEDGER_ENTRIES_PER_STEP = 2_040
+CHARGED_ATTEMPT_STATES = frozenset({
+    "settled",
+    "resolved_retry",
+    "resolved_skip",
+})
 
 
 class _EventPayload(BaseModel):
@@ -363,6 +368,18 @@ def project_agent_runtime_attempt_ledger_entry(
         return projected
     except (TypeError, ValueError, ValidationError) as exc:
         raise ValueError("Agent attempt cannot enter the terminal ledger") from exc
+
+
+def _seal_archived_attempt_accounting(
+    attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    projected = dict(attempt)
+    if (
+        projected.get("state") in CHARGED_ATTEMPT_STATES
+        and projected.get("accounting_revision") is None
+    ):
+        projected["accounting_revision"] = 1
+    return projected
 
 
 def _event_matches(
@@ -1406,15 +1423,27 @@ class AgentRuntimeRepository:
             raw_ledger = []
         if not isinstance(raw_ledger, list):
             raise AgentRuntimeStateConflict("Agent step attempt ledger is invalid")
+        overlapping_call_keys = {
+            str(raw_attempt.get("call_key") or "")
+            for raw_attempt in run.get("attempts") or []
+            if isinstance(raw_attempt, Mapping)
+            and raw_attempt.get("step_id") == str(step_id)
+        }
         merged: list[dict[str, Any]] = []
         positions: dict[str, int] = {}
         try:
             for raw_entry in raw_ledger:
                 if not isinstance(raw_entry, Mapping):
                     raise ValueError("attempt ledger entry must be an object")
-                projected = project_agent_runtime_attempt_ledger_entry(raw_entry)
-                if dict(raw_entry) != projected:
+                canonical = project_agent_runtime_attempt_ledger_entry(raw_entry)
+                if dict(raw_entry) != canonical:
                     raise ValueError("attempt ledger entry is not canonical")
+                call_key = str(canonical["call_key"])
+                projected = (
+                    _seal_archived_attempt_accounting(canonical)
+                    if call_key in overlapping_call_keys
+                    else canonical
+                )
                 call_key = str(projected["call_key"])
                 if call_key in positions:
                     raise ValueError("attempt ledger call_key is duplicated")
@@ -1427,7 +1456,9 @@ class AgentRuntimeRepository:
                     or raw_attempt.get("step_id") != str(step_id)
                 ):
                     continue
-                projected = project_agent_runtime_attempt_ledger_entry(raw_attempt)
+                projected = _seal_archived_attempt_accounting(
+                    project_agent_runtime_attempt_ledger_entry(raw_attempt)
+                )
                 call_key = str(projected["call_key"])
                 previous_position = positions.get(call_key)
                 if previous_position is None:
@@ -1482,6 +1513,43 @@ class AgentRuntimeRepository:
                 "terminal Agent step attempt archive lost its run lease"
             )
         return {**step, "attempt_ledger": merged, "updated_at": now}
+
+    async def require_live_attempt_accounting(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Version charged live attempts before repairing their audit events."""
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": {"$in": ["ready", "running", "paused"]},
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "attempts.$[attempt].accounting_revision": 1,
+                    "updated_at": now,
+                },
+            },
+            array_filters=[{
+                "attempt.state": {"$in": sorted(CHARGED_ATTEMPT_STATES)},
+                "attempt.accounting_revision": {"$exists": False},
+            }],
+        )
+        if result.matched_count != 1:
+            raise AgentRuntimeStateConflict(
+                "live Agent attempt accounting lost its run lease"
+            )
+        return await self.get_run_owned(run_id=run_id, owner_id=owner_id)
 
     async def release_call_pre_dispatch(
         self,
