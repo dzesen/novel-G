@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -23,6 +24,35 @@ RuntimeObservationStatus = Literal[
 V1_RUNTIME_EFFECT_CLASSES = frozenset({"read_only", "paid_read", "proposal_only"})
 V1_RUNTIME_PROPOSAL_KINDS = frozenset({"chapter_prose_candidate"})
 V1_RUNTIME_CHANGE_CLASSES = frozenset({"temporary_candidate"})
+MAX_PLANNER_VIEW_BYTES = 16_384
+MAX_RUNTIME_RESULT_PROJECTION_BYTES = 262_144
+
+
+def _json_size(value: Any, *, label: str) -> int:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be JSON serializable") from exc
+    return len(encoded)
+
+
+def _validate_bounded_projection(
+    *,
+    planner_view: dict[str, Any],
+    result_projection: dict[str, Any],
+) -> None:
+    if _json_size(planner_view, label="planner_view") > MAX_PLANNER_VIEW_BYTES:
+        raise ValueError("planner_view exceeds the Runtime v1 byte limit")
+    if (
+        _json_size(result_projection, label="result projection")
+        > MAX_RUNTIME_RESULT_PROJECTION_BYTES
+    ):
+        raise ValueError("result projection exceeds the Runtime v1 byte limit")
 
 
 class _StrictModel(BaseModel):
@@ -197,6 +227,17 @@ class RuntimeToolResult(_StrictModel):
     usage: RuntimeCallUsage = Field(default_factory=RuntimeCallUsage)
     error_summary: str | None = Field(default=None, max_length=1_000)
 
+    @model_validator(mode="after")
+    def validate_projection_size(self) -> "RuntimeToolResult":
+        _validate_bounded_projection(
+            planner_view=self.planner_view,
+            result_projection=self.model_dump(
+                mode="json",
+                exclude={"planner_view"},
+            ),
+        )
+        return self
+
 
 class RuntimeObservation(_StrictModel):
     schema_version: Literal["agent_runtime_observation.v1"] = (
@@ -220,6 +261,17 @@ class RuntimeObservation(_StrictModel):
     usage: RuntimeCallUsage = Field(default_factory=RuntimeCallUsage)
     error_summary: str | None = Field(default=None, max_length=1_000)
 
+    @model_validator(mode="after")
+    def validate_projection_size(self) -> "RuntimeObservation":
+        _validate_bounded_projection(
+            planner_view=self.planner_view,
+            result_projection=self.model_dump(
+                mode="json",
+                exclude={"planner_view"},
+            ),
+        )
+        return self
+
 
 class CompletionDecision(_StrictModel):
     schema_version: Literal["agent_runtime_completion_decision.v1"] = (
@@ -228,6 +280,15 @@ class CompletionDecision(_StrictModel):
     satisfied: bool
     reason_code: str = Field(min_length=1, max_length=160)
     planner_view: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_planner_view_size(self) -> "CompletionDecision":
+        if (
+            _json_size(self.planner_view, label="planner_view")
+            > MAX_PLANNER_VIEW_BYTES
+        ):
+            raise ValueError("planner_view exceeds the Runtime v1 byte limit")
+        return self
 
 
 class AgentRuntimeLimits(_StrictModel):

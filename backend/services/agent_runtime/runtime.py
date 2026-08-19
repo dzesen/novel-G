@@ -15,6 +15,7 @@ from bson import ObjectId
 from backend.db.errors import NotFoundError
 from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeBudgetExceeded,
+    AgentRuntimeCheckpointPending,
     AgentRuntimeReadinessConflict,
     AgentRuntimeRepository,
     AgentRuntimeStateConflict,
@@ -73,6 +74,7 @@ LINEAGE_LIMIT_FIELDS = (
 REPLAN_FEEDBACK_REASONS = frozenset({
     "scope_reference_invalid",
     "tool_input_invalid",
+    "tool_output_invalid",
 })
 
 
@@ -126,13 +128,75 @@ def _tool_snapshot(descriptor: RuntimeToolDescriptor) -> dict[str, Any]:
     }
 
 
+def _frozen_tool_snapshot(
+    authorization: Mapping[str, Any],
+    reference: RuntimeToolReference,
+) -> dict[str, Any]:
+    expected_reference = reference.model_dump(mode="json")
+    snapshot = next((
+        dict(item)
+        for item in authorization.get("tools") or []
+        if isinstance(item, Mapping)
+        and item.get("reference") == expected_reference
+    ), None)
+    if snapshot is None:
+        raise ValueError("frozen Tool descriptor was not found")
+    return snapshot
+
+
+def _validation_evidence(
+    *,
+    reason_code: str,
+    decision: PlannerDecision,
+    authorization: Mapping[str, Any],
+    authorization_digest: str,
+    subject: Any,
+) -> dict[str, Any]:
+    check_by_reason = {
+        "tool_input_invalid": "tool_input_schema",
+        "tool_output_invalid": "tool_output_schema",
+        "scope_reference_invalid": "scope_reference",
+    }
+    check = check_by_reason.get(reason_code)
+    if check is None:
+        raise ValueError(f"unsupported validation evidence: {reason_code}")
+    contract_digest = str(authorization_digest)
+    if reason_code in {"tool_input_invalid", "tool_output_invalid"}:
+        if decision.tool is None:
+            raise ValueError("Tool validation evidence requires a Tool decision")
+        descriptor = _frozen_tool_snapshot(authorization, decision.tool)
+        digest_field = (
+            "input_schema_digest"
+            if reason_code == "tool_input_invalid"
+            else "output_schema_digest"
+        )
+        contract_digest = str(descriptor.get(digest_field) or "")
+        if len(contract_digest) != 64:
+            raise ValueError("frozen Tool Schema digest is invalid")
+    return {
+        "schema_version": "agent_runtime_validation_evidence.v1",
+        "check": check,
+        "outcome": "invalid",
+        "subject_digest": _digest(subject),
+        "contract_digest": contract_digest,
+        "authorization_digest": str(authorization_digest),
+    }
+
+
 def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "step_id": str(step.get("step_id") or ""),
         "ordinal": int(step.get("ordinal") or 0),
         "status": str(step.get("status") or ""),
+        "input_observation_cursor": int(
+            step.get("input_observation_cursor") or 0
+        ),
+        "input_observation_digest": str(
+            step.get("input_observation_digest") or ""
+        ),
         "planner_decision": step.get("planner_decision"),
         "policy_decision": step.get("policy_decision"),
+        "validation_evidence": step.get("validation_evidence"),
         "tool_invocation": step.get("tool_invocation"),
         "observation": step.get("observation"),
         "usage_delta": step.get("usage_delta"),
@@ -316,6 +380,12 @@ class AgentRuntime:
             raise ValueError("readiness contains an unknown Runtime v1 effect class")
         if not allowed_changes.issubset(V1_RUNTIME_CHANGE_CLASSES):
             raise ValueError("readiness contains an unknown Runtime v1 change class")
+        if not set(self._planner.descriptor.external_data_categories).issubset(
+            allowed_external
+        ):
+            raise ValueError(
+                "Planner external-data category is not allowed by readiness"
+            )
         for reference in request.allowed_tools:
             descriptor = self._tools.describe(reference)
             if descriptor.reference != reference:
@@ -452,7 +522,11 @@ class AgentRuntime:
             raise AgentRuntimeReadinessConflict(
                 "lineage source does not match novel, goal, and scope"
             )
-        if source.get("has_uncertain_attempts") is True:
+        if source.get("has_uncertain_attempts") is True or any(
+            isinstance(item, Mapping)
+            and item.get("state") in {"dispatched", "uncertain"}
+            for item in source.get("attempts") or []
+        ):
             raise AgentRuntimeReadinessConflict(
                 "lineage source has an unresolved uncertain paid attempt"
             )
@@ -472,6 +546,37 @@ class AgentRuntime:
         if source.get("status") != "paused" or source.get("successor_run_id"):
             raise AgentRuntimeReadinessConflict(
                 "predecessor must be paused without an existing successor"
+            )
+        termination = dict(source.get("termination") or {})
+        reason_code = str(termination.get("reason_code") or "")
+        active_step_id = str(source.get("active_step_id") or "")
+        active_step = next((
+            item
+            for item in source_steps
+            if str(item.get("step_id") or "") == active_step_id
+        ), None)
+        canonical_active_pause = bool(
+            active_step_id
+            and isinstance(active_step, Mapping)
+            and active_step.get("status") == "paused"
+            and active_step.get("pause_reason") == reason_code
+            and active_step.get("paused_from_status")
+            in {"planning", "policy_checked", "executing", "observed"}
+        )
+        if (
+            termination.get("status") != "paused"
+            or reason_code == "uncertain_paid_attempt"
+            or (
+                active_step_id
+                and not canonical_active_pause
+            )
+            or (
+                not active_step_id
+                and reason_code != "concurrent_narrative_change"
+            )
+        ):
+            raise AgentRuntimeReadinessConflict(
+                "predecessor paused checkpoint is not canonical"
             )
         previous_lineage = source_authorization.get("lineage")
         previous_actual = (
@@ -563,8 +668,6 @@ class AgentRuntime:
         )
         run = binding.run
         run_id = str(run["_id"])
-        if binding.replayed:
-            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         if run.get("predecessor_run_id"):
             predecessor_id = str(run["predecessor_run_id"])
             await self._event(
@@ -578,6 +681,8 @@ class AgentRuntime:
                 },
                 now=now,
             )
+        if binding.replayed:
+            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
             await self._repair_projection_audit(
                 run_id=run_id,
@@ -655,10 +760,37 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=normalized_owner_id,
             )
+        try:
+            return await self._commit_cancel_projection(
+                run_id=run_id,
+                owner_id=normalized_owner_id,
+            )
+        except AgentRuntimeCheckpointPending:
+            repaired = await self._repair_checkpoint_before_cancel(
+                run_id=run_id,
+                owner_id=normalized_owner_id,
+            )
+            if repaired.status != "paused":
+                return repaired
+            return await self._commit_cancel_projection(
+                run_id=run_id,
+                owner_id=normalized_owner_id,
+            )
+
+    async def _commit_cancel_projection(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+    ) -> AgentRunView:
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
         now = _aware(self._clock())
         await self._repository.cancel_run(
             run_id=run_id,
-            owner_id=normalized_owner_id,
+            owner_id=owner_id,
             termination={
                 "status": "cancelled",
                 "category": "cancelled",
@@ -676,10 +808,69 @@ class AgentRuntime:
         )
         await self._repair_projection_audit(
             run_id=run_id,
-            owner_id=normalized_owner_id,
+            owner_id=owner_id,
             now=now,
         )
-        return await self._run_view(run_id=run_id, owner_id=normalized_owner_id)
+        return await self._run_view(run_id=run_id, owner_id=owner_id)
+
+    async def _repair_checkpoint_before_cancel(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+    ) -> AgentRunView:
+        """Project a committed pause/failure/success before honoring cancellation."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        step_id = str(run.get("active_step_id") or "")
+        uncertain_action: Literal["retry", "skip"] | None = None
+        if step_id:
+            resolved = [
+                str(item.get("state") or "")
+                for item in run.get("attempts") or []
+                if isinstance(item, Mapping)
+                and item.get("step_id") == step_id
+                and item.get("state") in {"resolved_retry", "resolved_skip"}
+            ]
+            if resolved:
+                uncertain_action = (
+                    "retry" if resolved[-1] == "resolved_retry" else "skip"
+                )
+        now = _aware(self._clock())
+        worker_id = uuid4().hex
+        leased = await self._repository.acquire_lease(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            now=now,
+            expires_at=now + timedelta(seconds=self._lease_seconds),
+        )
+        lease_epoch = int(leased.get("lease_epoch") or 0)
+        try:
+            await self._repair_checkpoint_projection(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                uncertain_action=uncertain_action,
+                now=now,
+            )
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=owner_id,
+                now=now,
+            )
+        finally:
+            await self._repository.release_lease(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=_aware(self._clock()),
+            )
+        return await self._run_view(run_id=run_id, owner_id=owner_id)
 
     async def _repair_projection_audit(
         self,
@@ -1341,24 +1532,46 @@ class AgentRuntime:
                     reason_code = str(
                         (stored_observation or {}).get("reason_code") or ""
                     )
+                    validation_subject: Any = None
                     if reason_code == "tool_input_invalid":
-                        try:
-                            runtime_descriptor = self._tools.describe(decision.tool)
-                        except ValueError:
+                        validation_subject = decision.arguments or {}
+                    elif reason_code == "scope_reference_invalid":
+                        validation_subject = decision.scope.model_dump(mode="json")
+                    elif reason_code == "tool_output_invalid":
+                        settled_tool_attempts = [
+                            item
+                            for item in attempts_by_step.get(step_id, [])
+                            if item.get("kind") == "tool"
+                            and item.get("state") == "settled"
+                            and isinstance(item.get("result_checkpoint"), Mapping)
+                        ]
+                        if settled_tool_attempts:
+                            validation_subject = (
+                                settled_tool_attempts[-1]["result_checkpoint"]
+                            ).get("data")
+                    try:
+                        expected_validation_evidence = _validation_evidence(
+                            reason_code=reason_code,
+                            decision=decision,
+                            authorization=authorization,
+                            authorization_digest=str(
+                                run.get("authorization_digest") or ""
+                            ),
+                            subject=validation_subject,
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        add_violation("policy_decision_mismatch")
+                    else:
+                        if (
+                            step.get("validation_evidence")
+                            != expected_validation_evidence
+                        ):
                             add_violation("policy_decision_mismatch")
-                        else:
-                            try:
-                                runtime_descriptor.input_schema.model_validate(
-                                    decision.arguments or {}
-                                )
-                            except ValueError:
-                                pass
-                            else:
-                                add_violation("policy_decision_mismatch")
-                    expected_policy = {
-                        "allowed": False,
-                        "reason_code": reason_code,
-                    }
+                    if reason_code != "tool_output_invalid":
+                        expected_policy = {
+                            "allowed": False,
+                            "reason_code": reason_code,
+                        }
 
                 if policy_rejected:
                     if not (
@@ -1432,12 +1645,18 @@ class AgentRuntime:
 
                     observation = stored_observation
                     if has_replan_feedback:
+                        feedback_reason = str(
+                            (observation or {}).get("reason_code") or ""
+                        )
+                        dispatched = positions_by_type.get("tool_dispatched", [])
+                        observed = positions_by_type.get("tool_observed", [])
+                        expected_dispatched = feedback_reason == "tool_output_invalid"
                         if (
                             not isinstance(observation, Mapping)
                             or dict(observation)
                             != _replan_feedback(str(observation.get("reason_code") or ""))
-                            or positions_by_type.get("tool_dispatched")
-                            or positions_by_type.get("tool_observed")
+                            or bool(dispatched) != expected_dispatched
+                            or observed
                         ):
                             add_violation("observation_mismatch")
                     elif isinstance(observation, Mapping):
@@ -1671,6 +1890,7 @@ class AgentRuntime:
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
+                uncertain_action=uncertain_action,
                 now=now,
             )
             await self._repair_projection_audit(
@@ -1752,8 +1972,9 @@ class AgentRuntime:
                 owner_id=owner_id,
             )
             if (
-                current.get("status") == "running"
+                current.get("status") in {"ready", "running", "paused"}
                 and int(current.get("lease_epoch") or 0) == lease_epoch
+                and (current.get("lease") or {}).get("worker_id") == worker_id
             ):
                 raise
         finally:
@@ -1773,6 +1994,7 @@ class AgentRuntime:
         owner_id: str,
         worker_id: str,
         lease_epoch: int,
+        uncertain_action: Literal["retry", "skip"] | None,
         now: datetime,
     ) -> dict[str, Any]:
         """Finish a run projection whose active step checkpoint committed first."""
@@ -1843,6 +2065,58 @@ class AgentRuntime:
             step_id=active_step_id,
         )
         step_status = str(step.get("status") or "")
+        if (
+            run.get("status") == "paused"
+            and (run.get("termination") or {}).get("reason_code")
+            == "uncertain_paid_attempt"
+            and step_status != "paused"
+        ):
+            self._assert_recovered_uncertain_action(
+                run=run,
+                step_id=active_step_id,
+                uncertain_action=uncertain_action,
+            )
+        completion = dict((step.get("observation") or {}).get("completion") or {})
+        if (
+            step_status == "completed"
+            and (step.get("planner_decision") or {}).get("kind") == "propose_finish"
+            and completion.get("satisfied") is True
+        ):
+            cleared = await self._repository.clear_active_step(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=active_step_id,
+                now=now,
+            )
+            if not cleared:
+                raise AgentRuntimeStateConflict(
+                    "completed Agent finish step could not be cleared during recovery"
+                )
+            termination_event_key, _, _ = _termination_event_projection(
+                status="completed",
+                reason_code="goal_satisfied",
+                lease_epoch=lease_epoch,
+            )
+            return await self._repository.set_run_status(
+                run_id=run_id,
+                owner_id=owner_id,
+                expected=(str(run.get("status") or ""),),
+                status="completed",
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                now=now,
+                fields={
+                    "termination": _termination_projection(
+                        status="completed",
+                        reason_code="goal_satisfied",
+                        now=now,
+                        step_id=active_step_id,
+                    ),
+                    "termination_event_key": termination_event_key,
+                },
+            )
         if step_status == "failed":
             reason_code = str(step.get("failure_reason") or "")
             if not reason_code:
@@ -2474,6 +2748,13 @@ class AgentRuntime:
                     expected_step_status=step_status,
                     decision=decision,
                     reason_code="tool_input_invalid",
+                    validation_evidence=_validation_evidence(
+                        reason_code="tool_input_invalid",
+                        decision=decision,
+                        authorization=authorization,
+                        authorization_digest=authorization_digest,
+                        subject=decision.arguments or {},
+                    ),
                     now=_aware(self._clock()),
                 )
                 raise _ReplanAfterFeedback()
@@ -2495,6 +2776,13 @@ class AgentRuntime:
                         expected_step_status=step_status,
                         decision=decision,
                         reason_code="scope_reference_invalid",
+                        validation_evidence=_validation_evidence(
+                            reason_code="scope_reference_invalid",
+                            decision=decision,
+                            authorization=authorization,
+                            authorization_digest=authorization_digest,
+                            subject=decision.scope.model_dump(mode="json"),
+                        ),
                         now=_aware(self._clock()),
                     )
                     raise _ReplanAfterFeedback()
@@ -2557,20 +2845,15 @@ class AgentRuntime:
             owner_id=owner_id,
         )
         attempts = self._step_attempts(run, step_id=step_id, kind="planner")
-        latest = attempts[-1] if attempts else None
-        if latest is not None and latest.get("state") == "reserved":
-            await self._repository.release_call_pre_dispatch(
+        attempts, latest, released_count = (
+            await self._release_interrupted_predispatch_attempt(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
-                call_key=str(latest["call_key"]),
-                reason="process_interrupted_before_dispatch",
+                attempts=attempts,
                 now=now,
             )
-            latest = dict(latest, state="released_pre_dispatch")
-        released_count = sum(
-            item.get("state") == "released_pre_dispatch" for item in attempts
         )
         if released_count > int(
             (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
@@ -2605,6 +2888,18 @@ class AgentRuntime:
                     now=_aware(self._clock()),
                 )
                 raise _UncertainDispatchedCall()
+            except Exception:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    now=_aware(self._clock()),
+                )
+                raise _UncertainDispatchedCall()
             if recovered is None:
                 await self._mark_uncertain(
                     run_id=run_id,
@@ -2617,7 +2912,20 @@ class AgentRuntime:
                     now=now,
                 )
                 raise _UncertainDispatchedCall()
-            result = PlannerResult.model_validate(recovered)
+            try:
+                result = PlannerResult.model_validate(recovered)
+            except Exception:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    now=_aware(self._clock()),
+                )
+                raise _UncertainDispatchedCall()
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -2901,20 +3209,15 @@ class AgentRuntime:
             owner_id=owner_id,
         )
         attempts = self._step_attempts(run, step_id=step_id, kind="tool")
-        latest = attempts[-1] if attempts else None
-        if latest is not None and latest.get("state") == "reserved":
-            await self._repository.release_call_pre_dispatch(
+        attempts, latest, released_count = (
+            await self._release_interrupted_predispatch_attempt(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
-                call_key=str(latest["call_key"]),
-                reason="process_interrupted_before_dispatch",
+                attempts=attempts,
                 now=now,
             )
-            latest = dict(latest, state="released_pre_dispatch")
-        released_count = sum(
-            item.get("state") == "released_pre_dispatch" for item in attempts
         )
         if released_count > int(
             (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
@@ -3063,7 +3366,30 @@ class AgentRuntime:
                     now=now,
                 )
                 return False
-            result = RuntimeToolResult.model_validate(recovered)
+            try:
+                result = RuntimeToolResult.model_validate(recovered)
+            except Exception:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=_aware(self._clock()),
+                )
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="uncertain_paid_attempt",
+                    now=_aware(self._clock()),
+                )
+                return False
             if result.status == "uncertain":
                 await self._mark_uncertain(
                     run_id=run_id,
@@ -3331,17 +3657,24 @@ class AgentRuntime:
         try:
             validated_output = descriptor.output_schema.model_validate(result.data)
         except Exception:
-            await self._fail_step_and_run(
+            await self._complete_tool_output_replan_feedback(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
                 step_id=step_id,
-                expected_step_status="executing",
-                reason_code="invariant_violation",
+                ordinal=ordinal,
+                result=result,
+                validation_evidence=_validation_evidence(
+                    reason_code="tool_output_invalid",
+                    decision=decision,
+                    authorization=authorization,
+                    authorization_digest=authorization_digest,
+                    subject=result.data,
+                ),
                 now=_aware(self._clock()),
             )
-            return False
+            return True
         observation = RuntimeObservation(
             observation_id=_digest({
                 "run_id": run_id,
@@ -3388,6 +3721,10 @@ class AgentRuntime:
             now=_aware(self._clock()),
         )
         if result.status == "blocked":
+            pause_reason = {
+                "ambiguous_identity": "ambiguous_identity",
+                "manual_approval_required": "manual_approval_required",
+            }.get(result.code, "authorization_required")
             await self._pause_step_and_run(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -3395,7 +3732,7 @@ class AgentRuntime:
                 lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status="observed",
-                reason_code="authorization_required",
+                reason_code=pause_reason,
                 now=_aware(self._clock()),
             )
             return False
@@ -3594,6 +3931,57 @@ class AgentRuntime:
             and item.get("kind") == str(kind)
         ]
 
+    @staticmethod
+    def _assert_recovered_uncertain_action(
+        *,
+        run: Mapping[str, Any],
+        step_id: str,
+        uncertain_action: Literal["retry", "skip"] | None,
+    ) -> None:
+        attempts = [
+            dict(item)
+            for item in run.get("attempts") or []
+            if isinstance(item, Mapping)
+            and item.get("step_id") == str(step_id)
+        ]
+        latest = attempts[-1] if attempts else None
+        if (
+            uncertain_action is None
+            or latest is None
+            or latest.get("state") != f"resolved_{uncertain_action}"
+        ):
+            raise AgentRuntimeStateConflict(
+                "uncertain Agent call was resolved with another action"
+            )
+
+    async def _release_interrupted_predispatch_attempt(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        attempts: list[dict[str, Any]],
+        now: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, int]:
+        latest = attempts[-1] if attempts else None
+        if latest is not None and latest.get("state") == "reserved":
+            await self._repository.release_call_pre_dispatch(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                call_key=str(latest["call_key"]),
+                reason="process_interrupted_before_dispatch",
+                now=now,
+            )
+            latest = dict(latest, state="released_pre_dispatch")
+            attempts[-1] = latest
+        released_count = sum(
+            item.get("state") == "released_pre_dispatch" for item in attempts
+        )
+        return attempts, latest, released_count
+
     async def _settle_runtime_call(
         self,
         *,
@@ -3661,6 +4049,7 @@ class AgentRuntime:
         expected_step_status: str,
         decision: PlannerDecision,
         reason_code: str,
+        validation_evidence: Mapping[str, Any],
         now: datetime,
     ) -> None:
         policy_decision = {
@@ -3679,6 +4068,7 @@ class AgentRuntime:
                 "planner_decision": decision.model_dump(mode="json"),
                 "policy_decision": policy_decision,
                 "observation": _replan_feedback(reason_code),
+                "validation_evidence": dict(validation_evidence),
             },
             now=now,
         )
@@ -3722,6 +4112,45 @@ class AgentRuntime:
             event_type=completed_event_type,
             payload=completed_event_payload,
             step_id=step_id,
+            now=now,
+        )
+
+    async def _complete_tool_output_replan_feedback(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        step_id: str,
+        ordinal: int,
+        result: RuntimeToolResult,
+        validation_evidence: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        await self._repository.transition_step(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            expected="executing",
+            status="observed",
+            fields={
+                "observation": _replan_feedback("tool_output_invalid"),
+                "validation_evidence": dict(validation_evidence),
+                "usage_delta": result.usage.model_dump(mode="json"),
+            },
+            now=now,
+        )
+        await self._complete_observed_step(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            ordinal=ordinal,
+            kind="tool",
             now=now,
         )
 
@@ -3841,6 +4270,14 @@ class AgentRuntime:
             planner_view = observation.get("planner_view")
             if isinstance(planner_view, Mapping):
                 observations.append(dict(planner_view))
+                continue
+            if observation.get("status") == "finish_evaluated":
+                completion = observation.get("completion")
+                if isinstance(completion, Mapping) and isinstance(
+                    completion.get("planner_view"),
+                    Mapping,
+                ):
+                    observations.append(dict(completion["planner_view"]))
         return observations
 
     async def _heartbeat(

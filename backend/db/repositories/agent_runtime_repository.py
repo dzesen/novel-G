@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from typing import Any, Literal, Mapping, Sequence
 from uuid import UUID, uuid5
@@ -24,6 +24,7 @@ STEP_NAMESPACE = UUID("e0dc1a47-9a48-4cb5-a165-2259c139fbb3")
 EVENT_NAMESPACE = UUID("814b1e75-93a6-49da-903c-03de77a202c6")
 CALL_NAMESPACE = UUID("73998e71-c0cf-4a99-91a8-8a01ad636aa9")
 MAX_EVENT_PAYLOAD_BYTES = 16_384
+SUCCESSOR_HANDOFF_TTL_SECONDS = 30
 
 
 class _EventPayload(BaseModel):
@@ -222,6 +223,10 @@ class AgentRuntimeStateConflict(ValueError):
     """A persisted run or step no longer matches the requested transition."""
 
 
+class AgentRuntimeCheckpointPending(AgentRuntimeStateConflict):
+    """A step checkpoint must be projected before cancellation can proceed."""
+
+
 class AgentRuntimeBudgetExceeded(ValueError):
     """A conservative call reservation would exceed the authorization."""
 
@@ -280,6 +285,35 @@ def _attempt_by_key(run: Mapping[str, Any], call_key: str) -> dict[str, Any] | N
         if isinstance(raw, Mapping) and raw.get("call_key") == str(call_key):
             return dict(raw)
     return None
+
+
+def _step_checkpoint_needs_projection(
+    run: Mapping[str, Any],
+    step: Mapping[str, Any] | None,
+) -> bool:
+    """Return whether cancellation must preserve and project this checkpoint."""
+    if not isinstance(step, Mapping):
+        return False
+    status = str(step.get("status") or "")
+    if status == "paused":
+        termination = dict(run.get("termination") or {})
+        return not (
+            run.get("status") == "paused"
+            and termination.get("status") == "paused"
+            and termination.get("reason_code") == step.get("pause_reason")
+        )
+    if status == "failed":
+        return True
+    return bool(
+        status == "completed"
+        and (step.get("planner_decision") or {}).get("kind") == "propose_finish"
+        and (
+            ((step.get("observation") or {}).get("completion") or {}).get(
+                "satisfied"
+            )
+            is True
+        )
+    )
 
 
 class AgentRuntimeRepository:
@@ -391,26 +425,31 @@ class AgentRuntimeRepository:
             return AgentRuntimeBinding(run=existing, replayed=True)
 
         proposed_run_id = ObjectId()
-        bound = await self.readiness.find_one_and_update(
-            {
-                "_id": readiness_object_id,
-                "owner_id": owner_object_id,
-                "status": "inspected",
-                "digest": str(digest),
-                "expires_at": {"$gt": now},
-                "is_deleted": False,
-            },
-            {
-                "$set": {
-                    "status": "bound",
-                    "bound_run_id": proposed_run_id,
-                    "start_request_id": str(start_request_id),
-                    "bound_at": now,
-                    "updated_at": now,
-                }
-            },
-            return_document=ReturnDocument.AFTER,
-        )
+        try:
+            bound = await self.readiness.find_one_and_update(
+                {
+                    "_id": readiness_object_id,
+                    "owner_id": owner_object_id,
+                    "status": "inspected",
+                    "digest": str(digest),
+                    "expires_at": {"$gt": now},
+                    "is_deleted": False,
+                },
+                {
+                    "$set": {
+                        "status": "bound",
+                        "bound_run_id": proposed_run_id,
+                        "start_request_id": str(start_request_id),
+                        "bound_at": now,
+                        "updated_at": now,
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError as exc:
+            raise AgentRuntimeReadinessConflict(
+                "start_request_id already belongs to another readiness"
+            ) from exc
         if bound is None:
             current = await self.get_readiness_owned(
                 readiness_id=readiness_id,
@@ -558,6 +597,24 @@ class AgentRuntimeRepository:
                 raise AgentRuntimeReadinessConflict(
                     "predecessor changed before successor binding"
                 )
+            predecessor_termination = dict(
+                predecessor_snapshot.get("termination") or {}
+            )
+            predecessor_reason = str(
+                predecessor_termination.get("reason_code") or ""
+            )
+            if not already_superseded and (
+                predecessor_termination.get("status") != "paused"
+                or predecessor_reason == "uncertain_paid_attempt"
+                or any(
+                    isinstance(item, Mapping)
+                    and item.get("state") in {"dispatched", "uncertain"}
+                    for item in predecessor_snapshot.get("attempts") or []
+                )
+            ):
+                raise AgentRuntimeReadinessConflict(
+                    "predecessor paused checkpoint is not canonical"
+                )
 
             predecessor = predecessor_snapshot if already_superseded else None
             fenced_step: dict[str, Any] | None = None
@@ -573,12 +630,39 @@ class AgentRuntimeRepository:
                         expected_lease_epoch=predecessor_epoch,
                         lease_epoch=successor_epoch,
                         now=now,
-                        expires_at=now,
+                        expires_at=now + timedelta(
+                            seconds=SUCCESSOR_HANDOFF_TTL_SECONDS
+                        ),
                     )
                 except AgentRuntimeStateConflict as exc:
                     raise AgentRuntimeReadinessConflict(
                         "predecessor has an active resume during successor binding"
                     ) from exc
+                if not (
+                    fenced_step.get("status") == "paused"
+                    and fenced_step.get("pause_reason") == predecessor_reason
+                    and fenced_step.get("paused_from_status")
+                    in {"planning", "policy_checked", "executing", "observed"}
+                ):
+                    if fenced_step.get("status") not in {"completed", "failed"}:
+                        await self._rollback_step_handoff(
+                            run=predecessor_snapshot,
+                            step_id=str(predecessor_step_id),
+                            worker_id=fence_worker_id,
+                            lease_epoch=successor_epoch,
+                            previous_epoch=predecessor_epoch,
+                            now=now,
+                        )
+                    raise AgentRuntimeReadinessConflict(
+                        "predecessor paused checkpoint is not canonical"
+                    )
+            elif (
+                not already_superseded
+                and predecessor_reason != "concurrent_narrative_change"
+            ):
+                raise AgentRuntimeReadinessConflict(
+                    "predecessor paused checkpoint is not canonical"
+                )
 
             if not already_superseded:
                 predecessor = await self.runs.find_one_and_update(
@@ -591,6 +675,7 @@ class AgentRuntimeRepository:
                         "active_step_id": predecessor_step_id,
                         "lease_epoch": predecessor_epoch,
                         "has_uncertain_attempts": {"$ne": True},
+                        "attempts.state": {"$nin": ["dispatched", "uncertain"]},
                         "authorization.goal": authorization.get("goal"),
                         "authorization.scope": authorization.get("scope"),
                         "is_deleted": False,
@@ -738,19 +823,52 @@ class AgentRuntimeRepository:
                 str(active_step_id) if active_step_id else None
             )
             if active_step_id:
-                await self.steps.update_one(
+                active_step = await self.steps.find_one({
+                    "_id": str(active_step_id),
+                    "run_id": run_object_id,
+                    "owner_id": owner_object_id,
+                    "is_deleted": False,
+                })
+                if _step_checkpoint_needs_projection(current, active_step):
+                    raise AgentRuntimeCheckpointPending(
+                        "Agent step checkpoint must be projected before cancellation"
+                    )
+                protected_step_conditions: list[dict[str, Any]] = [
+                    {"status": "failed"},
+                    {
+                        "status": "completed",
+                        "planner_decision.kind": "propose_finish",
+                        "observation.completion.satisfied": True,
+                    },
+                ]
+                if current.get("status") != "paused":
+                    protected_step_conditions.append({"status": "paused"})
+                revoked = await self.steps.update_one(
                     {
                         "_id": str(active_step_id),
                         "run_id": run_object_id,
                         "owner_id": owner_object_id,
                         "lease_epoch": current_epoch,
                         "is_deleted": False,
+                        "$nor": protected_step_conditions,
                     },
                     {
                         "$set": {"lease": None, "updated_at": now},
                         "$inc": {"lease_epoch": 1},
                     },
                 )
+                if revoked.modified_count != 1 and active_step is not None:
+                    latest_step = await self.steps.find_one({
+                        "_id": str(active_step_id),
+                        "run_id": run_object_id,
+                        "owner_id": owner_object_id,
+                        "is_deleted": False,
+                    })
+                    if _step_checkpoint_needs_projection(current, latest_step):
+                        raise AgentRuntimeCheckpointPending(
+                            "Agent step checkpoint must be projected before cancellation"
+                        )
+                    continue
             document = await self.runs.find_one_and_update(
                 {
                     "_id": run_object_id,
@@ -1266,6 +1384,13 @@ class AgentRuntimeRepository:
         active_step_id = current.get("active_step_id")
         adopted: dict[str, Any] | None = None
         if active_step_id:
+            seed = current.get("active_step_seed")
+            if isinstance(seed, Mapping):
+                if str(seed.get("step_id") or "") != str(active_step_id):
+                    raise AgentRuntimeStateConflict(
+                        "active Agent step seed does not match its pointer"
+                    )
+                await self._upsert_step_from_seed(current, dict(seed))
             try:
                 adopted = await self._adopt_step_lease(
                     run=current,
@@ -1407,6 +1532,10 @@ class AgentRuntimeRepository:
                     },
                     {
                         "lease_epoch": int(expected_lease_epoch),
+                        "lease.worker_id": str(worker_id),
+                    },
+                    {
+                        "lease_epoch": int(lease_epoch),
                         "lease.worker_id": str(worker_id),
                     },
                     {
@@ -1678,6 +1807,7 @@ class AgentRuntimeRepository:
             "input_observation_digest": str(seed.get("observation_digest") or ""),
             "planner_decision": None,
             "policy_decision": None,
+            "validation_evidence": None,
             "tool_invocation": None,
             "observation": None,
             "usage_delta": {},

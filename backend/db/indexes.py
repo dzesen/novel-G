@@ -205,6 +205,18 @@ async def init_agent_runtime_indexes():
     try:
         db = get_database()
         await db[collections.AGENT_RUNTIME_READINESS].create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("start_request_id", pymongo.ASCENDING),
+                ],
+                unique=True,
+                partialFilterExpression={
+                    "start_request_id": {"$type": "string"},
+                    "is_deleted": False,
+                },
+                name="agent_runtime_readiness_start_unique",
+            ),
             pymongo.IndexModel([
                 ("owner_id", pymongo.ASCENDING),
                 ("novel_id", pymongo.ASCENDING),
