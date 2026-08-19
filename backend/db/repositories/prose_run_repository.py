@@ -13,6 +13,10 @@ from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.mongo import get_database
+from backend.db.remediation_receipts import (
+    InvalidRemediationReceiptPointer,
+    parse_remediation_receipt_pointer,
+)
 from backend.db.repositories.generation_job_repository import (
     TokenBudgetExceeded,
     TokenBudgetUnbounded,
@@ -828,32 +832,10 @@ class ProseRunRepository(BaseRepository):
     def _remediation_receipt_pointer(
         document: dict[str, Any],
     ) -> dict[str, Any] | None:
-        raw_latest = (document.get("remediation") or {}).get(
-            "latest_receipt"
-        )
-        if raw_latest in (None, {}):
-            return None
-        if not isinstance(raw_latest, dict):
-            raise StaleProseRun("正文修复回执指针格式无效")
-        latest = dict(raw_latest)
         try:
-            source_revision = int(latest.get("source_revision"))
-            result_revision = int(latest.get("result_revision"))
-        except (TypeError, ValueError) as exc:
-            raise StaleProseRun("正文修复回执指针版本无效") from exc
-        if (
-            latest.get("schema_version")
-            != "prose_remediation_receipt_pointer.v1"
-            or not str(latest.get("idempotency_key") or "")
-            or not str(latest.get("request_digest") or "")
-            or not isinstance(latest.get("result_projection"), dict)
-            or source_revision <= 0
-            or result_revision <= 0
-        ):
-            raise StaleProseRun("正文修复回执指针证据不完整")
-        latest["source_revision"] = source_revision
-        latest["result_revision"] = result_revision
-        return latest
+            return parse_remediation_receipt_pointer(document)
+        except InvalidRemediationReceiptPointer as exc:
+            raise StaleProseRun("正文修复回执指针证据无效") from exc
 
     @classmethod
     def _latest_remediation_receipt(
@@ -987,8 +969,16 @@ class ProseRunRepository(BaseRepository):
         request_digest: str,
         source_revision: int,
         claim_token: str,
+        force_reclaim_reserved: bool = False,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-        """Claim one durable rewrite identity before Provider dispatch."""
+        """Claim one durable rewrite identity before Provider dispatch.
+
+        ``force_reclaim_reserved`` is reserved for an enclosing Agent worker
+        that already owns the newer run lease and is closing a deadline or
+        revision boundary.  The CAS revokes only a receipt that still proves
+        the inner Provider was not dispatched; a concurrent dispatch wins and
+        remains unknown.
+        """
         now = get_utc_now()
         document = await self._owned_remediation_run(
             run_id=run_id,
@@ -1061,7 +1051,15 @@ class ProseRunRepository(BaseRepository):
         )
         state = str(receipt.get("state") or "completed")
         if state == "completed":
-            return "completed", document, receipt
+            return (
+                "completed",
+                await self._owned_remediation_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                ),
+                receipt,
+            )
         if (
             state == "reserved"
             and str(receipt.get("claim_token") or "") == str(claim_token)
@@ -1069,7 +1067,9 @@ class ProseRunRepository(BaseRepository):
             return "claimed", document, receipt
         if state == "reserved":
             expires_at = receipt.get("claim_expires_at")
-            if expires_at is not None and expires_at <= now:
+            if force_reclaim_reserved or (
+                expires_at is not None and expires_at <= now
+            ):
                 reclaimed = await self.remediation_receipts.find_one_and_update(
                     {
                         "_id": receipt_id,
@@ -1096,6 +1096,39 @@ class ProseRunRepository(BaseRepository):
                 )
                 if reclaimed is not None:
                     return "claimed", document, reclaimed
+                receipt = await self.remediation_receipts.find_one({
+                    "_id": receipt_id,
+                })
+                if receipt is None:
+                    raise StaleProseRun("正文修复回执占用后丢失")
+                self._validate_remediation_receipt_scope(
+                    receipt,
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    source_revision=source_revision,
+                )
+                self._validate_remediation_receipt_digest(
+                    receipt,
+                    request_digest=request_digest,
+                )
+                state = str(receipt.get("state") or "")
+                if state == "completed":
+                    return (
+                        "completed",
+                        await self._owned_remediation_run(
+                            run_id=run_id,
+                            owner_id=owner_id,
+                            novel_id=novel_id,
+                        ),
+                        receipt,
+                    )
+                if (
+                    state == "reserved"
+                    and str(receipt.get("claim_token") or "")
+                    == str(claim_token)
+                ):
+                    return "claimed", document, receipt
         return f"in_progress_{state}", document, receipt
 
     async def mark_remediation_receipt_dispatched(

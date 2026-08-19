@@ -16,8 +16,8 @@ from backend.llm.exceptions import (
     LLMError,
     LLMRateLimitError,
     LLMResponseError,
-    LLMSchemaError,
     LLMSchemaUnsupportedError,
+    LLMStructuredValidationError,
     LLMTimeoutError,
     is_schema_protocol_unsupported,
 )
@@ -190,8 +190,9 @@ class GeminiClient(BaseLLMClient):
         try:
             parsed = schema.model_validate_json(text)
         except Exception as parse_exc:
-            error = LLMSchemaError(
+            error = LLMStructuredValidationError(
                 f"Gemini 返回内容无法解析为目标 Schema: {parse_exc}",
+                raw_output=text,
                 provider=self.provider_name,
                 model=model,
             )

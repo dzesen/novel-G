@@ -18,8 +18,8 @@ from backend.llm.exceptions import (
     LLMError,
     LLMRateLimitError,
     LLMResponseError,
-    LLMSchemaError,
     LLMSchemaUnsupportedError,
+    LLMStructuredValidationError,
     LLMTimeoutError,
     is_schema_protocol_unsupported,
 )
@@ -204,8 +204,17 @@ class ClaudeClient(BaseLLMClient):
                 break
 
         if tool_input is None:
-            error = LLMSchemaError(
+            error = LLMStructuredValidationError(
                 "Claude 未返回有效的 tool_use 结构化输出",
+                raw_output=json.dumps(
+                    [
+                        getattr(block, "text", None)
+                        or getattr(block, "input", None)
+                        for block in resp.content
+                    ],
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 provider=self.provider_name,
                 model=model,
             )
@@ -216,8 +225,13 @@ class ClaudeClient(BaseLLMClient):
         try:
             parsed = schema.model_validate(tool_input)
         except Exception as parse_exc:
-            error = LLMSchemaError(
+            error = LLMStructuredValidationError(
                 f"Claude 返回内容无法解析为目标 Schema: {parse_exc}",
+                raw_output=json.dumps(
+                    tool_input,
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 provider=self.provider_name,
                 model=model,
             )

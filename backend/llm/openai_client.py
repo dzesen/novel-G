@@ -19,8 +19,8 @@ from backend.llm.exceptions import (
     LLMError,
     LLMRateLimitError,
     LLMResponseError,
-    LLMSchemaError,
     LLMSchemaUnsupportedError,
+    LLMStructuredValidationError,
     LLMTimeoutError,
     is_schema_protocol_unsupported,
 )
@@ -245,7 +245,14 @@ class OpenAICompatibleClient(BaseLLMClient):
         if parsed_obj is None:
             refusal = getattr(choice.message, "refusal", None) if choice else None
             err_msg = refusal or "模型未返回有效的结构化输出"
-            error = LLMSchemaError(err_msg, provider=self.provider_name, model=model)
+            error = LLMStructuredValidationError(
+                err_msg,
+                raw_output=str(
+                    (choice.message.content or refusal or "") if choice else ""
+                ),
+                provider=self.provider_name,
+                model=model,
+            )
             log_llm_error(error, provider=self.provider_name, model=model)
             raise error
 

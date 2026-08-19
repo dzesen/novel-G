@@ -11,6 +11,7 @@ from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from bson import ObjectId
+from pydantic import BaseModel
 
 from backend.db.errors import NotFoundError
 from backend.db.repositories.agent_runtime_repository import (
@@ -3289,63 +3290,80 @@ class AgentRuntime:
                         for attempt in active_attempts
                         if attempt.get("state") in {"dispatched", "uncertain"}
                     ]
-                    reason_code = "concurrent_narrative_change"
-                    if unresolved:
-                        attempt = unresolved[-1]
-                        if attempt.get("state") == "dispatched":
-                            await self._mark_uncertain(
-                                run_id=run_id,
-                                owner_id=owner_id,
-                                worker_id=worker_id,
-                                lease_epoch=lease_epoch,
-                                step_id=active_step_id,
-                                ordinal=int(active_step.get("ordinal") or 0),
-                                call_key=str(attempt["call_key"]),
-                                now=now,
+                    defer_to_tool_receipt = bool(
+                        unresolved
+                        and unresolved[-1].get("state") == "dispatched"
+                        and unresolved[-1].get("kind") == "tool"
+                        and callable(
+                            getattr(
+                                self._tools,
+                                "recover_without_dispatch",
+                                None,
                             )
-                        reason_code = "uncertain_paid_attempt"
-                    else:
-                        for attempt in active_attempts:
-                            if attempt.get("state") != "reserved":
-                                continue
-                            released = (
-                                await self._repository.release_call_pre_dispatch(
+                        )
+                    )
+                    if not defer_to_tool_receipt:
+                        reason_code = "concurrent_narrative_change"
+                        if unresolved:
+                            attempt = unresolved[-1]
+                            if attempt.get("state") == "dispatched":
+                                await self._mark_uncertain(
                                     run_id=run_id,
                                     owner_id=owner_id,
                                     worker_id=worker_id,
                                     lease_epoch=lease_epoch,
+                                    step_id=active_step_id,
+                                    ordinal=int(active_step.get("ordinal") or 0),
                                     call_key=str(attempt["call_key"]),
-                                    reason=(
-                                        "narrative_revision_changed_before_dispatch"
-                                    ),
                                     now=now,
                                 )
-                            )
-                            if not released:
-                                raise AgentRuntimeStateConflict(
-                                    "pre-dispatch Agent call could not be released"
+                            reason_code = "uncertain_paid_attempt"
+                        else:
+                            for attempt in active_attempts:
+                                if attempt.get("state") != "reserved":
+                                    continue
+                                released = (
+                                    await self._repository.release_call_pre_dispatch(
+                                        run_id=run_id,
+                                        owner_id=owner_id,
+                                        worker_id=worker_id,
+                                        lease_epoch=lease_epoch,
+                                        call_key=str(attempt["call_key"]),
+                                        reason=(
+                                            "narrative_revision_changed_before_dispatch"
+                                        ),
+                                        now=now,
+                                    )
                                 )
-                    await self._pause_step_and_run(
+                                if not released:
+                                    raise AgentRuntimeStateConflict(
+                                        "pre-dispatch Agent call could not be released"
+                                    )
+                        await self._pause_step_and_run(
+                            run_id=run_id,
+                            owner_id=owner_id,
+                            worker_id=worker_id,
+                            lease_epoch=lease_epoch,
+                            step_id=active_step_id,
+                            expected_step_status=active_status,
+                            reason_code=reason_code,
+                            now=now,
+                        )
+                        return
+                    # The Tool owns a stronger inner dispatch receipt.  Its act
+                    # path can atomically prove/revoke pre-dispatch; the
+                    # run-level snapshot alone must not invent unknown.
+                if not active_step_id:
+                    await self._terminate(
                         run_id=run_id,
                         owner_id=owner_id,
                         worker_id=worker_id,
                         lease_epoch=lease_epoch,
-                        step_id=active_step_id,
-                        expected_step_status=active_status,
-                        reason_code=reason_code,
+                        status="paused",
+                        reason_code="concurrent_narrative_change",
                         now=now,
                     )
                     return
-                await self._terminate(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    status="paused",
-                    reason_code="concurrent_narrative_change",
-                    now=now,
-                )
-                return
 
             limits = dict(authorization.get("limits") or {})
             if (
@@ -4142,16 +4160,50 @@ class AgentRuntime:
             owner_id=owner_id,
             authorization=authorization,
         )
+        deadline_exceeded = self._deadline_is_exceeded(authorization)
+        if latest is not None and latest.get("state") == "uncertain":
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="uncertain_paid_attempt",
+                now=now,
+            )
+            return False
         if (
             latest is not None
-            and latest.get("state") in {"dispatched", "uncertain"}
-            and (
-                latest.get("state") == "uncertain"
-                or self._deadline_is_exceeded(authorization)
-                or not revision_matches
-            )
+            and latest.get("state") == "dispatched"
+            and (deadline_exceeded or not revision_matches)
         ):
-            if latest.get("state") == "dispatched":
+            boundary_reason = (
+                "concurrent_narrative_change"
+                if not revision_matches
+                else "deadline_exceeded"
+            )
+            recovered_at_boundary = (
+                await self._recover_tool_without_dispatch(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    reference=decision.tool,
+                    payload=payload,
+                    context=tool_context,
+                    idempotency_key=(
+                        f"{invocation['idempotency_key']}:"
+                        f"{latest['call_key']}"
+                    ),
+                    boundary_reason=boundary_reason,
+                    now=now,
+                )
+            )
+            if recovered_at_boundary is None:
                 await self._mark_uncertain(
                     run_id=run_id,
                     owner_id=owner_id,
@@ -4162,14 +4214,37 @@ class AgentRuntime:
                     call_key=str(latest["call_key"]),
                     now=now,
                 )
-            await self._pause_step_and_run(
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="uncertain_paid_attempt",
+                    now=now,
+                )
+                return False
+            if not revision_matches:
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="concurrent_narrative_change",
+                    now=now,
+                )
+                return False
+            await self._fail_step_and_run(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status=step_status,
-                reason_code="uncertain_paid_attempt",
+                reason_code="deadline_exceeded",
                 now=now,
             )
             return False
@@ -4304,7 +4379,8 @@ class AgentRuntime:
                     authorization=authorization,
                 )
             except _DeadlineExceeded:
-                await self._mark_uncertain(
+                boundary_now = _aware(self._clock())
+                recovered = await self._recover_tool_without_dispatch(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
@@ -4312,17 +4388,46 @@ class AgentRuntime:
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=call_key,
-                    now=_aware(self._clock()),
+                    reference=decision.tool,
+                    payload=payload,
+                    context=tool_context,
+                    idempotency_key=(
+                        f"{invocation['idempotency_key']}:{call_key}"
+                    ),
+                    boundary_reason="deadline_exceeded",
+                    now=boundary_now,
                 )
-                await self._pause_step_and_run(
+                if recovered is None:
+                    await self._mark_uncertain(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=step_id,
+                        ordinal=ordinal,
+                        call_key=call_key,
+                        now=boundary_now,
+                    )
+                    await self._pause_step_and_run(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=step_id,
+                        expected_step_status=step_status,
+                        reason_code="uncertain_paid_attempt",
+                        now=boundary_now,
+                    )
+                    return False
+                await self._fail_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
                     lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
-                    reason_code="uncertain_paid_attempt",
-                    now=_aware(self._clock()),
+                    reason_code="deadline_exceeded",
+                    now=boundary_now,
                 )
                 return False
             except Exception:
@@ -5024,6 +5129,63 @@ class AgentRuntime:
             item.get("state") == "released_pre_dispatch" for item in attempts
         )
         return attempts, latest, released_count
+
+    async def _recover_tool_without_dispatch(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        step_id: str,
+        ordinal: int,
+        call_key: str,
+        reference: RuntimeToolReference,
+        payload: BaseModel,
+        context: RuntimeToolContext,
+        idempotency_key: str,
+        boundary_reason: str,
+        now: datetime,
+    ) -> RuntimeToolResult | None:
+        """Ask an optional Tool receipt seam to prove zero inner dispatch.
+
+        Generic Tools remain deny-by-default: without this explicit seam, or
+        if a concurrent inner dispatch wins, the outer dispatched attempt is
+        still uncertain.  Implementations of this seam must be local and must
+        never issue a Provider request.
+        """
+        recover = getattr(self._tools, "recover_without_dispatch", None)
+        if not callable(recover):
+            return None
+        try:
+            raw_result = await recover(
+                reference,
+                payload,
+                context=context,
+                idempotency_key=idempotency_key,
+                boundary_reason=boundary_reason,
+            )
+            if raw_result is None:
+                return None
+            result = RuntimeToolResult.model_validate(raw_result)
+            if result.status == "uncertain":
+                return None
+        except Exception:
+            return None
+        await self._settle_runtime_call(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            ordinal=ordinal,
+            call_key=call_key,
+            usage=result.usage.model_dump(mode="python"),
+            result_checkpoint=result.model_dump(mode="json"),
+            now=now,
+            usage_is_complete=_tool_result_usage_is_complete(result),
+        )
+        return result
 
     async def _settle_runtime_call(
         self,

@@ -53,6 +53,10 @@ from backend.db.collections import (
     WORLDBOOK,
 )
 from backend.db.mongo import get_database
+from backend.db.remediation_receipts import (
+    InvalidRemediationReceiptPointer,
+    parse_remediation_receipt_pointer,
+)
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.volume_repository import volume_repo
@@ -107,30 +111,12 @@ BACKUP_COLLECTIONS = (
 
 
 def _remediation_receipt_pointer(document: Dict[str, Any]) -> Dict[str, Any] | None:
-    raw_pointer = (document.get("remediation") or {}).get("latest_receipt")
-    if raw_pointer in (None, {}):
-        return None
-    if not isinstance(raw_pointer, dict):
-        raise ValueError("Backup found an invalid prose remediation receipt pointer")
-    pointer = dict(raw_pointer)
     try:
-        source_revision = int(pointer.get("source_revision"))
-        result_revision = int(pointer.get("result_revision"))
-    except (TypeError, ValueError) as exc:
+        return parse_remediation_receipt_pointer(document)
+    except InvalidRemediationReceiptPointer as exc:
         raise ValueError(
-            "Backup found an invalid prose remediation receipt revision"
+            "Backup found an invalid prose remediation receipt pointer"
         ) from exc
-    if (
-        pointer.get("schema_version")
-        != "prose_remediation_receipt_pointer.v1"
-        or not str(pointer.get("idempotency_key") or "")
-        or not str(pointer.get("request_digest") or "")
-        or not isinstance(pointer.get("result_projection"), dict)
-        or source_revision <= 0
-        or result_revision <= 0
-    ):
-        raise ValueError("Backup found an incomplete prose remediation receipt pointer")
-    return pointer
 
 
 def _receipt_matches_pointer(

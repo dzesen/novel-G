@@ -94,6 +94,7 @@ _TOOL_INPUT_TOKEN_BOUND = 600_000
 _MAX_PLANNER_OBSERVATIONS = 32
 _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
+_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r2"
 
 OutlineIssueCategory = Literal[
     "scene_coverage",
@@ -365,7 +366,7 @@ class FrozenStructuredCall:
             "reviewer_alias": self.plan.reviewer_alias,
             "max_semantic_attempts": self.plan.max_semantic_attempts,
             "max_output_tokens": self.plan.max_output_tokens,
-            "frozen_budget_protocol": "nested-structured-total-r1",
+            "frozen_budget_protocol": _FROZEN_BUDGET_PROTOCOL,
         }
         encoded = json.dumps(
             payload,
@@ -784,7 +785,7 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r3-{call.revision[:20]}"
+                f"prose-remediation-planner-r4-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
@@ -1713,7 +1714,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r3-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r4-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1737,7 +1738,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r3-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r4-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1752,7 +1753,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r3-"
+            "prose-remediation-tools-r4-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
@@ -1778,6 +1779,7 @@ class ProseRemediationToolRegistry:
         idempotency_key: str,
         request_digest: str,
         wait_for_dispatched: bool,
+        force_reclaim_reserved: bool = False,
     ) -> tuple[str, Mapping[str, Any], Mapping[str, Any], str] | None:
         claim_token = str(uuid4())
         while True:
@@ -1790,6 +1792,7 @@ class ProseRemediationToolRegistry:
                     request_digest=request_digest,
                     source_revision=payload.expected_revision,
                     claim_token=claim_token,
+                    force_reclaim_reserved=force_reclaim_reserved,
                 )
             )
             if claim_state in {"claimed", "completed"}:
@@ -1850,6 +1853,99 @@ class ProseRemediationToolRegistry:
             receipt=stored_receipt,
             context=context,
             payload=payload,
+        )
+
+    async def recover_without_dispatch(
+        self,
+        reference: RuntimeToolReference,
+        payload: BaseModel,
+        *,
+        context: RuntimeToolContext,
+        idempotency_key: str,
+        boundary_reason: str,
+    ) -> RuntimeToolResult | None:
+        """Close a proven pre-dispatch rewrite at a Runtime hard boundary.
+
+        The outer Agent attempt is already ``dispatched`` because it crossed
+        the Tool adapter boundary.  This method atomically revokes only an
+        absent/reserved inner receipt, so a concurrent Provider dispatch wins
+        the CAS and remains unknown.  It never calls a Provider.
+        """
+        if reference == ADHERENCE_TOOL:
+            return None
+        if reference != REWRITE_TOOL:
+            raise ValueError(f"unknown prose remediation tool: {reference}")
+        if boundary_reason not in {
+            "deadline_exceeded",
+            "concurrent_narrative_change",
+        }:
+            raise ValueError("unsupported Runtime recovery boundary")
+        normalized = RewriteProseCandidateInput.model_validate(
+            payload.model_dump(mode="python")
+        )
+        request_digest = _rewrite_request_digest(
+            context=context,
+            payload=normalized,
+        )
+        claim = await self._claim_rewrite_execution(
+            payload=normalized,
+            context=context,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            wait_for_dispatched=False,
+            force_reclaim_reserved=True,
+        )
+        if claim is None:
+            return None
+        claim_state, document, receipt, claim_token = claim
+        if claim_state == "completed":
+            return _validated_rewrite_receipt_result(
+                document=document,
+                receipt=receipt,
+                context=context,
+                payload=normalized,
+            )
+        result = RuntimeToolResult(
+            status="retryable_error",
+            code="rewrite_provider_not_dispatched",
+            data=RewriteProseCandidateOutput(
+                outcome="blocked",
+                prose_run_id=context.scope.object_id,
+                source_revision=normalized.expected_revision,
+                candidate_revision=normalized.expected_revision,
+                content_digest=normalized.expected_content_digest,
+                changed=False,
+                summary="正文改写 Provider 未派发，运行边界已关闭。",
+            ).model_dump(mode="json"),
+            planner_view={
+                "observation_kind": "rewrite_provider_not_dispatched",
+                "boundary_reason": boundary_reason,
+            },
+            audit_view={
+                **_NO_PROVIDER_DISPATCH,
+                "boundary_reason": boundary_reason,
+            },
+            resource_revision=str(normalized.expected_revision),
+            resource_digest=normalized.expected_content_digest,
+            usage=RuntimeCallUsage(),
+            error_summary="正文改写 Provider 未派发。",
+        )
+        stored_document, stored_receipt = (
+            await self._prose_runs.complete_remediation_receipt(
+                run_id=context.scope.object_id,
+                owner_id=context.owner_id,
+                novel_id=context.novel_id,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                claim_token=claim_token,
+                result_projection=result.model_dump(mode="json"),
+            )
+        )
+        return _validated_rewrite_receipt_result(
+            document=stored_document,
+            receipt=stored_receipt,
+            context=context,
+            payload=normalized,
         )
 
     async def execute(
