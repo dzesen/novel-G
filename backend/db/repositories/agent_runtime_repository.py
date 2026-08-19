@@ -202,6 +202,11 @@ class _AttemptUncertainEventPayload(_OrdinalEventPayload):
     reason_code: Literal["dispatch_outcome_unknown"]
 
 
+class _AttemptAccountedEventPayload(_OrdinalEventPayload):
+    state: Literal["settled", "resolved_retry", "resolved_skip"]
+    attempt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class _StepCompletedEventPayload(_OrdinalEventPayload):
     status: Literal["completed"]
     kind: Literal["tool", "finish"]
@@ -240,6 +245,7 @@ EVENT_PAYLOAD_MODELS: dict[str, type[_EventPayload]] = {
     "mutation_committed": _MutationCommittedEventPayload,
     "attempt_settled": _OrdinalEventPayload,
     "attempt_uncertain": _AttemptUncertainEventPayload,
+    "attempt_accounted": _AttemptAccountedEventPayload,
     "step_completed": _StepCompletedEventPayload,
     "run_paused": _RunPausedEventPayload,
     "run_superseded": _RunSupersededEventPayload,

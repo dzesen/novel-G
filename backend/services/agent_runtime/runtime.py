@@ -258,7 +258,6 @@ def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
         "tool_invocation": step.get("tool_invocation"),
         "observation": step.get("observation"),
         "usage_delta": step.get("usage_delta"),
-        "attempt_ledger_digest": _digest(step.get("attempt_ledger") or []),
     }
 
 
@@ -476,20 +475,34 @@ def _step_completed_event_projection(
     ordinal: int,
     step: Mapping[str, Any],
     kind: Literal["finish", "tool"],
-    attempts: list[Mapping[str, Any]] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
-    projected_step = dict(step)
-    if attempts is not None:
-        projected_step["attempt_ledger"] = [
-            project_agent_runtime_attempt_ledger_entry(attempt)
-            for attempt in attempts
-        ]
     return f"step-{ordinal}-completed", "step_completed", {
         "ordinal": ordinal,
         "status": "completed",
         "kind": kind,
-        "step_digest": _digest(_step_audit_projection(projected_step)),
+        "step_digest": _digest(_step_audit_projection(step)),
     }
+
+
+def _attempt_accounted_event_projection(
+    *,
+    ordinal: int,
+    attempt: Mapping[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    projected = project_agent_runtime_attempt_ledger_entry(attempt)
+    state = str(projected["state"])
+    if state not in {"settled", "resolved_retry", "resolved_skip"}:
+        raise ValueError("only a charged Agent attempt can be accounted")
+    call_key = str(projected["call_key"])
+    return (
+        f"{call_key}-accounted-v1",
+        "attempt_accounted",
+        {
+            "ordinal": ordinal,
+            "state": state,
+            "attempt_digest": _digest(projected),
+        },
+    )
 
 
 class AgentRuntime:
@@ -620,6 +633,7 @@ class AgentRuntime:
         deadline_at = now + timedelta(seconds=request.limits.deadline_seconds)
         authorization = {
             "schema_version": "agent_runtime_authorization.v1",
+            "attempt_accounting_revision": 1,
             "readiness_id": readiness_id,
             "binding_mode": "single_use",
             "owner_id": str(owner_id),
@@ -1136,6 +1150,9 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
         )
+        attempt_accounting_required = int(
+            (run.get("authorization") or {}).get("attempt_accounting_revision") or 0
+        ) == 1
         await self._event(
             run_id=run_id,
             event_key="run-created",
@@ -1183,6 +1200,7 @@ class AgentRuntime:
                     attempt=attempt,
                     decision=None,
                     invocation=None,
+                    record_accounting=attempt_accounting_required,
                     now=now,
                 )
 
@@ -1228,6 +1246,7 @@ class AgentRuntime:
                     attempt=attempt,
                     decision=decision,
                     invocation=invocation,
+                    record_accounting=attempt_accounting_required,
                     now=now,
                 )
 
@@ -1259,7 +1278,6 @@ class AgentRuntime:
                         ordinal=ordinal,
                         step=step,
                         kind=kind,
-                        attempts=attempts,
                     )
                 )
                 await self._event(
@@ -1332,6 +1350,7 @@ class AgentRuntime:
         attempt: Mapping[str, Any],
         decision: PlannerDecision | None,
         invocation: Mapping[str, Any] | None,
+        record_accounting: bool,
         now: datetime,
     ) -> None:
         call_key = str(attempt.get("call_key") or "")
@@ -1397,6 +1416,18 @@ class AgentRuntime:
                 step_id=step_id,
                 now=now,
             )
+        if record_accounting and state in {
+            "settled",
+            "resolved_retry",
+            "resolved_skip",
+        }:
+            await self._record_attempt_accounted(
+                run_id=run_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                attempt=attempt,
+                now=now,
+            )
 
     async def get(self, *, owner_id: str, run_id: str) -> AgentRunView:
         return await self._run_view(run_id=run_id, owner_id=str(owner_id))
@@ -1441,6 +1472,9 @@ class AgentRuntime:
             != str(run.get("authorization_digest") or "")
         ):
             add_violation("authorization_digest_mismatch")
+        attempt_accounting_required = (
+            int(authorization.get("attempt_accounting_revision") or 0) == 1
+        )
 
         if [int(item["ordinal"]) for item in steps] != list(range(len(steps))):
             add_violation("step_ordinal_mismatch")
@@ -1484,7 +1518,8 @@ class AgentRuntime:
                 )
 
             if terminal_position is not None:
-                add_violation("run_event_order_mismatch")
+                if event_type != "attempt_accounted":
+                    add_violation("run_event_order_mismatch")
                 continue
             if event_type == "run_created":
                 if position != 0 or run_event_started:
@@ -1533,10 +1568,13 @@ class AgentRuntime:
                 "mutation_committed",
                 "attempt_settled",
                 "attempt_uncertain",
+                "attempt_accounted",
                 "step_completed",
             }:
                 add_violation("event_type_unknown")
-            elif derived_status != "running":
+            elif derived_status != "running" and not (
+                event_type == "attempt_accounted" and derived_status == "paused"
+            ):
                 add_violation("run_event_order_mismatch")
 
         if not run_event_started:
@@ -1570,6 +1608,7 @@ class AgentRuntime:
                 "attempt_reserved",
                 "attempt_settled",
                 "attempt_uncertain",
+                "attempt_accounted",
                 "tool_dispatched",
             }
             actual_attempt_events = [
@@ -1600,6 +1639,12 @@ class AgentRuntime:
                     chain.append(f"{call_key}-settled")
                 elif state in {"uncertain", "resolved_retry", "resolved_skip"}:
                     chain.append(f"{call_key}-uncertain")
+                accounted_key = f"{call_key}-accounted-v1"
+                if state in {"settled", "resolved_retry", "resolved_skip"} and (
+                    attempt_accounting_required
+                    or accounted_key in actual_attempt_keys
+                ):
+                    chain.append(accounted_key)
                 expected_attempt_keys.extend(chain)
                 expected_chain_by_call.append(chain)
             if (
@@ -1611,6 +1656,10 @@ class AgentRuntime:
                 str(event.get("event_key") or ""): position
                 for position, event in positioned
                 if str(event.get("type") or "") in attempt_event_types
+            }
+            event_by_key = {
+                str(event.get("event_key") or ""): event
+                for event in actual_attempt_events
             }
             prior_attempt_position: int | None = None
             for chain in expected_chain_by_call:
@@ -1693,6 +1742,16 @@ class AgentRuntime:
                             add_violation("attempt_budget_mismatch")
                 elif raw_usage is not None:
                     add_violation("attempt_budget_mismatch")
+                if state in {"settled", "resolved_retry", "resolved_skip"}:
+                    accounted_key = f"{attempt['call_key']}-accounted-v1"
+                    accounted_event = event_by_key.get(accounted_key)
+                    if accounted_event is not None:
+                        expected_payload = _attempt_accounted_event_projection(
+                            ordinal=ordinal,
+                            attempt=attempt,
+                        )[2]
+                        if (accounted_event.get("payload") or {}) != expected_payload:
+                            add_violation("attempt_ledger_mismatch")
 
             planned_positions = positions_by_type.get("step_planned", [])
             policy_positions = positions_by_type.get("policy_decided", [])
@@ -2079,7 +2138,6 @@ class AgentRuntime:
                     ordinal=ordinal,
                     step=step,
                     kind=expected_kind,
-                    attempts=attempts_by_step.get(step_id, []),
                 )[2]
                 if completed_payload != expected_completed_payload:
                     add_violation("step_status_mismatch")
@@ -2694,7 +2752,7 @@ class AgentRuntime:
             ]
             if len(unresolved) == 1:
                 attempt = unresolved[0]
-                await self._repository.resolve_uncertain_call(
+                attempt = await self._repository.resolve_uncertain_call(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
@@ -2713,6 +2771,13 @@ class AgentRuntime:
                 raise AgentRuntimeStateConflict(
                     "uncertain pause must reference exactly one frozen attempt"
                 )
+            await self._record_attempt_accounted(
+                run_id=run_id,
+                step_id=step_id,
+                ordinal=int(step.get("ordinal") or 0),
+                attempt=attempt,
+                now=now,
+            )
             if uncertain_action == "skip":
                 await self._fail_step_and_run(
                     run_id=run_id,
@@ -2751,6 +2816,10 @@ class AgentRuntime:
     ) -> None:
         if authorization.get("schema_version") != "agent_runtime_authorization.v1":
             raise AgentRuntimeStateConflict("authorization schema version is unknown")
+        if int(authorization.get("attempt_accounting_revision") or 0) not in {0, 1}:
+            raise AgentRuntimeStateConflict(
+                "attempt accounting revision is unknown"
+            )
         if _digest(dict(authorization)) != authorization_digest:
             raise AgentRuntimeStateConflict("authorization digest no longer matches")
         if authorization.get("planner") != self._planner.descriptor.model_dump(mode="json"):
@@ -2886,7 +2955,13 @@ class AgentRuntime:
                     now=now,
                 )
                 return
-            if not await self._revision_matches(
+            active_has_unknown_dispatch = any(
+                isinstance(attempt, Mapping)
+                and attempt.get("step_id") == active_step_id
+                and attempt.get("state") in {"dispatched", "uncertain"}
+                for attempt in run.get("attempts") or []
+            )
+            if not active_has_unknown_dispatch and not await self._revision_matches(
                 owner_id=owner_id,
                 authorization=authorization,
             ):
@@ -3300,12 +3375,23 @@ class AgentRuntime:
                 now=now,
             )
         )
-        if released_count > int(
-            (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
-        ):
-            raise AgentRuntimeStateConflict("planner predispatch retries are exhausted")
         if latest is not None and latest.get("state") in {"dispatched", "uncertain"}:
             if latest.get("state") == "uncertain":
+                raise _UncertainDispatchedCall()
+            if not await self._revision_matches(
+                owner_id=owner_id,
+                authorization=authorization,
+            ):
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    now=now,
+                )
                 raise _UncertainDispatchedCall()
             recover = getattr(self._planner, "recover", None)
             try:
@@ -3392,6 +3478,10 @@ class AgentRuntime:
                 now=now,
             )
             return result
+        if released_count > int(
+            (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
+        ):
+            raise AgentRuntimeStateConflict("planner predispatch retries are exhausted")
         if latest is not None and latest.get("state") == "settled":
             checkpoint = latest.get("result_checkpoint")
             if not isinstance(checkpoint, Mapping):
@@ -3589,21 +3679,6 @@ class AgentRuntime:
                 now=now,
             )
             return False
-        if not await self._revision_matches(
-            owner_id=owner_id,
-            authorization=authorization,
-        ):
-            await self._pause_step_and_run(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                lease_epoch=lease_epoch,
-                step_id=step_id,
-                expected_step_status=step_status,
-                reason_code="concurrent_narrative_change",
-                now=now,
-            )
-            return False
         await self._heartbeat(
             run_id=run_id,
             owner_id=owner_id,
@@ -3652,10 +3727,18 @@ class AgentRuntime:
                 now=now,
             )
         )
+        revision_matches = await self._revision_matches(
+            owner_id=owner_id,
+            authorization=authorization,
+        )
         if (
             latest is not None
             and latest.get("state") in {"dispatched", "uncertain"}
-            and self._deadline_is_exceeded(authorization)
+            and (
+                latest.get("state") == "uncertain"
+                or self._deadline_is_exceeded(authorization)
+                or not revision_matches
+            )
         ):
             if latest.get("state") == "dispatched":
                 await self._mark_uncertain(
@@ -3676,6 +3759,18 @@ class AgentRuntime:
                 step_id=step_id,
                 expected_step_status=step_status,
                 reason_code="uncertain_paid_attempt",
+                now=now,
+            )
+            return False
+        if not revision_matches:
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="concurrent_narrative_change",
                 now=now,
             )
             return False
@@ -4544,7 +4639,38 @@ class AgentRuntime:
             step_id=step_id,
             now=now,
         )
+        await self._record_attempt_accounted(
+            run_id=run_id,
+            step_id=step_id,
+            ordinal=ordinal,
+            attempt=settled_attempt,
+            now=now,
+        )
         return settled_attempt
+
+    async def _record_attempt_accounted(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        ordinal: int,
+        attempt: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        event_key, event_type, event_payload = (
+            _attempt_accounted_event_projection(
+                ordinal=ordinal,
+                attempt=attempt,
+            )
+        )
+        await self._event(
+            run_id=run_id,
+            event_key=event_key,
+            event_type=event_type,
+            payload=event_payload,
+            step_id=step_id,
+            now=now,
+        )
 
     async def _record_step_planned(
         self,
