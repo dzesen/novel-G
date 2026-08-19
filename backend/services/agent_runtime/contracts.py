@@ -32,7 +32,11 @@ class _StrictModel(BaseModel):
 class RuntimeToolReference(_StrictModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: str = Field(min_length=1, max_length=120)
+    name: str = Field(
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
     version: int = Field(ge=1)
 
 
@@ -179,7 +183,11 @@ class RuntimeToolResult(_StrictModel):
         "agent_runtime_tool_result.v1"
     )
     status: RuntimeObservationStatus
-    code: str = Field(min_length=1, max_length=160)
+    code: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
     data: dict[str, Any] = Field(default_factory=dict)
     planner_view: dict[str, Any] = Field(default_factory=dict)
     audit_view: dict[str, Any] = Field(default_factory=dict)
@@ -198,7 +206,11 @@ class RuntimeObservation(_StrictModel):
     step_id: str = Field(min_length=1, max_length=160)
     tool: RuntimeToolReference
     status: RuntimeObservationStatus
-    code: str = Field(min_length=1, max_length=160)
+    code: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
     data: dict[str, Any] = Field(default_factory=dict)
     planner_view: dict[str, Any] = Field(default_factory=dict)
     audit_view: dict[str, Any] = Field(default_factory=dict)

@@ -441,6 +441,11 @@ class AgentRuntime:
                 now=now,
             )
         if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=str(owner_id),
+                now=now,
+            )
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         return await self._execute_owned_run(
             run_id=run_id,
@@ -462,8 +467,18 @@ class AgentRuntime:
             owner_id=str(owner_id),
         )
         if run.get("status") in TERMINAL_RUN_STATUSES:
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=str(owner_id),
+                now=_aware(self._clock()),
+            )
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         if run.get("status") == "paused":
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=str(owner_id),
+                now=_aware(self._clock()),
+            )
             termination = dict(run.get("termination") or {})
             reason_code = str(termination.get("reason_code") or "")
             if reason_code == "uncertain_paid_attempt" and uncertain_action is None:
@@ -492,10 +507,9 @@ class AgentRuntime:
         )
         if run.get("status") in TERMINAL_RUN_STATUSES:
             if run.get("status") == "cancelled":
-                await self._record_cancel_audit(
+                await self._repair_projection_audit(
                     run_id=run_id,
                     owner_id=normalized_owner_id,
-                    run=run,
                     now=_aware(self._clock()),
                 )
             return await self._run_view(
@@ -503,7 +517,7 @@ class AgentRuntime:
                 owner_id=normalized_owner_id,
             )
         now = _aware(self._clock())
-        cancelled = await self._repository.cancel_run(
+        await self._repository.cancel_run(
             run_id=run_id,
             owner_id=normalized_owner_id,
             termination={
@@ -521,74 +535,284 @@ class AgentRuntime:
             },
             now=now,
         )
-        await self._record_cancel_audit(
+        await self._repair_projection_audit(
             run_id=run_id,
             owner_id=normalized_owner_id,
-            run=cancelled,
             now=now,
         )
         return await self._run_view(run_id=run_id, owner_id=normalized_owner_id)
 
-    async def _record_cancel_audit(
+    async def _repair_projection_audit(
         self,
         *,
         run_id: str,
         owner_id: str,
-        run: Mapping[str, Any],
         now: datetime,
     ) -> None:
+        """Idempotently complete events whose authoritative projection committed first."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
         steps = await self._repository.list_steps_owned(
             run_id=run_id,
             owner_id=owner_id,
         )
-        step_by_id = {
-            str(step["step_id"]): step
-            for step in steps
-        }
-        for attempt in run.get("attempts") or []:
-            if not (
-                isinstance(attempt, Mapping)
-                and attempt.get("state") == "uncertain"
-                and attempt.get("uncertain_reason")
-                == "cancelled_while_dispatched"
-            ):
-                continue
-            step_id = str(attempt.get("step_id") or "")
-            step = step_by_id.get(step_id)
-            if step is None:
-                raise AgentRuntimeStateConflict(
-                    "cancelled Agent attempt has no owning step"
-                )
+        existing_events = await self._repository.list_events_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        await self._event(
+            run_id=run_id,
+            event_key="run-created",
+            event_type="run_created",
+            payload={"status": "ready"},
+            now=now,
+        )
+        await self._event(
+            run_id=run_id,
+            event_key="readiness-bound",
+            event_type="readiness_bound",
+            payload={"status": "bound"},
+            now=now,
+        )
+        if run.get("status") != "ready" or steps or run.get("attempts"):
+            await self._event(
+                run_id=run_id,
+                event_key="run-started",
+                event_type="run_started",
+                payload={"status": "running"},
+                now=now,
+            )
+
+        attempts_by_step: dict[str, list[dict[str, Any]]] = {}
+        for raw_attempt in run.get("attempts") or []:
+            if isinstance(raw_attempt, Mapping) and raw_attempt.get("step_id"):
+                attempts_by_step.setdefault(
+                    str(raw_attempt["step_id"]),
+                    [],
+                ).append(dict(raw_attempt))
+
+        for step in steps:
+            step_id = str(step["step_id"])
             ordinal = int(step["ordinal"])
-            if attempt.get("kind") == "tool":
-                decision = PlannerDecision.model_validate(
-                    step.get("planner_decision")
+            attempts = attempts_by_step.get(step_id, [])
+            planner_attempts = [
+                attempt for attempt in attempts if attempt.get("kind") == "planner"
+            ]
+            tool_attempts = [
+                attempt for attempt in attempts if attempt.get("kind") == "tool"
+            ]
+            for attempt in planner_attempts:
+                await self._repair_attempt_events(
+                    run_id=run_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    attempt=attempt,
+                    decision=None,
+                    invocation=None,
+                    now=now,
                 )
-                if decision.kind != "call_tool" or decision.tool is None:
-                    raise AgentRuntimeStateConflict(
-                        "cancelled tool attempt has no tool decision"
+
+            decision: PlannerDecision | None = None
+            try:
+                decision = PlannerDecision.model_validate(step.get("planner_decision"))
+            except Exception:
+                decision = None
+            if decision is not None:
+                await self._record_step_planned(
+                    run_id=run_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    decision=decision,
+                    now=now,
+                )
+                policy_decision = step.get("policy_decision")
+                if isinstance(policy_decision, Mapping):
+                    await self._event(
+                        run_id=run_id,
+                        event_key=f"step-{ordinal}-policy",
+                        event_type="policy_decided",
+                        payload={
+                            "ordinal": ordinal,
+                            "allowed": bool(policy_decision.get("allowed")),
+                            "decision_kind": decision.kind,
+                            "policy_digest": _digest(policy_decision),
+                        },
+                        step_id=step_id,
+                        now=now,
                     )
-                invocation = step.get("tool_invocation")
-                if not isinstance(invocation, Mapping):
-                    raise AgentRuntimeStateConflict(
-                        "cancelled tool attempt has no invocation checkpoint"
-                    )
+
+            invocation = (
+                dict(step["tool_invocation"])
+                if isinstance(step.get("tool_invocation"), Mapping)
+                else None
+            )
+            for attempt in tool_attempts:
+                await self._repair_attempt_events(
+                    run_id=run_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    attempt=attempt,
+                    decision=decision,
+                    invocation=invocation,
+                    now=now,
+                )
+
+            observation = step.get("observation")
+            if (
+                decision is not None
+                and decision.kind == "call_tool"
+                and isinstance(observation, Mapping)
+            ):
+                validated = RuntimeObservation.model_validate(observation)
                 await self._event(
                     run_id=run_id,
-                    event_key=f"{attempt['call_key']}-dispatched",
-                    event_type="tool_dispatched",
+                    event_key=f"step-{ordinal}-tool-observed",
+                    event_type="tool_observed",
                     payload={
                         "ordinal": ordinal,
-                        "tool_name": decision.tool.name,
-                        "tool_version": decision.tool.version,
-                        "invocation_digest": _digest(invocation),
+                        "status": validated.status,
+                        "code": validated.code,
+                        "observation_digest": _digest(observation),
                     },
                     step_id=step_id,
                     now=now,
                 )
+            if step.get("status") == "completed" and decision is not None:
+                kind = "finish" if decision.kind == "propose_finish" else "tool"
+                await self._event(
+                    run_id=run_id,
+                    event_key=f"step-{ordinal}-completed",
+                    event_type="step_completed",
+                    payload={
+                        "ordinal": ordinal,
+                        "status": "completed",
+                        "kind": kind,
+                        "step_digest": _digest(_step_audit_projection(step)),
+                    },
+                    step_id=step_id,
+                    now=now,
+                )
+
+        termination = run.get("termination")
+        if not isinstance(termination, Mapping):
+            return
+        status = str(termination.get("status") or "")
+        reason_code = str(termination.get("reason_code") or "")
+        termination_step_id = (
+            str(termination["step_id"])
+            if termination.get("step_id")
+            else None
+        )
+        if status == "paused":
+            if any(
+                event.get("type") == "run_paused"
+                and (event.get("payload") or {}).get("status") == status
+                and (event.get("payload") or {}).get("reason_code") == reason_code
+                for event in existing_events
+            ):
+                return
             await self._event(
                 run_id=run_id,
-                event_key=f"{attempt['call_key']}-uncertain",
+                event_key=(
+                    f"run-paused-{reason_code}-"
+                    f"{int(run.get('lease_epoch') or 0)}"
+                ),
+                event_type="run_paused",
+                payload={"status": status, "reason_code": reason_code},
+                step_id=termination_step_id,
+                now=now,
+            )
+        elif status == "superseded" and run.get("successor_run_id"):
+            successor_id = str(run["successor_run_id"])
+            await self._event(
+                run_id=run_id,
+                event_key=f"superseded-by-{successor_id}",
+                event_type="run_superseded",
+                payload={
+                    "status": "superseded",
+                    "successor_run_id": successor_id,
+                    "reason_code": "continued_by_successor",
+                },
+                now=now,
+            )
+        elif status in {"completed", "failed", "cancelled"}:
+            await self._event(
+                run_id=run_id,
+                event_key=f"run-{status}-{reason_code}",
+                event_type="run_terminated",
+                payload={"status": status, "reason_code": reason_code},
+                step_id=termination_step_id,
+                now=now,
+            )
+
+    async def _repair_attempt_events(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        ordinal: int,
+        attempt: Mapping[str, Any],
+        decision: PlannerDecision | None,
+        invocation: Mapping[str, Any] | None,
+        now: datetime,
+    ) -> None:
+        call_key = str(attempt.get("call_key") or "")
+        kind = str(attempt.get("kind") or "")
+        if not call_key or kind not in {"planner", "tool"}:
+            raise AgentRuntimeStateConflict("Agent attempt identity is invalid")
+        await self._event(
+            run_id=run_id,
+            event_key=f"{call_key}-reserved",
+            event_type="attempt_reserved",
+            payload={"ordinal": ordinal, "kind": kind},
+            step_id=step_id,
+            now=now,
+        )
+        state = str(attempt.get("state") or "")
+        if kind == "tool" and state in {
+            "dispatched",
+            "settled",
+            "uncertain",
+            "resolved_retry",
+            "resolved_skip",
+        }:
+            if (
+                decision is None
+                or decision.kind != "call_tool"
+                or decision.tool is None
+                or invocation is None
+            ):
+                raise AgentRuntimeStateConflict(
+                    "dispatched tool attempt has no invocation projection"
+                )
+            await self._event(
+                run_id=run_id,
+                event_key=f"{call_key}-dispatched",
+                event_type="tool_dispatched",
+                payload={
+                    "ordinal": ordinal,
+                    "tool_name": decision.tool.name,
+                    "tool_version": decision.tool.version,
+                    "invocation_digest": _digest(invocation),
+                },
+                step_id=step_id,
+                now=now,
+            )
+        if state == "settled":
+            await self._event(
+                run_id=run_id,
+                event_key=f"{call_key}-settled",
+                event_type="attempt_settled",
+                payload={"ordinal": ordinal},
+                step_id=step_id,
+                now=now,
+            )
+        elif state in {"uncertain", "resolved_retry", "resolved_skip"}:
+            await self._event(
+                run_id=run_id,
+                event_key=f"{call_key}-uncertain",
                 event_type="attempt_uncertain",
                 payload={
                     "ordinal": ordinal,
@@ -597,19 +821,6 @@ class AgentRuntime:
                 step_id=step_id,
                 now=now,
             )
-        termination = run.get("termination") or {}
-        await self._event(
-            run_id=run_id,
-            event_key="run-cancelled-cancelled_by_user",
-            event_type="run_terminated",
-            payload={"status": "cancelled", "reason_code": "cancelled_by_user"},
-            step_id=(
-                str(termination["step_id"])
-                if termination.get("step_id")
-                else None
-            ),
-            now=now,
-        )
 
     async def get(self, *, owner_id: str, run_id: str) -> AgentRunView:
         return await self._run_view(run_id=run_id, owner_id=str(owner_id))
@@ -666,6 +877,18 @@ class AgentRuntime:
             add_violation("event_sequence_mismatch")
 
         step_by_id = {str(item["step_id"]): item for item in steps}
+        attempts_by_step: dict[str, list[dict[str, Any]]] = {}
+        for raw_attempt in run.get("attempts") or []:
+            if not isinstance(raw_attempt, Mapping):
+                add_violation("attempt_event_identity_mismatch")
+                continue
+            attempt = dict(raw_attempt)
+            attempt_step_id = str(attempt.get("step_id") or "")
+            call_key = str(attempt.get("call_key") or "")
+            if not attempt_step_id or not call_key:
+                add_violation("attempt_event_identity_mismatch")
+                continue
+            attempts_by_step.setdefault(attempt_step_id, []).append(attempt)
         event_positions_by_step: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
         derived_status = "ready"
         run_event_started = False
@@ -765,6 +988,70 @@ class AgentRuntime:
                 payload = event.get("payload") or {}
                 if "ordinal" in payload and int(payload["ordinal"]) != ordinal:
                     add_violation("event_step_mismatch")
+
+            attempt_event_types = {
+                "attempt_reserved",
+                "attempt_settled",
+                "attempt_uncertain",
+                "tool_dispatched",
+            }
+            actual_attempt_events = [
+                event
+                for _, event in positioned
+                if str(event.get("type") or "") in attempt_event_types
+            ]
+            actual_attempt_keys = [
+                str(event.get("event_key") or "")
+                for event in actual_attempt_events
+            ]
+            expected_attempt_keys: list[str] = []
+            expected_chain_by_call: list[list[str]] = []
+            for attempt in attempts_by_step.get(step_id, []):
+                call_key = str(attempt["call_key"])
+                state = str(attempt.get("state") or "")
+                kind = str(attempt.get("kind") or "")
+                chain = [f"{call_key}-reserved"]
+                if kind == "tool" and state in {
+                    "dispatched",
+                    "settled",
+                    "uncertain",
+                    "resolved_retry",
+                    "resolved_skip",
+                }:
+                    chain.append(f"{call_key}-dispatched")
+                if state == "settled":
+                    chain.append(f"{call_key}-settled")
+                elif state in {"uncertain", "resolved_retry", "resolved_skip"}:
+                    chain.append(f"{call_key}-uncertain")
+                expected_attempt_keys.extend(chain)
+                expected_chain_by_call.append(chain)
+            if (
+                len(actual_attempt_keys) != len(set(actual_attempt_keys))
+                or set(actual_attempt_keys) != set(expected_attempt_keys)
+            ):
+                add_violation("attempt_event_identity_mismatch")
+            event_position_by_key = {
+                str(event.get("event_key") or ""): position
+                for position, event in positioned
+                if str(event.get("type") or "") in attempt_event_types
+            }
+            prior_attempt_position: int | None = None
+            for chain in expected_chain_by_call:
+                chain_positions = [
+                    event_position_by_key[key]
+                    for key in chain
+                    if key in event_position_by_key
+                ]
+                if len(chain_positions) != len(chain):
+                    continue
+                if chain_positions != sorted(chain_positions):
+                    add_violation("step_event_order_mismatch")
+                if (
+                    prior_attempt_position is not None
+                    and chain_positions[0] <= prior_attempt_position
+                ):
+                    add_violation("step_event_order_mismatch")
+                prior_attempt_position = chain_positions[-1]
 
             decision: PlannerDecision | None = None
             try:
@@ -1201,6 +1488,12 @@ class AgentRuntime:
         )
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
+            if resumed:
+                await self._repair_projection_audit(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    now=now,
+                )
             if run.get("status") == "paused":
                 should_continue = await self._resume_paused_checkpoint(
                     run=run,
@@ -1318,6 +1611,8 @@ class AgentRuntime:
             await self._repository.resolve_uncertain_call(
                 run_id=run_id,
                 owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
                 call_key=str(uncertain[0]["call_key"]),
                 action=uncertain_action,
                 now=now,
@@ -3224,6 +3519,9 @@ class AgentRuntime:
             "step_id": step_id,
             "detail_code": reason_code,
         }
+        event_type = "run_terminated" if status != "paused" else "run_paused"
+        event_payload = {"status": status, "reason_code": reason_code}
+        project_agent_runtime_event_payload(event_type, event_payload)
         await self._repository.set_run_status(
             run_id=run_id,
             owner_id=owner_id,
@@ -3241,8 +3539,8 @@ class AgentRuntime:
                 if status == "paused"
                 else f"run-{status}-{reason_code}"
             ),
-            event_type="run_terminated" if status != "paused" else "run_paused",
-            payload={"status": status, "reason_code": reason_code},
+            event_type=event_type,
+            payload=event_payload,
             step_id=step_id,
             now=now,
         )

@@ -20,13 +20,13 @@ from backend.services.agent_runtime.contracts import (
 
 
 _URI_RE = re.compile(
-    r"(?:^|[\s\"'(<\[])[A-Za-z][A-Za-z0-9+.-]{1,31}:(?://)?[^\s\"'<>]*"
+    r"[A-Za-z][A-Za-z0-9+.-]{0,31}:(?://|[^\s\"'<>])[^\s\"'<>]*"
 )
 _WINDOWS_PATH_RE = re.compile(
-    r"(?:^|[\s\"'(<\[])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]*"
+    r"(?:^|[\s=,;\"'(<\[])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]*"
 )
 _LOCAL_PATH_RE = re.compile(
-    r"(?:^|[\s\"'(<\[])(?:/[^/\s][^\s\"'<>]*|\.\.?[\\/][^\s\"'<>]+)"
+    r"(?:^|[\s=,;\"'(<\[])(?:/[^/\s][^\s\"'<>]*|\.\.?[\\/][^\s\"'<>]+)"
 )
 
 
@@ -41,7 +41,11 @@ def _contains_forbidden_location(value: Any) -> bool:
             for pattern in (_URI_RE, _WINDOWS_PATH_RE, _LOCAL_PATH_RE)
         )
     if isinstance(value, Mapping):
-        return any(_contains_forbidden_location(item) for item in value.values())
+        return any(
+            _contains_forbidden_location(item)
+            for pair in value.items()
+            for item in pair
+        )
     if isinstance(value, (list, tuple)):
         return any(_contains_forbidden_location(item) for item in value)
     return False
