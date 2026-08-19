@@ -21,6 +21,7 @@ from backend.services.novel.emergent_reference_card_candidates import (
 )
 from backend.services.novel.volume_service import VolumeService
 from backend.services.generation.prose_runs import ProseRunModule
+from backend.services.generation.chapter_finalization import ChapterFinalizationService
 from backend.services.interop.card_import_proposal_service import (
     CardImportProposalService,
 )
@@ -35,6 +36,9 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
         ("accept_prose_run", 1): ProseRunModule._execute_accept,
+        ("finalize_chapter_generation", 1): (
+            ChapterFinalizationService._execute_finalize
+        ),
         ("create_chapter", 1): ChapterService._execute_create_chapter,
         ("create_chapter", 2): ChapterService._execute_create_chapter,
         ("update_chapter", 1): ChapterService._execute_update_chapter,
@@ -124,7 +128,12 @@ async def _sync_quarantined_proposals(
             quarantined_status = "stale"
         else:
             proposals = get_database()[collections.STATE_PREVIEWS]
-            claim = command.get("proposal_claim") or {}
+            claim = command.get("proposal_claim") or (
+                ((command.get("state_command") or {}).get("payload") or {}).get(
+                    "proposal_claim"
+                )
+                or {}
+            )
             proposal_id = claim.get("proposal_id")
             expected_status = "claimed"
             quarantined_status = "quarantined"

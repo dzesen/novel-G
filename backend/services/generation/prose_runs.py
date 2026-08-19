@@ -664,7 +664,7 @@ class ProseRunModule:
         run = await prose_run_repo.get_run(run_id, owner_id)
         return serialize_prose_run_telemetry(run)
 
-    async def accept(
+    async def prepare_accept_mutation(
         self,
         *,
         owner_id: str,
@@ -673,7 +673,7 @@ class ProseRunModule:
         expected_revision: int,
         accept_partial: bool,
         partial_acknowledgement: bool,
-    ) -> dict[str, Any]:
+    ) -> MutationCommand:
         run = await prose_run_repo.get_run(run_id, owner_id)
         if int(run.get("revision") or 0) != int(expected_revision):
             raise ValueError("正文草稿版本已经变化，请刷新后再接受")
@@ -732,8 +732,36 @@ class ProseRunModule:
                 "text_digest": text_digest,
                 "acceptance_state": acceptance_state,
                 "accepted_partial": bool(accept_partial),
+                "completion": completion,
+                "captured_narrative_revision": int(captured_narrative_revision),
             },
-            before_image={"chapter": chapter, "prose_run": run},
+            before_image={
+                "chapter": {"status": chapter.get("status")},
+                "prose_run": {
+                    "status": run.get("status"),
+                    "revision": int(run.get("revision") or 0),
+                },
+            },
+        )
+        return command
+
+    async def accept(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        chapter_id: str,
+        expected_revision: int,
+        accept_partial: bool,
+        partial_acknowledgement: bool,
+    ) -> dict[str, Any]:
+        command = await self.prepare_accept_mutation(
+            owner_id=owner_id,
+            run_id=run_id,
+            chapter_id=chapter_id,
+            expected_revision=expected_revision,
+            accept_partial=accept_partial,
+            partial_acknowledgement=partial_acknowledgement,
         )
         return await commit_mutation(
             command,
@@ -844,9 +872,12 @@ class ProseRunModule:
             if update.modified_count != 1:
                 raise ValueError("正文草稿接受发生并发冲突")
             await mutation.receipt("prose_run", {"run_id": run_id})
-        await mutation.advance_phase("derived_data")
-        stats = await derived_stats.refresh(str(run["novel_id"]), session=session)
-        await mutation.receipt("derived_stats", stats)
+        if not command.get("defer_derived_stats"):
+            await mutation.advance_phase("derived_data")
+            stats = await derived_stats.refresh(
+                str(run["novel_id"]), session=session
+            )
+            await mutation.receipt("derived_stats", stats)
         return {
             "chapter_id": chapter_id,
             "run_id": run_id,

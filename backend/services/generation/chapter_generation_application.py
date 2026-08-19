@@ -992,6 +992,14 @@ class ChapterGenerationApplicationService:
             return
 
         review = normalize_outline_adherence(generated.value.model_dump())
+        candidate = prepared.command.prose_candidate
+        if candidate is not None:
+            review = {
+                **review,
+                "source_prose_run_id": candidate.source_run_id,
+                "source_prose_run_revision": candidate.source_run_revision,
+                "source_content_digest": candidate.source_content_digest,
+            }
         usage = generated.usage.model_dump()
         attempts = _serialize_attempts(prepared.runtime)
         yield ChapterGenerationEvent(

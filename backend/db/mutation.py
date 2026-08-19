@@ -13,7 +13,10 @@ from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 from backend.db import collections
 from backend.db.mongo import get_database
-from backend.db.narrative_revision import narrative_revision_store
+from backend.db.narrative_revision import (
+    NarrativeRevisionConflict,
+    narrative_revision_store,
+)
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.utils import get_utc_now, to_object_id
 
@@ -77,6 +80,7 @@ class MutationCommand:
     before_image: dict[str, Any] | None = None
     child_ids: dict[str, str] = field(default_factory=dict)
     version: int = 1
+    expected_narrative_revision: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.novel_id, str) or not self.novel_id.strip():
@@ -97,6 +101,15 @@ class MutationCommand:
             raise TypeError("before_image must be a dictionary or None")
         if not isinstance(self.child_ids, dict):
             raise TypeError("child_ids must be a dictionary")
+        if (
+            self.expected_narrative_revision is not None
+            and (
+                not isinstance(self.expected_narrative_revision, int)
+                or isinstance(self.expected_narrative_revision, bool)
+                or self.expected_narrative_revision < 0
+            )
+        ):
+            raise ValueError("expected_narrative_revision must be a non-negative integer")
 
     @classmethod
     def from_journal(cls, journal: dict[str, Any]) -> "MutationCommand":
@@ -119,18 +132,26 @@ class MutationCommand:
             before_image=deepcopy(stored.get("before_image")),
             child_ids=child_ids,
             version=stored.get("version", 1),
+            expected_narrative_revision=stored.get(
+                "expected_narrative_revision"
+            ),
         )
 
     def digest(self) -> str:
         """返回不含 novel/idempotency 定位字段的稳定命令摘要。"""
-        encoded = json.dumps(
-            _digest_value({
+        digest_input = {
                 "operation": self.operation,
                 "version": self.version,
                 "payload": self.payload,
                 "before_image": self.before_image,
                 "child_ids": self.child_ids,
-            }),
+            }
+        if self.expected_narrative_revision is not None:
+            digest_input["expected_narrative_revision"] = (
+                self.expected_narrative_revision
+            )
+        encoded = json.dumps(
+            _digest_value(digest_input),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -406,6 +427,16 @@ async def _commit_mutation(
 
         async def execute(session):
             now = get_utc_now()
+            stored_command = {
+                "version": command.version,
+                "payload": deepcopy(command.payload),
+                "before_image": deepcopy(command.before_image),
+                "child_ids": deepcopy(command.child_ids),
+            }
+            if command.expected_narrative_revision is not None:
+                stored_command["expected_narrative_revision"] = (
+                    command.expected_narrative_revision
+                )
             await collection.update_one(
                 {
                     "novel_id": to_object_id(command.novel_id),
@@ -414,12 +445,7 @@ async def _commit_mutation(
                 {"$setOnInsert": {
                     "operation": command.operation,
                     "command_digest": command_digest,
-                    "command": {
-                        "version": command.version,
-                        "payload": deepcopy(command.payload),
-                        "before_image": deepcopy(command.before_image),
-                        "child_ids": deepcopy(command.child_ids),
-                    },
+                    "command": stored_command,
                     "receipts": {},
                     "status": "intent",
                     "phase": "intent",
@@ -458,14 +484,27 @@ async def _commit_mutation(
             )
             recorder = MutationRecorder(journal, session)
             if advances_narrative_revision:
-                revision = await narrative_revision_store.advance(
-                    command.novel_id,
-                    (
-                        f"{command.operation}@{command.version}:"
-                        f"{command.idempotency_key}:{command_digest}"
-                    ),
-                    session=session,
-                )
+                try:
+                    revision = await narrative_revision_store.advance(
+                        command.novel_id,
+                        (
+                            f"{command.operation}@{command.version}:"
+                            f"{command.idempotency_key}:{command_digest}"
+                        ),
+                        expected_revision=command.expected_narrative_revision,
+                        session=session,
+                    )
+                except NarrativeRevisionConflict as exc:
+                    await collection.update_one(
+                        {"_id": journal["_id"]},
+                        {"$set": {
+                            "status": "conflict",
+                            "error_type": type(exc).__name__,
+                            "updated_at": get_utc_now(),
+                        }},
+                        session=session,
+                    )
+                    raise MutationConflictError(str(exc)) from exc
                 await recorder.receipt(
                     "narrative_revision", {"revision": revision}
                 )
@@ -507,6 +546,15 @@ async def _commit_mutation(
                             "payload": deepcopy(command.payload),
                             "before_image": deepcopy(command.before_image),
                             "child_ids": deepcopy(command.child_ids),
+                            **(
+                                {
+                                    "expected_narrative_revision": (
+                                        command.expected_narrative_revision
+                                    )
+                                }
+                                if command.expected_narrative_revision is not None
+                                else {}
+                            ),
                         },
                         "receipts": {},
                         "phase": "intent",

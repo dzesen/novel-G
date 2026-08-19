@@ -187,13 +187,13 @@ class ChapterStateService:
             raise
 
     @staticmethod
-    async def _commit_chapter_state(
+    async def prepare_chapter_state_mutation(
         chapter_id: str,
         payload: Dict[str, Any],
         *,
         acceptance_metadata: Dict[str, Any] | None = None,
         proposal_claim: Dict[str, Any] | None = None,
-    ) -> Dict[str, Any]:
+    ) -> MutationCommand:
         """接受状态回填预览：写章摘要、回填人物状态、推进伏笔状态。
 
         Args:
@@ -356,22 +356,38 @@ class ChapterStateService:
             if proposal_claim
             else f"accept-state:{chapter_id}:{digest}"
         )
+        return MutationCommand(
+            novel_id=novel_id,
+            idempotency_key=idempotency_key,
+            operation="accept_chapter_state",
+            payload={
+                "chapter_id": chapter_id,
+                "chapter_order": chapter_order,
+                "state": {**data, "character_updates": planned},
+                "skipped_duplicate_facts": skipped_duplicate_facts,
+                "acceptance_metadata": metadata,
+                "proposal_claim": proposal_claim,
+            },
+            before_image={"chapter_summary": chapter.get("summary", "")},
+            child_ids=child_ids,
+        )
+
+    @staticmethod
+    async def _commit_chapter_state(
+        chapter_id: str,
+        payload: Dict[str, Any],
+        *,
+        acceptance_metadata: Dict[str, Any] | None = None,
+        proposal_claim: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        command = await ChapterStateService.prepare_chapter_state_mutation(
+            chapter_id,
+            payload,
+            acceptance_metadata=acceptance_metadata,
+            proposal_claim=proposal_claim,
+        )
         return await commit_mutation(
-            MutationCommand(
-                novel_id=novel_id,
-                idempotency_key=idempotency_key,
-                operation="accept_chapter_state",
-                payload={
-                    "chapter_id": chapter_id,
-                    "chapter_order": chapter_order,
-                    "state": {**data, "character_updates": planned},
-                    "skipped_duplicate_facts": skipped_duplicate_facts,
-                    "acceptance_metadata": metadata,
-                    "proposal_claim": proposal_claim,
-                },
-                before_image={"chapter_summary": chapter.get("summary", "")},
-                child_ids=child_ids,
-            ),
+            command,
             ChapterStateService._execute_accept_chapter_state,
         )
 

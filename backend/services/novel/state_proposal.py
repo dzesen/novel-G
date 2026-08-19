@@ -753,8 +753,42 @@ class StateProposalModule:
         acceptance_token = str(proposal.get("acceptance_token") or "")
         if not proposal_id or not acceptance_token:
             raise ValueError("Automatic state acceptance requires a proposal handle")
-        selected_fact_ids, selected_thread_ids = policy.decide(proposal)
+        stored = await self._load_verified_proposal(
+            chapter_id=chapter_id,
+            proposal_id=proposal_id,
+            acceptance_token=acceptance_token,
+        )
+        selected_fact_ids, selected_thread_ids = policy.decide(
+            deepcopy(stored.get("candidate") or {})
+        )
         return await self.accept(
+            chapter_id=chapter_id,
+            proposal_id=proposal_id,
+            acceptance_token=acceptance_token,
+            selected_fact_ids=selected_fact_ids,
+            selected_thread_ids=selected_thread_ids,
+            policy_name=policy.name,
+            policy_version=policy.version,
+        )
+
+    async def prepare_policy_decision(
+        self,
+        *,
+        chapter_id: str,
+        proposal_id: str,
+        acceptance_token: str,
+        policy: SelectAllPolicy,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Prepare a policy decision from the persisted candidate, never caller data."""
+        stored = await self._load_verified_proposal(
+            chapter_id=chapter_id,
+            proposal_id=proposal_id,
+            acceptance_token=acceptance_token,
+        )
+        selected_fact_ids, selected_thread_ids = policy.decide(
+            deepcopy(stored.get("candidate") or {})
+        )
+        return await self.prepare_decision(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
@@ -803,7 +837,33 @@ class StateProposalModule:
         chapter = await chapter_repo.get_chapter_by_id(
             str(current["chapter_id"]), session=session
         )
-        if _content_digest(chapter) != current.get("content_digest"):
+        baseline_matches = _content_digest(chapter) == current.get("content_digest")
+        finalized_prose = dict(claim.get("finalized_prose") or {})
+        prose_acceptance = dict(chapter.get("prose_acceptance") or {})
+        finalized_candidate_matches = bool(finalized_prose) and (
+            str(current.get("source_prose_run_id") or "")
+            == str(finalized_prose.get("run_id") or "")
+            and int(
+                current.get("source_prose_run_revision")
+                if current.get("source_prose_run_revision") is not None
+                else -1
+            )
+            == int(
+                finalized_prose.get("run_revision")
+                if finalized_prose.get("run_revision") is not None
+                else -2
+            )
+            and str(current.get("source_content_digest") or "")
+            == str(finalized_prose.get("content_digest") or "")
+            and chapter_content_digest(chapter.get("content") or "")
+            == str(finalized_prose.get("content_digest") or "")
+            and str(prose_acceptance.get("source_run_id") or "")
+            == str(finalized_prose.get("run_id") or "")
+            and str(prose_acceptance.get("content_digest") or "")
+            == str(finalized_prose.get("content_digest") or "")
+            and prose_acceptance.get("state") == "ai_complete"
+        )
+        if not baseline_matches and not finalized_candidate_matches:
             await self.collection.update_one(
                 {"_id": proposal_id, "status": "proposed"},
                 {
