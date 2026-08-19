@@ -31,12 +31,15 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
+    AcceptanceTiming,
     ChapterGenerationApplicationDeps,
     ChapterGenerationApplicationService,
+    ChapterGenerationResult,
     CHAPTER_OUTLINE_STEP,
     CHAPTER_OUTLINE_WORKFLOW,
     OutlineAdherenceCommand,
     OutlineGenerationCommand,
+    ProseCandidateSource,
     ProseGenerationCommand,
     STATE_STEP,
     STATE_WORKFLOW,
@@ -446,6 +449,31 @@ async def generate_prose(
         result.completion,
     )
 
+
+async def generate_prose_candidate(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
+) -> ChapterGenerationResult:
+    """Generate a persisted ProseRun candidate without accepting formal prose."""
+    execution = await _chapter_capability_registry().execute(
+        "chapter_prose",
+        ProseGenerationCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            authority=AcceptanceAuthority.SYSTEM,
+            acceptance_timing=AcceptanceTiming.DEFERRED,
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
+        ),
+        call=CapabilityCall(source="job_engine"),
+    )
+    result = execution.value
+    if result.accepted:
+        raise RuntimeError("deferred prose generation accepted formal content")
+    return result
+
 async def generate_state(
     novel_id: str,
     chapter: Dict[str, Any],
@@ -473,6 +501,36 @@ async def generate_state(
         result.acceptance,
     )
 
+
+async def generate_state_candidate(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    prose_candidate: ProseCandidateSource,
+    attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
+) -> ChapterGenerationResult:
+    """Extract a persisted state proposal without accepting chapter state."""
+    execution = await _chapter_capability_registry().execute(
+        "chapter_state",
+        StateGenerationCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            authority=AcceptanceAuthority.SYSTEM,
+            acceptance_timing=AcceptanceTiming.DEFERRED,
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
+            prose_candidate=prose_candidate,
+        ),
+        call=CapabilityCall(source="job_engine"),
+    )
+    result = execution.value
+    if result.accepted:
+        raise RuntimeError("deferred state generation accepted formal state")
+    proposal = dict(result.value or {})
+    if not proposal.get("proposal_id") or not proposal.get("acceptance_token"):
+        raise RuntimeError("deferred state generation returned no proposal receipt")
+    return result
+
 async def generate_outline_adherence(
     novel_id: str,
     chapter: Dict[str, Any],
@@ -496,6 +554,39 @@ async def generate_outline_adherence(
         result.truncation,
         result.attempts,
     )
+
+
+async def review_prose_candidate(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    prose_candidate: ProseCandidateSource,
+    attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
+) -> ChapterGenerationResult:
+    """Review one exact deferred prose candidate without reading formal prose."""
+    execution = await _chapter_capability_registry().execute(
+        "chapter_outline_adherence",
+        OutlineAdherenceCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
+            prose_candidate=prose_candidate,
+        ),
+        call=CapabilityCall(source="job_engine"),
+    )
+    result = execution.value
+    review = dict(result.value or {})
+    if (
+        str(review.get("source_prose_run_id") or "")
+        != prose_candidate.source_run_id
+        or int(review.get("source_prose_run_revision") or -1)
+        != prose_candidate.source_run_revision
+        or str(review.get("source_content_digest") or "")
+        != prose_candidate.source_content_digest
+    ):
+        raise RuntimeError("candidate review lost its exact prose identity")
+    return result
 
 def _serialize_attempts(runtime) -> list[dict[str, Any]]:
     if runtime is None:
