@@ -14,6 +14,9 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
+from backend.services.generation.chapter_finalization import (
+    build_chapter_finalization_authorization,
+)
 from backend.services.generation.prose_continuation import (
     SCENE_DIVERGENCE_STOP_FACTOR,
     ProseContinuationPolicy,
@@ -460,9 +463,13 @@ class GenerationReadinessModule:
             token_budget=token_budget,
             authorization_revision=authorization_revision,
         )
+        finalization_authorization = build_chapter_finalization_authorization(
+            authorization_revision=authorization_revision,
+        )
         planning = {
             **planning,
             "prose_continuation_authorization": prose_authorization,
+            "chapter_finalization_authorization": finalization_authorization,
         }
         automatic_requested = bool(
             continuation_policy.permits_automatic_continuation

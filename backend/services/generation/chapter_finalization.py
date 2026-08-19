@@ -23,6 +23,8 @@ from backend.services.novel.state_proposal import (
 
 FINALIZATION_AUTHORIZATION_SCHEMA = "chapter_finalization_authorization.v1"
 FINALIZATION_CHANGE_CLASSES = ("chapter_prose", "chapter_state")
+DEFAULT_FINALIZATION_REPAIR_CYCLES = 2
+MAX_FINALIZATION_REPAIR_CYCLES = 8
 
 
 class ChapterFinalizationDenied(ValueError):
@@ -49,10 +51,46 @@ def _strict_int(
     *,
     field: str,
     minimum: int = 0,
+    maximum: int | None = None,
 ) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
         raise ChapterFinalizationDenied(f"{field} 不是有效的冻结整数")
     return value
+
+
+def build_chapter_finalization_authorization(
+    *,
+    authorization_revision: int,
+    max_repair_cycles: int = DEFAULT_FINALIZATION_REPAIR_CYCLES,
+) -> dict[str, Any]:
+    """Build the closed authority later consumed by the atomic finalizer."""
+    if (
+        isinstance(authorization_revision, bool)
+        or not isinstance(authorization_revision, int)
+        or authorization_revision < 1
+    ):
+        raise ValueError("authorization revision must be a positive integer")
+    if (
+        isinstance(max_repair_cycles, bool)
+        or not isinstance(max_repair_cycles, int)
+        or max_repair_cycles < 0
+        or max_repair_cycles > MAX_FINALIZATION_REPAIR_CYCLES
+    ):
+        raise ValueError(
+            "repair cycles must be an integer between 0 and "
+            f"{MAX_FINALIZATION_REPAIR_CYCLES}"
+        )
+    return {
+        "schema_version": FINALIZATION_AUTHORIZATION_SCHEMA,
+        "change_classes": list(FINALIZATION_CHANGE_CLASSES),
+        "authorization_revision": authorization_revision,
+        "max_repair_cycles": max_repair_cycles,
+    }
 
 
 @dataclass(frozen=True)
@@ -303,6 +341,7 @@ class ChapterFinalizationService:
         max_repairs = _strict_int(
             authorization.get("max_repair_cycles"),
             field="正文修复次数上限",
+            maximum=MAX_FINALIZATION_REPAIR_CYCLES,
         )
         if evidence.repair_cycles_used > max_repairs:
             raise ChapterFinalizationDenied("正文修复次数超过已授权上限")
