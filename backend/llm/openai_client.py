@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import openai
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from backend.llm.base_client import BaseLLMClient
 from backend.llm.config import LLMProviderConfig
@@ -50,6 +50,32 @@ _OPENAI_ENDPOINT_SUFFIXES: tuple[tuple[str, ...], ...] = (
     ("vector_stores",),
     ("fine_tuning", "jobs"),
 )
+
+
+def _validation_error_raw_output(error: ValidationError) -> str:
+    """Recover the response value that the SDK already handed to Pydantic."""
+    for item in error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=True,
+    ):
+        if "input" not in item:
+            continue
+        value = item["input"]
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return ""
+    return ""
 
 
 def _trim_openai_endpoint_suffixes(segments: list[str]) -> list[str]:
@@ -226,6 +252,15 @@ class OpenAICompatibleClient(BaseLLMClient):
                 **params,
                 response_format=schema,
             )
+        except ValidationError as exc:
+            mapped = LLMStructuredValidationError(
+                "Provider 已返回，但结构化输出未通过本地 Schema 校验",
+                raw_output=_validation_error_raw_output(exc),
+                provider=self.provider_name,
+                model=model,
+            )
+            log_llm_error(mapped, provider=self.provider_name, model=model)
+            raise mapped from exc
         except Exception as exc:
             if is_schema_protocol_unsupported(exc):
                 mapped = LLMSchemaUnsupportedError(

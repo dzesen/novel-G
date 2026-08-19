@@ -94,7 +94,7 @@ _TOOL_INPUT_TOKEN_BOUND = 600_000
 _MAX_PLANNER_OBSERVATIONS = 32
 _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
-_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r2"
+_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r3"
 
 OutlineIssueCategory = Literal[
     "scene_coverage",
@@ -507,20 +507,15 @@ def _validated_rewrite_receipt_result(
             raise StaleProseRun("正文修复失败回执的来源摘要不一致")
         return result
     data = RewriteProseCandidateOutput.model_validate(result.data)
-    current_digest = chapter_content_digest(
-        str(document.get("assembled_text") or "")
-    )
     if (
         data.outcome != "rewritten"
         or data.prose_run_id != context.scope.object_id
         or data.source_revision != payload.expected_revision
-        or data.candidate_revision != int(document.get("revision") or 0)
-        or data.content_digest != current_digest
         or result.resource_revision != str(data.candidate_revision)
         or result.resource_digest != data.content_digest
         or int(receipt.get("result_revision") or 0) != data.candidate_revision
     ):
-        raise StaleProseRun("正文修复 receipt 与当前候选身份不一致")
+        raise StaleProseRun("正文修复 receipt 的不可变结果投影不一致")
     return result
 
 
@@ -785,7 +780,7 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r4-{call.revision[:20]}"
+                f"prose-remediation-planner-r5-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
@@ -1714,7 +1709,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r4-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r5-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1738,7 +1733,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r4-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r5-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1753,7 +1748,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r4-"
+            "prose-remediation-tools-r5-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

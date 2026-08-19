@@ -4183,71 +4183,25 @@ class AgentRuntime:
                 if not revision_matches
                 else "deadline_exceeded"
             )
-            recovered_at_boundary = (
-                await self._recover_tool_without_dispatch(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    step_id=step_id,
-                    ordinal=ordinal,
-                    call_key=str(latest["call_key"]),
-                    reference=decision.tool,
-                    payload=payload,
-                    context=tool_context,
-                    idempotency_key=(
-                        f"{invocation['idempotency_key']}:"
-                        f"{latest['call_key']}"
-                    ),
-                    boundary_reason=boundary_reason,
-                    now=now,
-                )
-            )
-            if recovered_at_boundary is None:
-                await self._mark_uncertain(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    step_id=step_id,
-                    ordinal=ordinal,
-                    call_key=str(latest["call_key"]),
-                    now=now,
-                )
-                await self._pause_step_and_run(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    step_id=step_id,
-                    expected_step_status=step_status,
-                    reason_code="uncertain_paid_attempt",
-                    now=now,
-                )
-                return False
-            if not revision_matches:
-                await self._pause_step_and_run(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    step_id=step_id,
-                    expected_step_status=step_status,
-                    reason_code="concurrent_narrative_change",
-                    now=now,
-                )
-                return False
-            await self._fail_step_and_run(
+            return await self._resolve_tool_dispatch_boundary(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 lease_epoch=lease_epoch,
                 step_id=step_id,
+                ordinal=ordinal,
+                call_key=str(latest["call_key"]),
+                reference=decision.tool,
+                payload=payload,
+                context=tool_context,
+                idempotency_key=(
+                    f"{invocation['idempotency_key']}:"
+                    f"{latest['call_key']}"
+                ),
                 expected_step_status=step_status,
-                reason_code="deadline_exceeded",
+                boundary_reason=boundary_reason,
                 now=now,
             )
-            return False
         if not revision_matches:
             await self._pause_step_and_run(
                 run_id=run_id,
@@ -4380,7 +4334,7 @@ class AgentRuntime:
                 )
             except _DeadlineExceeded:
                 boundary_now = _aware(self._clock())
-                recovered = await self._recover_tool_without_dispatch(
+                return await self._resolve_tool_dispatch_boundary(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
@@ -4394,42 +4348,10 @@ class AgentRuntime:
                     idempotency_key=(
                         f"{invocation['idempotency_key']}:{call_key}"
                     ),
+                    expected_step_status=step_status,
                     boundary_reason="deadline_exceeded",
                     now=boundary_now,
                 )
-                if recovered is None:
-                    await self._mark_uncertain(
-                        run_id=run_id,
-                        owner_id=owner_id,
-                        worker_id=worker_id,
-                        lease_epoch=lease_epoch,
-                        step_id=step_id,
-                        ordinal=ordinal,
-                        call_key=call_key,
-                        now=boundary_now,
-                    )
-                    await self._pause_step_and_run(
-                        run_id=run_id,
-                        owner_id=owner_id,
-                        worker_id=worker_id,
-                        lease_epoch=lease_epoch,
-                        step_id=step_id,
-                        expected_step_status=step_status,
-                        reason_code="uncertain_paid_attempt",
-                        now=boundary_now,
-                    )
-                    return False
-                await self._fail_step_and_run(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    step_id=step_id,
-                    expected_step_status=step_status,
-                    reason_code="deadline_exceeded",
-                    now=boundary_now,
-                )
-                return False
             except Exception:
                 recovered = None
             if recovered is None:
@@ -4604,7 +4526,8 @@ class AgentRuntime:
                     authorization=authorization,
                 )
             except _DeadlineExceeded:
-                await self._mark_uncertain(
+                boundary_now = _aware(self._clock())
+                return await self._resolve_tool_dispatch_boundary(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
@@ -4612,19 +4535,16 @@ class AgentRuntime:
                     step_id=step_id,
                     ordinal=ordinal,
                     call_key=call_key,
-                    now=_aware(self._clock()),
-                )
-                await self._pause_step_and_run(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    lease_epoch=lease_epoch,
-                    step_id=step_id,
+                    reference=decision.tool,
+                    payload=payload,
+                    context=tool_context,
+                    idempotency_key=(
+                        f"{invocation['idempotency_key']}:{call_key}"
+                    ),
                     expected_step_status="executing",
-                    reason_code="uncertain_paid_attempt",
-                    now=_aware(self._clock()),
+                    boundary_reason="deadline_exceeded",
+                    now=boundary_now,
                 )
-                return False
             except Exception:
                 await self._mark_uncertain(
                     run_id=run_id,
@@ -5186,6 +5106,88 @@ class AgentRuntime:
             usage_is_complete=_tool_result_usage_is_complete(result),
         )
         return result
+
+    async def _resolve_tool_dispatch_boundary(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        step_id: str,
+        ordinal: int,
+        call_key: str,
+        reference: RuntimeToolReference,
+        payload: BaseModel,
+        context: RuntimeToolContext,
+        idempotency_key: str,
+        expected_step_status: str,
+        boundary_reason: str,
+        now: datetime,
+    ) -> bool:
+        """Settle proven pre-dispatch work or freeze genuinely unknown work."""
+        recovered = await self._recover_tool_without_dispatch(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            ordinal=ordinal,
+            call_key=call_key,
+            reference=reference,
+            payload=payload,
+            context=context,
+            idempotency_key=idempotency_key,
+            boundary_reason=boundary_reason,
+            now=now,
+        )
+        if recovered is None:
+            await self._mark_uncertain(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=call_key,
+                now=now,
+            )
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=expected_step_status,
+                reason_code="uncertain_paid_attempt",
+                now=now,
+            )
+            return False
+        if boundary_reason == "concurrent_narrative_change":
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=expected_step_status,
+                reason_code=boundary_reason,
+                now=now,
+            )
+            return False
+        if boundary_reason != "deadline_exceeded":
+            raise AgentRuntimeStateConflict("unsupported Tool dispatch boundary")
+        await self._fail_step_and_run(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            expected_step_status=expected_step_status,
+            reason_code=boundary_reason,
+            now=now,
+        )
+        return False
 
     async def _settle_runtime_call(
         self,
