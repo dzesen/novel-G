@@ -429,13 +429,38 @@ def _validate_remediation_generation_plans(
             raise ValueError("candidate remediation Tool Provider plan changed")
 
 
+def _canonical_json_projection(value: Any, *, field: str) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} is not valid JSON") from exc
+
+
 def parse_candidate_repair_authorization(
     value: Mapping[str, Any],
 ) -> CandidateRepairAuthorization:
     try:
-        return CandidateRepairAuthorization.model_validate(value)
+        parsed = CandidateRepairAuthorization.model_validate(value)
     except ValidationError as exc:
         raise ValueError("candidate repair authorization is invalid") from exc
+    raw_json = _canonical_json_projection(
+        dict(value),
+        field="candidate repair authorization",
+    )
+    canonical_json = _canonical_json_projection(
+        parsed.model_dump(mode="json"),
+        field="canonical candidate repair authorization",
+    )
+    if raw_json != canonical_json:
+        raise ValueError(
+            "candidate repair authorization requires exact JSON types"
+        )
+    return parsed
 
 
 def _strict_positive_int(value: Any, *, field: str) -> int:
@@ -893,8 +918,13 @@ def authorized_candidate_repair_attempt_slots(
     planning = readiness.get("planning")
     if not isinstance(planning, Mapping):
         raise ValueError("generation readiness planning is missing")
-    if planning.get("chapter_candidate_pipeline_revision") != (
-        CANDIDATE_PIPELINE_REVISION
+    pipeline_revision = planning.get(
+        "chapter_candidate_pipeline_revision"
+    )
+    if (
+        isinstance(pipeline_revision, bool)
+        or not isinstance(pipeline_revision, int)
+        or pipeline_revision != CANDIDATE_PIPELINE_REVISION
     ):
         raise ValueError("candidate pipeline authorization revision is invalid")
     raw_authorization = planning.get(
@@ -919,10 +949,19 @@ def authorized_candidate_repair_attempt_slots(
         max_repair_cycles=authorization.max_repair_cycles_per_chapter,
     )
     raw_finalization = planning.get("chapter_finalization_authorization")
-    if (
-        not isinstance(raw_finalization, Mapping)
-        or dict(raw_finalization) != expected_finalization
-    ):
+    finalization_matches = False
+    if isinstance(raw_finalization, Mapping):
+        try:
+            finalization_matches = _canonical_json_projection(
+                dict(raw_finalization),
+                field="chapter finalization authorization",
+            ) == _canonical_json_projection(
+                expected_finalization,
+                field="expected chapter finalization authorization",
+            )
+        except ValueError:
+            pass
+    if not finalization_matches:
         raise ValueError("candidate repair and finalization authority diverged")
     if authorization.adherence_review is not None and (
         authorization.adherence_review.workflow != PROSE_REMEDIATION_WORKFLOW

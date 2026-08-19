@@ -588,12 +588,37 @@ class GenerationRuntime:
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
         terminal_adapter = adapter
         reserved_conservative_tokens = 0
+        request_kwargs = dict(gen_kwargs)
+        effective_output_tokens = _positive_int(
+            request_kwargs.get("max_tokens")
+        )
+        if effective_output_tokens is None:
+            effective_output_tokens = plan.max_output_tokens
+            if effective_output_tokens is not None:
+                # A logical structured call has one frozen output ceiling.
+                # Explicitly pass it so a reviewer with a larger configured
+                # default cannot silently expand this call's authorization.
+                request_kwargs["max_tokens"] = effective_output_tokens
+        if (
+            max_conservative_input_tokens is None
+            and plan.max_context_tokens is not None
+        ):
+            max_conservative_input_tokens = int(plan.max_context_tokens)
+        if (
+            max_conservative_total_tokens is None
+            and max_conservative_input_tokens is not None
+            and effective_output_tokens is not None
+        ):
+            max_conservative_total_tokens = int(plan.max_semantic_attempts) * (
+                int(max_conservative_input_tokens)
+                + int(effective_output_tokens)
+            )
 
         def bounded_reservation(prompt: str) -> int | None:
             nonlocal reserved_conservative_tokens
             input_tokens = conservative_prompt_input_bound(
                 prompt=prompt,
-                system_prompt=str(gen_kwargs.get("system_prompt") or ""),
+                system_prompt=str(request_kwargs.get("system_prompt") or ""),
             )
             if (
                 max_conservative_input_tokens is not None
@@ -602,7 +627,11 @@ class GenerationRuntime:
                 raise ConservativeGenerationBoundExceeded(
                     "structured repair input exceeds the frozen per-attempt bound"
                 )
-            bound = self._conservative_token_bound(plan, prompt, gen_kwargs)
+            bound = self._conservative_token_bound(
+                plan,
+                prompt,
+                request_kwargs,
+            )
             if bound is None and max_conservative_total_tokens is not None:
                 raise ConservativeGenerationBoundExceeded(
                     "structured call has no conservative output bound"
@@ -621,10 +650,20 @@ class GenerationRuntime:
 
         async def primary_call() -> Any:
             if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED:
-                return await adapter.generate_structured(prompts.native_schema_prompt, schema, **gen_kwargs)
+                return await adapter.generate_structured(
+                    prompts.native_schema_prompt,
+                    schema,
+                    **request_kwargs,
+                )
             if plan.mode == StructuredOutputMode.JSON_OBJECT and hasattr(adapter, "generate_json_object"):
-                return await adapter.generate_json_object(prompts.prompt_json_prompt, **gen_kwargs)
-            return await adapter.generate_text(prompts.prompt_json_prompt, **gen_kwargs)
+                return await adapter.generate_json_object(
+                    prompts.prompt_json_prompt,
+                    **request_kwargs,
+                )
+            return await adapter.generate_text(
+                prompts.prompt_json_prompt,
+                **request_kwargs,
+            )
 
         try:
             primary_prompt = (
@@ -644,7 +683,10 @@ class GenerationRuntime:
                 raise
 
             async def fallback_call() -> Any:
-                return await adapter.generate_text(prompts.prompt_json_prompt, **gen_kwargs)
+                return await adapter.generate_text(
+                    prompts.prompt_json_prompt,
+                    **request_kwargs,
+                )
 
             produced = await self._paid_call(
                 plan,
@@ -664,7 +706,10 @@ class GenerationRuntime:
             )
 
             async def repair_call() -> Any:
-                return await adapter.generate_text(repair_prompt, **gen_kwargs)
+                return await adapter.generate_text(
+                    repair_prompt,
+                    **request_kwargs,
+                )
 
             repaired = await self._paid_call(
                 plan, plan.provider_alias, "repair", adapter, repair_call,
@@ -681,7 +726,11 @@ class GenerationRuntime:
                 terminal_adapter = reviewer
 
                 async def review_call() -> Any:
-                    return await reviewer.generate_structured(repair_prompt, schema, **gen_kwargs)
+                    return await reviewer.generate_structured(
+                        repair_prompt,
+                        schema,
+                        **request_kwargs,
+                    )
 
                 value = await self._paid_call(
                     plan, plan.reviewer_alias, "reviewer", reviewer, review_call,

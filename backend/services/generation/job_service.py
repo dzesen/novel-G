@@ -147,7 +147,11 @@ def _estimate_authorized_chapter_attempt_slots(
         return base_slots
     if readiness_version != 2:
         raise ValueError("candidate repair readiness version is invalid")
-    if pipeline_revision != CANDIDATE_PIPELINE_REVISION:
+    if (
+        isinstance(pipeline_revision, bool)
+        or not isinstance(pipeline_revision, int)
+        or pipeline_revision != CANDIDATE_PIPELINE_REVISION
+    ):
         raise ValueError("candidate pipeline authorization revision is invalid")
     if not has_authorization:
         raise ValueError("generation readiness has no candidate repair authority")
