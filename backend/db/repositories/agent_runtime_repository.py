@@ -619,18 +619,6 @@ class AgentRuntimeRepository:
                     return_document=ReturnDocument.AFTER,
                 )
             if predecessor is None:
-                if (
-                    fenced_step is not None
-                    and fenced_step.get("status") not in {"completed", "failed"}
-                ):
-                    await self._rollback_step_handoff(
-                        run=predecessor_snapshot,
-                        step_id=str(predecessor_step_id),
-                        worker_id=fence_worker_id,
-                        lease_epoch=successor_epoch,
-                        previous_epoch=predecessor_epoch,
-                        now=now,
-                    )
                 current_predecessor = await self.runs.find_one({
                     "_id": predecessor_object_id,
                     "owner_id": owner_object_id,
@@ -641,6 +629,18 @@ class AgentRuntimeRepository:
                     and current_predecessor.get("status") == "superseded"
                     and current_predecessor.get("successor_run_id") == run_id
                 ):
+                    if (
+                        fenced_step is not None
+                        and fenced_step.get("status") not in {"completed", "failed"}
+                    ):
+                        await self._rollback_step_handoff(
+                            run=predecessor_snapshot,
+                            step_id=str(predecessor_step_id),
+                            worker_id=fence_worker_id,
+                            lease_epoch=successor_epoch,
+                            previous_epoch=predecessor_epoch,
+                            now=now,
+                        )
                     raise AgentRuntimeReadinessConflict(
                         "predecessor changed before successor binding"
                     )
