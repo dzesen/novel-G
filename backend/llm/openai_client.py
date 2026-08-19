@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import json
 import re
-from typing import Any, AsyncGenerator, Callable
+from typing import Any, AsyncGenerator, Callable, NoReturn
 from urllib.parse import urlsplit, urlunsplit
 
 import openai
@@ -201,6 +201,22 @@ class OpenAICompatibleClient(BaseLLMClient):
             return LLMResponseError(str(exc), **kwargs)
         return LLMError(str(exc), **kwargs)
 
+    def _raise_mapped_schema_error(
+        self,
+        exc: Exception,
+        *,
+        model: str,
+    ) -> NoReturn:
+        """Map one schema request boundary without duplicating error policy."""
+        if is_schema_protocol_unsupported(exc):
+            mapped: LLMError = LLMSchemaUnsupportedError(
+                str(exc), provider=self.provider_name, model=model
+            )
+        else:
+            mapped = self._map_error(exc, model)
+        log_llm_error(mapped, provider=self.provider_name, model=model)
+        raise mapped from exc
+
     @staticmethod
     def _extract_usage(usage: Any) -> TokenUsage:
         """从响应中提取 Token 用量。"""
@@ -262,15 +278,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                 )
             )
         except Exception as exc:
-            if is_schema_protocol_unsupported(exc):
-                mapped = LLMSchemaUnsupportedError(
-                    str(exc), provider=self.provider_name, model=model
-                )
-                log_llm_error(mapped, provider=self.provider_name, model=model)
-                raise mapped from exc
-            mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
-            raise mapped from exc
+            self._raise_mapped_schema_error(exc, model=model)
 
         try:
             resp = raw_response.parse()
@@ -284,15 +292,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             log_llm_error(mapped, provider=self.provider_name, model=model)
             raise mapped from exc
         except Exception as exc:
-            if is_schema_protocol_unsupported(exc):
-                mapped = LLMSchemaUnsupportedError(
-                    str(exc), provider=self.provider_name, model=model
-                )
-                log_llm_error(mapped, provider=self.provider_name, model=model)
-                raise mapped from exc
-            mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
-            raise mapped from exc
+            self._raise_mapped_schema_error(exc, model=model)
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         choice = resp.choices[0] if resp.choices else None
