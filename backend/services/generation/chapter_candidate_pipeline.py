@@ -78,6 +78,12 @@ class CandidateAttemptState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CandidateUsageEvidenceKind(StrEnum):
+    EXACT = "exact"
+    INCOMPLETE = "incomplete"
+    LOWER_BOUND = "lower_bound"
+
+
 class CandidateUnattributedUsageReason(StrEnum):
     MISSING_ATTEMPT_IDENTITY = "missing_attempt_identity"
     ATTEMPT_EVIDENCE_INVALID = "attempt_evidence_invalid"
@@ -85,6 +91,7 @@ class CandidateUnattributedUsageReason(StrEnum):
     AGGREGATE_RESIDUAL_UNATTRIBUTED = "aggregate_residual_unattributed"
     CHARGED_ATTEMPT_USAGE_MISSING = "charged_attempt_usage_missing"
     ATTEMPT_LEDGER_CONFLICT = "attempt_ledger_conflict"
+    ATTEMPT_LEDGER_CAPACITY_EXCEEDED = "attempt_ledger_capacity_exceeded"
     USAGE_PROJECTION_OVERFLOW = "usage_projection_overflow"
     RELEASED_PREDISPATCH_USAGE_INVALID = (
         "released_predispatch_usage_invalid"
@@ -121,8 +128,7 @@ class CandidateUnattributedUsageSummary(_RepairContract):
     )
     reason: CandidateUnattributedUsageReason
     usage: CandidateUsageSummary
-    is_lower_bound: bool = False
-    is_complete: bool = True
+    evidence_kind: CandidateUsageEvidenceKind = CandidateUsageEvidenceKind.EXACT
 
 
 class CandidateAttemptSummary(_RepairContract):
@@ -171,9 +177,14 @@ class _UsageProjectionOverflow(_EvidenceProjectionError):
 
 
 class _IncompleteAggregateUsageProjectionError(_EvidenceProjectionError):
-    def __init__(self, message: str, *, is_lower_bound: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        evidence_kind: CandidateUsageEvidenceKind,
+    ) -> None:
         super().__init__(message)
-        self.is_lower_bound = is_lower_bound
+        self.evidence_kind = evidence_kind
 
 
 class _UnattributedUsageProjectionError(_EvidenceProjectionError):
@@ -184,15 +195,15 @@ class _UnattributedUsageProjectionError(_EvidenceProjectionError):
         reason: CandidateUnattributedUsageReason,
         usage: CandidateUsageSummary,
         attempts: tuple[CandidateAttemptSummary, ...],
-        is_lower_bound: bool = False,
-        is_complete: bool = True,
+        evidence_kind: CandidateUsageEvidenceKind = (
+            CandidateUsageEvidenceKind.EXACT
+        ),
     ) -> None:
         super().__init__(message)
         self.reason = reason
         self.usage = usage
         self.attempts = attempts
-        self.is_lower_bound = is_lower_bound
-        self.is_complete = is_complete
+        self.evidence_kind = evidence_kind
 
 
 def _strict_token_count(value: Any, *, field: str) -> int:
@@ -409,7 +420,24 @@ def _project_aggregate_usage(
     value: Any,
 ) -> tuple[CandidateUsageSummary, _EvidenceProjectionError | None]:
     raw = _as_mapping(value)
-    if "usage_is_complete" in raw or "usage_is_lower_bound" in raw:
+    raw_kind = raw.get("usage_evidence_kind")
+    if raw_kind is not None:
+        try:
+            evidence_kind = CandidateUsageEvidenceKind(raw_kind)
+        except (TypeError, ValueError):
+            return (
+                _usage_component_floor(raw),
+                _EvidenceProjectionError("Token 用量完整性标记无效"),
+            )
+        if evidence_kind is not CandidateUsageEvidenceKind.EXACT:
+            return (
+                _usage_component_floor(raw),
+                _IncompleteAggregateUsageProjectionError(
+                    "Token 用量不是精确完整投影",
+                    evidence_kind=evidence_kind,
+                ),
+            )
+    elif "usage_is_complete" in raw or "usage_is_lower_bound" in raw:
         is_complete = raw.get("usage_is_complete")
         is_lower_bound = raw.get("usage_is_lower_bound")
         if type(is_complete) is not bool or type(is_lower_bound) is not bool:
@@ -427,7 +455,11 @@ def _project_aggregate_usage(
                 _usage_component_floor(raw),
                 _IncompleteAggregateUsageProjectionError(
                     "Token 用量不是精确完整投影",
-                    is_lower_bound=is_lower_bound,
+                    evidence_kind=(
+                        CandidateUsageEvidenceKind.LOWER_BOUND
+                        if is_lower_bound
+                        else CandidateUsageEvidenceKind.INCOMPLETE
+                    ),
                 ),
             )
     try:
@@ -446,9 +478,28 @@ def _usage_overflow_error(
         reason=CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW,
         usage=CandidateUsageSummary(total_tokens=_MAX_TOKEN_COUNT),
         attempts=(),
-        is_lower_bound=True,
-        is_complete=False,
+        evidence_kind=CandidateUsageEvidenceKind.LOWER_BOUND,
     )
+
+
+def _merge_usage_evidence_kind(
+    *kinds: CandidateUsageEvidenceKind,
+) -> CandidateUsageEvidenceKind:
+    if CandidateUsageEvidenceKind.LOWER_BOUND in kinds:
+        return CandidateUsageEvidenceKind.LOWER_BOUND
+    if CandidateUsageEvidenceKind.INCOMPLETE in kinds:
+        return CandidateUsageEvidenceKind.INCOMPLETE
+    return CandidateUsageEvidenceKind.EXACT
+
+
+def _aggregate_usage_evidence_kind(
+    error: _EvidenceProjectionError | None,
+) -> CandidateUsageEvidenceKind:
+    if isinstance(error, _IncompleteAggregateUsageProjectionError):
+        return error.evidence_kind
+    if error is not None:
+        return CandidateUsageEvidenceKind.INCOMPLETE
+    return CandidateUsageEvidenceKind.EXACT
 
 
 def _bounded_unattributed_attempt_usage(
@@ -489,6 +540,8 @@ def _bounded_unattributed_attempt_usage(
 def _project_attempt_batch_with_aggregate(
     attempts: list[Any] | tuple[Any, ...],
     aggregate: CandidateUsageSummary,
+    *,
+    aggregate_evidence_kind: CandidateUsageEvidenceKind,
 ) -> tuple[CandidateAttemptSummary, ...]:
     try:
         return _project_attempt_batch(attempts)
@@ -505,7 +558,10 @@ def _project_attempt_batch_with_aggregate(
             reason=CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID,
             usage=unattributed_usage,
             attempts=(),
-            is_complete=False,
+            evidence_kind=_merge_usage_evidence_kind(
+                aggregate_evidence_kind,
+                CandidateUsageEvidenceKind.INCOMPLETE,
+            ),
         ) from exc
 
 
@@ -527,12 +583,7 @@ def _invalid_aggregate_error(
         reason=CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID,
         usage=usage,
         attempts=attempts,
-        is_lower_bound=(
-            error.is_lower_bound
-            if isinstance(error, _IncompleteAggregateUsageProjectionError)
-            else False
-        ),
-        is_complete=False,
+        evidence_kind=_aggregate_usage_evidence_kind(error),
     )
 
 
@@ -558,6 +609,58 @@ def _usage_residual(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+    )
+
+
+def _usage_add(
+    left: CandidateUsageSummary,
+    right: CandidateUsageSummary,
+) -> CandidateUsageSummary:
+    input_tokens = _checked_token_add(
+        left.input_tokens,
+        right.input_tokens,
+    )
+    output_tokens = _checked_token_add(
+        left.output_tokens,
+        right.output_tokens,
+    )
+    supplied_total = _checked_token_add(
+        left.total_tokens,
+        right.total_tokens,
+    )
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=max(
+            supplied_total,
+            _checked_token_add(input_tokens, output_tokens),
+        ),
+    )
+
+
+def _usage_delta(
+    current: CandidateUsageSummary,
+    accounted: CandidateUsageSummary,
+) -> tuple[CandidateUsageSummary, CandidateUsageEvidenceKind]:
+    total_delta = max(0, current.total_tokens - accounted.total_tokens)
+    if (
+        current.input_tokens >= accounted.input_tokens
+        and current.output_tokens >= accounted.output_tokens
+    ):
+        input_delta = current.input_tokens - accounted.input_tokens
+        output_delta = current.output_tokens - accounted.output_tokens
+        if total_delta >= _checked_token_add(input_delta, output_delta):
+            return (
+                CandidateUsageSummary(
+                    input_tokens=input_delta,
+                    output_tokens=output_delta,
+                    total_tokens=total_delta,
+                ),
+                CandidateUsageEvidenceKind.EXACT,
+            )
+    return (
+        CandidateUsageSummary(total_tokens=total_delta),
+        CandidateUsageEvidenceKind.INCOMPLETE,
     )
 
 
@@ -597,14 +700,14 @@ def _unattributed_usage_error(
     reason: CandidateUnattributedUsageReason,
     aggregate: CandidateUsageSummary,
     attempts: tuple[CandidateAttemptSummary, ...],
-    is_complete: bool = True,
+    evidence_kind: CandidateUsageEvidenceKind = CandidateUsageEvidenceKind.EXACT,
 ) -> _UnattributedUsageProjectionError:
     return _UnattributedUsageProjectionError(
         message,
         reason=reason,
         usage=_effective_usage(aggregate, attempts),
         attempts=attempts,
-        is_complete=is_complete,
+        evidence_kind=evidence_kind,
     )
 
 
@@ -656,7 +759,7 @@ def _attribute_aggregate_usage(
             ),
             aggregate=aggregate,
             attempts=attempts,
-            is_complete=False,
+            evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
         )
     residual = _usage_residual(aggregate, _summed_usage(attempts))
     unreported_indexes = [
@@ -694,10 +797,16 @@ def _project_result_evidence(
         attempts = _project_attempt_batch_with_aggregate(
             result.attempts,
             aggregate,
+            aggregate_evidence_kind=_aggregate_usage_evidence_kind(
+                aggregate_error
+            ),
         )
-        if isinstance(
-            aggregate_error,
-            _IncompleteAggregateUsageProjectionError,
+        if aggregate_error is not None and (
+            not attempts
+            or isinstance(
+                aggregate_error,
+                _IncompleteAggregateUsageProjectionError,
+            )
         ):
             raise _invalid_aggregate_error(
                 aggregate_error,
@@ -869,15 +978,16 @@ class ChapterCandidatePipelineProgress:
 
 def _exception_usage_projection(
     progress: ChapterCandidatePipelineProgress,
-) -> dict[str, int | bool]:
+) -> dict[str, int | str]:
+    evidence_kind = _merge_usage_evidence_kind(
+        *(
+            item.evidence_kind
+            for item in progress.unattributed_usage
+        )
+    )
     return {
         "total_tokens": progress.tokens,
-        "usage_is_complete": all(
-            item.is_complete for item in progress.unattributed_usage
-        ),
-        "usage_is_lower_bound": any(
-            item.is_lower_bound for item in progress.unattributed_usage
-        ),
+        "usage_evidence_kind": evidence_kind.value,
     }
 
 
@@ -912,7 +1022,7 @@ class ChapterCandidatePipelineBlocked(ValueError):
         return [item.model_dump(mode="json") for item in self.progress.attempts]
 
     @property
-    def usage(self) -> dict[str, int | bool]:
+    def usage(self) -> dict[str, int | str]:
         return _exception_usage_projection(self.progress)
 
     @property
@@ -933,7 +1043,7 @@ class ChapterCandidatePipelineDependencyFailed(RuntimeError):
         return [item.model_dump(mode="json") for item in self.progress.attempts]
 
     @property
-    def usage(self) -> dict[str, int | bool]:
+    def usage(self) -> dict[str, int | str]:
         return _exception_usage_projection(self.progress)
 
     @property
@@ -1061,6 +1171,9 @@ class _PipelineTrace:
             aggregate, aggregate_error = _project_aggregate_usage(
                 usage_mapping
             )
+            aggregate_kind = _aggregate_usage_evidence_kind(
+                aggregate_error
+            )
             raw_attempts = getattr(exc, "attempts", None)
             if raw_attempts is None and outcome is not None:
                 raw_attempts = getattr(outcome, "attempts", None)
@@ -1075,7 +1188,10 @@ class _PipelineTrace:
                         ),
                         usage=aggregate,
                         attempts=(),
-                        is_complete=aggregate_error is None,
+                        evidence_kind=_merge_usage_evidence_kind(
+                            aggregate_kind,
+                            CandidateUsageEvidenceKind.INCOMPLETE,
+                        ),
                     )
                 raw_attempt_values = tuple(raw_attempts)
             else:
@@ -1086,15 +1202,22 @@ class _PipelineTrace:
                     ),
                     usage=aggregate,
                     attempts=(),
-                    is_complete=aggregate_error is None,
+                    evidence_kind=_merge_usage_evidence_kind(
+                        aggregate_kind,
+                        CandidateUsageEvidenceKind.INCOMPLETE,
+                    ),
                 )
             summaries = _project_attempt_batch_with_aggregate(
                 raw_attempt_values,
                 aggregate,
+                aggregate_evidence_kind=aggregate_kind,
             )
-            if isinstance(
-                aggregate_error,
-                _IncompleteAggregateUsageProjectionError,
+            if aggregate_error is not None and (
+                not summaries
+                or isinstance(
+                    aggregate_error,
+                    _IncompleteAggregateUsageProjectionError,
+                )
             ):
                 raise _invalid_aggregate_error(
                     aggregate_error,
@@ -1163,26 +1286,11 @@ class _PipelineTrace:
         self,
         error: _UnattributedUsageProjectionError,
     ) -> None:
-        if error.is_lower_bound:
-            if any(item.is_lower_bound for item in self.unattributed_usage):
-                self.tokens = _MAX_TOKEN_COUNT
-                return
-            if (
-                len(self.unattributed_usage)
-                >= _MAX_PIPELINE_UNATTRIBUTED_USAGE
-            ):
-                raise _EvidenceProjectionError(
-                    "候选管线未归属用量证据超过 V1 上限"
-                )
-            self.unattributed_usage.append(
-                CandidateUnattributedUsageSummary(
-                    reason=error.reason,
-                    usage=error.usage,
-                    is_lower_bound=True,
-                    is_complete=False,
-                )
-            )
-            self.tokens = _MAX_TOKEN_COUNT
+        if (
+            error.reason
+            is CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
+        ):
+            self._record_usage_overflow()
             return
         known = {item.attempt_id: item for item in self.attempts}
         duplicates = tuple(
@@ -1195,12 +1303,13 @@ class _PipelineTrace:
                 error.usage,
                 _summed_usage(duplicates),
             )
-        except _UsageProjectionOverflow as overflow:
-            self._record_unattributed_usage(
-                _usage_overflow_error(str(overflow))
-            )
+        except _UsageProjectionOverflow:
+            self._record_usage_overflow()
             return
-        if residual.total_tokens == 0 and error.is_complete:
+        if (
+            residual.total_tokens == 0
+            and error.evidence_kind is CandidateUsageEvidenceKind.EXACT
+        ):
             return
         if (
             len(self.unattributed_usage)
@@ -1214,30 +1323,43 @@ class _PipelineTrace:
                 self.tokens,
                 residual.total_tokens,
             )
-        except _UsageProjectionOverflow as overflow:
-            self._record_unattributed_usage(
-                _usage_overflow_error(str(overflow))
-            )
+        except _UsageProjectionOverflow:
+            self._record_usage_overflow()
             return
         self.unattributed_usage.append(
             CandidateUnattributedUsageSummary(
                 reason=error.reason,
                 usage=residual,
-                is_lower_bound=False,
-                is_complete=error.is_complete,
+                evidence_kind=error.evidence_kind,
             )
         )
         self.tokens = next_tokens
 
-    def _ensure_attempt_capacity(self, additional: int) -> None:
-        if len(self.attempts) + additional > _MAX_PIPELINE_ATTEMPTS:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线调用证据超过 V1 上限"
+    def _record_usage_overflow(self) -> None:
+        if any(
+            item.reason
+            is CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
+            for item in self.unattributed_usage
+        ):
+            self.tokens = _MAX_TOKEN_COUNT
+            return
+        if len(self.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
+            raise _EvidenceProjectionError(
+                "候选管线未归属用量证据超过 V1 上限"
             )
+        self.unattributed_usage.append(
+            CandidateUnattributedUsageSummary(
+                reason=(
+                    CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
+                ),
+                usage=CandidateUsageSummary(total_tokens=_MAX_TOKEN_COUNT),
+                evidence_kind=CandidateUsageEvidenceKind.LOWER_BOUND,
+            )
+        )
+        self.tokens = _MAX_TOKEN_COUNT
 
     def _classify_attempts(
         self,
-        usage: CandidateUsageSummary,
         summaries: tuple[CandidateAttemptSummary, ...],
     ) -> tuple[
         tuple[CandidateAttemptSummary, ...],
@@ -1246,7 +1368,9 @@ class _PipelineTrace:
         known = {item.attempt_id: item for item in self.attempts}
         new: list[CandidateAttemptSummary] = []
         duplicates: list[CandidateAttemptSummary] = []
-        conflicting_existing: list[CandidateAttemptSummary] = []
+        conflicting: list[
+            tuple[CandidateAttemptSummary, CandidateAttemptSummary]
+        ] = []
         for summary in summaries:
             existing = known.get(summary.attempt_id)
             if existing is None:
@@ -1254,18 +1378,32 @@ class _PipelineTrace:
             elif existing == summary:
                 duplicates.append(summary)
             else:
-                conflicting_existing.append(existing)
-        if conflicting_existing:
-            accounted = _summed_usage(
-                tuple(duplicates) + tuple(conflicting_existing)
+                conflicting.append((existing, summary))
+        if conflicting:
+            conflict_delta = CandidateUsageSummary()
+            conflict_kind = CandidateUsageEvidenceKind.EXACT
+            for old, current in conflicting:
+                item_delta, item_kind = _usage_delta(
+                    current.usage,
+                    old.usage,
+                )
+                conflict_delta = _usage_add(conflict_delta, item_delta)
+                conflict_kind = _merge_usage_evidence_kind(
+                    conflict_kind,
+                    item_kind,
+                )
+            unresolved_usage = _usage_add(
+                _summed_usage(tuple(new)),
+                conflict_delta,
             )
             raise _UnattributedUsageProjectionError(
                 "同一 attempt_id 的持久调用证据冲突",
                 reason=(
                     CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
                 ),
-                usage=_usage_residual(usage, accounted),
+                usage=unresolved_usage,
                 attempts=(),
+                evidence_kind=conflict_kind,
             )
         return tuple(new), tuple(duplicates)
 
@@ -1275,12 +1413,20 @@ class _PipelineTrace:
         summaries: tuple[CandidateAttemptSummary, ...],
     ) -> None:
         try:
-            new, duplicates = self._classify_attempts(usage, summaries)
+            new, duplicates = self._classify_attempts(summaries)
+            if len(self.attempts) + len(new) > _MAX_PIPELINE_ATTEMPTS:
+                raise _UnattributedUsageProjectionError(
+                    "候选管线调用证据超过 V1 上限",
+                    reason=(
+                        CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CAPACITY_EXCEEDED
+                    ),
+                    usage=_summed_usage(new),
+                    attempts=(),
+                )
             additional = self._additional_tokens(usage, new, duplicates)
             next_tokens = _checked_token_add(self.tokens, additional)
         except _UsageProjectionOverflow as overflow:
             raise _usage_overflow_error(str(overflow)) from overflow
-        self._ensure_attempt_capacity(len(new))
         self.attempts.extend(new)
         self.tokens = next_tokens
 
