@@ -39,6 +39,30 @@ async def _drop_legacy_unique_index(
                 logger.info("已删除旧全量唯一索引 %s.%s", collection.name, index_name)
 
 
+async def _migrate_agent_runtime_readiness_ttl(
+    collection: AsyncCollection,
+) -> None:
+    """Move readiness expiry off the authorization deadline field.
+
+    Bound readiness envelopes must remain available as the durable reservation for
+    a start_request_id, even after their original inspection deadline.
+    """
+    name = "agent_runtime_readiness_expiry_ttl"
+    existing = (await collection.index_information()).get(name)
+    if existing is None:
+        return
+    key = list(existing.get("key") or [])
+    expire_after = existing.get("expireAfterSeconds")
+    if key == [("ttl_expires_at", 1)] and expire_after == 0:
+        return
+    if key != [("expires_at", 1)] or expire_after != 0:
+        raise RuntimeError(
+            "Agent Runtime readiness TTL index has unexpected options"
+        )
+    await collection.drop_index(name)
+    logger.info("已迁移 Agent Runtime readiness TTL 索引。")
+
+
 async def init_novel_indexes():
     """初始化novels集合的索引。"""
     try:
@@ -204,6 +228,9 @@ async def init_agent_runtime_indexes():
     """初始化有界 Agent Runtime 的授权、运行、步骤与事件索引。"""
     try:
         db = get_database()
+        await _migrate_agent_runtime_readiness_ttl(
+            db[collections.AGENT_RUNTIME_READINESS]
+        )
         await db[collections.AGENT_RUNTIME_READINESS].create_indexes([
             pymongo.IndexModel(
                 [
@@ -223,7 +250,7 @@ async def init_agent_runtime_indexes():
                 ("created_at", pymongo.DESCENDING),
             ]),
             pymongo.IndexModel(
-                [("expires_at", pymongo.ASCENDING)],
+                [("ttl_expires_at", pymongo.ASCENDING)],
                 expireAfterSeconds=0,
                 name="agent_runtime_readiness_expiry_ttl",
             ),

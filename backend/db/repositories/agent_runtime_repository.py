@@ -357,6 +357,7 @@ class AgentRuntimeRepository:
             "authorization": deepcopy(dict(authorization)),
             "issued_at": issued_at,
             "expires_at": expires_at,
+            "ttl_expires_at": expires_at,
             "bound_run_id": None,
             "start_request_id": None,
             "bound_at": None,
@@ -442,7 +443,8 @@ class AgentRuntimeRepository:
                         "start_request_id": str(start_request_id),
                         "bound_at": now,
                         "updated_at": now,
-                    }
+                    },
+                    "$unset": {"ttl_expires_at": ""},
                 },
                 return_document=ReturnDocument.AFTER,
             )
