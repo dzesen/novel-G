@@ -15,6 +15,7 @@ from bson import ObjectId
 from backend.db.errors import NotFoundError
 from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeBudgetExceeded,
+    AgentRuntimeBinding,
     AgentRuntimeCheckpointPending,
     AgentRuntimeLeaseUnavailable,
     AgentRuntimeReadinessConflict,
@@ -257,6 +258,30 @@ def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
         "observation": step.get("observation"),
         "usage_delta": step.get("usage_delta"),
     }
+
+
+def _completed_step_planner_view(
+    step: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if step.get("status") != "completed":
+        return None
+    observation = step.get("observation")
+    if not isinstance(observation, Mapping):
+        return None
+    planner_view = observation.get("planner_view")
+    if isinstance(planner_view, Mapping):
+        return dict(planner_view)
+    if observation.get("status") != "finish_evaluated":
+        return None
+    completion = observation.get("completion")
+    if not isinstance(completion, Mapping):
+        return None
+    completion_planner_view = completion.get("planner_view")
+    return (
+        dict(completion_planner_view)
+        if isinstance(completion_planner_view, Mapping)
+        else None
+    )
 
 
 def _replan_feedback(reason_code: str) -> dict[str, Any]:
@@ -715,9 +740,10 @@ class AgentRuntime:
         start_request_id: str,
     ) -> AgentRunView:
         now = _aware(self._clock())
-        binding = await self._repository.bind_readiness(
+        normalized_owner_id = str(owner_id)
+        binding = await self._bind_readiness_with_checkpoint_repair(
             readiness_id=readiness_id,
-            owner_id=str(owner_id),
+            owner_id=normalized_owner_id,
             digest=digest,
             start_request_id=start_request_id,
             now=now,
@@ -738,19 +764,60 @@ class AgentRuntime:
                 now=now,
             )
         if binding.replayed:
-            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+            return await self._run_view(run_id=run_id, owner_id=normalized_owner_id)
         if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
             await self._repair_projection_audit(
                 run_id=run_id,
-                owner_id=str(owner_id),
+                owner_id=normalized_owner_id,
                 now=now,
             )
-            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+            return await self._run_view(run_id=run_id, owner_id=normalized_owner_id)
         return await self._execute_owned_run(
             run_id=run_id,
-            owner_id=str(owner_id),
+            owner_id=normalized_owner_id,
             resumed=False,
         )
+
+    async def _bind_readiness_with_checkpoint_repair(
+        self,
+        *,
+        readiness_id: str,
+        owner_id: str,
+        digest: str,
+        start_request_id: str,
+        now: datetime,
+    ) -> AgentRuntimeBinding:
+        try:
+            return await self._repository.bind_readiness(
+                readiness_id=readiness_id,
+                owner_id=owner_id,
+                digest=digest,
+                start_request_id=start_request_id,
+                now=now,
+            )
+        except AgentRuntimeCheckpointPending:
+            readiness = await self._repository.get_readiness_owned(
+                readiness_id=readiness_id,
+                owner_id=owner_id,
+            )
+            authorization = dict(readiness.get("authorization") or {})
+            predecessor_id = str(
+                authorization.get("predecessor_run_id") or ""
+            )
+            if readiness.get("digest") != str(digest) or not predecessor_id:
+                raise
+            await self._repair_projection_audit(
+                run_id=predecessor_id,
+                owner_id=owner_id,
+                now=now,
+            )
+            return await self._repository.bind_readiness(
+                readiness_id=readiness_id,
+                owner_id=owner_id,
+                digest=digest,
+                start_request_id=start_request_id,
+                now=now,
+            )
 
     async def resume(
         self,
@@ -1381,9 +1448,17 @@ class AgentRuntime:
         if derived_status != str(run.get("status") or ""):
             add_violation("run_status_mismatch")
 
+        replayed_observations: list[dict[str, Any]] = []
         for step in steps:
             step_id = str(step["step_id"])
             ordinal = int(step["ordinal"])
+            if (
+                int(step.get("input_observation_cursor") or 0)
+                != len(replayed_observations)
+                or str(step.get("input_observation_digest") or "")
+                != _digest(replayed_observations)
+            ):
+                add_violation("step_input_mismatch")
             positioned = event_positions_by_step.get(step_id, [])
             positions_by_type: dict[str, list[int]] = {}
             events_by_type: dict[str, list[Mapping[str, Any]]] = {}
@@ -1887,6 +1962,9 @@ class AgentRuntime:
                     add_violation("step_status_mismatch")
             elif persisted_step_status != derived_step_status:
                 add_violation("step_status_mismatch")
+            planner_view = _completed_step_planner_view(step)
+            if planner_view is not None:
+                replayed_observations.append(planner_view)
 
         attempts = [
             item for item in run.get("attempts") or []
@@ -4482,20 +4560,9 @@ class AgentRuntime:
         )
         observations: list[dict[str, Any]] = []
         for step in steps:
-            observation = step.get("observation")
-            if step.get("status") != "completed" or not isinstance(observation, Mapping):
-                continue
-            planner_view = observation.get("planner_view")
-            if isinstance(planner_view, Mapping):
-                observations.append(dict(planner_view))
-                continue
-            if observation.get("status") == "finish_evaluated":
-                completion = observation.get("completion")
-                if isinstance(completion, Mapping) and isinstance(
-                    completion.get("planner_view"),
-                    Mapping,
-                ):
-                    observations.append(dict(completion["planner_view"]))
+            planner_view = _completed_step_planner_view(step)
+            if planner_view is not None:
+                observations.append(planner_view)
         return observations
 
     async def _heartbeat(

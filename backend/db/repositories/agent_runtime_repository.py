@@ -617,6 +617,52 @@ class AgentRuntimeRepository:
                 raise AgentRuntimeReadinessConflict(
                     "predecessor paused checkpoint is not canonical"
                 )
+            if not already_superseded:
+                pause_event_key = str(
+                    predecessor_snapshot.get("termination_event_key") or ""
+                )
+                expected_pause_event_key = (
+                    f"run-paused-{predecessor_reason}-{predecessor_epoch}"
+                )
+                pause_step_id = (
+                    str(predecessor_termination["step_id"])
+                    if predecessor_termination.get("step_id")
+                    else None
+                )
+                pause_payload = project_agent_runtime_event_payload(
+                    "run_paused",
+                    {
+                        "status": "paused",
+                        "reason_code": predecessor_reason,
+                    },
+                )
+                pause_event = (
+                    await self.events.find_one({
+                        "run_id": predecessor_object_id,
+                        "event_key": pause_event_key,
+                        "is_deleted": False,
+                    })
+                    if pause_event_key
+                    else None
+                )
+                if pause_event is None:
+                    raise AgentRuntimeCheckpointPending(
+                        "predecessor pause event must be repaired before binding"
+                    )
+                if (
+                    pause_event_key != expected_pause_event_key
+                    or not _event_matches(
+                        pause_event,
+                        run_id=predecessor_object_id,
+                        event_key=pause_event_key,
+                        event_type="run_paused",
+                        step_id=pause_step_id,
+                        payload=pause_payload,
+                    )
+                ):
+                    raise AgentRuntimeReadinessConflict(
+                        "predecessor pause event does not match its checkpoint"
+                    )
 
             predecessor = predecessor_snapshot if already_superseded else None
             fenced_step: dict[str, Any] | None = None
