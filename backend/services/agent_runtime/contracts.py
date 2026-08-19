@@ -9,6 +9,22 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+RuntimeEffectClass = Literal["read_only", "paid_read", "proposal_only"]
+RuntimeProposalKind = Literal["chapter_prose_candidate"]
+RuntimeChangeClass = Literal["temporary_candidate"]
+RuntimeObservationStatus = Literal[
+    "ok",
+    "retryable_error",
+    "blocked",
+    "uncertain",
+    "permanent_error",
+]
+
+V1_RUNTIME_EFFECT_CLASSES = frozenset({"read_only", "paid_read", "proposal_only"})
+V1_RUNTIME_PROPOSAL_KINDS = frozenset({"chapter_prose_candidate"})
+V1_RUNTIME_CHANGE_CLASSES = frozenset({"temporary_candidate"})
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -45,6 +61,9 @@ class PlannerDescriptor(_StrictModel):
     max_paid_attempts_per_call: int = Field(ge=0)
     max_tokens_per_call: int = Field(ge=0)
     external_data_categories: tuple[str, ...] = ()
+    schema_version: Literal["agent_runtime_planner_descriptor.v1"] = (
+        "agent_runtime_planner_descriptor.v1"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,15 +75,18 @@ class RuntimeToolDescriptor:
     input_schema: type[BaseModel]
     output_schema: type[BaseModel]
     scope_kinds: tuple[str, ...]
-    effect_class: str
-    proposal_kinds: tuple[str, ...]
-    change_classes: tuple[str, ...]
+    effect_class: RuntimeEffectClass
+    proposal_kinds: tuple[RuntimeProposalKind, ...]
+    change_classes: tuple[RuntimeChangeClass, ...]
     max_paid_attempts_per_call: int
     max_tokens_per_call: int
     implementation_revision: str
     context_policy_revision: str
     external_data_categories: tuple[str, ...]
     idempotent: bool
+    schema_version: Literal["agent_runtime_tool_descriptor.v1"] = (
+        "agent_runtime_tool_descriptor.v1"
+    )
 
     def __post_init__(self) -> None:
         if not self.label.strip():
@@ -79,9 +101,26 @@ class RuntimeToolDescriptor:
             raise ValueError("tool implementation_revision is required")
         if not self.context_policy_revision.strip():
             raise ValueError("tool context_policy_revision is required")
+        if self.schema_version != "agent_runtime_tool_descriptor.v1":
+            raise ValueError("unknown tool descriptor schema_version")
+        if self.effect_class not in V1_RUNTIME_EFFECT_CLASSES:
+            raise ValueError("tool effect_class is outside the Runtime v1 closed set")
+        unknown_proposals = set(self.proposal_kinds) - V1_RUNTIME_PROPOSAL_KINDS
+        if unknown_proposals:
+            raise ValueError("tool proposal kind is outside the Runtime v1 closed set")
+        unknown_changes = set(self.change_classes) - V1_RUNTIME_CHANGE_CLASSES
+        if unknown_changes:
+            raise ValueError("tool change class is outside the Runtime v1 closed set")
+        if self.effect_class != "proposal_only" and (
+            self.proposal_kinds or self.change_classes
+        ):
+            raise ValueError("read tools cannot declare proposal or change classes")
 
 
 class PlannerDecision(_StrictModel):
+    schema_version: Literal["agent_runtime_planner_decision.v1"] = (
+        "agent_runtime_planner_decision.v1"
+    )
     kind: Literal["call_tool", "propose_finish"]
     tool: RuntimeToolReference | None = None
     scope: AgentScope | None = None
@@ -104,6 +143,9 @@ class PlannerDecision(_StrictModel):
 
 
 class PlannerInput(_StrictModel):
+    schema_version: Literal["agent_runtime_planner_input.v1"] = (
+        "agent_runtime_planner_input.v1"
+    )
     goal: str
     scope: AgentScope
     ordinal: int = Field(ge=0)
@@ -113,11 +155,17 @@ class PlannerInput(_StrictModel):
 
 
 class PlannerResult(_StrictModel):
+    schema_version: Literal["agent_runtime_planner_result.v1"] = (
+        "agent_runtime_planner_result.v1"
+    )
     decision: PlannerDecision
     usage: RuntimeCallUsage = Field(default_factory=RuntimeCallUsage)
 
 
 class RuntimeToolContext(_StrictModel):
+    schema_version: Literal["agent_runtime_tool_context.v1"] = (
+        "agent_runtime_tool_context.v1"
+    )
     owner_id: str
     novel_id: str
     run_id: str
@@ -127,18 +175,44 @@ class RuntimeToolContext(_StrictModel):
 
 
 class RuntimeToolResult(_StrictModel):
-    status: Literal["ok", "rejected", "failed"]
+    schema_version: Literal["agent_runtime_tool_result.v1"] = (
+        "agent_runtime_tool_result.v1"
+    )
+    status: RuntimeObservationStatus
     code: str = Field(min_length=1, max_length=160)
-    retryable: bool = False
     data: dict[str, Any] = Field(default_factory=dict)
     planner_view: dict[str, Any] = Field(default_factory=dict)
     audit_view: dict[str, Any] = Field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
     resource_revision: str | None = None
+    resource_digest: str | None = Field(default=None, min_length=1, max_length=160)
     usage: RuntimeCallUsage = Field(default_factory=RuntimeCallUsage)
+    error_summary: str | None = Field(default=None, max_length=1_000)
+
+
+class RuntimeObservation(_StrictModel):
+    schema_version: Literal["agent_runtime_observation.v1"] = (
+        "agent_runtime_observation.v1"
+    )
+    observation_id: str = Field(min_length=1, max_length=160)
+    step_id: str = Field(min_length=1, max_length=160)
+    tool: RuntimeToolReference
+    status: RuntimeObservationStatus
+    code: str = Field(min_length=1, max_length=160)
+    data: dict[str, Any] = Field(default_factory=dict)
+    planner_view: dict[str, Any] = Field(default_factory=dict)
+    audit_view: dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: tuple[str, ...] = ()
+    resource_revision: str | None = None
+    resource_digest: str | None = Field(default=None, min_length=1, max_length=160)
+    usage: RuntimeCallUsage = Field(default_factory=RuntimeCallUsage)
+    error_summary: str | None = Field(default=None, max_length=1_000)
 
 
 class CompletionDecision(_StrictModel):
+    schema_version: Literal["agent_runtime_completion_decision.v1"] = (
+        "agent_runtime_completion_decision.v1"
+    )
     satisfied: bool
     reason_code: str = Field(min_length=1, max_length=160)
     planner_view: dict[str, Any] = Field(default_factory=dict)
@@ -169,8 +243,8 @@ class AgentReadinessRequest(_StrictModel):
     goal: str = Field(min_length=1, max_length=20_000)
     scope: AgentScope
     allowed_tools: tuple[RuntimeToolReference, ...] = ()
-    allowed_effects: tuple[str, ...] = ()
-    allowed_change_classes: tuple[str, ...] = ()
+    allowed_effects: tuple[RuntimeEffectClass, ...] = ()
+    allowed_change_classes: tuple[RuntimeChangeClass, ...] = ()
     allowed_external_data_categories: tuple[str, ...] = ()
     approval_mode: Literal["proposal_only"] = "proposal_only"
     limits: AgentRuntimeLimits

@@ -31,14 +31,17 @@ from backend.services.agent_runtime.contracts import (
     PlannerDecision,
     PlannerInput,
     PlannerResult,
+    RuntimeObservation,
     RuntimeToolContext,
     RuntimeToolDescriptor,
     RuntimeToolReference,
     RuntimeToolResult,
+    V1_RUNTIME_CHANGE_CLASSES,
+    V1_RUNTIME_EFFECT_CLASSES,
+    V1_RUNTIME_PROPOSAL_KINDS,
 )
 from backend.services.agent_runtime.policy import (
     AgentRuntimePolicyViolation,
-    FORBIDDEN_RUNTIME_CHANGE_CLASSES,
     RuntimePolicyGate,
 )
 
@@ -83,6 +86,7 @@ def _schema_digest(schema: type) -> str:
 
 def _tool_snapshot(descriptor: RuntimeToolDescriptor) -> dict[str, Any]:
     return {
+        "schema_version": descriptor.schema_version,
         "reference": descriptor.reference.model_dump(mode="json"),
         "label": descriptor.label,
         "input_schema_digest": _schema_digest(descriptor.input_schema),
@@ -156,6 +160,12 @@ class AgentRuntime:
         allowed_effects = set(request.allowed_effects)
         allowed_changes = set(request.allowed_change_classes)
         allowed_external = set(request.allowed_external_data_categories)
+        if request.approval_mode != "proposal_only":
+            raise ValueError("Runtime v1 only accepts proposal_only approval")
+        if not allowed_effects.issubset(V1_RUNTIME_EFFECT_CLASSES):
+            raise ValueError("readiness contains an unknown Runtime v1 effect class")
+        if not allowed_changes.issubset(V1_RUNTIME_CHANGE_CLASSES):
+            raise ValueError("readiness contains an unknown Runtime v1 change class")
         for reference in request.allowed_tools:
             descriptor = self._tools.describe(reference)
             if descriptor.reference != reference:
@@ -164,14 +174,20 @@ class AgentRuntime:
                 raise ValueError("authorized tool does not support the target scope")
             if descriptor.effect_class not in allowed_effects:
                 raise ValueError("authorized tool effect is missing from allowed_effects")
-            if descriptor.effect_class == "system_write":
-                raise ValueError("Runtime v1 cannot authorize formal system writes")
-            if FORBIDDEN_RUNTIME_CHANGE_CLASSES & set(descriptor.change_classes):
+            if descriptor.effect_class not in V1_RUNTIME_EFFECT_CLASSES:
                 raise ValueError(
-                    "Runtime v1 cannot authorize formal or reference-card writes"
+                    "Runtime v1 cannot authorize an unknown effect class"
                 )
+            if not set(descriptor.change_classes).issubset(
+                V1_RUNTIME_CHANGE_CLASSES
+            ):
+                raise ValueError("Runtime v1 cannot authorize this change class")
             if not set(descriptor.change_classes).issubset(allowed_changes):
                 raise ValueError("authorized tool change class is not allowed")
+            if not set(descriptor.proposal_kinds).issubset(
+                V1_RUNTIME_PROPOSAL_KINDS
+            ):
+                raise ValueError("Runtime v1 cannot authorize this proposal kind")
             if not set(descriptor.external_data_categories).issubset(allowed_external):
                 raise ValueError("authorized tool external-data category is not allowed")
             tool_snapshots.append(_tool_snapshot(descriptor))
@@ -535,7 +551,10 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
         )
-        self._verify_runtime_snapshot(run.get("authorization") or {})
+        self._verify_runtime_snapshot(
+            run.get("authorization") or {},
+            authorization_digest=str(run.get("authorization_digest") or ""),
+        )
         now = _aware(self._clock())
 
         worker_id = uuid4().hex
@@ -590,7 +609,16 @@ class AgentRuntime:
             )
         return await self._run_view(run_id=run_id, owner_id=owner_id)
 
-    def _verify_runtime_snapshot(self, authorization: Mapping[str, Any]) -> None:
+    def _verify_runtime_snapshot(
+        self,
+        authorization: Mapping[str, Any],
+        *,
+        authorization_digest: str,
+    ) -> None:
+        if authorization.get("schema_version") != "agent_runtime_authorization.v1":
+            raise AgentRuntimeStateConflict("authorization schema version is unknown")
+        if _digest(dict(authorization)) != authorization_digest:
+            raise AgentRuntimeStateConflict("authorization digest no longer matches")
         if authorization.get("planner") != self._planner.descriptor.model_dump(mode="json"):
             raise AgentRuntimeStateConflict("planner contract drifted after readiness")
         if authorization.get("tool_registry_revision") != str(
@@ -1237,11 +1265,11 @@ class AgentRuntime:
                 )
                 return False
             candidate = RuntimeToolResult.model_validate(checkpoint)
-            if candidate.status == "failed" and candidate.retryable:
+            if candidate.status == "retryable_error":
                 retry_count = sum(
                     isinstance(item.get("result_checkpoint"), Mapping)
-                    and (item["result_checkpoint"]).get("status") == "failed"
-                    and bool((item["result_checkpoint"]).get("retryable"))
+                    and (item["result_checkpoint"]).get("status")
+                    == "retryable_error"
                     for item in attempts
                 )
                 if (
@@ -1305,6 +1333,24 @@ class AgentRuntime:
                 )
                 return False
             result = RuntimeToolResult.model_validate(recovered)
+            if result.status == "uncertain":
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=now,
+                )
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="uncertain_paid_attempt",
+                    now=now,
+                )
+                return False
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1410,6 +1456,24 @@ class AgentRuntime:
                     now=_aware(self._clock()),
                 )
                 return False
+            if result.status == "uncertain":
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=_aware(self._clock()),
+                )
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="uncertain_paid_attempt",
+                    now=_aware(self._clock()),
+                )
+                return False
             await self._settle_runtime_call(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1420,7 +1484,7 @@ class AgentRuntime:
                 result_checkpoint=result.model_dump(mode="json"),
                 now=_aware(self._clock()),
             )
-            if result.status == "failed" and result.retryable:
+            if result.status == "retryable_error":
                 return await self._act_and_observe(
                     run_id=run_id,
                     owner_id=owner_id,
@@ -1436,7 +1500,7 @@ class AgentRuntime:
                 )
 
         assert result is not None
-        if result.status == "failed" and result.retryable:
+        if result.status == "retryable_error":
             return await self._act_and_observe(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1450,6 +1514,16 @@ class AgentRuntime:
                 payload=payload,
                 step_status="executing",
             )
+        if result.status == "uncertain":
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+                expected_step_status="executing",
+                reason_code="uncertain_paid_attempt",
+                now=_aware(self._clock()),
+            )
+            return False
         try:
             validated_output = descriptor.output_schema.model_validate(result.data)
         except Exception:
@@ -1463,15 +1537,25 @@ class AgentRuntime:
                 now=_aware(self._clock()),
             )
             return False
-        observation = {
-            "status": result.status,
-            "code": result.code,
-            "data": validated_output.model_dump(mode="json"),
-            "planner_view": result.planner_view,
-            "audit_view": result.audit_view,
-            "evidence_refs": list(result.evidence_refs),
-            "resource_revision": result.resource_revision,
-        }
+        observation = RuntimeObservation(
+            observation_id=_digest({
+                "run_id": run_id,
+                "step_id": step_id,
+                "tool": decision.tool.model_dump(mode="json"),
+            })[:32],
+            step_id=step_id,
+            tool=decision.tool,
+            status=result.status,
+            code=result.code,
+            data=validated_output.model_dump(mode="json"),
+            planner_view=result.planner_view,
+            audit_view=result.audit_view,
+            evidence_refs=result.evidence_refs,
+            resource_revision=result.resource_revision,
+            resource_digest=result.resource_digest,
+            usage=result.usage,
+            error_summary=result.error_summary,
+        ).model_dump(mode="json")
         await self._repository.transition_step(
             run_id=run_id,
             step_id=step_id,
@@ -1495,6 +1579,27 @@ class AgentRuntime:
             step_id=step_id,
             now=_aware(self._clock()),
         )
+        if result.status == "blocked":
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+                expected_step_status="observed",
+                reason_code="authorization_required",
+                now=_aware(self._clock()),
+            )
+            return False
+        if result.status == "permanent_error":
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                expected_step_status="observed",
+                reason_code="tool_failure_exhausted",
+                now=_aware(self._clock()),
+            )
+            return False
         await self._complete_observed_step(
             run_id=run_id,
             owner_id=owner_id,

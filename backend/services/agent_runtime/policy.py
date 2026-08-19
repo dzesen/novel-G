@@ -13,30 +13,37 @@ from backend.services.agent_runtime.contracts import (
     PlannerDecision,
     RuntimeToolDescriptor,
     RuntimeToolReference,
+    V1_RUNTIME_CHANGE_CLASSES,
+    V1_RUNTIME_EFFECT_CLASSES,
+    V1_RUNTIME_PROPOSAL_KINDS,
 )
 
 
-_URL_RE = re.compile(r"https?://", re.IGNORECASE)
-FORBIDDEN_RUNTIME_CHANGE_CLASSES = frozenset({
-    "formal_write",
-    "reference_card_create",
-    "reference_card_merge",
-    "reference_card_restore",
-    "reference_card_restore_merge",
-})
+_URI_RE = re.compile(
+    r"(?:^|[\s\"'(<\[])[A-Za-z][A-Za-z0-9+.-]{1,31}:(?://)?[^\s\"'<>]*"
+)
+_WINDOWS_PATH_RE = re.compile(
+    r"(?:^|[\s\"'(<\[])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]*"
+)
+_LOCAL_PATH_RE = re.compile(
+    r"(?:^|[\s\"'(<\[])(?:/[^/\s][^\s\"'<>]*|\.\.?[\\/][^\s\"'<>]+)"
+)
 
 
 class AgentRuntimePolicyViolation(ValueError):
     """A planner decision exceeded the immutable readiness authorization."""
 
 
-def _contains_url(value: Any) -> bool:
+def _contains_forbidden_location(value: Any) -> bool:
     if isinstance(value, str):
-        return bool(_URL_RE.search(value))
+        return any(
+            pattern.search(value)
+            for pattern in (_URI_RE, _WINDOWS_PATH_RE, _LOCAL_PATH_RE)
+        )
     if isinstance(value, Mapping):
-        return any(_contains_url(item) for item in value.values())
+        return any(_contains_forbidden_location(item) for item in value.values())
     if isinstance(value, (list, tuple)):
-        return any(_contains_url(item) for item in value)
+        return any(_contains_forbidden_location(item) for item in value)
     return False
 
 
@@ -67,19 +74,37 @@ class RuntimePolicyGate:
         if decision.scope.kind not in descriptor.scope_kinds:
             raise AgentRuntimePolicyViolation("tool does not support the authorized scope kind")
 
+        if authorization.get("approval_mode") != "proposal_only":
+            raise AgentRuntimePolicyViolation(
+                "Runtime v1 only accepts proposal_only approval"
+            )
         allowed_effects = set(authorization.get("allowed_effects") or [])
+        if not allowed_effects.issubset(V1_RUNTIME_EFFECT_CLASSES):
+            raise AgentRuntimePolicyViolation(
+                "authorization contains an unknown Runtime v1 effect class"
+            )
+        if descriptor.effect_class not in V1_RUNTIME_EFFECT_CLASSES:
+            raise AgentRuntimePolicyViolation(
+                "tool effect class is outside the Runtime v1 closed set"
+            )
         if descriptor.effect_class not in allowed_effects:
             raise AgentRuntimePolicyViolation("tool effect class is not authorized")
-        if descriptor.effect_class == "system_write":
-            raise AgentRuntimePolicyViolation("formal system writes are forbidden in Runtime v1")
 
         allowed_changes = set(authorization.get("allowed_change_classes") or [])
-        if FORBIDDEN_RUNTIME_CHANGE_CLASSES & set(descriptor.change_classes):
+        if not allowed_changes.issubset(V1_RUNTIME_CHANGE_CLASSES):
             raise AgentRuntimePolicyViolation(
-                "formal and reference-card writes are forbidden in Runtime v1"
+                "authorization contains an unknown Runtime v1 change class"
+            )
+        if not set(descriptor.change_classes).issubset(V1_RUNTIME_CHANGE_CLASSES):
+            raise AgentRuntimePolicyViolation(
+                "tool change class is outside the Runtime v1 closed set"
             )
         if not set(descriptor.change_classes).issubset(allowed_changes):
             raise AgentRuntimePolicyViolation("tool change class is not authorized")
+        if not set(descriptor.proposal_kinds).issubset(V1_RUNTIME_PROPOSAL_KINDS):
+            raise AgentRuntimePolicyViolation(
+                "tool proposal kind is outside the Runtime v1 closed set"
+            )
 
         allowed_external = set(
             authorization.get("allowed_external_data_categories") or []
@@ -87,8 +112,10 @@ class RuntimePolicyGate:
         if not set(descriptor.external_data_categories).issubset(allowed_external):
             raise AgentRuntimePolicyViolation("tool external-data category is not authorized")
         arguments = decision.arguments or {}
-        if _contains_url(arguments) and not descriptor.external_data_categories:
-            raise AgentRuntimePolicyViolation("unclassified external URL is forbidden")
+        if _contains_forbidden_location(arguments):
+            raise AgentRuntimePolicyViolation(
+                "arbitrary URI and filesystem paths are forbidden in Runtime v1"
+            )
 
         payload = descriptor.input_schema.model_validate(arguments)
         return payload, {
@@ -98,4 +125,5 @@ class RuntimePolicyGate:
             "tool_version": decision.tool.version,
             "scope_kind": decision.scope.kind,
             "effect_class": descriptor.effect_class,
+            "approval_mode": "proposal_only",
         }
