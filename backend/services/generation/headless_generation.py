@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 
 from backend.llm.prompts.prompt_selector import PROSE_PROMPT_NAME, load_prompt_config
@@ -58,6 +58,7 @@ from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
 )
+from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.novel.style_controls import render_style_controls
 
 _GENERATION_OVERRIDE_KEYS = frozenset({
@@ -68,6 +69,14 @@ _GENERATION_OVERRIDE_KEYS = frozenset({
     "frequency_penalty",
     "system_prompt",
 })
+
+
+@dataclass(frozen=True)
+class GeneratedProseCandidate:
+    """A deferred generation result plus its exact, validated ProseRun identity."""
+
+    generation: ChapterGenerationResult
+    source: ProseCandidateSource
 
 
 def _generation_options(
@@ -455,7 +464,7 @@ async def generate_prose_candidate(
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
-) -> ChapterGenerationResult:
+) -> GeneratedProseCandidate:
     """Generate a persisted ProseRun candidate without accepting formal prose."""
     execution = await _chapter_capability_registry().execute(
         "chapter_prose",
@@ -472,7 +481,25 @@ async def generate_prose_candidate(
     result = execution.value
     if result.accepted:
         raise RuntimeError("deferred prose generation accepted formal content")
-    return result
+    completion = dict(result.completion or {})
+    revision = completion.get("source_run_revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise RuntimeError("deferred prose candidate has no valid run revision")
+    text = str(result.value or "")
+    run_id = str(completion.get("source_run_id") or "")
+    if not run_id:
+        raise RuntimeError("deferred prose candidate has no run id")
+    digest = str(completion.get("source_run_digest") or "")
+    if chapter_content_digest(text) != digest:
+        raise RuntimeError("deferred prose candidate digest does not match its text")
+    source = ProseCandidateSource(
+        text=text,
+        source_run_id=run_id,
+        source_run_revision=revision,
+        source_content_digest=digest,
+        completion=completion,
+    )
+    return GeneratedProseCandidate(generation=result, source=source)
 
 async def generate_state(
     novel_id: str,
