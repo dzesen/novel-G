@@ -13,7 +13,6 @@ from backend.services.generation.chapter_generation_application import (
 from backend.services.generation.headless_generation import (
     GeneratedProseCandidate,
 )
-from backend.services.generation.outline_adherence import is_material_deviation
 
 
 class ChapterCandidatePipelineBlocked(ValueError):
@@ -74,6 +73,80 @@ def _truncation(
     return {"step": step, **value}
 
 
+def _adherence_matches_source(
+    adherence: Mapping[str, Any],
+    source: ProseCandidateSource,
+) -> bool:
+    run_id = adherence.get("source_prose_run_id")
+    revision = adherence.get("source_prose_run_revision")
+    digest = adherence.get("source_content_digest")
+    return bool(
+        isinstance(run_id, str)
+        and run_id == source.source_run_id
+        and type(revision) is int
+        and revision >= 0
+        and revision == source.source_run_revision
+        and isinstance(digest, str)
+        and digest == source.source_content_digest
+    )
+
+
+def _validate_adherence_gate(
+    adherence: Mapping[str, Any],
+    chapter: Mapping[str, Any],
+) -> None:
+    if adherence.get("verdict") != "pass":
+        raise ChapterCandidatePipelineBlocked("正文候选未精确通过章纲符合度")
+    issues = adherence.get("issues")
+    if not isinstance(issues, list) or issues:
+        raise ChapterCandidatePipelineBlocked("章纲符合度仍包含偏离问题")
+    outline = chapter.get("outline")
+    scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
+    coverage = adherence.get("scene_coverage")
+    if (
+        not isinstance(scenes, list)
+        or not scenes
+        or not isinstance(coverage, list)
+        or len(coverage) != len(scenes)
+    ):
+        raise ChapterCandidatePipelineBlocked("章纲符合度没有覆盖全部场景")
+    scene_indexes: list[int] = []
+    for item in coverage:
+        if not isinstance(item, Mapping):
+            raise ChapterCandidatePipelineBlocked("章纲场景覆盖证据格式无效")
+        scene_index = item.get("scene_index")
+        if type(scene_index) is not int or item.get("status") != "covered":
+            raise ChapterCandidatePipelineBlocked("章纲场景尚未全部落实")
+        scene_indexes.append(scene_index)
+    if (
+        len(set(scene_indexes)) != len(scene_indexes)
+        or set(scene_indexes) != set(range(1, len(scenes) + 1))
+    ):
+        raise ChapterCandidatePipelineBlocked("章纲场景覆盖不是完整唯一集合")
+
+
+def _adherence_metadata(adherence: Mapping[str, Any]) -> dict[str, Any]:
+    issues = list(adherence.get("issues") or [])
+    categories = sorted(
+        {
+            str(item.get("category"))
+            for item in issues
+            if isinstance(item, Mapping) and item.get("category")
+        }
+    )
+    return {
+        "verdict": "pass",
+        "scene_count": len(list(adherence.get("scene_coverage") or [])),
+        "issue_count": len(issues),
+        "issue_categories": categories,
+        "source_prose_run_id": adherence["source_prose_run_id"],
+        "source_prose_run_revision": adherence[
+            "source_prose_run_revision"
+        ],
+        "source_content_digest": adherence["source_content_digest"],
+    }
+
+
 class ChapterCandidatePipeline:
     """Hide the ordered candidate gates behind one safe orchestration interface."""
 
@@ -108,17 +181,9 @@ class ChapterCandidatePipeline:
         if reviewed.stage is not ChapterGenerationStage.OUTLINE_ADHERENCE:
             raise ChapterCandidatePipelineBlocked("章纲符合度返回了错误阶段")
         adherence = dict(reviewed.value or {})
-        if (
-            str(adherence.get("source_prose_run_id") or "")
-            != source.source_run_id
-            or adherence.get("source_prose_run_revision")
-            != source.source_run_revision
-            or str(adherence.get("source_content_digest") or "")
-            != source.source_content_digest
-        ):
+        if not _adherence_matches_source(adherence, source):
             raise ChapterCandidatePipelineBlocked("章纲符合度没有绑定正文候选")
-        if is_material_deviation(adherence):
-            raise ChapterCandidatePipelineBlocked("正文候选存在实质章纲偏离")
+        _validate_adherence_gate(adherence, chapter)
 
         state_result = await self._deps.generate_state_candidate(
             novel_id,
@@ -170,7 +235,7 @@ class ChapterCandidatePipeline:
                 for attempt in result.attempts
             ),
             truncations=truncations,
-            outline_adherence=adherence,
+            outline_adherence=_adherence_metadata(adherence),
             consistency_issues=consistency_issues,
             prose_run_id=source.source_run_id,
             prose_run_revision=source.source_run_revision,
