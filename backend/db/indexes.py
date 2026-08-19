@@ -285,6 +285,7 @@ async def init_agent_runtime_indexes():
         logger.info("成功初始化有界 Agent Runtime 索引。")
     except Exception as exc:
         logger.error("初始化有界 Agent Runtime 索引失败：%s", exc)
+        raise
 
 
 async def init_volume_indexes():

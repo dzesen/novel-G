@@ -18,6 +18,7 @@ from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeRepository,
     AgentRuntimeStateConflict,
     agent_runtime_repository,
+    project_agent_runtime_event_payload,
 )
 from backend.services.agent_runtime.contracts import (
     AgentEventView,
@@ -107,6 +108,19 @@ def _tool_snapshot(descriptor: RuntimeToolDescriptor) -> dict[str, Any]:
         "context_policy_revision": descriptor.context_policy_revision,
         "external_data_categories": list(descriptor.external_data_categories),
         "idempotent": descriptor.idempotent,
+    }
+
+
+def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "step_id": str(step.get("step_id") or ""),
+        "ordinal": int(step.get("ordinal") or 0),
+        "status": str(step.get("status") or ""),
+        "planner_decision": step.get("planner_decision"),
+        "policy_decision": step.get("policy_decision"),
+        "tool_invocation": step.get("tool_invocation"),
+        "observation": step.get("observation"),
+        "usage_delta": step.get("usage_delta"),
     }
 
 
@@ -471,16 +485,27 @@ class AgentRuntime:
 
     async def cancel(self, *, owner_id: str, run_id: str) -> AgentRunView:
         """Idempotently cancel a non-terminal run without dispatching new work."""
+        normalized_owner_id = str(owner_id)
         run = await self._repository.get_run_owned(
             run_id=run_id,
-            owner_id=str(owner_id),
+            owner_id=normalized_owner_id,
         )
         if run.get("status") in TERMINAL_RUN_STATUSES:
-            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+            if run.get("status") == "cancelled":
+                await self._record_cancel_audit(
+                    run_id=run_id,
+                    owner_id=normalized_owner_id,
+                    run=run,
+                    now=_aware(self._clock()),
+                )
+            return await self._run_view(
+                run_id=run_id,
+                owner_id=normalized_owner_id,
+            )
         now = _aware(self._clock())
-        await self._repository.cancel_run(
+        cancelled = await self._repository.cancel_run(
             run_id=run_id,
-            owner_id=str(owner_id),
+            owner_id=normalized_owner_id,
             termination={
                 "status": "cancelled",
                 "category": "cancelled",
@@ -496,15 +521,95 @@ class AgentRuntime:
             },
             now=now,
         )
+        await self._record_cancel_audit(
+            run_id=run_id,
+            owner_id=normalized_owner_id,
+            run=cancelled,
+            now=now,
+        )
+        return await self._run_view(run_id=run_id, owner_id=normalized_owner_id)
+
+    async def _record_cancel_audit(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        run: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        steps = await self._repository.list_steps_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        step_by_id = {
+            str(step["step_id"]): step
+            for step in steps
+        }
+        for attempt in run.get("attempts") or []:
+            if not (
+                isinstance(attempt, Mapping)
+                and attempt.get("state") == "uncertain"
+                and attempt.get("uncertain_reason")
+                == "cancelled_while_dispatched"
+            ):
+                continue
+            step_id = str(attempt.get("step_id") or "")
+            step = step_by_id.get(step_id)
+            if step is None:
+                raise AgentRuntimeStateConflict(
+                    "cancelled Agent attempt has no owning step"
+                )
+            ordinal = int(step["ordinal"])
+            if attempt.get("kind") == "tool":
+                decision = PlannerDecision.model_validate(
+                    step.get("planner_decision")
+                )
+                if decision.kind != "call_tool" or decision.tool is None:
+                    raise AgentRuntimeStateConflict(
+                        "cancelled tool attempt has no tool decision"
+                    )
+                invocation = step.get("tool_invocation")
+                if not isinstance(invocation, Mapping):
+                    raise AgentRuntimeStateConflict(
+                        "cancelled tool attempt has no invocation checkpoint"
+                    )
+                await self._event(
+                    run_id=run_id,
+                    event_key=f"{attempt['call_key']}-dispatched",
+                    event_type="tool_dispatched",
+                    payload={
+                        "ordinal": ordinal,
+                        "tool_name": decision.tool.name,
+                        "tool_version": decision.tool.version,
+                        "invocation_digest": _digest(invocation),
+                    },
+                    step_id=step_id,
+                    now=now,
+                )
+            await self._event(
+                run_id=run_id,
+                event_key=f"{attempt['call_key']}-uncertain",
+                event_type="attempt_uncertain",
+                payload={
+                    "ordinal": ordinal,
+                    "reason_code": "dispatch_outcome_unknown",
+                },
+                step_id=step_id,
+                now=now,
+            )
+        termination = run.get("termination") or {}
         await self._event(
             run_id=run_id,
             event_key="run-cancelled-cancelled_by_user",
             event_type="run_terminated",
             payload={"status": "cancelled", "reason_code": "cancelled_by_user"},
-            step_id=(str(run["active_step_id"]) if run.get("active_step_id") else None),
+            step_id=(
+                str(termination["step_id"])
+                if termination.get("step_id")
+                else None
+            ),
             now=now,
         )
-        return await self._run_view(run_id=run_id, owner_id=str(owner_id))
 
     async def get(self, *, owner_id: str, run_id: str) -> AgentRunView:
         return await self._run_view(run_id=run_id, owner_id=str(owner_id))
@@ -522,7 +627,7 @@ class AgentRuntime:
         owner_id: str,
         run_id: str,
     ) -> AgentReplayView:
-        """Recompute audit invariants without invoking Planner or Tool adapters."""
+        """Replay frozen authorization, Policy, steps, and events without adapters."""
         run = await self._repository.get_run_owned(
             run_id=run_id,
             owner_id=str(owner_id),
@@ -536,52 +641,534 @@ class AgentRuntime:
             owner_id=str(owner_id),
         )
         violations: list[str] = []
-        if [int(item["ordinal"]) for item in steps] != list(range(len(steps))):
-            violations.append("step_ordinal_mismatch")
-        if [int(item["sequence"]) for item in events] != list(
-            range(1, len(events) + 1)
+
+        def add_violation(code: str) -> None:
+            if code not in violations:
+                violations.append(code)
+
+        authorization = dict(run.get("authorization") or {})
+        if (
+            authorization.get("schema_version")
+            != "agent_runtime_authorization.v1"
+            or _digest(authorization)
+            != str(run.get("authorization_digest") or "")
         ):
-            violations.append("event_sequence_mismatch")
+            add_violation("authorization_digest_mismatch")
+
+        if [int(item["ordinal"]) for item in steps] != list(range(len(steps))):
+            add_violation("step_ordinal_mismatch")
+
+        sequences = [int(item["sequence"]) for item in events]
+        if any(
+            current <= previous
+            for previous, current in zip(sequences, sequences[1:])
+        ):
+            add_violation("event_sequence_mismatch")
+
+        step_by_id = {str(item["step_id"]): item for item in steps}
+        event_positions_by_step: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
+        derived_status = "ready"
+        run_event_started = False
+        terminal_event: Mapping[str, Any] | None = None
+        terminal_position: int | None = None
+        for position, event in enumerate(events):
+            event_type = str(event.get("type") or "")
+            payload = dict(event.get("payload") or {})
+            if event.get("schema_version") != "agent_runtime_event.v1":
+                add_violation("event_schema_mismatch")
+            try:
+                projected = project_agent_runtime_event_payload(event_type, payload)
+                if projected != payload:
+                    add_violation("event_payload_mismatch")
+            except ValueError:
+                add_violation("event_payload_mismatch")
+
+            step_id = str(event.get("step_id") or "")
+            if step_id:
+                if step_id not in step_by_id:
+                    add_violation("event_step_mismatch")
+                event_positions_by_step.setdefault(step_id, []).append(
+                    (position, event)
+                )
+
+            if terminal_position is not None:
+                add_violation("run_event_order_mismatch")
+                continue
+            if event_type == "run_created":
+                if position != 0 or run_event_started:
+                    add_violation("run_event_order_mismatch")
+                derived_status = "ready"
+                run_event_started = True
+            elif event_type == "readiness_bound":
+                if not run_event_started or derived_status != "ready":
+                    add_violation("run_event_order_mismatch")
+            elif event_type == "run_started":
+                if not run_event_started or derived_status != "ready":
+                    add_violation("run_event_order_mismatch")
+                derived_status = "running"
+            elif event_type == "run_resumed":
+                if derived_status not in {"running", "paused"}:
+                    add_violation("run_event_order_mismatch")
+                derived_status = "running"
+            elif event_type == "run_paused":
+                if derived_status != "running":
+                    add_violation("run_event_order_mismatch")
+                derived_status = "paused"
+                terminal_event = event
+            elif event_type == "run_superseded":
+                if derived_status != "paused":
+                    add_violation("run_event_order_mismatch")
+                derived_status = "superseded"
+                terminal_event = event
+                terminal_position = position
+            elif event_type == "run_terminated":
+                if derived_status not in {"ready", "running", "paused"}:
+                    add_violation("run_event_order_mismatch")
+                candidate_status = str(payload.get("status") or "")
+                if candidate_status not in TERMINAL_RUN_STATUSES - {"superseded"}:
+                    add_violation("run_status_mismatch")
+                else:
+                    derived_status = candidate_status
+                terminal_event = event
+                terminal_position = position
+            elif event_type not in {
+                "step_planned",
+                "policy_decided",
+                "attempt_reserved",
+                "tool_dispatched",
+                "tool_observed",
+                "proposal_recorded",
+                "mutation_committed",
+                "attempt_settled",
+                "attempt_uncertain",
+                "step_completed",
+            }:
+                add_violation("event_type_unknown")
+            elif derived_status != "running":
+                add_violation("run_event_order_mismatch")
+
+        if not run_event_started:
+            add_violation("run_event_order_mismatch")
+        if derived_status != str(run.get("status") or ""):
+            add_violation("run_status_mismatch")
+
+        for step in steps:
+            step_id = str(step["step_id"])
+            ordinal = int(step["ordinal"])
+            positioned = event_positions_by_step.get(step_id, [])
+            positions_by_type: dict[str, list[int]] = {}
+            events_by_type: dict[str, list[Mapping[str, Any]]] = {}
+            for position, event in positioned:
+                event_type = str(event.get("type") or "")
+                positions_by_type.setdefault(event_type, []).append(position)
+                events_by_type.setdefault(event_type, []).append(event)
+                payload = event.get("payload") or {}
+                if "ordinal" in payload and int(payload["ordinal"]) != ordinal:
+                    add_violation("event_step_mismatch")
+
+            decision: PlannerDecision | None = None
+            try:
+                decision = PlannerDecision.model_validate(step.get("planner_decision"))
+            except Exception:
+                effective_status = (
+                    str(step.get("paused_from_status") or "")
+                    if str(step.get("status") or "") == "paused"
+                    else str(step.get("status") or "")
+                )
+                failed_before_decision = (
+                    effective_status == "failed"
+                    and step.get("failure_reason") in {
+                        "deadline_exceeded",
+                        "planner_output_exhausted",
+                    }
+                )
+                if effective_status != "planning" and not failed_before_decision:
+                    add_violation("planner_decision_mismatch")
+
+            planned_positions = positions_by_type.get("step_planned", [])
+            policy_positions = positions_by_type.get("policy_decided", [])
+            completed_positions = positions_by_type.get("step_completed", [])
+            planned_position = planned_positions[0] if planned_positions else None
+            policy_position = policy_positions[0] if policy_positions else None
+            last_planner_reservation: int | None = None
+            last_planner_settlement: int | None = None
+            last_tool_reservation: int | None = None
+            last_tool_dispatch: int | None = None
+            last_tool_settlement: int | None = None
+            last_tool_uncertain: int | None = None
+            for position, event in positioned:
+                event_type = str(event.get("type") or "")
+                payload = event.get("payload") or {}
+                if event_type == "attempt_reserved":
+                    if payload.get("kind") == "planner":
+                        if planned_position is not None and position > planned_position:
+                            add_violation("step_event_order_mismatch")
+                        last_planner_reservation = position
+                    elif payload.get("kind") == "tool":
+                        if policy_position is None or position <= policy_position:
+                            add_violation("step_event_order_mismatch")
+                        last_tool_reservation = position
+                elif event_type == "attempt_settled":
+                    if policy_position is not None and position > policy_position:
+                        if (
+                            last_tool_reservation is None
+                            or last_tool_reservation >= position
+                        ):
+                            add_violation("step_event_order_mismatch")
+                        last_tool_settlement = position
+                    else:
+                        if (
+                            last_planner_reservation is None
+                            or last_planner_reservation >= position
+                        ):
+                            add_violation("step_event_order_mismatch")
+                        last_planner_settlement = position
+                elif event_type == "step_planned":
+                    if (
+                        last_planner_settlement is None
+                        or last_planner_settlement >= position
+                    ):
+                        add_violation("step_event_order_mismatch")
+                elif event_type == "policy_decided":
+                    if planned_position is None or position <= planned_position:
+                        add_violation("step_event_order_mismatch")
+                elif event_type == "tool_dispatched":
+                    if (
+                        policy_position is None
+                        or position <= policy_position
+                        or last_tool_reservation is None
+                        or last_tool_reservation >= position
+                    ):
+                        add_violation("step_event_order_mismatch")
+                    last_tool_dispatch = position
+                elif event_type == "attempt_uncertain":
+                    if policy_position is not None and position > policy_position:
+                        if (
+                            last_tool_dispatch is None
+                            or last_tool_dispatch >= position
+                        ):
+                            add_violation("step_event_order_mismatch")
+                        last_tool_uncertain = position
+                    elif (
+                        last_planner_reservation is None
+                        or last_planner_reservation >= position
+                    ):
+                        add_violation("step_event_order_mismatch")
+                elif event_type == "tool_observed":
+                    if (
+                        last_tool_dispatch is None
+                        or last_tool_dispatch >= position
+                        or last_tool_settlement is None
+                        or last_tool_settlement >= position
+                        or (
+                            last_tool_uncertain is not None
+                            and last_tool_uncertain > last_tool_settlement
+                        )
+                    ):
+                        add_violation("step_event_order_mismatch")
+            if decision is not None:
+                if len(planned_positions) != 1:
+                    add_violation("step_event_order_mismatch")
+                else:
+                    planned_payload = events_by_type["step_planned"][0].get(
+                        "payload"
+                    ) or {}
+                    if (
+                        planned_payload.get("decision_kind") != decision.kind
+                        or planned_payload.get("decision_digest")
+                        != _digest(decision.model_dump(mode="json"))
+                    ):
+                        add_violation("planner_decision_mismatch")
+
+                stored_policy = step.get("policy_decision")
+                expected_policy: dict[str, Any] | None = None
+                policy_rejected = False
+                if decision.kind == "propose_finish":
+                    expected_policy = {
+                        "allowed": True,
+                        "reason_code": "finish_proposal_allowed",
+                    }
+                else:
+                    assert decision.tool is not None
+                    descriptor = next((
+                        item
+                        for item in authorization.get("tools") or []
+                        if (item.get("reference") or {})
+                        == decision.tool.model_dump(mode="json")
+                    ), None)
+                    if not isinstance(descriptor, Mapping):
+                        policy_rejected = True
+                    else:
+                        try:
+                            expected_policy = (
+                                self._policy_gate.authorize_tool_snapshot(
+                                    authorization=authorization,
+                                    decision=decision,
+                                    descriptor=descriptor,
+                                )
+                            )
+                        except (AgentRuntimePolicyViolation, ValueError):
+                            policy_rejected = True
+
+                if policy_rejected:
+                    if not (
+                        isinstance(stored_policy, Mapping)
+                        and stored_policy.get("allowed") is False
+                        and stored_policy.get("reason_code") == "policy_violation"
+                    ):
+                        add_violation("policy_decision_mismatch")
+                elif stored_policy != expected_policy:
+                    add_violation("policy_decision_mismatch")
+
+                if len(policy_positions) != 1:
+                    add_violation("step_event_order_mismatch")
+                else:
+                    policy_payload = events_by_type["policy_decided"][0].get(
+                        "payload"
+                    ) or {}
+                    if (
+                        policy_payload.get("decision_kind") != decision.kind
+                        or policy_payload.get("allowed")
+                        != bool((stored_policy or {}).get("allowed"))
+                        or policy_payload.get("policy_digest")
+                        != _digest(stored_policy or {})
+                    ):
+                        add_violation("policy_decision_mismatch")
+                    if (
+                        planned_positions
+                        and policy_positions[0] <= planned_positions[0]
+                    ):
+                        add_violation("step_event_order_mismatch")
+
+                if decision.kind == "call_tool":
+                    invocation = step.get("tool_invocation")
+                    if isinstance(invocation, Mapping):
+                        if (
+                            invocation.get("tool")
+                            != decision.tool.model_dump(mode="json")
+                            or invocation.get("scope")
+                            != decision.scope.model_dump(mode="json")
+                            or invocation.get("idempotency_key")
+                            != f"{run_id}:{step_id}:tool"
+                        ):
+                            add_violation("tool_invocation_mismatch")
+                        for dispatched_event in events_by_type.get(
+                            "tool_dispatched",
+                            [],
+                        ):
+                            dispatched_payload = dispatched_event.get(
+                                "payload"
+                            ) or {}
+                            if (
+                                dispatched_payload.get("tool_name")
+                                != decision.tool.name
+                                or dispatched_payload.get("tool_version")
+                                != decision.tool.version
+                                or dispatched_payload.get("invocation_digest")
+                                != _digest(invocation)
+                            ):
+                                add_violation("tool_invocation_mismatch")
+                    elif str(step.get("status") or "") in {
+                        "executing",
+                        "observed",
+                        "completed",
+                    }:
+                        add_violation("tool_invocation_mismatch")
+
+                    observation = step.get("observation")
+                    if isinstance(observation, Mapping):
+                        try:
+                            validated_observation = RuntimeObservation.model_validate(
+                                observation
+                            )
+                            expected_observation_id = _digest({
+                                "run_id": run_id,
+                                "step_id": step_id,
+                                "tool": decision.tool.model_dump(mode="json"),
+                            })[:32]
+                            if (
+                                validated_observation.observation_id
+                                != expected_observation_id
+                                or validated_observation.step_id != step_id
+                                or validated_observation.tool != decision.tool
+                            ):
+                                add_violation("observation_mismatch")
+                            observed_events = events_by_type.get(
+                                "tool_observed",
+                                [],
+                            )
+                            if len(observed_events) != 1:
+                                add_violation("observation_mismatch")
+                            else:
+                                observed_payload = observed_events[0].get(
+                                    "payload"
+                                ) or {}
+                                if (
+                                    observed_payload.get("status")
+                                    != validated_observation.status
+                                    or observed_payload.get("code")
+                                    != validated_observation.code
+                                    or observed_payload.get("observation_digest")
+                                    != _digest(observation)
+                                ):
+                                    add_violation("observation_mismatch")
+                        except Exception:
+                            add_violation("observation_mismatch")
+                    elif str(step.get("status") or "") in {"observed", "completed"}:
+                        add_violation("observation_mismatch")
+
+                    dispatched = positions_by_type.get("tool_dispatched", [])
+                    observed = positions_by_type.get("tool_observed", [])
+                    if observed and (
+                        not dispatched or observed[0] <= dispatched[-1]
+                    ):
+                        add_violation("step_event_order_mismatch")
+                else:
+                    if positions_by_type.get("tool_dispatched") or positions_by_type.get(
+                        "tool_observed"
+                    ):
+                        add_violation("step_event_order_mismatch")
+                    observation = step.get("observation")
+                    if isinstance(observation, Mapping):
+                        try:
+                            completion = CompletionDecision.model_validate(
+                                observation.get("completion")
+                            )
+                            if observation.get("status") != "finish_evaluated":
+                                add_violation("observation_mismatch")
+                        except Exception:
+                            add_violation("observation_mismatch")
+                    elif str(step.get("status") or "") in {"observed", "completed"}:
+                        add_violation("observation_mismatch")
+
+            derived_step_status = "planning"
+            if policy_positions:
+                policy_payload = events_by_type["policy_decided"][0].get(
+                    "payload"
+                ) or {}
+                derived_step_status = (
+                    "policy_checked"
+                    if policy_payload.get("allowed") is True
+                    else "failed"
+                )
+            if positions_by_type.get("tool_dispatched"):
+                derived_step_status = "executing"
+            if positions_by_type.get("tool_observed"):
+                derived_step_status = "observed"
+            if completed_positions:
+                derived_step_status = "completed"
+                if len(completed_positions) != 1:
+                    add_violation("step_event_order_mismatch")
+                if policy_positions and completed_positions[0] <= policy_positions[0]:
+                    add_violation("step_event_order_mismatch")
+                completed_payload = events_by_type["step_completed"][0].get(
+                    "payload"
+                ) or {}
+                expected_kind = (
+                    "finish"
+                    if decision is not None and decision.kind == "propose_finish"
+                    else "tool"
+                )
+                if (
+                    completed_payload.get("kind") != expected_kind
+                    or completed_payload.get("step_digest")
+                    != _digest(_step_audit_projection(step))
+                ):
+                    add_violation("step_status_mismatch")
+
+            persisted_step_status = str(step.get("status") or "")
+            if persisted_step_status == "paused":
+                matching_pause = any(
+                    event.get("type") == "run_paused"
+                    and str(event.get("step_id") or "") == step_id
+                    for event in events
+                )
+                if not matching_pause:
+                    add_violation("step_status_mismatch")
+            elif persisted_step_status == "failed":
+                matching_failure = any(
+                    event.get("type") == "run_terminated"
+                    and str(event.get("step_id") or "") == step_id
+                    and (event.get("payload") or {}).get("status") == "failed"
+                    for event in events
+                )
+                if derived_step_status != "failed" and not matching_failure:
+                    add_violation("step_status_mismatch")
+            elif persisted_step_status != derived_step_status:
+                add_violation("step_status_mismatch")
 
         attempts = [
             item for item in run.get("attempts") or []
             if item.get("state") != "released_pre_dispatch"
         ]
-        settled = [item for item in attempts if item.get("state") == "settled"]
+        accounted = [
+            item
+            for item in attempts
+            if item.get("state") in {
+                "settled",
+                "resolved_retry",
+                "resolved_skip",
+            }
+        ]
         derived_usage = AgentRuntimeUsage(
             planner_calls=sum(item.get("kind") == "planner" for item in attempts),
             tool_calls=sum(item.get("kind") == "tool" for item in attempts),
             paid_attempts=sum(
                 int((item.get("usage") or {}).get("paid_attempts") or 0)
-                for item in settled
+                for item in accounted
             ),
             input_tokens=sum(
                 int((item.get("usage") or {}).get("input_tokens") or 0)
-                for item in settled
+                for item in accounted
             ),
             output_tokens=sum(
                 int((item.get("usage") or {}).get("output_tokens") or 0)
-                for item in settled
+                for item in accounted
             ),
             total_tokens=sum(
                 int((item.get("usage") or {}).get("total_tokens") or 0)
-                for item in settled
+                for item in accounted
             ),
         )
         persisted_usage = AgentRuntimeUsage.model_validate(run.get("usage") or {})
         if derived_usage != persisted_usage:
-            violations.append("usage_mismatch")
+            add_violation("usage_mismatch")
         termination = run.get("termination")
         if isinstance(termination, Mapping):
             if termination.get("status") != run.get("status"):
-                violations.append("termination_status_mismatch")
+                add_violation("termination_status_mismatch")
+            if terminal_event is None:
+                add_violation("termination_event_missing")
+            else:
+                terminal_payload = terminal_event.get("payload") or {}
+                if (
+                    terminal_payload.get("status") != termination.get("status")
+                    or terminal_payload.get("reason_code")
+                    != termination.get("reason_code")
+                ):
+                    add_violation("termination_status_mismatch")
         elif run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
-            violations.append("termination_missing")
+            add_violation("termination_missing")
+
+        completed_finish = any(
+            (step.get("planner_decision") or {}).get("kind")
+            == "propose_finish"
+            and step.get("status") == "completed"
+            and (
+                ((step.get("observation") or {}).get("completion") or {}).get(
+                    "satisfied"
+                )
+                is True
+            )
+            for step in steps
+        )
+        if (derived_status == "completed") != completed_finish:
+            add_violation("completion_condition_mismatch")
         return AgentReplayView(
             run_id=str(run["_id"]),
             consistent=not violations,
             violations=tuple(violations),
-            derived_status=str(run["status"]),
+            derived_status=derived_status,
             derived_usage=derived_usage,
             source_input_digest=self._source_input_digest(run, steps),
         )
@@ -653,7 +1240,11 @@ class AgentRuntime:
                 )
             await self._event(
                 run_id=run_id,
-                event_key="run-resumed" if resumed else "run-started",
+                event_key=(
+                    f"run-resumed-{lease_epoch}"
+                    if resumed
+                    else "run-started"
+                ),
                 event_type="run_resumed" if resumed else "run_started",
                 payload={"status": "running"},
                 now=now,
@@ -860,6 +1451,9 @@ class AgentRuntime:
                             "ordinal": ordinal,
                             "status": "completed",
                             "kind": kind,
+                            "step_digest": _digest(
+                                _step_audit_projection(active_step)
+                            ),
                         },
                         step_id=active_step_id,
                         now=now,
@@ -939,15 +1533,6 @@ class AgentRuntime:
             )
             step_id = str(step["step_id"])
             ordinal = int(step["ordinal"])
-            await self._event(
-                run_id=run_id,
-                event_key=f"step-{ordinal}-claimed",
-                event_type="step_claimed",
-                payload={"ordinal": ordinal, "status": "planning"},
-                step_id=step_id,
-                now=now,
-            )
-
             prepared = await self._prepare_step_decision(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1132,6 +1717,10 @@ class AgentRuntime:
                     "reason_code": "finish_proposal_allowed",
                 }
         except (AgentRuntimePolicyViolation, ValueError, AssertionError):
+            policy_decision = {
+                "allowed": False,
+                "reason_code": "policy_violation",
+            }
             await self._repository.transition_step(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -1142,11 +1731,21 @@ class AgentRuntime:
                 status="failed",
                 fields={
                     "planner_decision": decision.model_dump(mode="json"),
-                    "policy_decision": {
-                        "allowed": False,
-                        "reason_code": "policy_violation",
-                    },
+                    "policy_decision": policy_decision,
                 },
+                now=_aware(self._clock()),
+            )
+            await self._event(
+                run_id=run_id,
+                event_key=f"step-{ordinal}-policy",
+                event_type="policy_decided",
+                payload={
+                    "ordinal": ordinal,
+                    "allowed": False,
+                    "decision_kind": decision.kind,
+                    "policy_digest": _digest(policy_decision),
+                },
+                step_id=step_id,
                 now=_aware(self._clock()),
             )
             await self._repository.clear_active_step(
@@ -1192,6 +1791,7 @@ class AgentRuntime:
                     "ordinal": ordinal,
                     "allowed": True,
                     "decision_kind": decision.kind,
+                    "policy_digest": _digest(policy_decision),
                 },
                 step_id=step_id,
                 now=_aware(self._clock()),
@@ -1662,6 +2262,19 @@ class AgentRuntime:
                     now=now,
                 )
                 return False
+            await self._event(
+                run_id=run_id,
+                event_key=f"{call_key}-dispatched",
+                event_type="tool_dispatched",
+                payload={
+                    "ordinal": ordinal,
+                    "tool_name": decision.tool.name,
+                    "tool_version": decision.tool.version,
+                    "invocation_digest": _digest(invocation),
+                },
+                step_id=step_id,
+                now=now,
+            )
             try:
                 recovered = await self._await_adapter(
                     self._tools.recover(
@@ -1819,7 +2432,12 @@ class AgentRuntime:
                 run_id=run_id,
                 event_key=f"{call_key}-dispatched",
                 event_type="tool_dispatched",
-                payload={"ordinal": ordinal, "tool_name": decision.tool.name},
+                payload={
+                    "ordinal": ordinal,
+                    "tool_name": decision.tool.name,
+                    "tool_version": decision.tool.version,
+                    "invocation_digest": _digest(invocation),
+                },
                 step_id=step_id,
                 now=now,
             )
@@ -2034,6 +2652,7 @@ class AgentRuntime:
                 "ordinal": ordinal,
                 "status": result.status,
                 "code": result.code,
+                "observation_digest": _digest(observation),
             },
             step_id=step_id,
             now=_aware(self._clock()),
@@ -2291,7 +2910,11 @@ class AgentRuntime:
             run_id=run_id,
             event_key=f"step-{ordinal}-planned",
             event_type="step_planned",
-            payload={"ordinal": ordinal, "decision_kind": decision.kind},
+            payload={
+                "ordinal": ordinal,
+                "decision_kind": decision.kind,
+                "decision_digest": _digest(decision.model_dump(mode="json")),
+            },
             step_id=step_id,
             now=now,
         )
@@ -2338,7 +2961,7 @@ class AgentRuntime:
         kind: str,
         now: datetime,
     ) -> None:
-        await self._repository.transition_step(
+        completed_step = await self._repository.transition_step(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
@@ -2361,7 +2984,14 @@ class AgentRuntime:
             run_id=run_id,
             event_key=f"step-{ordinal}-completed",
             event_type="step_completed",
-            payload={"ordinal": ordinal, "status": "completed", "kind": kind},
+            payload={
+                "ordinal": ordinal,
+                "status": "completed",
+                "kind": kind,
+                "step_digest": _digest(
+                    _step_audit_projection(completed_step)
+                ),
+            },
             step_id=step_id,
             now=now,
         )
@@ -2606,7 +3236,11 @@ class AgentRuntime:
         )
         await self._event(
             run_id=run_id,
-            event_key=f"run-{status}-{reason_code}",
+            event_key=(
+                f"run-paused-{reason_code}-{lease_epoch}"
+                if status == "paused"
+                else f"run-{status}-{reason_code}"
+            ),
             event_type="run_terminated" if status != "paused" else "run_paused",
             payload={"status": status, "reason_code": reason_code},
             step_id=step_id,

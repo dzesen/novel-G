@@ -50,13 +50,13 @@ def _contains_forbidden_location(value: Any) -> bool:
 class RuntimePolicyGate:
     """Authorize an exact tool/version/scope/effect tuple and validate its input."""
 
-    def authorize_tool(
+    def authorize_tool_snapshot(
         self,
         *,
         authorization: Mapping[str, Any],
         decision: PlannerDecision,
-        descriptor: RuntimeToolDescriptor,
-    ) -> tuple[BaseModel, dict[str, Any]]:
+        descriptor: Mapping[str, Any],
+    ) -> dict[str, Any]:
         if decision.kind != "call_tool" or decision.tool is None or decision.scope is None:
             raise AgentRuntimePolicyViolation("a tool decision is required")
         allowed_tools = {
@@ -65,13 +65,17 @@ class RuntimePolicyGate:
         }
         if decision.tool not in allowed_tools:
             raise AgentRuntimePolicyViolation("tool/version is not authorized")
-        if descriptor.reference != decision.tool:
+        descriptor_reference = RuntimeToolReference.model_validate(
+            descriptor.get("reference") or {}
+        )
+        if descriptor_reference != decision.tool:
             raise AgentRuntimePolicyViolation("tool descriptor identity drifted")
 
         authorized_scope = AgentScope.model_validate(authorization.get("scope") or {})
         if decision.scope != authorized_scope:
             raise AgentRuntimePolicyViolation("tool scope is outside the authorized target")
-        if decision.scope.kind not in descriptor.scope_kinds:
+        scope_kinds = tuple(str(item) for item in descriptor.get("scope_kinds") or ())
+        if decision.scope.kind not in scope_kinds:
             raise AgentRuntimePolicyViolation("tool does not support the authorized scope kind")
 
         if authorization.get("approval_mode") != "proposal_only":
@@ -83,11 +87,12 @@ class RuntimePolicyGate:
             raise AgentRuntimePolicyViolation(
                 "authorization contains an unknown Runtime v1 effect class"
             )
-        if descriptor.effect_class not in V1_RUNTIME_EFFECT_CLASSES:
+        effect_class = str(descriptor.get("effect_class") or "")
+        if effect_class not in V1_RUNTIME_EFFECT_CLASSES:
             raise AgentRuntimePolicyViolation(
                 "tool effect class is outside the Runtime v1 closed set"
             )
-        if descriptor.effect_class not in allowed_effects:
+        if effect_class not in allowed_effects:
             raise AgentRuntimePolicyViolation("tool effect class is not authorized")
 
         allowed_changes = set(authorization.get("allowed_change_classes") or [])
@@ -95,13 +100,15 @@ class RuntimePolicyGate:
             raise AgentRuntimePolicyViolation(
                 "authorization contains an unknown Runtime v1 change class"
             )
-        if not set(descriptor.change_classes).issubset(V1_RUNTIME_CHANGE_CLASSES):
+        change_classes = set(descriptor.get("change_classes") or [])
+        if not change_classes.issubset(V1_RUNTIME_CHANGE_CLASSES):
             raise AgentRuntimePolicyViolation(
                 "tool change class is outside the Runtime v1 closed set"
             )
-        if not set(descriptor.change_classes).issubset(allowed_changes):
+        if not change_classes.issubset(allowed_changes):
             raise AgentRuntimePolicyViolation("tool change class is not authorized")
-        if not set(descriptor.proposal_kinds).issubset(V1_RUNTIME_PROPOSAL_KINDS):
+        proposal_kinds = set(descriptor.get("proposal_kinds") or [])
+        if not proposal_kinds.issubset(V1_RUNTIME_PROPOSAL_KINDS):
             raise AgentRuntimePolicyViolation(
                 "tool proposal kind is outside the Runtime v1 closed set"
             )
@@ -109,7 +116,10 @@ class RuntimePolicyGate:
         allowed_external = set(
             authorization.get("allowed_external_data_categories") or []
         )
-        if not set(descriptor.external_data_categories).issubset(allowed_external):
+        external_categories = set(
+            descriptor.get("external_data_categories") or []
+        )
+        if not external_categories.issubset(allowed_external):
             raise AgentRuntimePolicyViolation("tool external-data category is not authorized")
         arguments = decision.arguments or {}
         if _contains_forbidden_location(arguments):
@@ -117,13 +127,36 @@ class RuntimePolicyGate:
                 "arbitrary URI and filesystem paths are forbidden in Runtime v1"
             )
 
-        payload = descriptor.input_schema.model_validate(arguments)
-        return payload, {
+        return {
             "allowed": True,
             "reason_code": "authorized",
             "tool_name": decision.tool.name,
             "tool_version": decision.tool.version,
             "scope_kind": decision.scope.kind,
-            "effect_class": descriptor.effect_class,
+            "effect_class": effect_class,
             "approval_mode": "proposal_only",
         }
+
+    def authorize_tool(
+        self,
+        *,
+        authorization: Mapping[str, Any],
+        decision: PlannerDecision,
+        descriptor: RuntimeToolDescriptor,
+    ) -> tuple[BaseModel, dict[str, Any]]:
+        policy_decision = self.authorize_tool_snapshot(
+            authorization=authorization,
+            decision=decision,
+            descriptor={
+                "reference": descriptor.reference.model_dump(mode="json"),
+                "scope_kinds": list(descriptor.scope_kinds),
+                "effect_class": descriptor.effect_class,
+                "proposal_kinds": list(descriptor.proposal_kinds),
+                "change_classes": list(descriptor.change_classes),
+                "external_data_categories": list(
+                    descriptor.external_data_categories
+                ),
+            },
+        )
+        payload = descriptor.input_schema.model_validate(decision.arguments or {})
+        return payload, policy_decision

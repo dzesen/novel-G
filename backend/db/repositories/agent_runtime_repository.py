@@ -5,12 +5,13 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 from uuid import UUID, uuid5
 
 from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from backend.db import collections
 from backend.db.errors import NotFoundError
@@ -22,19 +23,169 @@ STEP_NAMESPACE = UUID("e0dc1a47-9a48-4cb5-a165-2259c139fbb3")
 EVENT_NAMESPACE = UUID("814b1e75-93a6-49da-903c-03de77a202c6")
 CALL_NAMESPACE = UUID("73998e71-c0cf-4a99-91a8-8a01ad636aa9")
 MAX_EVENT_PAYLOAD_BYTES = 16_384
-SENSITIVE_EVENT_FIELDS = frozenset({
-    "api_key",
-    "arguments",
-    "content",
-    "data",
-    "password",
-    "prompt",
-    "raw_prompt",
-    "request",
-    "result",
-    "secret",
-    "text",
-})
+
+
+class _EventPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _ReadyEventPayload(_EventPayload):
+    status: Literal["ready"]
+
+
+class _BoundEventPayload(_EventPayload):
+    status: Literal["bound"]
+
+
+class _RunningEventPayload(_EventPayload):
+    status: Literal["running"]
+
+
+class _RunPausedEventPayload(_EventPayload):
+    status: Literal["paused"]
+    reason_code: Literal[
+        "budget_exhausted",
+        "authorization_required",
+        "concurrent_narrative_change",
+        "ambiguous_identity",
+        "manual_approval_required",
+        "uncertain_paid_attempt",
+    ]
+
+
+class _RunTerminatedEventPayload(_EventPayload):
+    status: Literal["completed", "failed", "cancelled"]
+    reason_code: Literal[
+        "goal_satisfied",
+        "no_change_required",
+        "max_steps_exhausted",
+        "deadline_exceeded",
+        "planner_output_exhausted",
+        "tool_failure_exhausted",
+        "policy_violation",
+        "invariant_violation",
+        "cancelled_by_user",
+    ]
+
+    @model_validator(mode="after")
+    def validate_status_reason_pair(self) -> "_RunTerminatedEventPayload":
+        valid_reasons = {
+            "completed": {"goal_satisfied", "no_change_required"},
+            "failed": {
+                "max_steps_exhausted",
+                "deadline_exceeded",
+                "planner_output_exhausted",
+                "tool_failure_exhausted",
+                "policy_violation",
+                "invariant_violation",
+            },
+            "cancelled": {"cancelled_by_user"},
+        }
+        if self.reason_code not in valid_reasons[self.status]:
+            raise ValueError("termination status and reason do not match")
+        return self
+
+
+class _RunSupersededEventPayload(_EventPayload):
+    status: Literal["superseded"]
+    successor_run_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    reason_code: Literal["continued_by_successor"]
+
+
+class _OrdinalEventPayload(_EventPayload):
+    ordinal: int = Field(ge=0)
+
+
+class _DecisionEventPayload(_OrdinalEventPayload):
+    decision_kind: Literal["call_tool", "propose_finish"]
+
+
+class _AttemptReservedEventPayload(_OrdinalEventPayload):
+    kind: Literal["planner", "tool"]
+
+
+class _StepPlannedEventPayload(_DecisionEventPayload):
+    decision_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _PolicyDecidedEventPayload(_DecisionEventPayload):
+    allowed: bool
+    policy_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _ToolDispatchedEventPayload(_OrdinalEventPayload):
+    tool_name: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    tool_version: int = Field(ge=1)
+    invocation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _ToolObservedEventPayload(_OrdinalEventPayload):
+    status: Literal[
+        "ok",
+        "retryable_error",
+        "blocked",
+        "uncertain",
+        "permanent_error",
+    ]
+    code: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
+    observation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _AttemptUncertainEventPayload(_OrdinalEventPayload):
+    reason_code: Literal["dispatch_outcome_unknown"]
+
+
+class _StepCompletedEventPayload(_OrdinalEventPayload):
+    status: Literal["completed"]
+    kind: Literal["tool", "finish"]
+    step_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class _ProposalRecordedEventPayload(_OrdinalEventPayload):
+    proposal_id: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    proposal_kind: Literal["chapter_prose_candidate"]
+
+
+class _MutationCommittedEventPayload(_OrdinalEventPayload):
+    mutation_id: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    change_class: Literal["temporary_candidate"]
+
+
+EVENT_PAYLOAD_MODELS: dict[str, type[_EventPayload]] = {
+    "run_created": _ReadyEventPayload,
+    "readiness_bound": _BoundEventPayload,
+    "run_started": _RunningEventPayload,
+    "run_resumed": _RunningEventPayload,
+    "step_planned": _StepPlannedEventPayload,
+    "policy_decided": _PolicyDecidedEventPayload,
+    "attempt_reserved": _AttemptReservedEventPayload,
+    "tool_dispatched": _ToolDispatchedEventPayload,
+    "tool_observed": _ToolObservedEventPayload,
+    "proposal_recorded": _ProposalRecordedEventPayload,
+    "mutation_committed": _MutationCommittedEventPayload,
+    "attempt_settled": _OrdinalEventPayload,
+    "attempt_uncertain": _AttemptUncertainEventPayload,
+    "step_completed": _StepCompletedEventPayload,
+    "run_paused": _RunPausedEventPayload,
+    "run_superseded": _RunSupersededEventPayload,
+    "run_terminated": _RunTerminatedEventPayload,
+}
 
 STEP_TRANSITIONS: dict[str, frozenset[str]] = {
     "planning": frozenset({"policy_checked", "paused", "failed"}),
@@ -79,16 +230,37 @@ def _required_object_id(value: str | ObjectId | None, field: str) -> ObjectId:
     return to_object_id(value)
 
 
-def _validate_event_payload(value: Any, *, path: str = "payload") -> None:
-    if isinstance(value, Mapping):
-        for raw_key, item in value.items():
-            key = str(raw_key)
-            if key.lower() in SENSITIVE_EVENT_FIELDS:
-                raise ValueError(f"sensitive event field is forbidden: {path}.{key}")
-            _validate_event_payload(item, path=f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _validate_event_payload(item, path=f"{path}[{index}]")
+def project_agent_runtime_event_payload(
+    event_type: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    model = EVENT_PAYLOAD_MODELS.get(str(event_type))
+    if model is None:
+        raise ValueError(f"unsupported Agent event type: {event_type}")
+    try:
+        return model.model_validate(dict(payload)).model_dump(mode="json")
+    except ValidationError as exc:
+        raise ValueError(
+            f"Agent event payload is invalid for '{event_type}'"
+        ) from exc
+
+
+def _event_matches(
+    existing: Mapping[str, Any],
+    *,
+    run_id: ObjectId,
+    event_key: str,
+    event_type: str,
+    step_id: str | None,
+    payload: Mapping[str, Any],
+) -> bool:
+    return all((
+        existing.get("run_id") == run_id,
+        existing.get("event_key") == event_key,
+        existing.get("type") == event_type,
+        existing.get("step_id") == step_id,
+        existing.get("payload") == dict(payload),
+    ))
 
 
 def _attempt_by_key(run: Mapping[str, Any], call_key: str) -> dict[str, Any] | None:
@@ -1226,8 +1398,13 @@ class AgentRuntimeRepository:
     ) -> dict[str, Any]:
         if not str(event_key).strip():
             raise ValueError("event_key is required")
-        projected = deepcopy(dict(payload))
-        _validate_event_payload(projected)
+        normalized_event_key = str(event_key)
+        normalized_event_type = str(event_type)
+        normalized_step_id = str(step_id) if step_id else None
+        projected = project_agent_runtime_event_payload(
+            normalized_event_type,
+            payload,
+        )
         encoded = json.dumps(
             projected,
             ensure_ascii=False,
@@ -1239,10 +1416,21 @@ class AgentRuntimeRepository:
             raise ValueError("Agent event payload exceeds the audit boundary")
 
         run_object_id = _required_object_id(run_id, "run_id")
-        event_id = uuid5(EVENT_NAMESPACE, f"{run_id}:{event_key}").hex
+        event_id = uuid5(EVENT_NAMESPACE, f"{run_id}:{normalized_event_key}").hex
         existing = await self.events.find_one({"_id": event_id})
         if existing is not None:
-            return existing
+            if _event_matches(
+                existing,
+                run_id=run_object_id,
+                event_key=normalized_event_key,
+                event_type=normalized_event_type,
+                step_id=normalized_step_id,
+                payload=projected,
+            ):
+                return existing
+            raise AgentRuntimeStateConflict(
+                "Agent event key was replayed with different content"
+            )
         run = await self.runs.find_one_and_update(
             {"_id": run_object_id, "is_deleted": False},
             {
@@ -1261,9 +1449,9 @@ class AgentRuntimeRepository:
             "owner_id": run["owner_id"],
             "novel_id": run["novel_id"],
             "sequence": sequence,
-            "event_key": str(event_key),
-            "type": str(event_type),
-            "step_id": str(step_id) if step_id else None,
+            "event_key": normalized_event_key,
+            "type": normalized_event_type,
+            "step_id": normalized_step_id,
             "schema_version": "agent_runtime_event.v1",
             "payload": projected,
             "created_at": now,
@@ -1274,8 +1462,19 @@ class AgentRuntimeRepository:
             await self.events.insert_one(document)
         except DuplicateKeyError:
             existing = await self.events.find_one({"_id": event_id})
-            if existing is not None:
+            if existing is not None and _event_matches(
+                existing,
+                run_id=run_object_id,
+                event_key=normalized_event_key,
+                event_type=normalized_event_type,
+                step_id=normalized_step_id,
+                payload=projected,
+            ):
                 return existing
+            if existing is not None:
+                raise AgentRuntimeStateConflict(
+                    "Agent event key was replayed with different content"
+                )
             raise
         return document
 
