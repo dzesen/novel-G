@@ -42,6 +42,10 @@ from backend.services.generation.chapter_generation_application import (
     STATE_WORKFLOW,
     StateGenerationCommand,
 )
+from backend.services.generation.chapter_capability_registry import (
+    build_chapter_capability_registry,
+)
+from backend.services.llm.capability_registry import CapabilityCall
 from backend.api.llm_routers.prose_router import PROSE_STEP, PROSE_WORKFLOW
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
 from backend.services.generation.job_planner import (
@@ -96,6 +100,12 @@ def _chapter_generation_service() -> ChapterGenerationApplicationService:
             create_runtime=create_generation_runtime,
             run_workflow=run_workflow,
         )
+    )
+
+
+def _chapter_capability_registry():
+    return build_chapter_capability_registry(
+        service_factory=_chapter_generation_service,
     )
 
 
@@ -388,15 +398,18 @@ async def generate_outline(
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
-    result = await _chapter_generation_service().collect(
+    execution = await _chapter_capability_registry().execute(
+        "chapter_outline",
         OutlineGenerationCommand(
             novel_id=novel_id,
             chapter_id=str(chapter["_id"]),
             authority=AcceptanceAuthority.SYSTEM,
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
-        )
+        ),
+        call=CapabilityCall(source="job_engine"),
     )
+    result = execution.value
     return (
         result.value,
         result.dropped,
@@ -413,15 +426,18 @@ async def generate_prose(
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[str, int, dict, list[dict[str, Any]], dict[str, Any]]:
-    result = await _chapter_generation_service().collect(
+    execution = await _chapter_capability_registry().execute(
+        "chapter_prose",
         ProseGenerationCommand(
             novel_id=novel_id,
             chapter_id=str(chapter["_id"]),
             authority=AcceptanceAuthority.SYSTEM,
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
-        )
+        ),
+        call=CapabilityCall(source="job_engine"),
     )
+    result = execution.value
     return (
         str(result.value or ""),
         result.total_tokens,
@@ -436,15 +452,18 @@ async def generate_state(
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]], dict[str, Any]]:
-    result = await _chapter_generation_service().collect(
+    execution = await _chapter_capability_registry().execute(
+        "chapter_state",
         StateGenerationCommand(
             novel_id=novel_id,
             chapter_id=str(chapter["_id"]),
             authority=AcceptanceAuthority.SYSTEM,
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
-        )
+        ),
+        call=CapabilityCall(source="job_engine"),
     )
+    result = execution.value
     return (
         dict(result.value or {}),
         result.dropped,
@@ -460,14 +479,17 @@ async def generate_outline_adherence(
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
 ) -> tuple[dict, int, dict, list[dict[str, Any]]]:
-    result = await _chapter_generation_service().collect(
+    execution = await _chapter_capability_registry().execute(
+        "chapter_outline_adherence",
         OutlineAdherenceCommand(
             novel_id=novel_id,
             chapter_id=str(chapter["_id"]),
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
-        )
+        ),
+        call=CapabilityCall(source="job_engine"),
     )
+    result = execution.value
     return (
         dict(result.value or {}),
         result.total_tokens,

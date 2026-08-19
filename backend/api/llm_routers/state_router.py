@@ -35,6 +35,10 @@ from backend.services.generation.chapter_generation_application import (
     STATE_STEP,
     STATE_WORKFLOW,
 )
+from backend.services.generation.chapter_capability_registry import (
+    build_chapter_capability_registry,
+)
+from backend.services.llm.capability_registry import CapabilityCall
 from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_context,
@@ -93,6 +97,12 @@ def _chapter_generation_service() -> ChapterGenerationApplicationService:
     )
 
 
+def _chapter_capability_registry():
+    return build_chapter_capability_registry(
+        service_factory=_chapter_generation_service,
+    )
+
+
 class ChapterStateRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
     chapter_id: str = Field(..., min_length=1)
@@ -101,8 +111,10 @@ class ChapterStateRequest(GenerationParamsMixin):
 @router.post("/extract-chapter-state-by-ai")
 async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request):
     """通过统一应用服务生成状态提案；本路由只授予预览权限。"""
+    request_id = uuid4().hex[:8]
     try:
-        execution = await _chapter_generation_service().execute(
+        capability_stream = await _chapter_capability_registry().stream(
+            "chapter_state",
             StateGenerationCommand(
                 novel_id=req.novel_id,
                 chapter_id=req.chapter_id,
@@ -111,9 +123,14 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
                     **build_gen_kwargs(req),
                     "allow_failure_retry": req.allow_failure_retry,
                 },
-                request_id=uuid4().hex[:8],
+                request_id=request_id,
                 is_disconnected=request.is_disconnected,
-            )
+            ),
+            call=CapabilityCall(
+                source="http",
+                request_id=request_id,
+                actor=getattr(request.state, "actor", None),
+            ),
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -123,7 +140,7 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        async for event in execution:
+        async for event in capability_stream.events:
             if event.name == "keepalive":
                 yield sse_comment("keepalive")
             else:

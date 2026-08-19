@@ -14,6 +14,8 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from pydantic import BaseModel, ConfigDict, Field as ModelField
+
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
 from backend.db.repositories.novel_repository import novel_repo
@@ -164,25 +166,27 @@ class PartialProseRequiresCompletion(ValueError):
     """正文只接受了部分 AI 结果，状态回填必须硬暂停。"""
 
 
-@dataclass(frozen=True)
-class OutlineGenerationCommand:
+class _ChapterGenerationCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+
+class OutlineGenerationCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
     authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
-    generation_params: Mapping[str, Any] = field(default_factory=dict)
-    attempt_scope: AttemptScope | None = None
+    generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
+    attempt_scope: Any | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
 
-@dataclass(frozen=True)
-class ProseGenerationCommand:
+class ProseGenerationCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
     authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
     owner_id: str | None = None
-    generation_params: Mapping[str, Any] = field(default_factory=dict)
-    attempt_scope: AttemptScope | None = None
+    generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
+    attempt_scope: Any | None = None
     resume_run_id: str | None = None
     expected_run_revision: int | None = None
     confirm_uncertain_retry: bool = False
@@ -194,36 +198,35 @@ class ProseGenerationCommand:
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
 
-@dataclass(frozen=True)
-class OutlineAdherenceCommand:
+class OutlineAdherenceCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
-    generation_params: Mapping[str, Any] = field(default_factory=dict)
-    attempt_scope: AttemptScope | None = None
+    generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
+    attempt_scope: Any | None = None
 
 
-@dataclass(frozen=True)
-class StateGenerationCommand:
+class StateGenerationCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
     authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
-    generation_params: Mapping[str, Any] = field(default_factory=dict)
-    attempt_scope: AttemptScope | None = None
+    generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
+    attempt_scope: Any | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
 
-@dataclass(frozen=True)
-class ChapterGenerationResult:
+class ChapterGenerationResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
     stage: ChapterGenerationStage
     value: Any
     usage: dict[str, Any]
     attempts: list[dict[str, Any]]
     truncation: dict[str, Any]
-    dropped: dict[str, Any] = field(default_factory=dict)
-    remapped: list[dict[str, Any]] = field(default_factory=list)
-    completion: dict[str, Any] = field(default_factory=dict)
-    acceptance: dict[str, Any] = field(default_factory=dict)
+    dropped: dict[str, Any] = ModelField(default_factory=dict)
+    remapped: list[dict[str, Any]] = ModelField(default_factory=list)
+    completion: dict[str, Any] = ModelField(default_factory=dict)
+    acceptance: dict[str, Any] = ModelField(default_factory=dict)
     accepted: bool = False
 
     @property
@@ -231,8 +234,9 @@ class ChapterGenerationResult:
         return int(self.usage.get("total_tokens") or 0)
 
 
-@dataclass(frozen=True)
-class ChapterGenerationEvent:
+class ChapterGenerationEvent(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
     name: str
     data: dict[str, Any]
     result: ChapterGenerationResult | None = None
@@ -467,7 +471,10 @@ class ChapterGenerationApplicationService:
         prepared: _PreparedOutline,
     ) -> AsyncIterator[ChapterGenerationEvent]:
         if any(prepared.truncation.values()):
-            yield ChapterGenerationEvent("context", prepared.truncation)
+            yield ChapterGenerationEvent(
+                name="context",
+                data=prepared.truncation,
+            )
 
         command = prepared.command
         frames = self._deps.run_workflow(
@@ -493,13 +500,13 @@ class ChapterGenerationApplicationService:
         async for frame in frames:
             parsed = parse_sse_event(frame)
             if parsed is None:
-                yield ChapterGenerationEvent("keepalive", {})
+                yield ChapterGenerationEvent(name="keepalive", data={})
                 continue
             name, raw_data = parsed
             data = dict(raw_data)
             outline = _extract_outline(name, data)
             if outline is None:
-                yield ChapterGenerationEvent(name, data)
+                yield ChapterGenerationEvent(name=name, data=data)
                 continue
 
             resolved, remapped = resolve_outline_character_references(
@@ -511,21 +518,21 @@ class ChapterGenerationApplicationService:
                 final_remapped = list(remapped)
                 if not reported_remapped:
                     yield ChapterGenerationEvent(
-                        "id_remapping",
-                        {"remapped": final_remapped},
+                        name="id_remapping",
+                        data={"remapped": final_remapped},
                     )
                     reported_remapped = True
             if dropped:
                 final_dropped = dict(dropped)
                 if not reported_dropped:
                     yield ChapterGenerationEvent(
-                        "id_validation",
-                        {"dropped": final_dropped},
+                        name="id_validation",
+                        data={"dropped": final_dropped},
                     )
                     reported_dropped = True
             cleaned_data = _replace_outline(name, data, cleaned)
             if name != "done":
-                yield ChapterGenerationEvent(name, cleaned_data)
+                yield ChapterGenerationEvent(name=name, data=cleaned_data)
                 continue
 
             accepted = False
@@ -546,7 +553,11 @@ class ChapterGenerationApplicationService:
                 remapped=final_remapped,
                 accepted=accepted,
             )
-            yield ChapterGenerationEvent(name, cleaned_data, result=result)
+            yield ChapterGenerationEvent(
+                name=name,
+                data=cleaned_data,
+                result=result,
+            )
 
     async def _prepare_state(
         self,
@@ -665,7 +676,10 @@ class ChapterGenerationApplicationService:
         prepared: _PreparedState,
     ) -> AsyncIterator[ChapterGenerationEvent]:
         if any(prepared.truncation.values()):
-            yield ChapterGenerationEvent("context", prepared.truncation)
+            yield ChapterGenerationEvent(
+                name="context",
+                data=prepared.truncation,
+            )
         command = prepared.command
         frames = self._deps.run_workflow(
             workflow_name=STATE_WORKFLOW,
@@ -693,17 +707,17 @@ class ChapterGenerationApplicationService:
         async for frame in preview:
             parsed = parse_sse_event(frame)
             if parsed is None:
-                yield ChapterGenerationEvent("keepalive", {})
+                yield ChapterGenerationEvent(name="keepalive", data={})
                 continue
             name, raw_data = parsed
             data = dict(raw_data)
             if name == "id_validation":
                 dropped = dict(data.get("dropped") or {})
-                yield ChapterGenerationEvent(name, data)
+                yield ChapterGenerationEvent(name=name, data=data)
                 continue
             if name == "id_remapping":
                 remapped = list(data.get("remapped") or [])
-                yield ChapterGenerationEvent(name, data)
+                yield ChapterGenerationEvent(name=name, data=data)
                 continue
             proposal = _extract_state_proposal(name, data)
             if proposal is None:
@@ -712,11 +726,11 @@ class ChapterGenerationApplicationService:
                         "attempts",
                         _serialize_attempts(prepared.runtime),
                     )
-                yield ChapterGenerationEvent(name, data)
+                yield ChapterGenerationEvent(name=name, data=data)
                 continue
 
             if name != "done":
-                yield ChapterGenerationEvent(name, data)
+                yield ChapterGenerationEvent(name=name, data=data)
                 continue
             acceptance: dict[str, Any] = {}
             accepted = False
@@ -739,7 +753,11 @@ class ChapterGenerationApplicationService:
                 acceptance=dict(acceptance or {}),
                 accepted=accepted,
             )
-            yield ChapterGenerationEvent(name, data, result=result)
+            yield ChapterGenerationEvent(
+                name=name,
+                data=data,
+                result=result,
+            )
 
     async def _prepare_outline_adherence(
         self,
@@ -822,10 +840,13 @@ class ChapterGenerationApplicationService:
         prepared: _PreparedOutlineAdherence,
     ) -> AsyncIterator[ChapterGenerationEvent]:
         if any(prepared.truncation.values()):
-            yield ChapterGenerationEvent("context", prepared.truncation)
+            yield ChapterGenerationEvent(
+                name="context",
+                data=prepared.truncation,
+            )
         yield ChapterGenerationEvent(
-            "step",
-            {
+            name="step",
+            data={
                 "step": "outline_adherence",
                 "status": "running",
                 "provider": getattr(prepared.plan, "provider_alias", ""),
@@ -845,8 +866,8 @@ class ChapterGenerationApplicationService:
         except Exception as exc:
             usage = _runtime_usage(prepared.runtime)
             yield ChapterGenerationEvent(
-                "done",
-                {
+                name="done",
+                data={
                     "success": False,
                     "failed_step": "outline_adherence",
                     "error": str(exc),
@@ -860,8 +881,8 @@ class ChapterGenerationApplicationService:
         usage = generated.usage.model_dump()
         attempts = _serialize_attempts(prepared.runtime)
         yield ChapterGenerationEvent(
-            "step",
-            {
+            name="step",
+            data={
                 "step": "outline_adherence",
                 "status": "done",
                 "data": review,
@@ -876,8 +897,8 @@ class ChapterGenerationApplicationService:
             truncation=prepared.truncation,
         )
         yield ChapterGenerationEvent(
-            "done",
-            {
+            name="done",
+            data={
                 "success": True,
                 "result": {"outline_adherence": review},
                 "usage": usage,
@@ -1094,8 +1115,14 @@ class ChapterGenerationApplicationService:
         prepared: _PreparedProse,
     ) -> AsyncIterator[ChapterGenerationEvent]:
         if any(prepared.truncation.values()):
-            yield ChapterGenerationEvent("context", prepared.truncation)
-        yield ChapterGenerationEvent("plan", prepared.execution_plan.to_dict())
+            yield ChapterGenerationEvent(
+                name="context",
+                data=prepared.truncation,
+            )
+        yield ChapterGenerationEvent(
+            name="plan",
+            data=prepared.execution_plan.to_dict(),
+        )
 
         command = prepared.command
         runtime = prepared.runtime
@@ -1149,8 +1176,8 @@ class ChapterGenerationApplicationService:
                 )
         except Exception as exc:
             yield ChapterGenerationEvent(
-                "done",
-                {
+                name="done",
+                data={
                     "success": False,
                     "error": str(exc),
                     "completion_status": "stale",
@@ -1160,8 +1187,8 @@ class ChapterGenerationApplicationService:
 
         if run_document is not None:
             yield ChapterGenerationEvent(
-                "run",
-                {
+                name="run",
+                data={
                     "run_id": str(run_document["_id"]),
                     "run_revision": int(run_document.get("revision") or 0),
                 },
@@ -1236,7 +1263,12 @@ class ChapterGenerationApplicationService:
             return consume()
 
         async def on_delta(chunk: str) -> None:
-            await queue.put(ChapterGenerationEvent("delta", {"text": chunk}))
+            await queue.put(
+                ChapterGenerationEvent(
+                    name="delta",
+                    data={"text": chunk},
+                )
+            )
 
         async def on_segment(segment: dict[str, Any]) -> None:
             nonlocal latest_run
@@ -1401,7 +1433,11 @@ class ChapterGenerationApplicationService:
                     accepted=accepted,
                 )
                 await queue.put(
-                    ChapterGenerationEvent("done", payload, result=result)
+                    ChapterGenerationEvent(
+                        name="done",
+                        data=payload,
+                        result=result,
+                    )
                 )
             except asyncio.CancelledError:
                 if latest_run is not None and owner_id is not None:
@@ -1425,8 +1461,8 @@ class ChapterGenerationApplicationService:
                 usage = usage_reader().model_dump()
                 await queue.put(
                     ChapterGenerationEvent(
-                        "done",
-                        {
+                        name="done",
+                        data={
                             "success": False,
                             "error": str(exc),
                             "usage": usage,

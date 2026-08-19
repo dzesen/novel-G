@@ -65,6 +65,10 @@ from backend.services.generation.chapter_generation_application import (
     ChapterGenerationApplicationService,
     ProseGenerationCommand,
 )
+from backend.services.generation.chapter_capability_registry import (
+    build_chapter_capability_registry,
+)
+from backend.services.llm.capability_registry import CapabilityCall
 from backend.services.novel.style_controls import render_style_controls
 from backend.db.repositories.prose_run_repository import prose_run_repo
 
@@ -115,6 +119,12 @@ def _chapter_generation_service() -> ChapterGenerationApplicationService:
             prose_run_repo=prose_run_repo,
             create_prose_attempt_scope=ProseRunAttemptScope,
         )
+    )
+
+
+def _chapter_capability_registry():
+    return build_chapter_capability_registry(
+        service_factory=_chapter_generation_service,
     )
 
 
@@ -465,8 +475,10 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
         if req.prose_continuation_policy is not None
         else ProseContinuationPolicy()
     )
+    request_id = uuid4().hex[:8]
     try:
-        execution = await _chapter_generation_service().execute(
+        capability_stream = await _chapter_capability_registry().stream(
+            "chapter_prose",
             ProseGenerationCommand(
                 novel_id=req.novel_id,
                 chapter_id=req.chapter_id,
@@ -485,9 +497,14 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
                     req.confirm_automatic_continuations
                 ),
                 token_budget=req.token_budget,
-                request_id=uuid4().hex[:8],
+                request_id=request_id,
                 is_disconnected=request.is_disconnected,
-            )
+            ),
+            call=CapabilityCall(
+                source="http",
+                request_id=request_id,
+                actor=actor,
+            ),
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -506,7 +523,7 @@ async def write_chapter_by_ai(req: ProseRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def application_event_stream() -> AsyncGenerator[str, None]:
-        async for event in execution:
+        async for event in capability_stream.events:
             yield sse_event(event.name, event.data)
 
     return StreamingResponse(

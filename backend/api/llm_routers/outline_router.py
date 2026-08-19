@@ -37,6 +37,10 @@ from backend.services.generation.chapter_generation_application import (
     CHAPTER_OUTLINE_WORKFLOW,
     OutlineGenerationCommand,
 )
+from backend.services.generation.chapter_capability_registry import (
+    build_chapter_capability_registry,
+)
+from backend.services.llm.capability_registry import CapabilityCall
 from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_outline_context,
@@ -125,6 +129,12 @@ def _chapter_generation_service() -> ChapterGenerationApplicationService:
     )
 
 
+def _chapter_capability_registry():
+    return build_chapter_capability_registry(
+        service_factory=_chapter_generation_service,
+    )
+
+
 @router.post("/create-volume-outline-by-ai")
 async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Request):
     """基于已保存小说设定生成分卷大纲预览（SSE）。不写数据库。"""
@@ -175,8 +185,10 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
 @router.post("/create-chapter-outline-by-ai")
 async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Request):
     """通过统一应用服务生成章节细纲预览（SSE）；本路由无落库权限。"""
+    request_id = uuid4().hex[:8]
     try:
-        execution = await _chapter_generation_service().execute(
+        capability_stream = await _chapter_capability_registry().stream(
+            "chapter_outline",
             OutlineGenerationCommand(
                 novel_id=req.novel_id,
                 chapter_id=req.chapter_id,
@@ -185,9 +197,14 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
                     **build_gen_kwargs(req),
                     "allow_failure_retry": req.allow_failure_retry,
                 },
-                request_id=uuid4().hex[:8],
+                request_id=request_id,
                 is_disconnected=request.is_disconnected,
-            )
+            ),
+            call=CapabilityCall(
+                source="http",
+                request_id=request_id,
+                actor=getattr(request.state, "actor", None),
+            ),
         )
     except HTTPException:
         raise
@@ -201,7 +218,7 @@ async def create_chapter_outline_by_ai(req: ChapterOutlineRequest, request: Requ
         raise HTTPException(status_code=400, detail=str(exc))
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        async for event in execution:
+        async for event in capability_stream.events:
             if event.name == "keepalive":
                 yield sse_comment("keepalive")
             else:

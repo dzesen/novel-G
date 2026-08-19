@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from pydantic import BaseModel
@@ -51,6 +52,13 @@ class ContextProvider:
 @dataclass(frozen=True)
 class CapabilityHandler:
     execute: Callable[[Any, Any, CapabilityCall], Awaitable[Any]]
+    stream: (
+        Callable[
+            [Any, Any, CapabilityCall],
+            Awaitable[AsyncIterator[Any]],
+        ]
+        | None
+    ) = None
 
     @property
     def handler_id(self) -> str:
@@ -77,6 +85,7 @@ class CapabilityDefinition:
     budget_estimator: Callable[[BaseModel], CapabilityBudget]
     revision_policy: RevisionPolicy
     audit_projector: Callable[[BaseModel], Mapping[str, Any]]
+    event_schema: type[BaseModel] | None = None
 
     def __post_init__(self) -> None:
         if not self.capability:
@@ -87,6 +96,8 @@ class CapabilityDefinition:
             raise TypeError("input_schema must be a Pydantic model")
         if not issubclass(self.output_schema, BaseModel):
             raise TypeError("output_schema must be a Pydantic model")
+        if self.handler.stream is not None and self.event_schema is None:
+            raise ValueError("stream handlers require an event_schema")
 
 
 @dataclass(frozen=True)
@@ -94,6 +105,14 @@ class CapabilityExecution:
     value: BaseModel
     budget: CapabilityBudget
     audit: Mapping[str, Any]
+    context_policy: str
+    handler_id: str
+
+
+@dataclass(frozen=True)
+class CapabilityStream:
+    events: AsyncIterator[BaseModel]
+    budget: CapabilityBudget
     context_policy: str
     handler_id: str
 
@@ -136,6 +155,34 @@ class CapabilityRegistry:
             value=result,
             budget=budget,
             audit=dict(definition.audit_projector(result)),
+            context_policy=definition.context_provider.policy_id,
+            handler_id=definition.handler.handler_id,
+        )
+
+    async def stream(
+        self,
+        capability: str,
+        payload: BaseModel | Mapping[str, Any],
+        *,
+        call: CapabilityCall,
+    ) -> CapabilityStream:
+        definition = self.get(capability)
+        if definition.handler.stream is None or definition.event_schema is None:
+            raise ValueError(f"capability is not streamable: {capability}")
+        request = definition.input_schema.model_validate(payload)
+        budget = definition.budget_estimator(request)
+        if not isinstance(budget, CapabilityBudget):
+            raise TypeError("budget_estimator must return CapabilityBudget")
+        context = await definition.context_provider.provide(request, call)
+        raw_events = await definition.handler.stream(request, context, call)
+
+        async def validated_events() -> AsyncIterator[BaseModel]:
+            async for event in raw_events:
+                yield definition.event_schema.model_validate(event)
+
+        return CapabilityStream(
+            events=validated_events(),
+            budget=budget,
             context_policy=definition.context_provider.policy_id,
             handler_id=definition.handler.handler_id,
         )
