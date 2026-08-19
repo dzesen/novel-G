@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator
 
 from pydantic import BaseModel
@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from backend.llm.models import TokenUsage
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.generation_runtime import (
+    GenerationPlan,
     GenerationRuntime,
     PromptPlan,
     StructuredOutputMode,
@@ -82,6 +83,9 @@ class WorkflowDeps:
     """
 
     runtime: GenerationRuntime
+    structured_plans: Mapping[str, GenerationPlan] = field(
+        default_factory=dict
+    )
 
 
 class ClientDisconnected(Exception):
@@ -244,9 +248,17 @@ async def run_workflow(
         config_key = step.resolved_config_key
         runtime_attempt_offset = len(deps.runtime.attempts)
         try:
-            generation_plan = deps.runtime.plan_structured(
-                WorkflowStepTarget(workflow_name, config_key)
-            )
+            target = WorkflowStepTarget(workflow_name, config_key)
+            generation_plan = deps.structured_plans.get(step.key)
+            if generation_plan is None:
+                generation_plan = deps.runtime.plan_structured(target)
+            elif (
+                not isinstance(generation_plan, GenerationPlan)
+                or generation_plan.target != target
+            ):
+                raise ValueError(
+                    "frozen structured plan does not match the workflow step"
+                )
             provider = generation_plan.provider_alias
             timeout_seconds = generation_plan.timeout_seconds
             use_schema = generation_plan.mode == StructuredOutputMode.SCHEMA_ENFORCED

@@ -1016,3 +1016,74 @@ def authorized_candidate_repair_attempt_slots(
     if snapshots[normalized_chapter_id].get("has_content") is True:
         return 0
     return cycles * per_cycle
+
+
+def validate_candidate_repair_execution_authorization(
+    readiness: Mapping[str, Any],
+    *,
+    chapter_id: str,
+    remediation_bundle: Any,
+    adherence_plan: GenerationPlan,
+    state_plan: GenerationPlan,
+    generation_params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Match the live production adapters to one frozen chapter authority.
+
+    Slot accounting alone proves only that a chapter is in the signed
+    worklist. Execution also has to prove that the Planner, Tool Registry and
+    the two deterministic structured workflows are still the exact adapters
+    whose identities and worst-case budgets were included in that digest.
+    """
+    slots = authorized_candidate_repair_attempt_slots(
+        readiness,
+        chapter_id=chapter_id,
+        generation_params=generation_params,
+    )
+    if slots <= 0:
+        raise ValueError("chapter has no authorized candidate repair slots")
+
+    planning = readiness.get("planning")
+    work = readiness.get("work")
+    if not isinstance(planning, Mapping) or not isinstance(work, Mapping):
+        raise ValueError("candidate repair readiness projection is invalid")
+    raw_authorization = planning.get(
+        "chapter_candidate_repair_authorization"
+    )
+    raw_snapshots = work.get("chapters")
+    if (
+        not isinstance(raw_authorization, Mapping)
+        or not isinstance(raw_snapshots, list)
+    ):
+        raise ValueError("candidate repair readiness projection is invalid")
+    authorization = parse_candidate_repair_authorization(raw_authorization)
+    chapters = [
+        {
+            "_id": str(snapshot["chapter_id"]),
+            "content": (
+                "already formal"
+                if snapshot.get("has_content") is True
+                else ""
+            ),
+        }
+        for snapshot in raw_snapshots
+    ]
+    expected = build_chapter_candidate_repair_authorization(
+        chapters=chapters,
+        authorization_revision=authorization.authorization_revision,
+        max_repair_cycles=(
+            authorization.max_repair_cycles_per_chapter
+        ),
+        generation_params=generation_params,
+        remediation_bundle=remediation_bundle,
+        adherence_plan=adherence_plan,
+        state_plan=state_plan,
+    )
+    if _canonical_json_projection(
+        dict(raw_authorization),
+        field="frozen candidate repair authorization",
+    ) != _canonical_json_projection(
+        expected,
+        field="current candidate repair runtime snapshot",
+    ):
+        raise ValueError("candidate repair runtime snapshot drifted")
+    return expected

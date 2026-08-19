@@ -64,6 +64,7 @@ from backend.services.llm.context_builder import (
 )
 from backend.services.llm.generation_runtime import (
     AttemptScope,
+    GenerationPlan,
     PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
@@ -150,6 +151,18 @@ _GENERATION_OVERRIDE_KEYS = frozenset(
 )
 
 
+def _validate_frozen_structured_plan(
+    plan: GenerationPlan,
+    *,
+    workflow: str,
+    step: str,
+) -> GenerationPlan:
+    target = WorkflowStepTarget(workflow, step)
+    if not isinstance(plan, GenerationPlan) or plan.target != target:
+        raise ValueError("冻结的结构化生成计划与章节步骤不匹配")
+    return plan
+
+
 class AcceptanceAuthority(str, Enum):
     """调用方获准执行的落库级别。"""
 
@@ -226,6 +239,7 @@ class OutlineAdherenceCommand(_ChapterGenerationCommand):
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
     prose_candidate: ProseCandidateSource | None = None
+    generation_plan: GenerationPlan | None = None
 
 
 class StateGenerationCommand(_ChapterGenerationCommand):
@@ -236,6 +250,7 @@ class StateGenerationCommand(_ChapterGenerationCommand):
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
     prose_candidate: ProseCandidateSource | None = None
+    generation_plan: GenerationPlan | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
@@ -372,6 +387,7 @@ class _PreparedState:
     params: dict[str, Any]
     gen_kwargs: dict[str, Any]
     runtime: Any
+    plan: GenerationPlan | None
     truncation: dict[str, Any]
 
 
@@ -740,6 +756,15 @@ class ChapterGenerationApplicationService:
                 attempt_scope=command.attempt_scope,
                 **runtime_kwargs,
             )
+            plan = (
+                _validate_frozen_structured_plan(
+                    command.generation_plan,
+                    workflow=STATE_WORKFLOW,
+                    step=STATE_STEP,
+                )
+                if command.generation_plan is not None
+                else None
+            )
             return _PreparedState(
                 command=command,
                 chapter=chapter,
@@ -754,6 +779,7 @@ class ChapterGenerationApplicationService:
                 },
                 gen_kwargs=gen_kwargs,
                 runtime=runtime,
+                plan=plan,
                 truncation={
                     "truncated_sections": list(context.truncated_sections),
                     "dropped_item_counts": dict(context.dropped_item_counts),
@@ -784,7 +810,14 @@ class ChapterGenerationApplicationService:
             params=prepared.params,
             gen_kwargs=prepared.gen_kwargs,
             cached={},
-            deps=WorkflowDeps(runtime=prepared.runtime),
+            deps=WorkflowDeps(
+                runtime=prepared.runtime,
+                structured_plans=(
+                    {STATE_STEP: prepared.plan}
+                    if prepared.plan is not None
+                    else {}
+                ),
+            ),
             request_id=command.request_id or uuid4().hex[:8],
             is_disconnected=command.is_disconnected,
             log_partial_on_disconnect=self._deps.log_partial_on_disconnect,
@@ -921,10 +954,18 @@ class ChapterGenerationApplicationService:
             attempt_scope=command.attempt_scope,
             **runtime_kwargs,
         )
-        plan = runtime.plan_structured(
-            WorkflowStepTarget(
-                PROSE_REMEDIATION_WORKFLOW,
-                OUTLINE_ADHERENCE_STEP,
+        plan = (
+            _validate_frozen_structured_plan(
+                command.generation_plan,
+                workflow=PROSE_REMEDIATION_WORKFLOW,
+                step=OUTLINE_ADHERENCE_STEP,
+            )
+            if command.generation_plan is not None
+            else runtime.plan_structured(
+                WorkflowStepTarget(
+                    PROSE_REMEDIATION_WORKFLOW,
+                    OUTLINE_ADHERENCE_STEP,
+                )
             )
         )
         return _PreparedOutlineAdherence(

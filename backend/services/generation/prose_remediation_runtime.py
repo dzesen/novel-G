@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -70,6 +70,7 @@ from backend.services.llm.context_builder import (
     normalize_outline_references,
 )
 from backend.services.llm.generation_runtime import (
+    AttemptScope,
     PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
@@ -2407,8 +2408,18 @@ class ProseRemediationRuntimeBundle:
     adherence_call: FrozenStructuredCall
 
 
-def _production_call(step_name: str) -> FrozenStructuredCall:
-    runtime = create_generation_runtime(max_provider_retries=0)
+def _production_call(
+    step_name: str,
+    attempt_scope_factory: Callable[[str], AttemptScope] | None = None,
+) -> FrozenStructuredCall:
+    runtime = create_generation_runtime(
+        attempt_scope=(
+            attempt_scope_factory(step_name)
+            if attempt_scope_factory is not None
+            else None
+        ),
+        max_provider_retries=0,
+    )
     plan = runtime.plan_structured(
         WorkflowStepTarget(PROSE_REMEDIATION_WORKFLOW, step_name)
     )
@@ -2420,17 +2431,23 @@ def build_prose_remediation_runtime(
     planner_call: FrozenStructuredCall | None = None,
     rewrite_call: FrozenStructuredCall | None = None,
     adherence_call: FrozenStructuredCall | None = None,
+    attempt_scope_factory: Callable[[str], AttemptScope] | None = None,
     tool_deps: ProseRemediationToolDeps | None = None,
     clock: Any = get_utc_now,
     repository: Any = None,
 ) -> ProseRemediationRuntimeBundle:
     """Compose production or injected adapters behind the AgentRuntime seam."""
-    planner_generation = planner_call or _production_call(REMEDIATION_PLANNER_STEP)
+    planner_generation = planner_call or _production_call(
+        REMEDIATION_PLANNER_STEP,
+        attempt_scope_factory,
+    )
     rewrite_generation = rewrite_call or _production_call(
-        PROSE_CANDIDATE_REWRITE_STEP
+        PROSE_CANDIDATE_REWRITE_STEP,
+        attempt_scope_factory,
     )
     adherence_generation = adherence_call or _production_call(
-        OUTLINE_ADHERENCE_STEP
+        OUTLINE_ADHERENCE_STEP,
+        attempt_scope_factory,
     )
     planner = ProseRemediationPlanner(planner_generation)
     application = ProseRemediationToolApplication(

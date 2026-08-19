@@ -24,6 +24,7 @@ from backend.services.llm.workflow_runner import (
 )
 from backend.services.llm.generation_runtime import (
     AttemptScope,
+    GenerationPlan,
     WorkflowStepTarget,
     create_generation_runtime,
 )
@@ -543,6 +544,8 @@ async def generate_state_candidate(
     prose_candidate: ProseCandidateSource,
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    generation_plan: GenerationPlan | None = None,
 ) -> ChapterGenerationResult:
     """Extract a persisted state proposal without accepting chapter state."""
     execution = await _chapter_capability_registry().execute(
@@ -555,6 +558,7 @@ async def generate_state_candidate(
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
             prose_candidate=prose_candidate,
+            generation_plan=generation_plan,
         ),
         call=CapabilityCall(source="job_engine"),
     )
@@ -597,6 +601,8 @@ async def review_prose_candidate(
     prose_candidate: ProseCandidateSource,
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    generation_plan: GenerationPlan | None = None,
 ) -> ChapterGenerationResult:
     """Review one exact deferred prose candidate without reading formal prose."""
     execution = await _chapter_capability_registry().execute(
@@ -607,6 +613,7 @@ async def review_prose_candidate(
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
             prose_candidate=prose_candidate,
+            generation_plan=generation_plan,
         ),
         call=CapabilityCall(source="job_engine"),
     )
