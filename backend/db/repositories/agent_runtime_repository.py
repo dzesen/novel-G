@@ -1423,12 +1423,6 @@ class AgentRuntimeRepository:
             raw_ledger = []
         if not isinstance(raw_ledger, list):
             raise AgentRuntimeStateConflict("Agent step attempt ledger is invalid")
-        overlapping_call_keys = {
-            str(raw_attempt.get("call_key") or "")
-            for raw_attempt in run.get("attempts") or []
-            if isinstance(raw_attempt, Mapping)
-            and raw_attempt.get("step_id") == str(step_id)
-        }
         merged: list[dict[str, Any]] = []
         positions: dict[str, int] = {}
         try:
@@ -1438,12 +1432,7 @@ class AgentRuntimeRepository:
                 canonical = project_agent_runtime_attempt_ledger_entry(raw_entry)
                 if dict(raw_entry) != canonical:
                     raise ValueError("attempt ledger entry is not canonical")
-                call_key = str(canonical["call_key"])
-                projected = (
-                    _seal_archived_attempt_accounting(canonical)
-                    if call_key in overlapping_call_keys
-                    else canonical
-                )
+                projected = _seal_archived_attempt_accounting(canonical)
                 call_key = str(projected["call_key"])
                 if call_key in positions:
                     raise ValueError("attempt ledger call_key is duplicated")

@@ -14,6 +14,7 @@ from bson import ObjectId
 
 from backend.db.errors import NotFoundError
 from backend.db.repositories.agent_runtime_repository import (
+    CHARGED_ATTEMPT_STATES,
     AgentRuntimeBudgetExceeded,
     AgentRuntimeBinding,
     AgentRuntimeCheckpointPending,
@@ -145,8 +146,7 @@ def _requires_attempt_accounting(
     if raw_revision is None:
         return authorization_revision == 1 or (
             is_live
-            and attempt.get("state")
-            in {"settled", "resolved_retry", "resolved_skip"}
+            and attempt.get("state") in CHARGED_ATTEMPT_STATES
         )
     if (
         isinstance(raw_revision, bool)
@@ -537,6 +537,40 @@ def _ledger_sealed_step_completed_event_projection(
     }
 
 
+def _compatible_ledger_sealed_step_completed_payloads(
+    *,
+    ordinal: int,
+    step: Mapping[str, Any],
+    kind: Literal["finish", "tool"],
+    attempts: list[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    payloads = [
+        _ledger_sealed_step_completed_event_projection(
+            ordinal=ordinal,
+            step=step,
+            kind=kind,
+            attempts=attempts,
+        )[2]
+    ]
+    markerless_attempts: list[dict[str, Any]] = []
+    marker_removed = False
+    for attempt in attempts:
+        markerless_attempt = dict(attempt)
+        if markerless_attempt.pop("accounting_revision", None) is not None:
+            marker_removed = True
+        markerless_attempts.append(markerless_attempt)
+    if marker_removed:
+        markerless_payload = _ledger_sealed_step_completed_event_projection(
+            ordinal=ordinal,
+            step=step,
+            kind=kind,
+            attempts=markerless_attempts,
+        )[2]
+        if markerless_payload not in payloads:
+            payloads.append(markerless_payload)
+    return tuple(payloads)
+
+
 def _attempt_accounted_event_projection(
     *,
     ordinal: int,
@@ -544,7 +578,7 @@ def _attempt_accounted_event_projection(
 ) -> tuple[str, str, dict[str, Any]]:
     projected = project_agent_runtime_attempt_ledger_entry(attempt)
     state = str(projected["state"])
-    if state not in {"settled", "resolved_retry", "resolved_skip"}:
+    if state not in CHARGED_ATTEMPT_STATES:
         raise ValueError("only a charged Agent attempt can be accounted")
     call_key = str(projected["call_key"])
     return (
@@ -1444,21 +1478,33 @@ class AgentRuntime:
                 )
                 existing = event_by_key.get(event_key)
                 if accounting_revision == 0:
-                    legacy_payload = _ledger_sealed_step_completed_event_projection(
-                        ordinal=ordinal,
-                        step=step,
-                        kind=kind,
-                        attempts=attempts,
-                    )[2]
-                    if existing is None:
+                    legacy_payloads = (
+                        _compatible_ledger_sealed_step_completed_payloads(
+                            ordinal=ordinal,
+                            step=step,
+                            kind=kind,
+                            attempts=attempts,
+                        )
+                    )
+                    legacy_payload = legacy_payloads[0]
+                    charged_call_keys = {
+                        str(attempt.get("call_key") or "")
+                        for attempt in attempts
+                        if attempt.get("state") in CHARGED_ATTEMPT_STATES
+                    }
+                    if (
+                        existing is None
+                        and not charged_call_keys.issubset(accounting_call_keys)
+                    ):
                         event_payload = legacy_payload
                     elif (
-                        existing.get("schema_version")
+                        existing is not None
+                        and existing.get("schema_version")
                         == "agent_runtime_event.v1"
                         and existing.get("type") == event_type
                         and str(existing.get("step_id") or "") == step_id
                         and (existing.get("payload") or {})
-                        in (event_payload, legacy_payload)
+                        in (event_payload, *legacy_payloads)
                     ):
                         continue
                 await self._event(
@@ -1597,11 +1643,7 @@ class AgentRuntime:
                 step_id=step_id,
                 now=now,
             )
-        if record_accounting and state in {
-            "settled",
-            "resolved_retry",
-            "resolved_skip",
-        }:
+        if record_accounting and state in CHARGED_ATTEMPT_STATES:
             await self._record_attempt_accounted(
                 run_id=run_id,
                 step_id=step_id,
@@ -1837,7 +1879,7 @@ class AgentRuntime:
                 except ValueError:
                     add_violation("attempt_event_identity_mismatch")
                     accounting_required = True
-                if state in {"settled", "resolved_retry", "resolved_skip"} and (
+                if state in CHARGED_ATTEMPT_STATES and (
                     accounting_required or accounted_key in actual_attempt_keys
                 ):
                     chain.append(accounted_key)
@@ -1930,7 +1972,7 @@ class AgentRuntime:
                     add_violation("attempt_budget_mismatch")
                 state = str(attempt.get("state") or "")
                 raw_usage = attempt.get("usage")
-                if state in {"settled", "resolved_retry", "resolved_skip"}:
+                if state in CHARGED_ATTEMPT_STATES:
                     try:
                         charged = RuntimeCallUsage.model_validate(raw_usage)
                     except Exception:
@@ -1945,7 +1987,7 @@ class AgentRuntime:
                             add_violation("attempt_budget_mismatch")
                 elif raw_usage is not None:
                     add_violation("attempt_budget_mismatch")
-                if state in {"settled", "resolved_retry", "resolved_skip"}:
+                if state in CHARGED_ATTEMPT_STATES:
                     accounted_key = f"{attempt['call_key']}-accounted-v1"
                     accounted_event = event_by_key.get(accounted_key)
                     if accounted_event is not None:
@@ -2345,13 +2387,13 @@ class AgentRuntime:
                 )[2]
                 compatible_completed_payloads = [expected_completed_payload]
                 if accounting_revision == 0:
-                    compatible_completed_payloads.append(
-                        _ledger_sealed_step_completed_event_projection(
+                    compatible_completed_payloads.extend(
+                        _compatible_ledger_sealed_step_completed_payloads(
                             ordinal=ordinal,
                             step=step,
                             kind=expected_kind,
                             attempts=attempts_by_step.get(step_id, []),
-                        )[2]
+                        )
                     )
                 if completed_payload not in compatible_completed_payloads:
                     add_violation("step_status_mismatch")
@@ -2387,11 +2429,7 @@ class AgentRuntime:
         accounted = [
             item
             for item in attempts
-            if item.get("state") in {
-                "settled",
-                "resolved_retry",
-                "resolved_skip",
-            }
+            if item.get("state") in CHARGED_ATTEMPT_STATES
         ]
         derived_usage = AgentRuntimeUsage(
             planner_calls=sum(item.get("kind") == "planner" for item in attempts),
@@ -2776,13 +2814,8 @@ class AgentRuntime:
                 step_id=active_step_id,
                 uncertain_action=uncertain_action,
             )
-        completion = dict((step.get("observation") or {}).get("completion") or {})
-        if (
-            step_status == "completed"
-            and (step.get("planner_decision") or {}).get("kind") == "propose_finish"
-            and completion.get("satisfied") is True
-        ):
-            await self._repository.archive_step_call_attempts(
+        if step_status in {"completed", "failed"}:
+            step = await self._repository.archive_step_call_attempts(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
@@ -2790,6 +2823,12 @@ class AgentRuntime:
                 step_id=active_step_id,
                 now=now,
             )
+        completion = dict((step.get("observation") or {}).get("completion") or {})
+        if (
+            step_status == "completed"
+            and (step.get("planner_decision") or {}).get("kind") == "propose_finish"
+            and completion.get("satisfied") is True
+        ):
             cleared = await self._repository.clear_active_step(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -2831,14 +2870,6 @@ class AgentRuntime:
                 raise AgentRuntimeStateConflict(
                     "failed Agent step is missing its termination reason"
                 )
-            await self._repository.archive_step_call_attempts(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                lease_epoch=lease_epoch,
-                step_id=active_step_id,
-                now=now,
-            )
             cleared = await self._repository.clear_active_step(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -3112,7 +3143,6 @@ class AgentRuntime:
                         raise AgentRuntimeStateConflict(
                             "terminal active Agent step could not be cleared"
                         )
-                    ordinal = int(active_step.get("ordinal") or 0)
                     if active_status == "failed":
                         await self._terminate(
                             run_id=run_id,
@@ -3133,21 +3163,6 @@ class AgentRuntime:
                         "finish"
                         if decision.get("kind") == "propose_finish"
                         else "tool"
-                    )
-                    event_key, event_type, event_payload = (
-                        _step_completed_event_projection(
-                            ordinal=ordinal,
-                            step=active_step,
-                            kind=kind,
-                        )
-                    )
-                    await self._event(
-                        run_id=run_id,
-                        event_key=event_key,
-                        event_type=event_type,
-                        payload=event_payload,
-                        step_id=active_step_id,
-                        now=now,
                     )
                     completion = dict(
                         (active_step.get("observation") or {}).get("completion")
