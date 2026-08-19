@@ -29,6 +29,7 @@ _MAX_REPAIR_CARD_ID_LENGTH = 64
 _MAX_DROPPED_REFERENCE_COUNT = 1_000
 _MAX_PIPELINE_ATTEMPTS = 512
 _MAX_PIPELINE_TRUNCATIONS = 32
+_MAX_PIPELINE_UNATTRIBUTED_USAGE = 32
 _MAX_TOKEN_COUNT = 1_000_000_000
 
 PROSE_REPAIR_REQUEST_SCHEMA = "prose_candidate_repair_request.v1"
@@ -77,6 +78,15 @@ class CandidateAttemptState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class CandidateUnattributedUsageReason(StrEnum):
+    MISSING_ATTEMPT_IDENTITY = "missing_attempt_identity"
+    AGGREGATE_RESIDUAL_UNATTRIBUTED = "aggregate_residual_unattributed"
+    CHARGED_ATTEMPT_USAGE_MISSING = "charged_attempt_usage_missing"
+    RELEASED_PREDISPATCH_USAGE_INVALID = (
+        "released_predispatch_usage_invalid"
+    )
+
+
 _CHARGED_ATTEMPT_STATES = frozenset({
     CandidateAttemptState.ACCOUNTED,
     CandidateAttemptState.SETTLED,
@@ -99,6 +109,14 @@ class CandidateUsageSummary(_RepairContract):
     input_tokens: int = Field(default=0, ge=0, le=_MAX_TOKEN_COUNT)
     output_tokens: int = Field(default=0, ge=0, le=_MAX_TOKEN_COUNT)
     total_tokens: int = Field(default=0, ge=0, le=_MAX_TOKEN_COUNT)
+
+
+class CandidateUnattributedUsageSummary(_RepairContract):
+    schema_version: Literal["chapter_candidate_unattributed_usage.v1"] = (
+        "chapter_candidate_unattributed_usage.v1"
+    )
+    reason: CandidateUnattributedUsageReason
+    usage: CandidateUsageSummary
 
 
 class CandidateAttemptSummary(_RepairContract):
@@ -140,6 +158,21 @@ def _bounded_non_negative_int(value: Any, *, maximum: int) -> int:
 
 class _EvidenceProjectionError(ValueError):
     pass
+
+
+class _UnattributedUsageProjectionError(_EvidenceProjectionError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: CandidateUnattributedUsageReason,
+        usage: CandidateUsageSummary,
+        attempts: tuple[CandidateAttemptSummary, ...],
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.usage = usage
+        self.attempts = attempts
 
 
 def _strict_token_count(value: Any, *, field: str) -> int:
@@ -321,16 +354,89 @@ def _effective_usage(
     )
 
 
+def _usage_residual(
+    usage: CandidateUsageSummary,
+    accounted: CandidateUsageSummary,
+) -> CandidateUsageSummary:
+    input_tokens = max(0, usage.input_tokens - accounted.input_tokens)
+    output_tokens = max(0, usage.output_tokens - accounted.output_tokens)
+    total_tokens = max(
+        0,
+        usage.total_tokens - accounted.total_tokens,
+        input_tokens + output_tokens,
+    )
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _summed_usage(
+    attempts: tuple[CandidateAttemptSummary, ...],
+) -> CandidateUsageSummary:
+    input_tokens = sum(item.usage.input_tokens for item in attempts)
+    output_tokens = sum(item.usage.output_tokens for item in attempts)
+    total_tokens = max(
+        sum(item.usage.total_tokens for item in attempts),
+        input_tokens + output_tokens,
+    )
+    if total_tokens > _MAX_TOKEN_COUNT:
+        raise _EvidenceProjectionError("调用 Token 用量超过 V1 上限")
+    return CandidateUsageSummary(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+def _unattributed_usage_error(
+    message: str,
+    *,
+    reason: CandidateUnattributedUsageReason,
+    aggregate: CandidateUsageSummary,
+    attempts: tuple[CandidateAttemptSummary, ...],
+) -> _UnattributedUsageProjectionError:
+    return _UnattributedUsageProjectionError(
+        message,
+        reason=reason,
+        usage=_effective_usage(aggregate, attempts),
+        attempts=attempts,
+    )
+
+
 def _attribute_aggregate_usage(
     aggregate: CandidateUsageSummary,
     attempts: tuple[CandidateAttemptSummary, ...],
 ) -> tuple[CandidateAttemptSummary, ...]:
     if not attempts:
         if aggregate.total_tokens:
-            raise _EvidenceProjectionError(
-                "聚合 Token 用量缺少 attempt 归属"
+            raise _unattributed_usage_error(
+                "聚合 Token 用量缺少 attempt 归属",
+                reason=(
+                    CandidateUnattributedUsageReason.MISSING_ATTEMPT_IDENTITY
+                ),
+                aggregate=aggregate,
+                attempts=attempts,
             )
         return attempts
+    released_with_usage = [
+        item
+        for item in attempts
+        if (
+            item.state is CandidateAttemptState.RELEASED_PRE_DISPATCH
+            and item.usage.total_tokens != 0
+        )
+    ]
+    if released_with_usage:
+        raise _unattributed_usage_error(
+            "派发前释放的 attempt 不能包含实际 Token 用量",
+            reason=(
+                CandidateUnattributedUsageReason.RELEASED_PREDISPATCH_USAGE_INVALID
+            ),
+            aggregate=aggregate,
+            attempts=attempts,
+        )
     charged_without_usage = [
         item
         for item in attempts
@@ -340,22 +446,38 @@ def _attribute_aggregate_usage(
         )
     ]
     if charged_without_usage:
-        raise _EvidenceProjectionError("已计费 attempt 缺少 Token 用量")
-    known_tokens = sum(item.usage.total_tokens for item in attempts)
-    residual = max(0, aggregate.total_tokens - known_tokens)
+        raise _unattributed_usage_error(
+            "已计费 attempt 缺少 Token 用量",
+            reason=(
+                CandidateUnattributedUsageReason.CHARGED_ATTEMPT_USAGE_MISSING
+            ),
+            aggregate=aggregate,
+            attempts=attempts,
+        )
+    residual = _usage_residual(aggregate, _summed_usage(attempts))
     unreported_indexes = [
         index
         for index, item in enumerate(attempts)
-        if item.usage.total_tokens == 0
+        if (
+            item.state is CandidateAttemptState.UNKNOWN
+            and item.usage.total_tokens == 0
+        )
     ]
-    if residual == 0:
+    if residual.total_tokens == 0:
         return attempts
     if len(unreported_indexes) != 1:
-        raise _EvidenceProjectionError("聚合 Token 用量无法归属到唯一 attempt")
+        raise _unattributed_usage_error(
+            "聚合 Token 用量无法归属到唯一 attempt",
+            reason=(
+                CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
+            ),
+            aggregate=aggregate,
+            attempts=attempts,
+        )
     target = unreported_indexes[0]
     projected = list(attempts)
     projected[target] = projected[target].model_copy(
-        update={"usage": CandidateUsageSummary(total_tokens=residual)}
+        update={"usage": residual}
     )
     return tuple(projected)
 
@@ -510,6 +632,7 @@ class ChapterCandidatePipelineProgress:
 
     tokens: int = 0
     attempts: tuple[CandidateAttemptSummary, ...] = ()
+    unattributed_usage: tuple[CandidateUnattributedUsageSummary, ...] = ()
     truncations: tuple[CandidateTruncationSummary, ...] = ()
     completed_steps: tuple[str, ...] = ()
     repair_cycles_used: int = 0
@@ -642,6 +765,9 @@ def _truncation(
 class _PipelineTrace:
     tokens: int = 0
     attempts: list[CandidateAttemptSummary] = field(default_factory=list)
+    unattributed_usage: list[CandidateUnattributedUsageSummary] = field(
+        default_factory=list
+    )
     truncations: list[CandidateTruncationSummary] = field(default_factory=list)
     completed_steps: list[str] = field(default_factory=list)
     repair_cycles_used: int = 0
@@ -653,6 +779,8 @@ class _PipelineTrace:
             usage, summaries = _project_result_evidence(result)
             self._record_evidence(usage, summaries)
         except _EvidenceProjectionError as exc:
+            if isinstance(exc, _UnattributedUsageProjectionError):
+                self._record_unattributed_usage(exc)
             raise ChapterCandidatePipelineBlocked(
                 f"候选管线调用证据无效：{exc}"
             ) from exc
@@ -738,9 +866,46 @@ class _PipelineTrace:
             self._record_evidence(usage, summaries)
             self.truncations.extend(projected_truncations)
         except _EvidenceProjectionError as projection_error:
+            if isinstance(
+                projection_error,
+                _UnattributedUsageProjectionError,
+            ):
+                self._record_unattributed_usage(projection_error)
             raise ChapterCandidatePipelineBlocked(
                 f"候选管线调用证据冲突或无效：{projection_error}"
             ) from projection_error
+
+    def _record_unattributed_usage(
+        self,
+        error: _UnattributedUsageProjectionError,
+    ) -> None:
+        known = {item.attempt_id: item for item in self.attempts}
+        duplicates = tuple(
+            item
+            for item in error.attempts
+            if known.get(item.attempt_id) == item
+        )
+        residual = _usage_residual(error.usage, _summed_usage(duplicates))
+        if residual.total_tokens == 0:
+            return
+        if (
+            len(self.unattributed_usage)
+            >= _MAX_PIPELINE_UNATTRIBUTED_USAGE
+        ):
+            raise _EvidenceProjectionError(
+                "候选管线未归属用量证据超过 V1 上限"
+            )
+        if self.tokens + residual.total_tokens > _MAX_TOKEN_COUNT:
+            raise _EvidenceProjectionError(
+                "候选管线累计 Token 用量超过 V1 上限"
+            )
+        self.unattributed_usage.append(
+            CandidateUnattributedUsageSummary(
+                reason=error.reason,
+                usage=residual,
+            )
+        )
+        self.tokens += residual.total_tokens
 
     def _ensure_attempt_capacity(self, additional: int) -> None:
         if len(self.attempts) + additional > _MAX_PIPELINE_ATTEMPTS:
@@ -808,6 +973,7 @@ class _PipelineTrace:
         return ChapterCandidatePipelineProgress(
             tokens=self.tokens,
             attempts=tuple(self.attempts),
+            unattributed_usage=tuple(self.unattributed_usage),
             truncations=tuple(self.truncations),
             completed_steps=tuple(self.completed_steps),
             repair_cycles_used=self.repair_cycles_used,
