@@ -543,6 +543,7 @@ def _compatible_ledger_sealed_step_completed_payloads(
     step: Mapping[str, Any],
     kind: Literal["finish", "tool"],
     attempts: list[Mapping[str, Any]],
+    markerful_call_keys: set[str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     payloads = [
         _ledger_sealed_step_completed_event_projection(
@@ -552,6 +553,28 @@ def _compatible_ledger_sealed_step_completed_payloads(
             attempts=attempts,
         )[2]
     ]
+    if markerful_call_keys is not None:
+        mixed_attempts: list[dict[str, Any]] = []
+        marker_removed = False
+        for attempt in attempts:
+            mixed_attempt = dict(attempt)
+            if (
+                str(mixed_attempt.get("call_key") or "")
+                not in markerful_call_keys
+                and mixed_attempt.pop("accounting_revision", None) is not None
+            ):
+                marker_removed = True
+            mixed_attempts.append(mixed_attempt)
+        if marker_removed:
+            mixed_payload = _ledger_sealed_step_completed_event_projection(
+                ordinal=ordinal,
+                step=step,
+                kind=kind,
+                attempts=mixed_attempts,
+            )[2]
+            if mixed_payload not in payloads:
+                payloads.append(mixed_payload)
+
     markerless_attempts: list[dict[str, Any]] = []
     marker_removed = False
     for attempt in attempts:
@@ -569,6 +592,25 @@ def _compatible_ledger_sealed_step_completed_payloads(
         if markerless_payload not in payloads:
             payloads.append(markerless_payload)
     return tuple(payloads)
+
+
+def _accounting_marker_call_keys_before_event(
+    *,
+    attempts: list[Mapping[str, Any]],
+    event_by_key: Mapping[str, Mapping[str, Any]],
+    boundary_event: Mapping[str, Any],
+) -> set[str]:
+    boundary_sequence = int(boundary_event.get("sequence") or 0)
+    markerful_call_keys: set[str] = set()
+    for attempt in attempts:
+        call_key = str(attempt.get("call_key") or "")
+        accounted_event = event_by_key.get(f"{call_key}-accounted-v1")
+        if (
+            accounted_event is not None
+            and int(accounted_event.get("sequence") or 0) < boundary_sequence
+        ):
+            markerful_call_keys.add(call_key)
+    return markerful_call_keys
 
 
 def _attempt_accounted_event_projection(
@@ -1478,12 +1520,22 @@ class AgentRuntime:
                 )
                 existing = event_by_key.get(event_key)
                 if accounting_revision == 0:
+                    markerful_call_keys = (
+                        _accounting_marker_call_keys_before_event(
+                            attempts=attempts,
+                            event_by_key=event_by_key,
+                            boundary_event=existing,
+                        )
+                        if existing is not None
+                        else None
+                    )
                     legacy_payloads = (
                         _compatible_ledger_sealed_step_completed_payloads(
                             ordinal=ordinal,
                             step=step,
                             kind=kind,
                             attempts=attempts,
+                            markerful_call_keys=markerful_call_keys,
                         )
                     )
                     legacy_payload = legacy_payloads[0]
@@ -2387,12 +2439,21 @@ class AgentRuntime:
                 )[2]
                 compatible_completed_payloads = [expected_completed_payload]
                 if accounting_revision == 0:
+                    completed_event = events_by_type["step_completed"][0]
+                    markerful_call_keys = (
+                        _accounting_marker_call_keys_before_event(
+                            attempts=attempts_by_step.get(step_id, []),
+                            event_by_key=event_by_key,
+                            boundary_event=completed_event,
+                        )
+                    )
                     compatible_completed_payloads.extend(
                         _compatible_ledger_sealed_step_completed_payloads(
                             ordinal=ordinal,
                             step=step,
                             kind=expected_kind,
                             attempts=attempts_by_step.get(step_id, []),
+                            markerful_call_keys=markerful_call_keys,
                         )
                     )
                 if completed_payload not in compatible_completed_payloads:
