@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -87,6 +88,26 @@ class RuntimeCallUsage(_StrictModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
+
+
+class RuntimeAdapterKnownFailure(RuntimeError):
+    """A dispatched adapter failed with a known, fully accounted outcome."""
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        usage: RuntimeCallUsage,
+    ) -> None:
+        normalized = str(reason_code or "").strip()
+        if (
+            len(normalized) > 160
+            or re.fullmatch(r"[a-z][a-z0-9_.-]*", normalized) is None
+        ):
+            raise ValueError("known adapter failure reason code is invalid")
+        super().__init__(normalized)
+        self.reason_code = normalized
+        self.usage = RuntimeCallUsage.model_validate(usage)
 
 
 class PlannerDescriptor(_StrictModel):

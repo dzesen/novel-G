@@ -40,6 +40,7 @@ from backend.services.agent_runtime.contracts import (
     PlannerDecision,
     PlannerInput,
     PlannerResult,
+    RuntimeAdapterKnownFailure,
     RuntimeCallUsage,
     RuntimeObservation,
     RuntimeToolContext,
@@ -3935,6 +3936,34 @@ class AgentRuntime:
                 now=_aware(self._clock()),
             )
             raise _UncertainDispatchedCall()
+        except RuntimeAdapterKnownFailure as failure:
+            await self._settle_runtime_call(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=call_key,
+                usage=failure.usage.model_dump(mode="python"),
+                result_checkpoint={
+                    "error_code": "planner_output_invalid",
+                    "adapter_reason_code": failure.reason_code,
+                },
+                now=_aware(self._clock()),
+            )
+            self._raise_if_deadline_exceeded(authorization)
+            return await self._plan(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                ordinal=ordinal,
+                authorization=authorization,
+                authorization_digest=authorization_digest,
+                observations=observations,
+            )
         except Exception:
             await self._mark_uncertain(
                 run_id=run_id,
@@ -4707,6 +4736,7 @@ class AgentRuntime:
             pause_reason = {
                 "ambiguous_identity": "ambiguous_identity",
                 "manual_approval_required": "manual_approval_required",
+                "resource_stale": "concurrent_narrative_change",
             }.get(result.code, "authorization_required")
             await self._pause_step_and_run(
                 run_id=run_id,

@@ -14,6 +14,8 @@ from backend.services.generation.chapter_generation_application import (
     ChapterGenerationResult,
     OutlineAdherenceCommand,
     OutlineGenerationCommand,
+    OUTLINE_ADHERENCE_STEP,
+    PROSE_REMEDIATION_WORKFLOW,
     PROSE_STEP,
     PROSE_WORKFLOW,
     ProseGenerationCommand,
@@ -202,7 +204,10 @@ def _adherence_budget(
 ) -> CapabilityBudget:
     plan = _try_structured_plan(
         command,
-        WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        WorkflowStepTarget(
+            PROSE_REMEDIATION_WORKFLOW,
+            OUTLINE_ADHERENCE_STEP,
+        )
     )
     return CapabilityBudget(
         max_paid_attempts=(

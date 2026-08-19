@@ -106,6 +106,8 @@ PROSE_WORKFLOW = "write_chapter_by_ai"
 PROSE_STEP = "chapter_content"
 STATE_WORKFLOW = "extract_chapter_state_by_ai"
 STATE_STEP = "chapter_state"
+PROSE_REMEDIATION_WORKFLOW = "remediate_chapter_prose_by_agent"
+OUTLINE_ADHERENCE_STEP = "outline_adherence"
 
 CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
@@ -920,7 +922,10 @@ class ChapterGenerationApplicationService:
             **runtime_kwargs,
         )
         plan = runtime.plan_structured(
-            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+            WorkflowStepTarget(
+                PROSE_REMEDIATION_WORKFLOW,
+                OUTLINE_ADHERENCE_STEP,
+            )
         )
         return _PreparedOutlineAdherence(
             command=command,

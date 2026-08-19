@@ -78,6 +78,25 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
         steps=(WorkflowStepDefinition(name="chapter_state", label_key="settings.workflow.steps.chapter_state"),),
     ),
     WorkflowDefinition(
+        name="remediate_chapter_prose_by_agent",
+        label_key="settings.workflow.catalog.remediate_chapter_prose_by_agent",
+        steps=(
+            WorkflowStepDefinition(
+                name="remediation_planner",
+                label_key="settings.workflow.steps.remediation_planner",
+            ),
+            WorkflowStepDefinition(
+                name="prose_candidate_rewrite",
+                label_key="settings.workflow.steps.prose_candidate_rewrite",
+                thinking_mode="disabled",
+            ),
+            WorkflowStepDefinition(
+                name="outline_adherence",
+                label_key="settings.workflow.steps.outline_adherence",
+            ),
+        ),
+    ),
+    WorkflowDefinition(
         name="rewrite_chapter_scene_by_agent",
         label_key="settings.workflow.catalog.rewrite_chapter_scene_by_agent",
         steps=(

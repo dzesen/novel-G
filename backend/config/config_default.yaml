@@ -225,6 +225,18 @@ llm:
         chapter_state:
           provider: ""
           timeout_seconds: null
+    remediate_chapter_prose_by_agent:
+      default_provider: ""
+      steps:
+        remediation_planner:
+          provider: ""
+          timeout_seconds: null
+        prose_candidate_rewrite:
+          provider: ""
+          timeout_seconds: null
+        outline_adherence:
+          provider: ""
+          timeout_seconds: null
     rewrite_chapter_scene_by_agent:
       default_provider: ""
       steps:

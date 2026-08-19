@@ -687,6 +687,131 @@ class ProseRunRepository(BaseRepository):
         result = await self.collection.update_one(query, update)
         return result.modified_count == 1
 
+    async def find_remediation_receipt(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Recover one proposal-only rewrite without reading Agent events."""
+        document = await self.collection.find_one(
+            {
+                "remediation_receipts": {
+                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
+                }
+            }
+        )
+        if document is None:
+            return None
+        receipt = next(
+            (
+                dict(item)
+                for item in document.get("remediation_receipts") or []
+                if str(item.get("idempotency_key") or "")
+                == str(idempotency_key)
+            ),
+            None,
+        )
+        return (document, receipt) if receipt is not None else None
+
+    async def apply_remediation_candidate(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        expected_revision: int,
+        expected_text: str,
+        idempotency_key: str,
+        request_digest: str,
+        assembled_text: str,
+        completion: dict[str, Any],
+        result_projection: dict[str, Any],
+    ) -> dict[str, Any]:
+        """CAS one temporary prose candidate and its crash-recovery receipt."""
+        existing = await self.collection.find_one(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "remediation_receipts": {
+                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
+                },
+            }
+        )
+        if existing is not None:
+            receipt = next(
+                dict(item)
+                for item in existing.get("remediation_receipts") or []
+                if str(item.get("idempotency_key") or "")
+                == str(idempotency_key)
+            )
+            if str(receipt.get("request_digest") or "") != str(request_digest):
+                raise StaleProseRun(
+                    "同一正文修复幂等键对应了不同的候选输入"
+                )
+            return existing
+
+        now = get_utc_now()
+        next_revision = int(expected_revision) + 1
+        receipt = {
+            "idempotency_key": str(idempotency_key),
+            "request_digest": str(request_digest),
+            "source_revision": int(expected_revision),
+            "result_revision": next_revision,
+            "result_projection": dict(result_projection),
+            "created_at": now,
+        }
+        document = await self.collection.find_one_and_update(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "is_deleted": False,
+                "status": "complete",
+                "revision": int(expected_revision),
+                "assembled_text": str(expected_text),
+                "$or": [
+                    {"lease": None},
+                    {"lease": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "assembled_text": str(assembled_text),
+                    "completion": dict(completion),
+                    "updated_at": now,
+                    "remediation": {
+                        "schema_version": "prose_run_remediation.v1",
+                        "latest_idempotency_key": str(idempotency_key),
+                        "latest_revision": next_revision,
+                        "updated_at": now,
+                    },
+                },
+                "$inc": {"revision": 1},
+                "$push": {
+                    "remediation_receipts": {
+                        "$each": [receipt],
+                        "$slice": -16,
+                    }
+                },
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is not None:
+            return document
+
+        recovered = await self.collection.find_one(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "remediation_receipts": {
+                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
+                },
+            }
+        )
+        if recovered is not None:
+            return recovered
+        raise StaleProseRun(
+            "正文候选已被其他运行修改，当前修复结果不能覆盖"
+        )
+
     async def finish(
         self,
         *,
