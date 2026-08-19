@@ -20,6 +20,7 @@ from backend.services.agent_runtime.contracts import (
     AgentEventView,
     AgentReadinessRequest,
     AgentReadinessView,
+    AgentReplayView,
     AgentRunView,
     AgentRuntimeUsage,
     AgentScope,
@@ -41,7 +42,16 @@ from backend.services.agent_runtime.policy import (
 
 
 READINESS_TTL_SECONDS = 30 * 60
-TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "aborted"})
+TERMINAL_RUN_STATUSES = frozenset({
+    "completed",
+    "failed",
+    "cancelled",
+    "superseded",
+})
+
+
+class _UncertainDispatchedCall(RuntimeError):
+    pass
 
 
 def _canonical_json(value: Any) -> str:
@@ -250,12 +260,141 @@ class AgentRuntime:
         run_id = str(run["_id"])
         if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+        return await self._execute_owned_run(
+            run_id=run_id,
+            owner_id=str(owner_id),
+            resumed=False,
+        )
+
+    async def resume(self, *, owner_id: str, run_id: str) -> AgentRunView:
+        """Recover a crashed run using only its frozen authorization snapshot."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=str(owner_id),
+        )
+        if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
+            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+        return await self._execute_owned_run(
+            run_id=run_id,
+            owner_id=str(owner_id),
+            resumed=True,
+        )
+
+    async def cancel(self, *, owner_id: str, run_id: str) -> AgentRunView:
+        """Idempotently cancel a non-terminal run without dispatching new work."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=str(owner_id),
+        )
+        if run.get("status") in TERMINAL_RUN_STATUSES:
+            return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+        await self._terminate(
+            run_id=run_id,
+            owner_id=str(owner_id),
+            status="cancelled",
+            reason_code="cancelled_by_user",
+            step_id=(str(run["active_step_id"]) if run.get("active_step_id") else None),
+            now=_aware(self._clock()),
+        )
+        return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+
+    async def get(self, *, owner_id: str, run_id: str) -> AgentRunView:
+        return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+
+    async def list(self, *, owner_id: str) -> tuple[AgentRunView, ...]:
+        runs = await self._repository.list_runs_owned(owner_id=str(owner_id))
+        return tuple([
+            await self._run_view(run_id=str(run["_id"]), owner_id=str(owner_id))
+            for run in runs
+        ])
+
+    async def audit_replay(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+    ) -> AgentReplayView:
+        """Recompute audit invariants without invoking Planner or Tool adapters."""
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=str(owner_id),
+        )
+        steps = await self._repository.list_steps_owned(
+            run_id=run_id,
+            owner_id=str(owner_id),
+        )
+        events = await self._repository.list_events_owned(
+            run_id=run_id,
+            owner_id=str(owner_id),
+        )
+        violations: list[str] = []
+        if [int(item["ordinal"]) for item in steps] != list(range(len(steps))):
+            violations.append("step_ordinal_mismatch")
+        if [int(item["sequence"]) for item in events] != list(
+            range(1, len(events) + 1)
+        ):
+            violations.append("event_sequence_mismatch")
+
+        attempts = [
+            item for item in run.get("attempts") or []
+            if item.get("state") != "released_pre_dispatch"
+        ]
+        settled = [item for item in attempts if item.get("state") == "settled"]
+        derived_usage = AgentRuntimeUsage(
+            planner_calls=sum(item.get("kind") == "planner" for item in attempts),
+            tool_calls=sum(item.get("kind") == "tool" for item in attempts),
+            paid_attempts=sum(
+                int((item.get("usage") or {}).get("paid_attempts") or 0)
+                for item in settled
+            ),
+            input_tokens=sum(
+                int((item.get("usage") or {}).get("input_tokens") or 0)
+                for item in settled
+            ),
+            output_tokens=sum(
+                int((item.get("usage") or {}).get("output_tokens") or 0)
+                for item in settled
+            ),
+            total_tokens=sum(
+                int((item.get("usage") or {}).get("total_tokens") or 0)
+                for item in settled
+            ),
+        )
+        persisted_usage = AgentRuntimeUsage.model_validate(run.get("usage") or {})
+        if derived_usage != persisted_usage:
+            violations.append("usage_mismatch")
+        termination = run.get("termination")
+        if isinstance(termination, Mapping):
+            if termination.get("status") != run.get("status"):
+                violations.append("termination_status_mismatch")
+        elif run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
+            violations.append("termination_missing")
+        return AgentReplayView(
+            run_id=str(run["_id"]),
+            consistent=not violations,
+            violations=tuple(violations),
+            derived_status=str(run["status"]),
+            derived_usage=derived_usage,
+        )
+
+    async def _execute_owned_run(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        resumed: bool,
+    ) -> AgentRunView:
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
         self._verify_runtime_snapshot(run.get("authorization") or {})
+        now = _aware(self._clock())
 
         worker_id = uuid4().hex
         await self._repository.acquire_lease(
             run_id=run_id,
-            owner_id=str(owner_id),
+            owner_id=owner_id,
             worker_id=worker_id,
             now=now,
             expires_at=now + timedelta(seconds=self._lease_seconds),
@@ -263,31 +402,46 @@ class AgentRuntime:
         try:
             await self._repository.set_run_status(
                 run_id=run_id,
-                owner_id=str(owner_id),
+                owner_id=owner_id,
                 expected=("ready", "running"),
                 status="running",
                 now=now,
             )
+            if not resumed:
+                await self._event(
+                    run_id=run_id,
+                    event_key="run-created",
+                    event_type="run_created",
+                    payload={"status": "ready"},
+                    now=now,
+                )
+                await self._event(
+                    run_id=run_id,
+                    event_key="readiness-bound",
+                    event_type="readiness_bound",
+                    payload={"status": "bound"},
+                    now=now,
+                )
             await self._event(
                 run_id=run_id,
-                event_key="run-started",
-                event_type="run_started",
+                event_key="run-resumed" if resumed else "run-started",
+                event_type="run_resumed" if resumed else "run_started",
                 payload={"status": "running"},
                 now=now,
             )
             await self._run_loop(
                 run_id=run_id,
-                owner_id=str(owner_id),
+                owner_id=owner_id,
                 worker_id=worker_id,
             )
         finally:
             await self._repository.release_lease(
                 run_id=run_id,
-                owner_id=str(owner_id),
+                owner_id=owner_id,
                 worker_id=worker_id,
                 now=_aware(self._clock()),
             )
-        return await self._run_view(run_id=run_id, owner_id=str(owner_id))
+        return await self._run_view(run_id=run_id, owner_id=owner_id)
 
     def _verify_runtime_snapshot(self, authorization: Mapping[str, Any]) -> None:
         if authorization.get("planner") != self._planner.descriptor.model_dump(mode="json"):
@@ -351,7 +505,10 @@ class AgentRuntime:
                 return
 
             limits = dict(authorization.get("limits") or {})
-            if int(run.get("next_ordinal") or 0) >= int(limits["max_steps"]):
+            if (
+                not run.get("active_step_id")
+                and int(run.get("next_ordinal") or 0) >= int(limits["max_steps"])
+            ):
                 await self._terminate(
                     run_id=run_id,
                     owner_id=owner_id,
@@ -384,6 +541,74 @@ class AgentRuntime:
                 now=now,
             )
 
+            prepared = await self._prepare_step_decision(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step=step,
+                authorization=authorization,
+                authorization_digest=authorization_digest,
+                observations=observations,
+            )
+            if prepared is None:
+                return
+            decision, descriptor, payload = prepared
+
+            if decision.kind == "call_tool":
+                assert descriptor is not None and payload is not None
+                finished = await self._act_and_observe(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    authorization=authorization,
+                    authorization_digest=authorization_digest,
+                    decision=decision,
+                    descriptor=descriptor,
+                    payload=payload,
+                    step_status=(
+                        "policy_checked"
+                        if str(step["status"]) == "planning"
+                        else str(step["status"])
+                    ),
+                )
+                if not finished:
+                    return
+                continue
+
+            completed = await self._observe_finish(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                decision=decision,
+                observations=observations,
+                step_status=(
+                    "policy_checked"
+                    if str(step["status"]) == "planning"
+                    else str(step["status"])
+                ),
+            )
+            if completed:
+                return
+
+    async def _prepare_step_decision(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        step: Mapping[str, Any],
+        authorization: Mapping[str, Any],
+        authorization_digest: str,
+        observations: list[dict[str, Any]],
+    ) -> tuple[PlannerDecision, RuntimeToolDescriptor | None, Any | None] | None:
+        step_id = str(step["step_id"])
+        ordinal = int(step["ordinal"])
+        step_status = str(step["status"])
+        if step_status == "planning":
             try:
                 planner_result = await self._plan(
                     run_id=run_id,
@@ -404,7 +629,17 @@ class AgentRuntime:
                     reason_code="budget_exhausted",
                     now=_aware(self._clock()),
                 )
-                return
+                return None
+            except _UncertainDispatchedCall:
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status="planning",
+                    reason_code="uncertain_paid_attempt",
+                    now=_aware(self._clock()),
+                )
+                return None
             except Exception:
                 await self._fail_step_and_run(
                     run_id=run_id,
@@ -412,64 +647,90 @@ class AgentRuntime:
                     worker_id=worker_id,
                     step_id=step_id,
                     expected_step_status="planning",
-                    reason_code="planner_execution_failed",
+                    reason_code="planner_output_exhausted",
                     now=_aware(self._clock()),
                 )
-                return
-
+                return None
             decision = planner_result.decision
+        elif step_status in {"policy_checked", "executing", "observed"}:
             try:
-                if decision.kind == "call_tool":
-                    descriptor = self._tools.describe(decision.tool)
-                    payload, policy_decision = self._policy_gate.authorize_tool(
-                        authorization=authorization,
-                        decision=decision,
-                        descriptor=descriptor,
-                    )
-                    await self._scope_validator(
-                        owner_id=owner_id,
-                        novel_id=str(authorization["novel_id"]),
-                        scope=decision.scope,
-                    )
-                else:
-                    descriptor = None
-                    payload = None
-                    policy_decision = {
-                        "allowed": True,
-                        "reason_code": "finish_proposal_allowed",
-                    }
-            except (AgentRuntimePolicyViolation, ValueError):
-                await self._repository.transition_step(
-                    run_id=run_id,
-                    step_id=step_id,
-                    expected="planning",
-                    status="failed",
-                    fields={
-                        "planner_decision": decision.model_dump(mode="json"),
-                        "policy_decision": {
-                            "allowed": False,
-                            "reason_code": "policy_violation",
-                        },
-                    },
-                    now=_aware(self._clock()),
-                )
-                await self._repository.clear_active_step(
+                decision = PlannerDecision.model_validate(step.get("planner_decision"))
+            except Exception:
+                await self._fail_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
                     worker_id=worker_id,
                     step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="invariant_violation",
                     now=_aware(self._clock()),
                 )
-                await self._terminate(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    status="failed",
-                    reason_code="policy_violation",
-                    step_id=step_id,
-                    now=_aware(self._clock()),
-                )
-                return
+                return None
+        else:
+            await self._terminate(
+                run_id=run_id,
+                owner_id=owner_id,
+                status="failed",
+                reason_code="invariant_violation",
+                step_id=step_id,
+                now=_aware(self._clock()),
+            )
+            return None
 
+        try:
+            if decision.kind == "call_tool":
+                assert decision.tool is not None and decision.scope is not None
+                descriptor = self._tools.describe(decision.tool)
+                payload, policy_decision = self._policy_gate.authorize_tool(
+                    authorization=authorization,
+                    decision=decision,
+                    descriptor=descriptor,
+                )
+                await self._scope_validator(
+                    owner_id=owner_id,
+                    novel_id=str(authorization["novel_id"]),
+                    scope=decision.scope,
+                )
+            else:
+                descriptor = None
+                payload = None
+                policy_decision = {
+                    "allowed": True,
+                    "reason_code": "finish_proposal_allowed",
+                }
+        except (AgentRuntimePolicyViolation, ValueError, AssertionError):
+            await self._repository.transition_step(
+                run_id=run_id,
+                step_id=step_id,
+                expected=step_status,
+                status="failed",
+                fields={
+                    "planner_decision": decision.model_dump(mode="json"),
+                    "policy_decision": {
+                        "allowed": False,
+                        "reason_code": "policy_violation",
+                    },
+                },
+                now=_aware(self._clock()),
+            )
+            await self._repository.clear_active_step(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                now=_aware(self._clock()),
+            )
+            await self._terminate(
+                run_id=run_id,
+                owner_id=owner_id,
+                status="failed",
+                reason_code="policy_violation",
+                step_id=step_id,
+                now=_aware(self._clock()),
+            )
+            return None
+
+        if step_status == "planning":
             await self._repository.transition_step(
                 run_id=run_id,
                 step_id=step_id,
@@ -484,7 +745,7 @@ class AgentRuntime:
             await self._event(
                 run_id=run_id,
                 event_key=f"step-{ordinal}-policy",
-                event_type="policy_checked",
+                event_type="policy_decided",
                 payload={
                     "ordinal": ordinal,
                     "allowed": True,
@@ -493,36 +754,7 @@ class AgentRuntime:
                 step_id=step_id,
                 now=_aware(self._clock()),
             )
-
-            if decision.kind == "call_tool":
-                assert descriptor is not None and payload is not None
-                finished = await self._act_and_observe(
-                    run_id=run_id,
-                    owner_id=owner_id,
-                    worker_id=worker_id,
-                    step_id=step_id,
-                    ordinal=ordinal,
-                    authorization=authorization,
-                    authorization_digest=authorization_digest,
-                    decision=decision,
-                    descriptor=descriptor,
-                    payload=payload,
-                )
-                if not finished:
-                    return
-                continue
-
-            completed = await self._observe_finish(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                step_id=step_id,
-                ordinal=ordinal,
-                decision=decision,
-                observations=observations,
-            )
-            if completed:
-                return
+        return decision, descriptor, payload
 
     async def _plan(
         self,
@@ -544,7 +776,101 @@ class AgentRuntime:
             now=now,
         )
         descriptor = self._planner.descriptor
-        call_key = f"step-{ordinal}-planner"
+        base_call_key = f"step-{ordinal}-planner"
+        run = await self._repository.get_run_owned(
+            run_id=run_id,
+            owner_id=owner_id,
+        )
+        attempts = self._step_attempts(run, step_id=step_id, kind="planner")
+        latest = attempts[-1] if attempts else None
+        if latest is not None and latest.get("state") == "reserved":
+            await self._repository.release_call_pre_dispatch(
+                run_id=run_id,
+                owner_id=owner_id,
+                call_key=str(latest["call_key"]),
+                reason="process_interrupted_before_dispatch",
+                now=now,
+            )
+            latest = dict(latest, state="released_pre_dispatch")
+        released_count = sum(
+            item.get("state") == "released_pre_dispatch" for item in attempts
+        )
+        if released_count > int(
+            (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
+        ):
+            raise AgentRuntimeStateConflict("planner predispatch retries are exhausted")
+        if latest is not None and latest.get("state") in {"dispatched", "uncertain"}:
+            if latest.get("state") == "uncertain":
+                raise _UncertainDispatchedCall()
+            recover = getattr(self._planner, "recover", None)
+            recovered = (
+                await recover(idempotency_key=f"{run_id}:{step_id}:planner")
+                if callable(recover)
+                else None
+            )
+            if recovered is None:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    now=now,
+                )
+                raise _UncertainDispatchedCall()
+            result = PlannerResult.model_validate(recovered)
+            await self._settle_runtime_call(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=str(latest["call_key"]),
+                result_checkpoint=result.model_dump(mode="json"),
+                usage=result.usage.model_dump(mode="python"),
+                now=now,
+            )
+            await self._record_step_planned(
+                run_id=run_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                decision=result.decision,
+                now=now,
+            )
+            return result
+        if latest is not None and latest.get("state") == "settled":
+            checkpoint = latest.get("result_checkpoint")
+            if not isinstance(checkpoint, Mapping):
+                raise AgentRuntimeStateConflict("settled planner result is missing")
+            if checkpoint.get("error_code") == "planner_output_invalid":
+                repair_count = sum(
+                    (item.get("result_checkpoint") or {}).get("error_code")
+                    == "planner_output_invalid"
+                    for item in attempts
+                    if isinstance(item.get("result_checkpoint"), Mapping)
+                )
+                if repair_count > int(
+                    (authorization.get("limits") or {}).get(
+                        "max_planner_repairs",
+                        0,
+                    )
+                ):
+                    raise AgentRuntimeStateConflict("planner repairs are exhausted")
+            else:
+                result = PlannerResult.model_validate(checkpoint)
+                await self._record_step_planned(
+                    run_id=run_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    decision=result.decision,
+                    now=now,
+                )
+                return result
+
+        call_key = (
+            base_call_key
+            if not attempts
+            else f"{base_call_key}-retry-{len(attempts)}"
+        )
         await self._repository.reserve_call(
             run_id=run_id,
             owner_id=owner_id,
@@ -556,6 +882,14 @@ class AgentRuntime:
             conservative_tokens=descriptor.max_tokens_per_call,
             now=now,
         )
+        await self._event(
+            run_id=run_id,
+            event_key=f"{call_key}-reserved",
+            event_type="attempt_reserved",
+            payload={"ordinal": ordinal, "kind": "planner"},
+            step_id=step_id,
+            now=now,
+        )
         await self._repository.mark_call_dispatched(
             run_id=run_id,
             owner_id=owner_id,
@@ -563,30 +897,66 @@ class AgentRuntime:
             call_key=call_key,
             now=now,
         )
-        result = PlannerResult.model_validate(await self._planner.plan(
-            PlannerInput(
-                goal=str(authorization["goal"]),
-                scope=AgentScope.model_validate(authorization["scope"]),
+        try:
+            raw_result = await self._planner.plan(
+                PlannerInput(
+                    goal=str(authorization["goal"]),
+                    scope=AgentScope.model_validate(authorization["scope"]),
+                    ordinal=ordinal,
+                    allowed_tools=tuple(authorization.get("tools") or []),
+                    observations=tuple(observations),
+                    authorization_digest=authorization_digest,
+                ),
+                idempotency_key=f"{run_id}:{step_id}:planner",
+            )
+        except Exception:
+            await self._mark_uncertain(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
                 ordinal=ordinal,
-                allowed_tools=tuple(authorization.get("tools") or []),
-                observations=tuple(observations),
+                call_key=call_key,
+                now=_aware(self._clock()),
+            )
+            raise _UncertainDispatchedCall()
+        try:
+            result = PlannerResult.model_validate(raw_result)
+        except Exception:
+            await self._settle_runtime_call(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=call_key,
+                usage={},
+                result_checkpoint={"error_code": "planner_output_invalid"},
+                now=_aware(self._clock()),
+            )
+            return await self._plan(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                authorization=authorization,
                 authorization_digest=authorization_digest,
-            ),
-            idempotency_key=f"{run_id}:{step_id}:planner",
-        ))
-        await self._repository.settle_call(
+                observations=observations,
+            )
+        await self._settle_runtime_call(
             run_id=run_id,
             owner_id=owner_id,
+            step_id=step_id,
+            ordinal=ordinal,
             call_key=call_key,
             usage=result.usage.model_dump(mode="python"),
+            result_checkpoint=result.model_dump(mode="json"),
             now=_aware(self._clock()),
         )
-        await self._event(
+        await self._record_step_planned(
             run_id=run_id,
-            event_key=f"step-{ordinal}-planned",
-            event_type="planner_completed",
-            payload={"ordinal": ordinal, "decision_kind": result.decision.kind},
             step_id=step_id,
+            ordinal=ordinal,
+            decision=result.decision,
             now=_aware(self._clock()),
         )
         return result
@@ -604,8 +974,31 @@ class AgentRuntime:
         decision: PlannerDecision,
         descriptor: RuntimeToolDescriptor,
         payload: Any,
+        step_status: str,
     ) -> bool:
         now = _aware(self._clock())
+        if step_status == "observed":
+            await self._complete_observed_step(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                kind="tool",
+                now=now,
+            )
+            return True
+        if step_status not in {"policy_checked", "executing"}:
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="invariant_violation",
+                now=now,
+            )
+            return False
         if not await self._revision_matches(
             owner_id=owner_id,
             authorization=authorization,
@@ -614,7 +1007,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=owner_id,
                 step_id=step_id,
-                expected_step_status="policy_checked",
+                expected_step_status=step_status,
                 reason_code="concurrent_narrative_change",
                 now=now,
             )
@@ -625,30 +1018,6 @@ class AgentRuntime:
             worker_id=worker_id,
             now=now,
         )
-        call_key = f"step-{ordinal}-tool"
-        try:
-            await self._repository.reserve_call(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                step_id=step_id,
-                call_key=call_key,
-                call_kind="tool",
-                conservative_paid_attempts=descriptor.max_paid_attempts_per_call,
-                conservative_tokens=descriptor.max_tokens_per_call,
-                now=now,
-            )
-        except AgentRuntimeBudgetExceeded:
-            await self._pause_step_and_run(
-                run_id=run_id,
-                owner_id=owner_id,
-                step_id=step_id,
-                expected_step_status="policy_checked",
-                reason_code="budget_exhausted",
-                now=now,
-            )
-            return False
-
         assert decision.tool is not None and decision.scope is not None
         invocation = {
             "tool": decision.tool.model_dump(mode="json"),
@@ -656,36 +1025,285 @@ class AgentRuntime:
             "arguments": payload.model_dump(mode="json"),
             "idempotency_key": f"{run_id}:{step_id}:tool",
         }
-        await self._repository.transition_step(
-            run_id=run_id,
-            step_id=step_id,
-            expected="policy_checked",
-            status="executing",
-            fields={"tool_invocation": invocation},
-            now=now,
-        )
-        await self._repository.mark_call_dispatched(
+        if step_status == "executing":
+            stored_step = await self._repository.get_step_owned(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+            )
+            if stored_step.get("tool_invocation") != invocation:
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="invariant_violation",
+                    now=now,
+                )
+                return False
+
+        run = await self._repository.get_run_owned(
             run_id=run_id,
             owner_id=owner_id,
-            worker_id=worker_id,
-            call_key=call_key,
-            now=now,
         )
-        try:
-            raw_result = await self._tools.execute(
-                decision.tool,
-                payload,
-                context=RuntimeToolContext(
+        attempts = self._step_attempts(run, step_id=step_id, kind="tool")
+        latest = attempts[-1] if attempts else None
+        if latest is not None and latest.get("state") == "reserved":
+            await self._repository.release_call_pre_dispatch(
+                run_id=run_id,
+                owner_id=owner_id,
+                call_key=str(latest["call_key"]),
+                reason="process_interrupted_before_dispatch",
+                now=now,
+            )
+            latest = dict(latest, state="released_pre_dispatch")
+        released_count = sum(
+            item.get("state") == "released_pre_dispatch" for item in attempts
+        )
+        if released_count > int(
+            (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
+        ):
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="tool_failure_exhausted",
+                now=now,
+            )
+            return False
+
+        result: RuntimeToolResult | None = None
+        if latest is not None and latest.get("state") == "settled":
+            checkpoint = latest.get("result_checkpoint")
+            if not isinstance(checkpoint, Mapping):
+                await self._fail_step_and_run(
+                    run_id=run_id,
                     owner_id=owner_id,
-                    novel_id=str(authorization["novel_id"]),
+                    worker_id=worker_id,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="invariant_violation",
+                    now=now,
+                )
+                return False
+            candidate = RuntimeToolResult.model_validate(checkpoint)
+            if candidate.status == "failed" and candidate.retryable:
+                retry_count = sum(
+                    isinstance(item.get("result_checkpoint"), Mapping)
+                    and (item["result_checkpoint"]).get("status") == "failed"
+                    and bool((item["result_checkpoint"]).get("retryable"))
+                    for item in attempts
+                )
+                if (
+                    retry_count
+                    > int((authorization.get("limits") or {}).get(
+                        "max_tool_retries",
+                        0,
+                    ))
+                    or not descriptor.idempotent
+                ):
+                    await self._fail_step_and_run(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        step_id=step_id,
+                        expected_step_status=step_status,
+                        reason_code="tool_failure_exhausted",
+                        now=now,
+                    )
+                    return False
+                latest = dict(latest, state="retryable_failure")
+            else:
+                result = candidate
+        if result is None and latest is not None and latest.get("state") in {
+            "dispatched",
+            "uncertain",
+        }:
+            call_key = str(latest["call_key"])
+            if latest.get("state") == "uncertain":
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="uncertain_paid_attempt",
+                    now=now,
+                )
+                return False
+            try:
+                recovered = await self._tools.recover(
+                    idempotency_key=invocation["idempotency_key"],
+                )
+            except Exception:
+                recovered = None
+            if recovered is None:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=now,
+                )
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="uncertain_paid_attempt",
+                    now=now,
+                )
+                return False
+            result = RuntimeToolResult.model_validate(recovered)
+            await self._settle_runtime_call(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=call_key,
+                usage=result.usage.model_dump(mode="python"),
+                result_checkpoint=result.model_dump(mode="json"),
+                now=now,
+            )
+        elif result is None:
+            base_call_key = f"step-{ordinal}-tool"
+            call_key = (
+                base_call_key
+                if not attempts
+                else f"{base_call_key}-retry-{len(attempts)}"
+            )
+            try:
+                await self._repository.reserve_call(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    step_id=step_id,
+                    call_key=call_key,
+                    call_kind="tool",
+                    conservative_paid_attempts=descriptor.max_paid_attempts_per_call,
+                    conservative_tokens=descriptor.max_tokens_per_call,
+                    now=now,
+                )
+            except AgentRuntimeBudgetExceeded:
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status=step_status,
+                    reason_code="budget_exhausted",
+                    now=now,
+                )
+                return False
+            await self._event(
+                run_id=run_id,
+                event_key=f"{call_key}-reserved",
+                event_type="attempt_reserved",
+                payload={"ordinal": ordinal, "kind": "tool"},
+                step_id=step_id,
+                now=now,
+            )
+            if step_status == "policy_checked":
+                await self._repository.transition_step(
                     run_id=run_id,
                     step_id=step_id,
-                    scope=decision.scope,
-                    authorization_digest=authorization_digest,
-                ),
-                idempotency_key=invocation["idempotency_key"],
+                    expected="policy_checked",
+                    status="executing",
+                    fields={"tool_invocation": invocation},
+                    now=now,
+                )
+                step_status = "executing"
+            await self._repository.mark_call_dispatched(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                call_key=call_key,
+                now=now,
             )
-            result = RuntimeToolResult.model_validate(raw_result)
+            await self._event(
+                run_id=run_id,
+                event_key=f"{call_key}-dispatched",
+                event_type="tool_dispatched",
+                payload={"ordinal": ordinal, "tool_name": decision.tool.name},
+                step_id=step_id,
+                now=now,
+            )
+            try:
+                raw_result = await self._tools.execute(
+                    decision.tool,
+                    payload,
+                    context=RuntimeToolContext(
+                        owner_id=owner_id,
+                        novel_id=str(authorization["novel_id"]),
+                        run_id=run_id,
+                        step_id=step_id,
+                        scope=decision.scope,
+                        authorization_digest=authorization_digest,
+                    ),
+                    idempotency_key=invocation["idempotency_key"],
+                )
+                result = RuntimeToolResult.model_validate(raw_result)
+            except Exception:
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=call_key,
+                    now=_aware(self._clock()),
+                )
+                await self._pause_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="uncertain_paid_attempt",
+                    now=_aware(self._clock()),
+                )
+                return False
+            await self._settle_runtime_call(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                call_key=call_key,
+                usage=result.usage.model_dump(mode="python"),
+                result_checkpoint=result.model_dump(mode="json"),
+                now=_aware(self._clock()),
+            )
+            if result.status == "failed" and result.retryable:
+                return await self._act_and_observe(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    authorization=authorization,
+                    authorization_digest=authorization_digest,
+                    decision=decision,
+                    descriptor=descriptor,
+                    payload=payload,
+                    step_status="executing",
+                )
+
+        assert result is not None
+        if result.status == "failed" and result.retryable:
+            return await self._act_and_observe(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                step_id=step_id,
+                ordinal=ordinal,
+                authorization=authorization,
+                authorization_digest=authorization_digest,
+                decision=decision,
+                descriptor=descriptor,
+                payload=payload,
+                step_status="executing",
+            )
+        try:
             validated_output = descriptor.output_schema.model_validate(result.data)
         except Exception:
             await self._fail_step_and_run(
@@ -694,17 +1312,10 @@ class AgentRuntime:
                 worker_id=worker_id,
                 step_id=step_id,
                 expected_step_status="executing",
-                reason_code="tool_execution_failed",
+                reason_code="invariant_violation",
                 now=_aware(self._clock()),
             )
             return False
-        await self._repository.settle_call(
-            run_id=run_id,
-            owner_id=owner_id,
-            call_key=call_key,
-            usage=result.usage.model_dump(mode="python"),
-            now=_aware(self._clock()),
-        )
         observation = {
             "status": result.status,
             "code": result.code,
@@ -725,27 +1336,25 @@ class AgentRuntime:
             },
             now=_aware(self._clock()),
         )
-        await self._repository.transition_step(
+        await self._event(
             run_id=run_id,
+            event_key=f"step-{ordinal}-tool-observed",
+            event_type="tool_observed",
+            payload={
+                "ordinal": ordinal,
+                "status": result.status,
+                "code": result.code,
+            },
             step_id=step_id,
-            expected="observed",
-            status="completed",
-            fields={},
             now=_aware(self._clock()),
         )
-        await self._repository.clear_active_step(
+        await self._complete_observed_step(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
             step_id=step_id,
-            now=_aware(self._clock()),
-        )
-        await self._event(
-            run_id=run_id,
-            event_key=f"step-{ordinal}-completed",
-            event_type="step_completed",
-            payload={"ordinal": ordinal, "status": "completed", "kind": "tool"},
-            step_id=step_id,
+            ordinal=ordinal,
+            kind="tool",
             now=_aware(self._clock()),
         )
         return True
@@ -760,70 +1369,81 @@ class AgentRuntime:
         ordinal: int,
         decision: PlannerDecision,
         observations: list[dict[str, Any]],
+        step_status: str,
     ) -> bool:
-        await self._repository.transition_step(
-            run_id=run_id,
-            step_id=step_id,
-            expected="policy_checked",
-            status="executing",
-            fields={"tool_invocation": None},
-            now=_aware(self._clock()),
-        )
-        try:
-            completion = CompletionDecision.model_validate(
-                await self._completion_policy.evaluate(
-                    run=await self._repository.get_run_owned(
-                        run_id=run_id,
-                        owner_id=owner_id,
-                    ),
-                    observations=observations,
-                    proposal=decision.model_dump(mode="json"),
-                )
+        if step_status == "policy_checked":
+            await self._repository.transition_step(
+                run_id=run_id,
+                step_id=step_id,
+                expected="policy_checked",
+                status="executing",
+                fields={"tool_invocation": None},
+                now=_aware(self._clock()),
             )
-        except Exception:
+            step_status = "executing"
+        if step_status == "executing":
+            try:
+                completion = CompletionDecision.model_validate(
+                    await self._completion_policy.evaluate(
+                        run=await self._repository.get_run_owned(
+                            run_id=run_id,
+                            owner_id=owner_id,
+                        ),
+                        observations=observations,
+                        proposal=decision.model_dump(mode="json"),
+                    )
+                )
+            except Exception:
+                await self._fail_step_and_run(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    step_id=step_id,
+                    expected_step_status="executing",
+                    reason_code="invariant_violation",
+                    now=_aware(self._clock()),
+                )
+                return True
+            await self._repository.transition_step(
+                run_id=run_id,
+                step_id=step_id,
+                expected="executing",
+                status="observed",
+                fields={"observation": {
+                    "status": "finish_evaluated",
+                    "code": decision.finish_code,
+                    "completion": completion.model_dump(mode="json"),
+                }},
+                now=_aware(self._clock()),
+            )
+        elif step_status == "observed":
+            stored_step = await self._repository.get_step_owned(
+                run_id=run_id,
+                owner_id=owner_id,
+                step_id=step_id,
+            )
+            completion = CompletionDecision.model_validate(
+                (stored_step.get("observation") or {}).get("completion")
+            )
+        else:
             await self._fail_step_and_run(
                 run_id=run_id,
                 owner_id=owner_id,
                 worker_id=worker_id,
                 step_id=step_id,
-                expected_step_status="executing",
-                reason_code="completion_check_failed",
+                expected_step_status=step_status,
+                reason_code="invariant_violation",
                 now=_aware(self._clock()),
             )
             return True
-        await self._repository.transition_step(
-            run_id=run_id,
-            step_id=step_id,
-            expected="executing",
-            status="observed",
-            fields={"observation": {
-                "status": "finish_evaluated",
-                "code": decision.finish_code,
-                "completion": completion.model_dump(mode="json"),
-            }},
-            now=_aware(self._clock()),
-        )
-        await self._repository.transition_step(
-            run_id=run_id,
-            step_id=step_id,
-            expected="observed",
-            status="completed",
-            fields={},
-            now=_aware(self._clock()),
-        )
-        await self._repository.clear_active_step(
+
+        await self._complete_observed_step(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
             step_id=step_id,
-            now=_aware(self._clock()),
-        )
-        await self._event(
-            run_id=run_id,
-            event_key=f"step-{ordinal}-completed",
-            event_type="step_completed",
-            payload={"ordinal": ordinal, "status": "completed", "kind": "finish"},
-            step_id=step_id,
+            ordinal=ordinal,
+            kind="finish",
             now=_aware(self._clock()),
         )
         if not completion.satisfied:
@@ -837,6 +1457,129 @@ class AgentRuntime:
             now=_aware(self._clock()),
         )
         return True
+
+    @staticmethod
+    def _step_attempts(
+        run: Mapping[str, Any],
+        *,
+        step_id: str,
+        kind: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for item in run.get("attempts") or []
+            if isinstance(item, Mapping)
+            and item.get("step_id") == str(step_id)
+            and item.get("kind") == str(kind)
+        ]
+
+    async def _settle_runtime_call(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        step_id: str,
+        ordinal: int,
+        call_key: str,
+        usage: Mapping[str, Any],
+        result_checkpoint: Mapping[str, Any],
+        now: datetime,
+    ) -> None:
+        await self._repository.settle_call(
+            run_id=run_id,
+            owner_id=owner_id,
+            call_key=call_key,
+            usage=usage,
+            result_checkpoint=result_checkpoint,
+            now=now,
+        )
+        await self._event(
+            run_id=run_id,
+            event_key=f"{call_key}-settled",
+            event_type="attempt_settled",
+            payload={"ordinal": ordinal},
+            step_id=step_id,
+            now=now,
+        )
+
+    async def _record_step_planned(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        ordinal: int,
+        decision: PlannerDecision,
+        now: datetime,
+    ) -> None:
+        await self._event(
+            run_id=run_id,
+            event_key=f"step-{ordinal}-planned",
+            event_type="step_planned",
+            payload={"ordinal": ordinal, "decision_kind": decision.kind},
+            step_id=step_id,
+            now=now,
+        )
+
+    async def _mark_uncertain(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        step_id: str,
+        ordinal: int,
+        call_key: str,
+        now: datetime,
+    ) -> None:
+        await self._repository.mark_call_uncertain(
+            run_id=run_id,
+            owner_id=owner_id,
+            call_key=call_key,
+            reason="dispatch_outcome_unknown",
+            now=now,
+        )
+        await self._event(
+            run_id=run_id,
+            event_key=f"{call_key}-uncertain",
+            event_type="attempt_uncertain",
+            payload={"ordinal": ordinal, "reason_code": "dispatch_outcome_unknown"},
+            step_id=step_id,
+            now=now,
+        )
+
+    async def _complete_observed_step(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        step_id: str,
+        ordinal: int,
+        kind: str,
+        now: datetime,
+    ) -> None:
+        await self._repository.transition_step(
+            run_id=run_id,
+            step_id=step_id,
+            expected="observed",
+            status="completed",
+            fields={},
+            now=now,
+        )
+        await self._repository.clear_active_step(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            step_id=step_id,
+            now=now,
+        )
+        await self._event(
+            run_id=run_id,
+            event_key=f"step-{ordinal}-completed",
+            event_type="step_completed",
+            payload={"ordinal": ordinal, "status": "completed", "kind": kind},
+            step_id=step_id,
+            now=now,
+        )
 
     async def _revision_matches(
         self,
@@ -960,11 +1703,31 @@ class AgentRuntime:
         now: datetime,
         step_id: str | None = None,
     ) -> None:
+        category_by_status = {
+            "completed": "success",
+            "paused": "pause",
+            "failed": "failure",
+            "cancelled": "cancelled",
+            "superseded": "superseded",
+        }
+        try:
+            category = category_by_status[status]
+        except KeyError as exc:
+            raise ValueError(f"unsupported Agent termination status: {status}") from exc
         termination = {
             "status": status,
+            "category": category,
             "reason_code": reason_code,
+            "resumable": bool(
+                status == "paused"
+                and reason_code in {
+                    "authorization_required",
+                    "manual_approval_required",
+                }
+            ),
             "occurred_at": now,
             "step_id": step_id,
+            "detail_code": reason_code,
         }
         await self._repository.set_run_status(
             run_id=run_id,

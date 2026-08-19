@@ -129,6 +129,7 @@ class RuntimeToolContext(_StrictModel):
 class RuntimeToolResult(_StrictModel):
     status: Literal["ok", "rejected", "failed"]
     code: str = Field(min_length=1, max_length=160)
+    retryable: bool = False
     data: dict[str, Any] = Field(default_factory=dict)
     planner_view: dict[str, Any] = Field(default_factory=dict)
     audit_view: dict[str, Any] = Field(default_factory=dict)
@@ -152,6 +153,9 @@ class AgentRuntimeLimits(_StrictModel):
     max_paid_attempts: int = Field(ge=0, le=10_000)
     token_budget: int = Field(ge=0, le=1_000_000_000)
     deadline_seconds: int = Field(ge=1, le=86_400)
+    max_predispatch_retries: int = Field(default=2, ge=0, le=20)
+    max_planner_repairs: int = Field(default=1, ge=0, le=20)
+    max_tool_retries: int = Field(default=1, ge=0, le=20)
 
     @model_validator(mode="after")
     def validate_step_capacity(self) -> "AgentRuntimeLimits":
@@ -198,9 +202,12 @@ class AgentRuntimeUsage(_StrictModel):
 
 class AgentTermination(_StrictModel):
     status: str
+    category: Literal["success", "pause", "failure", "cancelled", "superseded"]
     reason_code: str
+    resumable: bool
     occurred_at: datetime
     step_id: str | None = None
+    detail_code: str | None = None
 
 
 class AgentStepView(_StrictModel):
@@ -231,3 +238,11 @@ class AgentRunView(_StrictModel):
     steps: tuple[AgentStepView, ...] = ()
     events: tuple[AgentEventView, ...] = ()
     has_uncertain_attempts: bool = False
+
+
+class AgentReplayView(_StrictModel):
+    run_id: str
+    consistent: bool
+    violations: tuple[str, ...] = ()
+    derived_status: str
+    derived_usage: AgentRuntimeUsage

@@ -493,6 +493,7 @@ class AgentRuntimeRepository:
         call_key: str,
         usage: Mapping[str, Any],
         now: datetime,
+        result_checkpoint: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Release a call reservation once; missing usage is charged conservatively."""
         run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
@@ -523,6 +524,11 @@ class AgentRuntimeRepository:
             "output_tokens": output_tokens,
             "total_tokens": charged_tokens,
         }
+        checkpoint = (
+            deepcopy(dict(result_checkpoint))
+            if result_checkpoint is not None
+            else None
+        )
         result = await self.runs.update_one(
             {
                 "_id": _required_object_id(run_id, "run_id"),
@@ -547,6 +553,7 @@ class AgentRuntimeRepository:
                 "$set": {
                     "attempts.$[attempt].state": "settled",
                     "attempts.$[attempt].usage": charged_usage,
+                    "attempts.$[attempt].result_checkpoint": checkpoint,
                     "attempts.$[attempt].settled_at": now,
                     "updated_at": now,
                 },
@@ -564,6 +571,97 @@ class AgentRuntimeRepository:
         if settled is None:
             raise AgentRuntimeStateConflict("settled Agent call was not found")
         return settled
+
+    async def release_call_pre_dispatch(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        call_key: str,
+        reason: str,
+        now: datetime,
+    ) -> bool:
+        """Release only a call proven not to have crossed the adapter boundary."""
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        attempt = _attempt_by_key(run, call_key)
+        if attempt is None:
+            raise AgentRuntimeStateConflict("Agent call reservation was not found")
+        if attempt.get("state") == "released_pre_dispatch":
+            return True
+        if attempt.get("state") != "reserved":
+            return False
+        kind = str(attempt.get("kind"))
+        if kind not in {"planner", "tool"}:
+            raise AgentRuntimeStateConflict("Agent call kind is invalid")
+        call_field = "planner_calls" if kind == "planner" else "tool_calls"
+        paid_bound = int(attempt.get("conservative_paid_attempts") or 0)
+        token_bound = int(attempt.get("conservative_tokens") or 0)
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "attempts": {"$elemMatch": {
+                    "call_key": str(call_key),
+                    "state": "reserved",
+                }},
+                f"usage.{call_field}": {"$gte": 1},
+                "paid_attempts_reserved": {"$gte": paid_bound},
+                "tokens_reserved": {"$gte": token_bound},
+                "is_deleted": False,
+            },
+            {
+                "$inc": {
+                    f"usage.{call_field}": -1,
+                    "paid_attempts_reserved": -paid_bound,
+                    "tokens_reserved": -token_bound,
+                },
+                "$set": {
+                    "attempts.$[attempt].state": "released_pre_dispatch",
+                    "attempts.$[attempt].release_reason": str(reason),
+                    "attempts.$[attempt].released_at": now,
+                    "updated_at": now,
+                },
+            },
+            array_filters=[{"attempt.call_key": str(call_key)}],
+        )
+        return result.modified_count == 1
+
+    async def mark_call_uncertain(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        call_key: str,
+        reason: str,
+        now: datetime,
+    ) -> bool:
+        """Freeze a dispatched call reservation when its outcome is unknown."""
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "attempts": {"$elemMatch": {
+                    "call_key": str(call_key),
+                    "state": "dispatched",
+                }},
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "attempts.$[attempt].state": "uncertain",
+                    "attempts.$[attempt].uncertain_reason": str(reason),
+                    "attempts.$[attempt].uncertain_at": now,
+                    "has_uncertain_attempts": True,
+                    "updated_at": now,
+                }
+            },
+            array_filters=[{"attempt.call_key": str(call_key)}],
+        )
+        if result.modified_count == 1:
+            return True
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        attempt = _attempt_by_key(run, call_key)
+        return bool(attempt and attempt.get("state") == "uncertain")
 
     async def acquire_lease(
         self,
@@ -890,6 +988,24 @@ class AgentRuntimeRepository:
         }).sort("ordinal", 1)
         return await cursor.to_list(length=None)
 
+    async def get_step_owned(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        step_id: str,
+    ) -> dict[str, Any]:
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        document = await self.steps.find_one({
+            "_id": str(step_id),
+            "run_id": run["_id"],
+            "owner_id": run["owner_id"],
+            "is_deleted": False,
+        })
+        if document is None:
+            raise NotFoundError(f"Agent runtime step '{step_id}' was not found")
+        return document
+
     async def list_events_owned(
         self,
         *,
@@ -902,6 +1018,13 @@ class AgentRuntimeRepository:
             "owner_id": run["owner_id"],
             "is_deleted": False,
         }).sort("sequence", 1)
+        return await cursor.to_list(length=None)
+
+    async def list_runs_owned(self, *, owner_id: str) -> list[dict[str, Any]]:
+        cursor = self.runs.find({
+            "owner_id": _required_object_id(owner_id, "owner_id"),
+            "is_deleted": False,
+        }).sort([("created_at", -1), ("_id", -1)])
         return await cursor.to_list(length=None)
 
 
