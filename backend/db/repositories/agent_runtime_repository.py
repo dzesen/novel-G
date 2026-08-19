@@ -20,6 +20,7 @@ from backend.db.utils import get_utc_now, to_object_id
 
 STEP_NAMESPACE = UUID("e0dc1a47-9a48-4cb5-a165-2259c139fbb3")
 EVENT_NAMESPACE = UUID("814b1e75-93a6-49da-903c-03de77a202c6")
+CALL_NAMESPACE = UUID("73998e71-c0cf-4a99-91a8-8a01ad636aa9")
 MAX_EVENT_PAYLOAD_BYTES = 16_384
 SENSITIVE_EVENT_FIELDS = frozenset({
     "api_key",
@@ -58,6 +59,14 @@ class AgentRuntimeStateConflict(ValueError):
     """A persisted run or step no longer matches the requested transition."""
 
 
+class AgentRuntimeBudgetExceeded(ValueError):
+    """A conservative call reservation would exceed the authorization."""
+
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = str(reason_code)
+        super().__init__(self.reason_code)
+
+
 def _required_object_id(value: str | ObjectId | None, field: str) -> ObjectId:
     if value is None or not str(value).strip():
         raise ValueError(f"{field} is required")
@@ -74,6 +83,13 @@ def _validate_event_payload(value: Any, *, path: str = "payload") -> None:
     elif isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
             _validate_event_payload(item, path=f"{path}[{index}]")
+
+
+def _attempt_by_key(run: Mapping[str, Any], call_key: str) -> dict[str, Any] | None:
+    for raw in run.get("attempts") or []:
+        if isinstance(raw, Mapping) and raw.get("call_key") == str(call_key):
+            return dict(raw)
+    return None
 
 
 class AgentRuntimeRepository:
@@ -328,6 +344,227 @@ class AgentRuntimeRepository:
             raise AgentRuntimeStateConflict("Agent run status changed concurrently")
         return document
 
+    async def reserve_call(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        step_id: str,
+        call_key: str,
+        call_kind: str,
+        conservative_paid_attempts: int,
+        conservative_tokens: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Atomically reserve a bounded planner/tool call before dispatch."""
+        kind = str(call_kind)
+        if kind not in {"planner", "tool"}:
+            raise ValueError("call_kind must be planner or tool")
+        if not str(call_key).strip():
+            raise ValueError("call_key is required")
+        paid_bound = int(conservative_paid_attempts)
+        token_bound = int(conservative_tokens)
+        if paid_bound < 0 or token_bound < 0:
+            raise ValueError("conservative call bounds cannot be negative")
+
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        existing = _attempt_by_key(run, call_key)
+        if existing is not None:
+            return existing
+        if run.get("status") != "running":
+            raise AgentRuntimeStateConflict("Agent run is not running")
+        lease = run.get("lease") or {}
+        if lease.get("worker_id") != str(worker_id) or lease.get("expires_at") <= now:
+            raise AgentRuntimeLeaseUnavailable("Agent run lease is unavailable")
+
+        limits = dict((run.get("authorization") or {}).get("limits") or {})
+        usage = dict(run.get("usage") or {})
+        call_field = "planner_calls" if kind == "planner" else "tool_calls"
+        call_limit_field = "max_planner_calls" if kind == "planner" else "max_tool_calls"
+        current_calls = int(usage.get(call_field) or 0)
+        if current_calls + 1 > int(limits.get(call_limit_field) or 0):
+            raise AgentRuntimeBudgetExceeded(f"{kind}_call_limit")
+        current_paid = int(usage.get("paid_attempts") or 0)
+        reserved_paid = int(run.get("paid_attempts_reserved") or 0)
+        if current_paid + reserved_paid + paid_bound > int(
+            limits.get("max_paid_attempts") or 0
+        ):
+            raise AgentRuntimeBudgetExceeded("paid_attempt_budget")
+        current_tokens = int(usage.get("total_tokens") or 0)
+        reserved_tokens = int(run.get("tokens_reserved") or 0)
+        if current_tokens + reserved_tokens + token_bound > int(
+            limits.get("token_budget") or 0
+        ):
+            raise AgentRuntimeBudgetExceeded("token_budget")
+
+        attempt_id = uuid5(CALL_NAMESPACE, f"{run_id}:{call_key}").hex
+        attempt = {
+            "attempt_id": attempt_id,
+            "call_key": str(call_key),
+            "step_id": str(step_id),
+            "kind": kind,
+            "state": "reserved",
+            "conservative_paid_attempts": paid_bound,
+            "conservative_tokens": token_bound,
+            "reserved_at": now,
+            "dispatched_at": None,
+            "settled_at": None,
+            "usage": None,
+        }
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "running",
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "is_deleted": False,
+                "attempts.call_key": {"$ne": str(call_key)},
+                f"usage.{call_field}": current_calls,
+                "usage.paid_attempts": current_paid,
+                "paid_attempts_reserved": reserved_paid,
+                "usage.total_tokens": current_tokens,
+                "tokens_reserved": reserved_tokens,
+            },
+            {
+                "$inc": {
+                    f"usage.{call_field}": 1,
+                    "paid_attempts_reserved": paid_bound,
+                    "tokens_reserved": token_bound,
+                },
+                "$push": {"attempts": attempt},
+                "$set": {"updated_at": now},
+            },
+        )
+        if result.modified_count == 1:
+            return attempt
+        current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        existing = _attempt_by_key(current, call_key)
+        if existing is not None:
+            return existing
+        raise AgentRuntimeStateConflict("Agent call reservation changed concurrently")
+
+    async def mark_call_dispatched(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        call_key: str,
+        now: datetime,
+    ) -> dict[str, Any]:
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": "running",
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "attempts": {"$elemMatch": {
+                    "call_key": str(call_key),
+                    "state": "reserved",
+                }},
+                "is_deleted": False,
+            },
+            {"$set": {
+                "attempts.$[attempt].state": "dispatched",
+                "attempts.$[attempt].dispatched_at": now,
+                "updated_at": now,
+            }},
+            array_filters=[{"attempt.call_key": str(call_key)}],
+        )
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        attempt = _attempt_by_key(run, call_key)
+        if attempt is None:
+            raise AgentRuntimeStateConflict("Agent call reservation was not found")
+        if result.modified_count != 1 and attempt.get("state") not in {
+            "dispatched",
+            "settled",
+        }:
+            raise AgentRuntimeStateConflict("Agent call could not be dispatched")
+        return attempt
+
+    async def settle_call(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        call_key: str,
+        usage: Mapping[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Release a call reservation once; missing usage is charged conservatively."""
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        attempt = _attempt_by_key(run, call_key)
+        if attempt is None:
+            raise AgentRuntimeStateConflict("Agent call reservation was not found")
+        if attempt.get("state") == "settled":
+            return attempt
+        if attempt.get("state") != "dispatched":
+            raise AgentRuntimeStateConflict("only a dispatched Agent call can settle")
+
+        paid_bound = int(attempt.get("conservative_paid_attempts") or 0)
+        token_bound = int(attempt.get("conservative_tokens") or 0)
+        reported_paid = int(usage.get("paid_attempts") or 0)
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        reported_total = int(usage.get("total_tokens") or 0)
+        if min(reported_paid, input_tokens, output_tokens, reported_total) < 0:
+            raise ValueError("Agent call usage cannot be negative")
+        paid = reported_paid if reported_paid > 0 else paid_bound
+        observed_tokens = max(reported_total, input_tokens + output_tokens)
+        charged_tokens = observed_tokens if observed_tokens > 0 else token_bound
+        if paid > paid_bound or charged_tokens > token_bound:
+            raise AgentRuntimeStateConflict("Agent call exceeded its conservative bound")
+        charged_usage = {
+            "paid_attempts": paid,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": charged_tokens,
+        }
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "attempts": {"$elemMatch": {
+                    "call_key": str(call_key),
+                    "state": "dispatched",
+                }},
+                "paid_attempts_reserved": {"$gte": paid_bound},
+                "tokens_reserved": {"$gte": token_bound},
+                "is_deleted": False,
+            },
+            {
+                "$inc": {
+                    "paid_attempts_reserved": -paid_bound,
+                    "tokens_reserved": -token_bound,
+                    "usage.paid_attempts": paid,
+                    "usage.input_tokens": input_tokens,
+                    "usage.output_tokens": output_tokens,
+                    "usage.total_tokens": charged_tokens,
+                },
+                "$set": {
+                    "attempts.$[attempt].state": "settled",
+                    "attempts.$[attempt].usage": charged_usage,
+                    "attempts.$[attempt].settled_at": now,
+                    "updated_at": now,
+                },
+            },
+            array_filters=[{"attempt.call_key": str(call_key)}],
+        )
+        if result.modified_count != 1:
+            current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+            settled = _attempt_by_key(current, call_key)
+            if settled is not None and settled.get("state") == "settled":
+                return settled
+            raise AgentRuntimeStateConflict("Agent call settlement changed concurrently")
+        current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        settled = _attempt_by_key(current, call_key)
+        if settled is None:
+            raise AgentRuntimeStateConflict("settled Agent call was not found")
+        return settled
+
     async def acquire_lease(
         self,
         *,
@@ -392,7 +629,7 @@ class AgentRuntimeRepository:
                 "updated_at": now,
             }},
         )
-        return result.modified_count == 1
+        return result.matched_count == 1
 
     async def release_lease(
         self,
