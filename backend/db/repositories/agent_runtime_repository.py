@@ -936,6 +936,30 @@ class AgentRuntimeRepository:
             raise NotFoundError(f"Agent runtime run '{run_id}' was not found")
         return document
 
+    async def assert_completed_remediation(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        prose_run_id: str,
+    ) -> dict[str, Any]:
+        """Validate the stable terminal contract for one prose repair run."""
+        run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        scope = dict((run.get("authorization") or {}).get("scope") or {})
+        termination = dict(run.get("termination") or {})
+        if (
+            str(run.get("status") or "") != "completed"
+            or str(run.get("novel_id") or "") != str(novel_id)
+            or scope.get("kind") != "chapter_prose_candidate"
+            or str(scope.get("object_id") or "") != str(prose_run_id)
+            or termination.get("reason_code") != "goal_satisfied"
+        ):
+            raise AgentRuntimeStateConflict(
+                "Prose remediation AgentRun is not a matching success"
+            )
+        return run
+
     async def set_run_status(
         self,
         *,

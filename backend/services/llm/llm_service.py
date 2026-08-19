@@ -112,6 +112,13 @@ class LLMService:
             total_tokens=self._total_usage.total_tokens + usage.total_tokens,
         )
 
+    def _record_response(self, response: LLMResponse) -> None:
+        """Record usage and the Provider's terminal reason for any response."""
+        self._record_usage(response.usage)
+        raw_finish_reason = str(response.finish_reason or "unreported")
+        self._last_raw_finish_reason = raw_finish_reason
+        self._last_finish_reason = normalize_finish_reason(raw_finish_reason)
+
     def _make_request(
         self,
         prompt: str,
@@ -136,7 +143,7 @@ class LLMService:
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.text_generate(request)
-        self._record_usage(response.usage)
+        self._record_response(response)
         return response.content
 
     async def generate_structured(
@@ -150,7 +157,7 @@ class LLMService:
         request = self._make_request(prompt, system_prompt, **kwargs)
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.schema_generate(request, schema)
-        self._record_usage(response.usage)
+        self._record_response(response)
         try:
             return schema.model_validate(json.loads(response.content))
         except Exception as exc:
@@ -176,7 +183,7 @@ class LLMService:
         )
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
             response: LLMResponse = await self._client.text_generate(request)
-        self._record_usage(response.usage)
+        self._record_response(response)
         return response.content
 
     async def stream_text(

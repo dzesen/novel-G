@@ -3963,7 +3963,10 @@ class AgentRuntime:
                     "adapter_reason_code": failure.reason_code,
                 },
                 now=_aware(self._clock()),
-                usage_is_complete=True,
+                usage_is_complete=bool(
+                    failure.usage.paid_attempts == 0
+                    or failure.usage.total_tokens > 0
+                ),
             )
             self._raise_if_deadline_exceeded(authorization)
             return await self._plan(
@@ -4290,7 +4293,9 @@ class AgentRuntime:
                         decision.tool,
                         payload,
                         context=tool_context,
-                        idempotency_key=invocation["idempotency_key"],
+                        idempotency_key=(
+                            f"{invocation['idempotency_key']}:{call_key}"
+                        ),
                     ),
                     run_id=run_id,
                     owner_id=owner_id,
@@ -4483,7 +4488,9 @@ class AgentRuntime:
                         decision.tool,
                         payload,
                         context=tool_context,
-                        idempotency_key=invocation["idempotency_key"],
+                        idempotency_key=(
+                            f"{invocation['idempotency_key']}:{call_key}"
+                        ),
                     ),
                     run_id=run_id,
                     owner_id=owner_id,

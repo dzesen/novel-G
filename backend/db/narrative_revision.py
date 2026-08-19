@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import timedelta
 from typing import Any
 
 from pymongo import ReturnDocument
@@ -16,7 +17,71 @@ class NarrativeRevisionConflict(ValueError):
     """A context mutation was prepared against a stale narrative revision."""
 
 
+class NarrativeRevisionFenceConflict(NarrativeRevisionConflict):
+    """A short-lived candidate mutation fence could not be acquired."""
+
+
 class NarrativeRevisionStore:
+    async def acquire_write_fence(
+        self,
+        novel_id: str,
+        *,
+        expected_revision: int,
+        fence_token: str,
+        ttl_seconds: int = 30,
+    ) -> None:
+        """Fence context writers while one candidate CAS validates its basis."""
+        if not fence_token:
+            raise ValueError("fence_token is required")
+        now = get_utc_now()
+        novel = await get_database()[collections.NOVELS].find_one_and_update(
+            {
+                "_id": to_object_id(novel_id),
+                "$expr": {
+                    "$eq": [
+                        {"$ifNull": ["$narrative_revision", 0]},
+                        int(expected_revision),
+                    ]
+                },
+                "$or": [
+                    {"narrative_write_fence": {"$exists": False}},
+                    {"narrative_write_fence": None},
+                    {"narrative_write_fence.expires_at": {"$lte": now}},
+                    {"narrative_write_fence.token": str(fence_token)},
+                ],
+            },
+            {
+                "$set": {
+                    "narrative_write_fence": {
+                        "token": str(fence_token),
+                        "expires_at": now
+                        + timedelta(seconds=max(1, int(ttl_seconds))),
+                    }
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if novel is None:
+            raise NarrativeRevisionFenceConflict(
+                "Narrative revision changed before the candidate mutation"
+            )
+
+    async def release_write_fence(
+        self,
+        novel_id: str,
+        *,
+        fence_token: str,
+    ) -> None:
+        if not fence_token:
+            return
+        await get_database()[collections.NOVELS].update_one(
+            {
+                "_id": to_object_id(novel_id),
+                "narrative_write_fence.token": str(fence_token),
+            },
+            {"$unset": {"narrative_write_fence": ""}},
+        )
+
     async def current(self, novel_id: str, *, session: Any = None) -> int:
         novel = await get_database()[collections.NOVELS].find_one(
             {"_id": to_object_id(novel_id)},
@@ -42,6 +107,15 @@ class NarrativeRevisionStore:
         query: dict[str, Any] = {
             "_id": to_object_id(novel_id),
             marker: {"$exists": False},
+            "$or": [
+                {"narrative_write_fence": {"$exists": False}},
+                {"narrative_write_fence": None},
+                {
+                    "narrative_write_fence.expires_at": {
+                        "$lte": get_utc_now()
+                    }
+                },
+            ],
         }
         if expected_revision is not None:
             query["$expr"] = {
@@ -70,11 +144,9 @@ class NarrativeRevisionStore:
             raise ValueError(f"Novel {novel_id} does not exist")
         if operation_key in (current.get("narrative_revision_operations") or {}):
             return int(current.get("narrative_revision") or 0)
-        if expected_revision is not None:
-            raise NarrativeRevisionConflict(
-                "Narrative revision changed before the authorized mutation"
-            )
-        return int(current.get("narrative_revision") or 0)
+        raise NarrativeRevisionConflict(
+            "Narrative revision changed or is fenced before the authorized mutation"
+        )
 
 
 narrative_revision_store = NarrativeRevisionStore()

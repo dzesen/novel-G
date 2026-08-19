@@ -709,15 +709,15 @@ class ProseRunModule:
         completion = dict(run.get("completion") or {})
         can_write = bool(completion.get("can_write_formal_prose"))
         remediation = dict(run.get("remediation") or {})
-        if (
-            can_write
-            and remediation.get("schema_version")
-            == "prose_run_remediation.v1"
-        ):
+        if remediation:
+            if remediation.get("schema_version") != "prose_run_remediation.v1":
+                raise ValueError("正文修复证据版本未知，不能正式接受")
             verification = dict(remediation.get("verification") or {})
             text_digest = chapter_content_digest(prose_run_draft_text(run))
             if (
-                int(verification.get("candidate_revision") or 0)
+                verification.get("schema_version")
+                != "prose_remediation_verification.v1"
+                or int(verification.get("candidate_revision") or 0)
                 != int(expected_revision)
                 or str(verification.get("content_digest") or "")
                 != text_digest
@@ -725,27 +725,16 @@ class ProseRunModule:
             ):
                 raise ValueError("正文修复复检证据与当前候选不一致")
             try:
-                agent_run = await agent_runtime_repository.get_run_owned(
+                await agent_runtime_repository.assert_completed_remediation(
                     run_id=str(verification["agent_run_id"]),
                     owner_id=owner_id,
+                    novel_id=str(run.get("novel_id") or ""),
+                    prose_run_id=str(run["_id"]),
                 )
-            except NotFoundError as exc:
+            except (NotFoundError, ValueError) as exc:
                 raise ValueError(
                     "正文修复 Agent 尚未完成，不能正式接受"
                 ) from exc
-            agent_scope = dict(
-                (agent_run.get("authorization") or {}).get("scope") or {}
-            )
-            agent_termination = dict(agent_run.get("termination") or {})
-            if (
-                str(agent_run.get("status") or "") != "completed"
-                or str(agent_run.get("novel_id") or "")
-                != str(run.get("novel_id") or "")
-                or agent_scope.get("kind") != "chapter_prose_candidate"
-                or str(agent_scope.get("object_id") or "") != str(run["_id"])
-                or agent_termination.get("reason_code") != "goal_satisfied"
-            ):
-                raise ValueError("正文修复 Agent 尚未完成，不能正式接受")
         if not can_write and not accept_partial:
             raise ValueError("正文尚未完成；只能继续生成或明确接受部分正文")
         if accept_partial and not partial_acknowledgement:

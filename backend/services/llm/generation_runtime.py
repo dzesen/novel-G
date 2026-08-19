@@ -168,6 +168,8 @@ class StructuredGenerationResult:
     usage: TokenUsage
     attempts: tuple[AttemptUsage, ...]
     plan: GenerationPlan
+    finish_reason: FinishReason
+    raw_finish_reason: str
 
 
 def _positive_int(value: Any) -> int | None:
@@ -496,6 +498,7 @@ class GenerationRuntime:
     ) -> StructuredGenerationResult:
         attempt_offset = len(self.attempts)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
+        terminal_adapter = adapter
 
         async def primary_call() -> Any:
             if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED:
@@ -562,6 +565,7 @@ class GenerationRuntime:
                         f"Structured output validation failed after one same-Provider repair: {first_error}"
                     ) from first_error
                 reviewer = self._adapter_factory(plan.reviewer_alias, None)
+                terminal_adapter = reviewer
 
                 async def review_call() -> Any:
                     return await reviewer.generate_structured(repair_prompt, schema, **gen_kwargs)
@@ -574,11 +578,20 @@ class GenerationRuntime:
                 )
 
         attempts = self.attempts[attempt_offset:]
+        self._last_finish_reason = normalize_finish_reason(
+            getattr(terminal_adapter, "last_finish_reason", None)
+        )
+        self._last_raw_finish_reason = str(
+            getattr(terminal_adapter, "last_raw_finish_reason", None)
+            or self._last_finish_reason
+        )
         return StructuredGenerationResult(
             value=value,
             usage=_add_usage(attempts),
             attempts=attempts,
             plan=plan,
+            finish_reason=self._last_finish_reason,
+            raw_finish_reason=self._last_raw_finish_reason,
         )
 
     async def stream_text(
