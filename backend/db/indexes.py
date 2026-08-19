@@ -234,6 +234,20 @@ async def init_agent_runtime_indexes():
                 ("status", pymongo.ASCENDING),
                 ("lease.expires_at", pymongo.ASCENDING),
             ]),
+            pymongo.IndexModel(
+                [("predecessor_run_id", pymongo.ASCENDING)],
+                unique=True,
+                partialFilterExpression={
+                    "predecessor_run_id": {"$type": "objectId"},
+                    "is_deleted": False,
+                },
+                name="agent_runtime_predecessor_unique",
+            ),
+            pymongo.IndexModel([
+                ("owner_id", pymongo.ASCENDING),
+                ("lineage_root_run_id", pymongo.ASCENDING),
+                ("created_at", pymongo.ASCENDING),
+            ]),
         ])
         await db[collections.AGENT_RUNTIME_STEPS].create_indexes([
             pymongo.IndexModel(

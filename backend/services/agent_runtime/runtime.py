@@ -12,6 +12,7 @@ from bson import ObjectId
 
 from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeBudgetExceeded,
+    AgentRuntimeReadinessConflict,
     AgentRuntimeRepository,
     AgentRuntimeStateConflict,
     agent_runtime_repository,
@@ -48,6 +49,13 @@ TERMINAL_RUN_STATUSES = frozenset({
     "cancelled",
     "superseded",
 })
+LINEAGE_LIMIT_FIELDS = (
+    "max_steps",
+    "max_planner_calls",
+    "max_tool_calls",
+    "max_paid_attempts",
+    "token_budget",
+)
 
 
 class _UncertainDispatchedCall(RuntimeError):
@@ -193,6 +201,10 @@ class AgentRuntime:
                 "token_budget": request.limits.token_budget,
             },
         }
+        lineage, replay_source_input_digest = await self._resolve_lineage(
+            owner_id=str(owner_id),
+            request=request,
+        )
 
         readiness_id = str(ObjectId())
         expires_at = now + timedelta(seconds=READINESS_TTL_SECONDS)
@@ -201,6 +213,7 @@ class AgentRuntime:
             "schema_version": "agent_runtime_authorization.v1",
             "readiness_id": readiness_id,
             "binding_mode": "single_use",
+            "owner_id": str(owner_id),
             "novel_id": request.novel_id,
             "goal": request.goal,
             "scope": request.scope.model_dump(mode="json"),
@@ -218,6 +231,10 @@ class AgentRuntime:
             "budget_projection": budget_projection,
             "completion_policy_revision": str(self._completion_policy.revision),
             "baseline_narrative_revision": baseline_revision,
+            "predecessor_run_id": request.predecessor_run_id,
+            "replay_of_run_id": request.replay_of_run_id,
+            "lineage": lineage,
+            "replay_source_input_digest": replay_source_input_digest,
             "issued_at": now.isoformat(),
             "expires_at": expires_at.isoformat(),
             "deadline_at": deadline_at.isoformat(),
@@ -241,6 +258,117 @@ class AgentRuntime:
             authorization=authorization,
         )
 
+    async def _resolve_lineage(
+        self,
+        *,
+        owner_id: str,
+        request: AgentReadinessRequest,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        source_id = request.predecessor_run_id or request.replay_of_run_id
+        if source_id is None:
+            return None, None
+        source = await self._repository.get_run_owned(
+            run_id=source_id,
+            owner_id=owner_id,
+        )
+        source_authorization = dict(source.get("authorization") or {})
+        if (
+            str(source.get("novel_id")) != request.novel_id
+            or source_authorization.get("goal") != request.goal
+            or source_authorization.get("scope")
+            != request.scope.model_dump(mode="json")
+        ):
+            raise AgentRuntimeReadinessConflict(
+                "lineage source does not match novel, goal, and scope"
+            )
+
+        source_steps = await self._repository.list_steps_owned(
+            run_id=source_id,
+            owner_id=owner_id,
+        )
+        source_input_digest = self._source_input_digest(source, source_steps)
+        if request.replay_of_run_id:
+            if source.get("status") not in {"completed", "failed", "cancelled"}:
+                raise AgentRuntimeReadinessConflict(
+                    "replay source must be terminal and cannot be superseded"
+                )
+            return None, source_input_digest
+
+        if source.get("status") != "paused" or source.get("successor_run_id"):
+            raise AgentRuntimeReadinessConflict(
+                "predecessor must be paused without an existing successor"
+            )
+        previous_lineage = source_authorization.get("lineage")
+        previous_actual = (
+            dict(previous_lineage.get("cumulative_actual_usage") or {})
+            if isinstance(previous_lineage, Mapping)
+            else {}
+        )
+        source_usage = AgentRuntimeUsage.model_validate(source.get("usage") or {})
+        cumulative_actual = {
+            field: int(previous_actual.get(field) or 0)
+            + int(getattr(source_usage, field))
+            for field in AgentRuntimeUsage.model_fields
+        }
+        previous_authorized = (
+            dict(previous_lineage.get("cumulative_authorized_upper_bound") or {})
+            if isinstance(previous_lineage, Mapping)
+            else {
+                field: int((source_authorization.get("limits") or {}).get(field) or 0)
+                for field in LINEAGE_LIMIT_FIELDS
+            }
+        )
+        new_limits = request.limits.model_dump(mode="python")
+        cumulative_authorized = {
+            field: int(previous_authorized.get(field) or 0)
+            + int(new_limits.get(field) or 0)
+            for field in LINEAGE_LIMIT_FIELDS
+        }
+        root_run_id = (
+            str(previous_lineage.get("root_run_id"))
+            if isinstance(previous_lineage, Mapping)
+            else str(source["_id"])
+        )
+        return {
+            "root_run_id": root_run_id,
+            "predecessor_run_id": str(source["_id"]),
+            "predecessor_input_digest": source_input_digest,
+            "cumulative_actual_usage": cumulative_actual,
+            "new_authorized_upper_bound": {
+                field: int(new_limits.get(field) or 0)
+                for field in LINEAGE_LIMIT_FIELDS
+            },
+            "cumulative_authorized_upper_bound": cumulative_authorized,
+        }, None
+
+    @staticmethod
+    def _source_input_digest(
+        run: Mapping[str, Any],
+        steps: list[dict[str, Any]],
+    ) -> str:
+        authorization = dict(run.get("authorization") or {})
+        return _digest({
+            "schema_version": "agent_runtime_replay_input.v1",
+            "authorization_digest": str(run.get("authorization_digest") or ""),
+            "goal": authorization.get("goal"),
+            "scope": authorization.get("scope"),
+            "baseline_narrative_revision": authorization.get(
+                "baseline_narrative_revision"
+            ),
+            "step_inputs": [
+                {
+                    "ordinal": int(step.get("ordinal") or 0),
+                    "observation_cursor": int(
+                        step.get("input_observation_cursor") or 0
+                    ),
+                    "observation_digest": str(
+                        step.get("input_observation_digest") or ""
+                    ),
+                }
+                for step in steps
+            ],
+        })
+
     async def start(
         self,
         *,
@@ -258,6 +386,19 @@ class AgentRuntime:
             now=now,
         )
         run_id = str(run["_id"])
+        if run.get("predecessor_run_id"):
+            predecessor_id = str(run["predecessor_run_id"])
+            await self._event(
+                run_id=predecessor_id,
+                event_key=f"superseded-by-{run_id}",
+                event_type="run_superseded",
+                payload={
+                    "status": "superseded",
+                    "successor_run_id": run_id,
+                    "reason_code": "continued_by_successor",
+                },
+                now=now,
+            )
         if run.get("status") in TERMINAL_RUN_STATUSES or run.get("status") == "paused":
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         return await self._execute_owned_run(
@@ -375,6 +516,7 @@ class AgentRuntime:
             violations=tuple(violations),
             derived_status=str(run["status"]),
             derived_usage=derived_usage,
+            source_input_digest=self._source_input_digest(run, steps),
         )
 
     async def _execute_owned_run(
@@ -1807,4 +1949,24 @@ class AgentRuntime:
                 created_at=event["created_at"],
             ) for event in events),
             has_uncertain_attempts=bool(run.get("has_uncertain_attempts")),
+            predecessor_run_id=(
+                str(run["predecessor_run_id"])
+                if run.get("predecessor_run_id")
+                else None
+            ),
+            replay_of_run_id=(
+                str(run["replay_of_run_id"])
+                if run.get("replay_of_run_id")
+                else None
+            ),
+            successor_run_id=(
+                str(run["successor_run_id"])
+                if run.get("successor_run_id")
+                else None
+            ),
+            lineage_root_run_id=(
+                str(run["lineage_root_run_id"])
+                if run.get("lineage_root_run_id")
+                else None
+            ),
         )

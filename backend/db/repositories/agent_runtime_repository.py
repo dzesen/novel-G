@@ -246,6 +246,28 @@ class AgentRuntimeRepository:
         run_id = _required_object_id(bound.get("bound_run_id"), "bound_run_id")
         authorization = deepcopy(dict(bound.get("authorization") or {}))
         novel_object_id = _required_object_id(bound.get("novel_id"), "novel_id")
+        predecessor_object_id = (
+            _required_object_id(
+                authorization.get("predecessor_run_id"),
+                "predecessor_run_id",
+            )
+            if authorization.get("predecessor_run_id")
+            else None
+        )
+        replay_object_id = (
+            _required_object_id(
+                authorization.get("replay_of_run_id"),
+                "replay_of_run_id",
+            )
+            if authorization.get("replay_of_run_id")
+            else None
+        )
+        lineage = authorization.get("lineage")
+        lineage_root_object_id = (
+            _required_object_id(lineage.get("root_run_id"), "lineage.root_run_id")
+            if isinstance(lineage, Mapping) and lineage.get("root_run_id")
+            else run_id
+        )
         run_document = {
             "_id": run_id,
             "owner_id": owner_object_id,
@@ -278,12 +300,72 @@ class AgentRuntimeRepository:
             "lease": None,
             "lease_epoch": 0,
             "termination": None,
+            "predecessor_run_id": predecessor_object_id,
+            "replay_of_run_id": replay_object_id,
+            "lineage_root_run_id": lineage_root_object_id,
             "successor_run_id": None,
             "created_at": now,
             "updated_at": now,
             "is_deleted": False,
             "deleted_at": None,
         }
+        if predecessor_object_id is not None:
+            predecessor = await self.runs.find_one_and_update(
+                {
+                    "_id": predecessor_object_id,
+                    "owner_id": owner_object_id,
+                    "novel_id": novel_object_id,
+                    "status": "paused",
+                    "successor_run_id": None,
+                    "authorization.goal": authorization.get("goal"),
+                    "authorization.scope": authorization.get("scope"),
+                    "is_deleted": False,
+                },
+                {"$set": {
+                    "status": "superseded",
+                    "successor_run_id": run_id,
+                    "termination": {
+                        "status": "superseded",
+                        "category": "superseded",
+                        "reason_code": "continued_by_successor",
+                        "resumable": False,
+                        "occurred_at": now,
+                        "step_id": None,
+                        "detail_code": "continued_by_successor",
+                    },
+                    "updated_at": now,
+                }},
+                return_document=ReturnDocument.AFTER,
+            )
+            if predecessor is None:
+                current_predecessor = await self.runs.find_one({
+                    "_id": predecessor_object_id,
+                    "owner_id": owner_object_id,
+                    "is_deleted": False,
+                })
+                if not (
+                    current_predecessor
+                    and current_predecessor.get("status") == "superseded"
+                    and current_predecessor.get("successor_run_id") == run_id
+                ):
+                    await self.readiness.update_one(
+                        {
+                            "_id": readiness_object_id,
+                            "status": "bound",
+                            "bound_run_id": run_id,
+                            "start_request_id": str(start_request_id),
+                        },
+                        {"$set": {
+                            "status": "inspected",
+                            "bound_run_id": None,
+                            "start_request_id": None,
+                            "bound_at": None,
+                            "updated_at": now,
+                        }},
+                    )
+                    raise AgentRuntimeReadinessConflict(
+                        "predecessor changed before successor binding"
+                    )
         try:
             await self.runs.update_one(
                 {"_id": run_id},

@@ -174,11 +174,15 @@ class AgentReadinessRequest(_StrictModel):
     allowed_external_data_categories: tuple[str, ...] = ()
     approval_mode: Literal["proposal_only"] = "proposal_only"
     limits: AgentRuntimeLimits
+    predecessor_run_id: str | None = Field(default=None, min_length=1)
+    replay_of_run_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def validate_unique_tools(self) -> "AgentReadinessRequest":
         if len(set(self.allowed_tools)) != len(self.allowed_tools):
             raise ValueError("allowed_tools cannot contain duplicates")
+        if self.predecessor_run_id and self.replay_of_run_id:
+            raise ValueError("predecessor_run_id and replay_of_run_id are exclusive")
         return self
 
 
@@ -238,6 +242,10 @@ class AgentRunView(_StrictModel):
     steps: tuple[AgentStepView, ...] = ()
     events: tuple[AgentEventView, ...] = ()
     has_uncertain_attempts: bool = False
+    predecessor_run_id: str | None = None
+    replay_of_run_id: str | None = None
+    successor_run_id: str | None = None
+    lineage_root_run_id: str | None = None
 
 
 class AgentReplayView(_StrictModel):
@@ -246,3 +254,4 @@ class AgentReplayView(_StrictModel):
     violations: tuple[str, ...] = ()
     derived_status: str
     derived_usage: AgentRuntimeUsage
+    source_input_digest: str
