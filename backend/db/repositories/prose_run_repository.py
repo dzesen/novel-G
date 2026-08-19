@@ -687,22 +687,13 @@ class ProseRunRepository(BaseRepository):
         result = await self.collection.update_one(query, update)
         return result.modified_count == 1
 
-    async def find_remediation_receipt(
-        self,
+    @staticmethod
+    def _matching_remediation_receipt(
+        document: dict[str, Any],
         *,
         idempotency_key: str,
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """Recover one proposal-only rewrite without reading Agent events."""
-        document = await self.collection.find_one(
-            {
-                "remediation_receipts": {
-                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
-                }
-            }
-        )
-        if document is None:
-            return None
-        receipt = next(
+    ) -> dict[str, Any] | None:
+        return next(
             (
                 dict(item)
                 for item in document.get("remediation_receipts") or []
@@ -711,43 +702,95 @@ class ProseRunRepository(BaseRepository):
             ),
             None,
         )
-        return (document, receipt) if receipt is not None else None
+
+    @staticmethod
+    def _validate_remediation_receipt_digest(
+        receipt: dict[str, Any],
+        *,
+        request_digest: str,
+    ) -> None:
+        if str(receipt.get("request_digest") or "") != str(request_digest):
+            raise StaleProseRun(
+                "同一正文修复幂等键对应了不同的候选输入"
+            )
+
+    async def find_remediation_receipt(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Recover one proposal-only rewrite without reading Agent events."""
+        document = await self.collection.find_one(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "is_deleted": False,
+                "remediation_receipts": {
+                    "$elemMatch": {"idempotency_key": str(idempotency_key)}
+                }
+            }
+        )
+        if document is None:
+            return None
+        receipt = self._matching_remediation_receipt(
+            document,
+            idempotency_key=idempotency_key,
+        )
+        if receipt is None:
+            return None
+        self._validate_remediation_receipt_digest(
+            receipt,
+            request_digest=request_digest,
+        )
+        return document, receipt
 
     async def apply_remediation_candidate(
         self,
         *,
         run_id: str,
         owner_id: str,
+        novel_id: str,
         expected_revision: int,
         expected_text: str,
+        expected_narrative_revision: int,
+        expected_outline_revision: str,
         idempotency_key: str,
         request_digest: str,
         assembled_text: str,
         completion: dict[str, Any],
+        target_issue_categories: list[str],
+        target_scene_indexes: list[int],
         result_projection: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """CAS one temporary prose candidate and its crash-recovery receipt."""
         existing = await self.collection.find_one(
             {
                 "_id": to_object_id(run_id),
                 "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "is_deleted": False,
                 "remediation_receipts": {
                     "$elemMatch": {"idempotency_key": str(idempotency_key)}
                 },
             }
         )
         if existing is not None:
-            receipt = next(
-                dict(item)
-                for item in existing.get("remediation_receipts") or []
-                if str(item.get("idempotency_key") or "")
-                == str(idempotency_key)
+            existing_receipt = self._matching_remediation_receipt(
+                existing,
+                idempotency_key=idempotency_key,
             )
-            if str(receipt.get("request_digest") or "") != str(request_digest):
-                raise StaleProseRun(
-                    "同一正文修复幂等键对应了不同的候选输入"
-                )
-            return existing
+            if existing_receipt is None:
+                raise StaleProseRun("正文修复 receipt 已损坏")
+            self._validate_remediation_receipt_digest(
+                existing_receipt,
+                request_digest=request_digest,
+            )
+            return existing, existing_receipt
 
         now = get_utc_now()
         next_revision = int(expected_revision) + 1
@@ -763,10 +806,13 @@ class ProseRunRepository(BaseRepository):
             {
                 "_id": to_object_id(run_id),
                 "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
                 "is_deleted": False,
                 "status": "complete",
                 "revision": int(expected_revision),
                 "assembled_text": str(expected_text),
+                "narrative_revision": int(expected_narrative_revision),
+                "outline_revision": str(expected_outline_revision),
                 "$or": [
                     {"lease": None},
                     {"lease": {"$exists": False}},
@@ -781,6 +827,20 @@ class ProseRunRepository(BaseRepository):
                         "schema_version": "prose_run_remediation.v1",
                         "latest_idempotency_key": str(idempotency_key),
                         "latest_revision": next_revision,
+                        "latest_content_digest": str(
+                            result_projection.get("resource_digest") or ""
+                        ),
+                        "source_narrative_revision": int(
+                            expected_narrative_revision
+                        ),
+                        "source_outline_revision": str(
+                            expected_outline_revision
+                        ),
+                        "target_issue_categories": list(
+                            target_issue_categories
+                        ),
+                        "target_scene_indexes": list(target_scene_indexes),
+                        "verification": None,
                         "updated_at": now,
                     },
                 },
@@ -795,21 +855,116 @@ class ProseRunRepository(BaseRepository):
             return_document=ReturnDocument.AFTER,
         )
         if document is not None:
-            return document
+            return document, receipt
 
         recovered = await self.collection.find_one(
             {
                 "_id": to_object_id(run_id),
                 "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "is_deleted": False,
                 "remediation_receipts": {
                     "$elemMatch": {"idempotency_key": str(idempotency_key)}
                 },
             }
         )
         if recovered is not None:
-            return recovered
+            recovered_receipt = self._matching_remediation_receipt(
+                recovered,
+                idempotency_key=idempotency_key,
+            )
+            if recovered_receipt is None:
+                raise StaleProseRun("正文修复 receipt 已损坏")
+            self._validate_remediation_receipt_digest(
+                recovered_receipt,
+                request_digest=request_digest,
+            )
+            return recovered, recovered_receipt
         raise StaleProseRun(
             "正文候选已被其他运行修改，当前修复结果不能覆盖"
+        )
+
+    async def verify_remediation_candidate(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        novel_id: str,
+        agent_run_id: str,
+        expected_revision: int,
+        expected_text: str,
+        expected_content_digest: str,
+        expected_narrative_revision: int,
+        expected_outline_revision: str,
+        completion: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Unlock one exact temporary candidate after its bound review passes."""
+        now = get_utc_now()
+        verification = {
+            "schema_version": "prose_remediation_verification.v1",
+            "agent_run_id": str(agent_run_id),
+            "candidate_revision": int(expected_revision),
+            "content_digest": str(expected_content_digest),
+            "verified_at": now,
+        }
+        document = await self.collection.find_one_and_update(
+            {
+                "_id": to_object_id(run_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "is_deleted": False,
+                "status": "complete",
+                "revision": int(expected_revision),
+                "assembled_text": str(expected_text),
+                "narrative_revision": int(expected_narrative_revision),
+                "outline_revision": str(expected_outline_revision),
+                "remediation.schema_version": "prose_run_remediation.v1",
+                "remediation.latest_revision": int(expected_revision),
+                "remediation.latest_content_digest": str(
+                    expected_content_digest
+                ),
+                "remediation.verification": None,
+                "completion.can_write_formal_prose": False,
+            },
+            {
+                "$set": {
+                    "completion": dict(completion),
+                    "remediation.verification": verification,
+                    "remediation.updated_at": now,
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is not None:
+            return document
+        current = await self.collection.find_one({
+            "_id": to_object_id(run_id),
+            "owner_id": to_object_id(owner_id),
+            "novel_id": to_object_id(novel_id),
+            "is_deleted": False,
+        })
+        if current is not None:
+            existing = dict(
+                (current.get("remediation") or {}).get("verification") or {}
+            )
+            if (
+                int(current.get("revision") or 0) == int(expected_revision)
+                and str(current.get("assembled_text") or "")
+                == str(expected_text)
+                and int(existing.get("candidate_revision") or 0)
+                == int(expected_revision)
+                and str(existing.get("content_digest") or "")
+                == str(expected_content_digest)
+                and bool(
+                    (current.get("completion") or {}).get(
+                        "can_write_formal_prose"
+                    )
+                )
+            ):
+                return current
+        raise StaleProseRun(
+            "正文候选在复检通过后又发生变化，不能解锁正式接受"
         )
 
     async def finish(

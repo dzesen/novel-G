@@ -127,6 +127,7 @@ class _RunTerminatedEventPayload(_EventPayload):
         "deadline_exceeded",
         "planner_output_exhausted",
         "tool_failure_exhausted",
+        "repair_no_progress",
         "policy_violation",
         "invariant_violation",
         "cancelled_by_user",
@@ -141,6 +142,7 @@ class _RunTerminatedEventPayload(_EventPayload):
                 "deadline_exceeded",
                 "planner_output_exhausted",
                 "tool_failure_exhausted",
+                "repair_no_progress",
                 "policy_violation",
                 "invariant_violation",
             },
@@ -1291,8 +1293,9 @@ class AgentRuntimeRepository:
         usage: Mapping[str, Any],
         now: datetime,
         result_checkpoint: Mapping[str, Any] | None = None,
+        usage_is_complete: bool = False,
     ) -> dict[str, Any]:
-        """Release a call reservation once; missing usage is charged conservatively."""
+        """Release a call reservation once; unknown usage is conservative."""
         run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
         attempt = _attempt_by_key(run, call_key)
         if attempt is None:
@@ -1310,9 +1313,13 @@ class AgentRuntimeRepository:
         reported_total = int(usage.get("total_tokens") or 0)
         if min(reported_paid, input_tokens, output_tokens, reported_total) < 0:
             raise ValueError("Agent call usage cannot be negative")
-        paid = reported_paid if reported_paid > 0 else paid_bound
         observed_tokens = max(reported_total, input_tokens + output_tokens)
-        charged_tokens = observed_tokens if observed_tokens > 0 else token_bound
+        if usage_is_complete:
+            paid = reported_paid
+            charged_tokens = observed_tokens
+        else:
+            paid = reported_paid if reported_paid > 0 else paid_bound
+            charged_tokens = observed_tokens if observed_tokens > 0 else token_bound
         if paid > paid_bound or charged_tokens > token_bound:
             raise AgentRuntimeStateConflict("Agent call exceeded its conservative bound")
         charged_usage = {

@@ -83,6 +83,9 @@ MAX_REMEDIATION_PROSE_CHARACTERS = 80_000
 _FALLBACK_OUTPUT_TOKENS = 20_000
 _PLANNER_INPUT_TOKEN_BOUND = 120_000
 _TOOL_INPUT_TOKEN_BOUND = 600_000
+_MAX_PLANNER_OBSERVATIONS = 32
+_MAX_PLANNER_OBSERVATION_BYTES = 64_000
+_NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
 
 OutlineIssueCategory = Literal[
     "scene_coverage",
@@ -151,10 +154,15 @@ class RemediationAdherenceProviderOutput(
         self,
     ) -> "RemediationAdherenceProviderOutput":
         severities = {issue.severity for issue in self.issues}
+        scene_indexes = [item.scene_index for item in self.scene_coverage]
+        if len(set(scene_indexes)) != len(scene_indexes):
+            raise ValueError("adherence review contains duplicate scene coverage")
         incomplete_scene = any(
             item.status != "covered" for item in self.scene_coverage
         )
-        if self.verdict == "pass" and (self.issues or incomplete_scene):
+        if self.verdict == "pass" and (
+            self.issues or incomplete_scene or not self.scene_coverage
+        ):
             raise ValueError("passing adherence review contains a deviation")
         if self.verdict == "warn" and (
             not self.issues or "error" in severities
@@ -177,7 +185,7 @@ class RewriteProseCandidateOutput(_StrictModel):
 
 
 class CheckOutlineAdherenceOutput(_StrictModel):
-    outcome: Literal["checked", "stale", "blocked"]
+    outcome: Literal["checked", "no_progress", "stale", "blocked"]
     prose_run_id: str = Field(min_length=1)
     candidate_revision: int = Field(ge=1)
     content_digest: str = Field(min_length=64, max_length=64)
@@ -186,12 +194,14 @@ class CheckOutlineAdherenceOutput(_StrictModel):
 
     @model_validator(mode="after")
     def validate_passed_projection(self) -> "CheckOutlineAdherenceOutput":
-        if self.outcome != "checked":
+        if self.outcome not in {"checked", "no_progress"}:
             if self.passed is not None or self.review is not None:
                 raise ValueError("blocked adherence output cannot contain a review")
             return self
         if self.passed is None or self.review is None:
             raise ValueError("checked adherence output requires a review")
+        if self.outcome == "no_progress" and self.passed:
+            raise ValueError("no-progress adherence output cannot pass")
         if self.passed != (self.review.verdict == "pass"):
             raise ValueError("passed must match the normalized adherence verdict")
         return self
@@ -339,6 +349,61 @@ def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _rewrite_request_digest(
+    *,
+    context: RuntimeToolContext,
+    payload: RewriteProseCandidateInput,
+) -> str:
+    return _canonical_digest({
+        "scope": context.scope.model_dump(mode="json"),
+        "payload": payload.model_dump(mode="json"),
+    })
+
+
+def _validated_rewrite_receipt_result(
+    *,
+    document: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    context: RuntimeToolContext,
+    payload: RewriteProseCandidateInput,
+) -> RuntimeToolResult:
+    request_digest = _rewrite_request_digest(context=context, payload=payload)
+    if str(receipt.get("request_digest") or "") != request_digest:
+        raise StaleProseRun(
+            "同一正文修复幂等键对应了不同的候选输入"
+        )
+    if (
+        str(document.get("_id") or "") != context.scope.object_id
+        or str(document.get("owner_id") or "") != context.owner_id
+        or str(document.get("novel_id") or "") != context.novel_id
+        or document.get("is_deleted") is True
+    ):
+        raise StaleProseRun("正文修复 receipt 不属于当前授权作用域")
+    projection = receipt.get("result_projection")
+    if not isinstance(projection, Mapping):
+        raise StaleProseRun("正文修复 receipt 缺少结果投影")
+    result = RuntimeToolResult.model_validate(projection)
+    data = RewriteProseCandidateOutput.model_validate(result.data)
+    current_digest = chapter_content_digest(
+        str(document.get("assembled_text") or "")
+    )
+    if (
+        result.status != "ok"
+        or result.code != "prose_candidate_rewritten"
+        or data.outcome != "rewritten"
+        or data.prose_run_id != context.scope.object_id
+        or data.source_revision != payload.expected_revision
+        or data.candidate_revision != int(document.get("revision") or 0)
+        or data.content_digest != current_digest
+        or result.resource_revision != str(data.candidate_revision)
+        or result.resource_digest != data.content_digest
+        or int(receipt.get("source_revision") or 0) != data.source_revision
+        or int(receipt.get("result_revision") or 0) != data.candidate_revision
+    ):
+        raise StaleProseRun("正文修复 receipt 与当前候选身份不一致")
+    return result
+
+
 def _validate_candidate_snapshot(
     *,
     run: Mapping[str, Any],
@@ -346,6 +411,7 @@ def _validate_candidate_snapshot(
     novel_id: str,
     expected_revision: int | None = None,
     expected_content_digest: str | None = None,
+    allow_unverified_remediation: bool = False,
 ) -> str:
     if str(run.get("novel_id") or "") != str(novel_id):
         raise ValueError("prose candidate is outside the authorized novel")
@@ -371,10 +437,21 @@ def _validate_candidate_snapshot(
     ):
         raise StaleProseRun("prose candidate digest changed")
     completion = dict(run.get("completion") or {})
-    if (
-        completion.get("can_write_formal_prose") is not True
-        or str(completion.get("status") or "") != "complete"
-    ):
+    completion_is_formal = (
+        completion.get("can_write_formal_prose") is True
+        and str(completion.get("status") or "") in {"complete", "degraded"}
+    )
+    remediation = dict(run.get("remediation") or {})
+    unverified_remediation_is_current = bool(
+        allow_unverified_remediation
+        and remediation.get("schema_version") == "prose_run_remediation.v1"
+        and int(remediation.get("latest_revision") or 0)
+        == int(run.get("revision") or 0)
+        and remediation.get("verification") is None
+        and completion.get("can_write_formal_prose") is False
+        and str(completion.get("status") or "") == "incomplete"
+    )
+    if not completion_is_formal and not unverified_remediation_is_current:
         raise ValueError("prose candidate has not passed completion")
     if chapter.get("novel_id") != to_object_id(novel_id):
         raise ValueError("prose candidate chapter ownership changed")
@@ -389,30 +466,88 @@ def _validate_candidate_snapshot(
     return text
 
 
+def _execution_plan(run: Mapping[str, Any]) -> ProseExecutionPlan:
+    raw = dict(run.get("plan") or {})
+    return ProseExecutionPlan(
+        requested_word_count=int(raw["requested_word_count"]),
+        scene_count=int(raw["scene_count"]),
+        mode=str(raw["mode"]),
+        provider_output_limit=(
+            int(raw["provider_output_limit"])
+            if raw.get("provider_output_limit") is not None
+            else None
+        ),
+        safe_output_budget=int(raw["safe_output_budget"]),
+        minimum_completion_ratio=float(raw["minimum_completion_ratio"]),
+        segment_budgets=tuple(int(item) for item in raw["segment_budgets"]),
+        reason_codes=tuple(str(item) for item in raw.get("reason_codes") or ()),
+        protocol_revision=str(raw["protocol_revision"]),
+    )
+
+
 def _planner_observations(
     observations: tuple[dict[str, Any], ...],
 ) -> list[dict[str, Any]]:
     """Project only bounded Tool feedback into the next paid Planner call."""
-    allowed_fields = (
-        "observation_kind",
-        "candidate_revision",
-        "content_digest",
-        "changed",
-        "addressed_categories",
-        "passed",
-        "verdict",
-        "summary",
-        "issue_categories",
-        "scene_indexes",
-        "reason_codes",
-        "satisfied",
-        "rewrite_count",
-        "latest_kind",
-    )
-    return [
-        {field: item[field] for field in allowed_fields if field in item}
-        for item in observations
-    ]
+    text_limits = {
+        "observation_kind": 160,
+        "content_digest": 64,
+        "verdict": 32,
+        "summary": 1_000,
+        "latest_kind": 160,
+    }
+    list_fields = {
+        "addressed_categories": 80,
+        "issue_categories": 80,
+        "reason_codes": 160,
+    }
+    projected_newest_first: list[dict[str, Any]] = []
+    total_bytes = 2
+    for item in reversed(observations):
+        if not isinstance(item, Mapping):
+            continue
+        projected: dict[str, Any] = {}
+        for field, limit in text_limits.items():
+            if field in item:
+                projected[field] = str(item[field])[:limit]
+        for field in ("candidate_revision", "rewrite_count"):
+            value = item.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                projected[field] = value
+        for field in ("changed", "passed", "satisfied"):
+            value = item.get(field)
+            if isinstance(value, bool):
+                projected[field] = value
+        for field, item_limit in list_fields.items():
+            raw = item.get(field)
+            if isinstance(raw, (list, tuple)):
+                projected[field] = [
+                    str(value)[:item_limit] for value in raw[:20]
+                ]
+        raw_scene_indexes = item.get("scene_indexes")
+        if isinstance(raw_scene_indexes, (list, tuple)):
+            projected["scene_indexes"] = [
+                value
+                for value in raw_scene_indexes[:20]
+                if isinstance(value, int) and not isinstance(value, bool)
+            ]
+        if not projected:
+            continue
+        encoded_size = len(
+            json.dumps(
+                projected,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ) + 1
+        if total_bytes + encoded_size > _MAX_PLANNER_OBSERVATION_BYTES:
+            continue
+        projected_newest_first.append(projected)
+        total_bytes += encoded_size
+        if len(projected_newest_first) == _MAX_PLANNER_OBSERVATIONS:
+            break
+    return list(reversed(projected_newest_first))
 
 
 class ProseRemediationPlanner:
@@ -539,6 +674,7 @@ class ProseRemediationToolApplication:
         context: RuntimeToolContext,
         payload: RewriteProseCandidateInput,
         usage: RuntimeCallUsage | None = None,
+        provider_dispatched: bool = False,
         error: Exception,
         code: Literal["resource_stale", "manual_approval_required"] = (
             "resource_stale"
@@ -571,6 +707,7 @@ class ProseRemediationToolApplication:
                 "prose_run_id": context.scope.object_id,
                 "expected_revision": payload.expected_revision,
                 "expected_content_digest": payload.expected_content_digest,
+                **({} if provider_dispatched else _NO_PROVIDER_DISPATCH),
             },
             resource_revision=str(payload.expected_revision),
             resource_digest=payload.expected_content_digest,
@@ -583,6 +720,8 @@ class ProseRemediationToolApplication:
         *,
         context: RuntimeToolContext,
         payload: CheckOutlineAdherenceInput,
+        usage: RuntimeCallUsage | None = None,
+        provider_dispatched: bool = False,
         error: Exception,
         code: Literal["resource_stale", "manual_approval_required"] = (
             "resource_stale"
@@ -607,9 +746,11 @@ class ProseRemediationToolApplication:
                 "prose_run_id": context.scope.object_id,
                 "expected_revision": payload.expected_revision,
                 "expected_content_digest": payload.expected_content_digest,
+                **({} if provider_dispatched else _NO_PROVIDER_DISPATCH),
             },
             resource_revision=str(payload.expected_revision),
             resource_digest=payload.expected_content_digest,
+            usage=usage or RuntimeCallUsage(),
             error_summary=str(error)[:1_000],
         )
 
@@ -619,6 +760,13 @@ class ProseRemediationToolApplication:
         operation: Literal["rewrite", "adherence"],
         failure: _FrozenStructuredCallFailure,
     ) -> RuntimeToolResult:
+        no_provider_dispatch = bool(
+            not failure.uncertain
+            and failure.usage.paid_attempts == 0
+            and failure.usage.total_tokens == 0
+            and failure.usage.input_tokens == 0
+            and failure.usage.output_tokens == 0
+        )
         return RuntimeToolResult(
             status=("uncertain" if failure.uncertain else "retryable_error"),
             code=(
@@ -635,6 +783,7 @@ class ProseRemediationToolApplication:
                 "outcome": (
                     "unknown" if failure.uncertain else "known_failure"
                 ),
+                **(_NO_PROVIDER_DISPATCH if no_provider_dispatch else {}),
             },
             usage=failure.usage,
             error_summary=str(failure),
@@ -655,9 +804,98 @@ class ProseRemediationToolApplication:
             audit_view={
                 "operation": operation,
                 "outcome": "known_preflight_failure",
+                **_NO_PROVIDER_DISPATCH,
             },
             error_summary="正文候选预检暂时失败。",
         )
+
+    @staticmethod
+    def _invalid_adherence_result(
+        *,
+        context: RuntimeToolContext,
+        payload: CheckOutlineAdherenceInput,
+        usage: RuntimeCallUsage,
+        error: Exception,
+    ) -> RuntimeToolResult:
+        return RuntimeToolResult(
+            status="retryable_error",
+            code="adherence_review_invalid",
+            planner_view={
+                "candidate_revision": payload.expected_revision,
+                "content_digest": payload.expected_content_digest,
+                "reason_codes": ["adherence_review_invalid"],
+            },
+            audit_view={
+                "prose_run_id": context.scope.object_id,
+                "candidate_revision": payload.expected_revision,
+                "content_digest": payload.expected_content_digest,
+                "validation": "full_scene_coverage_required",
+            },
+            resource_revision=str(payload.expected_revision),
+            resource_digest=payload.expected_content_digest,
+            usage=usage,
+            error_summary=str(error)[:1_000],
+        )
+
+    @staticmethod
+    def _invalid_rewrite_result(
+        *,
+        context: RuntimeToolContext,
+        payload: RewriteProseCandidateInput,
+        usage: RuntimeCallUsage,
+        error: Exception,
+    ) -> RuntimeToolResult:
+        return RuntimeToolResult(
+            status="retryable_error",
+            code="rewrite_output_invalid",
+            planner_view={
+                "candidate_revision": payload.expected_revision,
+                "content_digest": payload.expected_content_digest,
+                "reason_codes": ["rewrite_output_invalid"],
+            },
+            audit_view={
+                "prose_run_id": context.scope.object_id,
+                "source_revision": payload.expected_revision,
+                "source_content_digest": payload.expected_content_digest,
+                "validation": "complete_candidate_schema_required",
+            },
+            resource_revision=str(payload.expected_revision),
+            resource_digest=payload.expected_content_digest,
+            usage=usage,
+            error_summary=str(error)[:1_000],
+        )
+
+    async def _candidate_snapshot(
+        self,
+        *,
+        context: RuntimeToolContext,
+        expected_revision: int,
+        expected_content_digest: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        if context.scope.kind != REMEDIATION_SCOPE_KIND:
+            raise ValueError("prose remediation requires a candidate scope")
+        run_id = context.scope.object_id
+        run = await self._deps.prose_runs.get_run(run_id, context.owner_id)
+        if str(run.get("novel_id") or "") != context.novel_id:
+            raise ValueError("prose candidate is outside the authorized novel")
+        current_narrative_revision = await narrative_revision_store.current(
+            context.novel_id
+        )
+        if (
+            run.get("narrative_revision") is None
+            or int(run["narrative_revision"]) != current_narrative_revision
+        ):
+            raise StaleProseRun("prose candidate narrative revision changed")
+        chapter = await self._deps.chapters.get_chapter_by_id(str(run["chapter_id"]))
+        text = _validate_candidate_snapshot(
+            run=run,
+            chapter=chapter,
+            novel_id=context.novel_id,
+            expected_revision=expected_revision,
+            expected_content_digest=expected_content_digest,
+            allow_unverified_remediation=True,
+        )
+        return run, chapter, text
 
     async def _candidate(
         self,
@@ -666,17 +904,8 @@ class ProseRemediationToolApplication:
         expected_revision: int,
         expected_content_digest: str,
     ) -> tuple[dict[str, Any], dict[str, Any], str, Any]:
-        if context.scope.kind != REMEDIATION_SCOPE_KIND:
-            raise ValueError("prose remediation requires a candidate scope")
-        run_id = context.scope.object_id
-        run = await self._deps.prose_runs.get_run(run_id, context.owner_id)
-        if str(run.get("novel_id") or "") != context.novel_id:
-            raise ValueError("prose candidate is outside the authorized novel")
-        chapter = await self._deps.chapters.get_chapter_by_id(str(run["chapter_id"]))
-        text = _validate_candidate_snapshot(
-            run=run,
-            chapter=chapter,
-            novel_id=context.novel_id,
+        run, chapter, text = await self._candidate_snapshot(
+            context=context,
             expected_revision=expected_revision,
             expected_content_digest=expected_content_digest,
         )
@@ -688,22 +917,7 @@ class ProseRemediationToolApplication:
 
     @staticmethod
     def _execution_plan(run: Mapping[str, Any]) -> ProseExecutionPlan:
-        raw = dict(run.get("plan") or {})
-        return ProseExecutionPlan(
-            requested_word_count=int(raw["requested_word_count"]),
-            scene_count=int(raw["scene_count"]),
-            mode=str(raw["mode"]),
-            provider_output_limit=(
-                int(raw["provider_output_limit"])
-                if raw.get("provider_output_limit") is not None
-                else None
-            ),
-            safe_output_budget=int(raw["safe_output_budget"]),
-            minimum_completion_ratio=float(raw["minimum_completion_ratio"]),
-            segment_budgets=tuple(int(item) for item in raw["segment_budgets"]),
-            reason_codes=tuple(str(item) for item in raw.get("reason_codes") or ()),
-            protocol_revision=str(raw["protocol_revision"]),
-        )
+        return _execution_plan(run)
 
     async def rewrite(
         self,
@@ -786,27 +1000,40 @@ class ProseRemediationToolApplication:
                 failure=failure,
             )
         usage = _runtime_usage(generated)
-        output = RewrittenProseProviderOutput.model_validate(generated.value)
-        completion = prose_completion_module.inspect(
+        try:
+            output = RewrittenProseProviderOutput.model_validate(
+                generated.value
+            )
+        except (TypeError, ValueError) as exc:
+            return self._invalid_rewrite_result(
+                context=context,
+                payload=payload,
+                usage=usage,
+                error=exc,
+            )
+        draft_completion = prose_completion_module.inspect(
             text=output.prose,
             plan=plan,
             finish_reason="stop",
             raw_finish_reason="stop",
-            completed_scene_indexes=range(plan.scene_count),
+            completed_scene_indexes=(),
             outline_revision=str(run["outline_revision"]),
             expected_outline_revision=str(run["outline_revision"]),
         )
-        if not completion.can_write_formal_prose:
+        fatal_completion_reasons = set(draft_completion.reason_codes) - {
+            "scenes_incomplete"
+        }
+        if fatal_completion_reasons:
             return RuntimeToolResult(
                 status="retryable_error",
                 code="candidate_completion_failed",
                 planner_view={
-                    "reason_codes": list(completion.reason_codes),
+                    "reason_codes": sorted(fatal_completion_reasons),
                     "candidate_revision": payload.expected_revision,
                     "content_digest": payload.expected_content_digest,
                 },
                 audit_view={
-                    "completion": completion.to_dict(),
+                    "completion": draft_completion.to_dict(),
                     "source_revision": payload.expected_revision,
                 },
                 resource_revision=str(payload.expected_revision),
@@ -814,6 +1041,18 @@ class ProseRemediationToolApplication:
                 usage=usage,
                 error_summary="改写结果未通过正文完整性闸门",
             )
+
+        locked_completion = {
+            **draft_completion.to_dict(),
+            "status": "incomplete",
+            "completed_scene_count": 0,
+            "completion_reason": "remediation_verification_required",
+            "reason_codes": list(dict.fromkeys([
+                *draft_completion.reason_codes,
+                "remediation_verification_required",
+            ])),
+            "can_write_formal_prose": False,
+        }
 
         new_digest = chapter_content_digest(output.prose)
         addressed = tuple(
@@ -848,7 +1087,7 @@ class ProseRemediationToolApplication:
                 "candidate_revision": data.candidate_revision,
                 "source_content_digest": payload.expected_content_digest,
                 "content_digest": data.content_digest,
-                "completion": completion.to_dict(),
+                "completion": locked_completion,
             },
             evidence_refs=(
                 f"prose-run:{data.prose_run_id}:{data.candidate_revision}",
@@ -857,36 +1096,69 @@ class ProseRemediationToolApplication:
             resource_digest=data.content_digest,
             usage=usage,
         )
-        request_digest = _canonical_digest({
-            "scope": context.scope.model_dump(mode="json"),
-            "payload": payload.model_dump(mode="json"),
-        })
+        request_digest = _rewrite_request_digest(
+            context=context,
+            payload=payload,
+        )
+        try:
+            current_run, _current_chapter, current_text = (
+                await self._candidate_snapshot(
+                    context=context,
+                    expected_revision=payload.expected_revision,
+                    expected_content_digest=payload.expected_content_digest,
+                )
+            )
+        except (StaleProseRun, NotFoundError, ValueError) as exc:
+            return self._stale_rewrite_result(
+                context=context,
+                payload=payload,
+                usage=usage,
+                provider_dispatched=True,
+                error=exc,
+            )
         stored_completion = {
-            **dict(run.get("completion") or {}),
-            **completion.to_dict(),
+            **dict(current_run.get("completion") or {}),
+            **locked_completion,
         }
         try:
-            await self._deps.prose_runs.apply_remediation_candidate(
-                run_id=data.prose_run_id,
-                owner_id=context.owner_id,
-                expected_revision=payload.expected_revision,
-                expected_text=current_text,
-                idempotency_key=idempotency_key,
-                request_digest=request_digest,
-                assembled_text=output.prose,
-                completion=stored_completion,
-                result_projection=result.model_dump(mode="json"),
+            stored_document, stored_receipt = (
+                await self._deps.prose_runs.apply_remediation_candidate(
+                    run_id=data.prose_run_id,
+                    owner_id=context.owner_id,
+                    novel_id=context.novel_id,
+                    expected_revision=payload.expected_revision,
+                    expected_text=current_text,
+                    expected_narrative_revision=int(
+                        current_run["narrative_revision"]
+                    ),
+                    expected_outline_revision=str(
+                        current_run["outline_revision"]
+                    ),
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                    assembled_text=output.prose,
+                    completion=stored_completion,
+                    target_issue_categories=list(payload.issue_categories),
+                    target_scene_indexes=list(payload.scene_indexes),
+                    result_projection=result.model_dump(mode="json"),
+                )
             )
         except StaleProseRun:
             return self._stale_rewrite_result(
                 context=context,
                 payload=payload,
                 usage=usage,
+                provider_dispatched=True,
                 error=StaleProseRun(
                     "正文候选已被其他运行修改"
                 ),
             )
-        return result
+        return _validated_rewrite_receipt_result(
+            document=stored_document,
+            receipt=stored_receipt,
+            context=context,
+            payload=payload,
+        )
 
     async def check(
         self,
@@ -959,12 +1231,52 @@ class ProseRemediationToolApplication:
                 failure=failure,
             )
         usage = _runtime_usage(generated)
-        normalized = normalize_outline_adherence(
-            ChapterOutlineAdherenceResultSchema.model_validate(
+        try:
+            provider_review = RemediationAdherenceProviderOutput.model_validate(
                 generated.value
-            ).model_dump()
-        )
-        review = ChapterOutlineAdherenceResultSchema.model_validate(normalized)
+            )
+            normalized = normalize_outline_adherence(
+                provider_review.model_dump()
+            )
+            review = ChapterOutlineAdherenceResultSchema.model_validate(
+                normalized
+            )
+            expected_scene_indexes = set(
+                range(1, _execution_plan(run).scene_count + 1)
+            )
+            actual_scene_indexes = [
+                item.scene_index for item in review.scene_coverage
+            ]
+            if (
+                len(actual_scene_indexes) != len(set(actual_scene_indexes))
+                or set(actual_scene_indexes) != expected_scene_indexes
+            ):
+                raise ValueError(
+                    "adherence review must cover every outline scene exactly once"
+                )
+        except (TypeError, ValueError) as exc:
+            return self._invalid_adherence_result(
+                context=context,
+                payload=payload,
+                usage=usage,
+                error=exc,
+            )
+        try:
+            current_run, _current_chapter, _current_text = (
+                await self._candidate_snapshot(
+                    context=context,
+                    expected_revision=payload.expected_revision,
+                    expected_content_digest=payload.expected_content_digest,
+                )
+            )
+        except (StaleProseRun, NotFoundError, ValueError) as exc:
+            return self._stale_adherence_result(
+                context=context,
+                payload=payload,
+                usage=usage,
+                provider_dispatched=True,
+                error=exc,
+            )
         data = CheckOutlineAdherenceOutput(
             outcome="checked",
             prose_run_id=str(run["_id"]),
@@ -981,6 +1293,66 @@ class ProseRemediationToolApplication:
             for item in review.scene_coverage
             if item.status != "covered"
         ]
+        remediation = dict(current_run.get("remediation") or {})
+        target_categories = {
+            str(item)
+            for item in remediation.get("target_issue_categories") or []
+        }
+        target_scenes = {
+            int(item) for item in remediation.get("target_scene_indexes") or []
+        }
+        remaining_categories = target_categories.intersection(issue_categories)
+        remaining_scenes = target_scenes.intersection(missing_scenes)
+        target_count = len(target_categories) + len(target_scenes)
+        no_progress = bool(
+            review.verdict != "pass"
+            and target_count > 0
+            and len(remaining_categories) + len(remaining_scenes)
+            == target_count
+        )
+        if no_progress:
+            no_progress_data = CheckOutlineAdherenceOutput(
+                outcome="no_progress",
+                prose_run_id=str(run["_id"]),
+                candidate_revision=payload.expected_revision,
+                content_digest=payload.expected_content_digest,
+                passed=False,
+                review=review,
+            )
+            return RuntimeToolResult(
+                status="permanent_error",
+                code="repair_no_progress",
+                data=no_progress_data.model_dump(mode="json"),
+                planner_view={
+                    "observation_kind": "outline_adherence_checked",
+                    "candidate_revision": payload.expected_revision,
+                    "content_digest": payload.expected_content_digest,
+                    "passed": False,
+                    "verdict": review.verdict,
+                    "summary": review.summary,
+                    "issue_categories": issue_categories,
+                    "scene_indexes": missing_scenes,
+                    "reason_codes": ["repair_no_progress"],
+                },
+                audit_view={
+                    "prose_run_id": str(run["_id"]),
+                    "candidate_revision": payload.expected_revision,
+                    "content_digest": payload.expected_content_digest,
+                    "target_issue_categories": sorted(target_categories),
+                    "target_scene_indexes": sorted(target_scenes),
+                    "remaining_issue_categories": sorted(
+                        remaining_categories
+                    ),
+                    "remaining_scene_indexes": sorted(remaining_scenes),
+                },
+                evidence_refs=(
+                    f"prose-run:{run['_id']}:{payload.expected_revision}",
+                ),
+                resource_revision=str(payload.expected_revision),
+                resource_digest=payload.expected_content_digest,
+                usage=usage,
+                error_summary="改写后的目标偏离没有减少",
+            )
         return RuntimeToolResult(
             status="ok",
             code="outline_adherence_checked",
@@ -1105,7 +1477,12 @@ class ProseRemediationToolRegistry:
         idempotency_key: str,
     ) -> RuntimeToolResult:
         if reference == REWRITE_TOOL:
-            recovered = await self.recover(idempotency_key=idempotency_key)
+            recovered = await self.recover(
+                reference,
+                payload,
+                context=context,
+                idempotency_key=idempotency_key,
+            )
             if recovered is not None:
                 return recovered
             return await self._application.rewrite(
@@ -1127,23 +1504,52 @@ class ProseRemediationToolRegistry:
 
     async def recover(
         self,
+        reference: RuntimeToolReference,
+        payload: BaseModel,
         *,
+        context: RuntimeToolContext,
         idempotency_key: str,
     ) -> RuntimeToolResult | None:
+        if reference == ADHERENCE_TOOL:
+            return None
+        if reference != REWRITE_TOOL:
+            raise ValueError(f"unknown prose remediation tool: {reference}")
+        normalized = RewriteProseCandidateInput.model_validate(
+            payload.model_dump(mode="python")
+        )
+        request_digest = _rewrite_request_digest(
+            context=context,
+            payload=normalized,
+        )
         recovered = await self._prose_runs.find_remediation_receipt(
+            run_id=context.scope.object_id,
+            owner_id=context.owner_id,
+            novel_id=context.novel_id,
             idempotency_key=idempotency_key,
+            request_digest=request_digest,
         )
         if recovered is None:
             return None
-        _run, receipt = recovered
-        projection = receipt.get("result_projection")
-        if not isinstance(projection, Mapping):
-            raise ValueError("stored remediation receipt is invalid")
-        return RuntimeToolResult.model_validate(projection)
+        document, receipt = recovered
+        return _validated_rewrite_receipt_result(
+            document=document,
+            receipt=receipt,
+            context=context,
+            payload=normalized,
+        )
 
 
 class ProseRemediationCompletionPolicy:
-    revision = "prose-remediation-completion-r1"
+    revision = "prose-remediation-completion-r2"
+
+    def __init__(
+        self,
+        *,
+        prose_runs: ProseRunRepository = prose_run_repo,
+        chapters: Any = chapter_repo,
+    ) -> None:
+        self._prose_runs = prose_runs
+        self._chapters = chapters
 
     async def evaluate(
         self,
@@ -1152,7 +1558,6 @@ class ProseRemediationCompletionPolicy:
         observations: list[dict[str, Any]],
         proposal: Mapping[str, Any],
     ) -> CompletionDecision:
-        del run
         rewrites = [
             item
             for item in observations
@@ -1160,7 +1565,7 @@ class ProseRemediationCompletionPolicy:
         ]
         latest = observations[-1] if observations else {}
         latest_rewrite = rewrites[-1] if rewrites else {}
-        satisfied = bool(
+        evidence_matches = bool(
             proposal.get("kind") == "propose_finish"
             and proposal.get("finish_code") == "candidate_ready"
             and rewrites
@@ -1171,6 +1576,82 @@ class ProseRemediationCompletionPolicy:
             and str(latest.get("content_digest") or "")
             == str(latest_rewrite.get("content_digest") or "")
         )
+        satisfied = False
+        if evidence_matches:
+            authorization = dict(run.get("authorization") or {})
+            scope = dict(authorization.get("scope") or {})
+            owner_id = str(run.get("owner_id") or "")
+            novel_id = str(run.get("novel_id") or "")
+            prose_run_id = str(scope.get("object_id") or "")
+            candidate_revision = int(
+                latest.get("candidate_revision") or -1
+            )
+            content_digest = str(latest.get("content_digest") or "")
+            try:
+                if (
+                    scope.get("kind") != REMEDIATION_SCOPE_KIND
+                    or not owner_id
+                    or not novel_id
+                    or not prose_run_id
+                ):
+                    raise ValueError("invalid prose remediation completion scope")
+                candidate = await self._prose_runs.get_run(
+                    prose_run_id,
+                    owner_id,
+                )
+                current_narrative_revision = (
+                    await narrative_revision_store.current(novel_id)
+                )
+                if (
+                    candidate.get("narrative_revision") is None
+                    or int(candidate["narrative_revision"])
+                    != current_narrative_revision
+                ):
+                    raise StaleProseRun(
+                        "prose candidate narrative revision changed"
+                    )
+                chapter = await self._chapters.get_chapter_by_id(
+                    str(candidate["chapter_id"])
+                )
+                text = _validate_candidate_snapshot(
+                    run=candidate,
+                    chapter=chapter,
+                    novel_id=novel_id,
+                    expected_revision=candidate_revision,
+                    expected_content_digest=content_digest,
+                    allow_unverified_remediation=True,
+                )
+                plan = _execution_plan(candidate)
+                completion = prose_completion_module.inspect(
+                    text=text,
+                    plan=plan,
+                    finish_reason="stop",
+                    raw_finish_reason="stop",
+                    completed_scene_indexes=range(plan.scene_count),
+                    outline_revision=str(candidate["outline_revision"]),
+                    expected_outline_revision=str(candidate["outline_revision"]),
+                )
+                if not completion.can_write_formal_prose:
+                    raise ValueError(
+                        "verified candidate did not pass prose completion"
+                    )
+                await self._prose_runs.verify_remediation_candidate(
+                    run_id=prose_run_id,
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    agent_run_id=str(run.get("_id") or ""),
+                    expected_revision=candidate_revision,
+                    expected_text=text,
+                    expected_content_digest=content_digest,
+                    expected_narrative_revision=current_narrative_revision,
+                    expected_outline_revision=str(
+                        candidate["outline_revision"]
+                    ),
+                    completion=completion.to_dict(),
+                )
+                satisfied = True
+            except (NotFoundError, StaleProseRun, TypeError, ValueError):
+                satisfied = False
         return CompletionDecision(
             satisfied=satisfied,
             reason_code=(
@@ -1182,6 +1663,7 @@ class ProseRemediationCompletionPolicy:
                 "satisfied": satisfied,
                 "rewrite_count": len(rewrites),
                 "latest_kind": str(latest.get("observation_kind") or ""),
+                "candidate_identity_current": satisfied,
             },
         )
 
@@ -1208,6 +1690,7 @@ async def validate_prose_remediation_scope(
         run=run,
         chapter=chapter,
         novel_id=novel_id,
+        allow_unverified_remediation=True,
     )
 
 
@@ -1267,7 +1750,10 @@ def build_prose_remediation_runtime(
         adherence_call=adherence_generation,
         prose_runs=(tool_deps.prose_runs if tool_deps else prose_run_repo),
     )
-    completion = ProseRemediationCompletionPolicy()
+    completion = ProseRemediationCompletionPolicy(
+        prose_runs=(tool_deps.prose_runs if tool_deps else prose_run_repo),
+        chapters=(tool_deps.chapters if tool_deps else chapter_repo),
+    )
     runtime_kwargs = {"repository": repository} if repository is not None else {}
     runtime = AgentRuntime(
         planner=planner,

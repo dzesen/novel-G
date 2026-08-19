@@ -275,6 +275,18 @@ def _invalid_tool_result_validation_subject(
     }
 
 
+def _tool_result_usage_is_complete(result: RuntimeToolResult) -> bool:
+    """Trust explicit server-side proof that no Provider was dispatched."""
+    usage = result.usage
+    return bool(
+        result.audit_view.get("provider_dispatch") == "not_dispatched"
+        and usage.paid_attempts == 0
+        and usage.input_tokens == 0
+        and usage.output_tokens == 0
+        and usage.total_tokens == 0
+    )
+
+
 def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "step_id": str(step.get("step_id") or ""),
@@ -3951,6 +3963,7 @@ class AgentRuntime:
                     "adapter_reason_code": failure.reason_code,
                 },
                 now=_aware(self._clock()),
+                usage_is_complete=True,
             )
             self._raise_if_deadline_exceeded(authorization)
             return await self._plan(
@@ -4080,6 +4093,14 @@ class AgentRuntime:
             "arguments": payload.model_dump(mode="json"),
             "idempotency_key": f"{run_id}:{step_id}:tool",
         }
+        tool_context = RuntimeToolContext(
+            owner_id=owner_id,
+            novel_id=str(authorization["novel_id"]),
+            run_id=run_id,
+            step_id=step_id,
+            scope=decision.scope,
+            authorization_digest=authorization_digest,
+        )
         if step_status == "executing":
             stored_step = await self._repository.get_step_owned(
                 run_id=run_id,
@@ -4266,6 +4287,9 @@ class AgentRuntime:
             try:
                 recovered = await self._await_adapter(
                     self._tools.recover(
+                        decision.tool,
+                        payload,
+                        context=tool_context,
                         idempotency_key=invocation["idempotency_key"],
                     ),
                     run_id=run_id,
@@ -4377,6 +4401,7 @@ class AgentRuntime:
                 usage=result.usage.model_dump(mode="python"),
                 result_checkpoint=result.model_dump(mode="json"),
                 now=now,
+                usage_is_complete=_tool_result_usage_is_complete(result),
             )
         elif result is None:
             base_call_key = f"step-{ordinal}-tool"
@@ -4457,14 +4482,7 @@ class AgentRuntime:
                     self._tools.execute(
                         decision.tool,
                         payload,
-                        context=RuntimeToolContext(
-                            owner_id=owner_id,
-                            novel_id=str(authorization["novel_id"]),
-                            run_id=run_id,
-                            step_id=step_id,
-                            scope=decision.scope,
-                            authorization_digest=authorization_digest,
-                        ),
+                        context=tool_context,
                         idempotency_key=invocation["idempotency_key"],
                     ),
                     run_id=run_id,
@@ -4608,6 +4626,7 @@ class AgentRuntime:
                 usage=result.usage.model_dump(mode="python"),
                 result_checkpoint=result.model_dump(mode="json"),
                 now=_aware(self._clock()),
+                usage_is_complete=_tool_result_usage_is_complete(result),
             )
             if result.status == "retryable_error":
                 return await self._act_and_observe(
@@ -4757,7 +4776,11 @@ class AgentRuntime:
                 lease_epoch=lease_epoch,
                 step_id=step_id,
                 expected_step_status="observed",
-                reason_code="tool_failure_exhausted",
+                reason_code=(
+                    "repair_no_progress"
+                    if result.code == "repair_no_progress"
+                    else "tool_failure_exhausted"
+                ),
                 now=_aware(self._clock()),
             )
             return False
@@ -5008,6 +5031,7 @@ class AgentRuntime:
         usage: Mapping[str, Any],
         result_checkpoint: Mapping[str, Any],
         now: datetime,
+        usage_is_complete: bool = False,
     ) -> dict[str, Any]:
         settled_attempt = await self._repository.settle_call(
             run_id=run_id,
@@ -5018,6 +5042,7 @@ class AgentRuntime:
             usage=usage,
             result_checkpoint=result_checkpoint,
             now=now,
+            usage_is_complete=usage_is_complete,
         )
         await self._event(
             run_id=run_id,
