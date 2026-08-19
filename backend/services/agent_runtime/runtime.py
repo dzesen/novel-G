@@ -38,6 +38,7 @@ from backend.services.agent_runtime.contracts import (
 )
 from backend.services.agent_runtime.policy import (
     AgentRuntimePolicyViolation,
+    FORBIDDEN_RUNTIME_CHANGE_CLASSES,
     RuntimePolicyGate,
 )
 
@@ -165,6 +166,10 @@ class AgentRuntime:
                 raise ValueError("authorized tool effect is missing from allowed_effects")
             if descriptor.effect_class == "system_write":
                 raise ValueError("Runtime v1 cannot authorize formal system writes")
+            if FORBIDDEN_RUNTIME_CHANGE_CLASSES & set(descriptor.change_classes):
+                raise ValueError(
+                    "Runtime v1 cannot authorize formal or reference-card writes"
+                )
             if not set(descriptor.change_classes).issubset(allowed_changes):
                 raise ValueError("authorized tool change class is not allowed")
             if not set(descriptor.external_data_categories).issubset(allowed_external):

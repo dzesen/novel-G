@@ -17,6 +17,13 @@ from backend.services.agent_runtime.contracts import (
 
 
 _URL_RE = re.compile(r"https?://", re.IGNORECASE)
+FORBIDDEN_RUNTIME_CHANGE_CLASSES = frozenset({
+    "formal_write",
+    "reference_card_create",
+    "reference_card_merge",
+    "reference_card_restore",
+    "reference_card_restore_merge",
+})
 
 
 class AgentRuntimePolicyViolation(ValueError):
@@ -67,6 +74,10 @@ class RuntimePolicyGate:
             raise AgentRuntimePolicyViolation("formal system writes are forbidden in Runtime v1")
 
         allowed_changes = set(authorization.get("allowed_change_classes") or [])
+        if FORBIDDEN_RUNTIME_CHANGE_CLASSES & set(descriptor.change_classes):
+            raise AgentRuntimePolicyViolation(
+                "formal and reference-card writes are forbidden in Runtime v1"
+            )
         if not set(descriptor.change_classes).issubset(allowed_changes):
             raise AgentRuntimePolicyViolation("tool change class is not authorized")
 
