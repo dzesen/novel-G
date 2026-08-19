@@ -24,6 +24,7 @@ from backend.config.workflow_catalog import get_workflow_step_definition
 from backend.services.generation.prose_token_bounds import (
     conservative_prompt_input_bound,
     conservative_runtime_token_bound,
+    structured_schema_request_payload,
 )
 
 
@@ -620,11 +621,7 @@ class GenerationRuntime:
                 + int(effective_output_tokens)
             )
 
-        schema_request_payload = json.dumps(
-            schema.model_json_schema(),
-            ensure_ascii=True,
-            sort_keys=True,
-        )
+        schema_request_payload = structured_schema_request_payload(schema)
 
         def bounded_reservation(
             prompt: str,

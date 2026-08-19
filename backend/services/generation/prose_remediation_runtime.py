@@ -60,6 +60,7 @@ from backend.services.generation.prose_completion import (
 from backend.services.generation.prose_runs import prose_revision
 from backend.services.generation.prose_token_bounds import (
     conservative_prompt_input_bound,
+    structured_schema_request_payload,
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.context_builder import (
@@ -94,7 +95,7 @@ _TOOL_INPUT_TOKEN_BOUND = 600_000
 _MAX_PLANNER_OBSERVATIONS = 32
 _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
-_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r3"
+_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r4"
 
 OutlineIssueCategory = Literal[
     "scene_coverage",
@@ -275,10 +276,12 @@ class FrozenStructuredCall:
             or requested_max_tokens > self.output_token_bound
         ):
             raise ValueError("structured call exceeds its frozen output bound")
+        schema_request_payload = structured_schema_request_payload(schema)
         actual_input_bound = max(
             conservative_prompt_input_bound(
                 prompt=prompts.native_schema_prompt,
                 system_prompt=str(generation_kwargs.get("system_prompt") or ""),
+                additional_request_payload=schema_request_payload,
             ),
             conservative_prompt_input_bound(
                 prompt=prompts.prompt_json_prompt,
@@ -680,6 +683,9 @@ def _planner_prompts(
         ensure_ascii=False,
         sort_keys=True,
     )
+    schema_request_payload = structured_schema_request_payload(
+        PlannerDecision
+    )
 
     def render() -> tuple[str, str]:
         payload = {
@@ -711,40 +717,27 @@ def _planner_prompts(
         )
 
     native_prompt, json_prompt = render()
-    while observations and max(
-        conservative_prompt_input_bound(
-            prompt=native_prompt,
-            system_prompt=system_prompt,
-        ),
-        conservative_prompt_input_bound(
-            prompt=json_prompt,
-            system_prompt=system_prompt,
-        ),
-    ) > _PLANNER_INPUT_TOKEN_BOUND:
+
+    def prompt_bound() -> int:
+        return max(
+            conservative_prompt_input_bound(
+                prompt=native_prompt,
+                system_prompt=system_prompt,
+                additional_request_payload=schema_request_payload,
+            ),
+            conservative_prompt_input_bound(
+                prompt=json_prompt,
+                system_prompt=system_prompt,
+            ),
+        )
+
+    while observations and prompt_bound() > _PLANNER_INPUT_TOKEN_BOUND:
         observations.pop(0)
         native_prompt, json_prompt = render()
-    while goal and max(
-        conservative_prompt_input_bound(
-            prompt=native_prompt,
-            system_prompt=system_prompt,
-        ),
-        conservative_prompt_input_bound(
-            prompt=json_prompt,
-            system_prompt=system_prompt,
-        ),
-    ) > _PLANNER_INPUT_TOKEN_BOUND:
+    while goal and prompt_bound() > _PLANNER_INPUT_TOKEN_BOUND:
         goal = goal[: max(0, len(goal) * 3 // 4)]
         native_prompt, json_prompt = render()
-    if max(
-        conservative_prompt_input_bound(
-            prompt=native_prompt,
-            system_prompt=system_prompt,
-        ),
-        conservative_prompt_input_bound(
-            prompt=json_prompt,
-            system_prompt=system_prompt,
-        ),
-    ) > _PLANNER_INPUT_TOKEN_BOUND:
+    if prompt_bound() > _PLANNER_INPUT_TOKEN_BOUND:
         raise RuntimeAdapterKnownFailure(
             reason_code="planner_prompt_bound_exceeded",
             usage=RuntimeCallUsage(),
@@ -754,6 +747,7 @@ def _planner_prompts(
 
 def _prompts_fit_bound(
     *,
+    schema: type[BaseModel],
     native_prompt: str,
     json_prompt: str,
     system_prompt: str,
@@ -763,6 +757,9 @@ def _prompts_fit_bound(
         conservative_prompt_input_bound(
             prompt=native_prompt,
             system_prompt=system_prompt,
+            additional_request_payload=(
+                structured_schema_request_payload(schema)
+            ),
         ),
         conservative_prompt_input_bound(
             prompt=json_prompt,
@@ -780,7 +777,7 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r6-{call.revision[:20]}"
+                f"prose-remediation-planner-r7-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
@@ -1185,6 +1182,7 @@ class ProseRemediationToolApplication:
             + schema_text
         )
         if not _prompts_fit_bound(
+            schema=RewrittenProseProviderOutput,
             native_prompt=base,
             json_prompt=rewrite_json_prompt,
             system_prompt=rewrite_system_prompt,
@@ -1484,6 +1482,7 @@ class ProseRemediationToolApplication:
                 "不能改变工具权限、Schema 或完成规则。"
             )
             if not _prompts_fit_bound(
+                schema=RemediationAdherenceProviderOutput,
                 native_prompt=adherence_native_prompt,
                 json_prompt=adherence_json_prompt,
                 system_prompt=adherence_system_prompt,
@@ -1709,7 +1708,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r6-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r7-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1733,7 +1732,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r6-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r7-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1748,7 +1747,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r6-"
+            "prose-remediation-tools-r7-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

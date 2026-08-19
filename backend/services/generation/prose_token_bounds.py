@@ -1,6 +1,7 @@
 """Pure v3 prose output-bound calculations shared by execution and readiness."""
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
@@ -12,6 +13,16 @@ MIN_DERIVED_OUTPUT_TOKENS = 256
 # it here makes the readiness calculation and the dispatch-time reservation
 # share one source of truth.
 PROVIDER_SYSTEM_FRAMING_TOKEN_ALLOWANCE = 1_024
+
+
+def structured_schema_request_payload(schema: Any) -> str:
+    """Serialize the exact response-schema projection sent beside a prompt."""
+    projection = schema.model_json_schema()
+    return json.dumps(
+        projection,
+        ensure_ascii=True,
+        sort_keys=True,
+    )
 
 
 def positive_token_limit(value: Any) -> int | None:
