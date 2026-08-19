@@ -25,9 +25,11 @@ EVENT_NAMESPACE = UUID("814b1e75-93a6-49da-903c-03de77a202c6")
 CALL_NAMESPACE = UUID("73998e71-c0cf-4a99-91a8-8a01ad636aa9")
 MAX_EVENT_PAYLOAD_BYTES = 16_384
 SUCCESSOR_HANDOFF_TTL_SECONDS = 30
-# Per step: 20 planner repairs + the accepted plan, 20 tool retries + the
-# accepted result, and 20 pre-dispatch releases for each adapter kind.
-MAX_ATTEMPT_LEDGER_ENTRIES_PER_STEP = 82
+# A single step can consume every frozen Planner/Tool call in a run when the
+# user explicitly retries uncertain calls.  Pre-dispatch releases restore the
+# call counters, so each adapter kind can additionally retain 20 such entries.
+# These values mirror the V1 schema maxima and are locked by a contract test.
+MAX_ATTEMPT_LEDGER_ENTRIES_PER_STEP = 2_040
 
 
 class _EventPayload(BaseModel):
@@ -1342,7 +1344,7 @@ class AgentRuntimeRepository:
         lease_epoch: int,
         step_id: str,
         now: datetime,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Move one terminal step's attempts into its bounded audit ledger.
 
         The step write precedes the run-array pull deliberately.  A crash between
@@ -1457,6 +1459,7 @@ class AgentRuntimeRepository:
             raise AgentRuntimeStateConflict(
                 "terminal Agent step attempt archive lost its run lease"
             )
+        return {**step, "attempt_ledger": merged, "updated_at": now}
 
     async def release_call_pre_dispatch(
         self,

@@ -258,6 +258,7 @@ def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
         "tool_invocation": step.get("tool_invocation"),
         "observation": step.get("observation"),
         "usage_delta": step.get("usage_delta"),
+        "attempt_ledger_digest": _digest(step.get("attempt_ledger") or []),
     }
 
 
@@ -475,12 +476,19 @@ def _step_completed_event_projection(
     ordinal: int,
     step: Mapping[str, Any],
     kind: Literal["finish", "tool"],
+    attempts: list[Mapping[str, Any]] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
+    projected_step = dict(step)
+    if attempts is not None:
+        projected_step["attempt_ledger"] = [
+            project_agent_runtime_attempt_ledger_entry(attempt)
+            for attempt in attempts
+        ]
     return f"step-{ordinal}-completed", "step_completed", {
         "ordinal": ordinal,
         "status": "completed",
         "kind": kind,
-        "step_digest": _digest(_step_audit_projection(step)),
+        "step_digest": _digest(_step_audit_projection(projected_step)),
     }
 
 
@@ -922,22 +930,29 @@ class AgentRuntime:
             )
             return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         if run.get("status") == "paused":
-            await self._repair_projection_audit(
-                run_id=run_id,
-                owner_id=str(owner_id),
-                now=_aware(self._clock()),
-            )
             termination = dict(run.get("termination") or {})
             reason_code = str(termination.get("reason_code") or "")
-            if reason_code == "uncertain_paid_attempt" and uncertain_action is None:
-                return await self._run_view(run_id=run_id, owner_id=str(owner_id))
-            if reason_code in {"authorization_required", "manual_approval_required"}:
-                if not conditions_confirmed:
-                    return await self._run_view(run_id=run_id, owner_id=str(owner_id))
-            elif reason_code not in {
+            should_return = (
+                reason_code == "uncertain_paid_attempt"
+                and uncertain_action is None
+            ) or (
+                reason_code in {
+                    "authorization_required",
+                    "manual_approval_required",
+                }
+                and not conditions_confirmed
+            ) or reason_code not in {
                 "uncertain_paid_attempt",
                 "concurrent_narrative_change",
-            }:
+                "authorization_required",
+                "manual_approval_required",
+            }
+            if should_return:
+                await self._repair_projection_audit(
+                    run_id=run_id,
+                    owner_id=str(owner_id),
+                    now=_aware(self._clock()),
+                )
                 return await self._run_view(run_id=run_id, owner_id=str(owner_id))
         return await self._execute_owned_run(
             run_id=run_id,
@@ -1244,6 +1259,7 @@ class AgentRuntime:
                         ordinal=ordinal,
                         step=step,
                         kind=kind,
+                        attempts=attempts,
                     )
                 )
                 await self._event(
@@ -2063,6 +2079,7 @@ class AgentRuntime:
                     ordinal=ordinal,
                     step=step,
                     kind=expected_kind,
+                    attempts=attempts_by_step.get(step_id, []),
                 )[2]
                 if completed_payload != expected_completed_payload:
                     add_violation("step_status_mismatch")
@@ -2127,12 +2144,38 @@ class AgentRuntime:
         persisted_usage = AgentRuntimeUsage.model_validate(run.get("usage") or {})
         if derived_usage != persisted_usage:
             add_violation("usage_mismatch")
+        reservation_attempts = [
+            item
+            for item in attempts
+            if item.get("state") in {"reserved", "dispatched", "uncertain"}
+        ]
+        derived_paid_reserved = sum(
+            int(item.get("conservative_paid_attempts") or 0)
+            for item in reservation_attempts
+        )
+        derived_tokens_reserved = sum(
+            int(item.get("conservative_tokens") or 0)
+            for item in reservation_attempts
+        )
+        derived_has_uncertain = any(
+            item.get("state") == "uncertain" for item in attempts
+        )
+        if any((
+            derived_paid_reserved
+            != int(run.get("paid_attempts_reserved") or 0),
+            derived_tokens_reserved != int(run.get("tokens_reserved") or 0),
+            derived_has_uncertain
+            != bool(run.get("has_uncertain_attempts")),
+        )):
+            add_violation("attempt_reservation_mismatch")
         limits = dict(authorization.get("limits") or {})
         if any((
             derived_usage.planner_calls > int(limits.get("max_planner_calls") or 0),
             derived_usage.tool_calls > int(limits.get("max_tool_calls") or 0),
-            derived_usage.paid_attempts > int(limits.get("max_paid_attempts") or 0),
-            derived_usage.total_tokens > int(limits.get("token_budget") or 0),
+            derived_usage.paid_attempts + derived_paid_reserved
+            > int(limits.get("max_paid_attempts") or 0),
+            derived_usage.total_tokens + derived_tokens_reserved
+            > int(limits.get("token_budget") or 0),
         )):
             add_violation("usage_limit_exceeded")
         termination = run.get("termination")
@@ -2757,7 +2800,7 @@ class AgentRuntime:
                 )
                 active_status = str(active_step.get("status") or "")
                 if active_status in {"completed", "failed"}:
-                    await self._repository.archive_step_call_attempts(
+                    active_step = await self._repository.archive_step_call_attempts(
                         run_id=run_id,
                         owner_id=owner_id,
                         worker_id=worker_id,
@@ -2832,7 +2875,7 @@ class AgentRuntime:
                         return
                     continue
             deadline_at = datetime.fromisoformat(str(authorization["deadline_at"]))
-            if now >= _aware(deadline_at):
+            if not active_step_id and now >= _aware(deadline_at):
                 await self._terminate(
                     run_id=run_id,
                     owner_id=owner_id,
@@ -3522,18 +3565,6 @@ class AgentRuntime:
         step_status: str,
     ) -> bool:
         now = _aware(self._clock())
-        if self._deadline_is_exceeded(authorization):
-            await self._fail_step_and_run(
-                run_id=run_id,
-                owner_id=owner_id,
-                worker_id=worker_id,
-                lease_epoch=lease_epoch,
-                step_id=step_id,
-                expected_step_status=step_status,
-                reason_code="deadline_exceeded",
-                now=now,
-            )
-            return False
         if step_status == "observed":
             await self._complete_observed_step(
                 run_id=run_id,
@@ -3621,6 +3652,33 @@ class AgentRuntime:
                 now=now,
             )
         )
+        if (
+            latest is not None
+            and latest.get("state") in {"dispatched", "uncertain"}
+            and self._deadline_is_exceeded(authorization)
+        ):
+            if latest.get("state") == "dispatched":
+                await self._mark_uncertain(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    worker_id=worker_id,
+                    lease_epoch=lease_epoch,
+                    step_id=step_id,
+                    ordinal=ordinal,
+                    call_key=str(latest["call_key"]),
+                    now=now,
+                )
+            await self._pause_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="uncertain_paid_attempt",
+                now=now,
+            )
+            return False
         if released_count > int(
             (authorization.get("limits") or {}).get("max_predispatch_retries", 0)
         ):
@@ -3632,6 +3690,18 @@ class AgentRuntime:
                 step_id=step_id,
                 expected_step_status=step_status,
                 reason_code="tool_failure_exhausted",
+                now=now,
+            )
+            return False
+        if self._deadline_is_exceeded(authorization):
+            await self._fail_step_and_run(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=step_id,
+                expected_step_status=step_status,
+                reason_code="deadline_exceeded",
                 now=now,
             )
             return False
@@ -4533,7 +4603,7 @@ class AgentRuntime:
             },
             now=now,
         )
-        await self._repository.archive_step_call_attempts(
+        completed_step = await self._repository.archive_step_call_attempts(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
@@ -4679,7 +4749,7 @@ class AgentRuntime:
             fields={},
             now=now,
         )
-        await self._repository.archive_step_call_attempts(
+        completed_step = await self._repository.archive_step_call_attempts(
             run_id=run_id,
             owner_id=owner_id,
             worker_id=worker_id,
