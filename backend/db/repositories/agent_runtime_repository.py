@@ -829,6 +829,18 @@ class AgentRuntimeRepository:
                     "owner_id": owner_object_id,
                     "is_deleted": False,
                 })
+                active_step_seed = current.get("active_step_seed")
+                if active_step is None and isinstance(active_step_seed, Mapping):
+                    if str(active_step_seed.get("step_id") or "") != str(
+                        active_step_id
+                    ):
+                        raise AgentRuntimeStateConflict(
+                            "active Agent step seed does not match its pointer"
+                        )
+                    active_step = await self._upsert_step_from_seed(
+                        current,
+                        dict(active_step_seed),
+                    )
                 if _step_checkpoint_needs_projection(current, active_step):
                     raise AgentRuntimeCheckpointPending(
                         "Agent step checkpoint must be projected before cancellation"
@@ -869,6 +881,22 @@ class AgentRuntimeRepository:
                             "Agent step checkpoint must be projected before cancellation"
                         )
                     continue
+            else:
+                latest_ordinal = int(current.get("next_ordinal") or 0) - 1
+                latest_step = (
+                    await self.steps.find_one({
+                        "run_id": run_object_id,
+                        "owner_id": owner_object_id,
+                        "ordinal": latest_ordinal,
+                        "is_deleted": False,
+                    })
+                    if latest_ordinal >= 0
+                    else None
+                )
+                if _step_checkpoint_needs_projection(current, latest_step):
+                    raise AgentRuntimeCheckpointPending(
+                        "Agent step checkpoint must be projected before cancellation"
+                    )
             document = await self.runs.find_one_and_update(
                 {
                     "_id": run_object_id,

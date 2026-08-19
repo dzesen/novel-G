@@ -16,6 +16,7 @@ from backend.db.errors import NotFoundError
 from backend.db.repositories.agent_runtime_repository import (
     AgentRuntimeBudgetExceeded,
     AgentRuntimeCheckpointPending,
+    AgentRuntimeLeaseUnavailable,
     AgentRuntimeReadinessConflict,
     AgentRuntimeRepository,
     AgentRuntimeStateConflict,
@@ -814,7 +815,7 @@ class AgentRuntime:
                 run_id=run_id,
                 owner_id=normalized_owner_id,
             )
-            if repaired.status != "paused":
+            if repaired.status in TERMINAL_RUN_STATUSES:
                 return repaired
             return await self._commit_cancel_projection(
                 run_id=run_id,
@@ -868,6 +869,13 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
         )
+        if run.get("status") in TERMINAL_RUN_STATUSES:
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=owner_id,
+                now=_aware(self._clock()),
+            )
+            return await self._run_view(run_id=run_id, owner_id=owner_id)
         step_id = str(run.get("active_step_id") or "")
         uncertain_action: Literal["retry", "skip"] | None = None
         if step_id:
@@ -884,13 +892,27 @@ class AgentRuntime:
                 )
         now = _aware(self._clock())
         worker_id = uuid4().hex
-        leased = await self._repository.acquire_lease(
-            run_id=run_id,
-            owner_id=owner_id,
-            worker_id=worker_id,
-            now=now,
-            expires_at=now + timedelta(seconds=self._lease_seconds),
-        )
+        try:
+            leased = await self._repository.acquire_lease(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                now=now,
+                expires_at=now + timedelta(seconds=self._lease_seconds),
+            )
+        except AgentRuntimeLeaseUnavailable:
+            current = await self._repository.get_run_owned(
+                run_id=run_id,
+                owner_id=owner_id,
+            )
+            if current.get("status") not in TERMINAL_RUN_STATUSES:
+                raise
+            await self._repair_projection_audit(
+                run_id=run_id,
+                owner_id=owner_id,
+                now=now,
+            )
+            return await self._run_view(run_id=run_id, owner_id=owner_id)
         lease_epoch = int(leased.get("lease_epoch") or 0)
         try:
             await self._repair_checkpoint_projection(
