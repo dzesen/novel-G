@@ -55,6 +55,11 @@ def _validate_bounded_projection(
         raise ValueError("result projection exceeds the Runtime v1 byte limit")
 
 
+def _validate_runtime_result_projection(value: Any, *, label: str) -> None:
+    if _json_size(value, label=label) > MAX_RUNTIME_RESULT_PROJECTION_BYTES:
+        raise ValueError(f"{label} exceeds the Runtime v1 byte limit")
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -194,6 +199,14 @@ class PlannerResult(_StrictModel):
     )
     decision: PlannerDecision
     usage: RuntimeCallUsage = Field(default_factory=RuntimeCallUsage)
+
+    @model_validator(mode="after")
+    def validate_projection_size(self) -> "PlannerResult":
+        _validate_runtime_result_projection(
+            self.model_dump(mode="json"),
+            label="planner result projection",
+        )
+        return self
 
 
 class RuntimeToolContext(_StrictModel):

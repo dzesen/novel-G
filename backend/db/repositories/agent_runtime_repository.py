@@ -1203,6 +1203,55 @@ class AgentRuntimeRepository:
             raise AgentRuntimeStateConflict("settled Agent call was not found")
         return settled
 
+    async def compact_step_call_checkpoints(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        worker_id: str,
+        lease_epoch: int,
+        step_id: str,
+        now: datetime,
+    ) -> None:
+        """Drop recoverable call payloads after the step becomes authoritative."""
+        result = await self.runs.update_one(
+            {
+                "_id": _required_object_id(run_id, "run_id"),
+                "owner_id": _required_object_id(owner_id, "owner_id"),
+                "status": {"$in": ["running", "paused"]},
+                "lease.worker_id": str(worker_id),
+                "lease.expires_at": {"$gt": now},
+                "lease_epoch": int(lease_epoch),
+                "attempts": {"$elemMatch": {
+                    "step_id": str(step_id),
+                    "state": {"$in": [
+                        "settled",
+                        "resolved_retry",
+                        "resolved_skip",
+                    ]},
+                }},
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "attempts.$[attempt].result_checkpoint": None,
+                    "updated_at": now,
+                }
+            },
+            array_filters=[{
+                "attempt.step_id": str(step_id),
+                "attempt.state": {"$in": [
+                    "settled",
+                    "resolved_retry",
+                    "resolved_skip",
+                ]},
+            }],
+        )
+        if result.matched_count != 1:
+            raise AgentRuntimeStateConflict(
+                "completed Agent step checkpoints could not be compacted"
+            )
+
     async def release_call_pre_dispatch(
         self,
         *,

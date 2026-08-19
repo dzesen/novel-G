@@ -107,6 +107,17 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _is_sha256_digest(value: Any) -> bool:
+    normalized = str(value or "")
+    if len(normalized) != 64 or normalized != normalized.lower():
+        return False
+    try:
+        int(normalized, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def _schema_digest(schema: type) -> str:
     return _digest(schema.model_json_schema())
 
@@ -1636,8 +1647,25 @@ class AgentRuntime:
                     except (AttributeError, TypeError, ValueError):
                         add_violation("policy_decision_mismatch")
                     else:
+                        stored_validation_evidence = step.get(
+                            "validation_evidence"
+                        )
                         if (
-                            step.get("validation_evidence")
+                            validation_subject is None
+                            and reason_code in {
+                                "tool_output_invalid",
+                                "tool_result_invalid",
+                            }
+                            and isinstance(stored_validation_evidence, Mapping)
+                            and _is_sha256_digest(
+                                stored_validation_evidence.get("subject_digest")
+                            )
+                        ):
+                            expected_validation_evidence["subject_digest"] = str(
+                                stored_validation_evidence["subject_digest"]
+                            )
+                        if (
+                            stored_validation_evidence
                             != expected_validation_evidence
                         ):
                             add_violation("policy_decision_mismatch")
@@ -2116,6 +2144,14 @@ class AgentRuntime:
                     )
             else:
                 return run
+            await self._repository.compact_step_call_checkpoints(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=str(latest["step_id"]),
+                now=now,
+            )
             termination_event_key, _, _ = _termination_event_projection(
                 status=status,
                 reason_code=reason_code,
@@ -2162,6 +2198,14 @@ class AgentRuntime:
             and (step.get("planner_decision") or {}).get("kind") == "propose_finish"
             and completion.get("satisfied") is True
         ):
+            await self._repository.compact_step_call_checkpoints(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=active_step_id,
+                now=now,
+            )
             cleared = await self._repository.clear_active_step(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -2203,6 +2247,14 @@ class AgentRuntime:
                 raise AgentRuntimeStateConflict(
                     "failed Agent step is missing its termination reason"
                 )
+            await self._repository.compact_step_call_checkpoints(
+                run_id=run_id,
+                owner_id=owner_id,
+                worker_id=worker_id,
+                lease_epoch=lease_epoch,
+                step_id=active_step_id,
+                now=now,
+            )
             cleared = await self._repository.clear_active_step(
                 run_id=run_id,
                 owner_id=owner_id,
@@ -2443,6 +2495,14 @@ class AgentRuntime:
                 )
                 active_status = str(active_step.get("status") or "")
                 if active_status in {"completed", "failed"}:
+                    await self._repository.compact_step_call_checkpoints(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=active_step_id,
+                        now=now,
+                    )
                     cleared = await self._repository.clear_active_step(
                         run_id=run_id,
                         owner_id=owner_id,
@@ -4211,6 +4271,14 @@ class AgentRuntime:
             },
             now=now,
         )
+        await self._repository.compact_step_call_checkpoints(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
+            now=now,
+        )
         cleared = await self._repository.clear_active_step(
             run_id=run_id,
             owner_id=owner_id,
@@ -4347,6 +4415,14 @@ class AgentRuntime:
             expected="observed",
             status="completed",
             fields={},
+            now=now,
+        )
+        await self._repository.compact_step_call_checkpoints(
+            run_id=run_id,
+            owner_id=owner_id,
+            worker_id=worker_id,
+            lease_epoch=lease_epoch,
+            step_id=step_id,
             now=now,
         )
         await self._repository.clear_active_step(
