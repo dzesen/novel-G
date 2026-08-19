@@ -576,6 +576,16 @@ def _strict_event_sequence(event: Mapping[str, Any]) -> int:
     return sequence
 
 
+def _strict_event_sequences(events: list[Mapping[str, Any]]) -> list[int]:
+    sequences = [_strict_event_sequence(event) for event in events]
+    if any(
+        current <= previous
+        for previous, current in zip(sequences, sequences[1:])
+    ):
+        raise ValueError("Agent event sequences must be strictly increasing")
+    return sequences
+
+
 def _accounting_marker_call_keys_before_event(
     *,
     attempts: list[Mapping[str, Any]],
@@ -1313,6 +1323,12 @@ class AgentRuntime:
             run_id=run_id,
             owner_id=owner_id,
         )
+        try:
+            _strict_event_sequences(events)
+        except ValueError as exc:
+            raise AgentRuntimeStateConflict(
+                "Agent event sequence is invalid"
+            ) from exc
         event_by_key = {
             str(event.get("event_key") or ""): event for event in events
         }
@@ -1745,14 +1761,8 @@ class AgentRuntime:
             add_violation("step_ordinal_mismatch")
 
         try:
-            sequences = [_strict_event_sequence(item) for item in events]
+            _strict_event_sequences(events)
         except ValueError:
-            add_violation("event_sequence_mismatch")
-            sequences = []
-        if sequences and any(
-            current <= previous
-            for previous, current in zip(sequences, sequences[1:])
-        ):
             add_violation("event_sequence_mismatch")
 
         step_by_id = {str(item["step_id"]): item for item in steps}
