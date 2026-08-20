@@ -1396,10 +1396,21 @@ class _PipelineTrace:
         truncation_start = len(self.truncations)
         try:
             usage, summaries = _project_result_evidence(result)
-            self._record_cross_step_attempt_conflict(usage, summaries)
+            conflict = self._cross_step_attempt_conflict(
+                usage,
+                summaries,
+            )
+            if conflict is not None:
+                raise conflict
             self._record_evidence(usage, summaries)
         except _EvidenceProjectionError as exc:
             if isinstance(exc, _UnattributedUsageProjectionError):
+                conflict = self._cross_step_attempt_conflict(
+                    exc.usage,
+                    exc.attempts,
+                )
+                if conflict is not None:
+                    exc = conflict
                 self._record_unattributed_usage(exc)
             raise ChapterCandidatePipelineBlocked(
                 f"候选管线调用证据无效：{exc}"
@@ -1490,6 +1501,12 @@ class _PipelineTrace:
                 aggregate,
                 aggregate_evidence_kind=aggregate_kind,
             )
+            conflict = self._cross_step_attempt_conflict(
+                _effective_usage(aggregate, summaries),
+                summaries,
+            )
+            if conflict is not None:
+                raise conflict
             if aggregate_error is not None and (
                 not summaries
                 or isinstance(
@@ -1514,7 +1531,6 @@ class _PipelineTrace:
                     attempts=summaries,
                 ) from aggregate_error
             usage = _effective_usage(aggregate, summaries)
-            self._record_cross_step_attempt_conflict(usage, summaries)
             self._record_evidence(usage, summaries)
             raw_truncations = getattr(exc, "truncations", None)
             if raw_truncations is None and outcome is not None:
@@ -1560,6 +1576,12 @@ class _PipelineTrace:
                 projection_error,
                 _UnattributedUsageProjectionError,
             ):
+                conflict = self._cross_step_attempt_conflict(
+                    projection_error.usage,
+                    projection_error.attempts,
+                )
+                if conflict is not None:
+                    projection_error = conflict
                 self._record_unattributed_usage(projection_error)
             raise ChapterCandidatePipelineBlocked(
                 f"候选管线调用证据冲突或无效：{projection_error}"
@@ -1637,23 +1659,23 @@ class _PipelineTrace:
             self.unattributed_usage.append(marker)
         self.tokens = _MAX_TOKEN_COUNT
 
-    def _record_cross_step_attempt_conflict(
+    def _cross_step_attempt_conflict(
         self,
         usage: CandidateUsageSummary,
         summaries: tuple[CandidateAttemptSummary, ...],
-    ) -> None:
+    ) -> _UnattributedUsageProjectionError | None:
         """Preserve a later paid step without reusing an earlier ledger ID."""
         known_ids = {item.attempt_id for item in self.attempts}
         reused = tuple(
             item for item in summaries if item.attempt_id in known_ids
         )
         if not reused:
-            return
+            return None
         new = tuple(
             item for item in summaries if item.attempt_id not in known_ids
         )
         if len(self.attempts) + len(new) > _MAX_PIPELINE_ATTEMPTS:
-            raise _UnattributedUsageProjectionError(
+            return _UnattributedUsageProjectionError(
                 "付费步骤复用了先前步骤的 attempt_id，且新调用证据超过 V1 上限",
                 reason=(
                     CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
@@ -1665,18 +1687,22 @@ class _PipelineTrace:
         try:
             new_usage = _summed_usage(new)
             reused_usage = _summed_usage(reused)
+            conflict_usage = _conservative_usage_max(
+                reused_usage,
+                _usage_residual(usage, new_usage),
+            )
             next_tokens = _checked_token_add(
                 self.tokens,
                 new_usage.total_tokens,
             )
         except _UsageProjectionOverflow as overflow:
-            raise _usage_overflow_error(str(overflow)) from overflow
+            return _usage_overflow_error(str(overflow))
         self.attempts.extend(new)
         self.tokens = next_tokens
-        raise _UnattributedUsageProjectionError(
+        return _UnattributedUsageProjectionError(
             "付费步骤复用了先前步骤的 attempt_id",
             reason=CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT,
-            usage=reused_usage,
+            usage=conflict_usage,
             attempts=(),
             evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
         )
