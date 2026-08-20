@@ -35,6 +35,9 @@ from backend.services.generation.outline_adherence import (
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
+from backend.services.generation.prose_completion import (
+    completion_allows_formal_write,
+)
 from backend.services.generation.state_repair_contracts import (
     MAX_STATE_REPAIR_CARD_ID_LENGTH,
     MAX_STATE_REPAIR_CARD_IDS,
@@ -672,7 +675,15 @@ def _usage_delta(
     current: CandidateUsageSummary,
     accounted: CandidateUsageSummary,
 ) -> tuple[CandidateUsageSummary, CandidateUsageEvidenceKind]:
-    total_delta = max(0, current.total_tokens - accounted.total_tokens)
+    current_floor = max(
+        current.total_tokens,
+        _checked_token_add(current.input_tokens, current.output_tokens),
+    )
+    accounted_floor = max(
+        accounted.total_tokens,
+        _checked_token_add(accounted.input_tokens, accounted.output_tokens),
+    )
+    total_delta = max(0, current_floor - accounted_floor)
     if (
         current.input_tokens >= accounted.input_tokens
         and current.output_tokens >= accounted.output_tokens
@@ -707,6 +718,29 @@ def _summed_usage(
     attempts: tuple[CandidateAttemptSummary, ...],
 ) -> CandidateUsageSummary:
     return _summed_usage_values(tuple(item.usage for item in attempts))
+
+
+def _attempt_usage_violation(
+    attempt: CandidateAttemptSummary,
+) -> tuple[str, CandidateUnattributedUsageReason] | None:
+    usage_floor = _usage_component_floor(attempt.usage)
+    if (
+        attempt.state is CandidateAttemptState.RELEASED_PRE_DISPATCH
+        and usage_floor.total_tokens != 0
+    ):
+        return (
+            "派发前释放的 attempt 不能包含实际 Token 用量",
+            CandidateUnattributedUsageReason.RELEASED_PREDISPATCH_USAGE_INVALID,
+        )
+    if (
+        attempt.state in _CHARGED_ATTEMPT_STATES
+        and usage_floor.total_tokens == 0
+    ):
+        return (
+            "已计费 attempt 缺少 Token 用量",
+            CandidateUnattributedUsageReason.CHARGED_ATTEMPT_USAGE_MISSING,
+        )
+    return None
 
 
 def _unattributed_usage_error(
@@ -744,41 +778,19 @@ def _attribute_aggregate_usage(
                 evidence_kind=aggregate_evidence_kind,
             )
         return attempts
-    released_with_usage = [
-        item
-        for item in attempts
-        if (
-            item.state is CandidateAttemptState.RELEASED_PRE_DISPATCH
-            and item.usage.total_tokens != 0
-        )
-    ]
-    if released_with_usage:
+    violation = next(
+        (
+            violation
+            for item in attempts
+            if (violation := _attempt_usage_violation(item)) is not None
+        ),
+        None,
+    )
+    if violation is not None:
+        message, reason = violation
         raise _unattributed_usage_error(
-            "派发前释放的 attempt 不能包含实际 Token 用量",
-            reason=(
-                CandidateUnattributedUsageReason.RELEASED_PREDISPATCH_USAGE_INVALID
-            ),
-            aggregate=aggregate,
-            attempts=attempts,
-            evidence_kind=_merge_usage_evidence_kind(
-                aggregate_evidence_kind,
-                CandidateUsageEvidenceKind.INCOMPLETE,
-            ),
-        )
-    charged_without_usage = [
-        item
-        for item in attempts
-        if (
-            item.state in _CHARGED_ATTEMPT_STATES
-            and item.usage.total_tokens == 0
-        )
-    ]
-    if charged_without_usage:
-        raise _unattributed_usage_error(
-            "已计费 attempt 缺少 Token 用量",
-            reason=(
-                CandidateUnattributedUsageReason.CHARGED_ATTEMPT_USAGE_MISSING
-            ),
+            message,
+            reason=reason,
             aggregate=aggregate,
             attempts=attempts,
             evidence_kind=_merge_usage_evidence_kind(
@@ -1565,28 +1577,13 @@ def _checkpoint_step_name(
 def _checkpoint_completion_passed(
     checkpoint: ProseCandidateCheckpointV1,
 ) -> bool:
-    return _completion_contract_passed(
+    return completion_allows_formal_write(
         status=checkpoint.completion.status,
         can_write_formal_prose=(
             checkpoint.completion.can_write_formal_prose
         ),
         finish_reason=checkpoint.completion.finish_reason,
     )
-
-
-def _completion_contract_passed(
-    *,
-    status: Any,
-    can_write_formal_prose: Any,
-    finish_reason: Any,
-) -> bool:
-    return bool(
-        status == "complete"
-        and can_write_formal_prose is True
-        and finish_reason == "stop"
-    )
-
-
 def _checkpoint_adherence_passed(
     checkpoint: AdherenceCandidateCheckpointV1,
     *,
@@ -2044,7 +2041,7 @@ def _resume_trace(
             reason=CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID,
         )
         raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
-    attempt_ids: set[str] = set()
+    attempts_by_id: dict[str, CandidateAttemptSummary] = {}
     has_unresolved_uncertain_attempt = False
     for item in progress.attempts:
         if not isinstance(item, CandidateAttemptSummary):
@@ -2061,13 +2058,29 @@ def _resume_trace(
             validated = CandidateAttemptSummary.model_validate(
                 item.model_dump(mode="python")
             )
-            if validated.attempt_id in attempt_ids:
+            violation = _attempt_usage_violation(validated)
+            if violation is not None:
+                message, reason = violation
+                _preserve_resume_aggregate_floor(
+                    restored,
+                    aggregate_tokens=trusted_progress_tokens,
+                    reason=reason,
+                    item_usage_floor=_usage_component_floor(validated.usage),
+                )
+                raise _blocked_resume(restored, message)
+            existing = attempts_by_id.get(validated.attempt_id)
+            if existing is not None:
+                usage_delta, _evidence_kind = _usage_delta(
+                    validated.usage,
+                    existing.usage,
+                )
                 _preserve_resume_aggregate_floor(
                     restored,
                     aggregate_tokens=trusted_progress_tokens,
                     reason=(
                         CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
                     ),
+                    item_usage_floor=usage_delta,
                 )
                 raise _blocked_resume(restored, "候选管线恢复 attempt 重复")
         except _UsageProjectionOverflow as exc:
@@ -2092,7 +2105,7 @@ def _resume_trace(
                 "候选管线恢复 attempt 无效",
             ) from exc
         restored.attempts.append(validated)
-        attempt_ids.add(validated.attempt_id)
+        attempts_by_id[validated.attempt_id] = validated
         has_unresolved_uncertain_attempt = bool(
             has_unresolved_uncertain_attempt
             or validated.state is CandidateAttemptState.UNCERTAIN
@@ -2151,6 +2164,18 @@ def _resume_trace(
                 restored,
                 "候选管线恢复用量证据无效",
             ) from exc
+        if (
+            validated.reason
+            is CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
+        ):
+            if (
+                validated.usage
+                != CandidateUsageSummary(total_tokens=_MAX_TOKEN_COUNT)
+                or validated.evidence_kind
+                is not CandidateUsageEvidenceKind.LOWER_BOUND
+            ):
+                restored._record_usage_overflow()
+                continue
         restored.unattributed_usage.append(validated)
         try:
             _refresh_restored_usage(restored)
@@ -2263,8 +2288,18 @@ def _resume_trace(
     review_count = replay.review_count
     if replay.completed_steps != progress.completed_steps:
         raise _blocked_resume(restored, "候选管线恢复步骤与检查点不一致")
-    if replay.attempt_ids != tuple(
+    restored_attempt_ids = tuple(
         item.attempt_id for item in restored.attempts
+    )
+    trailing_attempts = restored.attempts[len(replay.attempt_ids):]
+    if (
+        restored_attempt_ids[:len(replay.attempt_ids)]
+        != replay.attempt_ids
+        or len(trailing_attempts) > 1
+        or any(
+            item.state is not CandidateAttemptState.UNCERTAIN
+            for item in trailing_attempts
+        )
     ):
         raise _blocked_resume(restored, "候选管线恢复调用与检查点不一致")
     if replay.truncations != tuple(restored.truncations):
@@ -2713,7 +2748,7 @@ def _validate_prose_source(
 
 def _completion_passed(source: ProseCandidateSource) -> bool:
     completion = source.completion
-    return _completion_contract_passed(
+    return completion_allows_formal_write(
         status=completion.get("status"),
         can_write_formal_prose=completion.get("can_write_formal_prose"),
         finish_reason=completion.get("finish_reason"),

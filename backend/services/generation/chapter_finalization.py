@@ -20,6 +20,9 @@ from backend.services.generation.outline_adherence import (
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import ProseRunModule, prose_run_module
+from backend.services.generation.prose_completion import (
+    completion_allows_formal_write,
+)
 from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.state_proposal import (
@@ -336,9 +339,10 @@ class ChapterFinalizationService:
         chapter: Mapping[str, Any],
     ) -> dict[str, Any]:
         completion = dict(prose_command.payload.get("completion") or {})
-        if (
-            completion.get("can_write_formal_prose") is not True
-            or str(completion.get("status") or "") != "complete"
+        if not completion_allows_formal_write(
+            status=completion.get("status"),
+            can_write_formal_prose=completion.get("can_write_formal_prose"),
+            finish_reason=completion.get("finish_reason"),
         ):
             raise ChapterFinalizationDenied("正文候选未通过完整性闸门")
         adherence = dict(evidence.outline_adherence or {})
