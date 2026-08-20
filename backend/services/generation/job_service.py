@@ -17,11 +17,29 @@ from backend.services.generation.chapter_candidate_authorization import (
     authorized_candidate_repair_attempt_slots,
     readiness_uses_candidate_pipeline,
 )
+from backend.services.generation.chapter_candidate_job import (
+    CandidateJobExecution,
+    ChapterCandidateJobRunner,
+    ChapterCandidateJobRunnerDeps,
+)
+from backend.services.generation.chapter_candidate_repairs import (
+    ChapterCandidateRepairApplication,
+)
+from backend.services.generation.chapter_finalization import (
+    ChapterFinalizationAuthorization,
+    ChapterFinalizationEvidence,
+    chapter_finalization_service,
+    parse_chapter_finalization_authorization,
+)
 from backend.services.generation.attempt_scope import JobAttemptScope
 from backend.services.generation.headless_generation import (
     build_chapter_pipeline_deps,
     estimate_chapter_attempt_slots,
     estimate_worklist_attempt_capacity,
+    generate_outline,
+    generate_prose_candidate,
+    generate_state_candidate,
+    review_prose_candidate,
 )
 from backend.services.generation.failure_diagnostics import summarize_jobs
 from backend.services.generation.job_engine import (
@@ -37,6 +55,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
 from backend.services.generation.readiness import generation_readiness_module
 from backend.services.novel.state_completion import state_completion_module
+from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.novel.emergent_reference_card_candidates import (
     emergent_reference_card_candidate_module,
 )
@@ -427,6 +446,157 @@ class GenerationJobService:
             finally:
                 await generation_job_repo.finish_attempt_reservation(job_id, chapter_id)
 
+        async def _run_candidate_chapter(
+            novel_id: str,
+            chapter: Dict[str, Any],
+        ):
+            chapter_id = str(chapter["_id"])
+            current_job = await generation_job_repo.get_job(job_id)
+            readiness = current_job.get("readiness")
+            if not isinstance(readiness, Mapping):
+                raise ValueError("candidate Job readiness is invalid")
+            generation_params = dict(
+                current_job.get("generation_params") or {}
+            )
+            authorized_slots = _estimate_authorized_chapter_attempt_slots(
+                current_job,
+                chapter,
+                generation_params,
+            )
+            existing_slots = await generation_job_repo.list_attempt_slots(
+                job_id,
+                chapter_id=chapter_id,
+                step_prefix="",
+            )
+            remaining_slots = max(0, authorized_slots - len(existing_slots))
+            await generation_job_repo.reserve_attempts(
+                job_id,
+                chapter_id,
+                remaining_slots,
+            )
+
+            def build_execution(
+                *,
+                chapter_id: str,
+                attempt_scope_factory,
+            ) -> CandidateJobExecution:
+                repairs = ChapterCandidateRepairApplication(
+                    execution_id=job_id,
+                    readiness=readiness,
+                    generation_params=generation_params,
+                    attempt_scope_factory=attempt_scope_factory,
+                )
+                cycles, adherence_plan, state_plan = (
+                    repairs.execution_snapshot(chapter_id=chapter_id)
+                )
+                return CandidateJobExecution(
+                    max_repair_cycles=cycles,
+                    adherence_plan=adherence_plan,
+                    state_plan=state_plan,
+                    repair_prose_candidate=(
+                        repairs.repair_prose_candidate if cycles else None
+                    ),
+                    repair_state_candidate=(
+                        repairs.repair_state_candidate if cycles else None
+                    ),
+                    recover_source=repairs.recover_source,
+                )
+
+            async def finalize_candidate(
+                *,
+                owner_id: str,
+                novel_id: str,
+                chapter: Mapping[str, Any],
+                source,
+                adherence: Mapping[str, Any],
+                state: Mapping[str, Any],
+                repair_cycles_used: int,
+            ) -> Mapping[str, Any]:
+                del novel_id
+                planning = readiness.get("planning")
+                if not isinstance(planning, Mapping):
+                    raise ValueError("candidate finalization planning is invalid")
+                frozen = parse_chapter_finalization_authorization(
+                    planning.get("chapter_finalization_authorization")
+                )
+                proposal_id = state.get("proposal_id")
+                acceptance_token = state.get("acceptance_token")
+                if not isinstance(proposal_id, str) or not isinstance(
+                    acceptance_token, str
+                ):
+                    raise ValueError("candidate state receipt is invalid")
+                readiness_digest = readiness.get("digest")
+                if not isinstance(readiness_digest, str) or not readiness_digest:
+                    raise ValueError("candidate readiness digest is invalid")
+                return await chapter_finalization_service.commit(
+                    owner_id=owner_id,
+                    chapter_id=str(chapter.get("_id") or ""),
+                    prose_run_id=source.source_run_id,
+                    prose_run_revision=source.source_run_revision,
+                    state_proposal_id=proposal_id,
+                    state_acceptance_token=acceptance_token,
+                    authorization=ChapterFinalizationAuthorization(
+                        job_id=job_id,
+                        readiness_digest=readiness_digest,
+                        authorization_revision=frozen[
+                            "authorization_revision"
+                        ],
+                    ),
+                    evidence=ChapterFinalizationEvidence(
+                        outline_adherence=dict(adherence),
+                        repair_cycles_used=repair_cycles_used,
+                    ),
+                )
+
+            runner = ChapterCandidateJobRunner(
+                execution_id=job_id,
+                readiness=readiness,
+                generation_params=generation_params,
+                recalculate_after_outline=(
+                    lambda accepted_chapter_id, _outline:
+                    GenerationJobService._recalculate_after_outline_acceptance(
+                        job_id,
+                        accepted_chapter_id,
+                    )
+                ),
+                deps=ChapterCandidateJobRunnerDeps(
+                    get_novel=novel_repo.get_novel_by_id,
+                    get_chapter=chapter_repo.get_chapter_by_id,
+                    list_checkpoints=(
+                        generation_job_repo.list_candidate_pipeline_checkpoints
+                    ),
+                    append_checkpoint=(
+                        generation_job_repo.append_candidate_pipeline_checkpoint
+                    ),
+                    list_attempts=generation_job_repo.list_attempt_slots,
+                    attempt_scope_factory=(
+                        lambda target_job_id, target_chapter_id, step, slots:
+                        JobAttemptScope(
+                            target_job_id,
+                            target_chapter_id,
+                            step,
+                            existing_attempt_slots=slots,
+                        )
+                    ),
+                    build_execution=build_execution,
+                    generate_outline=generate_outline,
+                    generate_prose_candidate=generate_prose_candidate,
+                    review_prose_candidate=review_prose_candidate,
+                    generate_state_candidate=generate_state_candidate,
+                    recover_state_candidate=(
+                        state_proposal_module.recover_owned_repair_result
+                    ),
+                    finalize=finalize_candidate,
+                ),
+            )
+            try:
+                return await runner.run(novel_id, chapter)
+            finally:
+                await generation_job_repo.finish_attempt_reservation(
+                    job_id,
+                    chapter_id,
+                )
+
         async def _inspect_reference_card_blockers():
             current_job = await generation_job_repo.get_job(job_id)
             return await emergent_reference_card_candidate_module.blocking_summary(
@@ -436,6 +606,7 @@ class GenerationJobService:
         deps = JobEngineDeps(
             list_worklist_chapters=_list_worklist,
             run_chapter=_run_chapter,
+            run_candidate_chapter=_run_candidate_chapter,
             inspect_reference_card_blockers=_inspect_reference_card_blockers,
         )
         task = asyncio.create_task(run_job(job_id, deps, control))

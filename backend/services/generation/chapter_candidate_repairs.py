@@ -24,6 +24,7 @@ from backend.services.agent_runtime.contracts import (
 )
 from backend.services.generation.chapter_candidate_authorization import (
     CandidateRepairAuthorization,
+    authorized_candidate_repair_attempt_slots,
     parse_candidate_repair_authorization,
     validate_candidate_repair_execution_authorization,
 )
@@ -456,6 +457,41 @@ class ChapterCandidateRepairApplication:
             raise ValueError("candidate repair has no prose Runtime authority")
         return authorization, bundle, adherence_plan, state_plan
 
+    def execution_snapshot(
+        self,
+        *,
+        chapter_id: str,
+    ) -> tuple[int, GenerationPlan, GenerationPlan]:
+        """Validate and expose the frozen plans used by the outer candidate tail."""
+
+        planning = self._readiness.get("planning")
+        if not isinstance(planning, Mapping):
+            raise ValueError("candidate repair readiness planning is invalid")
+        raw_authorization = planning.get(
+            "chapter_candidate_repair_authorization"
+        )
+        if not isinstance(raw_authorization, Mapping):
+            raise ValueError("candidate repair authority is missing")
+        authorization = parse_candidate_repair_authorization(
+            raw_authorization
+        )
+        cycles = authorization.max_repair_cycles_per_chapter
+        adherence_plan, state_plan = self._deps.plan_candidate_workflows()
+        if cycles:
+            _authorization, _bundle, adherence_plan, state_plan = (
+                self._authorized_snapshot(
+                    chapter_id=chapter_id,
+                    cycle=1,
+                )
+            )
+        else:
+            authorized_candidate_repair_attempt_slots(
+                self._readiness,
+                chapter_id=chapter_id,
+                generation_params=self._generation_params,
+            )
+        return cycles, adherence_plan, state_plan
+
     def _state_receipt_identity(
         self,
         *,
@@ -755,6 +791,27 @@ class ChapterCandidateRepairApplication:
             source_run_revision=revision,
             source_content_digest=digest,
             completion=completion,
+        )
+
+    async def recover_source(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        run_id: str,
+        revision: int,
+        digest: str,
+    ) -> ProseCandidateSource:
+        """Rebuild one exact persisted ProseRun without dispatching a Provider."""
+
+        return await self._source(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            run_id=run_id,
+            revision=revision,
+            digest=digest,
         )
 
     @staticmethod
