@@ -694,6 +694,14 @@ class GenerationJobRepository(BaseRepository):
         current_pre_dispatch_fence: PreDispatchFenceV1 | None = None,
     ) -> bool:
         """Remove a cross-ledger orphan only after receipt fencing proves no dispatch."""
+        current_fence: dict[str, Any] | None = None
+        if current_pre_dispatch_fence is not None:
+            validated_fence = _validated_pre_dispatch_fence(
+                current_pre_dispatch_fence
+            )
+            if validated_fence.step_id != str(step_id):
+                raise ValueError("pre-dispatch fence step does not match cleanup")
+            current_fence = validated_fence.model_dump(mode="json")
         job = await self.get_job(job_id)
         slot = next(
             (
@@ -711,14 +719,7 @@ class GenerationJobRepository(BaseRepository):
         )
         if slot is None:
             return False
-        current_fence: dict[str, Any] | None = None
-        if current_pre_dispatch_fence is not None:
-            validated_fence = _validated_pre_dispatch_fence(
-                current_pre_dispatch_fence
-            )
-            if validated_fence.step_id != str(step_id):
-                raise ValueError("pre-dispatch fence step does not match cleanup")
-            current_fence = validated_fence.model_dump(mode="json")
+        if current_fence is not None:
             active_fence = (job.get("attempt_reservation") or {}).get(
                 "pre_dispatch_fence"
             )
