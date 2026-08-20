@@ -228,6 +228,7 @@ def _ordered_attempt_projection(
         "uncertain": "uncertain",
         "uncertain_retry_acknowledged": "resolved_retry",
         "uncertain_skip_acknowledged": "resolved_skip",
+        "uncertain_abort_acknowledged": "resolved_abort",
     }
     allowed_states = {*charged_states, "released_pre_dispatch", "claimed"}
     for raw in raw_attempts:

@@ -33,6 +33,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
+    STATE_DISPATCH_RESOLUTION_ACTIONS,
     StateContextProjection,
 )
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
@@ -49,7 +50,6 @@ from backend.services.novel.state_validation import (
 
 PROPOSAL_TTL_SECONDS = 15 * 60
 STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION = 1
-_JOB_DISPATCH_RESOLUTION_ACTIONS = frozenset({"retry", "skip", "abort"})
 
 
 class StaleStatePreview(ValueError):
@@ -1340,7 +1340,7 @@ class StateProposalModule:
     ) -> bool:
         """Persist one explicit retry/skip/abort decision without releasing its key."""
 
-        if action not in _JOB_DISPATCH_RESOLUTION_ACTIONS:
+        if action not in STATE_DISPATCH_RESOLUTION_ACTIONS:
             raise ValueError("Unknown state Provider dispatch resolution")
         frozen, proposal = await self._load_job_bound_proposal(binding)
         if proposal is None:
@@ -1353,7 +1353,10 @@ class StateProposalModule:
         status = str(proposal.get("status") or "")
         if status == expected_status:
             return True
-        if status not in {"dispatched", "failed"}:
+        allowed_statuses = {"dispatched", "failed"}
+        if action == "abort":
+            allowed_statuses.update({"generating", "proposed"})
+        if status not in allowed_statuses:
             raise MutationConflictError(
                 "Persisted state Provider dispatch cannot accept this resolution"
             )
@@ -1394,7 +1397,7 @@ class StateProposalModule:
     ) -> bool:
         """Release only a receipt carrying the same explicit resolution action."""
 
-        if action not in _JOB_DISPATCH_RESOLUTION_ACTIONS:
+        if action not in STATE_DISPATCH_RESOLUTION_ACTIONS:
             raise ValueError("Unknown state Provider dispatch resolution")
         frozen, proposal = await self._load_job_bound_proposal(binding)
         if proposal is None:
@@ -1586,6 +1589,13 @@ class StateProposalModule:
         current = await self.collection.find_one({"_id": proposal_id}, session=session)
         if current is None:
             raise MutationConflictError("State proposal disappeared before acceptance")
+        stored_job_binding = _job_mutation_binding(current)
+        if stored_job_binding is not None and not _uses_current_dispatch_protocol(
+            current
+        ):
+            raise MutationConflictError(
+                "State proposal Provider dispatch evidence is unknown"
+            )
         existing = current.get("claim") or {}
         if current.get("status") in {"claimed", "applied"}:
             if (
@@ -1598,7 +1608,6 @@ class StateProposalModule:
             )
         if current.get("status") != "proposed":
             raise MutationConflictError("State proposal cannot be claimed")
-        stored_job_binding = _job_mutation_binding(current)
         raw_claim_binding = claim.get("job_mutation_binding")
         supplied_job_binding = None
         if raw_claim_binding is not None:
@@ -1691,12 +1700,15 @@ class StateProposalModule:
             raise MutationConflictError(
                 "Narrative state changed before proposal acceptance"
             )
+        claim_query: dict[str, Any] = {
+            "_id": proposal_id,
+            "status": "proposed",
+            "narrative_revision": expected_revision,
+        }
+        if stored_job_binding is not None:
+            claim_query["dispatch_protocol_revision"] = _dispatch_protocol_query()
         claimed = await self.collection.find_one_and_update(
-            {
-                "_id": proposal_id,
-                "status": "proposed",
-                "narrative_revision": expected_revision,
-            },
+            claim_query,
             {
                 "$set": {
                     "status": "claimed",
@@ -1716,6 +1728,13 @@ class StateProposalModule:
         )
         if claimed is None:
             latest = await self.collection.find_one({"_id": proposal_id}, session=session)
+            if (
+                _job_mutation_binding(latest or {}) is not None
+                and not _uses_current_dispatch_protocol(latest or {})
+            ):
+                raise MutationConflictError(
+                    "State proposal Provider dispatch evidence is unknown"
+                )
             latest_claim = (latest or {}).get("claim") or {}
             if (
                 (latest or {}).get("status") in {"claimed", "applied"}
@@ -1734,12 +1753,17 @@ class StateProposalModule:
     ) -> None:
         proposal_id = to_object_id(str(claim["proposal_id"]))
         decision_digest = str(claim["decision_digest"])
+        applied_query: dict[str, Any] = {
+            "_id": proposal_id,
+            "status": "claimed",
+            "claim.decision_digest": decision_digest,
+        }
+        if claim.get("job_mutation_binding") is not None:
+            applied_query["dispatch_protocol_revision"] = (
+                _dispatch_protocol_query()
+            )
         applied = await self.collection.find_one_and_update(
-            {
-                "_id": proposal_id,
-                "status": "claimed",
-                "claim.decision_digest": decision_digest,
-            },
+            applied_query,
             {
                 "$set": {
                     "status": "applied",
@@ -1756,6 +1780,13 @@ class StateProposalModule:
         if applied is not None:
             return
         current = await self.collection.find_one({"_id": proposal_id}, session=session)
+        if (
+            claim.get("job_mutation_binding") is not None
+            and not _uses_current_dispatch_protocol(current or {})
+        ):
+            raise MutationConflictError(
+                "State proposal Provider dispatch evidence is unknown"
+            )
         current_claim = (current or {}).get("claim") or {}
         if (
             (current or {}).get("status") == "applied"

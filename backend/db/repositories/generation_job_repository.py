@@ -27,6 +27,9 @@ from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
     JobMutationReceiptV1,
     PreDispatchFenceV1,
+    STATE_DISPATCH_RESOLUTION_ACTIONS,
+    STATE_DISPATCH_RESOLUTION_PHASES,
+    StateDispatchResolutionV1,
     candidate_pipeline_checkpoint_digest,
     candidate_pipeline_checkpoint_ledger_digest,
     parse_candidate_pipeline_checkpoint,
@@ -44,6 +47,7 @@ _ATOMIC_JOB_FIELDS = frozenset({
     "expected_narrative_revision",
     "job_mutation_recovery",
     "progress",
+    "state_dispatch_resolution",
 })
 _MAX_NARRATIVE_REVISION = 2**63 - 1
 
@@ -96,6 +100,8 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         )
     if document.get("job_mutation_recovery") is not None:
         raise ValueError("Job mutation recovery binding must start empty")
+    if document.get("state_dispatch_resolution") is not None:
+        raise ValueError("State dispatch resolution must start empty")
     revision = document.get("expected_narrative_revision")
     if revision is not None and (
         type(revision) is not int
@@ -717,6 +723,266 @@ class GenerationJobRepository(BaseRepository):
             return True
         raise CandidatePipelineCheckpointConflict(
             "Job mutation recovery release lost its terminal fence"
+        )
+
+    @staticmethod
+    def _validated_state_dispatch_resolution(
+        resolution: StateDispatchResolutionV1,
+    ) -> StateDispatchResolutionV1:
+        try:
+            return StateDispatchResolutionV1.model_validate(
+                resolution.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch resolution is invalid"
+            ) from exc
+
+    async def begin_state_dispatch_resolution(
+        self,
+        job_id: str,
+        binding: JobMutationRecoveryBindingV1,
+        action: str,
+    ) -> StateDispatchResolutionV1:
+        """Persist one immutable explicit action before touching either ledger."""
+
+        try:
+            frozen_binding = JobMutationRecoveryBindingV1.model_validate(
+                binding.model_dump(mode="python")
+            )
+            intent = StateDispatchResolutionV1(
+                schema_version="state_dispatch_resolution.v1",
+                binding=frozen_binding,
+                action=action,
+                phase="intent",
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch resolution intent is invalid"
+            ) from exc
+        if frozen_binding.job_id != str(job_id):
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch resolution belongs to another Job"
+            )
+        canonical_binding = frozen_binding.model_dump(mode="json")
+        canonical_intent = intent.model_dump(mode="json")
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "job_mutation_recovery": canonical_binding,
+                "$or": [
+                    {"state_dispatch_resolution": {"$exists": False}},
+                    {"state_dispatch_resolution": None},
+                ],
+            },
+            {
+                "$set": {
+                    "state_dispatch_resolution": canonical_intent,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return intent
+        current = await self.get_job(job_id)
+        raw = current.get("state_dispatch_resolution")
+        try:
+            existing = StateDispatchResolutionV1.model_validate(raw)
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Persisted state dispatch resolution is invalid"
+            ) from exc
+        if existing.binding == frozen_binding and existing.action == intent.action:
+            return existing
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch resolution intent diverged"
+        )
+
+    async def advance_state_dispatch_resolution(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV1,
+        next_phase: str,
+    ) -> StateDispatchResolutionV1:
+        """Advance exactly one durable action phase with the Job marker fenced."""
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        try:
+            current_index = STATE_DISPATCH_RESOLUTION_PHASES.index(current.phase)
+            next_index = STATE_DISPATCH_RESOLUTION_PHASES.index(next_phase)
+        except ValueError as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch resolution phase is invalid"
+            ) from exc
+        if next_index != current_index + 1:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch resolution phase is not monotonic"
+            )
+        advanced = current.model_copy(update={"phase": next_phase})
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "job_mutation_recovery": current.binding.model_dump(mode="json"),
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+            },
+            {
+                "$set": {
+                    "state_dispatch_resolution": advanced.model_dump(mode="json"),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return advanced
+        latest = await self.get_job(job_id)
+        try:
+            existing = StateDispatchResolutionV1.model_validate(
+                latest.get("state_dispatch_resolution")
+            )
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Persisted state dispatch resolution disappeared"
+            ) from exc
+        if existing == advanced:
+            return existing
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch resolution phase raced"
+        )
+
+    async def transition_state_dispatch_retry(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV1,
+        fields: Dict[str, Any],
+    ) -> StateDispatchResolutionV1:
+        """Set Job running only after both ledgers and the receipt key are resolved."""
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        if current.action != "retry" or current.phase != "proposal_released":
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry is not ready to transition"
+            )
+        if fields.get("status") != "running":
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry target status is invalid"
+            )
+        _reject_atomic_field_updates(fields)
+        transitioned = current.model_copy(update={"phase": "job_transitioned"})
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "job_mutation_recovery": current.binding.model_dump(mode="json"),
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+            },
+            {
+                "$set": {
+                    **dict(fields),
+                    "state_dispatch_resolution": transitioned.model_dump(
+                        mode="json"
+                    ),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return transitioned
+        latest = await self.get_job(job_id)
+        try:
+            existing = StateDispatchResolutionV1.model_validate(
+                latest.get("state_dispatch_resolution")
+            )
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry transition disappeared"
+            ) from exc
+        if existing == transitioned and latest.get("status") == "running":
+            return existing
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch retry transition raced"
+        )
+
+    async def complete_state_dispatch_terminal(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV1,
+        fields: Dict[str, Any],
+    ) -> bool:
+        """Publish skip/abort terminal state and clear both Job receipts atomically."""
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        expected_status = {"skip": "failed", "abort": "aborted"}.get(
+            current.action
+        )
+        if current.phase != "proposal_released" or expected_status is None:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch terminal resolution is not ready"
+            )
+        if fields.get("status") != expected_status:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch terminal status is invalid"
+            )
+        _reject_atomic_field_updates(fields)
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "job_mutation_recovery": current.binding.model_dump(mode="json"),
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+            },
+            {
+                "$set": {**dict(fields), "updated_at": get_utc_now()},
+                "$unset": {
+                    "job_mutation_recovery": "",
+                    "state_dispatch_resolution": "",
+                },
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        if (
+            latest.get("status") == expected_status
+            and latest.get("job_mutation_recovery") is None
+            and latest.get("state_dispatch_resolution") is None
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch terminal transition raced"
+        )
+
+    async def clear_state_dispatch_resolution(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV1,
+    ) -> bool:
+        """Clear a retry receipt only after a worker has been scheduled."""
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        if current.action != "retry" or current.phase != "job_transitioned":
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry completion is invalid"
+            )
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+            },
+            {
+                "$unset": {"state_dispatch_resolution": ""},
+                "$set": {"updated_at": get_utc_now()},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        if latest.get("state_dispatch_resolution") is None:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch retry completion raced"
         )
 
     async def complete_job_mutation_chapter(
@@ -1413,7 +1679,7 @@ class GenerationJobRepository(BaseRepository):
         return changed
 
     async def acknowledge_uncertain_attempts(self, job_id: str, action: str) -> bool:
-        if action not in {"retry", "skip"}:
+        if action not in STATE_DISPATCH_RESOLUTION_ACTIONS:
             raise ValueError("Unknown uncertain-attempt action")
         now = get_utc_now()
         result = await self.collection.update_one(

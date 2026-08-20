@@ -370,6 +370,7 @@ def _attempt_summary(slot: Mapping[str, Any]) -> CandidateAttemptSummary:
         "released_pre_dispatch": CandidateAttemptState.RELEASED_PRE_DISPATCH,
         "uncertain_retry_acknowledged": CandidateAttemptState.RESOLVED_RETRY,
         "uncertain_skip_acknowledged": CandidateAttemptState.RESOLVED_SKIP,
+        "uncertain_abort_acknowledged": CandidateAttemptState.RESOLVED_ABORT,
     }.get(state_value)
     if state is None:
         raise ChapterCandidatePipelineBlocked("候选作业持久调用状态无效")

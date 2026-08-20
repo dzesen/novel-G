@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
@@ -101,6 +101,29 @@ class JobMutationRecoveryBindingV1(BaseModel):
         "finalize_chapter_generation",
     ]
     idempotency_key: str = Field(min_length=1, max_length=240)
+
+
+StateDispatchResolutionAction = Literal["retry", "skip", "abort"]
+StateDispatchResolutionPhase = Literal[
+    "intent",
+    "proposal_acknowledged",
+    "attempts_acknowledged",
+    "proposal_released",
+    "job_transitioned",
+]
+STATE_DISPATCH_RESOLUTION_PHASES = get_args(StateDispatchResolutionPhase)
+STATE_DISPATCH_RESOLUTION_ACTIONS = get_args(StateDispatchResolutionAction)
+
+
+class StateDispatchResolutionV1(BaseModel):
+    """Durable phase receipt for one explicit Job-bound dispatch decision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["state_dispatch_resolution.v1"]
+    binding: JobMutationRecoveryBindingV1
+    action: StateDispatchResolutionAction
+    phase: StateDispatchResolutionPhase
 
 
 class JobMutationReceiptV1(BaseModel):

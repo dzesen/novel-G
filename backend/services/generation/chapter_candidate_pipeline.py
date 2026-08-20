@@ -98,6 +98,7 @@ class CandidateAttemptState(StrEnum):
     UNCERTAIN = "uncertain"
     RESOLVED_RETRY = "resolved_retry"
     RESOLVED_SKIP = "resolved_skip"
+    RESOLVED_ABORT = "resolved_abort"
     UNKNOWN = "unknown"
 
 
@@ -134,6 +135,7 @@ _CHARGED_ATTEMPT_STATES = frozenset({
     CandidateAttemptState.UNCERTAIN,
     CandidateAttemptState.RESOLVED_RETRY,
     CandidateAttemptState.RESOLVED_SKIP,
+    CandidateAttemptState.RESOLVED_ABORT,
 })
 
 

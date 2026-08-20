@@ -22,18 +22,21 @@ _PERSISTED_ATTEMPT_STATES = frozenset({
     "released_pre_dispatch",
     "uncertain_retry_acknowledged",
     "uncertain_skip_acknowledged",
+    "uncertain_abort_acknowledged",
 })
 _EVIDENCE_ATTEMPT_STATES = frozenset({
     "accounted",
     "uncertain",
     "uncertain_retry_acknowledged",
     "uncertain_skip_acknowledged",
+    "uncertain_abort_acknowledged",
 })
 _RECOVERED_OUTCOME_ATTEMPT_STATES = frozenset({
     "accounted",
     "released_pre_dispatch",
     "uncertain_retry_acknowledged",
     "uncertain_skip_acknowledged",
+    "uncertain_abort_acknowledged",
 })
 _MAX_PERSISTED_ATTEMPT_TOKENS = 1_000_000_000
 _MAX_PERSISTED_LEDGER_TOKENS = 2**63 - 1
@@ -242,6 +245,7 @@ class JobAttemptScope:
             projected_state = {
                 "uncertain_retry_acknowledged": "resolved_retry",
                 "uncertain_skip_acknowledged": "resolved_skip",
+                "uncertain_abort_acknowledged": "resolved_abort",
             }.get(state, state or "uncertain")
             evidence.append(AttemptUsage(
                 attempt_id=attempt_id,

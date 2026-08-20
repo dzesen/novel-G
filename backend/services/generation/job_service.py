@@ -34,6 +34,7 @@ from backend.services.generation.chapter_candidate_job import (
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
     JobMutationReceiptV1,
+    StateDispatchResolutionV1,
 )
 from backend.services.generation.chapter_candidate_repairs import (
     ChapterCandidateRepairApplication,
@@ -141,6 +142,152 @@ def _state_only_job_mutation_binding(
         operation="accept_chapter_state",
         idempotency_key=f"candidate-job-state:{job_id}:{chapter_id}",
     )
+
+
+def _validated_state_dispatch_binding(
+    *,
+    job_id: str,
+    job: Mapping[str, Any],
+    value: Any,
+) -> JobMutationRecoveryBindingV1:
+    """Rebuild the exact current Job authority before touching a proposal receipt."""
+
+    try:
+        binding = JobMutationRecoveryBindingV1.model_validate(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Generation job mutation recovery binding is invalid"
+        ) from exc
+    if binding.job_id != str(job_id):
+        raise ValueError(
+            "Generation job mutation recovery binding belongs to another Job"
+        )
+    chapter_id = job.get("current_chapter_id")
+    if str(chapter_id or "") != binding.chapter_id:
+        raise ValueError(
+            "Generation job mutation recovery chapter diverged"
+        )
+    expected_revision = job.get("expected_narrative_revision")
+    if type(expected_revision) is not int or expected_revision < 0:
+        raise ValueError(
+            "Generation job narrative revision cursor is invalid"
+        )
+    expected = _state_only_job_mutation_binding(
+        job_id=str(job_id),
+        job=job,
+        chapter_id=binding.chapter_id,
+        expected_revision=expected_revision,
+    )
+    if binding != expected:
+        raise ValueError(
+            "Generation job mutation recovery binding diverged from current authority"
+        )
+    return binding
+
+
+def _persisted_state_dispatch_resolution(
+    *,
+    job_id: str,
+    job: Mapping[str, Any],
+) -> StateDispatchResolutionV1 | None:
+    raw = job.get("state_dispatch_resolution")
+    if raw is None:
+        return None
+    try:
+        resolution = StateDispatchResolutionV1.model_validate(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Generation job state dispatch resolution is invalid"
+        ) from exc
+    binding = _validated_state_dispatch_binding(
+        job_id=job_id,
+        job=job,
+        value=resolution.binding,
+    )
+    if resolution.binding != binding:
+        raise ValueError(
+            "Generation job state dispatch resolution binding diverged"
+        )
+    return resolution
+
+
+async def _advance_state_dispatch_resolution(
+    *,
+    job_id: str,
+    job: Mapping[str, Any],
+    binding: JobMutationRecoveryBindingV1,
+    action: str,
+    retry_fields: Mapping[str, Any] | None = None,
+    terminal_fields: Mapping[str, Any] | None = None,
+) -> StateDispatchResolutionV1:
+    """Drive one explicit action through both ledgers using a durable Job phase."""
+
+    resolution = await generation_job_repo.begin_state_dispatch_resolution(
+        job_id,
+        binding,
+        action,
+    )
+    if resolution.phase == "intent":
+        acknowledged = await state_proposal_module.acknowledge_job_bound_dispatch(
+            binding,
+            action,
+        )
+        if not acknowledged and action != "abort":
+            raise ValueError(
+                "Generation job state dispatch receipt disappeared before resolution"
+            )
+        resolution = await generation_job_repo.advance_state_dispatch_resolution(
+            job_id,
+            resolution,
+            "proposal_acknowledged",
+        )
+    if resolution.phase == "proposal_acknowledged":
+        current = await generation_job_repo.get_job(job_id)
+        if current.get("has_uncertain_attempts"):
+            await generation_job_repo.acknowledge_uncertain_attempts(
+                job_id,
+                action,
+            )
+        resolution = await generation_job_repo.advance_state_dispatch_resolution(
+            job_id,
+            resolution,
+            "attempts_acknowledged",
+        )
+    if resolution.phase == "attempts_acknowledged":
+        # False is the idempotent crash-after-release case: no worker can have
+        # reused the key while the durable Job action is still non-terminal.
+        await state_proposal_module.release_job_bound_dispatch(binding, action)
+        resolution = await generation_job_repo.advance_state_dispatch_resolution(
+            job_id,
+            resolution,
+            "proposal_released",
+        )
+    if action == "retry":
+        if resolution.phase == "proposal_released":
+            if retry_fields is None:
+                raise ValueError(
+                    "Generation job retry transition fields are missing"
+                )
+            resolution = await generation_job_repo.transition_state_dispatch_retry(
+                job_id,
+                resolution,
+                dict(retry_fields),
+            )
+        if resolution.phase != "job_transitioned":
+            raise ValueError("Generation job retry resolution is incomplete")
+        return resolution
+    if resolution.phase == "proposal_released":
+        if terminal_fields is None:
+            raise ValueError(
+                "Generation job terminal transition fields are missing"
+            )
+        await generation_job_repo.complete_state_dispatch_terminal(
+            job_id,
+            resolution,
+            dict(terminal_fields),
+        )
+        return resolution
+    raise ValueError("Generation job terminal resolution is incomplete")
 
 
 def _recovered_state_only_outcome(
@@ -273,6 +420,7 @@ def _new_job_doc(
         "attempt_slots": [],
         "attempt_reservation": None,
         "candidate_pipeline_checkpoints": [],
+        "state_dispatch_resolution": None,
         "authorization_confirmation_required": None,
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
@@ -1239,10 +1387,9 @@ class GenerationJobService:
         readiness_digest: str | None = None,
         acknowledged_warning_codes: tuple[str, ...] | list[str] | None = None,
     ) -> Dict[str, Any]:
+        retry_resolution_to_clear: StateDispatchResolutionV1 | None = None
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
-            if not job_planner.can_resume(job["status"]):
-                raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
             state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None
             raw_job_mutation_recovery = job.get("job_mutation_recovery")
             if raw_job_mutation_recovery is not None:
@@ -1255,11 +1402,34 @@ class GenerationJobService:
                         "Generation job mutation recovery binding is invalid"
                     ) from exc
                 if candidate_binding.operation == "accept_chapter_state":
-                    state_dispatch_binding = candidate_binding
+                    state_dispatch_binding = _validated_state_dispatch_binding(
+                        job_id=job_id,
+                        job=job,
+                        value=candidate_binding,
+                    )
+            pending_state_resolution = _persisted_state_dispatch_resolution(
+                job_id=job_id,
+                job=job,
+            )
+            if (
+                pending_state_resolution is not None
+                and state_dispatch_binding != pending_state_resolution.binding
+            ):
+                raise ValueError(
+                    "Generation job state dispatch resolution lost its binding"
+                )
+            if (
+                not job_planner.can_resume(job["status"])
+                and pending_state_resolution is None
+            ):
+                raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
             unresolved_state_dispatch = bool(
-                state_dispatch_binding is not None
-                and await state_proposal_module.has_unresolved_job_dispatch(
-                    state_dispatch_binding
+                pending_state_resolution is not None
+                or (
+                    state_dispatch_binding is not None
+                    and await state_proposal_module.has_unresolved_job_dispatch(
+                        state_dispatch_binding
+                    )
                 )
             )
             candidate_prefix = job.get("candidate_pipeline_checkpoints")
@@ -1276,6 +1446,25 @@ class GenerationJobService:
                 raise ValueError(
                     "confirm_uncertain_retry and skip_uncertain are mutually exclusive"
                 )
+            if pending_state_resolution is not None:
+                supplied_action = (
+                    "retry"
+                    if confirm_uncertain_retry
+                    else "skip"
+                    if skip_uncertain
+                    else None
+                )
+                if (
+                    supplied_action is not None
+                    and supplied_action != pending_state_resolution.action
+                ):
+                    raise ValueError(
+                        "Generation job state dispatch resolution action diverged"
+                    )
+                confirm_uncertain_retry = (
+                    pending_state_resolution.action == "retry"
+                )
+                skip_uncertain = pending_state_resolution.action == "skip"
             reauthorization_payload_supplied = (
                 prose_continuation_policy is not None
                 or token_budget_provided
@@ -1290,6 +1479,32 @@ class GenerationJobService:
                     "uncertain-attempt recovery and re-authorized resume are mutually exclusive"
                 )
             if (
+                pending_state_resolution is not None
+                and pending_state_resolution.action == "abort"
+            ):
+                if reauthorization_payload_supplied:
+                    raise ValueError(
+                        "aborted state dispatch resolution cannot be re-authorized"
+                    )
+                if state_dispatch_binding is None:
+                    raise ValueError(
+                        "Generation job state dispatch binding disappeared"
+                    )
+                await _advance_state_dispatch_resolution(
+                    job_id=job_id,
+                    job=job,
+                    binding=state_dispatch_binding,
+                    action="abort",
+                    terminal_fields={
+                        "status": "aborted",
+                        "current_chapter_id": None,
+                        "active_slot": None,
+                        "has_uncertain_attempts": False,
+                        "attempt_reservation": None,
+                    },
+                )
+                return await generation_job_repo.get_job(job_id)
+            if (
                 (confirm_uncertain_retry or skip_uncertain)
                 and not (
                     job.get("has_uncertain_attempts")
@@ -1303,43 +1518,46 @@ class GenerationJobService:
                 job.get("has_uncertain_attempts") or unresolved_state_dispatch
             ) and not confirm_uncertain_retry:
                 if skip_uncertain:
-                    state_dispatch_acknowledged = False
                     if state_dispatch_binding is not None:
-                        state_dispatch_acknowledged = await (
-                            state_proposal_module.acknowledge_job_bound_dispatch(
-                                state_dispatch_binding,
-                                "skip",
-                            )
+                        await _advance_state_dispatch_resolution(
+                            job_id=job_id,
+                            job=job,
+                            binding=state_dispatch_binding,
+                            action="skip",
+                            terminal_fields={
+                                "status": "failed",
+                                "pause_reason": "uncertain_skipped",
+                                "active_slot": None,
+                                "current_chapter_id": None,
+                                "has_uncertain_attempts": False,
+                                "attempt_reservation": None,
+                                "error": {
+                                    "step": "uncertain_attempt",
+                                    "message": (
+                                        "用户选择跳过可能已发出的 Provider 请求；"
+                                        "请人工检查章节后再恢复"
+                                    ),
+                                },
+                            },
                         )
-                    if job.get("has_uncertain_attempts"):
+                    else:
                         await generation_job_repo.acknowledge_uncertain_attempts(
                             job_id,
                             "skip",
                         )
-                    await generation_job_repo.update_job_fields(job_id, {
-                        "status": "failed",
-                        "pause_reason": "uncertain_skipped",
-                        "active_slot": None,
-                        "current_chapter_id": None,
-                        "error": {
-                            "step": "uncertain_attempt",
-                            "message": "用户选择跳过可能已发出的 Provider 请求；请人工检查章节后再恢复",
-                        },
-                    })
-                    if state_dispatch_acknowledged:
-                        if state_dispatch_binding is None:
-                            raise ValueError(
-                                "Generation job state dispatch binding disappeared"
-                            )
-                        await generation_job_repo.clear_job_mutation_recovery(
-                            job_id,
-                            state_dispatch_binding,
-                            terminal_status="failed",
-                        )
-                        await state_proposal_module.release_job_bound_dispatch(
-                            state_dispatch_binding,
-                            "skip",
-                        )
+                        await generation_job_repo.update_job_fields(job_id, {
+                            "status": "failed",
+                            "pause_reason": "uncertain_skipped",
+                            "active_slot": None,
+                            "current_chapter_id": None,
+                            "error": {
+                                "step": "uncertain_attempt",
+                                "message": (
+                                    "用户选择跳过可能已发出的 Provider 请求；"
+                                    "请人工检查章节后再恢复"
+                                ),
+                            },
+                        })
                     return await generation_job_repo.get_job(job_id)
                 raise ValueError(
                     "存在请求已发出但未取得 usage 的 attempt，可能已计费；"
@@ -1511,20 +1729,14 @@ class GenerationJobService:
                     )
                 incomplete_prose_updates["incomplete_prose"] = None
 
-            await GenerationJobService._guard_no_running()
-            state_dispatch_acknowledged = False
-            if confirm_uncertain_retry and state_dispatch_binding is not None:
-                state_dispatch_acknowledged = await (
-                    state_proposal_module.acknowledge_job_bound_dispatch(
-                        state_dispatch_binding,
-                        "retry",
-                    )
-                )
-            if job.get("has_uncertain_attempts") and confirm_uncertain_retry:
-                await generation_job_repo.acknowledge_uncertain_attempts(
-                    job_id,
-                    "retry",
-                )
+            retry_already_transitioned = bool(
+                pending_state_resolution is not None
+                and pending_state_resolution.action == "retry"
+                and pending_state_resolution.phase == "job_transitioned"
+                and job.get("status") == "running"
+            )
+            if not retry_already_transitioned:
+                await GenerationJobService._guard_no_running()
             # 任何 resume 把检查点窗口推进到当前 progress 长度（设计 §7）。
             resume_fields = {
                 **authorization_updates,
@@ -1537,7 +1749,21 @@ class GenerationJobService:
                 "confirm_uncertain_prose_retry": bool(confirm_uncertain_retry),
                 "last_checkpoint_index": len(job.get("progress", [])),
             }
-            if authorization_updates and reauthorized_revision is not None:
+            if confirm_uncertain_retry and state_dispatch_binding is not None:
+                if authorization_updates:
+                    raise ValueError(
+                        "state dispatch retry cannot replace its frozen authorization"
+                    )
+                retry_resolution_to_clear = await (
+                    _advance_state_dispatch_resolution(
+                        job_id=job_id,
+                        job=job,
+                        binding=state_dispatch_binding,
+                        action="retry",
+                        retry_fields=resume_fields,
+                    )
+                )
+            elif authorization_updates and reauthorized_revision is not None:
                 previous_revision = job.get("expected_narrative_revision")
                 if previous_revision is not None and type(previous_revision) is not int:
                     raise ValueError(
@@ -1583,18 +1809,22 @@ class GenerationJobService:
                     previous_active_slot=previous_active_slot,
                 )
             else:
-                await generation_job_repo.update_job_fields(job_id, resume_fields)
-            if state_dispatch_acknowledged:
-                if state_dispatch_binding is None:
-                    raise ValueError(
-                        "Generation job state dispatch binding disappeared"
+                if job.get("has_uncertain_attempts") and confirm_uncertain_retry:
+                    await generation_job_repo.acknowledge_uncertain_attempts(
+                        job_id,
+                        "retry",
                     )
-                await state_proposal_module.release_job_bound_dispatch(
-                    state_dispatch_binding,
-                    "retry",
-                )
+                await generation_job_repo.update_job_fields(job_id, resume_fields)
         control = JobControl()
-        GenerationJobService._spawn(job_id, control)
+        existing_entry = _REGISTRY.get(job_id)
+        existing_task = existing_entry[0] if existing_entry is not None else None
+        if existing_task is None or existing_task.done():
+            GenerationJobService._spawn(job_id, control)
+        if retry_resolution_to_clear is not None:
+            await generation_job_repo.clear_state_dispatch_resolution(
+                job_id,
+                retry_resolution_to_clear,
+            )
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
@@ -1609,7 +1839,6 @@ class GenerationJobService:
     async def abort_job(job_id: str) -> Dict[str, Any]:
         job = await generation_job_repo.get_job(job_id)
         state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None
-        state_dispatch_acknowledged = False
         raw_job_mutation_recovery = job.get("job_mutation_recovery")
         if raw_job_mutation_recovery is not None:
             try:
@@ -1620,47 +1849,53 @@ class GenerationJobService:
                 raise ValueError(
                     "Generation job mutation recovery binding is invalid"
                 ) from exc
-            if (
-                candidate_binding.operation == "accept_chapter_state"
-                and await state_proposal_module.has_unresolved_job_dispatch(
-                    candidate_binding
+            if candidate_binding.operation == "accept_chapter_state":
+                state_dispatch_binding = _validated_state_dispatch_binding(
+                    job_id=job_id,
+                    job=job,
+                    value=candidate_binding,
                 )
-            ):
-                state_dispatch_binding = candidate_binding
-                state_dispatch_acknowledged = await (
-                    state_proposal_module.acknowledge_job_bound_dispatch(
-                        candidate_binding,
-                        "abort",
-                    )
+        pending_resolution = _persisted_state_dispatch_resolution(
+            job_id=job_id,
+            job=job,
+        )
+        if pending_resolution is not None and pending_resolution.action != "abort":
+            raise ValueError(
+                "Generation job state dispatch resolution action diverged"
+            )
+        if state_dispatch_binding is not None:
+            await _advance_state_dispatch_resolution(
+                job_id=job_id,
+                job=job,
+                binding=state_dispatch_binding,
+                action="abort",
+                terminal_fields={
+                    "status": "aborted",
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                    "has_uncertain_attempts": False,
+                    "attempt_reservation": None,
+                },
+            )
+        else:
+            if job.get("has_uncertain_attempts"):
+                await generation_job_repo.acknowledge_uncertain_attempts(
+                    job_id,
+                    "abort",
                 )
+            await generation_job_repo.update_job_fields(job_id, {
+                "status": "aborted",
+                "current_chapter_id": None,
+                "active_slot": None,
+                "has_uncertain_attempts": False,
+                "attempt_reservation": None,
+            })
         entry = _REGISTRY.get(job_id)
         if entry is not None:
             entry[1].abort_requested = True
             task = entry[0]
             if task is not None:
                 task.cancel()
-        # 无条件落终态：run_job 被 cancel 后其 finally 只弹注册表、不写状态，且
-        # CancelledError（BaseException）绕过 except Exception，循环顶端的 abort 标记
-        # 可能永不执行——若不在此处写 aborted，作业会永远卡在 running，全局单作业槽被
-        # 死锁（list_running_jobs 计入它，挡住之后所有 start/resume）。cancel 后 run_job
-        # 不会再写状态，故此处写入不会被覆盖。
-        await generation_job_repo.update_job_fields(job_id, {
-            "status": "aborted", "current_chapter_id": None, "active_slot": None,
-        })
-        if state_dispatch_acknowledged:
-            if state_dispatch_binding is None:
-                raise ValueError(
-                    "Generation job state dispatch binding disappeared"
-                )
-            await generation_job_repo.clear_job_mutation_recovery(
-                job_id,
-                state_dispatch_binding,
-                terminal_status="aborted",
-            )
-            await state_proposal_module.release_job_bound_dispatch(
-                state_dispatch_binding,
-                "abort",
-            )
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
