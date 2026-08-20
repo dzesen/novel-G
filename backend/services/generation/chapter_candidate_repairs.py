@@ -91,6 +91,9 @@ class ChapterCandidateRepairApplicationDeps:
     get_state_proposal: Callable[..., Awaitable[Mapping[str, Any]]]
     state_repair_receipts: Any
     recover_state_proposal: Callable[..., Awaitable[Any]]
+    discard_pre_dispatch_attempt: Callable[..., Awaitable[bool]] = (
+        generation_job_repo.discard_proven_pre_dispatch_attempt
+    )
 
     @classmethod
     def production(cls) -> "ChapterCandidateRepairApplicationDeps":
@@ -114,6 +117,9 @@ class ChapterCandidateRepairApplicationDeps:
             state_repair_receipts=state_candidate_repair_receipt_repo,
             recover_state_proposal=(
                 state_proposal_module.recover_owned_repair_result
+            ),
+            discard_pre_dispatch_attempt=(
+                generation_job_repo.discard_proven_pre_dispatch_attempt
             ),
         )
 
@@ -482,13 +488,103 @@ class ChapterCandidateRepairApplication:
         claimed_are_uncertain: bool = False,
     ) -> list[dict[str, Any]]:
         return _ordered_attempt_projection(
-            await self._deps.read_ordered_attempts(
-                job_id=self._execution_id,
+            await self._raw_state_attempts(
                 chapter_id=chapter_id,
-                step_prefix=f"candidate-state-repair:{cycle}",
+                cycle=cycle,
             ),
             claimed_are_uncertain=claimed_are_uncertain,
         )
+
+    async def _raw_state_attempts(
+        self,
+        *,
+        chapter_id: str,
+        cycle: int,
+    ) -> Sequence[Mapping[str, Any]]:
+        return await self._deps.read_ordered_attempts(
+                job_id=self._execution_id,
+                chapter_id=chapter_id,
+                step_prefix=f"candidate-state-repair:{cycle}",
+            )
+
+    async def _reopen_released_state_receipt(
+        self,
+        *,
+        chapter_id: str,
+        cycle: int,
+        receipt: Mapping[str, Any],
+        new_claim_token: str,
+    ) -> Mapping[str, Any]:
+        raw_ids = receipt.get("provider_attempt_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return receipt
+        attempt_ids = tuple(
+            item for item in raw_ids if isinstance(item, str) and item
+        )
+        if len(attempt_ids) != len(raw_ids) or len(set(attempt_ids)) != len(
+            attempt_ids
+        ):
+            raise ValueError("state repair receipt attempt identities are invalid")
+        slots = await self._raw_state_attempts(
+            chapter_id=chapter_id,
+            cycle=cycle,
+        )
+        states = {
+            str(slot.get("attempt_id") or ""): slot.get("state")
+            for slot in slots
+        }
+        if not all(
+            states.get(attempt_id) == "released_pre_dispatch"
+            for attempt_id in attempt_ids
+        ):
+            return receipt
+        return await self._deps.state_repair_receipts.reopen_released_pre_dispatch(
+            receipt_id=str(receipt.get("_id") or ""),
+            claim_token=str(receipt.get("claim_token") or ""),
+            new_claim_token=new_claim_token,
+            attempt_ids=attempt_ids,
+        )
+
+    async def _discard_reserved_state_attempts(
+        self,
+        *,
+        chapter_id: str,
+        cycle: int,
+    ) -> None:
+        step_id = f"candidate-state-repair:{cycle}"
+        for _attempt in range(4):
+            slots = await self._raw_state_attempts(
+                chapter_id=chapter_id,
+                cycle=cycle,
+            )
+            orphaned = [
+                slot
+                for slot in slots
+                if slot.get("state") in {
+                    "claimed",
+                    "released_pre_dispatch",
+                }
+            ]
+            if not orphaned:
+                return
+            changed = False
+            for slot in orphaned:
+                attempt_id = slot.get("attempt_id")
+                if not isinstance(attempt_id, str) or not attempt_id:
+                    raise ValueError(
+                        "state repair pre-dispatch attempt identity is invalid"
+                    )
+                changed = bool(
+                    await self._deps.discard_pre_dispatch_attempt(
+                        self._execution_id,
+                        chapter_id,
+                        step_id,
+                        attempt_id,
+                    )
+                ) or changed
+            if not changed:
+                continue
+        raise ValueError("state repair pre-dispatch attempts could not reconcile")
 
     async def _recover_state_generation(
         self,
@@ -524,23 +620,65 @@ class ChapterCandidateRepairApplication:
             )
         if isinstance(recovered, Mapping):
             value = dict(recovered)
-            recovered_dropped = 0
+            recovered_context = None
+            recovered_dropped = None
         else:
             value = dict(getattr(recovered, "value", {}) or {})
-            recovered_dropped = int(
-                getattr(recovered, "dropped_reference_count", 0) or 0
+            raw_truncated = getattr(
+                recovered,
+                "truncated_section_count",
+                None,
             )
+            raw_dropped_items = getattr(
+                recovered,
+                "dropped_item_count",
+                None,
+            )
+            raw_dropped_references = getattr(
+                recovered,
+                "dropped_reference_count",
+                None,
+            )
+            if any(
+                type(item) is not int or item < 0
+                for item in (
+                    raw_truncated,
+                    raw_dropped_items,
+                    raw_dropped_references,
+                )
+            ):
+                raise ValueError(
+                    "state repair proposal recovery metadata is invalid"
+                )
+            recovered_context = (
+                min(100, raw_truncated),
+                min(10_000, raw_dropped_items),
+            )
+            recovered_dropped = min(1_000, raw_dropped_references)
         if not value.get("proposal_id") or not value.get("acceptance_token"):
             raise ValueError("state repair proposal result is incomplete")
         if projection is None:
+            if recovered_context is None or recovered_dropped is None:
+                raise ValueError(
+                    "state repair proposal recovery metadata is unavailable"
+                )
             projection = StateCandidateRepairResultProjection(
                 proposal_id=str(value["proposal_id"]),
-                truncated_section_count=0,
-                dropped_item_count=0,
-                dropped_reference_count=min(1_000, recovered_dropped),
+                truncated_section_count=recovered_context[0],
+                dropped_item_count=recovered_context[1],
+                dropped_reference_count=recovered_dropped,
             )
         elif str(value["proposal_id"]) != projection.proposal_id:
             raise ValueError("state repair receipt proposal identity diverged")
+        elif recovered_context is not None and (
+            recovered_context
+            != (
+                projection.truncated_section_count,
+                projection.dropped_item_count,
+            )
+            or recovered_dropped != projection.dropped_reference_count
+        ):
+            raise ValueError("state repair receipt metadata diverged")
         attempts = await self._state_attempts(
             chapter_id=chapter_id,
             cycle=request.cycle,
@@ -764,6 +902,53 @@ class ChapterCandidateRepairApplication:
         chapter_id: str,
         request: StateCandidateRepairRequest,
     ) -> StateCandidateRepairReceipt:
+        try:
+            return await self._repair_state_candidate(
+                owner_id,
+                novel_id,
+                chapter_id,
+                request,
+            )
+        except CandidateRepairRunStopped:
+            raise
+        except Exception as exc:
+            claimed_are_uncertain = False
+            try:
+                identity = self._state_receipt_identity(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    chapter_id=chapter_id,
+                    request=request,
+                )
+                receipt = await self._deps.state_repair_receipts.find_receipt(
+                    **identity
+                )
+                claimed_are_uncertain = bool(
+                    receipt is not None
+                    and receipt.get("state") == "dispatched"
+                )
+            except Exception:
+                claimed_are_uncertain = True
+            attempts = await self._state_attempts(
+                chapter_id=chapter_id,
+                cycle=request.cycle,
+                claimed_are_uncertain=claimed_are_uncertain,
+            )
+            if attempts:
+                raise CandidateRepairRunStopped(
+                    "state repair failed after a persisted Provider attempt",
+                    usage=_attempt_usage(attempts),
+                    attempts=attempts,
+                ) from exc
+            raise
+
+    async def _repair_state_candidate(
+        self,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        request: StateCandidateRepairRequest,
+    ) -> StateCandidateRepairReceipt:
         _authorization, _bundle, _adherence_plan, state_plan = (
             self._authorized_snapshot(
                 chapter_id=chapter_id,
@@ -779,6 +964,20 @@ class ChapterCandidateRepairApplication:
         existing = await self._deps.state_repair_receipts.find_receipt(
             **identity
         )
+        reconciled_claim_token: str | None = None
+        if existing is not None and existing.get("state") == "dispatched":
+            proposed_claim_token = uuid4().hex
+            existing = await self._reopen_released_state_receipt(
+                chapter_id=chapter_id,
+                cycle=request.cycle,
+                receipt=existing,
+                new_claim_token=proposed_claim_token,
+            )
+            if (
+                existing.get("state") == "reserved"
+                and existing.get("claim_token") == proposed_claim_token
+            ):
+                reconciled_claim_token = proposed_claim_token
         if existing is not None and existing.get("state") == "completed":
             generation = await self._recover_state_generation(
                 owner_id=owner_id,
@@ -851,7 +1050,7 @@ class ChapterCandidateRepairApplication:
             or audit.get("mode") != "system"
         ):
             raise ValueError("state repair proposal identity is invalid")
-        claim_token = uuid4().hex
+        claim_token = reconciled_claim_token or uuid4().hex
         receipt_state, receipt = (
             await self._deps.state_repair_receipts.claim_receipt(
                 **identity,
@@ -879,6 +1078,10 @@ class ChapterCandidateRepairApplication:
                 usage=_attempt_usage(attempts),
                 attempts=attempts,
             )
+        await self._discard_reserved_state_attempts(
+            chapter_id=chapter_id,
+            cycle=request.cycle,
+        )
         base_attempt_scope = self._attempt_scope_factory(
             f"candidate-state-repair:{request.cycle}"
         )

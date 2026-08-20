@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from bson import ObjectId
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from backend.db import collections
 from backend.db.mongo import get_database
 from backend.db.utils import get_utc_now, to_object_id
+from backend.services.generation.candidate_repair_contracts import (
+    MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
+)
 
 
 _CLAIM_TTL_SECONDS = 30
@@ -34,6 +38,69 @@ class StateCandidateRepairResultProjection(BaseModel):
     truncated_section_count: int = Field(ge=0, le=100)
     dropped_item_count: int = Field(ge=0, le=10_000)
     dropped_reference_count: int = Field(ge=0, le=1_000)
+
+
+class StateCandidateRepairReceiptEnvelope(BaseModel):
+    """Closed persisted envelope for every receipt lifecycle state."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+        strict=True,
+    )
+
+    receipt_id: str = Field(alias="_id", min_length=64, max_length=64)
+    owner_id: ObjectId
+    novel_id: ObjectId
+    chapter_id: ObjectId
+    execution_id: ObjectId
+    cycle: int = Field(ge=1, le=MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES)
+    schema_version: Literal["state_candidate_repair_receipt.v1"]
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: Literal["reserved", "dispatched", "completed"]
+    claim_token: str = Field(min_length=1, max_length=128)
+    claim_expires_at: datetime | None = None
+    provider_attempt_ids: list[str] = Field(max_length=64)
+    result_projection: StateCandidateRepairResultProjection | None = None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    is_deleted: Literal[False]
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> "StateCandidateRepairReceiptEnvelope":
+        if len(set(self.provider_attempt_ids)) != len(
+            self.provider_attempt_ids
+        ) or any(
+            not item or len(item) > 128 for item in self.provider_attempt_ids
+        ):
+            raise ValueError("receipt attempt identities are invalid")
+        if self.state == "reserved":
+            valid = (
+                isinstance(self.claim_expires_at, datetime)
+                and not self.provider_attempt_ids
+                and self.result_projection is None
+                and self.completed_at is None
+            )
+        elif self.state == "dispatched":
+            valid = (
+                self.claim_expires_at is None
+                and bool(self.provider_attempt_ids)
+                and self.result_projection is None
+                and self.completed_at is None
+            )
+        else:
+            valid = (
+                self.claim_expires_at is None
+                and bool(self.provider_attempt_ids)
+                and self.result_projection is not None
+                and isinstance(self.completed_at, datetime)
+            )
+        if not valid:
+            raise ValueError("receipt lifecycle projection is invalid")
+        return self
 
 
 class StateCandidateRepairReceiptRepository:
@@ -69,7 +136,11 @@ class StateCandidateRepairReceiptRepository:
         execution_id: str,
         cycle: int,
     ) -> dict[str, Any]:
-        if type(cycle) is not int or cycle < 1 or cycle > 8:
+        if (
+            type(cycle) is not int
+            or cycle < 1
+            or cycle > MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
+        ):
             raise StateCandidateRepairReceiptConflict(
                 "state repair receipt cycle is invalid"
             )
@@ -94,8 +165,20 @@ class StateCandidateRepairReceiptRepository:
         *,
         scope: dict[str, Any],
         request_digest: str,
-    ) -> None:
-        if receipt.get("is_deleted") is True or any(
+    ) -> StateCandidateRepairReceiptEnvelope:
+        if receipt.get("schema_version") != "state_candidate_repair_receipt.v1":
+            raise StateCandidateRepairReceiptConflict(
+                "state repair receipt schema is invalid"
+            )
+        try:
+            envelope = StateCandidateRepairReceiptEnvelope.model_validate(
+                receipt
+            )
+        except ValidationError as exc:
+            raise StateCandidateRepairReceiptConflict(
+                "state repair receipt envelope is invalid"
+            ) from exc
+        if any(
             receipt.get(field) != expected
             for field, expected in scope.items()
         ):
@@ -114,6 +197,7 @@ class StateCandidateRepairReceiptRepository:
             raise StateCandidateRepairReceiptConflict(
                 "state repair receipt state is invalid"
             )
+        return envelope
 
     async def find_receipt(
         self,
@@ -296,6 +380,63 @@ class StateCandidateRepairReceiptRepository:
             },
         )
 
+    async def reopen_released_pre_dispatch(
+        self,
+        *,
+        receipt_id: str,
+        claim_token: str,
+        new_claim_token: str,
+        attempt_ids: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Repair a receipt after the Job ledger proves zero dispatch."""
+        if (
+            not new_claim_token
+            or not attempt_ids
+            or len(set(attempt_ids)) != len(attempt_ids)
+        ):
+            raise StateCandidateRepairReceiptConflict(
+                "state repair released attempts are invalid"
+            )
+        now = get_utc_now()
+        reopened = await self.collection.find_one_and_update(
+            {
+                "_id": str(receipt_id),
+                "state": "dispatched",
+                "claim_token": str(claim_token),
+                "provider_attempt_ids": list(attempt_ids),
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "state": "reserved",
+                    "claim_token": str(new_claim_token),
+                    "claim_expires_at": (
+                        now + timedelta(seconds=_CLAIM_TTL_SECONDS)
+                    ),
+                    "provider_attempt_ids": [],
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if reopened is None:
+            reopened = await self.collection.find_one({"_id": str(receipt_id)})
+        if reopened is None:
+            raise StateCandidateRepairReceiptConflict(
+                "state repair receipt disappeared during release repair"
+            )
+        try:
+            StateCandidateRepairReceiptEnvelope.model_validate(reopened)
+        except ValidationError as exc:
+            raise StateCandidateRepairReceiptConflict(
+                "state repair released receipt is invalid"
+            ) from exc
+        if str(reopened.get("state") or "") != "reserved":
+            raise StateCandidateRepairReceiptConflict(
+                "state repair released receipt could not reopen"
+            )
+        return reopened
+
     async def complete_receipt(
         self,
         *,
@@ -331,6 +472,12 @@ class StateCandidateRepairReceiptRepository:
             raise StateCandidateRepairReceiptConflict(
                 "state repair receipt could not be completed"
             )
+        try:
+            StateCandidateRepairReceiptEnvelope.model_validate(receipt)
+        except ValidationError as exc:
+            raise StateCandidateRepairReceiptConflict(
+                "state repair completed receipt is invalid"
+            ) from exc
         stored = StateCandidateRepairResultProjection.model_validate(
             receipt.get("result_projection")
         ).model_dump(mode="json")

@@ -30,6 +30,9 @@ from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import get_utc_now, to_object_id
+from backend.services.generation.candidate_repair_contracts import (
+    StateContextProjection,
+)
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
 from backend.services.novel.state_completion import (
     chapter_content_digest,
@@ -111,6 +114,8 @@ class StateProposalLease:
 @dataclass(frozen=True)
 class RecoveredStateProposal:
     value: dict[str, Any]
+    truncated_section_count: int
+    dropped_item_count: int
     dropped_reference_count: int
 
 
@@ -251,6 +256,14 @@ class StateProposalModule:
             chapter_id=chapter_id,
             proposal_id=str(resolved_proposal_id),
         )
+        if str(proposal.get("status") or "") not in {
+            "proposed",
+            "claimed",
+            "applied",
+        }:
+            raise StaleStatePreview(
+                "State repair proposal status is not recoverable"
+            )
         audit = proposal.get("generation_audit")
         candidate = proposal.get("candidate")
         expires_at = proposal.get("expires_at")
@@ -305,6 +318,14 @@ class StateProposalModule:
                     for items in dropped.values()
                 ),
             )
+        try:
+            context_projection = StateContextProjection.model_validate(
+                audit.get("state_context_projection")
+            )
+        except Exception as exc:
+            raise StaleStatePreview(
+                "State repair context projection is invalid"
+            ) from exc
         return RecoveredStateProposal(
             value={
                 **deepcopy(candidate),
@@ -312,6 +333,10 @@ class StateProposalModule:
                 "acceptance_token": token,
                 "proposal_expires_at": expires_at.isoformat(),
             },
+            truncated_section_count=(
+                context_projection.truncated_section_count
+            ),
+            dropped_item_count=context_projection.dropped_item_count,
             dropped_reference_count=dropped_count,
         )
 

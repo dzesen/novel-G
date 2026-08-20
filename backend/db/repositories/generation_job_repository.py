@@ -591,4 +591,74 @@ class GenerationJobRepository(BaseRepository):
             array_filters=[{"slot.attempt_id": str(attempt_id)}],
         )
         return result.modified_count == 1
+
+    async def discard_proven_pre_dispatch_attempt(
+        self,
+        job_id: str,
+        chapter_id: str,
+        step_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Remove a cross-ledger orphan only after receipt fencing proves no dispatch."""
+        job = await self.get_job(job_id)
+        slot = next(
+            (
+                item
+                for item in list(job.get("attempt_slots") or [])
+                if str(item.get("attempt_id") or "") == str(attempt_id)
+                and str(item.get("chapter_id") or "") == str(chapter_id)
+                and str(item.get("step_id") or "") == str(step_id)
+                and item.get("state") in {
+                    "claimed",
+                    "released_pre_dispatch",
+                }
+            ),
+            None,
+        )
+        if slot is None:
+            return False
+        state = str(slot["state"])
+        bound = slot.get("conservative_tokens")
+        reserved = (
+            int(bound)
+            if state == "claimed" and type(bound) is int and bound > 0
+            else 0
+        )
+        query: dict[str, Any] = {
+            "_id": to_object_id(job_id),
+            "is_deleted": False,
+            "usage_attempt_claimed": {"$gte": 1},
+            "attempt_slots": {"$elemMatch": {
+                "attempt_id": str(attempt_id),
+                "chapter_id": str(chapter_id),
+                "step_id": str(step_id),
+                "state": state,
+            }},
+        }
+        update: dict[str, Any] = {
+            "$pull": {"attempt_slots": {"attempt_id": str(attempt_id)}},
+            "$inc": {"usage_attempt_claimed": -1},
+            "$set": {"updated_at": get_utc_now()},
+        }
+        reservation = job.get("attempt_reservation")
+        if (
+            isinstance(reservation, dict)
+            and str(reservation.get("chapter_id") or "") == str(chapter_id)
+            and int(reservation.get("claimed_slots") or 0) > 0
+        ):
+            query["attempt_reservation.chapter_id"] = str(chapter_id)
+            query["attempt_reservation.claimed_slots"] = {"$gte": 1}
+            update["$inc"]["attempt_reservation.claimed_slots"] = -1
+        if reserved:
+            query["tokens_reserved"] = {"$gte": reserved}
+            query["active_token_reservations"] = {"$elemMatch": {
+                "attempt_id": str(attempt_id),
+                "conservative_tokens": reserved,
+            }}
+            update["$inc"]["tokens_reserved"] = -reserved
+            update["$pull"]["active_token_reservations"] = {
+                "attempt_id": str(attempt_id)
+            }
+        result = await self.collection.update_one(query, update)
+        return result.modified_count == 1
 generation_job_repo = GenerationJobRepository()

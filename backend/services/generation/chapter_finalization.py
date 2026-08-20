@@ -12,6 +12,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.db.mutation import MutationCommand, MutationRecorder, commit_mutation
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.services.generation.candidate_repair_contracts import (
+    MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
+)
 from backend.services.generation.outline_adherence import (
     OutlineAdherenceValidationError,
     validate_complete_outline_adherence,
@@ -28,7 +31,7 @@ from backend.services.novel.state_proposal import (
 FINALIZATION_AUTHORIZATION_SCHEMA = "chapter_finalization_authorization.v1"
 FINALIZATION_CHANGE_CLASSES = ("chapter_prose", "chapter_state")
 DEFAULT_FINALIZATION_REPAIR_CYCLES = 2
-MAX_FINALIZATION_REPAIR_CYCLES = 8
+MAX_FINALIZATION_REPAIR_CYCLES = MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
 
 
 class ChapterFinalizationDenied(ValueError):

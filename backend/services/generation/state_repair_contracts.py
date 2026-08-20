@@ -6,8 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from backend.services.generation.chapter_finalization import (
-    MAX_FINALIZATION_REPAIR_CYCLES,
+from backend.services.generation.candidate_repair_contracts import (
+    MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
 )
 
 
@@ -26,7 +26,7 @@ class StateRepairDirective(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    cycle: int = Field(ge=1, le=MAX_FINALIZATION_REPAIR_CYCLES)
+    cycle: int = Field(ge=1, le=MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES)
     reason_codes: tuple[StateRepairReason, ...] = Field(
         min_length=1,
         max_length=2,

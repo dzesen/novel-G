@@ -35,6 +35,9 @@ from backend.llm.schemas.novel_pydantic import (
     ChapterStateResultSchema,
 )
 from backend.llm.models import TokenUsage
+from backend.services.generation.candidate_repair_contracts import (
+    project_state_context,
+)
 from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
@@ -754,6 +757,15 @@ class ChapterGenerationApplicationService:
             )
             context = self._deps.assemble_context(inputs)
             context_text = context.to_prompt_text()
+            await self._deps.state_proposals.record_generation_audit(
+                lease,
+                {
+                    "state_context_projection": project_state_context(
+                        truncated_sections=context.truncated_sections,
+                        dropped_item_counts=context.dropped_item_counts,
+                    ).model_dump(mode="json")
+                },
+            )
             guidance = command.repair_guidance
             if guidance is not None:
                 outline = chapter.get("outline")
