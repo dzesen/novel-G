@@ -12,7 +12,11 @@ from backend.db.errors import NotFoundError
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
 from backend.services.generation.candidate_repair_contracts import (
+    MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
+    CandidatePipelineCheckpointConflict,
+    CandidatePipelineCheckpointV1,
     PreDispatchFenceV1,
+    parse_candidate_pipeline_checkpoint,
 )
 
 
@@ -100,6 +104,190 @@ class GenerationJobRepository(BaseRepository):
             if str(slot.get("chapter_id") or "") == str(chapter_id)
             and str(slot.get("step_id") or "").startswith(step_prefix)
         ]
+
+    @staticmethod
+    def _candidate_pipeline_checkpoints(
+        job: Dict[str, Any],
+        *,
+        chapter_id: str,
+    ) -> list[CandidatePipelineCheckpointV1]:
+        raw = job.get("candidate_pipeline_checkpoints")
+        if raw is None:
+            raw = []
+        if (
+            not isinstance(raw, list)
+            or len(raw) > MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline checkpoint ledger is invalid"
+            )
+        parsed: list[CandidatePipelineCheckpointV1] = []
+        checkpoint_ids: set[str] = set()
+        for sequence, item in enumerate(raw, start=1):
+            try:
+                checkpoint = parse_candidate_pipeline_checkpoint(item)
+            except Exception as exc:
+                raise CandidatePipelineCheckpointConflict(
+                    "Candidate pipeline checkpoint contract is invalid"
+                ) from exc
+            if (
+                checkpoint.chapter_id != str(chapter_id)
+                or checkpoint.sequence != sequence
+                or checkpoint.checkpoint_id in checkpoint_ids
+            ):
+                raise CandidatePipelineCheckpointConflict(
+                    "Candidate pipeline checkpoint order or scope changed"
+                )
+            checkpoint_ids.add(checkpoint.checkpoint_id)
+            parsed.append(checkpoint)
+        return parsed
+
+    async def list_candidate_pipeline_checkpoints(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+    ) -> List[Dict[str, Any]]:
+        normalized_chapter_id = str(chapter_id or "")
+        if not normalized_chapter_id:
+            raise ValueError("Candidate pipeline chapter id is required")
+        job = await self.get_job(job_id)
+        if str(job.get("current_chapter_id") or "") != normalized_chapter_id:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline chapter is no longer current"
+            )
+        return [
+            checkpoint.model_dump(mode="json")
+            for checkpoint in self._candidate_pipeline_checkpoints(
+                job,
+                chapter_id=normalized_chapter_id,
+            )
+        ]
+
+    async def append_candidate_pipeline_checkpoint(
+        self,
+        job_id: str,
+        checkpoint: CandidatePipelineCheckpointV1,
+    ) -> bool:
+        try:
+            validated = parse_candidate_pipeline_checkpoint(checkpoint)
+        except Exception as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline checkpoint contract is invalid"
+            ) from exc
+        value = validated.model_dump(mode="json")
+        job = await self.get_job(job_id)
+        if (
+            str(job.get("status") or "") != "running"
+            or str(job.get("current_chapter_id") or "")
+            != validated.chapter_id
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline execution is no longer current"
+            )
+        existing = self._candidate_pipeline_checkpoints(
+            job,
+            chapter_id=validated.chapter_id,
+        )
+        matched = next(
+            (
+                item
+                for item in existing
+                if item.checkpoint_id == validated.checkpoint_id
+            ),
+            None,
+        )
+        if matched is not None:
+            if matched == validated:
+                return True
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline checkpoint replay diverged"
+            )
+        if validated.sequence != len(existing) + 1:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline checkpoint sequence diverged"
+            )
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": validated.chapter_id,
+                "candidate_pipeline_checkpoints.checkpoint_id": {
+                    "$ne": validated.checkpoint_id
+                },
+                "$expr": {
+                    "$eq": [
+                        {
+                            "$size": {
+                                "$ifNull": [
+                                    "$candidate_pipeline_checkpoints",
+                                    [],
+                                ]
+                            }
+                        },
+                        len(existing),
+                    ]
+                },
+            },
+            {
+                "$push": {"candidate_pipeline_checkpoints": value},
+                "$set": {"updated_at": get_utc_now()},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        if (
+            str(current.get("current_chapter_id") or "")
+            == validated.chapter_id
+        ):
+            for item in self._candidate_pipeline_checkpoints(
+                current,
+                chapter_id=validated.chapter_id,
+            ):
+                if item.checkpoint_id == validated.checkpoint_id:
+                    if item == validated:
+                        return True
+                    break
+        raise CandidatePipelineCheckpointConflict(
+            "Candidate pipeline checkpoint append lost its execution fence"
+        )
+
+    async def clear_candidate_pipeline_checkpoints(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+    ) -> bool:
+        normalized_chapter_id = str(chapter_id or "")
+        if not normalized_chapter_id:
+            raise ValueError("Candidate pipeline chapter id is required")
+        job = await self.get_job(job_id)
+        if str(job.get("current_chapter_id") or "") != normalized_chapter_id:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline chapter is no longer current"
+            )
+        self._candidate_pipeline_checkpoints(
+            job,
+            chapter_id=normalized_chapter_id,
+        )
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "current_chapter_id": normalized_chapter_id,
+            },
+            {
+                "$set": {
+                    "candidate_pipeline_checkpoints": [],
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        return result.modified_count == 1 or not job.get(
+            "candidate_pipeline_checkpoints"
+        )
 
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))

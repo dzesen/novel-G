@@ -183,6 +183,7 @@ def _new_job_doc(
         "usage_attempt_summaries": [],
         "attempt_slots": [],
         "attempt_reservation": None,
+        "candidate_pipeline_checkpoints": [],
         "authorization_confirmation_required": None,
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,

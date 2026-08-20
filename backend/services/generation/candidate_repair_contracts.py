@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+
+from backend.llm.stream_terminal import FinishReason
 
 
 MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
+MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
+MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 256
+
+
+class CandidatePipelineCheckpointConflict(ValueError):
+    """The append-only candidate cursor no longer matches this execution."""
 
 
 class PreDispatchFenceV1(BaseModel):
@@ -39,6 +47,154 @@ class StateContextProjection(BaseModel):
     )
     truncated_section_count: int = Field(ge=0, le=100)
     dropped_item_count: int = Field(ge=0, le=10_000)
+
+
+class _CandidateCheckpointContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class CandidateSourceIdentityV1(_CandidateCheckpointContract):
+    schema_version: Literal["candidate_source_identity.v1"] = (
+        "candidate_source_identity.v1"
+    )
+    source_run_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    source_run_revision: int = Field(ge=1)
+    source_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CandidateCompletionProjectionV1(_CandidateCheckpointContract):
+    """Only completion fields consumed by the deterministic candidate gates."""
+
+    schema_version: Literal["candidate_completion_projection.v1"] = (
+        "candidate_completion_projection.v1"
+    )
+    status: Literal["complete", "degraded", "incomplete", "stale"]
+    can_write_formal_prose: bool
+    finish_reason: FinishReason
+
+
+class CandidateTruncationProjectionV1(_CandidateCheckpointContract):
+    schema_version: Literal["candidate_truncation_projection.v1"] = (
+        "candidate_truncation_projection.v1"
+    )
+    truncated_section_count: int = Field(default=0, ge=0, le=100)
+    dropped_item_count: int = Field(default=0, ge=0, le=10_000)
+
+
+class CandidateSceneCoverageV1(_CandidateCheckpointContract):
+    scene_index: int = Field(ge=1, le=100)
+    status: Literal["covered", "partial", "missing"]
+
+
+CandidateOutlineIssueCategory = Literal[
+    "scene_coverage",
+    "scene_order",
+    "core_conflict",
+    "ending_hook",
+    "unplanned_major_event",
+    "volume_arc",
+]
+
+
+class _CandidatePipelineCheckpointV1(_CandidateCheckpointContract):
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v1"] = (
+        "chapter_candidate_pipeline_checkpoint.v1"
+    )
+    checkpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sequence: int = Field(
+        ge=1,
+        le=MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
+    )
+    chapter_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    cycle: int = Field(ge=0, le=MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES)
+    source: CandidateSourceIdentityV1
+    attempt_ids: tuple[str, ...] = Field(
+        default=(),
+        max_length=MAX_CANDIDATE_CHECKPOINT_ATTEMPTS,
+    )
+    truncation: CandidateTruncationProjectionV1 = Field(
+        default_factory=CandidateTruncationProjectionV1
+    )
+
+    @model_validator(mode="after")
+    def validate_attempt_identities(self) -> "_CandidatePipelineCheckpointV1":
+        if any(
+            len(attempt_id) != 32
+            or any(character not in "0123456789abcdef" for character in attempt_id)
+            for attempt_id in self.attempt_ids
+        ):
+            raise ValueError("candidate checkpoint attempt identity is invalid")
+        if len(set(self.attempt_ids)) != len(self.attempt_ids):
+            raise ValueError("candidate checkpoint attempt identity is duplicated")
+        return self
+
+
+class ProseCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
+    kind: Literal["prose_candidate"] = "prose_candidate"
+    origin: Literal["initial", "repair"]
+    completion: CandidateCompletionProjectionV1
+
+    @model_validator(mode="after")
+    def validate_origin_cycle(self) -> "ProseCandidateCheckpointV1":
+        if (self.origin == "initial") != (self.cycle == 0):
+            raise ValueError("prose checkpoint origin and cycle diverged")
+        return self
+
+
+class AdherenceCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
+    kind: Literal["outline_adherence"] = "outline_adherence"
+    verdict: Literal["pass", "warn", "fail"]
+    issue_categories: tuple[CandidateOutlineIssueCategory, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    scene_coverage: tuple[CandidateSceneCoverageV1, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+
+
+class StateCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
+    kind: Literal["state_candidate"] = "state_candidate"
+    origin: Literal["initial", "repair"]
+    proposal_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    request_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dropped_reference_count: int = Field(default=0, ge=0, le=1_000)
+
+    @model_validator(mode="after")
+    def validate_origin_cycle(self) -> "StateCandidateCheckpointV1":
+        if (self.origin == "initial") != (self.cycle == 0):
+            raise ValueError("state checkpoint origin and cycle diverged")
+        return self
+
+
+CandidatePipelineCheckpointV1 = Annotated[
+    ProseCandidateCheckpointV1
+    | AdherenceCandidateCheckpointV1
+    | StateCandidateCheckpointV1,
+    Field(discriminator="kind"),
+]
+
+
+_CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER = TypeAdapter(
+    CandidatePipelineCheckpointV1
+)
+
+
+def parse_candidate_pipeline_checkpoint(
+    value: Any,
+) -> CandidatePipelineCheckpointV1:
+    """Revalidate even already-built models to reject forged model_copy values."""
+
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="python")
+    elif isinstance(value, Mapping):
+        value = dict(value)
+        for field in ("attempt_ids", "issue_categories", "scene_coverage"):
+            stored = value.get(field)
+            if isinstance(stored, list):
+                value[field] = tuple(stored)
+    return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
 
 
 def project_state_context(
