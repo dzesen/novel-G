@@ -536,6 +536,35 @@ class StateProposalModule:
             },
         )
 
+    async def record_pre_dispatch_projection(
+        self,
+        lease: StateProposalLease,
+        projection: StateContextProjection,
+    ) -> None:
+        """Persist the bounded recovery projection before Provider dispatch."""
+        value = StateContextProjection.model_validate(
+            projection
+        ).model_dump(mode="json")
+        result = await self.collection.update_one(
+            {
+                "_id": lease.proposal_id,
+                "status": "generating",
+                "content_digest": lease.snapshot.content_digest,
+                "narrative_revision": lease.snapshot.narrative_revision,
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "generation_audit.state_context_projection": value,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.matched_count != 1:
+            raise StaleStatePreview(
+                "State generation pre-dispatch projection was not persisted"
+            )
+
     async def record_generation_audit(
         self,
         lease: StateProposalLease,

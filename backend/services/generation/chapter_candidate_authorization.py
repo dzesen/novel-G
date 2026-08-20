@@ -49,7 +49,7 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v3"
 )
-CANDIDATE_PIPELINE_REVISION = 5
+CANDIDATE_PIPELINE_REVISION = 6
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
 PROSE_REMEDIATION_MAX_STEPS = 3

@@ -65,7 +65,31 @@ class JobAttemptScope:
         self._attempts: dict[str, AttemptUsage] = {}
         self._uncertain: set[str] = set()
         self._persisted_states: dict[str, str] = {}
+        self._pre_dispatch_fence: dict[str, object] | None = None
         self._restore_attempt_evidence(existing_attempt_slots)
+
+    async def bind_pre_dispatch_fence(
+        self,
+        *,
+        receipt_id: str,
+        claim_token: str,
+        claim_epoch: int,
+    ) -> None:
+        """Fence future claims to the current durable receipt lease."""
+        await self.repo.bind_pre_dispatch_fence(
+            self.job_id,
+            self.chapter_id,
+            self.step_id,
+            receipt_id=receipt_id,
+            claim_token=claim_token,
+            claim_epoch=claim_epoch,
+        )
+        self._pre_dispatch_fence = {
+            "receipt_id": str(receipt_id),
+            "claim_token": str(claim_token),
+            "claim_epoch": int(claim_epoch),
+            "step_id": self.step_id,
+        }
 
     def _restore_attempt_evidence(
         self,
@@ -169,6 +193,7 @@ class JobAttemptScope:
             phase,
             provider_alias,
             conservative_tokens,
+            pre_dispatch_fence=self._pre_dispatch_fence,
         )
         self._claims[attempt_id] = (provider_alias, phase)
         self._conservative_tokens[attempt_id] = conservative_tokens

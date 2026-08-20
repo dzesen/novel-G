@@ -757,14 +757,12 @@ class ChapterGenerationApplicationService:
             )
             context = self._deps.assemble_context(inputs)
             context_text = context.to_prompt_text()
-            await self._deps.state_proposals.record_generation_audit(
+            await self._deps.state_proposals.record_pre_dispatch_projection(
                 lease,
-                {
-                    "state_context_projection": project_state_context(
-                        truncated_sections=context.truncated_sections,
-                        dropped_item_counts=context.dropped_item_counts,
-                    ).model_dump(mode="json")
-                },
+                project_state_context(
+                    truncated_sections=context.truncated_sections,
+                    dropped_item_counts=context.dropped_item_counts,
+                ),
             )
             guidance = command.repair_guidance
             if guidance is not None:

@@ -337,11 +337,13 @@ class _StateRepairReceiptAttemptScope:
         receipts: Any,
         receipt_id: str,
         claim_token: str,
+        claim_epoch: int,
     ) -> None:
         self._wrapped = wrapped
         self._receipts = receipts
         self._receipt_id = str(receipt_id)
         self._claim_token = str(claim_token)
+        self._claim_epoch = int(claim_epoch)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._wrapped, name)
@@ -351,6 +353,7 @@ class _StateRepairReceiptAttemptScope:
             await self._receipts.mark_dispatched(
                 receipt_id=self._receipt_id,
                 claim_token=self._claim_token,
+                claim_epoch=self._claim_epoch,
                 attempt_id=attempt_id,
             )
         except BaseException:
@@ -395,6 +398,7 @@ class _StateRepairReceiptAttemptScope:
         await self._receipts.release_pre_dispatch(
             receipt_id=self._receipt_id,
             claim_token=self._claim_token,
+            claim_epoch=self._claim_epoch,
             attempt_id=attempt_id,
         )
 
@@ -541,6 +545,7 @@ class ChapterCandidateRepairApplication:
         return await self._deps.state_repair_receipts.reopen_released_pre_dispatch(
             receipt_id=str(receipt.get("_id") or ""),
             claim_token=str(receipt.get("claim_token") or ""),
+            claim_epoch=receipt.get("claim_epoch"),
             new_claim_token=new_claim_token,
             attempt_ids=attempt_ids,
         )
@@ -550,8 +555,22 @@ class ChapterCandidateRepairApplication:
         *,
         chapter_id: str,
         cycle: int,
+        receipt_id: str,
+        claim_token: str,
+        claim_epoch: int,
+        fence_bound: bool,
     ) -> None:
         step_id = f"candidate-state-repair:{cycle}"
+        current_fence = (
+            {
+                "receipt_id": str(receipt_id),
+                "claim_token": str(claim_token),
+                "claim_epoch": claim_epoch,
+                "step_id": step_id,
+            }
+            if fence_bound
+            else None
+        )
         for _attempt in range(4):
             slots = await self._raw_state_attempts(
                 chapter_id=chapter_id,
@@ -580,6 +599,7 @@ class ChapterCandidateRepairApplication:
                         chapter_id,
                         step_id,
                         attempt_id,
+                        current_pre_dispatch_fence=current_fence,
                     )
                 ) or changed
             if not changed:
@@ -1012,6 +1032,7 @@ class ChapterCandidateRepairApplication:
             await self._deps.state_repair_receipts.complete_receipt(
                 receipt_id=str(existing["_id"]),
                 claim_token=str(existing.get("claim_token") or ""),
+                claim_epoch=existing.get("claim_epoch"),
                 result_projection=_state_result_projection(generation),
             )
             return StateCandidateRepairReceipt(generation=generation)
@@ -1078,18 +1099,38 @@ class ChapterCandidateRepairApplication:
                 usage=_attempt_usage(attempts),
                 attempts=attempts,
             )
+        claim_epoch = receipt.get("claim_epoch")
+        if type(claim_epoch) is not int or claim_epoch < 1:
+            raise ValueError("state repair receipt claim epoch is invalid")
+        base_attempt_scope = self._attempt_scope_factory(
+            f"candidate-state-repair:{request.cycle}"
+        )
+        bind_fence = getattr(
+            base_attempt_scope,
+            "bind_pre_dispatch_fence",
+            None,
+        )
+        fence_bound = callable(bind_fence)
+        if fence_bound:
+            await bind_fence(
+                receipt_id=str(receipt["_id"]),
+                claim_token=claim_token,
+                claim_epoch=claim_epoch,
+            )
         await self._discard_reserved_state_attempts(
             chapter_id=chapter_id,
             cycle=request.cycle,
-        )
-        base_attempt_scope = self._attempt_scope_factory(
-            f"candidate-state-repair:{request.cycle}"
+            receipt_id=str(receipt["_id"]),
+            claim_token=claim_token,
+            claim_epoch=claim_epoch,
+            fence_bound=fence_bound,
         )
         attempt_scope = _StateRepairReceiptAttemptScope(
             base_attempt_scope,
             receipts=self._deps.state_repair_receipts,
             receipt_id=str(receipt["_id"]),
             claim_token=claim_token,
+            claim_epoch=claim_epoch,
         )
         generation = await self._deps.generate_state_candidate(
             novel_id,
@@ -1127,6 +1168,7 @@ class ChapterCandidateRepairApplication:
         await self._deps.state_repair_receipts.complete_receipt(
             receipt_id=str(receipt["_id"]),
             claim_token=claim_token,
+            claim_epoch=claim_epoch,
             result_projection=_state_result_projection(generation),
         )
         return StateCandidateRepairReceipt(generation=generation)
