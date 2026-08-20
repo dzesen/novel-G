@@ -51,6 +51,7 @@ from backend.services.generation.chapter_generation_application import (
     PROSE_REMEDIATION_WORKFLOW,
 )
 from backend.services.generation.outline_adherence import (
+    OutlineIssueCategoryValue,
     normalize_outline_adherence,
 )
 from backend.services.generation.prose_completion import (
@@ -98,16 +99,6 @@ _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
 _FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r4"
 
-OutlineIssueCategory = Literal[
-    "scene_coverage",
-    "scene_order",
-    "core_conflict",
-    "ending_hook",
-    "unplanned_major_event",
-    "volume_arc",
-]
-
-
 def _blocked_error_summary(
     operation: Literal["rewrite", "adherence"],
     code: Literal["resource_stale", "manual_approval_required"],
@@ -136,7 +127,7 @@ class RewriteProseCandidateInput(_StrictModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
-    issue_categories: tuple[OutlineIssueCategory, ...] = Field(
+    issue_categories: tuple[OutlineIssueCategoryValue, ...] = Field(
         min_length=1,
         max_length=20,
     )
@@ -168,7 +159,7 @@ class RewrittenProseProviderOutput(_StrictModel):
         max_length=MAX_REMEDIATION_PROSE_CHARACTERS,
     )
     summary: str = Field(min_length=1, max_length=1_000)
-    addressed_categories: tuple[OutlineIssueCategory, ...] = Field(
+    addressed_categories: tuple[OutlineIssueCategoryValue, ...] = Field(
         default=(),
         max_length=20,
     )
@@ -209,7 +200,7 @@ class RewriteProseCandidateOutput(_StrictModel):
     content_digest: str = Field(min_length=64, max_length=64)
     changed: bool
     summary: str = Field(min_length=1, max_length=1_000)
-    addressed_categories: tuple[OutlineIssueCategory, ...] = ()
+    addressed_categories: tuple[OutlineIssueCategoryValue, ...] = ()
 
 
 class CheckOutlineAdherenceOutput(_StrictModel):

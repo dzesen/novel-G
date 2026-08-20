@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from enum import StrEnum
+from typing import Any, Literal, Mapping
+
+
+class OutlineIssueCategory(StrEnum):
+    """Stable categories shared by review, repair, and checkpoint contracts."""
+
+    SCENE_COVERAGE = "scene_coverage"
+    SCENE_ORDER = "scene_order"
+    CORE_CONFLICT = "core_conflict"
+    ENDING_HOOK = "ending_hook"
+    UNPLANNED_MAJOR_EVENT = "unplanned_major_event"
+    VOLUME_ARC = "volume_arc"
+
+
+OUTLINE_ISSUE_CATEGORIES = frozenset(OutlineIssueCategory)
+OutlineIssueCategoryValue = Literal[
+    *tuple(category.value for category in OutlineIssueCategory)
+]
 
 PAUSE_FOR_REWRITE = "pause_for_rewrite"
 ACCEPT_AND_CONTINUE = "accept_and_continue"

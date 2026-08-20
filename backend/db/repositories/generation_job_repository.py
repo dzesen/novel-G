@@ -254,42 +254,11 @@ class GenerationJobRepository(BaseRepository):
             "Candidate pipeline checkpoint append lost its execution fence"
         )
 
-    async def clear_candidate_pipeline_checkpoints(
-        self,
-        job_id: str,
-        *,
-        chapter_id: str,
-    ) -> bool:
-        normalized_chapter_id = str(chapter_id or "")
-        if not normalized_chapter_id:
-            raise ValueError("Candidate pipeline chapter id is required")
-        job = await self.get_job(job_id)
-        if str(job.get("current_chapter_id") or "") != normalized_chapter_id:
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline chapter is no longer current"
-            )
-        self._candidate_pipeline_checkpoints(
-            job,
-            chapter_id=normalized_chapter_id,
-        )
-        result = await self.collection.update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "current_chapter_id": normalized_chapter_id,
-            },
-            {
-                "$set": {
-                    "candidate_pipeline_checkpoints": [],
-                    "updated_at": get_utc_now(),
-                }
-            },
-        )
-        return result.modified_count == 1 or not job.get(
-            "candidate_pipeline_checkpoints"
-        )
-
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
+        if "candidate_pipeline_checkpoints" in fields:
+            raise ValueError(
+                "Candidate pipeline checkpoints require an atomic repository command"
+            )
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))
 
     async def append_diagnostic(

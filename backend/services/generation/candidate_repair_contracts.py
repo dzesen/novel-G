@@ -8,11 +8,15 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from backend.llm.stream_terminal import FinishReason
+from backend.services.generation.outline_adherence import (
+    OutlineIssueCategoryValue,
+)
 
 
 MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 256
+MAX_BSON_INT64 = 2**63 - 1
 
 
 class CandidatePipelineCheckpointConflict(ValueError):
@@ -54,52 +58,38 @@ class _CandidateCheckpointContract(BaseModel):
 
 
 class CandidateSourceIdentityV1(_CandidateCheckpointContract):
-    schema_version: Literal["candidate_source_identity.v1"] = (
-        "candidate_source_identity.v1"
-    )
+    schema_version: Literal["candidate_source_identity.v1"]
     source_run_id: str = Field(pattern=r"^[0-9a-f]{24}$")
-    source_run_revision: int = Field(ge=1)
+    source_run_revision: int = Field(ge=1, le=MAX_BSON_INT64)
     source_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class CandidateCompletionProjectionV1(_CandidateCheckpointContract):
     """Only completion fields consumed by the deterministic candidate gates."""
 
-    schema_version: Literal["candidate_completion_projection.v1"] = (
-        "candidate_completion_projection.v1"
-    )
+    schema_version: Literal["candidate_completion_projection.v1"]
     status: Literal["complete", "degraded", "incomplete", "stale"]
     can_write_formal_prose: bool
     finish_reason: FinishReason
 
 
 class CandidateTruncationProjectionV1(_CandidateCheckpointContract):
-    schema_version: Literal["candidate_truncation_projection.v1"] = (
-        "candidate_truncation_projection.v1"
-    )
+    schema_version: Literal["candidate_truncation_projection.v1"]
     truncated_section_count: int = Field(default=0, ge=0, le=100)
     dropped_item_count: int = Field(default=0, ge=0, le=10_000)
 
 
 class CandidateSceneCoverageV1(_CandidateCheckpointContract):
+    schema_version: Literal["candidate_scene_coverage.v1"]
     scene_index: int = Field(ge=1, le=100)
     status: Literal["covered", "partial", "missing"]
 
 
-CandidateOutlineIssueCategory = Literal[
-    "scene_coverage",
-    "scene_order",
-    "core_conflict",
-    "ending_hook",
-    "unplanned_major_event",
-    "volume_arc",
-]
+CandidateOutlineIssueCategory = OutlineIssueCategoryValue
 
 
 class _CandidatePipelineCheckpointV1(_CandidateCheckpointContract):
-    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v1"] = (
-        "chapter_candidate_pipeline_checkpoint.v1"
-    )
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v1"]
     checkpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     sequence: int = Field(
         ge=1,
@@ -112,9 +102,7 @@ class _CandidatePipelineCheckpointV1(_CandidateCheckpointContract):
         default=(),
         max_length=MAX_CANDIDATE_CHECKPOINT_ATTEMPTS,
     )
-    truncation: CandidateTruncationProjectionV1 = Field(
-        default_factory=CandidateTruncationProjectionV1
-    )
+    truncation: CandidateTruncationProjectionV1
 
     @model_validator(mode="after")
     def validate_attempt_identities(self) -> "_CandidatePipelineCheckpointV1":
@@ -188,13 +176,88 @@ def parse_candidate_pipeline_checkpoint(
 
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="python")
-    elif isinstance(value, Mapping):
-        value = dict(value)
-        for field in ("attempt_ids", "issue_categories", "scene_coverage"):
-            stored = value.get(field)
-            if isinstance(stored, list):
-                value[field] = tuple(stored)
+    if not isinstance(value, Mapping):
+        return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
+
+    value = dict(value)
+    _require_contract_version(
+        value,
+        expected="chapter_candidate_pipeline_checkpoint.v1",
+        subject="candidate checkpoint",
+    )
+    _require_nested_contract_version(
+        value,
+        field="source",
+        expected="candidate_source_identity.v1",
+    )
+    _require_nested_contract_version(
+        value,
+        field="truncation",
+        expected="candidate_truncation_projection.v1",
+    )
+    if value.get("kind") == "prose_candidate":
+        _require_nested_contract_version(
+            value,
+            field="completion",
+            expected="candidate_completion_projection.v1",
+        )
+
+    list_limits = {
+        "attempt_ids": MAX_CANDIDATE_CHECKPOINT_ATTEMPTS,
+        "issue_categories": 20,
+        "scene_coverage": 20,
+    }
+    for field, limit in list_limits.items():
+        stored = value.get(field)
+        if stored is None:
+            continue
+        if not isinstance(stored, (list, tuple)):
+            raise ValueError(f"candidate checkpoint {field} is not a list")
+        if len(stored) > limit:
+            raise ValueError(
+                f"candidate checkpoint {field} exceeds its bounded length"
+            )
+        if field == "scene_coverage":
+            for item in stored:
+                if not isinstance(item, Mapping):
+                    raise ValueError(
+                        "candidate checkpoint scene coverage is invalid"
+                    )
+                _require_contract_version(
+                    item,
+                    expected="candidate_scene_coverage.v1",
+                    subject="candidate scene coverage",
+                )
+        if isinstance(stored, list):
+            value[field] = tuple(stored)
     return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
+
+
+def _require_contract_version(
+    value: Mapping[str, Any],
+    *,
+    expected: str,
+    subject: str,
+) -> None:
+    version = value.get("schema_version")
+    if type(version) is not str or version != expected:
+        raise ValueError(f"{subject} schema version is invalid")
+
+
+def _require_nested_contract_version(
+    value: Mapping[str, Any],
+    *,
+    field: str,
+    expected: str,
+) -> None:
+    nested = value.get(field)
+    if not isinstance(nested, Mapping):
+        raise ValueError(f"candidate checkpoint {field} is invalid")
+    _require_contract_version(
+        nested,
+        expected=expected,
+        subject=f"candidate checkpoint {field}",
+    )
 
 
 def project_state_context(

@@ -21,6 +21,8 @@ from backend.services.generation.headless_generation import (
     GeneratedProseCandidate,
 )
 from backend.services.generation.outline_adherence import (
+    OUTLINE_ISSUE_CATEGORIES,
+    OutlineIssueCategory,
     OutlineAdherenceValidationError,
     validate_complete_outline_adherence,
 )
@@ -51,16 +53,7 @@ ProseRepairReason = Literal[
 ]
 
 
-class OutlineIssueCategory(StrEnum):
-    SCENE_COVERAGE = "scene_coverage"
-    SCENE_ORDER = "scene_order"
-    CORE_CONFLICT = "core_conflict"
-    ENDING_HOOK = "ending_hook"
-    UNPLANNED_MAJOR_EVENT = "unplanned_major_event"
-    VOLUME_ARC = "volume_arc"
-
-
-_OUTLINE_ISSUE_CATEGORIES = frozenset(OutlineIssueCategory)
+_OUTLINE_ISSUE_CATEGORIES = OUTLINE_ISSUE_CATEGORIES
 
 
 class CandidateAttemptPhase(StrEnum):
