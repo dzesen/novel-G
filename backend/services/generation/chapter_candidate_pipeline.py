@@ -1399,6 +1399,7 @@ class _PipelineTrace:
             conflict = self._cross_step_attempt_conflict(
                 usage,
                 summaries,
+                evidence_kind=CandidateUsageEvidenceKind.EXACT,
             )
             if conflict is not None:
                 raise conflict
@@ -1408,6 +1409,7 @@ class _PipelineTrace:
                 conflict = self._cross_step_attempt_conflict(
                     exc.usage,
                     exc.attempts,
+                    evidence_kind=exc.evidence_kind,
                 )
                 if conflict is not None:
                     exc = conflict
@@ -1504,6 +1506,7 @@ class _PipelineTrace:
             conflict = self._cross_step_attempt_conflict(
                 _effective_usage(aggregate, summaries),
                 summaries,
+                evidence_kind=aggregate_kind,
             )
             if conflict is not None:
                 raise conflict
@@ -1579,6 +1582,7 @@ class _PipelineTrace:
                 conflict = self._cross_step_attempt_conflict(
                     projection_error.usage,
                     projection_error.attempts,
+                    evidence_kind=projection_error.evidence_kind,
                 )
                 if conflict is not None:
                     projection_error = conflict
@@ -1663,6 +1667,8 @@ class _PipelineTrace:
         self,
         usage: CandidateUsageSummary,
         summaries: tuple[CandidateAttemptSummary, ...],
+        *,
+        evidence_kind: CandidateUsageEvidenceKind,
     ) -> _UnattributedUsageProjectionError | None:
         """Preserve a later paid step without reusing an earlier ledger ID."""
         known_ids = {item.attempt_id for item in self.attempts}
@@ -1682,7 +1688,10 @@ class _PipelineTrace:
                 ),
                 usage=usage,
                 attempts=(),
-                evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+                evidence_kind=_merge_usage_evidence_kind(
+                    evidence_kind,
+                    CandidateUsageEvidenceKind.INCOMPLETE,
+                ),
             )
         try:
             new_usage = _summed_usage(new)
@@ -1704,7 +1713,10 @@ class _PipelineTrace:
             reason=CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT,
             usage=conflict_usage,
             attempts=(),
-            evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+            evidence_kind=_merge_usage_evidence_kind(
+                evidence_kind,
+                CandidateUsageEvidenceKind.INCOMPLETE,
+            ),
         )
 
     def _classify_attempts(
