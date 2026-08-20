@@ -19,6 +19,11 @@ from backend.services.generation.chapter_finalization import (
 )
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
+    AdherenceCandidateCheckpointV1,
+    CandidatePipelineCheckpointV1,
+    ProseCandidateCheckpointV1,
+    StateCandidateCheckpointV1,
+    parse_candidate_pipeline_checkpoint,
 )
 from backend.services.generation.headless_generation import (
     GeneratedProseCandidate,
@@ -976,10 +981,10 @@ class ChapterCandidatePipelineResume:
     """Owner-scoped live candidates reconstructed from persisted checkpoints."""
 
     progress: ChapterCandidatePipelineProgress
+    checkpoints: tuple[CandidatePipelineCheckpointV1, ...]
     source: ProseCandidateSource
     adherence: ChapterGenerationResult | None = None
     state: ChapterGenerationResult | None = None
-    last_repair_kept_digest: bool = False
 
 
 def _exception_usage_projection(
@@ -1484,168 +1489,615 @@ class _PipelineTrace:
         )
 
 
+@dataclass(frozen=True)
+class _RestoredPipeline:
+    trace: _PipelineTrace
+    source: ProseCandidateSource
+    adherence: ChapterGenerationResult | None
+    state: ChapterGenerationResult | None
+    review_count: int
+    last_repair_kept_digest: bool
+
+
+def _blocked_resume(
+    trace: _PipelineTrace,
+    message: str,
+) -> ChapterCandidatePipelineBlocked:
+    return ChapterCandidatePipelineBlocked(
+        message,
+        progress=trace.snapshot(),
+    )
+
+
+def _is_lower_hex(value: Any, *, length: int) -> bool:
+    return bool(
+        type(value) is str
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _checkpoint_source_key(
+    checkpoint: CandidatePipelineCheckpointV1,
+) -> tuple[str, int, str]:
+    source = checkpoint.source
+    return (
+        source.source_run_id,
+        source.source_run_revision,
+        source.source_content_digest,
+    )
+
+
+def _runtime_source_key(
+    source: ProseCandidateSource,
+) -> tuple[str, int, str]:
+    return (
+        source.source_run_id,
+        source.source_run_revision,
+        source.source_content_digest,
+    )
+
+
+def _checkpoint_step_name(
+    checkpoint: CandidatePipelineCheckpointV1,
+    *,
+    review_count: int,
+) -> str:
+    if isinstance(checkpoint, ProseCandidateCheckpointV1):
+        return (
+            "prose"
+            if checkpoint.origin == "initial"
+            else f"prose_repair_{checkpoint.cycle}"
+        )
+    if isinstance(checkpoint, AdherenceCandidateCheckpointV1):
+        return (
+            "outline_adherence"
+            if review_count == 1
+            else f"outline_adherence_recheck_{review_count}"
+        )
+    return (
+        "state"
+        if checkpoint.origin == "initial"
+        else f"state_repair_{checkpoint.cycle}"
+    )
+
+
+def _checkpoint_completion_passed(
+    checkpoint: ProseCandidateCheckpointV1,
+) -> bool:
+    return bool(
+        checkpoint.completion.status == "complete"
+        and checkpoint.completion.can_write_formal_prose is True
+        and checkpoint.completion.finish_reason == "stop"
+    )
+
+
+def _checkpoint_adherence_passed(
+    checkpoint: AdherenceCandidateCheckpointV1,
+    *,
+    chapter: Mapping[str, Any],
+) -> bool:
+    outline = chapter.get("outline")
+    scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
+    if not isinstance(scenes, list) or not scenes:
+        return False
+    indexes = [item.scene_index for item in checkpoint.scene_coverage]
+    return bool(
+        checkpoint.verdict == "pass"
+        and not checkpoint.issue_categories
+        and len(indexes) == len(scenes)
+        and len(set(indexes)) == len(indexes)
+        and set(indexes) == set(range(1, len(scenes) + 1))
+        and all(
+            item.status == "covered"
+            for item in checkpoint.scene_coverage
+        )
+    )
+
+
+def _validate_resumed_adherence_projection(
+    reviewed: ChapterGenerationResult,
+    *,
+    checkpoint: AdherenceCandidateCheckpointV1,
+    source: ProseCandidateSource,
+) -> None:
+    if reviewed.stage is not ChapterGenerationStage.OUTLINE_ADHERENCE:
+        raise ChapterCandidatePipelineBlocked("候选管线恢复复检结果无效")
+    if not isinstance(reviewed.value, Mapping):
+        raise ChapterCandidatePipelineBlocked("候选管线恢复复检结果无效")
+    adherence = dict(reviewed.value)
+    if not _adherence_matches_source(adherence, source):
+        raise ChapterCandidatePipelineBlocked("候选管线恢复复检身份不一致")
+    issues = adherence.get("issues")
+    coverage = adherence.get("scene_coverage")
+    if not isinstance(issues, list) or not isinstance(coverage, list):
+        raise ChapterCandidatePipelineBlocked("候选管线恢复复检结果无效")
+    issue_categories: list[str] = []
+    for item in issues:
+        if not isinstance(item, Mapping):
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复复检结果无效"
+            )
+        category = item.get("category")
+        if category not in _OUTLINE_ISSUE_CATEGORIES:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复复检结果无效"
+            )
+        if category not in issue_categories:
+            issue_categories.append(category)
+    projected_coverage: list[tuple[int, str]] = []
+    for item in coverage:
+        if not isinstance(item, Mapping):
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复复检结果无效"
+            )
+        index = item.get("scene_index")
+        status = item.get("status")
+        if type(index) is not int or status not in {
+            "covered",
+            "partial",
+            "missing",
+        }:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复复检结果无效"
+            )
+        projected_coverage.append((index, status))
+    if (
+        adherence.get("verdict") != checkpoint.verdict
+        or tuple(issue_categories) != tuple(checkpoint.issue_categories)
+        or tuple(projected_coverage)
+        != tuple(
+            (item.scene_index, item.status)
+            for item in checkpoint.scene_coverage
+        )
+    ):
+        raise ChapterCandidatePipelineBlocked(
+            "候选管线恢复复检投影与检查点不一致"
+        )
+
+
+def _validate_resumed_state_projection(
+    state_result: ChapterGenerationResult,
+    *,
+    checkpoint: StateCandidateCheckpointV1,
+) -> None:
+    _state, proposal_id, _acceptance_token, _issues = _validate_state_shape(
+        state_result
+    )
+    if (
+        proposal_id != checkpoint.proposal_id
+        or _dropped_reference_count(state_result.dropped)
+        != checkpoint.dropped_reference_count
+    ):
+        raise ChapterCandidatePipelineBlocked(
+            "候选管线恢复状态投影与检查点不一致"
+        )
+
+
 def _resume_trace(
     resume: ChapterCandidatePipelineResume,
     *,
     repair_limit: int,
-) -> _PipelineTrace:
+    chapter_id: str,
+    chapter: Mapping[str, Any],
+) -> _RestoredPipeline:
     if not isinstance(resume, ChapterCandidatePipelineResume):
         raise ChapterCandidatePipelineBlocked("候选管线恢复协议无效")
     progress = resume.progress
     if not isinstance(progress, ChapterCandidatePipelineProgress):
         raise ChapterCandidatePipelineBlocked("候选管线恢复进度无效")
+
+    restored = _PipelineTrace()
+    if (
+        not isinstance(progress.attempts, tuple)
+        or len(progress.attempts) > _MAX_PIPELINE_ATTEMPTS
+    ):
+        raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
+    attempt_ids: set[str] = set()
+    for item in progress.attempts:
+        if not isinstance(item, CandidateAttemptSummary):
+            raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
+        try:
+            validated = CandidateAttemptSummary.model_validate(
+                item.model_dump(mode="python")
+            )
+            if validated.attempt_id in attempt_ids:
+                raise _blocked_resume(restored, "候选管线恢复 attempt 重复")
+            restored.tokens = _checked_token_add(
+                restored.tokens,
+                validated.usage.total_tokens,
+            )
+        except ChapterCandidatePipelineBlocked:
+            raise
+        except _UsageProjectionOverflow as exc:
+            restored._record_usage_overflow()
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复 Token 超过 V1 上限",
+            ) from exc
+        except Exception as exc:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复 attempt 无效",
+            ) from exc
+        restored.attempts.append(validated)
+        attempt_ids.add(validated.attempt_id)
+
+    if (
+        not isinstance(progress.unattributed_usage, tuple)
+        or len(progress.unattributed_usage)
+        > _MAX_PIPELINE_UNATTRIBUTED_USAGE
+    ):
+        raise _blocked_resume(restored, "候选管线恢复用量证据无效")
+    for item in progress.unattributed_usage:
+        if not isinstance(item, CandidateUnattributedUsageSummary):
+            raise _blocked_resume(restored, "候选管线恢复用量证据无效")
+        try:
+            validated = CandidateUnattributedUsageSummary.model_validate(
+                item.model_dump(mode="python")
+            )
+            restored.tokens = _checked_token_add(
+                restored.tokens,
+                validated.usage.total_tokens,
+            )
+        except _UsageProjectionOverflow as exc:
+            restored._record_usage_overflow()
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复 Token 超过 V1 上限",
+            ) from exc
+        except Exception as exc:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复用量证据无效",
+            ) from exc
+        restored.unattributed_usage.append(validated)
+
     if (
         type(progress.tokens) is not int
         or progress.tokens < 0
         or progress.tokens > _MAX_TOKEN_COUNT
     ):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复 Token 无效")
-    if (
-        not isinstance(progress.attempts, tuple)
-        or len(progress.attempts) > _MAX_PIPELINE_ATTEMPTS
-    ):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复 attempt 无效")
-    attempts: list[CandidateAttemptSummary] = []
-    for item in progress.attempts:
-        if not isinstance(item, CandidateAttemptSummary):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复 attempt 无效"
+        raise _blocked_resume(restored, "候选管线恢复 Token 无效")
+    if restored.tokens != progress.tokens:
+        if progress.tokens > restored.tokens:
+            restored.unattributed_usage.append(
+                CandidateUnattributedUsageSummary(
+                    reason=(
+                        CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
+                    ),
+                    usage=CandidateUsageSummary(
+                        total_tokens=progress.tokens - restored.tokens
+                    ),
+                    evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+                )
             )
-        try:
-            attempts.append(CandidateAttemptSummary.model_validate(
-                item.model_dump(mode="python")
-            ))
-        except Exception as exc:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复 attempt 无效"
-            ) from exc
-    if len({item.attempt_id for item in attempts}) != len(attempts):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复 attempt 重复")
-    try:
-        attempt_tokens = _summed_usage(tuple(attempts)).total_tokens
-    except _EvidenceProjectionError as exc:
-        raise ChapterCandidatePipelineBlocked(
-            "候选管线恢复 Token 无效"
-        ) from exc
-    if attempt_tokens != progress.tokens:
-        raise ChapterCandidatePipelineBlocked(
-            "候选管线恢复 Token 与 attempt 账本不一致"
+            restored.tokens = progress.tokens
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复 Token 与调用证据不一致",
         )
-    if progress.unattributed_usage != ():
-        raise ChapterCandidatePipelineBlocked(
-            "候选管线恢复仍有未归属的 Token 证据"
+    if restored.unattributed_usage:
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复仍有未归属的 Token 证据",
         )
+
     if (
         not isinstance(progress.truncations, tuple)
         or len(progress.truncations) > _MAX_PIPELINE_TRUNCATIONS
     ):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复截断证据无效")
-    truncations: list[CandidateTruncationSummary] = []
+        raise _blocked_resume(restored, "候选管线恢复截断证据无效")
     for item in progress.truncations:
         if not isinstance(item, CandidateTruncationSummary):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复截断证据无效"
-            )
+            raise _blocked_resume(restored, "候选管线恢复截断证据无效")
         try:
-            truncations.append(CandidateTruncationSummary.model_validate(
-                item.model_dump(mode="python")
-            ))
+            restored.truncations.append(
+                CandidateTruncationSummary.model_validate(
+                    item.model_dump(mode="python")
+                )
+            )
         except Exception as exc:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复截断证据无效"
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复截断证据无效",
             ) from exc
-    completed_steps = progress.completed_steps
+
     if (
-        not isinstance(completed_steps, tuple)
-        or len(completed_steps) > MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS
-        or any(
-            not isinstance(step, str) or not 0 < len(step) <= 64
-            for step in completed_steps
+        not _is_lower_hex(progress.prose_run_id, length=24)
+        or type(progress.prose_run_revision) is not int
+        or not 1 <= progress.prose_run_revision < 2**63
+        or not _is_lower_hex(progress.prose_content_digest, length=64)
+        or (
+            progress.state_proposal_id is not None
+            and not _is_lower_hex(progress.state_proposal_id, length=24)
         )
-        or len(set(completed_steps)) != len(completed_steps)
     ):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复步骤证据无效")
+        raise _blocked_resume(restored, "候选管线恢复正文身份无效")
+
+    raw_checkpoints = resume.checkpoints
+    if (
+        not isinstance(raw_checkpoints, tuple)
+        or not raw_checkpoints
+        or len(raw_checkpoints)
+        > MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS
+    ):
+        raise _blocked_resume(restored, "候选管线恢复检查点无效")
+    checkpoints: list[CandidatePipelineCheckpointV1] = []
+    for raw_checkpoint in raw_checkpoints:
+        try:
+            checkpoints.append(
+                parse_candidate_pipeline_checkpoint(raw_checkpoint)
+            )
+        except Exception as exc:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复检查点无效",
+            ) from exc
+
+    completed_steps: list[str] = []
+    checkpoint_attempt_ids: list[str] = []
+    expected_truncations: list[CandidateTruncationSummary] = []
+    current_prose: ProseCandidateCheckpointV1 | None = None
+    previous_prose: ProseCandidateCheckpointV1 | None = None
+    latest_adherence: AdherenceCandidateCheckpointV1 | None = None
+    latest_state: StateCandidateCheckpointV1 | None = None
+    phase = "start"
+    repair_cycles_used = 0
+    review_count = 0
+    for expected_sequence, checkpoint in enumerate(checkpoints, start=1):
+        if (
+            checkpoint.sequence != expected_sequence
+            or checkpoint.chapter_id != chapter_id
+        ):
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复检查点顺序或章节身份无效",
+            )
+        if isinstance(checkpoint, ProseCandidateCheckpointV1):
+            if checkpoint.origin == "initial":
+                if phase != "start":
+                    raise _blocked_resume(
+                        restored,
+                        "候选管线恢复步骤顺序无效",
+                    )
+            else:
+                if phase not in {"prose", "adherence"}:
+                    raise _blocked_resume(
+                        restored,
+                        "候选管线恢复步骤顺序无效",
+                    )
+                if phase == "prose" and current_prose is not None:
+                    if _checkpoint_completion_passed(current_prose):
+                        raise _blocked_resume(
+                            restored,
+                            "候选管线恢复步骤顺序无效",
+                        )
+                if phase == "adherence" and latest_adherence is not None:
+                    if _checkpoint_adherence_passed(
+                        latest_adherence,
+                        chapter=chapter,
+                    ):
+                        raise _blocked_resume(
+                            restored,
+                            "候选管线恢复步骤顺序无效",
+                        )
+                if checkpoint.cycle != repair_cycles_used + 1:
+                    raise _blocked_resume(
+                        restored,
+                        "候选管线恢复修复轮次无效",
+                    )
+                if (
+                    current_prose is None
+                    or checkpoint.source.source_run_id
+                    != current_prose.source.source_run_id
+                    or checkpoint.source.source_run_revision
+                    <= current_prose.source.source_run_revision
+                ):
+                    raise _blocked_resume(
+                        restored,
+                        "候选管线恢复正文修复谱系无效",
+                    )
+                repair_cycles_used = checkpoint.cycle
+            previous_prose = current_prose
+            current_prose = checkpoint
+            latest_adherence = None
+            latest_state = None
+            phase = "prose"
+        elif isinstance(checkpoint, AdherenceCandidateCheckpointV1):
+            if phase != "prose" or current_prose is None:
+                raise _blocked_resume(
+                    restored,
+                    "候选管线恢复步骤顺序无效",
+                )
+            if not _checkpoint_completion_passed(current_prose):
+                raise _blocked_resume(
+                    restored,
+                    "候选管线恢复复检早于正文完成闸门",
+                )
+            if (
+                _checkpoint_source_key(checkpoint)
+                != _checkpoint_source_key(current_prose)
+                or checkpoint.cycle != current_prose.cycle
+            ):
+                raise _blocked_resume(
+                    restored,
+                    "候选管线恢复复检身份无效",
+                )
+            review_count += 1
+            latest_adherence = checkpoint
+            latest_state = None
+            phase = "adherence"
+        else:
+            if checkpoint.origin == "initial":
+                if (
+                    phase != "adherence"
+                    or latest_adherence is None
+                    or not _checkpoint_adherence_passed(
+                        latest_adherence,
+                        chapter=chapter,
+                    )
+                ):
+                    raise _blocked_resume(
+                        restored,
+                        "候选管线恢复状态前置步骤无效",
+                    )
+            else:
+                if phase != "state" or checkpoint.cycle != repair_cycles_used + 1:
+                    raise _blocked_resume(
+                        restored,
+                        "候选管线恢复状态修复轮次无效",
+                    )
+                repair_cycles_used = checkpoint.cycle
+            if (
+                current_prose is None
+                or _checkpoint_source_key(checkpoint)
+                != _checkpoint_source_key(current_prose)
+            ):
+                raise _blocked_resume(
+                    restored,
+                    "候选管线恢复状态正文身份无效",
+                )
+            latest_state = checkpoint
+            phase = "state"
+
+        step = _checkpoint_step_name(
+            checkpoint,
+            review_count=review_count,
+        )
+        completed_steps.append(step)
+        checkpoint_attempt_ids.extend(checkpoint.attempt_ids)
+        truncation = checkpoint.truncation
+        if truncation.truncated_section_count or truncation.dropped_item_count:
+            expected_truncations.append(CandidateTruncationSummary(
+                step=step,
+                truncated_section_count=truncation.truncated_section_count,
+                dropped_item_count=truncation.dropped_item_count,
+            ))
+
+    if current_prose is None:
+        raise _blocked_resume(restored, "候选管线恢复正文步骤缺失")
+    if tuple(completed_steps) != progress.completed_steps:
+        raise _blocked_resume(restored, "候选管线恢复步骤与检查点不一致")
+    if tuple(checkpoint_attempt_ids) != tuple(
+        item.attempt_id for item in restored.attempts
+    ):
+        raise _blocked_resume(restored, "候选管线恢复调用与检查点不一致")
+    if tuple(expected_truncations) != tuple(restored.truncations):
+        raise _blocked_resume(restored, "候选管线恢复截断与检查点不一致")
     if (
         type(progress.repair_cycles_used) is not int
-        or progress.repair_cycles_used < 0
-        or progress.repair_cycles_used > repair_limit
+        or progress.repair_cycles_used != repair_cycles_used
     ):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复超出修复授权")
-    restored = _PipelineTrace(
-        tokens=progress.tokens,
-        attempts=attempts,
-        truncations=truncations,
-        completed_steps=list(completed_steps),
-        repair_cycles_used=progress.repair_cycles_used,
-        state_proposal_id=progress.state_proposal_id,
-    )
-    try:
-        if (
-            resume.adherence is not None
-            and not isinstance(resume.adherence, ChapterGenerationResult)
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复复检结果无效"
-            )
-        if resume.state is not None and not isinstance(
-            resume.state,
-            ChapterGenerationResult,
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复状态结果无效"
-            )
-        if resume.state is not None and resume.adherence is None:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复状态缺少前置复检"
-            )
-        if type(resume.last_repair_kept_digest) is not bool:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复摘要标记无效"
-            )
-        if (
-            resume.last_repair_kept_digest
-            and progress.repair_cycles_used == 0
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复摘要标记无效"
-            )
+        raise _blocked_resume(restored, "候选管线恢复修复轮次与检查点不一致")
+    if repair_cycles_used > repair_limit:
+        raise _blocked_resume(restored, "候选管线恢复超出修复授权")
 
+    try:
         source = _validate_prose_source(resume.source)
-        if (
-            progress.prose_run_id != source.source_run_id
-            or progress.prose_run_revision != source.source_run_revision
-            or progress.prose_content_digest != source.source_content_digest
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "恢复检查点与正文候选身份不一致"
-            )
-        if not any(
-            step == "prose" or step.startswith("prose_repair_")
-            for step in completed_steps
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复正文步骤缺失"
-            )
-        if resume.adherence is not None and not any(
-            step == "outline_adherence"
-            or step.startswith("outline_adherence_recheck_")
-            for step in completed_steps
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复复检步骤缺失"
-            )
-        if resume.state is not None and not any(
-            step == "state" or step.startswith("state_repair_")
-            for step in completed_steps
-        ):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复状态步骤缺失"
-            )
     except ChapterCandidatePipelineBlocked as exc:
         exc.attach_progress(restored.snapshot())
         raise
+    if (
+        _runtime_source_key(source) != _checkpoint_source_key(current_prose)
+        or progress.prose_run_id != source.source_run_id
+        or progress.prose_run_revision != source.source_run_revision
+        or progress.prose_content_digest != source.source_content_digest
+        or current_prose.completion.status
+        != source.completion.get("status")
+        or current_prose.completion.can_write_formal_prose
+        is not source.completion.get("can_write_formal_prose")
+        or current_prose.completion.finish_reason
+        != source.completion.get("finish_reason")
+    ):
+        raise _blocked_resume(
+            restored,
+            "恢复检查点与正文候选身份不一致",
+        )
+
+    if (
+        resume.adherence is not None
+        and not isinstance(resume.adherence, ChapterGenerationResult)
+    ):
+        raise _blocked_resume(restored, "候选管线恢复复检结果无效")
+    if resume.state is not None and not isinstance(
+        resume.state,
+        ChapterGenerationResult,
+    ):
+        raise _blocked_resume(restored, "候选管线恢复状态结果无效")
+
+    if phase == "prose":
+        if (
+            resume.adherence is not None
+            or resume.state is not None
+            or progress.state_proposal_id is not None
+        ):
+            raise _blocked_resume(restored, "候选管线恢复候选阶段无效")
+    elif phase == "adherence":
+        if resume.adherence is None:
+            raise _blocked_resume(restored, "候选管线恢复复检候选缺失")
+        if (
+            resume.state is not None
+            or progress.state_proposal_id is not None
+            or latest_adherence is None
+        ):
+            raise _blocked_resume(restored, "候选管线恢复候选阶段无效")
+        try:
+            _validate_resumed_adherence_projection(
+                resume.adherence,
+                checkpoint=latest_adherence,
+                source=source,
+            )
+        except ChapterCandidatePipelineBlocked as exc:
+            exc.attach_progress(restored.snapshot())
+            raise
+    else:
+        if resume.state is None:
+            raise _blocked_resume(restored, "候选管线恢复状态候选缺失")
+        if resume.adherence is None or latest_adherence is None or latest_state is None:
+            raise _blocked_resume(restored, "候选管线恢复状态缺少前置复检")
+        try:
+            _validate_resumed_adherence_projection(
+                resume.adherence,
+                checkpoint=latest_adherence,
+                source=source,
+            )
+            _validate_resumed_state_projection(
+                resume.state,
+                checkpoint=latest_state,
+            )
+            _validate_resumed_state_prerequisite(
+                resume.adherence,
+                source=source,
+                chapter=chapter,
+            )
+        except ChapterCandidatePipelineBlocked as exc:
+            exc.attach_progress(restored.snapshot())
+            raise
+        if progress.state_proposal_id != latest_state.proposal_id:
+            raise _blocked_resume(
+                restored,
+                "恢复检查点与状态候选身份不一致",
+            )
+
+    restored.completed_steps = completed_steps
+    restored.repair_cycles_used = repair_cycles_used
     restored.source = source
-    return restored
+    restored.state_proposal_id = progress.state_proposal_id
+    last_repair_kept_digest = bool(
+        current_prose.origin == "repair"
+        and previous_prose is not None
+        and current_prose.source.source_content_digest
+        == previous_prose.source.source_content_digest
+    )
+    return _RestoredPipeline(
+        trace=restored,
+        source=source,
+        adherence=resume.adherence,
+        state=resume.state,
+        review_count=review_count,
+        last_repair_kept_digest=last_repair_kept_digest,
+    )
 
 
 def _adherence_matches_source(
@@ -2063,19 +2515,23 @@ class ChapterCandidatePipeline:
     ) -> ChapterCandidatePipelineResult:
         repair_limit = _strict_repair_limit(max_repair_cycles)
         trace = _PipelineTrace()
+        restored: _RestoredPipeline | None = None
         try:
             if resume is not None:
-                trace = _resume_trace(
+                restored = _resume_trace(
                     resume,
                     repair_limit=repair_limit,
+                    chapter_id=str(chapter.get("_id") or ""),
+                    chapter=chapter,
                 )
+                trace = restored.trace
             return await self._run(
                 novel_id=novel_id,
                 owner_id=owner_id,
                 chapter=chapter,
                 repair_limit=repair_limit,
                 trace=trace,
-                resume=resume,
+                resume=restored,
             )
         except ChapterCandidatePipelineBlocked as exc:
             if not exc.has_progress:
@@ -2099,7 +2555,7 @@ class ChapterCandidatePipeline:
         chapter: dict[str, Any],
         repair_limit: int,
         trace: _PipelineTrace,
-        resume: ChapterCandidatePipelineResume | None,
+        resume: _RestoredPipeline | None,
     ) -> ChapterCandidatePipelineResult:
         chapter_id = str(chapter.get("_id") or "")
         if not chapter_id:
@@ -2113,7 +2569,7 @@ class ChapterCandidatePipeline:
             _prose, source = _validate_prose_candidate(generated)
             trace.source = source
         else:
-            source = _validate_prose_source(resume.source)
+            source = resume.source
             if resume.state is not None:
                 resumed_adherence = resume.adherence
                 if resumed_adherence is None:
@@ -2126,11 +2582,7 @@ class ChapterCandidatePipeline:
                     chapter=chapter,
                 )
 
-        review_count = sum(
-            step == "outline_adherence"
-            or step.startswith("outline_adherence_recheck_")
-            for step in trace.completed_steps
-        )
+        review_count = resume.review_count if resume is not None else 0
         pending_review = resume.adherence if resume is not None else None
         last_repair_kept_digest = bool(
             resume is not None and resume.last_repair_kept_digest
