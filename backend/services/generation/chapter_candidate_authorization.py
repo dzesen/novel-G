@@ -68,8 +68,10 @@ _Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 def readiness_uses_candidate_pipeline(readiness: Any) -> bool:
     """Select the execution protocol without allowing damaged v2 to downgrade."""
 
-    if not isinstance(readiness, Mapping):
+    if readiness is None:
         return False
+    if not isinstance(readiness, Mapping):
+        raise ValueError("generation readiness is invalid")
     version = readiness.get("version")
     planning = readiness.get("planning")
     if version is not None and (
@@ -99,6 +101,40 @@ def readiness_uses_candidate_pipeline(readiness: Any) -> bool:
     if not isinstance(authorization, Mapping):
         raise ValueError("generation readiness has no candidate repair authority")
     return True
+
+
+def readiness_chapter_uses_candidate_pipeline(
+    readiness: Any,
+    *,
+    chapter_id: str,
+) -> bool:
+    """Select candidate execution for one frozen chapter snapshot."""
+
+    if not readiness_uses_candidate_pipeline(readiness):
+        return False
+    assert isinstance(readiness, Mapping)
+    work = readiness.get("work")
+    raw_chapters = work.get("chapters") if isinstance(work, Mapping) else None
+    if not isinstance(raw_chapters, list):
+        raise ValueError("generation readiness worklist is invalid")
+    normalized_chapter_id = str(chapter_id or "")
+    matches: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for raw_chapter in raw_chapters:
+        if not isinstance(raw_chapter, Mapping):
+            raise ValueError("generation readiness chapter snapshot is invalid")
+        snapshot_id = str(raw_chapter.get("chapter_id") or "")
+        if not snapshot_id or snapshot_id in seen:
+            raise ValueError("generation readiness chapter identity is invalid")
+        seen.add(snapshot_id)
+        has_content = raw_chapter.get("has_content")
+        if type(has_content) is not bool:
+            raise ValueError("generation readiness prose state is invalid")
+        if snapshot_id == normalized_chapter_id:
+            matches.append(raw_chapter)
+    if len(matches) != 1:
+        raise ValueError("chapter is outside the frozen generation worklist")
+    return matches[0].get("has_content") is False
 
 
 class _ClosedAuthorizationModel(BaseModel):

@@ -324,9 +324,7 @@ class GenerationJobRepository(BaseRepository):
                 CANDIDATE_PIPELINE_REVISION,
             )
             from backend.services.generation.chapter_finalization import (
-                FINALIZATION_AUTHORIZATION_SCHEMA,
-                FINALIZATION_CHANGE_CLASSES,
-                MAX_FINALIZATION_REPAIR_CYCLES,
+                parse_chapter_finalization_authorization,
             )
 
             readiness = job.get("readiness")
@@ -342,41 +340,10 @@ class GenerationJobRepository(BaseRepository):
             revision = planning.get("chapter_candidate_pipeline_revision")
             if type(revision) is not int or revision != CANDIDATE_PIPELINE_REVISION:
                 raise ValueError("candidate pipeline revision changed")
-            raw_finalization = planning.get(
-                "chapter_finalization_authorization"
+            finalization = parse_chapter_finalization_authorization(
+                planning.get("chapter_finalization_authorization")
             )
-            if not isinstance(raw_finalization, Mapping):
-                raise ValueError("candidate finalization authority is missing")
-            authorization_revision = raw_finalization.get(
-                "authorization_revision"
-            )
-            max_repair_cycles = raw_finalization.get("max_repair_cycles")
-            if (
-                type(authorization_revision) is not int
-                or authorization_revision < 1
-                or type(max_repair_cycles) is not int
-                or not 0
-                <= max_repair_cycles
-                <= MAX_FINALIZATION_REPAIR_CYCLES
-                or set(raw_finalization) != {
-                    "schema_version",
-                    "change_classes",
-                    "authorization_revision",
-                    "max_repair_cycles",
-                }
-                or raw_finalization.get("schema_version")
-                != FINALIZATION_AUTHORIZATION_SCHEMA
-                or not isinstance(
-                    raw_finalization.get("change_classes"),
-                    list,
-                )
-                or raw_finalization.get("change_classes")
-                != list(FINALIZATION_CHANGE_CLASSES)
-                or type(raw_finalization.get("authorization_revision"))
-                is not int
-                or type(raw_finalization.get("max_repair_cycles")) is not int
-            ):
-                raise ValueError("candidate completion authority changed")
+            max_repair_cycles = finalization["max_repair_cycles"]
             work = readiness.get("work")
             raw_snapshots = (
                 work.get("chapters") if isinstance(work, Mapping) else None

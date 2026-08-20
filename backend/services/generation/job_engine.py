@@ -27,6 +27,7 @@ from backend.services.generation.chapter_pipeline import (
     IncompleteProseGeneration,
 )
 from backend.services.generation.chapter_candidate_authorization import (
+    readiness_chapter_uses_candidate_pipeline,
     readiness_uses_candidate_pipeline,
 )
 from backend.services.generation.failure_diagnostics import (
@@ -387,7 +388,7 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             job = await repo.get_job(job_id)
 
             try:
-                candidate_execution = readiness_uses_candidate_pipeline(
+                candidate_authorized = readiness_uses_candidate_pipeline(
                     job.get("readiness")
                 )
             except ValueError as exc:
@@ -418,7 +419,7 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 })
                 return
             candidate_recovery = bool(raw_candidate_checkpoints)
-            if candidate_recovery and not candidate_execution:
+            if candidate_recovery and not candidate_authorized:
                 await repo.update_job_fields(job_id, {
                     "status": "failed",
                     "pause_reason": None,
@@ -431,18 +432,6 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     },
                 })
                 return
-            if candidate_execution and deps.run_candidate_chapter is None:
-                await repo.update_job_fields(job_id, {
-                    "status": "failed",
-                    "pause_reason": None,
-                    "active_slot": None,
-                    "error": {
-                        "step": "candidate_pipeline_recovery",
-                        "message": "Candidate checkpoint runner is unavailable",
-                    },
-                })
-                return
-
             # 成本上限：开下一章前的软天花板。
             committed_or_reserved = int(job.get("tokens_used", 0)) + int(
                 job.get("tokens_reserved", 0) or 0
@@ -516,6 +505,38 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             if chapter is None:
                 await repo.update_job_fields(job_id, {
                     "status": "completed", "current_chapter_id": None, "active_slot": None,
+                })
+                return
+
+            try:
+                candidate_execution = readiness_chapter_uses_candidate_pipeline(
+                    job.get("readiness"),
+                    chapter_id=str(chapter.get("_id") or ""),
+                )
+                if candidate_recovery and not candidate_execution:
+                    raise ValueError(
+                        "Candidate checkpoints do not match the frozen chapter mode"
+                    )
+            except ValueError as exc:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "candidate_pipeline_recovery",
+                        "message": str(exc),
+                    },
+                })
+                return
+            if candidate_execution and deps.run_candidate_chapter is None:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "candidate_pipeline_recovery",
+                        "message": "Candidate checkpoint runner is unavailable",
+                    },
                 })
                 return
 

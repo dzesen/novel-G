@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
 from backend.llm.stream_terminal import FinishReason
 from backend.services.generation.outline_adherence import (
     OutlineIssueCategoryValue,
@@ -23,7 +24,7 @@ MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 512
 MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES = 10_000
-MAX_CANDIDATE_OUTLINE_SCENES = 20
+MAX_CANDIDATE_OUTLINE_SCENES = MAX_CHAPTER_OUTLINE_SCENES
 MAX_BSON_INT64 = 2**63 - 1
 _SAFE_CANDIDATE_IDENTIFIER_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
@@ -432,8 +433,6 @@ def replay_candidate_pipeline_checkpoints(
                     or checkpoint.cycle != repair_cycles_used + 1
                     or checkpoint.source.source_run_id
                     != current_prose.source.source_run_id
-                    or checkpoint.source.source_run_revision
-                    <= current_prose.source.source_run_revision
                 ):
                     raise diverged(
                         message=(
@@ -450,6 +449,15 @@ def replay_candidate_pipeline_checkpoints(
                             if kept_digest
                             else "candidate_gate_blocked"
                         )
+                    )
+                if (
+                    checkpoint.source.source_run_revision
+                    <= current_prose.source.source_run_revision
+                ):
+                    raise diverged(
+                        "正文修复没有产生新候选",
+                        code="repair_no_progress",
+                        include_current=True,
                     )
                 repair_cycles_used = checkpoint.cycle
                 if repair_cycles_used > max_repair_cycles:

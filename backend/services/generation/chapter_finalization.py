@@ -103,6 +103,42 @@ def build_chapter_finalization_authorization(
     }
 
 
+def parse_chapter_finalization_authorization(
+    value: Any,
+) -> dict[str, Any]:
+    """Revalidate one persisted finalization authority without coercion."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "change_classes",
+        "authorization_revision",
+        "max_repair_cycles",
+    }:
+        raise ChapterFinalizationDenied("批量作业没有有效的正式提交授权")
+    if value.get("schema_version") != FINALIZATION_AUTHORIZATION_SCHEMA:
+        raise ChapterFinalizationDenied("批量作业没有正式提交授权")
+    change_classes = value.get("change_classes")
+    if (
+        not isinstance(change_classes, list)
+        or change_classes != list(FINALIZATION_CHANGE_CLASSES)
+    ):
+        raise ChapterFinalizationDenied("正式提交授权范围不完整")
+    authorization_revision = _strict_int(
+        value.get("authorization_revision"),
+        field="正式提交授权版本",
+        minimum=1,
+    )
+    max_repair_cycles = _strict_int(
+        value.get("max_repair_cycles"),
+        field="正文修复次数上限",
+        maximum=MAX_FINALIZATION_REPAIR_CYCLES,
+    )
+    return build_chapter_finalization_authorization(
+        authorization_revision=authorization_revision,
+        max_repair_cycles=max_repair_cycles,
+    )
+
+
 @dataclass(frozen=True)
 class ChapterFinalizationDeps:
     job_repo: Any = generation_job_repo
@@ -310,23 +346,15 @@ class ChapterFinalizationService:
         readiness = dict(job.get("readiness") or {})
         if str(readiness.get("digest") or "") != supplied.readiness_digest:
             raise ChapterFinalizationDenied("批量 readiness 摘要已经变化")
-        frozen = dict(
-            (readiness.get("planning") or {}).get(
-                "chapter_finalization_authorization"
-            )
-            or {}
+        planning = readiness.get("planning")
+        if not isinstance(planning, Mapping):
+            raise ChapterFinalizationDenied("批量 readiness 规划无效")
+        frozen = parse_chapter_finalization_authorization(
+            planning.get("chapter_finalization_authorization")
         )
-        if frozen.get("schema_version") != FINALIZATION_AUTHORIZATION_SCHEMA:
-            raise ChapterFinalizationDenied("批量作业没有正式提交授权")
-        frozen_revision = _strict_int(
-            frozen.get("authorization_revision"),
-            field="正式提交授权版本",
-            minimum=1,
-        )
+        frozen_revision = frozen["authorization_revision"]
         if frozen_revision != supplied.authorization_revision:
             raise ChapterFinalizationDenied("正式提交授权版本已经变化")
-        if tuple(frozen.get("change_classes") or ()) != FINALIZATION_CHANGE_CLASSES:
-            raise ChapterFinalizationDenied("正式提交授权范围不完整")
         return frozen
 
     @staticmethod

@@ -20,6 +20,7 @@ from backend.services.generation.chapter_finalization import (
     MAX_FINALIZATION_REPAIR_CYCLES,
 )
 from backend.services.generation.candidate_repair_contracts import (
+    MAX_CANDIDATE_OUTLINE_SCENES,
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     AdherenceCandidateCheckpointV1,
     CandidateCompletionProjectionV1,
@@ -57,12 +58,12 @@ from backend.services.generation.state_repair_contracts import (
 )
 
 
-_MAX_REPAIR_SCENE_INDEXES = 20
+_MAX_REPAIR_SCENE_INDEXES = MAX_CANDIDATE_OUTLINE_SCENES
 _MAX_PIPELINE_ATTEMPTS = 512
 _MAX_PIPELINE_TRUNCATIONS = 32
 _MAX_PIPELINE_UNATTRIBUTED_USAGE = 32
 _MAX_TOKEN_COUNT = 1_000_000_000
-_MAX_RESUMED_ADHERENCE_ITEMS = 20
+_MAX_RESUMED_ADHERENCE_ITEMS = MAX_CANDIDATE_OUTLINE_SCENES
 _MAX_DROPPED_PROJECTION_DEPTH = 8
 _MAX_DROPPED_PROJECTION_NODES = 1_000
 _MAX_DROPPED_PROJECTION_MAPPING_KEYS = 100
@@ -3173,9 +3174,22 @@ class ChapterCandidatePipeline:
     async def _persist_checkpoint(
         self,
         checkpoint: CandidatePipelineCheckpointV1,
+        *,
+        ledger: list[CandidatePipelineCheckpointV1],
     ) -> None:
         persist = self._deps.persist_checkpoint
-        await persist(parse_candidate_pipeline_checkpoint(checkpoint))
+        validated = parse_candidate_pipeline_checkpoint(checkpoint)
+        await persist(validated)
+        if any(
+            existing.checkpoint_id == validated.checkpoint_id
+            for existing in ledger
+        ):
+            if not any(existing == validated for existing in ledger):
+                raise ChapterCandidatePipelineBlocked(
+                    "候选管线检查点幂等重放分歧"
+                )
+            return
+        ledger.append(validated)
 
     async def _apply_prose_repair(
         self,
@@ -3186,6 +3200,7 @@ class ChapterCandidatePipeline:
         source: ProseCandidateSource,
         request: ProseCandidateRepairRequest,
         trace: _PipelineTrace,
+        checkpoint_ledger: list[CandidatePipelineCheckpointV1],
     ) -> tuple[ProseCandidateSource, bool]:
         repair = self._deps.repair_prose_candidate
         if repair is None:
@@ -3216,7 +3231,7 @@ class ChapterCandidatePipeline:
             evidence=evidence,
             cycle=request.cycle,
             origin="repair",
-        ))
+        ), ledger=checkpoint_ledger)
         if not _prose_repair_advanced_revision(source, repaired_source):
             raise ChapterCandidatePipelineBlocked(
                 "正文修复没有产生新候选",
@@ -3240,6 +3255,7 @@ class ChapterCandidatePipeline:
         repair_limit = _strict_repair_limit(max_repair_cycles)
         trace = _PipelineTrace()
         restored: _RestoredPipeline | None = None
+        checkpoint_ledger: list[CandidatePipelineCheckpointV1] = []
         try:
             if resume is not None:
                 restored = _resume_trace(
@@ -3249,6 +3265,10 @@ class ChapterCandidatePipeline:
                     chapter=chapter,
                 )
                 trace = restored.trace
+                checkpoint_ledger = [
+                    parse_candidate_pipeline_checkpoint(checkpoint)
+                    for checkpoint in resume.checkpoints
+                ]
             return await self._run(
                 novel_id=novel_id,
                 owner_id=owner_id,
@@ -3256,6 +3276,7 @@ class ChapterCandidatePipeline:
                 repair_limit=repair_limit,
                 trace=trace,
                 resume=restored,
+                checkpoint_ledger=checkpoint_ledger,
             )
         except ChapterCandidatePipelineBlocked as exc:
             if not exc.has_progress:
@@ -3280,6 +3301,7 @@ class ChapterCandidatePipeline:
         repair_limit: int,
         trace: _PipelineTrace,
         resume: _RestoredPipeline | None,
+        checkpoint_ledger: list[CandidatePipelineCheckpointV1],
     ) -> ChapterCandidatePipelineResult:
         chapter_id = str(chapter.get("_id") or "")
         if not chapter_id:
@@ -3299,7 +3321,7 @@ class ChapterCandidatePipeline:
                 evidence=evidence,
                 cycle=0,
                 origin="initial",
-            ))
+            ), ledger=checkpoint_ledger)
         else:
             source = resume.source
             if resume.state is not None:
@@ -3346,6 +3368,7 @@ class ChapterCandidatePipeline:
                             chapter=chapter,
                         ),
                         trace=trace,
+                        checkpoint_ledger=checkpoint_ledger,
                     )
                 )
                 continue
@@ -3390,7 +3413,7 @@ class ChapterCandidatePipeline:
                     evidence=review_evidence,
                     cycle=trace.repair_cycles_used,
                     adherence=adherence,
-                ))
+                ), ledger=checkpoint_ledger)
             try:
                 adherence_metadata = _validate_adherence_gate(
                     adherence,
@@ -3421,6 +3444,7 @@ class ChapterCandidatePipeline:
                             chapter=chapter,
                         ),
                         trace=trace,
+                        checkpoint_ledger=checkpoint_ledger,
                     )
                 )
                 continue
@@ -3481,7 +3505,7 @@ class ChapterCandidatePipeline:
                     dropped_reference_count=_dropped_reference_count(
                         dropped
                     ),
-                ))
+                ), ledger=checkpoint_ledger)
             state_checkpoint_context = None
             if not consistency_issues and not dropped:
                 break
@@ -3535,13 +3559,31 @@ class ChapterCandidatePipeline:
                 dropped_reference_count=_dropped_reference_count(
                     state_result.dropped
                 ),
-            ))
+            ), ledger=checkpoint_ledger)
             if next_proposal_id == proposal_id:
                 raise ChapterCandidatePipelineBlocked(
                     "状态修复没有产生新候选",
                     code="repair_no_progress",
                 )
             trace.state_proposal_id = next_proposal_id
+
+        outline = chapter.get("outline")
+        scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
+        if not isinstance(scenes, list) or not scenes:
+            raise ChapterCandidatePipelineBlocked("章节缺少有效章纲")
+        try:
+            replay_candidate_pipeline_checkpoints(
+                tuple(checkpoint_ledger),
+                chapter_id=chapter_id,
+                expected_scene_count=len(scenes),
+                max_repair_cycles=repair_limit,
+                require_terminal=True,
+            )
+        except CandidatePipelineCheckpointConflict as exc:
+            raise ChapterCandidatePipelineBlocked(
+                str(exc),
+                code=exc.code,
+            ) from exc
 
         finalization = dict(
             await self._deps.finalize(
