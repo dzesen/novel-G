@@ -16,6 +16,10 @@ from backend.db.errors import NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
+from backend.services.generation.attempt_ledger_contracts import (
+    MAX_PERSISTED_ATTEMPT_TOKENS,
+    validate_launchable_attempt_ledgers,
+)
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
     MAX_CANDIDATE_OUTLINE_SCENES,
@@ -44,6 +48,11 @@ from backend.services.generation.job_execution import (
     JobExecutionLeaseV1,
     current_job_execution,
 )
+from backend.services.generation.job_authorization_contracts import (
+    OutlineAuthorizationRecalculationCommandV1,
+    evaluate_outline_authorization_recalculation,
+    parse_prose_authorization,
+)
 
 
 USAGE_SUMMARY_LIMIT = 100
@@ -58,6 +67,15 @@ _ATOMIC_JOB_FIELDS = frozenset({
     "job_mutation_recovery",
     "progress",
     "state_dispatch_resolution",
+})
+_LEASED_RUNTIME_PATCH_FIELDS = frozenset({
+    "active_slot",
+    "authorization_confirmation_required",
+    "current_chapter_id",
+    "error",
+    "incomplete_prose",
+    "pause_reason",
+    "status",
 })
 _MAX_NARRATIVE_REVISION = 2**63 - 1
 
@@ -74,6 +92,30 @@ def _reject_atomic_field_updates(fields: Dict[str, Any]) -> None:
     ):
         raise ValueError(
             "Candidate pipeline checkpoints require an atomic repository command"
+        )
+
+
+def _validate_leased_runtime_patch(fields: Mapping[str, Any]) -> None:
+    """Keep a worker's generic patch surface away from authority and ledgers."""
+
+    invalid = [
+        key
+        for key in fields
+        if not isinstance(key, str)
+        or "." in key
+        or key not in _LEASED_RUNTIME_PATCH_FIELDS
+    ]
+    if invalid:
+        raise ValueError(
+            "Generation Job worker generic patch contains protected fields"
+        )
+    confirmation = fields.get("authorization_confirmation_required")
+    if "authorization_confirmation_required" in fields and (
+        not isinstance(confirmation, Mapping)
+        or confirmation.get("requires_confirmation") is not True
+    ):
+        raise ValueError(
+            "Generation Job worker cannot clear authorization confirmation"
         )
 
 
@@ -135,12 +177,11 @@ class TokenBudgetUnbounded(TokenBudgetExceeded):
 
 
 def _trusted_usage_tokens(usage: TokenUsage) -> int:
-    reported_total = int(usage.total_tokens or 0)
-    if reported_total > 0:
-        return reported_total
-    return max(0, int(usage.input_tokens or 0)) + max(
+    reported_total = max(0, int(usage.total_tokens or 0))
+    component_total = max(0, int(usage.input_tokens or 0)) + max(
         0, int(usage.output_tokens or 0)
     )
+    return max(reported_total, component_total)
 
 
 def _live_attempt_transition_fields(
@@ -211,6 +252,98 @@ def _live_attempt_transition_fields(
     }
 
 
+def _execution_interruption_pipeline(
+    *,
+    previous_epoch: int,
+    now: datetime,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Publish one complete execution takeover without an unfenced tail write."""
+
+    pending_or_uncertain = {
+        "$or": [
+            {"$eq": ["$has_uncertain_attempts", True]},
+            {
+                "$gt": [
+                    {
+                        "$size": {
+                            "$filter": {
+                                "input": {"$ifNull": ["$attempt_slots", []]},
+                                "as": "slot",
+                                "cond": {
+                                    "$in": [
+                                        "$$slot.state",
+                                        ["claimed", "uncertain"],
+                                    ]
+                                },
+                            }
+                        }
+                    },
+                    0,
+                ]
+            },
+        ]
+    }
+    return [
+        {
+            "$set": {
+                **_live_attempt_transition_fields(
+                    source_states=("claimed",),
+                    target_state="uncertain",
+                    now=now,
+                    reason=reason,
+                ),
+            }
+        },
+        {
+            "$set": {
+                "execution_epoch": previous_epoch + 1,
+                "execution_lease": "$$REMOVE",
+                "status": "interrupted",
+                "pause_reason": {
+                    "$cond": [
+                        pending_or_uncertain,
+                        "uncertain_attempt",
+                        "process_restart",
+                    ]
+                },
+                "current_chapter_id": {
+                    "$cond": [
+                        {
+                            "$or": [
+                                {
+                                    "$gt": [
+                                        {
+                                            "$size": {
+                                                "$ifNull": [
+                                                    "$candidate_pipeline_checkpoints",
+                                                    [],
+                                                ]
+                                            }
+                                        },
+                                        0,
+                                    ]
+                                },
+                                {
+                                    "$eq": [
+                                        {"$type": "$job_mutation_recovery"},
+                                        "object",
+                                    ]
+                                },
+                            ]
+                        },
+                        "$current_chapter_id",
+                        None,
+                    ]
+                },
+                "active_slot": None,
+                "has_uncertain_attempts": pending_or_uncertain,
+                "updated_at": now,
+            }
+        },
+    ]
+
+
 class AttemptCapacityExceeded(ValueError):
     """作业固定 attempt 容量或当前章节 reservation 已耗尽。"""
 
@@ -230,9 +363,76 @@ class GenerationJobRepository:
     def __init__(self) -> None:
         self._base = BaseRepository(collections.GENERATION_JOBS)
 
-    @property
-    def collection(self) -> Any:
-        return self._base.collection
+    @staticmethod
+    def _assert_unowned_creation() -> None:
+        if current_job_execution() is not None:
+            raise JobExecutionLeaseLost(
+                "Generation Job workers cannot create Generation Jobs"
+            )
+
+    @staticmethod
+    def _launchable_attempt_filter(
+        current: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Freeze a live-attempt-free ledger into the execution-acquire CAS."""
+
+        has_uncertain = current.get("has_uncertain_attempts", False)
+        if type(has_uncertain) is not bool:
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job uncertainty marker is invalid"
+            )
+        if has_uncertain:
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job has uncertain Provider attempts"
+            )
+        exact_fields: list[dict[str, Any]] = []
+        if "has_uncertain_attempts" in current:
+            exact_fields.append({"has_uncertain_attempts": False})
+        else:
+            exact_fields.append({
+                "has_uncertain_attempts": {"$exists": False}
+            })
+        capacity = current.get("usage_attempt_capacity", 0)
+        claimed = current.get("usage_attempt_claimed", 0)
+        raw_attempts = current.get("attempt_slots", [])
+        raw_reservations = current.get("active_token_reservations", [])
+        raw_accounted_ids = current.get("usage_attempt_ids", [])
+        tokens_reserved = current.get("tokens_reserved", 0)
+        tokens_used = current.get("tokens_used", 0)
+        token_budget = current.get("token_budget")
+        try:
+            validate_launchable_attempt_ledgers(
+                attempt_slots=raw_attempts,
+                active_token_reservations=raw_reservations,
+                usage_attempt_ids=raw_accounted_ids,
+                attempt_capacity=capacity,
+                attempts_claimed=claimed,
+                tokens_used=tokens_used,
+                tokens_reserved=tokens_reserved,
+                token_budget=token_budget,
+                maximum_active_reservations=MAX_ACTIVE_TOKEN_RESERVATIONS,
+            )
+        except ValueError as exc:
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job attempt or usage ledger is invalid"
+            ) from exc
+        for field, raw_items in (
+            ("attempt_slots", raw_attempts),
+            ("active_token_reservations", raw_reservations),
+            ("usage_attempt_ids", raw_accounted_ids),
+        ):
+            if field in current:
+                exact_fields.append({field: raw_items})
+            else:
+                exact_fields.append({field: {"$exists": False}})
+        exact_fields.extend([
+            {"usage_attempt_capacity": capacity},
+            {"usage_attempt_claimed": claimed},
+            {"tokens_reserved": tokens_reserved},
+            {"tokens_used": tokens_used},
+            {"token_budget": token_budget},
+        ])
+        return {"$and": exact_fields}
 
     @staticmethod
     def _execution_authority_filter(
@@ -337,7 +537,7 @@ class GenerationJobRepository:
             if isinstance(update, Sequence) and not isinstance(update, Mapping)
             else dict(update)
         )
-        result = await self.collection.update_one(
+        result = await self._base.collection.update_one(
             self._execution_filter(query),
             update_document,
             **kwargs,
@@ -357,7 +557,7 @@ class GenerationJobRepository:
             if isinstance(update, Sequence) and not isinstance(update, Mapping)
             else dict(update)
         )
-        document = await self.collection.find_one_and_update(
+        document = await self._base.collection.find_one_and_update(
             self._execution_filter(query),
             update_document,
             **kwargs,
@@ -372,7 +572,7 @@ class GenerationJobRepository:
         lease = current_job_execution()
         if lease is None:
             return
-        current = await self.collection.find_one({
+        current = await self._base.collection.find_one({
             "$and": [
                 {"is_deleted": False},
                 self._execution_authority_filter(
@@ -385,6 +585,23 @@ class GenerationJobRepository:
             raise JobExecutionLeaseLost(
                 "Generation Job execution lease is no longer current"
             )
+
+    async def _assert_worker_generic_patch_allowed(
+        self,
+        fields: Mapping[str, Any],
+    ) -> None:
+        if current_job_execution() is None:
+            return
+        await self._assert_execution_current()
+        _validate_leased_runtime_patch(fields)
+
+    async def _reject_worker_generic_mutation(self, operation: str) -> None:
+        if current_job_execution() is None:
+            return
+        await self._assert_execution_current()
+        raise ValueError(
+            f"Generation Job worker cannot use generic {operation}"
+        )
 
     async def acquire_execution_lease(
         self,
@@ -399,6 +616,36 @@ class GenerationJobRepository:
         if expires_at <= now:
             raise ValueError("Generation job execution lease expiry is invalid")
         current = await self.get_job(job_id)
+        current_status = str(current.get("status") or "")
+        raw_resolution = current.get("state_dispatch_resolution")
+        resolution_query: dict[str, Any]
+        if raw_resolution is None:
+            if current_status != "running":
+                raise JobExecutionLeaseUnavailable(
+                    "Generation Job is not ready to acquire an execution lease"
+                )
+            resolution_query = {"state_dispatch_resolution": None}
+        else:
+            try:
+                resolution = StateDispatchResolutionV3.model_validate(
+                    raw_resolution
+                )
+            except (TypeError, ValueError) as exc:
+                raise JobExecutionLeaseUnavailable(
+                    "Generation Job retry launch receipt is invalid"
+                ) from exc
+            if (
+                resolution.action != "retry"
+                or resolution.phase != "job_transitioned"
+                or current_status not in {"running", "interrupted"}
+            ):
+                raise JobExecutionLeaseUnavailable(
+                    "Generation Job action is not ready to launch"
+                )
+            resolution_query = {
+                "state_dispatch_resolution": resolution.model_dump(mode="json")
+            }
+        launchable_attempts = self._launchable_attempt_filter(current)
         previous_epoch = current.get("execution_epoch", 0)
         if (
             type(previous_epoch) is not int
@@ -411,6 +658,10 @@ class GenerationJobRepository:
         raw_lease = current.get("execution_lease")
         existing: JobExecutionLeaseV1 | None = None
         if raw_lease is not None:
+            if current_status != "running":
+                raise JobExecutionLeaseUnavailable(
+                    "Interrupted Generation Job retained an execution lease"
+                )
             try:
                 existing = JobExecutionLeaseV1.model_validate(raw_lease)
             except (TypeError, ValueError) as exc:
@@ -446,27 +697,6 @@ class GenerationJobRepository:
                 "Generation Job execution lease command is invalid"
             ) from exc
 
-        raw_resolution = current.get("state_dispatch_resolution")
-        resolution_query: dict[str, Any]
-        if raw_resolution is None:
-            resolution_query = {"state_dispatch_resolution": None}
-        else:
-            try:
-                resolution = StateDispatchResolutionV3.model_validate(
-                    raw_resolution
-                )
-            except (TypeError, ValueError) as exc:
-                raise JobExecutionLeaseUnavailable(
-                    "Generation Job retry launch receipt is invalid"
-                ) from exc
-            if resolution.action != "retry" or resolution.phase != "job_transitioned":
-                raise JobExecutionLeaseUnavailable(
-                    "Generation Job action is not ready to launch"
-                )
-            resolution_query = {
-                "state_dispatch_resolution": resolution.model_dump(mode="json")
-            }
-
         epoch_query: dict[str, Any] = {"execution_epoch": previous_epoch}
         if previous_epoch == 0:
             epoch_query = {
@@ -480,10 +710,11 @@ class GenerationJobRepository:
                 {
                     "_id": to_object_id(job_id),
                     "is_deleted": False,
-                    "status": {"$in": ["running", "interrupted"]},
+                    "status": current_status,
                     **resolution_query,
                 },
                 epoch_query,
+                launchable_attempts,
                 (
                     {"execution_lease": existing.model_dump(mode="python")}
                     if existing is not None
@@ -509,7 +740,7 @@ class GenerationJobRepository:
         }
         if raw_resolution is not None:
             update["$unset"] = {"state_dispatch_resolution": ""}
-        document = await self.collection.find_one_and_update(
+        document = await self._base.collection.find_one_and_update(
             query,
             update,
             return_document=ReturnDocument.AFTER,
@@ -555,7 +786,7 @@ class GenerationJobRepository:
         renewed = frozen.model_copy(
             update={"heartbeat_at": now, "expires_at": expires_at}
         )
-        result = await self.collection.update_one(
+        result = await self._base.collection.update_one(
             {
                 "$and": [
                     {"is_deleted": False, "status": "running"},
@@ -578,34 +809,68 @@ class GenerationJobRepository:
         self,
         lease: JobExecutionLeaseV1,
     ) -> bool:
-        """Release only the worker/epoch owned by the completed local task."""
+        """Release terminal work or atomically interrupt unfinished work."""
 
         frozen = JobExecutionLeaseV1.model_validate(
             lease.model_dump(mode="python")
         )
-        result = await self.collection.update_one(
+        now = get_utc_now()
+        interrupted = await self._base.collection.update_one(
             {
                 "$and": [
-                    {"is_deleted": False},
+                    {"is_deleted": False, "status": "running"},
                     self._execution_authority_filter(
                         frozen,
-                        now=get_utc_now(),
+                        now=now,
+                        require_live=False,
+                    ),
+                ]
+            },
+            _execution_interruption_pipeline(
+                previous_epoch=frozen.epoch,
+                now=now,
+                reason="execution worker stopped before reaching a stable state",
+            ),
+        )
+        if interrupted.modified_count == 1:
+            return True
+        result = await self._base.collection.update_one(
+            {
+                "$and": [
+                    {
+                        "is_deleted": False,
+                        "status": {"$ne": "running"},
+                    },
+                    self._execution_authority_filter(
+                        frozen,
+                        now=now,
                         require_live=False,
                     ),
                 ]
             },
             {
                 "$unset": {"execution_lease": ""},
-                "$set": {"updated_at": get_utc_now()},
+                "$set": {"updated_at": now},
             },
         )
         if result.modified_count == 1:
             return True
-        latest = await self.collection.find_one({
+        latest = await self._base.collection.find_one({
             "_id": to_object_id(frozen.job_id),
             "is_deleted": False,
         })
-        return bool(latest is not None and latest.get("execution_lease") is None)
+        if latest is None:
+            return False
+        if (
+            latest.get("status") == "running"
+            and latest.get("execution_lease") is None
+            and latest.get("execution_epoch") == frozen.epoch
+        ):
+            return await self.interrupt_stale_execution(
+                frozen.job_id,
+                now=now,
+            )
+        return latest.get("execution_lease") is None
 
     async def interrupt_stale_execution(
         self,
@@ -655,34 +920,7 @@ class GenerationJobRepository:
                     {"execution_epoch": {"$exists": False}},
                 ]
             }
-        reason = "backend process interrupted before usage was recorded"
-        pending_or_uncertain = {
-            "$or": [
-                {"$eq": ["$has_uncertain_attempts", True]},
-                {
-                    "$gt": [
-                        {
-                            "$size": {
-                                "$filter": {
-                                    "input": {
-                                        "$ifNull": ["$attempt_slots", []]
-                                    },
-                                    "as": "slot",
-                                    "cond": {
-                                        "$in": [
-                                            "$$slot.state",
-                                            ["claimed", "uncertain"],
-                                        ]
-                                    },
-                                }
-                            }
-                        },
-                        0,
-                    ]
-                },
-            ]
-        }
-        result = await self.collection.update_one(
+        result = await self._base.collection.update_one(
             {
                 "$and": [
                     {
@@ -694,72 +932,16 @@ class GenerationJobRepository:
                     lease_query,
                 ]
             },
-            [
-                {
-                    "$set": {
-                        **_live_attempt_transition_fields(
-                            source_states=("claimed",),
-                            target_state="uncertain",
-                            now=now,
-                            reason=reason,
-                        ),
-                    }
-                },
-                {
-                    "$set": {
-                        "execution_epoch": previous_epoch + 1,
-                        "execution_lease": "$$REMOVE",
-                        "status": "interrupted",
-                        "pause_reason": {
-                            "$cond": [
-                                pending_or_uncertain,
-                                "uncertain_attempt",
-                                "process_restart",
-                            ]
-                        },
-                        "current_chapter_id": {
-                            "$cond": [
-                                {
-                                    "$or": [
-                                        {
-                                            "$gt": [
-                                                {
-                                                    "$size": {
-                                                        "$ifNull": [
-                                                            "$candidate_pipeline_checkpoints",
-                                                            [],
-                                                        ]
-                                                    }
-                                                },
-                                                0,
-                                            ]
-                                        },
-                                        {
-                                            "$eq": [
-                                                {
-                                                    "$type": (
-                                                        "$job_mutation_recovery"
-                                                    )
-                                                },
-                                                "object",
-                                            ]
-                                        },
-                                    ]
-                                },
-                                "$current_chapter_id",
-                                None,
-                            ]
-                        },
-                        "active_slot": None,
-                        "has_uncertain_attempts": pending_or_uncertain,
-                        "updated_at": now,
-                    }
-                },
-            ],
+            _execution_interruption_pipeline(
+                previous_epoch=previous_epoch,
+                now=now,
+                reason="backend process interrupted before usage was recorded",
+            ),
         )
         return result.modified_count == 1
 
     async def create_job(self, data: Dict[str, Any]) -> str:
+        self._assert_unowned_creation()
         return await self.insert_one(dict(data))
 
     async def insert_one(
@@ -767,6 +949,7 @@ class GenerationJobRepository:
         document: Dict[str, Any],
         session: AsyncClientSession | None = None,
     ) -> str:
+        self._assert_unowned_creation()
         _validate_initial_candidate_ledgers(document)
         return await self._base.insert_one(dict(document), session=session)
 
@@ -775,6 +958,7 @@ class GenerationJobRepository:
         documents: List[Dict[str, Any]],
         session: AsyncClientSession | None = None,
     ) -> List[str]:
+        self._assert_unowned_creation()
         for document in documents:
             _validate_initial_candidate_ledgers(document)
         return await self._base.insert_many(
@@ -826,6 +1010,7 @@ class GenerationJobRepository:
         session: AsyncClientSession | None = None,
     ) -> bool:
         _reject_atomic_field_updates(update_data)
+        await self._assert_worker_generic_patch_allowed(update_data)
         updated = await self._base.update_one(
             self._execution_filter(query),
             update_data,
@@ -844,6 +1029,7 @@ class GenerationJobRepository:
         session: AsyncClientSession | None = None,
     ) -> int:
         _reject_atomic_field_updates(update_data)
+        await self._reject_worker_generic_mutation("update_many")
         updated = await self._base.update_many(
             self._execution_filter(query),
             update_data,
@@ -862,6 +1048,7 @@ class GenerationJobRepository:
         session: AsyncClientSession | None = None,
     ) -> bool:
         _reject_atomic_field_updates(increments)
+        await self._reject_worker_generic_mutation("increment_one")
         updated = await self._base.increment_one(
             self._execution_filter(query),
             increments,
@@ -898,6 +1085,7 @@ class GenerationJobRepository:
         query: Dict[str, Any],
         session: AsyncClientSession | None = None,
     ) -> bool:
+        await self._reject_worker_generic_mutation("delete")
         changed = await self._base.soft_delete_one(
             self._execution_filter(query),
             session=session,
@@ -911,6 +1099,7 @@ class GenerationJobRepository:
         query: Dict[str, Any],
         session: AsyncClientSession | None = None,
     ) -> bool:
+        await self._reject_worker_generic_mutation("restore")
         changed = await self._base.restore_one(
             self._execution_filter(query),
             session=session,
@@ -924,6 +1113,7 @@ class GenerationJobRepository:
         query: Dict[str, Any],
         session: AsyncClientSession | None = None,
     ) -> bool:
+        await self._reject_worker_generic_mutation("delete")
         changed = await self._base.hard_delete_one(
             self._execution_filter(query),
             session=session,
@@ -937,6 +1127,7 @@ class GenerationJobRepository:
         query: Dict[str, Any],
         session: AsyncClientSession | None = None,
     ) -> int:
+        await self._reject_worker_generic_mutation("delete")
         changed = await self._base.hard_delete_many(
             self._execution_filter(query),
             session=session,
@@ -2108,16 +2299,9 @@ class GenerationJobRepository:
     async def complete_job_abort(
         self,
         job_id: str,
-        fields: Mapping[str, Any],
     ) -> bool:
         """Publish abort while atomically freezing every live paid attempt."""
 
-        updates = dict(fields)
-        _reject_atomic_field_updates(updates)
-        if updates.get("status") != "aborted":
-            raise CandidatePipelineCheckpointConflict(
-                "Generation job abort command is invalid"
-            )
         current = await self.get_job(job_id)
         previous_epoch = current.get("execution_epoch", 0)
         if (
@@ -2138,11 +2322,6 @@ class GenerationJobRepository:
                     {"execution_epoch": {"$exists": False}},
                 ]
             }
-        for enforced in (
-            "attempt_reservation",
-            "has_uncertain_attempts",
-        ):
-            updates.pop(enforced, None)
         now = get_utc_now()
         acknowledged_state = "uncertain_abort_acknowledged"
         result = await self._collection_update_one(
@@ -2169,7 +2348,9 @@ class GenerationJobRepository:
                         "execution_lease": "$$REMOVE",
                         "attempt_reservation": None,
                         "has_uncertain_attempts": False,
-                        **updates,
+                        "status": "aborted",
+                        "current_chapter_id": None,
+                        "active_slot": None,
                         "updated_at": now,
                     }
                 }
@@ -2437,6 +2618,103 @@ class GenerationJobRepository:
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))
 
+    async def publish_outline_authorization_recalculation(
+        self,
+        job_id: str,
+        *,
+        command: OutlineAuthorizationRecalculationCommandV1,
+    ) -> dict[str, Any]:
+        """Prove and publish one post-outline authorization narrowing."""
+
+        if not isinstance(command, OutlineAuthorizationRecalculationCommandV1):
+            raise ValueError(
+                "Outline authorization recalculation command is required"
+            )
+        frozen = OutlineAuthorizationRecalculationCommandV1.model_validate(
+            command.model_dump(mode="python")
+        )
+        current = await self.get_job(job_id)
+        if str(current.get("status") or "") != "running":
+            raise CandidatePipelineCheckpointConflict(
+                "Outline authorization Job is no longer running"
+            )
+        readiness = current.get("readiness")
+        if not isinstance(readiness, Mapping):
+            raise ValueError("Generation Job readiness is invalid")
+        readiness_digest = readiness.get("digest")
+        if (
+            not isinstance(readiness_digest, str)
+            or readiness_digest != frozen.readiness_digest
+            or current.get("current_chapter_id") != frozen.chapter_id
+            or current.get("expected_narrative_revision")
+            != frozen.expected_narrative_revision
+            or current.get("authorization_revision")
+            != frozen.authorization_revision
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Outline authorization snapshot changed"
+            )
+        raw_current_authorization = current.get(
+            "prose_continuation_authorization"
+        )
+        current_authorization = parse_prose_authorization(
+            raw_current_authorization
+        )
+        decision = evaluate_outline_authorization_recalculation(
+            command=frozen,
+            current_authorization=current_authorization,
+            job_token_budget=current.get("token_budget"),
+        )
+        payload = decision.model_dump(mode="json")
+        fields: dict[str, Any] = {
+            "readiness_recalculation": payload,
+            "authorization_confirmation_required": (
+                payload if decision.requires_confirmation else None
+            ),
+        }
+        assert isinstance(raw_current_authorization, Mapping)
+        current_payload = dict(raw_current_authorization)
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "state_dispatch_resolution": None,
+                "current_chapter_id": frozen.chapter_id,
+                "expected_narrative_revision": (
+                    frozen.expected_narrative_revision
+                ),
+                "authorization_revision": frozen.authorization_revision,
+                "readiness.digest": frozen.readiness_digest,
+                "prose_continuation_authorization": current_payload,
+            },
+            {"$set": {**fields, "updated_at": get_utc_now()}},
+        )
+        if result.matched_count == 1:
+            return payload
+        raise CandidatePipelineCheckpointConflict(
+            "Outline authorization decision lost its execution fence"
+        )
+
+    async def consume_uncertain_prose_retry(self, job_id: str) -> bool:
+        """Consume the one-shot retry grant without a generic authority patch."""
+
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "state_dispatch_resolution": None,
+                "confirm_uncertain_prose_retry": True,
+            },
+            {
+                "$set": {
+                    "confirm_uncertain_prose_retry": False,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        return result.modified_count == 1
+
     async def append_diagnostic(
         self,
         job_id: str,
@@ -2546,47 +2824,11 @@ class GenerationJobRepository:
         phase: str,
         provider_alias: str,
     ) -> str:
-        """在发起 Provider 请求前原子占用一个已预留槽。"""
-        attempt_id = uuid4().hex
-        now = get_utc_now()
-        slot = {
-            "attempt_id": attempt_id,
-            "chapter_id": str(chapter_id),
-            "step_id": str(step_id),
-            "phase": str(phase),
-            "provider_alias": str(provider_alias),
-            "state": "claimed",
-            "claimed_at": now,
-        }
-        result = await self._collection_update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "state_dispatch_resolution": None,
-                "attempt_reservation.chapter_id": str(chapter_id),
-                "$expr": {"$and": [
-                    {"$lt": [
-                        {"$ifNull": ["$usage_attempt_claimed", 0]},
-                        {"$ifNull": ["$usage_attempt_capacity", 0]},
-                    ]},
-                    {"$lt": [
-                        {"$ifNull": ["$attempt_reservation.claimed_slots", 0]},
-                        {"$ifNull": ["$attempt_reservation.reserved_slots", 0]},
-                    ]},
-                ]},
-            },
-            {
-                "$inc": {
-                    "usage_attempt_claimed": 1,
-                    "attempt_reservation.claimed_slots": 1,
-                },
-                "$push": {"attempt_slots": slot},
-                "$set": {"updated_at": now},
-            },
+        """Reject the removed pre-budget claim protocol before it can persist."""
+        del job_id, chapter_id, step_id, phase, provider_alias
+        raise TokenBudgetUnbounded(
+            "Every Provider attempt requires a conservative token bound"
         )
-        if result.modified_count != 1:
-            raise AttemptCapacityExceeded("Attempt capacity or chapter reservation is exhausted")
-        return attempt_id
 
     async def account_attempt(
         self,
@@ -2594,43 +2836,11 @@ class GenerationJobRepository:
         attempt_id: str,
         usage: TokenUsage,
     ) -> bool:
-        """逐 attempt 幂等计费；摘要裁剪不影响永久 ID 去重账本。"""
-        now = get_utc_now()
-        summary = {
-            "attempt_id": str(attempt_id),
-            "usage": usage.model_dump(),
-            "accounted_at": now,
-        }
-        result = await self._collection_update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "state_dispatch_resolution": None,
-                "usage_attempt_ids": {"$ne": str(attempt_id)},
-                "attempt_slots": {"$elemMatch": {
-                    "attempt_id": str(attempt_id),
-                    "state": {"$in": ["claimed", "uncertain"]},
-                }},
-            },
-            {
-                "$addToSet": {"usage_attempt_ids": str(attempt_id)},
-                "$push": {
-                    "usage_attempt_summaries": {
-                        "$each": [summary],
-                        "$slice": -USAGE_SUMMARY_LIMIT,
-                    }
-                },
-                "$inc": {"tokens_used": int(usage.total_tokens or 0)},
-                "$set": {
-                    "attempt_slots.$[slot].state": "accounted",
-                    "attempt_slots.$[slot].usage": usage.model_dump(),
-                    "attempt_slots.$[slot].accounted_at": now,
-                    "updated_at": now,
-                },
-            },
-            array_filters=[{"slot.attempt_id": str(attempt_id)}],
+        """Reject settlement that has no matching conservative reservation."""
+        del job_id, attempt_id, usage
+        raise TokenBudgetUnbounded(
+            "Every Provider attempt requires a conservative token bound"
         )
-        return result.modified_count == 1
 
     async def mark_attempt_uncertain(self, job_id: str, attempt_id: str, reason: str) -> bool:
         now = get_utc_now()
@@ -2691,22 +2901,27 @@ class GenerationJobRepository:
         if action not in STATE_DISPATCH_RESOLUTION_ACTIONS:
             raise ValueError("Unknown uncertain-attempt action")
         now = get_utc_now()
+        acknowledged_state = f"uncertain_{action}_acknowledged"
         result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
                 "state_dispatch_resolution": None,
             },
-            {
-                "$set": {
-                    "attempt_slots.$[slot].state": f"uncertain_{action}_acknowledged",
-                    "attempt_slots.$[slot].updated_at": now,
-                    "has_uncertain_attempts": False,
-                    "attempt_reservation": None,
-                    "updated_at": now,
+            [
+                {
+                    "$set": {
+                        **_live_attempt_transition_fields(
+                            source_states=("uncertain",),
+                            target_state=acknowledged_state,
+                            now=now,
+                        ),
+                        "has_uncertain_attempts": False,
+                        "attempt_reservation": None,
+                        "updated_at": now,
+                    }
                 }
-            },
-            array_filters=[{"slot.state": "uncertain"}],
+            ],
         )
         return result.matched_count == 1
 
@@ -2778,11 +2993,15 @@ class GenerationJobRepository:
         pre_dispatch_fence: PreDispatchFenceV1 | None = None,
     ) -> str:
         """Atomically claim an attempt slot and reserve its worst-case tokens."""
-        reserved = (
-            None
-            if conservative_tokens is None
-            else max(1, int(conservative_tokens))
-        )
+        if (
+            type(conservative_tokens) is not int
+            or conservative_tokens <= 0
+            or conservative_tokens > MAX_PERSISTED_ATTEMPT_TOKENS
+        ):
+            raise TokenBudgetUnbounded(
+                "Every Provider attempt requires a conservative token bound"
+            )
+        reserved = conservative_tokens
         attempt_id = uuid4().hex
         now = get_utc_now()
         slot = {
@@ -2812,12 +3031,8 @@ class GenerationJobRepository:
         }
         if fence is not None:
             query["attempt_reservation.pre_dispatch_fence"] = fence
-        if reserved is None:
-            # A finite job budget must never silently accept an unbounded call.
-            query["token_budget"] = None
-        else:
-            query["$expr"] = {
-                "$and": [
+        query["$expr"] = {
+            "$and": [
                     {
                         "$lt": [
                             {"$ifNull": ["$usage_attempt_claimed", 0]},
@@ -2853,8 +3068,8 @@ class GenerationJobRepository:
                             },
                         ]
                     },
-                ]
-            }
+            ]
+        }
         update: dict[str, Any] = {
             "$inc": {
                 "usage_attempt_claimed": 1,
@@ -2863,18 +3078,17 @@ class GenerationJobRepository:
             "$push": {"attempt_slots": slot},
             "$set": {"updated_at": now},
         }
-        if reserved is not None:
-            update["$inc"]["tokens_reserved"] = reserved
-            update["$push"]["active_token_reservations"] = {
-                "attempt_id": attempt_id,
-                "chapter_id": str(chapter_id),
-                "step_id": str(step_id),
-                "phase": str(phase),
-                "provider_alias": str(provider_alias),
-                "conservative_tokens": reserved,
-                "state": "claimed",
-                "reserved_at": now,
-            }
+        update["$inc"]["tokens_reserved"] = reserved
+        update["$push"]["active_token_reservations"] = {
+            "attempt_id": attempt_id,
+            "chapter_id": str(chapter_id),
+            "step_id": str(step_id),
+            "phase": str(phase),
+            "provider_alias": str(provider_alias),
+            "conservative_tokens": reserved,
+            "state": "claimed",
+            "reserved_at": now,
+        }
         result = await self._collection_update_one(query, update)
         if result.modified_count == 1:
             return attempt_id
@@ -2889,11 +3103,7 @@ class GenerationJobRepository:
                     "Provider attempt dispatch fence was replaced"
                 )
         budget = job.get("token_budget")
-        if reserved is None and budget is not None:
-            raise TokenBudgetUnbounded(
-                "A finite token budget requires a conservative Provider bound"
-            )
-        if budget is not None and reserved is not None:
+        if budget is not None:
             used = int(job.get("tokens_used") or 0)
             already_reserved = int(job.get("tokens_reserved") or 0)
             if used + already_reserved + reserved > int(budget):
@@ -2917,9 +3127,15 @@ class GenerationJobRepository:
         conservative_tokens: int | None,
     ) -> bool:
         """Release a reservation once; missing usage is charged conservatively."""
-        if conservative_tokens is None:
-            return await self.account_attempt(job_id, attempt_id, usage)
-        reserved = max(1, int(conservative_tokens))
+        if (
+            type(conservative_tokens) is not int
+            or conservative_tokens <= 0
+            or conservative_tokens > MAX_PERSISTED_ATTEMPT_TOKENS
+        ):
+            raise TokenBudgetUnbounded(
+                "Every Provider attempt requires a conservative token bound"
+            )
+        reserved = conservative_tokens
         observed = _trusted_usage_tokens(usage)
         charged = observed if observed > 0 else reserved
         accounted_usage = usage.model_copy(update={"total_tokens": charged})

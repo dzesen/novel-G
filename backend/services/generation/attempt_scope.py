@@ -9,35 +9,17 @@ from backend.db.repositories.generation_job_repository import (
     generation_job_repo,
 )
 from backend.llm.models import TokenUsage
+from backend.services.generation.attempt_ledger_contracts import (
+    EVIDENCE_ATTEMPT_STATES,
+    PERSISTED_ATTEMPT_STATES,
+    RECOVERED_OUTCOME_ATTEMPT_STATES,
+)
 from backend.services.generation.candidate_repair_contracts import (
     PreDispatchFenceV1,
 )
 from backend.services.llm.generation_runtime import AttemptUsage
 
 
-_PERSISTED_ATTEMPT_STATES = frozenset({
-    "claimed",
-    "accounted",
-    "uncertain",
-    "released_pre_dispatch",
-    "uncertain_retry_acknowledged",
-    "uncertain_skip_acknowledged",
-    "uncertain_abort_acknowledged",
-})
-_EVIDENCE_ATTEMPT_STATES = frozenset({
-    "accounted",
-    "uncertain",
-    "uncertain_retry_acknowledged",
-    "uncertain_skip_acknowledged",
-    "uncertain_abort_acknowledged",
-})
-_RECOVERED_OUTCOME_ATTEMPT_STATES = frozenset({
-    "accounted",
-    "released_pre_dispatch",
-    "uncertain_retry_acknowledged",
-    "uncertain_skip_acknowledged",
-    "uncertain_abort_acknowledged",
-})
 _MAX_PERSISTED_ATTEMPT_TOKENS = 1_000_000_000
 _MAX_PERSISTED_LEDGER_TOKENS = 2**63 - 1
 
@@ -90,7 +72,7 @@ def project_persisted_attempt_evidence(
             or not isinstance(phase, str)
             or not phase
             or len(phase) > 64
-            or state not in _RECOVERED_OUTCOME_ATTEMPT_STATES
+            or state not in RECOVERED_OUTCOME_ATTEMPT_STATES
         ):
             raise ValueError("persisted Provider attempt identity is invalid")
         seen.add(attempt_id)
@@ -195,7 +177,7 @@ class JobAttemptScope:
             if attempt_id in self._claims:
                 raise ValueError("persisted Provider attempt identity is duplicated")
             state = slot.get("state")
-            if not isinstance(state, str) or state not in _PERSISTED_ATTEMPT_STATES:
+            if not isinstance(state, str) or state not in PERSISTED_ATTEMPT_STATES:
                 raise ValueError("persisted Provider attempt state is invalid")
             self._claims[attempt_id] = (provider_alias, phase)
             self._persisted_states[attempt_id] = state
@@ -231,7 +213,7 @@ class JobAttemptScope:
             if accounted is not None:
                 evidence.append(accounted)
                 continue
-            if state not in _EVIDENCE_ATTEMPT_STATES:
+            if state not in EVIDENCE_ATTEMPT_STATES:
                 continue
             conservative_tokens = self._conservative_tokens.get(attempt_id)
             if (

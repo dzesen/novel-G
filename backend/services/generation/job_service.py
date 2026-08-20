@@ -47,6 +47,12 @@ from backend.services.generation.job_execution import (
     JobExecutionLeaseV1,
     bind_job_execution,
 )
+from backend.services.generation.job_authorization_contracts import (
+    OutlineAuthorizationRecalculationCommandV1,
+    parse_prose_authorization,
+    prose_authorization_digest,
+    prose_authorization_scope,
+)
 from backend.services.generation.chapter_candidate_repairs import (
     ChapterCandidateRepairApplication,
 )
@@ -357,47 +363,6 @@ class ResumeReadinessRequired(ValueError):
     """The paused job needs a fresh, user-confirmed authorization preview."""
 
 
-_AUTHORIZATION_SCOPE_FIELDS = (
-    "max_base_calls",
-    "max_automatic_continuation_calls",
-    "max_logical_prose_calls",
-    "max_actual_provider_attempts",
-    "conservative_base_token_bound",
-    "conservative_continuation_token_bound",
-    "conservative_token_bound",
-    "conservative_total_token_bound",
-)
-
-
-def _safe_scope_value(value: Any) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _authorization_scope(authorization: Mapping[str, Any] | None) -> dict[str, int]:
-    values = dict(authorization or {})
-    return {
-        field: _safe_scope_value(values.get(field))
-        for field in _AUTHORIZATION_SCOPE_FIELDS
-    }
-
-
-def _authorization_scope_increases(
-    *,
-    authorized: Mapping[str, Any] | None,
-    candidate: Mapping[str, Any] | None,
-) -> list[str]:
-    authorized_scope = _authorization_scope(authorized)
-    candidate_scope = _authorization_scope(candidate)
-    return [
-        field
-        for field in _AUTHORIZATION_SCOPE_FIELDS
-        if candidate_scope[field] > authorized_scope[field]
-    ]
-
-
 def _estimate_authorized_chapter_attempt_slots(
     job: Mapping[str, Any],
     chapter: Mapping[str, Any],
@@ -558,10 +523,21 @@ class GenerationJobService:
         """
         job = await generation_job_repo.get_job(job_id)
         authorization = dict(job.get("prose_continuation_authorization") or {})
-        current_revision = max(
-            int(job.get("authorization_revision") or 0),
-            int(authorization.get("authorization_revision") or 0),
+        current_authorization = parse_prose_authorization(authorization)
+        current_revision = job.get("authorization_revision")
+        if (
+            type(current_revision) is not int
+            or current_revision != current_authorization.authorization_revision
+        ):
+            raise ValueError("outline authorization revision is invalid")
+        readiness = job.get("readiness")
+        readiness_digest = (
+            readiness.get("digest")
+            if isinstance(readiness, Mapping)
+            else None
         )
+        if not isinstance(readiness_digest, str) or not readiness_digest:
+            raise ValueError("outline authorization readiness digest is invalid")
         if job.get("scope") == "book":
             chapters = await get_book_worklist(
                 str(job["novel_id"]),
@@ -605,11 +581,8 @@ class GenerationJobService:
                 "prose_continuation_authorization"
             ) or {}
         )
-        authorized_scope = _authorization_scope(authorization)
-        candidate_scope = _authorization_scope(candidate)
-        exceeded_fields = _authorization_scope_increases(
-            authorized=authorization,
-            candidate=candidate,
+        candidate_authorization = (
+            parse_prose_authorization(candidate) if candidate else None
         )
         previously_acknowledged = set(
             str(code)
@@ -628,47 +601,32 @@ class GenerationJobService:
             for issue in list(report.get("issues") or [])
             if issue.get("level") == "blocked"
         ]
-        recalculation = {
-            "chapter_id": str(chapter_id),
-            "authorization_revision": max(1, current_revision),
-            "authorized_scope": authorized_scope,
-            "candidate_scope": candidate_scope,
-            "exceeded_fields": exceeded_fields,
-            "new_acknowledgement_codes": new_acknowledgements,
-            "blocked_issue_codes": blocked,
-            "expected_narrative_revision": (
-                (report.get("resources") or {}).get("narrative_revision")
-            ),
-        }
-        expected_revision = recalculation["expected_narrative_revision"]
+        expected_revision = (report.get("resources") or {}).get(
+            "narrative_revision"
+        )
         if type(expected_revision) is not int or expected_revision < 0:
             raise ValueError("outline recalculation narrative revision is invalid")
-        if not candidate or exceeded_fields or new_acknowledgements or blocked:
-            result = {
-                **recalculation,
-                "status": "confirmation_required",
-                "requires_confirmation": True,
-            }
-            await generation_job_repo.update_job_fields(job_id, {
-                "readiness_recalculation": result,
-                "authorization_confirmation_required": result,
-            })
-            return result
-
-        await generation_job_repo.update_job_fields(job_id, {
-            "prose_continuation_authorization": candidate,
-            "readiness_recalculation": {
-                **recalculation,
-                "status": "narrowed_or_unchanged",
-                "requires_confirmation": False,
-            },
-            "authorization_confirmation_required": None,
-        })
-        return {
-            **recalculation,
-            "status": "narrowed_or_unchanged",
-            "requires_confirmation": False,
-        }
+        command = OutlineAuthorizationRecalculationCommandV1(
+            schema_version="outline_authorization_recalculation_command.v1",
+            chapter_id=str(chapter_id),
+            authorization_revision=current_revision,
+            expected_narrative_revision=expected_revision,
+            readiness_digest=readiness_digest,
+            expected_authorization_digest=prose_authorization_digest(
+                current_authorization
+            ),
+            candidate_scope=(
+                prose_authorization_scope(candidate_authorization)
+                if candidate_authorization is not None
+                else None
+            ),
+            new_acknowledgement_codes=tuple(new_acknowledgements),
+            blocked_issue_codes=tuple(blocked),
+        )
+        return await generation_job_repo.publish_outline_authorization_recalculation(
+            job_id,
+            command=command,
+        )
 
     @staticmethod
     async def _spawn(job_id: str, control: JobControl) -> bool:
@@ -687,6 +645,10 @@ class GenerationJobService:
                 ),
             )
         except JobExecutionLeaseUnavailable:
+            await generation_job_repo.interrupt_stale_execution(
+                job_id,
+                now=now,
+            )
             return False
 
         previous_task = (
@@ -810,10 +772,12 @@ class GenerationJobService:
             if confirm_prose_retry:
                 # Consume before any Provider work. A second crash requires a new
                 # user confirmation instead of inheriting a stale blanket grant.
-                await generation_job_repo.update_job_fields(
-                    job_id,
-                    {"confirm_uncertain_prose_retry": False},
-                )
+                if not await generation_job_repo.consume_uncertain_prose_retry(
+                    job_id
+                ):
+                    raise ValueError(
+                        "Generation job prose retry grant changed before use"
+                    )
             deps = build_chapter_pipeline_deps(
                 lambda step: JobAttemptScope(
                     job_id,
@@ -2021,13 +1985,7 @@ class GenerationJobService:
                 action="abort",
             )
         else:
-            await generation_job_repo.complete_job_abort(job_id, {
-                "status": "aborted",
-                "current_chapter_id": None,
-                "active_slot": None,
-                "has_uncertain_attempts": False,
-                "attempt_reservation": None,
-            })
+            await generation_job_repo.complete_job_abort(job_id)
         entry = _REGISTRY.get(job_id)
         if entry is not None:
             entry[1].abort_requested = True
