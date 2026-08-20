@@ -917,6 +917,11 @@ class ChapterCandidateJobRunner:
                         "候选作业没有冻结章纲生成计划"
                     )
                 await ensure_reserved()
+                outline_binding = scope.mutation_binding(
+                    operation="accept_chapter_outline",
+                    idempotency_key=outline_key,
+                    expected_narrative_revision=expected_revision,
+                )
                 await self._deps.generate_outline(
                     novel_id,
                     current,
@@ -925,6 +930,7 @@ class ChapterCandidateJobRunner:
                     generation_plan=execution.outline_plan,
                     expected_narrative_revision=expected_revision,
                     mutation_idempotency_key=outline_key,
+                    job_mutation_binding=outline_binding,
                 )
                 outline_revision = await self._recover_mutation_revision(
                     scope,

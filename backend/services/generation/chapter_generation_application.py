@@ -273,6 +273,7 @@ class OutlineGenerationCommand(_ChapterGenerationCommand):
         min_length=1,
         max_length=240,
     )
+    job_mutation_binding: JobMutationRecoveryBindingV1 | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
@@ -575,6 +576,22 @@ class ChapterGenerationApplicationService:
         self,
         command: OutlineGenerationCommand,
     ) -> _PreparedOutline:
+        binding = command.job_mutation_binding
+        if binding is not None:
+            frozen_binding = JobMutationRecoveryBindingV1.model_validate(
+                binding.model_dump(mode="python")
+            )
+            if (
+                command.authority is not AcceptanceAuthority.SYSTEM
+                or frozen_binding.operation != "accept_chapter_outline"
+                or frozen_binding.novel_id != command.novel_id
+                or frozen_binding.chapter_id != command.chapter_id
+                or frozen_binding.expected_narrative_revision
+                != command.expected_narrative_revision
+                or frozen_binding.idempotency_key
+                != command.mutation_idempotency_key
+            ):
+                raise ValueError("章纲 mutation 的 Job 授权绑定无效")
         novel = await self._deps.novel_repo.get_novel_by_id(command.novel_id)
         chapter = await self._deps.chapter_repo.get_chapter_by_id(
             command.chapter_id
@@ -718,13 +735,20 @@ class ChapterGenerationApplicationService:
                     command.expected_narrative_revision is not None
                     or command.mutation_idempotency_key is not None
                 ):
+                    mutation_options: dict[str, Any] = {
+                        "expected_narrative_revision": (
+                            command.expected_narrative_revision
+                        ),
+                        "idempotency_key": command.mutation_idempotency_key,
+                    }
+                    if command.job_mutation_binding is not None:
+                        mutation_options["job_mutation_binding"] = (
+                            command.job_mutation_binding
+                        )
                     await self._deps.accept_outline(
                         command.chapter_id,
                         cleaned,
-                        expected_narrative_revision=(
-                            command.expected_narrative_revision
-                        ),
-                        idempotency_key=command.mutation_idempotency_key,
+                        **mutation_options,
                     )
                 else:
                     await self._deps.accept_outline(command.chapter_id, cleaned)
@@ -1033,6 +1057,7 @@ class ChapterGenerationApplicationService:
                     chapter_id=command.chapter_id,
                     proposal=proposal,
                     policy=SelectAllPolicy(),
+                    job_mutation_binding=command.job_mutation_binding,
                 )
                 accepted = True
             usage = dict(data.get("usage") or {})

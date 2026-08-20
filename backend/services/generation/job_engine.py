@@ -549,6 +549,7 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 chapter = job_planner.first_needing_work(chapters)
             if (
                 not candidate_recovery
+                and not job_mutation_recovery
                 and chapter is not None
                 and deps.inspect_reference_card_blockers is not None
             ):

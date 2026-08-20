@@ -6,7 +6,7 @@ import logging
 import hashlib
 import json
 import re
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from pydantic import ValidationError
 from bson import ObjectId
@@ -36,6 +36,11 @@ from backend.services.novel.state_timeline import (
     record_plot_thread_event,
 )
 from backend.services.novel.state_completion import chapter_content_digest
+
+if TYPE_CHECKING:
+    from backend.services.generation.candidate_repair_contracts import (
+        JobMutationRecoveryBindingV1,
+    )
 
 
 _WORD_TOKEN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]|[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
@@ -437,6 +442,7 @@ class ChapterService:
         edited_by_human: bool = False,
         expected_narrative_revision: int | None = None,
         idempotency_key: str | None = None,
+        job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
     ) -> Dict[str, Any]:
         """接受章节细纲预览：创建 new_threads 并写入 chapter.outline（设计 §3.2 / §5.2）。
 
@@ -548,6 +554,29 @@ class ChapterService:
         ):
             raise ValueError("outline idempotency key is invalid")
 
+        canonical_job_binding: dict[str, Any] | None = None
+        if job_mutation_binding is not None:
+            from backend.services.generation.candidate_repair_contracts import (
+                JobMutationRecoveryBindingV1,
+            )
+
+            try:
+                frozen_binding = JobMutationRecoveryBindingV1.model_validate(
+                    job_mutation_binding.model_dump(mode="python")
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("outline Job mutation binding is invalid") from exc
+            if (
+                frozen_binding.operation != "accept_chapter_outline"
+                or frozen_binding.novel_id != novel_id
+                or frozen_binding.chapter_id != str(chapter_id)
+                or frozen_binding.expected_narrative_revision
+                != expected_narrative_revision
+                or frozen_binding.idempotency_key != normalized_idempotency_key
+            ):
+                raise ValueError("outline Job mutation binding diverged")
+            canonical_job_binding = frozen_binding.model_dump(mode="json")
+
         return await commit_mutation(
             MutationCommand(
                 novel_id=novel_id,
@@ -567,6 +596,11 @@ class ChapterService:
                     "previous_thread_ids": previous_thread_ids,
                     "edited_by_human": bool(edited_by_human),
                     "generated_at": get_utc_now(),
+                    **(
+                        {"job_mutation_binding": canonical_job_binding}
+                        if canonical_job_binding is not None
+                        else {}
+                    ),
                 },
                 before_image={"outline": chapter.get("outline")},
                 child_ids=child_ids,

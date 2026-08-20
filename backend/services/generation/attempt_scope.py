@@ -29,6 +29,14 @@ _EVIDENCE_ATTEMPT_STATES = frozenset({
     "uncertain_retry_acknowledged",
     "uncertain_skip_acknowledged",
 })
+_RECOVERED_OUTCOME_ATTEMPT_STATES = frozenset({
+    "accounted",
+    "released_pre_dispatch",
+    "uncertain_retry_acknowledged",
+    "uncertain_skip_acknowledged",
+})
+_MAX_PERSISTED_ATTEMPT_TOKENS = 1_000_000_000
+_MAX_PERSISTED_LEDGER_TOKENS = 2**63 - 1
 
 
 def _strict_persisted_usage(value: object) -> TokenUsage:
@@ -43,6 +51,85 @@ def _strict_persisted_usage(value: object) -> TokenUsage:
     ):
         raise ValueError("persisted Provider attempt usage is invalid")
     return TokenUsage(**{field: int(value[field]) for field in fields})
+
+
+def project_persisted_attempt_evidence(
+    slots: Sequence[Mapping[str, object]],
+    *,
+    maximum_entries: int,
+) -> tuple[list[dict[str, object]], int]:
+    """Strictly project a bounded persisted Job ledger for public recovery."""
+
+    if (
+        type(maximum_entries) is not int
+        or maximum_entries < 0
+        or len(slots) > maximum_entries
+    ):
+        raise ValueError("persisted Provider attempt ledger exceeds its bound")
+    projected: list[dict[str, object]] = []
+    seen: set[str] = set()
+    total = 0
+    for slot in slots:
+        if not isinstance(slot, Mapping):
+            raise ValueError("persisted Provider attempt ledger is invalid")
+        attempt_id = slot.get("attempt_id")
+        provider_alias = slot.get("provider_alias")
+        phase = slot.get("phase")
+        state = slot.get("state")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or len(attempt_id) > 128
+            or attempt_id in seen
+            or not isinstance(provider_alias, str)
+            or not provider_alias
+            or len(provider_alias) > 64
+            or not isinstance(phase, str)
+            or not phase
+            or len(phase) > 64
+            or state not in _RECOVERED_OUTCOME_ATTEMPT_STATES
+        ):
+            raise ValueError("persisted Provider attempt identity is invalid")
+        seen.add(attempt_id)
+        raw_usage = slot.get("usage")
+        if raw_usage is None and state != "accounted":
+            raw_usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            }
+        usage = _strict_persisted_usage(raw_usage)
+        components = (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+        )
+        if any(value > _MAX_PERSISTED_ATTEMPT_TOKENS for value in components):
+            raise ValueError("persisted Provider attempt usage exceeds its bound")
+        if state == "released_pre_dispatch" and any(components):
+            raise ValueError("released Provider attempt has paid usage")
+        conservative_total = max(
+            usage.total_tokens,
+            usage.input_tokens + usage.output_tokens,
+        )
+        if (
+            conservative_total > _MAX_PERSISTED_ATTEMPT_TOKENS
+            or total > _MAX_PERSISTED_LEDGER_TOKENS - conservative_total
+        ):
+            raise ValueError("persisted Provider attempt usage exceeds its bound")
+        total += conservative_total
+        projected.append({
+            "attempt_id": attempt_id,
+            "provider_alias": provider_alias,
+            "phase": phase,
+            "state": state,
+            "usage": {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": conservative_total,
+            },
+        })
+    return projected, total
 
 
 class JobAttemptScope:

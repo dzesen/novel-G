@@ -1228,6 +1228,15 @@ async def init_state_timeline_indexes():
             pymongo.IndexModel([("expires_at", 1)], expireAfterSeconds=0),
             pymongo.IndexModel([("novel_id", 1), ("chapter_id", 1)]),
             pymongo.IndexModel([("status", 1), ("updated_at", 1)]),
+            pymongo.IndexModel(
+                [("job_mutation_key", 1)],
+                unique=True,
+                partialFilterExpression={
+                    "job_mutation_key": {"$type": "string"},
+                    "is_deleted": False,
+                },
+                name="state_preview_job_mutation_unique",
+            ),
         ])
         await db[collections.MUTATION_JOURNALS].create_indexes([
             pymongo.IndexModel(

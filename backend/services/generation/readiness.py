@@ -434,6 +434,27 @@ class GenerationReadinessModule:
                 )
             )
 
+        prose_without_outline = [
+            snapshot["chapter_id"]
+            for snapshot in work["chapters"]
+            if snapshot["has_content"] is True
+            and snapshot["has_outline"] is False
+            and snapshot["state_completion_status"]
+            not in REUSABLE_STATE_COMPLETION_STATUSES
+        ]
+        if prose_without_outline:
+            issues.append(
+                _issue(
+                    "existing_prose_without_outline_requires_manual_review",
+                    "blocked",
+                    details={
+                        "chapter_count": len(prose_without_outline),
+                        "chapter_ids": prose_without_outline[:50],
+                    },
+                    action_codes=["review_chapter_outline"],
+                )
+            )
+
         runs_character_sensitive_steps = (
             work["steps"]["outline"]["generate"] > 0
             or work["steps"]["state"]["generate"] > 0
@@ -487,6 +508,7 @@ class GenerationReadinessModule:
                     authorization_revision=authorization_revision,
                 )
             )
+
             if has_work and self._deps.plan_candidate_repairs is not None:
                 candidate_repair_authorization = (
                     parse_candidate_repair_authorization(

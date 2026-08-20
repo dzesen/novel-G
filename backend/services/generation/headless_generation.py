@@ -426,6 +426,7 @@ async def generate_outline(
     generation_plan: GenerationPlan | None = None,
     expected_narrative_revision: int | None = None,
     mutation_idempotency_key: str | None = None,
+    job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     execution = await _chapter_capability_registry().execute(
         "chapter_outline",
@@ -438,6 +439,7 @@ async def generate_outline(
             generation_plan=generation_plan,
             expected_narrative_revision=expected_narrative_revision,
             mutation_idempotency_key=mutation_idempotency_key,
+            job_mutation_binding=job_mutation_binding,
         ),
         call=CapabilityCall(source="job_engine"),
     )

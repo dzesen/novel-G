@@ -50,7 +50,7 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v3"
 )
-CANDIDATE_PIPELINE_REVISION = 11
+CANDIDATE_PIPELINE_REVISION = 12
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v1"
@@ -133,13 +133,19 @@ def readiness_chapter_uses_candidate_pipeline(
             raise ValueError("generation readiness chapter identity is invalid")
         seen.add(snapshot_id)
         has_content = raw_chapter.get("has_content")
-        if type(has_content) is not bool:
-            raise ValueError("generation readiness prose state is invalid")
+        has_outline = raw_chapter.get("has_outline")
+        if type(has_content) is not bool or type(has_outline) is not bool:
+            raise ValueError("generation readiness chapter mode is invalid")
         if snapshot_id == normalized_chapter_id:
             matches.append(raw_chapter)
     if len(matches) != 1:
         raise ValueError("chapter is outside the frozen generation worklist")
-    return matches[0].get("has_content") is False
+    selected = matches[0]
+    if selected.get("has_content") is True and selected.get("has_outline") is False:
+        raise ValueError(
+            "existing prose without outline cannot enter the state-only pipeline"
+        )
+    return selected.get("has_content") is False
 
 
 class _ClosedAuthorizationModel(BaseModel):

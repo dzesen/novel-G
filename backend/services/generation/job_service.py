@@ -44,7 +44,10 @@ from backend.services.generation.chapter_finalization import (
     chapter_finalization_service,
     parse_chapter_finalization_authorization,
 )
-from backend.services.generation.attempt_scope import JobAttemptScope
+from backend.services.generation.attempt_scope import (
+    JobAttemptScope,
+    project_persisted_attempt_evidence,
+)
 from backend.services.generation.headless_generation import (
     build_chapter_pipeline_deps,
     estimate_chapter_attempt_slots,
@@ -145,93 +148,15 @@ def _recovered_state_only_outcome(
     receipt: JobMutationReceiptV1,
     attempts: List[Mapping[str, Any]],
 ) -> ChapterOutcome:
-    if len(attempts) > 2_040:
+    try:
+        projected_attempts, tokens = project_persisted_attempt_evidence(
+            attempts,
+            maximum_entries=2_040,
+        )
+    except ValueError as exc:
         raise StaleStatePreview(
-            "Generation job state attempt ledger exceeds its frozen bound"
-        )
-    projected_attempts: list[dict[str, Any]] = []
-    seen_attempt_ids: set[str] = set()
-    tokens = 0
-    for raw in attempts:
-        if not isinstance(raw, Mapping):
-            raise StaleStatePreview(
-                "Generation job state attempt ledger is invalid"
-            )
-        attempt_id = raw.get("attempt_id")
-        provider_alias = raw.get("provider_alias")
-        phase = raw.get("phase")
-        state = raw.get("state")
-        if (
-            not isinstance(attempt_id, str)
-            or not attempt_id
-            or len(attempt_id) > 128
-            or attempt_id in seen_attempt_ids
-            or not isinstance(provider_alias, str)
-            or not provider_alias
-            or len(provider_alias) > 64
-            or not isinstance(phase, str)
-            or not phase
-            or len(phase) > 64
-            or state not in {
-                "accounted",
-                "released_pre_dispatch",
-                "uncertain_retry_acknowledged",
-                "uncertain_skip_acknowledged",
-            }
-        ):
-            raise StaleStatePreview(
-                "Generation job state attempt identity is invalid"
-            )
-        seen_attempt_ids.add(attempt_id)
-        usage = raw.get("usage")
-        if usage is None and state != "accounted":
-            usage = {}
-        if not isinstance(usage, Mapping):
-            raise StaleStatePreview(
-                "Generation job state attempt usage is invalid"
-            )
-        components = (
-            usage.get("input_tokens", 0),
-            usage.get("output_tokens", 0),
-            usage.get("total_tokens", 0),
-        )
-        if any(
-            type(value) is not int
-            or value < 0
-            or value > 1_000_000_000
-            for value in components
-        ):
-            raise StaleStatePreview(
-                "Generation job state attempt usage is invalid"
-            )
-        input_tokens, output_tokens, declared_total = components
-        if (
-            state == "released_pre_dispatch"
-            and any(components)
-        ):
-            raise StaleStatePreview(
-                "Generation job released attempt has paid usage"
-            )
-        total_tokens = max(
-            declared_total,
-            input_tokens + output_tokens,
-        )
-        if total_tokens > 1_000_000_000 or tokens + total_tokens > 2**63 - 1:
-            raise StaleStatePreview(
-                "Generation job state attempt usage exceeds its bound"
-            )
-        tokens += total_tokens
-        projected_attempts.append({
-            "attempt_id": attempt_id,
-            "provider_alias": provider_alias,
-            "phase": phase,
-            "state": state,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens,
-            },
-        })
+            "Generation job state attempt ledger is invalid"
+        ) from exc
     return ChapterOutcome(
         chapter_id=str(chapter.get("_id") or ""),
         order_index=int(chapter.get("order_index") or 0),
@@ -1017,12 +942,31 @@ class GenerationJobService:
                 return []
             await GenerationJobService._guard_no_running()
             job_id = str(target["_id"])
+            current_chapter_id = None
+            raw_recovery = target.get("job_mutation_recovery")
+            if raw_recovery is not None:
+                try:
+                    recovery = JobMutationRecoveryBindingV1.model_validate(
+                        raw_recovery
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "Generation job mutation recovery binding is invalid"
+                    ) from exc
+                if (
+                    recovery.job_id != job_id
+                    or recovery.novel_id != str(target.get("novel_id") or "")
+                ):
+                    raise ValueError(
+                        "Generation job mutation recovery binding diverged"
+                    )
+                current_chapter_id = recovery.chapter_id
             await generation_job_repo.update_job_fields(job_id, {
                 "status": "running",
                 "pause_reason": None,
                 "error": None,
                 "active_slot": "global",
-                "current_chapter_id": None,
+                "current_chapter_id": current_chapter_id,
             })
         control = JobControl()
         GenerationJobService._spawn(job_id, control)

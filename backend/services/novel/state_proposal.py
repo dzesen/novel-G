@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from bson import ObjectId
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from backend.config.config import CONFIG_PATH
 from backend.config.lifecycle import FileSecretVersionStore
@@ -446,32 +447,74 @@ class StateProposalModule:
         )
         self._validate_snapshot_identity(active_snapshot, novel_id, chapter_id)
         await self.ensure_current(active_snapshot)
+        generation_audit = deepcopy(audit or {})
+        raw_job_binding = generation_audit.get("job_mutation_binding")
+        job_binding: JobMutationRecoveryBindingV1 | None = None
+        if raw_job_binding is not None:
+            try:
+                job_binding = JobMutationRecoveryBindingV1.model_validate(
+                    raw_job_binding
+                )
+            except (TypeError, ValueError) as exc:
+                raise StaleStatePreview(
+                    "State proposal Job mutation binding is invalid"
+                ) from exc
+            if (
+                job_binding.operation != "accept_chapter_state"
+                or job_binding.novel_id != str(novel_id)
+                or job_binding.chapter_id != str(chapter_id)
+                or job_binding.expected_narrative_revision
+                != active_snapshot.narrative_revision
+            ):
+                raise StaleStatePreview(
+                    "State proposal Job mutation binding diverged"
+                )
+            existing = await self.collection.find_one({
+                "job_mutation_key": job_binding.idempotency_key,
+                "is_deleted": False,
+            })
+            if existing is not None:
+                raise StaleStatePreview(
+                    "State proposal Job result already exists and must be recovered"
+                )
         proposal_id = ObjectId()
         now = get_utc_now()
-        await self.collection.insert_one(
-            {
-                "_id": proposal_id,
-                "novel_id": to_object_id(novel_id),
-                "chapter_id": to_object_id(chapter_id),
-                "status": "generating",
-                "content_digest": active_snapshot.content_digest,
-                "state_revision": active_snapshot.narrative_revision,
-                "narrative_revision": active_snapshot.narrative_revision,
-                "source_content_digest": active_snapshot.source_content_digest,
-                "source_prose_run_id": active_snapshot.source_prose_run_id,
-                "source_prose_run_revision": active_snapshot.source_prose_run_revision,
-                "source_prose_acceptance_state": (
-                    active_snapshot.source_prose_acceptance_state
-                ),
-                "generation_captured_at": active_snapshot.captured_at,
-                "generation_started_at": now,
-                "generation_audit": deepcopy(audit or {}),
-                "expires_at": now + timedelta(seconds=PROPOSAL_TTL_SECONDS),
-                "created_at": now,
-                "updated_at": now,
-                "is_deleted": False,
-            }
-        )
+        document = {
+            "_id": proposal_id,
+            "novel_id": to_object_id(novel_id),
+            "chapter_id": to_object_id(chapter_id),
+            "status": "generating",
+            "content_digest": active_snapshot.content_digest,
+            "state_revision": active_snapshot.narrative_revision,
+            "narrative_revision": active_snapshot.narrative_revision,
+            "source_content_digest": active_snapshot.source_content_digest,
+            "source_prose_run_id": active_snapshot.source_prose_run_id,
+            "source_prose_run_revision": active_snapshot.source_prose_run_revision,
+            "source_prose_acceptance_state": (
+                active_snapshot.source_prose_acceptance_state
+            ),
+            "generation_captured_at": active_snapshot.captured_at,
+            "generation_started_at": now,
+            "generation_audit": generation_audit,
+            "expires_at": now + timedelta(seconds=PROPOSAL_TTL_SECONDS),
+            "created_at": now,
+            "updated_at": now,
+            "is_deleted": False,
+            **(
+                {
+                    "job_mutation_key": job_binding.idempotency_key,
+                    "job_mutation_binding": job_binding.model_dump(mode="json"),
+                }
+                if job_binding is not None
+                else {}
+            ),
+        }
+        try:
+            await self.collection.insert_one(document)
+        except DuplicateKeyError as exc:
+            raise StaleStatePreview(
+                "State proposal Job result already exists and must be recovered"
+            ) from exc
         return StateProposalLease(proposal_id=proposal_id, snapshot=active_snapshot)
 
     async def publish(
@@ -517,19 +560,28 @@ class StateProposalModule:
             **deepcopy(current.get("generation_audit") or {}),
             **deepcopy(audit or {}),
         }
+        job_binding = _job_mutation_binding(current)
+        update: dict[str, Any] = {
+            "$set": {
+                "status": "proposed",
+                "candidate": prepared,
+                "candidate_digest": candidate_digest,
+                "token_digest": hashlib.sha256(token.encode("ascii")).hexdigest(),
+                "generation_audit": generation_audit,
+                "proposed_at": get_utc_now(),
+                "updated_at": get_utc_now(),
+                **(
+                    {"acceptance_expires_at": expires_at}
+                    if job_binding is not None
+                    else {}
+                ),
+            }
+        }
+        if job_binding is not None:
+            update["$unset"] = {"expires_at": ""}
         published = await self.collection.find_one_and_update(
             {"_id": lease.proposal_id, "status": "generating"},
-            {
-                "$set": {
-                    "status": "proposed",
-                    "candidate": prepared,
-                    "candidate_digest": candidate_digest,
-                    "token_digest": hashlib.sha256(token.encode("ascii")).hexdigest(),
-                    "generation_audit": generation_audit,
-                    "proposed_at": get_utc_now(),
-                    "updated_at": get_utc_now(),
-                }
-            },
+            update,
             return_document=ReturnDocument.AFTER,
         )
         if published is None:
@@ -733,17 +785,38 @@ class StateProposalModule:
         chapter_id: str,
         proposal_id: str,
         acceptance_token: str,
+        job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
     ) -> dict[str, Any]:
         proposal = await self.collection.find_one({"_id": to_object_id(proposal_id)})
         if not proposal:
             raise StaleStatePreview("State proposal is missing")
         if proposal.get("status") not in {"proposed", "claimed", "applied"}:
             raise StaleStatePreview("State proposal is not available for acceptance")
+        stored_job_binding = _job_mutation_binding(proposal)
+        allow_expired = False
+        if job_mutation_binding is not None:
+            try:
+                supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
+                    job_mutation_binding.model_dump(mode="python")
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise StaleStatePreview(
+                    "State proposal Job mutation binding is invalid"
+                ) from exc
+            if stored_job_binding != supplied_job_binding:
+                raise StaleStatePreview(
+                    "State proposal belongs to another Job authorization"
+                )
+            allow_expired = True
         now = datetime.now(timezone.utc)
-        expires_at = proposal.get("expires_at")
+        expires_at = proposal.get("expires_at") or proposal.get(
+            "acceptance_expires_at"
+        )
         if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not isinstance(expires_at, datetime) or expires_at <= now:
+        if not isinstance(expires_at, datetime) or (
+            expires_at <= now and not allow_expired
+        ):
             await self.collection.update_one(
                 {"_id": proposal["_id"], "status": "proposed"},
                 {"$set": {"status": "expired", "updated_at": get_utc_now()}},
@@ -769,12 +842,14 @@ class StateProposalModule:
         edits: dict[str, Any] | None = None,
         policy_name: str = "human_review",
         policy_version: str = "1",
+        job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Validate a decision without consuming the proposal or creating a gap."""
         proposal = await self._load_verified_proposal(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
+            job_mutation_binding=job_mutation_binding,
         )
         novel_id = str(proposal["novel_id"])
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
@@ -964,6 +1039,7 @@ class StateProposalModule:
         edits: dict[str, Any] | None = None,
         policy_name: str = "human_review",
         policy_version: str = "1",
+        job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
     ) -> dict[str, Any]:
         payload, metadata, claim = await self.prepare_decision(
             chapter_id=chapter_id,
@@ -974,6 +1050,7 @@ class StateProposalModule:
             edits=edits,
             policy_name=policy_name,
             policy_version=policy_version,
+            job_mutation_binding=job_mutation_binding,
         )
         # Lazy import keeps the proposal lifecycle independent of timeline writes.
         from backend.services.novel.chapter_state_service import ChapterStateService
@@ -1023,6 +1100,7 @@ class StateProposalModule:
         chapter_id: str,
         proposal: dict[str, Any],
         policy: SelectAllPolicy,
+        job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
     ) -> dict[str, Any]:
         """Apply a versioned automatic decision through the normal accept path."""
         proposal_id = str(proposal.get("proposal_id") or "")
@@ -1033,6 +1111,7 @@ class StateProposalModule:
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
+            job_mutation_binding=job_mutation_binding,
         )
         selected_fact_ids, selected_thread_ids = policy.decide(
             deepcopy(stored.get("candidate") or {})
@@ -1045,7 +1124,85 @@ class StateProposalModule:
             selected_thread_ids=selected_thread_ids,
             policy_name=policy.name,
             policy_version=policy.version,
+            job_mutation_binding=job_mutation_binding,
         )
+
+    async def recover_job_bound_result(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+    ) -> dict[str, Any] | None:
+        """Load one exact published Job result without replaying its Provider."""
+
+        try:
+            frozen = JobMutationRecoveryBindingV1.model_validate(
+                binding.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise MutationConflictError(
+                "State proposal Job mutation binding is invalid"
+            ) from exc
+        if frozen.operation != "accept_chapter_state":
+            raise MutationConflictError(
+                "State proposal recovery operation is invalid"
+            )
+        proposal = await self.collection.find_one({
+            "job_mutation_key": frozen.idempotency_key,
+            "is_deleted": False,
+        })
+        if proposal is None:
+            return None
+        try:
+            stored = JobMutationRecoveryBindingV1.model_validate(
+                proposal.get("job_mutation_binding")
+            )
+        except (TypeError, ValueError) as exc:
+            raise MutationConflictError(
+                "Persisted state proposal Job binding is invalid"
+            ) from exc
+        if stored != frozen or _job_mutation_binding(proposal) != frozen:
+            raise MutationConflictError(
+                "Persisted state proposal belongs to another Job authorization"
+            )
+        if str(proposal.get("status") or "") != "proposed":
+            raise MutationConflictError(
+                "Persisted state Provider result is not recoverable"
+            )
+        candidate = proposal.get("candidate")
+        expires_at = proposal.get("acceptance_expires_at") or proposal.get(
+            "expires_at"
+        )
+        if not isinstance(candidate, dict) or not isinstance(expires_at, datetime):
+            raise MutationConflictError(
+                "Persisted state Provider result projection is invalid"
+            )
+        candidate_digest = _digest(candidate)
+        if candidate_digest != str(proposal.get("candidate_digest") or ""):
+            raise MutationConflictError(
+                "Persisted state Provider result digest diverged"
+            )
+        token = _proposal_acceptance_token(
+            proposal_id=proposal["_id"],
+            content_digest=str(proposal.get("content_digest") or ""),
+            narrative_revision=int(proposal.get("narrative_revision") or 0),
+            candidate_digest=candidate_digest,
+            source_content_digest=str(
+                proposal.get("source_content_digest") or ""
+            ),
+            expires_at=expires_at,
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(token.encode("ascii")).hexdigest(),
+            str(proposal.get("token_digest") or ""),
+        ):
+            raise MutationConflictError(
+                "Persisted state Provider result token digest diverged"
+            )
+        return {
+            **deepcopy(candidate),
+            "proposal_id": str(proposal["_id"]),
+            "acceptance_token": token,
+            "proposal_expires_at": expires_at.isoformat(),
+        }
 
     async def prepare_policy_decision(
         self,
@@ -1102,10 +1259,34 @@ class StateProposalModule:
             )
         if current.get("status") != "proposed":
             raise MutationConflictError("State proposal cannot be claimed")
-        expires_at = current.get("expires_at")
+        stored_job_binding = _job_mutation_binding(current)
+        raw_claim_binding = claim.get("job_mutation_binding")
+        supplied_job_binding = None
+        if raw_claim_binding is not None:
+            try:
+                supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
+                    raw_claim_binding
+                )
+            except (TypeError, ValueError) as exc:
+                raise MutationConflictError(
+                    "State proposal claim Job binding is invalid"
+                ) from exc
+        allow_expired = (
+            supplied_job_binding is not None
+            and supplied_job_binding == stored_job_binding
+        )
+        if supplied_job_binding is not None and not allow_expired:
+            raise MutationConflictError(
+                "State proposal claim belongs to another Job authorization"
+            )
+        expires_at = current.get("expires_at") or current.get(
+            "acceptance_expires_at"
+        )
         if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
+        if not isinstance(expires_at, datetime) or (
+            expires_at <= datetime.now(timezone.utc) and not allow_expired
+        ):
             await self.collection.update_one(
                 {"_id": proposal_id, "status": "proposed"},
                 {"$set": {"status": "expired", "updated_at": get_utc_now()}},
@@ -1226,6 +1407,8 @@ class StateProposalModule:
                     "accept_result": deepcopy(result),
                     "applied_at": get_utc_now(),
                     "updated_at": get_utc_now(),
+                    "expires_at": get_utc_now()
+                    + timedelta(seconds=PROPOSAL_TTL_SECONDS),
                 }
             },
             return_document=ReturnDocument.AFTER,

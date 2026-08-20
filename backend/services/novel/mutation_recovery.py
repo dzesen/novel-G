@@ -206,7 +206,27 @@ async def recover_bound_mutation_revision(
     }
     journal = await collection.find_one(query)
     if journal is None:
-        return None
+        if normalized_operation != "accept_chapter_state":
+            return None
+        from backend.services.novel.state_proposal import (
+            SelectAllPolicy,
+            state_proposal_module,
+        )
+
+        proposal = await state_proposal_module.recover_job_bound_result(frozen)
+        if proposal is None:
+            return None
+        await state_proposal_module.run_auto(
+            chapter_id=frozen.chapter_id,
+            proposal=proposal,
+            policy=SelectAllPolicy(),
+            job_mutation_binding=frozen,
+        )
+        journal = await collection.find_one(query)
+        if journal is None:
+            raise MutationConflictError(
+                "The recovered state result did not create a mutation intent"
+            )
     if str(journal.get("operation") or "") != normalized_operation:
         raise MutationConflictError(
             "The idempotency key is bound to a different mutation operation"
@@ -237,6 +257,18 @@ async def recover_bound_mutation_revision(
         if normalized_key != expected_key:
             raise MutationConflictError(
                 "The persisted outline mutation is not bound to this Job"
+            )
+        try:
+            stored_binding = JobMutationRecoveryBindingV1.model_validate(
+                payload.get("job_mutation_binding")
+            )
+        except (TypeError, ValueError) as exc:
+            raise MutationConflictError(
+                "The persisted outline mutation Job binding is invalid"
+            ) from exc
+        if stored_binding != frozen:
+            raise MutationConflictError(
+                "The persisted outline mutation belongs to another Job authorization"
             )
     elif normalized_operation == "accept_chapter_state":
         proposal_claim = payload.get("proposal_claim")
