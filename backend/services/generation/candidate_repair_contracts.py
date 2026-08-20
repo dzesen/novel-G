@@ -17,7 +17,7 @@ MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 512
 MAX_BSON_INT64 = 2**63 - 1
-_SAFE_ATTEMPT_ID_CHARACTERS = frozenset(
+_SAFE_CANDIDATE_IDENTIFIER_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
 )
 _CANDIDATE_CHECKPOINT_LIST_LIMITS = {
@@ -25,6 +25,18 @@ _CANDIDATE_CHECKPOINT_LIST_LIMITS = {
     "issue_categories": 20,
     "scene_coverage": 20,
 }
+
+
+def is_safe_candidate_identifier(value: Any, *, maximum: int) -> bool:
+    """Validate one bounded identifier shared by live and persisted evidence."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= maximum
+        and all(
+            character in _SAFE_CANDIDATE_IDENTIFIER_CHARACTERS
+            for character in value
+        )
+    )
 
 
 class CandidatePipelineCheckpointConflict(ValueError):
@@ -115,11 +127,7 @@ class _CandidatePipelineCheckpointV1(_CandidateCheckpointContract):
     @model_validator(mode="after")
     def validate_attempt_identities(self) -> "_CandidatePipelineCheckpointV1":
         if any(
-            not 1 <= len(attempt_id) <= 128
-            or any(
-                character not in _SAFE_ATTEMPT_ID_CHARACTERS
-                for character in attempt_id
-            )
+            not is_safe_candidate_identifier(attempt_id, maximum=128)
             for attempt_id in self.attempt_ids
         ):
             raise ValueError("candidate checkpoint attempt identity is invalid")

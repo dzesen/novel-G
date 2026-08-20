@@ -29,6 +29,7 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidateTruncationProjectionV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
+    is_safe_candidate_identifier,
     parse_candidate_pipeline_checkpoint,
 )
 from backend.services.generation.headless_generation import (
@@ -291,17 +292,8 @@ def _usage_summary(
     )
 
 
-_SAFE_IDENTIFIER_CHARACTERS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
-)
-
-
 def _safe_identifier(value: Any, *, maximum: int) -> str:
-    if (
-        isinstance(value, str)
-        and 0 < len(value) <= maximum
-        and all(character in _SAFE_IDENTIFIER_CHARACTERS for character in value)
-    ):
+    if is_safe_candidate_identifier(value, maximum=maximum):
         return value
     return "unreported"
 
@@ -1404,16 +1396,7 @@ class _PipelineTrace:
         truncation_start = len(self.truncations)
         try:
             usage, summaries = _project_result_evidence(result)
-            existing_attempts = {
-                item.attempt_id: item for item in self.attempts
-            }
-            if any(
-                existing_attempts.get(item.attempt_id) == item
-                for item in summaries
-            ):
-                raise _EvidenceProjectionError(
-                    "付费步骤复用了先前步骤的 attempt_id"
-                )
+            self._record_cross_step_attempt_conflict(usage, summaries)
             self._record_evidence(usage, summaries)
         except _EvidenceProjectionError as exc:
             if isinstance(exc, _UnattributedUsageProjectionError):
@@ -1531,6 +1514,7 @@ class _PipelineTrace:
                     attempts=summaries,
                 ) from aggregate_error
             usage = _effective_usage(aggregate, summaries)
+            self._record_cross_step_attempt_conflict(usage, summaries)
             self._record_evidence(usage, summaries)
             raw_truncations = getattr(exc, "truncations", None)
             if raw_truncations is None and outcome is not None:
@@ -1652,6 +1636,50 @@ class _PipelineTrace:
         else:
             self.unattributed_usage.append(marker)
         self.tokens = _MAX_TOKEN_COUNT
+
+    def _record_cross_step_attempt_conflict(
+        self,
+        usage: CandidateUsageSummary,
+        summaries: tuple[CandidateAttemptSummary, ...],
+    ) -> None:
+        """Preserve a later paid step without reusing an earlier ledger ID."""
+        known_ids = {item.attempt_id for item in self.attempts}
+        reused = tuple(
+            item for item in summaries if item.attempt_id in known_ids
+        )
+        if not reused:
+            return
+        new = tuple(
+            item for item in summaries if item.attempt_id not in known_ids
+        )
+        if len(self.attempts) + len(new) > _MAX_PIPELINE_ATTEMPTS:
+            raise _UnattributedUsageProjectionError(
+                "付费步骤复用了先前步骤的 attempt_id，且新调用证据超过 V1 上限",
+                reason=(
+                    CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
+                ),
+                usage=usage,
+                attempts=(),
+                evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+            )
+        try:
+            new_usage = _summed_usage(new)
+            reused_usage = _summed_usage(reused)
+            next_tokens = _checked_token_add(
+                self.tokens,
+                new_usage.total_tokens,
+            )
+        except _UsageProjectionOverflow as overflow:
+            raise _usage_overflow_error(str(overflow)) from overflow
+        self.attempts.extend(new)
+        self.tokens = next_tokens
+        raise _UnattributedUsageProjectionError(
+            "付费步骤复用了先前步骤的 attempt_id",
+            reason=CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT,
+            usage=reused_usage,
+            attempts=(),
+            evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+        )
 
     def _classify_attempts(
         self,
