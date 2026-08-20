@@ -355,22 +355,4 @@ async def mark_running_jobs_interrupted() -> int:
         if not interrupted:
             continue
         interrupted_count += 1
-        checkpoints = job.get("candidate_pipeline_checkpoints")
-        preserve_candidate_chapter = bool(checkpoints) or isinstance(
-            job.get("job_mutation_recovery"),
-            dict,
-        )
-        uncertain = await generation_job_repo.mark_claimed_attempts_uncertain(
-            job_id, "backend process interrupted before usage was recorded"
-        )
-        await generation_job_repo.update_job_fields(job_id, {
-            "status": "interrupted",
-            "pause_reason": "uncertain_attempt" if uncertain else "process_restart",
-            "current_chapter_id": (
-                job.get("current_chapter_id")
-                if preserve_candidate_chapter
-                else None
-            ),
-            "active_slot": None,
-        })
     return interrupted_count

@@ -114,7 +114,8 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         raise ValueError("State dispatch resolution must start empty")
     if document.get("execution_lease") is not None:
         raise ValueError("Generation job execution lease must start empty")
-    if document.get("execution_epoch", 0) != 0:
+    execution_epoch = document.get("execution_epoch", 0)
+    if type(execution_epoch) is not int or execution_epoch != 0:
         raise ValueError("Generation job execution epoch must start at zero")
     revision = document.get("expected_narrative_revision")
     if revision is not None and (
@@ -142,6 +143,74 @@ def _trusted_usage_tokens(usage: TokenUsage) -> int:
     )
 
 
+def _live_attempt_transition_fields(
+    *,
+    source_states: Sequence[str],
+    target_state: str,
+    now: datetime,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Build one atomic, metadata-only transition for both attempt ledgers."""
+
+    source = list(source_states)
+    replacement: dict[str, Any] = {
+        "state": target_state,
+        "updated_at": now,
+    }
+    if reason is not None:
+        replacement["uncertain_reason"] = reason
+
+    def mapped(field: str, alias: str) -> dict[str, Any]:
+        return {
+            "$map": {
+                "input": {"$ifNull": [f"${field}", []]},
+                "as": alias,
+                "in": {
+                    "$cond": [
+                        {"$in": [f"$${alias}.state", source]},
+                        {
+                            "$mergeObjects": [
+                                f"$${alias}",
+                                replacement,
+                            ]
+                        },
+                        f"$${alias}",
+                    ]
+                },
+            }
+        }
+
+    return {
+        "attempt_slots": mapped("attempt_slots", "slot"),
+        "active_token_reservations": mapped(
+            "active_token_reservations",
+            "reservation",
+        ),
+        "uncertain_attempt_ids": {
+            "$setUnion": [
+                {"$ifNull": ["$uncertain_attempt_ids", []]},
+                {
+                    "$map": {
+                        "input": {
+                            "$filter": {
+                                "input": {
+                                    "$ifNull": ["$attempt_slots", []]
+                                },
+                                "as": "slot",
+                                "cond": {
+                                    "$in": ["$$slot.state", source]
+                                },
+                            }
+                        },
+                        "as": "slot",
+                        "in": "$$slot.attempt_id",
+                    }
+                },
+            ]
+        },
+    }
+
+
 class AttemptCapacityExceeded(ValueError):
     """作业固定 attempt 容量或当前章节 reservation 已耗尽。"""
 
@@ -150,9 +219,88 @@ class AttemptFenceExpired(AttemptCapacityExceeded):
     """A stale worker tried to claim against a replaced dispatch fence."""
 
 
-class GenerationJobRepository(BaseRepository):
+class GenerationJobRepository:
+    """Generation Job persistence behind one lease-aware surface.
+
+    This repository deliberately uses ``BaseRepository`` by composition.  A
+    leased worker must not inherit a new generic CRUD method that bypasses the
+    execution authority checks below.
+    """
+
     def __init__(self) -> None:
-        super().__init__(collections.GENERATION_JOBS)
+        self._base = BaseRepository(collections.GENERATION_JOBS)
+
+    @property
+    def collection(self) -> Any:
+        return self._base.collection
+
+    @staticmethod
+    def _execution_authority_filter(
+        lease: JobExecutionLeaseV1,
+        *,
+        now: datetime,
+        require_live: bool = True,
+    ) -> dict[str, Any]:
+        """Match one strict V1 lease without freezing heartbeat timestamps."""
+
+        expires_at: dict[str, Any] = {"$type": "date"}
+        if require_live:
+            expires_at["$gt"] = now
+        return {
+            "$and": [
+                {
+                    "_id": to_object_id(lease.job_id),
+                    "execution_epoch": lease.epoch,
+                    "execution_lease.schema_version": (
+                        "job_execution_lease.v1"
+                    ),
+                    "execution_lease.job_id": lease.job_id,
+                    "execution_lease.worker_id": lease.worker_id,
+                    "execution_lease.epoch": lease.epoch,
+                    "execution_lease.heartbeat_at": {"$type": "date"},
+                    "execution_lease.expires_at": expires_at,
+                },
+                {
+                    "$expr": {
+                        "$and": [
+                            {
+                                "$in": [
+                                    {"$type": "$execution_epoch"},
+                                    ["int", "long"],
+                                ]
+                            },
+                            {
+                                "$in": [
+                                    {"$type": "$execution_lease.epoch"},
+                                    ["int", "long"],
+                                ]
+                            },
+                            {
+                                "$eq": [
+                                    {
+                                        "$size": {
+                                            "$objectToArray": {
+                                                "$ifNull": [
+                                                    "$execution_lease",
+                                                    {},
+                                                ]
+                                            }
+                                        }
+                                    },
+                                    6,
+                                ]
+                            },
+                            {
+                                "$gt": [
+                                    "$execution_lease.expires_at",
+                                    "$execution_lease.heartbeat_at",
+                                ]
+                            },
+                        ]
+                    }
+                },
+            ]
+        }
 
     @staticmethod
     def _execution_filter(query: Mapping[str, Any]) -> dict[str, Any]:
@@ -171,28 +319,27 @@ class GenerationJobRepository(BaseRepository):
         return {
             "$and": [
                 base,
-                {
-                    "_id": expected_id,
-                    "execution_epoch": lease.epoch,
-                    "execution_lease.schema_version": (
-                        "job_execution_lease.v1"
-                    ),
-                    "execution_lease.job_id": lease.job_id,
-                    "execution_lease.worker_id": lease.worker_id,
-                    "execution_lease.expires_at": {"$gt": get_utc_now()},
-                },
+                GenerationJobRepository._execution_authority_filter(
+                    lease,
+                    now=get_utc_now(),
+                ),
             ]
         }
 
     async def _collection_update_one(
         self,
         query: Mapping[str, Any],
-        update: Mapping[str, Any],
+        update: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         **kwargs: Any,
     ) -> Any:
+        update_document: Any = (
+            [dict(stage) for stage in update]
+            if isinstance(update, Sequence) and not isinstance(update, Mapping)
+            else dict(update)
+        )
         result = await self.collection.update_one(
             self._execution_filter(query),
-            dict(update),
+            update_document,
             **kwargs,
         )
         if result.matched_count == 0:
@@ -202,12 +349,17 @@ class GenerationJobRepository(BaseRepository):
     async def _collection_find_one_and_update(
         self,
         query: Mapping[str, Any],
-        update: Mapping[str, Any],
+        update: Mapping[str, Any] | Sequence[Mapping[str, Any]],
         **kwargs: Any,
     ) -> Any:
+        update_document: Any = (
+            [dict(stage) for stage in update]
+            if isinstance(update, Sequence) and not isinstance(update, Mapping)
+            else dict(update)
+        )
         document = await self.collection.find_one_and_update(
             self._execution_filter(query),
-            dict(update),
+            update_document,
             **kwargs,
         )
         if document is None:
@@ -221,13 +373,13 @@ class GenerationJobRepository(BaseRepository):
         if lease is None:
             return
         current = await self.collection.find_one({
-            "_id": to_object_id(lease.job_id),
-            "is_deleted": False,
-            "execution_epoch": lease.epoch,
-            "execution_lease.schema_version": "job_execution_lease.v1",
-            "execution_lease.job_id": lease.job_id,
-            "execution_lease.worker_id": lease.worker_id,
-            "execution_lease.expires_at": {"$gt": get_utc_now()},
+            "$and": [
+                {"is_deleted": False},
+                self._execution_authority_filter(
+                    lease,
+                    now=get_utc_now(),
+                ),
+            ]
         })
         if current is None:
             raise JobExecutionLeaseLost(
@@ -247,6 +399,15 @@ class GenerationJobRepository(BaseRepository):
         if expires_at <= now:
             raise ValueError("Generation job execution lease expiry is invalid")
         current = await self.get_job(job_id)
+        previous_epoch = current.get("execution_epoch", 0)
+        if (
+            type(previous_epoch) is not int
+            or previous_epoch < 0
+            or previous_epoch >= _MAX_NARRATIVE_REVISION
+        ):
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job execution epoch is invalid"
+            )
         raw_lease = current.get("execution_lease")
         existing: JobExecutionLeaseV1 | None = None
         if raw_lease is not None:
@@ -260,26 +421,16 @@ class GenerationJobRepository(BaseRepository):
                 raise JobExecutionLeaseUnavailable(
                     "Persisted Generation Job execution lease changed scope"
                 )
+            if existing.epoch != previous_epoch:
+                raise JobExecutionLeaseUnavailable(
+                    "Persisted Generation Job execution lease epoch diverged"
+                )
             if existing.expires_at > now:
                 if existing.worker_id == str(worker_id):
                     return existing
                 raise JobExecutionLeaseUnavailable(
                     "Generation Job already has a live execution worker"
                 )
-
-        previous_epoch = current.get("execution_epoch", 0)
-        if (
-            type(previous_epoch) is not int
-            or previous_epoch < 0
-            or previous_epoch >= _MAX_NARRATIVE_REVISION
-        ):
-            raise JobExecutionLeaseUnavailable(
-                "Generation Job execution epoch is invalid"
-            )
-        if existing is not None and existing.epoch != previous_epoch:
-            raise JobExecutionLeaseUnavailable(
-                "Persisted Generation Job execution lease epoch diverged"
-            )
         next_epoch = previous_epoch + 1
         try:
             lease = JobExecutionLeaseV1(
@@ -374,7 +525,14 @@ class GenerationJobRepository(BaseRepository):
             raise JobExecutionLeaseUnavailable(
                 "Generation Job execution lease raced"
             ) from exc
-        if existing.worker_id == worker_id and existing.job_id == str(job_id):
+        latest_epoch = latest.get("execution_epoch")
+        if (
+            existing.worker_id == worker_id
+            and existing.job_id == str(job_id)
+            and type(latest_epoch) is int
+            and existing.epoch == latest_epoch
+            and existing.expires_at > now
+        ):
             return existing
         raise JobExecutionLeaseUnavailable(
             "Generation Job execution lease is owned by another worker"
@@ -399,14 +557,13 @@ class GenerationJobRepository(BaseRepository):
         )
         result = await self.collection.update_one(
             {
-                "_id": to_object_id(frozen.job_id),
-                "is_deleted": False,
-                "status": "running",
-                "execution_epoch": frozen.epoch,
-                "execution_lease.schema_version": "job_execution_lease.v1",
-                "execution_lease.job_id": frozen.job_id,
-                "execution_lease.worker_id": frozen.worker_id,
-                "execution_lease.expires_at": {"$gt": now},
+                "$and": [
+                    {"is_deleted": False, "status": "running"},
+                    self._execution_authority_filter(
+                        frozen,
+                        now=now,
+                    ),
+                ]
             },
             {
                 "$set": {
@@ -428,12 +585,14 @@ class GenerationJobRepository(BaseRepository):
         )
         result = await self.collection.update_one(
             {
-                "_id": to_object_id(frozen.job_id),
-                "is_deleted": False,
-                "execution_epoch": frozen.epoch,
-                "execution_lease.schema_version": "job_execution_lease.v1",
-                "execution_lease.job_id": frozen.job_id,
-                "execution_lease.worker_id": frozen.worker_id,
+                "$and": [
+                    {"is_deleted": False},
+                    self._execution_authority_filter(
+                        frozen,
+                        now=get_utc_now(),
+                        require_live=False,
+                    ),
+                ]
             },
             {
                 "$unset": {"execution_lease": ""},
@@ -496,6 +655,33 @@ class GenerationJobRepository(BaseRepository):
                     {"execution_epoch": {"$exists": False}},
                 ]
             }
+        reason = "backend process interrupted before usage was recorded"
+        pending_or_uncertain = {
+            "$or": [
+                {"$eq": ["$has_uncertain_attempts", True]},
+                {
+                    "$gt": [
+                        {
+                            "$size": {
+                                "$filter": {
+                                    "input": {
+                                        "$ifNull": ["$attempt_slots", []]
+                                    },
+                                    "as": "slot",
+                                    "cond": {
+                                        "$in": [
+                                            "$$slot.state",
+                                            ["claimed", "uncertain"],
+                                        ]
+                                    },
+                                }
+                            }
+                        },
+                        0,
+                    ]
+                },
+            ]
+        }
         result = await self.collection.update_one(
             {
                 "$and": [
@@ -508,16 +694,68 @@ class GenerationJobRepository(BaseRepository):
                     lease_query,
                 ]
             },
-            {
-                "$inc": {"execution_epoch": 1},
-                "$unset": {"execution_lease": ""},
-                "$set": {
-                    "status": "interrupted",
-                    "pause_reason": "process_restart",
-                    "active_slot": None,
-                    "updated_at": now,
+            [
+                {
+                    "$set": {
+                        **_live_attempt_transition_fields(
+                            source_states=("claimed",),
+                            target_state="uncertain",
+                            now=now,
+                            reason=reason,
+                        ),
+                    }
                 },
-            },
+                {
+                    "$set": {
+                        "execution_epoch": previous_epoch + 1,
+                        "execution_lease": "$$REMOVE",
+                        "status": "interrupted",
+                        "pause_reason": {
+                            "$cond": [
+                                pending_or_uncertain,
+                                "uncertain_attempt",
+                                "process_restart",
+                            ]
+                        },
+                        "current_chapter_id": {
+                            "$cond": [
+                                {
+                                    "$or": [
+                                        {
+                                            "$gt": [
+                                                {
+                                                    "$size": {
+                                                        "$ifNull": [
+                                                            "$candidate_pipeline_checkpoints",
+                                                            [],
+                                                        ]
+                                                    }
+                                                },
+                                                0,
+                                            ]
+                                        },
+                                        {
+                                            "$eq": [
+                                                {
+                                                    "$type": (
+                                                        "$job_mutation_recovery"
+                                                    )
+                                                },
+                                                "object",
+                                            ]
+                                        },
+                                    ]
+                                },
+                                "$current_chapter_id",
+                                None,
+                            ]
+                        },
+                        "active_slot": None,
+                        "has_uncertain_attempts": pending_or_uncertain,
+                        "updated_at": now,
+                    }
+                },
+            ],
         )
         return result.modified_count == 1
 
@@ -530,7 +768,7 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> str:
         _validate_initial_candidate_ledgers(document)
-        return await super().insert_one(dict(document), session=session)
+        return await self._base.insert_one(dict(document), session=session)
 
     async def insert_many(
         self,
@@ -539,7 +777,7 @@ class GenerationJobRepository(BaseRepository):
     ) -> List[str]:
         for document in documents:
             _validate_initial_candidate_ledgers(document)
-        return await super().insert_many(
+        return await self._base.insert_many(
             [dict(document) for document in documents],
             session=session,
         )
@@ -550,7 +788,7 @@ class GenerationJobRepository(BaseRepository):
         include_deleted: bool = False,
         session: AsyncClientSession | None = None,
     ) -> Dict[str, Any] | None:
-        document = await super().find_one(
+        document = await self._base.find_one(
             self._execution_filter(query),
             include_deleted=include_deleted,
             session=session,
@@ -568,7 +806,7 @@ class GenerationJobRepository(BaseRepository):
         sort: Any = None,
         session: AsyncClientSession | None = None,
     ) -> List[Dict[str, Any]]:
-        documents = await super().find_many(
+        documents = await self._base.find_many(
             self._execution_filter(query),
             include_deleted=include_deleted,
             limit=limit,
@@ -588,7 +826,7 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> bool:
         _reject_atomic_field_updates(update_data)
-        updated = await super().update_one(
+        updated = await self._base.update_one(
             self._execution_filter(query),
             update_data,
             include_deleted=include_deleted,
@@ -606,7 +844,7 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> int:
         _reject_atomic_field_updates(update_data)
-        updated = await super().update_many(
+        updated = await self._base.update_many(
             self._execution_filter(query),
             update_data,
             include_deleted=include_deleted,
@@ -624,7 +862,7 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> bool:
         _reject_atomic_field_updates(increments)
-        updated = await super().increment_one(
+        updated = await self._base.increment_one(
             self._execution_filter(query),
             increments,
             include_deleted=include_deleted,
@@ -655,8 +893,124 @@ class GenerationJobRepository(BaseRepository):
             "Generation job bulk writes require an atomic repository command"
         )
 
+    async def soft_delete_one(
+        self,
+        query: Dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        changed = await self._base.soft_delete_one(
+            self._execution_filter(query),
+            session=session,
+        )
+        if not changed:
+            await self._assert_execution_current()
+        return changed
+
+    async def restore_one(
+        self,
+        query: Dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        changed = await self._base.restore_one(
+            self._execution_filter(query),
+            session=session,
+        )
+        if not changed:
+            await self._assert_execution_current()
+        return changed
+
+    async def hard_delete_one(
+        self,
+        query: Dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        changed = await self._base.hard_delete_one(
+            self._execution_filter(query),
+            session=session,
+        )
+        if not changed:
+            await self._assert_execution_current()
+        return changed
+
+    async def hard_delete_many(
+        self,
+        query: Dict[str, Any],
+        session: AsyncClientSession | None = None,
+    ) -> int:
+        changed = await self._base.hard_delete_many(
+            self._execution_filter(query),
+            session=session,
+        )
+        if changed == 0:
+            await self._assert_execution_current()
+        return changed
+
+    async def count_documents(
+        self,
+        query: Dict[str, Any],
+        include_deleted: bool = False,
+        session: AsyncClientSession | None = None,
+    ) -> int:
+        count = await self._base.count_documents(
+            self._execution_filter(query),
+            include_deleted=include_deleted,
+            session=session,
+        )
+        if count == 0:
+            await self._assert_execution_current()
+        return count
+
+    async def exists(
+        self,
+        query: Dict[str, Any],
+        include_deleted: bool = False,
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        return (
+            await self.count_documents(
+                query,
+                include_deleted=include_deleted,
+                session=session,
+            )
+        ) > 0
+
+    async def paginate(
+        self,
+        query: Dict[str, Any],
+        page: int = 1,
+        page_size: int = 10,
+        include_deleted: bool = False,
+        sort: Any = None,
+        session: AsyncClientSession | None = None,
+    ) -> Dict[str, Any]:
+        skip = (page - 1) * page_size
+        items = await self.find_many(
+            query,
+            include_deleted=include_deleted,
+            limit=page_size,
+            skip=skip,
+            sort=sort,
+            session=session,
+        )
+        total = await self.count_documents(
+            query,
+            include_deleted=include_deleted,
+            session=session,
+        )
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (
+                (total + page_size - 1) // page_size
+                if page_size > 0
+                else 0
+            ),
+        }
+
     async def get_job(self, job_id: str) -> Dict[str, Any]:
-        doc = await super().find_one(
+        doc = await self._base.find_one(
             self._execution_filter({"_id": to_object_id(job_id)})
         )
         if doc is None:
@@ -1756,7 +2110,7 @@ class GenerationJobRepository(BaseRepository):
         job_id: str,
         fields: Mapping[str, Any],
     ) -> bool:
-        """Publish abort while atomically invalidating the active worker."""
+        """Publish abort while atomically freezing every live paid attempt."""
 
         updates = dict(fields)
         _reject_atomic_field_updates(updates)
@@ -1764,18 +2118,62 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "Generation job abort command is invalid"
             )
+        current = await self.get_job(job_id)
+        previous_epoch = current.get("execution_epoch", 0)
+        if (
+            type(previous_epoch) is not int
+            or previous_epoch < 0
+            or previous_epoch >= _MAX_NARRATIVE_REVISION
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Generation job abort execution epoch is invalid"
+            )
+        epoch_query: dict[str, Any] = {
+            "execution_epoch": previous_epoch
+        }
+        if previous_epoch == 0:
+            epoch_query = {
+                "$or": [
+                    {"execution_epoch": 0},
+                    {"execution_epoch": {"$exists": False}},
+                ]
+            }
+        for enforced in (
+            "attempt_reservation",
+            "has_uncertain_attempts",
+        ):
+            updates.pop(enforced, None)
+        now = get_utc_now()
+        acknowledged_state = "uncertain_abort_acknowledged"
         result = await self._collection_update_one(
             {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "status": {"$nin": ["completed", "aborted"]},
-                "state_dispatch_resolution": None,
+                "$and": [
+                    {
+                        "_id": to_object_id(job_id),
+                        "is_deleted": False,
+                        "status": {"$nin": ["completed", "aborted"]},
+                        "state_dispatch_resolution": None,
+                    },
+                    epoch_query,
+                ]
             },
-            {
-                "$inc": {"execution_epoch": 1},
-                "$unset": {"execution_lease": ""},
-                "$set": {**updates, "updated_at": get_utc_now()},
-            },
+            [
+                {
+                    "$set": {
+                        **_live_attempt_transition_fields(
+                            source_states=("claimed", "uncertain"),
+                            target_state=acknowledged_state,
+                            now=now,
+                        ),
+                        "execution_epoch": previous_epoch + 1,
+                        "execution_lease": "$$REMOVE",
+                        "attempt_reservation": None,
+                        "has_uncertain_attempts": False,
+                        **updates,
+                        "updated_at": now,
+                    }
+                }
+            ],
         )
         if result.modified_count == 1:
             return True

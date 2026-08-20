@@ -2021,11 +2021,6 @@ class GenerationJobService:
                 action="abort",
             )
         else:
-            if job.get("has_uncertain_attempts"):
-                await generation_job_repo.acknowledge_uncertain_attempts(
-                    job_id,
-                    "abort",
-                )
             await generation_job_repo.complete_job_abort(job_id, {
                 "status": "aborted",
                 "current_chapter_id": None,
