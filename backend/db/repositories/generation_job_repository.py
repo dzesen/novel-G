@@ -12,10 +12,12 @@ from pymongo.results import BulkWriteResult
 from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
+from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
+    MAX_CANDIDATE_OUTLINE_SCENES,
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     CandidatePipelineCheckpointConflict,
     CandidatePipelineCompletionEvidenceV1,
@@ -283,12 +285,14 @@ class GenerationJobRepository(BaseRepository):
         checkpoints: Sequence[CandidatePipelineCheckpointV1],
         *,
         entry: CandidatePipelineProgressV1,
+        expected_scene_count: int,
+        max_repair_cycles: int,
     ) -> CandidatePipelineCompletionEvidenceV1:
         evidence = validate_candidate_pipeline_completion_chain(
             checkpoints,
             chapter_id=entry.chapter_id,
-            expected_scene_count=entry.scene_coverage_count,
-            expected_repair_cycles=entry.repair_cycles_used,
+            expected_scene_count=expected_scene_count,
+            max_repair_cycles=max_repair_cycles,
         )
         if (
             entry.source != evidence.prose.source
@@ -299,11 +303,115 @@ class GenerationJobRepository(BaseRepository):
             != evidence.adherence.issue_categories
             or entry.consistency_issue_count
             != evidence.state.consistency_issue_count
+            or entry.scene_coverage_count != expected_scene_count
+            or entry.repair_cycles_used != evidence.repair_cycles_used
         ):
             raise CandidatePipelineCheckpointConflict(
                 "Candidate pipeline progress does not match its checkpoint"
             )
         return evidence
+
+    @staticmethod
+    async def _candidate_completion_authority(
+        job: Mapping[str, Any],
+        *,
+        chapter_id: str,
+    ) -> tuple[int, int]:
+        """Re-read the two authorities that terminal progress cannot self-report."""
+
+        try:
+            from backend.services.generation.chapter_candidate_authorization import (
+                CANDIDATE_PIPELINE_REVISION,
+            )
+            from backend.services.generation.chapter_finalization import (
+                FINALIZATION_AUTHORIZATION_SCHEMA,
+                FINALIZATION_CHANGE_CLASSES,
+                MAX_FINALIZATION_REPAIR_CYCLES,
+            )
+
+            readiness = job.get("readiness")
+            if (
+                not isinstance(readiness, Mapping)
+                or type(readiness.get("version")) is not int
+                or readiness.get("version") != 2
+            ):
+                raise ValueError("candidate readiness is missing")
+            planning = readiness.get("planning")
+            if not isinstance(planning, Mapping):
+                raise ValueError("candidate readiness planning is missing")
+            revision = planning.get("chapter_candidate_pipeline_revision")
+            if type(revision) is not int or revision != CANDIDATE_PIPELINE_REVISION:
+                raise ValueError("candidate pipeline revision changed")
+            raw_finalization = planning.get(
+                "chapter_finalization_authorization"
+            )
+            if not isinstance(raw_finalization, Mapping):
+                raise ValueError("candidate finalization authority is missing")
+            authorization_revision = raw_finalization.get(
+                "authorization_revision"
+            )
+            max_repair_cycles = raw_finalization.get("max_repair_cycles")
+            if (
+                type(authorization_revision) is not int
+                or authorization_revision < 1
+                or type(max_repair_cycles) is not int
+                or not 0
+                <= max_repair_cycles
+                <= MAX_FINALIZATION_REPAIR_CYCLES
+                or set(raw_finalization) != {
+                    "schema_version",
+                    "change_classes",
+                    "authorization_revision",
+                    "max_repair_cycles",
+                }
+                or raw_finalization.get("schema_version")
+                != FINALIZATION_AUTHORIZATION_SCHEMA
+                or not isinstance(
+                    raw_finalization.get("change_classes"),
+                    list,
+                )
+                or raw_finalization.get("change_classes")
+                != list(FINALIZATION_CHANGE_CLASSES)
+                or type(raw_finalization.get("authorization_revision"))
+                is not int
+                or type(raw_finalization.get("max_repair_cycles")) is not int
+            ):
+                raise ValueError("candidate completion authority changed")
+            work = readiness.get("work")
+            raw_snapshots = (
+                work.get("chapters") if isinstance(work, Mapping) else None
+            )
+            if not isinstance(raw_snapshots, list):
+                raise ValueError("candidate worklist is missing")
+            matching_snapshots = [
+                snapshot
+                for snapshot in raw_snapshots
+                if isinstance(snapshot, Mapping)
+                and str(snapshot.get("chapter_id") or "") == chapter_id
+            ]
+            if (
+                len(matching_snapshots) != 1
+                or matching_snapshots[0].get("has_content") is not False
+            ):
+                raise ValueError("candidate chapter is outside the worklist")
+            chapter = await chapter_repo.get_chapter_by_id(chapter_id)
+            if str(chapter.get("novel_id") or "") != str(
+                job.get("novel_id") or ""
+            ):
+                raise ValueError("candidate chapter scope changed")
+            outline = chapter.get("outline")
+            scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
+            if (
+                not isinstance(scenes, list)
+                or not 1 <= len(scenes) <= MAX_CANDIDATE_OUTLINE_SCENES
+                or any(not isinstance(scene, Mapping) for scene in scenes)
+            ):
+                raise ValueError("candidate chapter outline is invalid")
+        except Exception as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline completion authority diverged"
+            ) from exc
+        return len(scenes), max_repair_cycles
 
     async def list_candidate_pipeline_checkpoints(
         self,
@@ -541,11 +649,7 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "Candidate pipeline completion ledger is invalid"
             )
-        evidence = self._validate_candidate_completion_chain(
-            validated_checkpoints,
-            entry=validated_entry,
-        )
-        validated_checkpoint = evidence.state
+        validated_checkpoint = validated_checkpoints[-1]
         receipt = CandidatePipelineCompletionV1(
             schema_version="candidate_pipeline_completion.v1",
             checkpoint_id=validated_checkpoint.checkpoint_id,
@@ -568,6 +672,22 @@ class GenerationJobRepository(BaseRepository):
             entry=validated_entry,
         ):
             return True
+        expected_scene_count, max_repair_cycles = (
+            await self._candidate_completion_authority(
+                job,
+                chapter_id=normalized_chapter_id,
+            )
+        )
+        evidence = self._validate_candidate_completion_chain(
+            validated_checkpoints,
+            entry=validated_entry,
+            expected_scene_count=expected_scene_count,
+            max_repair_cycles=max_repair_cycles,
+        )
+        if evidence.state != validated_checkpoint:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline completion ledger is invalid"
+            )
         raw_progress = job.get("progress")
         if raw_progress is None:
             raw_progress = []
@@ -593,6 +713,8 @@ class GenerationJobRepository(BaseRepository):
         self._validate_candidate_completion_chain(
             checkpoints,
             entry=validated_entry,
+            expected_scene_count=expected_scene_count,
+            max_repair_cycles=max_repair_cycles,
         )
         if tuple(checkpoints) != validated_checkpoints:
             raise CandidatePipelineCheckpointConflict(

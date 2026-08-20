@@ -23,17 +23,17 @@ from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     AdherenceCandidateCheckpointV1,
     CandidateCompletionProjectionV1,
+    CandidatePipelineCheckpointConflict,
     CandidatePipelineCheckpointV1,
     CandidateSceneCoverageV1,
     CandidateSourceIdentityV1,
     CandidateTruncationProjectionV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
-    candidate_checkpoint_adherence_passed,
-    candidate_checkpoint_completion_passed,
     candidate_pipeline_checkpoint_digest,
     is_safe_candidate_identifier,
     parse_candidate_pipeline_checkpoint,
+    replay_candidate_pipeline_checkpoints,
 )
 from backend.services.generation.headless_generation import (
     GeneratedProseCandidate,
@@ -1904,25 +1904,6 @@ def _checkpoint_step_name(
     )
 
 
-def _checkpoint_completion_passed(
-    checkpoint: ProseCandidateCheckpointV1,
-) -> bool:
-    return candidate_checkpoint_completion_passed(checkpoint)
-def _checkpoint_adherence_passed(
-    checkpoint: AdherenceCandidateCheckpointV1,
-    *,
-    chapter: Mapping[str, Any],
-) -> bool:
-    outline = chapter.get("outline")
-    scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
-    if not isinstance(scenes, list) or not scenes:
-        return False
-    return candidate_checkpoint_adherence_passed(
-        checkpoint,
-        expected_scene_count=len(scenes),
-    )
-
-
 def _validate_resumed_adherence_projection(
     reviewed: ChapterGenerationResult,
     *,
@@ -2186,6 +2167,37 @@ def _prose_checkpoint_kept_digest(
     )
 
 
+def _project_replayed_checkpoint_prefix(
+    trace: _PipelineTrace,
+    checkpoints: tuple[CandidatePipelineCheckpointV1, ...],
+) -> tuple[tuple[str, ...], tuple[CandidateTruncationSummary, ...]]:
+    """Project a reducer-approved prefix without reinterpreting its gates."""
+
+    completed_steps: list[str] = []
+    truncations: list[CandidateTruncationSummary] = []
+    review_count = 0
+    repair_cycles_used = 0
+    for checkpoint in checkpoints:
+        if isinstance(checkpoint, AdherenceCandidateCheckpointV1):
+            review_count += 1
+        step = _checkpoint_step_name(
+            checkpoint,
+            review_count=review_count,
+        )
+        completed_steps.append(step)
+        repair_cycles_used = max(repair_cycles_used, checkpoint.cycle)
+        truncation = checkpoint.truncation
+        if truncation.truncated_section_count or truncation.dropped_item_count:
+            truncations.append(CandidateTruncationSummary(
+                step=step,
+                truncated_section_count=truncation.truncated_section_count,
+                dropped_item_count=truncation.dropped_item_count,
+            ))
+    trace.completed_steps = list(completed_steps)
+    trace.repair_cycles_used = repair_cycles_used
+    return tuple(completed_steps), tuple(truncations)
+
+
 def _replay_candidate_checkpoints(
     checkpoints: tuple[CandidatePipelineCheckpointV1, ...],
     *,
@@ -2194,219 +2206,42 @@ def _replay_candidate_checkpoints(
     chapter_id: str,
     chapter: Mapping[str, Any],
 ) -> _CheckpointReplay:
-    completed_steps: list[str] = []
-    checkpoint_attempt_ids: list[str] = []
-    expected_truncations: list[CandidateTruncationSummary] = []
-    current_prose: ProseCandidateCheckpointV1 | None = None
-    previous_prose: ProseCandidateCheckpointV1 | None = None
-    latest_adherence: AdherenceCandidateCheckpointV1 | None = None
-    latest_state: StateCandidateCheckpointV1 | None = None
-    phase = _ResumePhase.START
-    repair_cycles_used = 0
-    review_count = 0
-    seen_checkpoint_ids: set[str] = set()
-    seen_state_request_ids: set[str] = set()
-    seen_state_proposal_ids: set[str] = set()
-
-    for expected_sequence, checkpoint in enumerate(checkpoints, start=1):
-        if (
-            checkpoint.sequence != expected_sequence
-            or checkpoint.chapter_id != chapter_id
-            or checkpoint.checkpoint_id in seen_checkpoint_ids
-        ):
-            raise _blocked_resume(
-                trace,
-                "候选管线恢复检查点顺序或章节身份无效",
-            )
-        seen_checkpoint_ids.add(checkpoint.checkpoint_id)
-
-        if isinstance(checkpoint, ProseCandidateCheckpointV1):
-            if checkpoint.origin == "initial":
-                if phase is not _ResumePhase.START:
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复步骤顺序无效",
-                    )
-            else:
-                if phase not in {
-                    _ResumePhase.PROSE,
-                    _ResumePhase.ADHERENCE,
-                }:
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复步骤顺序无效",
-                    )
-                kept_digest = _prose_checkpoint_kept_digest(
-                    current_prose,
-                    previous_prose,
-                )
-                if phase is _ResumePhase.PROSE and current_prose is not None:
-                    if _checkpoint_completion_passed(current_prose):
-                        raise _blocked_resume(
-                            trace,
-                            "候选管线恢复步骤顺序无效",
-                        )
-                    if kept_digest:
-                        raise _blocked_resume(
-                            trace,
-                            "正文摘要未变化且完成闸门复检仍未通过",
-                            code="repair_no_progress",
-                        )
-                if (
-                    phase is _ResumePhase.ADHERENCE
-                    and latest_adherence is not None
-                ):
-                    if _checkpoint_adherence_passed(
-                        latest_adherence,
-                        chapter=chapter,
-                    ):
-                        raise _blocked_resume(
-                            trace,
-                            "候选管线恢复步骤顺序无效",
-                        )
-                    if kept_digest:
-                        raise _blocked_resume(
-                            trace,
-                            "正文摘要未变化且章纲复检仍未通过",
-                            code="repair_no_progress",
-                        )
-                if checkpoint.cycle != repair_cycles_used + 1:
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复修复轮次无效",
-                    )
-                if (
-                    current_prose is None
-                    or checkpoint.source.source_run_id
-                    != current_prose.source.source_run_id
-                    or checkpoint.source.source_run_revision
-                    <= current_prose.source.source_run_revision
-                ):
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复正文修复谱系无效",
-                    )
-                repair_cycles_used = checkpoint.cycle
-            previous_prose = current_prose
-            current_prose = checkpoint
-            latest_adherence = None
-            latest_state = None
-            phase = _ResumePhase.PROSE
-        elif isinstance(checkpoint, AdherenceCandidateCheckpointV1):
-            if phase is not _ResumePhase.PROSE or current_prose is None:
-                raise _blocked_resume(
-                    trace,
-                    "候选管线恢复步骤顺序无效",
-                )
-            if not _checkpoint_completion_passed(current_prose):
-                raise _blocked_resume(
-                    trace,
-                    "候选管线恢复复检早于正文完成闸门",
-                )
-            if (
-                _checkpoint_source_key(checkpoint)
-                != _checkpoint_source_key(current_prose)
-                or checkpoint.cycle != current_prose.cycle
-            ):
-                raise _blocked_resume(
-                    trace,
-                    "候选管线恢复复检身份无效",
-                )
-            review_count += 1
-            latest_adherence = checkpoint
-            latest_state = None
-            phase = _ResumePhase.ADHERENCE
-        else:
-            if checkpoint.request_id in seen_state_request_ids:
-                raise _blocked_resume(
-                    trace,
-                    "候选管线恢复状态修复身份重复",
-                )
-            if checkpoint.origin == "initial":
-                if (
-                    phase is not _ResumePhase.ADHERENCE
-                    or latest_adherence is None
-                    or not _checkpoint_adherence_passed(
-                        latest_adherence,
-                        chapter=chapter,
-                    )
-                ):
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复状态前置步骤无效",
-                    )
-            else:
-                if (
-                    phase is not _ResumePhase.STATE
-                    or latest_state is None
-                    or checkpoint.cycle != repair_cycles_used + 1
-                ):
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复状态修复轮次无效",
-                    )
-                if checkpoint.proposal_id == latest_state.proposal_id:
-                    trace.completed_steps.append(_checkpoint_step_name(
-                        checkpoint,
-                        review_count=review_count,
-                    ))
-                    trace.repair_cycles_used = checkpoint.cycle
-                    raise _blocked_resume(
-                        trace,
-                        "状态修复没有产生新候选",
-                        code="repair_no_progress",
-                    )
-                if checkpoint.proposal_id in seen_state_proposal_ids:
-                    raise _blocked_resume(
-                        trace,
-                        "候选管线恢复状态修复身份重复",
-                    )
-                repair_cycles_used = checkpoint.cycle
-            if (
-                current_prose is None
-                or _checkpoint_source_key(checkpoint)
-                != _checkpoint_source_key(current_prose)
-            ):
-                raise _blocked_resume(
-                    trace,
-                    "候选管线恢复状态正文身份无效",
-                )
-            seen_state_request_ids.add(checkpoint.request_id)
-            seen_state_proposal_ids.add(checkpoint.proposal_id)
-            latest_state = checkpoint
-            phase = _ResumePhase.STATE
-
-        step = _checkpoint_step_name(
-            checkpoint,
-            review_count=review_count,
+    outline = chapter.get("outline")
+    scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
+    if not isinstance(scenes, list) or not scenes:
+        raise _blocked_resume(trace, "候选管线恢复章节章纲无效")
+    try:
+        replay = replay_candidate_pipeline_checkpoints(
+            checkpoints,
+            chapter_id=chapter_id,
+            expected_scene_count=len(scenes),
+            max_repair_cycles=repair_limit,
         )
-        completed_steps.append(step)
-        trace.completed_steps.append(step)
-        trace.repair_cycles_used = repair_cycles_used
-        checkpoint_attempt_ids.extend(checkpoint.attempt_ids)
-        truncation = checkpoint.truncation
-        if truncation.truncated_section_count or truncation.dropped_item_count:
-            expected_truncations.append(CandidateTruncationSummary(
-                step=step,
-                truncated_section_count=truncation.truncated_section_count,
-                dropped_item_count=truncation.dropped_item_count,
-            ))
+    except CandidatePipelineCheckpointConflict as exc:
+        _project_replayed_checkpoint_prefix(
+            trace,
+            checkpoints[:exc.accepted_checkpoints],
+        )
+        raise _blocked_resume(
+            trace,
+            str(exc),
+            code=exc.code,
+        ) from exc
 
-    if current_prose is None:
-        raise _blocked_resume(trace, "候选管线恢复正文步骤缺失")
-    if repair_cycles_used > repair_limit:
-        raise _blocked_resume(trace, "候选管线恢复超出修复授权")
+    completed_steps, expected_truncations = (
+        _project_replayed_checkpoint_prefix(trace, checkpoints)
+    )
     return _CheckpointReplay(
-        completed_steps=tuple(completed_steps),
-        attempt_ids=tuple(checkpoint_attempt_ids),
+        completed_steps=completed_steps,
+        attempt_ids=replay.attempt_ids,
         truncations=tuple(expected_truncations),
-        current_prose=current_prose,
-        previous_prose=previous_prose,
-        latest_adherence=latest_adherence,
-        latest_state=latest_state,
-        phase=phase,
-        repair_cycles_used=repair_cycles_used,
-        review_count=review_count,
+        current_prose=replay.current_prose,
+        previous_prose=replay.previous_prose,
+        latest_adherence=replay.latest_adherence,
+        latest_state=replay.latest_state,
+        phase=_ResumePhase(replay.phase),
+        repair_cycles_used=replay.repair_cycles_used,
+        review_count=replay.review_count,
     )
 
 

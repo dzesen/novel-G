@@ -23,6 +23,7 @@ MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 512
 MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES = 10_000
+MAX_CANDIDATE_OUTLINE_SCENES = 20
 MAX_BSON_INT64 = 2**63 - 1
 _SAFE_CANDIDATE_IDENTIFIER_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
@@ -48,6 +49,17 @@ def is_safe_candidate_identifier(value: Any, *, maximum: int) -> bool:
 
 class CandidatePipelineCheckpointConflict(ValueError):
     """The append-only candidate cursor no longer matches this execution."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "candidate_gate_blocked",
+        accepted_checkpoints: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.accepted_checkpoints = accepted_checkpoints
 
 
 class PreDispatchFenceV1(BaseModel):
@@ -132,7 +144,10 @@ class CandidatePipelineProgressV1(_CandidateCheckpointContract):
         default=(),
         max_length=20,
     )
-    scene_coverage_count: int = Field(ge=0, le=20)
+    scene_coverage_count: int = Field(
+        ge=0,
+        le=MAX_CANDIDATE_OUTLINE_SCENES,
+    )
     consistency_issue_count: int = Field(ge=0, le=20)
 
 
@@ -248,6 +263,22 @@ class CandidatePipelineCompletionEvidenceV1:
     truncation_count: int
 
 
+@dataclass(frozen=True)
+class CandidatePipelineReplayV1:
+    """Canonical prefix state shared by live recovery and terminal publish."""
+
+    checkpoints: tuple[CandidatePipelineCheckpointV1, ...]
+    current_prose: ProseCandidateCheckpointV1
+    previous_prose: ProseCandidateCheckpointV1 | None
+    latest_adherence: AdherenceCandidateCheckpointV1 | None
+    latest_state: StateCandidateCheckpointV1 | None
+    phase: Literal["prose", "adherence", "state"]
+    repair_cycles_used: int
+    review_count: int
+    attempt_ids: tuple[str, ...]
+    truncation_count: int
+
+
 def candidate_checkpoint_completion_passed(
     checkpoint: ProseCandidateCheckpointV1,
 ) -> bool:
@@ -266,7 +297,7 @@ def candidate_checkpoint_adherence_passed(
     indexes = tuple(item.scene_index for item in checkpoint.scene_coverage)
     return bool(
         type(expected_scene_count) is int
-        and 1 <= expected_scene_count <= 20
+        and 1 <= expected_scene_count <= MAX_CANDIDATE_OUTLINE_SCENES
         and checkpoint.verdict == "pass"
         and not checkpoint.issue_categories
         and len(indexes) == expected_scene_count
@@ -276,19 +307,21 @@ def candidate_checkpoint_adherence_passed(
     )
 
 
-def validate_candidate_pipeline_completion_chain(
+def replay_candidate_pipeline_checkpoints(
     values: Sequence[Any],
     *,
     chapter_id: str,
     expected_scene_count: int,
-    expected_repair_cycles: int,
-) -> CandidatePipelineCompletionEvidenceV1:
-    """Replay the bounded terminal chain before publishing committed progress."""
+    max_repair_cycles: int,
+    require_terminal: bool = False,
+) -> CandidatePipelineReplayV1:
+    """Replay one bounded checkpoint prefix with the canonical gate reducer."""
 
     if (
         isinstance(values, (str, bytes))
         or not isinstance(values, Sequence)
-        or len(values) < 3
+        or not values
+        or (require_terminal and len(values) < 3)
     ):
         raise CandidatePipelineCheckpointConflict(
             "Candidate pipeline completion ledger is incomplete"
@@ -296,9 +329,9 @@ def validate_candidate_pipeline_completion_chain(
     if (
         len(values) > MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS
         or not is_safe_candidate_identifier(chapter_id, maximum=24)
-        or type(expected_repair_cycles) is not int
+        or type(max_repair_cycles) is not int
         or not 0
-        <= expected_repair_cycles
+        <= max_repair_cycles
         <= MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
     ):
         raise CandidatePipelineCheckpointConflict(
@@ -319,27 +352,48 @@ def validate_candidate_pipeline_completion_chain(
     latest_state: StateCandidateCheckpointV1 | None = None
     phase: Literal["start", "prose", "adherence", "state"] = "start"
     repair_cycles_used = 0
+    review_count = 0
     seen_checkpoint_ids: set[str] = set()
     seen_attempt_ids: set[str] = set()
+    ordered_attempt_ids: list[str] = []
     seen_state_request_ids: set[str] = set()
     seen_state_proposal_ids: set[str] = set()
     truncation_count = 0
+    accepted_checkpoints = 0
+
+    def diverged(
+        message: str = "Candidate pipeline completion gates diverged",
+        *,
+        code: str = "candidate_gate_blocked",
+        include_current: bool = False,
+    ) -> CandidatePipelineCheckpointConflict:
+        return CandidatePipelineCheckpointConflict(
+            message,
+            code=code,
+            accepted_checkpoints=(
+                accepted_checkpoints + 1
+                if include_current
+                else accepted_checkpoints
+            ),
+        )
 
     for sequence, checkpoint in enumerate(checkpoints, start=1):
         if (
             checkpoint.chapter_id != chapter_id
             or checkpoint.sequence != sequence
             or checkpoint.checkpoint_id in seen_checkpoint_ids
-            or any(
-                attempt_id in seen_attempt_ids
-                for attempt_id in checkpoint.attempt_ids
-            )
         ):
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion gates diverged"
+            raise diverged(
+                "候选管线恢复检查点顺序或章节身份无效"
             )
+        if any(
+            attempt_id in seen_attempt_ids
+            for attempt_id in checkpoint.attempt_ids
+        ):
+            raise diverged("候选管线恢复调用与检查点不一致")
         seen_checkpoint_ids.add(checkpoint.checkpoint_id)
         seen_attempt_ids.update(checkpoint.attempt_ids)
+        ordered_attempt_ids.extend(checkpoint.attempt_ids)
         if (
             checkpoint.truncation.truncated_section_count
             or checkpoint.truncation.dropped_item_count
@@ -349,9 +403,7 @@ def validate_candidate_pipeline_completion_chain(
         if isinstance(checkpoint, ProseCandidateCheckpointV1):
             if checkpoint.origin == "initial":
                 if phase != "start":
-                    raise CandidatePipelineCheckpointConflict(
-                        "Candidate pipeline completion gates diverged"
-                    )
+                    raise diverged()
             else:
                 kept_digest = bool(
                     current_prose is not None
@@ -383,15 +435,31 @@ def validate_candidate_pipeline_completion_chain(
                     or checkpoint.source.source_run_revision
                     <= current_prose.source.source_run_revision
                 ):
-                    raise CandidatePipelineCheckpointConflict(
-                        "Candidate pipeline completion gates diverged"
+                    raise diverged(
+                        message=(
+                            "正文摘要未变化且章纲复检仍未通过"
+                            if kept_digest and phase == "adherence"
+                            else (
+                                "正文摘要未变化且完成闸门复检仍未通过"
+                                if kept_digest
+                                else "Candidate pipeline completion gates diverged"
+                            )
+                        ),
+                        code=(
+                            "repair_no_progress"
+                            if kept_digest
+                            else "candidate_gate_blocked"
+                        )
                     )
                 repair_cycles_used = checkpoint.cycle
+                if repair_cycles_used > max_repair_cycles:
+                    raise diverged()
             previous_prose = current_prose
             current_prose = checkpoint
             latest_adherence = None
             latest_state = None
             phase = "prose"
+            accepted_checkpoints = sequence
             continue
 
         if isinstance(checkpoint, AdherenceCandidateCheckpointV1):
@@ -402,35 +470,32 @@ def validate_candidate_pipeline_completion_chain(
                 or checkpoint.source != current_prose.source
                 or checkpoint.cycle != current_prose.cycle
             ):
-                raise CandidatePipelineCheckpointConflict(
-                    "Candidate pipeline completion gates diverged"
-                )
+                raise diverged()
+            review_count += 1
             latest_adherence = checkpoint
             latest_state = None
             phase = "adherence"
+            accepted_checkpoints = sequence
             continue
 
         if (
             current_prose is None
             or checkpoint.source != current_prose.source
-            or checkpoint.request_id in seen_state_request_ids
-            or checkpoint.proposal_id in seen_state_proposal_ids
         ):
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion gates diverged"
-            )
+            raise diverged("候选管线恢复状态正文身份无效")
+        if checkpoint.request_id in seen_state_request_ids:
+            raise diverged("候选管线恢复状态修复身份重复")
         if checkpoint.origin == "initial":
             if (
                 phase != "adherence"
                 or latest_adherence is None
+                or checkpoint.proposal_id in seen_state_proposal_ids
                 or not candidate_checkpoint_adherence_passed(
                     latest_adherence,
                     expected_scene_count=expected_scene_count,
                 )
             ):
-                raise CandidatePipelineCheckpointConflict(
-                    "Candidate pipeline completion gates diverged"
-                )
+                raise diverged("候选管线恢复状态前置步骤无效")
         elif (
             phase != "state"
             or latest_state is None
@@ -441,17 +506,43 @@ def validate_candidate_pipeline_completion_chain(
             or checkpoint.cycle != repair_cycles_used + 1
             or checkpoint.proposal_id == latest_state.proposal_id
         ):
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion gates diverged"
+            raise diverged(
+                message=(
+                    "状态修复没有产生新候选"
+                    if (
+                        latest_state is not None
+                        and checkpoint.proposal_id
+                        == latest_state.proposal_id
+                    )
+                    else "Candidate pipeline completion gates diverged"
+                ),
+                code=(
+                    "repair_no_progress"
+                    if (
+                        latest_state is not None
+                        and checkpoint.proposal_id
+                        == latest_state.proposal_id
+                    )
+                    else "candidate_gate_blocked"
+                ),
+                include_current=(
+                    latest_state is not None
+                    and checkpoint.proposal_id == latest_state.proposal_id
+                ),
             )
         else:
+            if checkpoint.proposal_id in seen_state_proposal_ids:
+                raise diverged("候选管线恢复状态修复身份重复")
             repair_cycles_used = checkpoint.cycle
+            if repair_cycles_used > max_repair_cycles:
+                raise diverged()
         seen_state_request_ids.add(checkpoint.request_id)
         seen_state_proposal_ids.add(checkpoint.proposal_id)
         latest_state = checkpoint
         phase = "state"
+        accepted_checkpoints = sequence
 
-    if (
+    if require_terminal and (
         phase != "state"
         or current_prose is None
         or latest_adherence is None
@@ -463,18 +554,62 @@ def validate_candidate_pipeline_completion_chain(
         )
         or latest_state.consistency_issue_count != 0
         or latest_state.dropped_reference_count != 0
-        or repair_cycles_used != expected_repair_cycles
+        or repair_cycles_used > max_repair_cycles
     ):
+        raise diverged()
+    if current_prose is None or phase == "start":
         raise CandidatePipelineCheckpointConflict(
-            "Candidate pipeline completion gates diverged"
+            "Candidate pipeline completion ledger is incomplete",
+            accepted_checkpoints=accepted_checkpoints,
         )
-    return CandidatePipelineCompletionEvidenceV1(
-        prose=current_prose,
-        adherence=latest_adherence,
-        state=latest_state,
+    return CandidatePipelineReplayV1(
+        checkpoints=checkpoints,
+        current_prose=current_prose,
+        previous_prose=previous_prose,
+        latest_adherence=latest_adherence,
+        latest_state=latest_state,
+        phase=phase,
         repair_cycles_used=repair_cycles_used,
-        attempt_count=len(seen_attempt_ids),
+        review_count=review_count,
+        attempt_ids=tuple(ordered_attempt_ids),
         truncation_count=truncation_count,
+    )
+
+
+def validate_candidate_pipeline_completion_chain(
+    values: Sequence[Any],
+    *,
+    chapter_id: str,
+    expected_scene_count: int,
+    max_repair_cycles: int,
+) -> CandidatePipelineCompletionEvidenceV1:
+    """Replay the bounded terminal chain before publishing committed progress."""
+
+    try:
+        replay = replay_candidate_pipeline_checkpoints(
+            values,
+            chapter_id=chapter_id,
+            expected_scene_count=expected_scene_count,
+            max_repair_cycles=max_repair_cycles,
+            require_terminal=True,
+        )
+    except CandidatePipelineCheckpointConflict as exc:
+        if str(exc).startswith("Candidate pipeline completion ledger"):
+            raise
+        raise CandidatePipelineCheckpointConflict(
+            "Candidate pipeline completion gates diverged",
+            code=exc.code,
+            accepted_checkpoints=exc.accepted_checkpoints,
+        ) from exc
+    assert replay.latest_adherence is not None
+    assert replay.latest_state is not None
+    return CandidatePipelineCompletionEvidenceV1(
+        prose=replay.current_prose,
+        adherence=replay.latest_adherence,
+        state=replay.latest_state,
+        repair_cycles_used=replay.repair_cycles_used,
+        attempt_count=len(replay.attempt_ids),
+        truncation_count=replay.truncation_count,
     )
 
 
