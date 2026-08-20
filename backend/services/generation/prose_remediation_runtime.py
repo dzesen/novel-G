@@ -534,7 +534,11 @@ def _validate_candidate_snapshot(
 ) -> str:
     if str(run.get("novel_id") or "") != str(novel_id):
         raise ValueError("prose candidate is outside the authorized novel")
-    if str(run.get("status") or "") != "complete":
+    run_status = str(run.get("status") or "")
+    incomplete_repair_source = bool(
+        allow_unverified_remediation and run_status == "incomplete"
+    )
+    if run_status != "complete" and not incomplete_repair_source:
         raise ValueError("only a complete prose candidate can be remediated")
     if (
         expected_revision is not None
@@ -561,6 +565,12 @@ def _validate_candidate_snapshot(
         and str(completion.get("status") or "") in {"complete", "degraded"}
     )
     remediation = dict(run.get("remediation") or {})
+    initial_incomplete_is_current = bool(
+        incomplete_repair_source
+        and not remediation
+        and completion.get("can_write_formal_prose") is False
+        and str(completion.get("status") or "") == "incomplete"
+    )
     unverified_remediation_is_current = bool(
         allow_unverified_remediation
         and remediation.get("schema_version") == "prose_run_remediation.v1"
@@ -570,7 +580,11 @@ def _validate_candidate_snapshot(
         and completion.get("can_write_formal_prose") is False
         and str(completion.get("status") or "") == "incomplete"
     )
-    if not completion_is_formal and not unverified_remediation_is_current:
+    if not (
+        completion_is_formal
+        or initial_incomplete_is_current
+        or unverified_remediation_is_current
+    ):
         raise ValueError("prose candidate has not passed completion")
     if chapter.get("novel_id") != to_object_id(novel_id):
         raise ValueError("prose candidate chapter ownership changed")
@@ -1709,7 +1723,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r7-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r8-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1733,7 +1747,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r7-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r8-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -1748,7 +1762,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r7-"
+            "prose-remediation-tools-r8-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

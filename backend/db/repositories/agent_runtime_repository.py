@@ -936,6 +936,22 @@ class AgentRuntimeRepository:
             raise NotFoundError(f"Agent runtime run '{run_id}' was not found")
         return document
 
+    async def find_run_by_start_request_id_owned(
+        self,
+        *,
+        start_request_id: str,
+        owner_id: str,
+    ) -> dict[str, Any] | None:
+        """Find an idempotently started run without weakening owner isolation."""
+        normalized_request_id = str(start_request_id).strip()
+        if not normalized_request_id:
+            raise ValueError("start_request_id is required")
+        return await self.runs.find_one({
+            "owner_id": _required_object_id(owner_id, "owner_id"),
+            "start_request_id": normalized_request_id,
+            "is_deleted": False,
+        })
+
     async def assert_completed_remediation(
         self,
         *,

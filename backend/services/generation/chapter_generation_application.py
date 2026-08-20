@@ -11,10 +11,10 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field as ModelField
+from pydantic import BaseModel, ConfigDict, Field as ModelField, field_validator
 
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
@@ -189,6 +189,50 @@ class ProseCandidateSource(BaseModel):
     completion: Mapping[str, Any]
 
 
+class StateRepairGuidance(BaseModel):
+    """Bounded, metadata-only guidance for one state-candidate regeneration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["state_repair_guidance.v1"] = (
+        "state_repair_guidance.v1"
+    )
+    cycle: int = ModelField(strict=True, ge=1, le=8)
+    prior_proposal_id: str = ModelField(min_length=1, max_length=128)
+    reason_codes: tuple[
+        Literal["consistency_conflict", "invalid_internal_reference"], ...
+    ] = ModelField(min_length=1, max_length=2)
+    consistency_issue_count: int = ModelField(strict=True, ge=0, le=20)
+    affected_card_ids: tuple[str, ...] = ModelField(max_length=20)
+    dropped_reference_count: int = ModelField(strict=True, ge=0, le=1_000)
+
+    @field_validator("reason_codes", "affected_card_ids")
+    @classmethod
+    def validate_unique_items(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("state repair guidance cannot contain duplicates")
+        return value
+
+    @field_validator("affected_card_ids")
+    @classmethod
+    def validate_card_id_shape(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item or len(item) > 64 for item in value):
+            raise ValueError("state repair card ids exceed the V1 bound")
+        return value
+
+
+def _render_state_repair_guidance(guidance: StateRepairGuidance) -> str:
+    return (
+        "【本轮状态候选修复约束】\n"
+        "仅重新提取候选，不写入正式状态；不得猜测或创建任何内部 ID。\n"
+        f"原因：{','.join(guidance.reason_codes)}\n"
+        f"冲突数量：{guidance.consistency_issue_count}\n"
+        f"无效引用数量：{guidance.dropped_reference_count}\n"
+        "需重点核对的已声明 card_id："
+        + (",".join(guidance.affected_card_ids) or "无")
+    )
+
+
 class ChapterGenerationStage(str, Enum):
     OUTLINE = "outline"
     PROSE = "prose"
@@ -251,6 +295,7 @@ class StateGenerationCommand(_ChapterGenerationCommand):
     attempt_scope: Any | None = None
     prose_candidate: ProseCandidateSource | None = None
     generation_plan: GenerationPlan | None = None
+    repair_guidance: StateRepairGuidance | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
@@ -658,6 +703,8 @@ class ChapterGenerationApplicationService:
             if chapter.get("novel_id") != to_object_id(command.novel_id):
                 raise ValueError("该章节不属于指定小说")
             candidate = command.prose_candidate
+            if command.repair_guidance is not None and candidate is None:
+                raise ValueError("状态修复必须绑定精确正文候选")
             content = (
                 candidate.text
                 if candidate is not None
@@ -721,6 +768,33 @@ class ChapterGenerationApplicationService:
                 command.chapter_id,
             )
             context = self._deps.assemble_context(inputs)
+            context_text = context.to_prompt_text()
+            guidance = command.repair_guidance
+            if guidance is not None:
+                outline = chapter.get("outline")
+                raw_declared_ids = (
+                    outline.get("present_character_card_ids")
+                    if isinstance(outline, Mapping)
+                    else None
+                )
+                declared_ids = {
+                    item
+                    for item in (
+                        raw_declared_ids
+                        if isinstance(raw_declared_ids, list)
+                        else []
+                    )
+                    if isinstance(item, str) and item
+                }
+                if not set(guidance.affected_card_ids) <= declared_ids:
+                    raise ValueError(
+                        "状态修复包含章细纲未声明的资料卡 ID"
+                    )
+                context_text = (
+                    context_text
+                    + "\n\n"
+                    + _render_state_repair_guidance(guidance)
+                )
             generation_values = dict(command.generation_params or {})
             reserved_output = int(
                 generation_values.get("max_tokens")
@@ -728,7 +802,7 @@ class ChapterGenerationApplicationService:
                 or 4096
             )
             estimated_input = self._deps.estimate_tokens(
-                context.to_prompt_text()
+                context_text
             ) + self._deps.estimate_tokens(content)
             max_context_tokens = int(
                 getattr(provider_config, "max_context_tokens", 128000)
@@ -772,7 +846,7 @@ class ChapterGenerationApplicationService:
                 roster=inputs["roster"],
                 lease=lease,
                 params={
-                    "context": context.to_prompt_text(),
+                    "context": context_text,
                     "chapter_order": int(chapter.get("order_index") or 0),
                     "chapter_title": str(chapter.get("title") or ""),
                     "chapter_content": content,

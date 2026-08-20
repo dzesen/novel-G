@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from backend.db.repositories.generation_job_repository import (
     GenerationJobRepository,
     generation_job_repo,
@@ -21,6 +23,7 @@ class JobAttemptScope:
         *,
         repo: GenerationJobRepository = generation_job_repo,
         confirm_uncertain_retry: bool = False,
+        existing_attempt_slots: Sequence[Mapping[str, object]] = (),
     ) -> None:
         self.job_id = str(job_id)
         self.chapter_id = str(chapter_id)
@@ -31,6 +34,52 @@ class JobAttemptScope:
         self._conservative_tokens: dict[str, int | None] = {}
         self._attempts: dict[str, AttemptUsage] = {}
         self._uncertain: set[str] = set()
+        self._restore_attempt_evidence(existing_attempt_slots)
+
+    def _restore_attempt_evidence(
+        self,
+        slots: Sequence[Mapping[str, object]],
+    ) -> None:
+        for slot in slots:
+            if (
+                str(slot.get("chapter_id") or "") != self.chapter_id
+                or str(slot.get("step_id") or "") != self.step_id
+            ):
+                continue
+            attempt_id = str(slot.get("attempt_id") or "")
+            provider_alias = str(slot.get("provider_alias") or "")
+            phase = str(slot.get("phase") or "")
+            if not attempt_id or not provider_alias or not phase:
+                raise ValueError("persisted Provider attempt identity is invalid")
+            if attempt_id in self._claims:
+                raise ValueError("persisted Provider attempt identity is duplicated")
+            self._claims[attempt_id] = (provider_alias, phase)
+            raw_bound = slot.get("conservative_tokens")
+            if raw_bound is None:
+                self._conservative_tokens[attempt_id] = None
+            elif (
+                isinstance(raw_bound, bool)
+                or not isinstance(raw_bound, int)
+                or raw_bound < 0
+            ):
+                raise ValueError("persisted Provider attempt bound is invalid")
+            else:
+                self._conservative_tokens[attempt_id] = raw_bound
+            state = str(slot.get("state") or "")
+            if state == "uncertain":
+                self._uncertain.add(attempt_id)
+            if state != "accounted":
+                continue
+            raw_usage = slot.get("usage")
+            if not isinstance(raw_usage, Mapping):
+                raise ValueError("persisted Provider attempt usage is invalid")
+            usage = TokenUsage.model_validate(dict(raw_usage))
+            self._attempts[attempt_id] = AttemptUsage(
+                attempt_id=attempt_id,
+                provider_alias=provider_alias,
+                phase=phase,
+                usage=usage,
+            )
 
     @property
     def attempts(self) -> tuple[AttemptUsage, ...]:

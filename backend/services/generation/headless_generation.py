@@ -47,6 +47,7 @@ from backend.services.generation.chapter_generation_application import (
     STATE_STEP,
     STATE_WORKFLOW,
     StateGenerationCommand,
+    StateRepairGuidance,
 )
 from backend.services.generation.chapter_capability_registry import (
     build_chapter_capability_registry,
@@ -546,6 +547,7 @@ async def generate_state_candidate(
     generation_params: Mapping[str, Any] | None = None,
     *,
     generation_plan: GenerationPlan | None = None,
+    repair_guidance: StateRepairGuidance | None = None,
 ) -> ChapterGenerationResult:
     """Extract a persisted state proposal without accepting chapter state."""
     execution = await _chapter_capability_registry().execute(
@@ -559,6 +561,7 @@ async def generate_state_candidate(
             attempt_scope=attempt_scope,
             prose_candidate=prose_candidate,
             generation_plan=generation_plan,
+            repair_guidance=repair_guidance,
         ),
         call=CapabilityCall(source="job_engine"),
     )

@@ -1330,7 +1330,7 @@ class ProseRunRepository(BaseRepository):
                 "owner_id": to_object_id(owner_id),
                 "novel_id": to_object_id(novel_id),
                 "is_deleted": False,
-                "status": "complete",
+                "status": {"$in": ["complete", "incomplete"]},
                 "revision": int(expected_revision),
                 "narrative_revision": int(expected_narrative_revision),
                 "$or": [
@@ -1478,7 +1478,7 @@ class ProseRunRepository(BaseRepository):
             "owner_id": to_object_id(owner_id),
             "novel_id": to_object_id(novel_id),
             "is_deleted": False,
-            "status": "complete",
+            "status": {"$in": ["complete", "incomplete"]},
             "revision": int(expected_revision),
             "assembled_text": str(expected_text),
             "narrative_revision": int(expected_narrative_revision),
@@ -1522,6 +1522,7 @@ class ProseRunRepository(BaseRepository):
             query,
             {
                 "$set": {
+                    "status": "complete",
                     "assembled_text": str(assembled_text),
                     "completion": dict(completion),
                     "updated_at": now,
