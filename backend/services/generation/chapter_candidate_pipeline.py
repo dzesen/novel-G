@@ -29,6 +29,7 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidateTruncationProjectionV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
+    candidate_pipeline_checkpoint_digest,
     is_safe_candidate_identifier,
     parse_candidate_pipeline_checkpoint,
 )
@@ -1184,16 +1185,10 @@ def _checkpoint_source(
 def _checkpoint_id(
     checkpoint: CandidatePipelineCheckpointV1,
 ) -> str:
-    payload = checkpoint.model_dump(
-        mode="json",
-        exclude={"checkpoint_id"},
+    return candidate_pipeline_checkpoint_digest(
+        checkpoint,
+        include_checkpoint_id=False,
     )
-    return hashlib.sha256(json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
 
 
 def _seal_checkpoint(

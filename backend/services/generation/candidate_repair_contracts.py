@@ -18,6 +18,7 @@ from backend.services.generation.outline_adherence import (
 MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 512
+MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES = 10_000
 MAX_BSON_INT64 = 2**63 - 1
 _SAFE_CANDIDATE_IDENTIFIER_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
@@ -89,11 +90,10 @@ class CandidateSourceIdentityV1(_CandidateCheckpointContract):
 class CandidatePipelineCompletionV1(_CandidateCheckpointContract):
     """Stable receipt for atomically rolling one active ledger into progress."""
 
-    schema_version: Literal["candidate_pipeline_completion.v1"] = (
-        "candidate_pipeline_completion.v1"
-    )
+    schema_version: Literal["candidate_pipeline_completion.v1"]
     checkpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     checkpoint_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ledger_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     sequence: int = Field(
         ge=1,
         le=MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
@@ -102,6 +102,34 @@ class CandidatePipelineCompletionV1(_CandidateCheckpointContract):
     source: CandidateSourceIdentityV1
     state_proposal_id: str = Field(pattern=r"^[0-9a-f]{24}$")
     tokens_delta: int = Field(ge=0, le=MAX_BSON_INT64)
+
+
+class CandidatePipelineProgressV1(_CandidateCheckpointContract):
+    """Bounded metadata-only chapter result published by the atomic rollover."""
+
+    schema_version: Literal["candidate_pipeline_progress.v1"]
+    status: Literal["completed"]
+    finalization_status: Literal["committed"]
+    chapter_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    order_index: int = Field(ge=0, le=1_000_000)
+    tokens: int = Field(ge=0, le=MAX_BSON_INT64)
+    source: CandidateSourceIdentityV1
+    state_proposal_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    repair_cycles_used: int = Field(
+        ge=0,
+        le=MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
+    )
+    attempt_count: int = Field(ge=0, le=MAX_CANDIDATE_CHECKPOINT_ATTEMPTS)
+    truncation_count: int = Field(
+        ge=0,
+        le=MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
+    )
+    outline_issue_categories: tuple[OutlineIssueCategoryValue, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    scene_coverage_count: int = Field(ge=0, le=20)
+    consistency_issue_count: int = Field(ge=0, le=20)
 
 
 class CandidateCompletionProjectionV1(_CandidateCheckpointContract):
@@ -260,17 +288,85 @@ def parse_candidate_pipeline_checkpoint(
     return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
 
 
-def candidate_pipeline_checkpoint_digest(value: Any) -> str:
-    """Hash the full canonical checkpoint independently of its claimed ID."""
+def candidate_pipeline_checkpoint_digest(
+    value: Any,
+    *,
+    include_checkpoint_id: bool = True,
+) -> str:
+    """Hash one canonical checkpoint, optionally excluding its claimed ID."""
 
     checkpoint = parse_candidate_pipeline_checkpoint(value)
     encoded = json.dumps(
-        checkpoint.model_dump(mode="json"),
+        checkpoint.model_dump(
+            mode="json",
+            exclude=None if include_checkpoint_id else {"checkpoint_id"},
+        ),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def candidate_pipeline_checkpoint_ledger_digest(
+    values: Sequence[Any],
+) -> str:
+    """Hash the complete ordered checkpoint ledger used by one finalization."""
+
+    if (
+        isinstance(values, (str, bytes))
+        or not isinstance(values, Sequence)
+        or not 1 <= len(values) <= MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS
+    ):
+        raise ValueError("candidate checkpoint ledger is invalid")
+    checkpoints = [
+        parse_candidate_pipeline_checkpoint(value).model_dump(mode="json")
+        for value in values
+    ]
+    encoded = json.dumps(
+        checkpoints,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def parse_candidate_pipeline_progress(value: Any) -> CandidatePipelineProgressV1:
+    """Revalidate the bounded public progress projection without coercion."""
+
+    raw_categories = (
+        getattr(value, "outline_issue_categories", None)
+        if isinstance(value, BaseModel)
+        else value.get("outline_issue_categories")
+        if isinstance(value, Mapping)
+        else None
+    )
+    if raw_categories is not None and (
+        not isinstance(raw_categories, (list, tuple))
+        or len(raw_categories) > 20
+    ):
+        raise ValueError("candidate progress issue categories are invalid")
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="python")
+    if not isinstance(value, Mapping):
+        return CandidatePipelineProgressV1.model_validate(value)
+    value = dict(value)
+    _require_contract_version(
+        value,
+        expected="candidate_pipeline_progress.v1",
+        subject="candidate pipeline progress",
+    )
+    _require_nested_contract_version(
+        value,
+        field="source",
+        expected="candidate_source_identity.v1",
+    )
+    if isinstance(value.get("outline_issue_categories"), list):
+        value["outline_issue_categories"] = tuple(
+            value["outline_issue_categories"]
+        )
+    return CandidatePipelineProgressV1.model_validate(value)
 
 
 def _validate_checkpoint_list_bounds(value: Any) -> tuple[str, ...]:
