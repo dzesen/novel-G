@@ -1714,6 +1714,38 @@ def _resume_item_usage_floor(
         ) from exc
 
 
+def _append_resume_unattributed_usage(
+    trace: _PipelineTrace,
+    marker: CandidateUnattributedUsageSummary,
+) -> None:
+    if (
+        marker.reason
+        is CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
+    ):
+        trace._record_usage_overflow()
+        return
+    if len(trace.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
+        previous = trace.unattributed_usage[-1]
+        try:
+            trace.unattributed_usage[-1] = CandidateUnattributedUsageSummary(
+                reason=marker.reason,
+                usage=_usage_add(previous.usage, marker.usage),
+                evidence_kind=_merge_usage_evidence_kind(
+                    previous.evidence_kind,
+                    marker.evidence_kind,
+                ),
+            )
+        except _UsageProjectionOverflow:
+            trace._record_usage_overflow()
+            return
+    else:
+        trace.unattributed_usage.append(marker)
+    try:
+        _refresh_restored_usage(trace)
+    except _UsageProjectionOverflow:
+        trace._record_usage_overflow()
+
+
 def _preserve_resume_aggregate_floor(
     trace: _PipelineTrace,
     *,
@@ -1736,26 +1768,7 @@ def _preserve_resume_aggregate_floor(
         usage=usage,
         evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
     )
-    if len(trace.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
-        try:
-            previous = trace.unattributed_usage[-1]
-            trace.unattributed_usage[-1] = CandidateUnattributedUsageSummary(
-                reason=reason,
-                usage=_usage_add(previous.usage, marker.usage),
-                evidence_kind=_merge_usage_evidence_kind(
-                    previous.evidence_kind,
-                    marker.evidence_kind,
-                ),
-            )
-        except _UsageProjectionOverflow:
-            trace._record_usage_overflow()
-            return
-    else:
-        trace.unattributed_usage.append(marker)
-    try:
-        _refresh_restored_usage(trace)
-    except _UsageProjectionOverflow:
-        trace._record_usage_overflow()
+    _append_resume_unattributed_usage(trace, marker)
 
 
 @dataclass(frozen=True)
@@ -2041,8 +2054,7 @@ def _resume_trace(
             reason=CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID,
         )
         raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
-    attempts_by_id: dict[str, CandidateAttemptSummary] = {}
-    attempt_indexes_by_id: dict[str, int] = {}
+    attempt_groups: dict[str, list[CandidateAttemptSummary]] = {}
     has_unresolved_uncertain_attempt = False
     attempt_error_message: str | None = None
     for item in progress.attempts:
@@ -2082,93 +2094,78 @@ def _resume_trace(
                 attempt_error_message or "候选管线恢复 attempt 无效"
             )
             continue
+        attempt_groups.setdefault(validated.attempt_id, []).append(validated)
+
+    for variants in attempt_groups.values():
         try:
-            violation = _attempt_usage_violation(validated)
-            existing = attempts_by_id.get(validated.attempt_id)
-            if existing is not None:
-                if existing == validated:
+            unique_variants: list[CandidateAttemptSummary] = []
+            violations: list[
+                tuple[str, CandidateUnattributedUsageReason]
+            ] = []
+            valid_variants: list[CandidateAttemptSummary] = []
+            group_usage = CandidateUsageSummary()
+            for variant in variants:
+                if variant in unique_variants:
                     continue
-                usage_delta, _evidence_kind = _usage_delta(
-                    validated.usage,
-                    existing.usage,
+                unique_variants.append(variant)
+                group_usage = _conservative_usage_max(
+                    group_usage,
+                    variant.usage,
                 )
+                violation = _attempt_usage_violation(variant)
+                if violation is None:
+                    valid_variants.append(variant)
+                elif violation not in violations:
+                    violations.append(violation)
+
+            representative: CandidateAttemptSummary | None = None
+            if valid_variants:
+                representative = valid_variants[0]
+                if any(
+                    item.state is CandidateAttemptState.UNCERTAIN
+                    for item in unique_variants
+                ):
+                    representative = representative.model_copy(
+                        update={"state": CandidateAttemptState.UNCERTAIN}
+                    )
+                restored.attempts.append(representative)
+                has_unresolved_uncertain_attempt = bool(
+                    has_unresolved_uncertain_attempt
+                    or representative.state is CandidateAttemptState.UNCERTAIN
+                )
+
+            for index, (message, reason) in enumerate(violations):
+                _preserve_resume_aggregate_floor(
+                    restored,
+                    aggregate_tokens=None,
+                    reason=reason,
+                    item_usage_floor=(
+                        group_usage
+                        if representative is None and index == 0
+                        else CandidateUsageSummary()
+                    ),
+                )
+                attempt_error_message = attempt_error_message or message
+
+            if len(unique_variants) > 1:
+                conflict_usage = CandidateUsageSummary()
+                if representative is not None:
+                    conflict_usage, _evidence_kind = _usage_delta(
+                        group_usage,
+                        representative.usage,
+                    )
                 _preserve_resume_aggregate_floor(
                     restored,
                     aggregate_tokens=None,
                     reason=(
                         CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
                     ),
-                    item_usage_floor=usage_delta,
+                    item_usage_floor=conflict_usage,
                 )
-                if violation is not None:
-                    _message, reason = violation
-                    _preserve_resume_aggregate_floor(
-                        restored,
-                        aggregate_tokens=None,
-                        reason=reason,
-                        item_usage_floor=CandidateUsageSummary(),
-                    )
-                existing_floor = _usage_component_floor(
-                    existing.usage
-                ).total_tokens
-                current_floor = _usage_component_floor(
-                    validated.usage
-                ).total_tokens
-                representative_state = (
-                    CandidateAttemptState.UNCERTAIN
-                    if (
-                        existing.state is CandidateAttemptState.UNCERTAIN
-                        or validated.state is CandidateAttemptState.UNCERTAIN
-                    )
-                    else existing.state
-                )
-                attempts_by_id[validated.attempt_id] = existing.model_copy(
-                    update={
-                        "state": representative_state,
-                        "usage": CandidateUsageSummary(
-                            total_tokens=max(existing_floor, current_floor)
-                        )
-                    }
-                )
-                if representative_state is CandidateAttemptState.UNCERTAIN:
-                    has_unresolved_uncertain_attempt = True
-                    existing_index = attempt_indexes_by_id.get(
-                        validated.attempt_id
-                    )
-                    if existing_index is not None:
-                        restored.attempts[existing_index] = restored.attempts[
-                            existing_index
-                        ].model_copy(update={"state": representative_state})
                 attempt_error_message = (
-                    attempt_error_message
-                    or (violation[0] if violation is not None else None)
-                    or "候选管线恢复 attempt 重复"
+                    attempt_error_message or "候选管线恢复 attempt 重复"
                 )
-                continue
-            attempts_by_id[validated.attempt_id] = validated
-            if violation is not None:
-                message, reason = violation
-                _preserve_resume_aggregate_floor(
-                    restored,
-                    aggregate_tokens=None,
-                    reason=reason,
-                    item_usage_floor=_usage_component_floor(validated.usage),
-                )
-                attempt_error_message = attempt_error_message or message
-                continue
-        except _UsageProjectionOverflow:
-            restored._record_usage_overflow()
-            attempt_error_message = (
-                attempt_error_message or "候选管线恢复 Token 超过 V1 上限"
-            )
-            continue
-        attempt_indexes_by_id[validated.attempt_id] = len(restored.attempts)
-        restored.attempts.append(validated)
-        has_unresolved_uncertain_attempt = bool(
-            has_unresolved_uncertain_attempt
-            or validated.state is CandidateAttemptState.UNCERTAIN
-        )
-        try:
+
             _refresh_restored_usage(restored)
         except _UsageProjectionOverflow:
             restored._record_usage_overflow()
@@ -2238,12 +2235,7 @@ def _resume_trace(
             ):
                 restored._record_usage_overflow()
                 continue
-        restored.unattributed_usage.append(validated)
-        try:
-            _refresh_restored_usage(restored)
-        except _UsageProjectionOverflow:
-            restored._record_usage_overflow()
-            break
+        _append_resume_unattributed_usage(restored, validated)
 
     has_usage_overflow = any(
         item.reason
