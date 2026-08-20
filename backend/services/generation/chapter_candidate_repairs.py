@@ -1004,7 +1004,10 @@ class ChapterCandidateRepairApplication:
                 receipt=existing,
                 require_result_projection=True,
             )
-            return StateCandidateRepairReceipt(generation=generation)
+            return StateCandidateRepairReceipt(
+                request_id=str(existing["_id"]),
+                generation=generation,
+            )
         if existing is not None and existing.get("state") == "dispatched":
             try:
                 generation = await self._recover_state_generation(
@@ -1032,7 +1035,10 @@ class ChapterCandidateRepairApplication:
                 claim_epoch=existing.get("claim_epoch"),
                 result_projection=_state_result_projection(generation),
             )
-            return StateCandidateRepairReceipt(generation=generation)
+            return StateCandidateRepairReceipt(
+                request_id=str(existing["_id"]),
+                generation=generation,
+            )
 
         source = await self._source(
             owner_id=owner_id,
@@ -1084,7 +1090,10 @@ class ChapterCandidateRepairApplication:
                 receipt=receipt,
                 require_result_projection=True,
             )
-            return StateCandidateRepairReceipt(generation=generation)
+            return StateCandidateRepairReceipt(
+                request_id=str(receipt["_id"]),
+                generation=generation,
+            )
         if receipt_state != "claimed":
             attempts = await self._state_attempts(
                 chapter_id=chapter_id,
@@ -1164,4 +1173,7 @@ class ChapterCandidateRepairApplication:
             claim_epoch=claim_epoch,
             result_projection=_state_result_projection(generation),
         )
-        return StateCandidateRepairReceipt(generation=generation)
+        return StateCandidateRepairReceipt(
+            request_id=str(receipt["_id"]),
+            generation=generation,
+        )

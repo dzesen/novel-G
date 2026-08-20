@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from itertools import islice
@@ -20,7 +22,11 @@ from backend.services.generation.chapter_finalization import (
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     AdherenceCandidateCheckpointV1,
+    CandidateCompletionProjectionV1,
     CandidatePipelineCheckpointV1,
+    CandidateSceneCoverageV1,
+    CandidateSourceIdentityV1,
+    CandidateTruncationProjectionV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
     parse_candidate_pipeline_checkpoint,
@@ -971,6 +977,11 @@ class StateCandidateRepairReceipt(_RepairReceipt):
     schema_version: Literal["state_candidate_repair_receipt.v1"] = (
         STATE_REPAIR_RECEIPT_SCHEMA
     )
+    request_id: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 @dataclass(frozen=True)
@@ -1092,7 +1103,7 @@ class ChapterCandidatePipelineDeps:
         Awaitable[ChapterGenerationResult],
     ]
     generate_state_candidate: Callable[
-        [str, dict[str, Any], ProseCandidateSource],
+        ...,
         Awaitable[ChapterGenerationResult],
     ]
     finalize: Callable[
@@ -1123,6 +1134,10 @@ class ChapterCandidatePipelineDeps:
             StateCandidateRepairRequest,
         ],
         Awaitable[StateCandidateRepairReceipt],
+    ] | None = None
+    persist_checkpoint: Callable[
+        [CandidatePipelineCheckpointV1],
+        Awaitable[None],
     ] | None = None
 
 
@@ -1157,6 +1172,216 @@ def _truncation(
     )
 
 
+@dataclass(frozen=True)
+class _RecordedStepEvidence:
+    attempt_ids: tuple[str, ...]
+    truncation: CandidateTruncationProjectionV1
+
+
+def _checkpoint_source(
+    source: ProseCandidateSource,
+) -> CandidateSourceIdentityV1:
+    return CandidateSourceIdentityV1(
+        schema_version="candidate_source_identity.v1",
+        source_run_id=source.source_run_id,
+        source_run_revision=source.source_run_revision,
+        source_content_digest=source.source_content_digest,
+    )
+
+
+def _checkpoint_id(
+    checkpoint: CandidatePipelineCheckpointV1,
+) -> str:
+    payload = checkpoint.model_dump(
+        mode="json",
+        exclude={"checkpoint_id"},
+    )
+    return hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _seal_checkpoint(
+    checkpoint: CandidatePipelineCheckpointV1,
+) -> CandidatePipelineCheckpointV1:
+    return parse_candidate_pipeline_checkpoint(checkpoint.model_copy(
+        update={"checkpoint_id": _checkpoint_id(checkpoint)}
+    ))
+
+
+def _checkpoint_common(
+    *,
+    chapter_id: str,
+    sequence: int,
+    source: ProseCandidateSource,
+    evidence: _RecordedStepEvidence,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "chapter_candidate_pipeline_checkpoint.v1",
+        "checkpoint_id": "0" * 64,
+        "sequence": sequence,
+        "chapter_id": chapter_id,
+        "source": _checkpoint_source(source),
+        "attempt_ids": evidence.attempt_ids,
+        "truncation": evidence.truncation,
+    }
+
+
+def _prose_checkpoint(
+    *,
+    chapter_id: str,
+    sequence: int,
+    source: ProseCandidateSource,
+    evidence: _RecordedStepEvidence,
+    cycle: int,
+    origin: Literal["initial", "repair"],
+) -> ProseCandidateCheckpointV1:
+    completion = source.completion
+    return _seal_checkpoint(ProseCandidateCheckpointV1(
+        **_checkpoint_common(
+            chapter_id=chapter_id,
+            sequence=sequence,
+            source=source,
+            evidence=evidence,
+        ),
+        cycle=cycle,
+        origin=origin,
+        completion=CandidateCompletionProjectionV1(
+            schema_version="candidate_completion_projection.v1",
+            status=completion.get("status"),
+            can_write_formal_prose=completion.get(
+                "can_write_formal_prose"
+            ),
+            finish_reason=completion.get("finish_reason"),
+        ),
+    ))
+
+
+def _adherence_checkpoint_projection(
+    adherence: Mapping[str, Any],
+) -> tuple[
+    Literal["pass", "warn", "fail"],
+    tuple[OutlineIssueCategory, ...],
+    tuple[CandidateSceneCoverageV1, ...],
+]:
+    verdict = adherence.get("verdict")
+    if verdict not in {"pass", "warn", "fail"}:
+        raise ChapterCandidatePipelineBlocked(
+            "章纲符合度 verdict 无效"
+        )
+    raw_issues = adherence.get("issues")
+    raw_coverage = adherence.get("scene_coverage")
+    if (
+        not isinstance(raw_issues, list)
+        or not isinstance(raw_coverage, list)
+        or len(raw_issues) > _MAX_RESUMED_ADHERENCE_ITEMS
+        or len(raw_coverage) > _MAX_RESUMED_ADHERENCE_ITEMS
+    ):
+        raise ChapterCandidatePipelineBlocked(
+            "章纲符合度持久投影无效"
+        )
+    categories: list[OutlineIssueCategory] = []
+    for item in raw_issues:
+        if not isinstance(item, Mapping):
+            raise ChapterCandidatePipelineBlocked(
+                "章纲符合度问题投影无效"
+            )
+        category = item.get("category")
+        if category not in _OUTLINE_ISSUE_CATEGORIES:
+            raise ChapterCandidatePipelineBlocked(
+                "章纲符合度问题类别无效"
+            )
+        if category not in categories:
+            categories.append(category)
+    coverage: list[CandidateSceneCoverageV1] = []
+    for item in raw_coverage:
+        if not isinstance(item, Mapping):
+            raise ChapterCandidatePipelineBlocked(
+                "章纲符合度场景投影无效"
+            )
+        coverage.append(CandidateSceneCoverageV1(
+            schema_version="candidate_scene_coverage.v1",
+            scene_index=item.get("scene_index"),
+            status=item.get("status"),
+        ))
+    return verdict, tuple(categories), tuple(coverage)
+
+
+def _adherence_checkpoint(
+    *,
+    chapter_id: str,
+    sequence: int,
+    source: ProseCandidateSource,
+    evidence: _RecordedStepEvidence,
+    cycle: int,
+    adherence: Mapping[str, Any],
+) -> AdherenceCandidateCheckpointV1:
+    verdict, categories, coverage = _adherence_checkpoint_projection(
+        adherence
+    )
+    return _seal_checkpoint(AdherenceCandidateCheckpointV1(
+        **_checkpoint_common(
+            chapter_id=chapter_id,
+            sequence=sequence,
+            source=source,
+            evidence=evidence,
+        ),
+        cycle=cycle,
+        verdict=verdict,
+        issue_categories=categories,
+        scene_coverage=coverage,
+    ))
+
+
+def _state_checkpoint(
+    *,
+    chapter_id: str,
+    sequence: int,
+    source: ProseCandidateSource,
+    evidence: _RecordedStepEvidence,
+    cycle: int,
+    origin: Literal["initial", "repair"],
+    request_id: str,
+    proposal_id: str,
+    dropped_reference_count: int,
+) -> StateCandidateCheckpointV1:
+    return _seal_checkpoint(StateCandidateCheckpointV1(
+        **_checkpoint_common(
+            chapter_id=chapter_id,
+            sequence=sequence,
+            source=source,
+            evidence=evidence,
+        ),
+        cycle=cycle,
+        origin=origin,
+        request_id=request_id,
+        proposal_id=proposal_id,
+        dropped_reference_count=dropped_reference_count,
+    ))
+
+
+def _initial_state_request_id(
+    *,
+    chapter_id: str,
+    source: ProseCandidateSource,
+) -> str:
+    identity = {
+        "schema_version": "chapter_candidate_state_request.v1",
+        "chapter_id": chapter_id,
+        "source_run_id": source.source_run_id,
+        "source_run_revision": source.source_run_revision,
+        "source_content_digest": source.source_content_digest,
+    }
+    return hashlib.sha256(json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")).hexdigest()
+
+
 @dataclass
 class _PipelineTrace:
     tokens: int = 0
@@ -1170,7 +1395,13 @@ class _PipelineTrace:
     source: ProseCandidateSource | None = None
     state_proposal_id: str | None = None
 
-    def record(self, step: str, result: ChapterGenerationResult) -> None:
+    def record(
+        self,
+        step: str,
+        result: ChapterGenerationResult,
+    ) -> _RecordedStepEvidence:
+        attempt_start = len(self.attempts)
+        truncation_start = len(self.truncations)
         try:
             usage, summaries = _project_result_evidence(result)
             self._record_evidence(usage, summaries)
@@ -1188,6 +1419,30 @@ class _PipelineTrace:
                 )
             self.truncations.append(truncation)
         self.completed_steps.append(step)
+        recorded_truncation = (
+            self.truncations[truncation_start]
+            if len(self.truncations) > truncation_start
+            else None
+        )
+        return _RecordedStepEvidence(
+            attempt_ids=tuple(
+                item.attempt_id
+                for item in self.attempts[attempt_start:]
+            ),
+            truncation=CandidateTruncationProjectionV1(
+                schema_version="candidate_truncation_projection.v1",
+                truncated_section_count=(
+                    recorded_truncation.truncated_section_count
+                    if recorded_truncation is not None
+                    else 0
+                ),
+                dropped_item_count=(
+                    recorded_truncation.dropped_item_count
+                    if recorded_truncation is not None
+                    else 0
+                ),
+            ),
+        )
 
     def record_failure(self, exc: Exception) -> None:
         outcome = getattr(exc, "outcome", None)
@@ -3009,6 +3264,14 @@ class ChapterCandidatePipeline:
     def __init__(self, deps: ChapterCandidatePipelineDeps) -> None:
         self._deps = deps
 
+    async def _persist_checkpoint(
+        self,
+        checkpoint: CandidatePipelineCheckpointV1,
+    ) -> None:
+        persist = self._deps.persist_checkpoint
+        if persist is not None:
+            await persist(parse_candidate_pipeline_checkpoint(checkpoint))
+
     async def _apply_prose_repair(
         self,
         *,
@@ -3035,11 +3298,21 @@ class ChapterCandidatePipeline:
         )
         if not isinstance(receipt, ProseCandidateRepairReceipt):
             raise ChapterCandidatePipelineBlocked("正文修复回执版本无效")
-        trace.record(
+        evidence = trace.record(
             f"prose_repair_{request.cycle}",
             receipt.generation,
         )
         _repaired_prose, repaired_source = _validate_prose_candidate(receipt)
+        trace.source = repaired_source
+        if self._deps.persist_checkpoint is not None:
+            await self._persist_checkpoint(_prose_checkpoint(
+                chapter_id=chapter_id,
+                sequence=len(trace.completed_steps),
+                source=repaired_source,
+                evidence=evidence,
+                cycle=request.cycle,
+                origin="repair",
+            ))
         if not _prose_repair_advanced_revision(source, repaired_source):
             raise ChapterCandidatePipelineBlocked(
                 "正文修复没有产生新候选",
@@ -3049,7 +3322,6 @@ class ChapterCandidatePipeline:
             repaired_source.source_content_digest
             == source.source_content_digest
         )
-        trace.source = repaired_source
         return repaired_source, same_digest
 
     async def run(
@@ -3113,9 +3385,18 @@ class ChapterCandidatePipeline:
                 novel_id,
                 chapter,
             )
-            trace.record("prose", generated.generation)
+            evidence = trace.record("prose", generated.generation)
             _prose, source = _validate_prose_candidate(generated)
             trace.source = source
+            if self._deps.persist_checkpoint is not None:
+                await self._persist_checkpoint(_prose_checkpoint(
+                    chapter_id=chapter_id,
+                    sequence=len(trace.completed_steps),
+                    source=source,
+                    evidence=evidence,
+                    cycle=0,
+                    origin="initial",
+                ))
         else:
             source = resume.source
             if resume.state is not None:
@@ -3173,7 +3454,7 @@ class ChapterCandidatePipeline:
                     source,
                 )
                 review_count += 1
-                trace.record(
+                review_evidence = trace.record(
                     (
                         "outline_adherence"
                         if review_count == 1
@@ -3184,6 +3465,7 @@ class ChapterCandidatePipeline:
             else:
                 reviewed = pending_review
                 pending_review = None
+                review_evidence = None
             if reviewed.stage is not ChapterGenerationStage.OUTLINE_ADHERENCE:
                 raise ChapterCandidatePipelineBlocked(
                     "章纲符合度返回了错误阶段"
@@ -3197,6 +3479,18 @@ class ChapterCandidatePipeline:
                 raise ChapterCandidatePipelineBlocked(
                     "章纲符合度没有绑定正文候选"
                 )
+            if (
+                review_evidence is not None
+                and self._deps.persist_checkpoint is not None
+            ):
+                await self._persist_checkpoint(_adherence_checkpoint(
+                    chapter_id=chapter_id,
+                    sequence=len(trace.completed_steps),
+                    source=source,
+                    evidence=review_evidence,
+                    cycle=trace.repair_cycles_used,
+                    adherence=adherence,
+                ))
             try:
                 adherence_metadata = _validate_adherence_gate(
                     adherence,
@@ -3234,13 +3528,25 @@ class ChapterCandidatePipeline:
 
         if resume is not None and resume.state is not None:
             state_result = resume.state
+            state_checkpoint_context = None
         else:
+            state_request_id = _initial_state_request_id(
+                chapter_id=chapter_id,
+                source=source,
+            )
             state_result = await self._deps.generate_state_candidate(
                 novel_id,
                 chapter,
                 source,
+                request_id=state_request_id,
             )
-            trace.record("state", state_result)
+            state_evidence = trace.record("state", state_result)
+            state_checkpoint_context = (
+                state_evidence,
+                "initial",
+                0,
+                state_request_id,
+            )
         while True:
             state, proposal_id, _acceptance_token, consistency_issues = (
                 _validate_state_shape(state_result)
@@ -3255,6 +3561,30 @@ class ChapterCandidatePipeline:
                 )
             trace.state_proposal_id = proposal_id
             dropped = dict(state_result.dropped or {})
+            if (
+                state_checkpoint_context is not None
+                and self._deps.persist_checkpoint is not None
+            ):
+                (
+                    state_evidence,
+                    state_origin,
+                    state_cycle,
+                    state_request_id,
+                ) = state_checkpoint_context
+                await self._persist_checkpoint(_state_checkpoint(
+                    chapter_id=chapter_id,
+                    sequence=len(trace.completed_steps),
+                    source=source,
+                    evidence=state_evidence,
+                    cycle=state_cycle,
+                    origin=state_origin,
+                    request_id=state_request_id,
+                    proposal_id=proposal_id,
+                    dropped_reference_count=_dropped_reference_count(
+                        dropped
+                    ),
+                ))
+            state_checkpoint_context = None
             if not consistency_issues and not dropped:
                 break
             if self._deps.repair_state_candidate is None:
@@ -3287,10 +3617,27 @@ class ChapterCandidatePipeline:
             if not isinstance(receipt, StateCandidateRepairReceipt):
                 raise ChapterCandidatePipelineBlocked("状态修复回执版本无效")
             state_result = receipt.generation
-            trace.record(f"state_repair_{cycle}", state_result)
+            state_evidence = trace.record(
+                f"state_repair_{cycle}",
+                state_result,
+            )
             _next_state, next_proposal_id, _next_token, _next_issues = (
                 _validate_state_shape(state_result)
             )
+            if self._deps.persist_checkpoint is not None:
+                await self._persist_checkpoint(_state_checkpoint(
+                    chapter_id=chapter_id,
+                    sequence=len(trace.completed_steps),
+                    source=source,
+                    evidence=state_evidence,
+                    cycle=cycle,
+                    origin="repair",
+                    request_id=receipt.request_id,
+                    proposal_id=next_proposal_id,
+                    dropped_reference_count=_dropped_reference_count(
+                        state_result.dropped
+                    ),
+                ))
             if next_proposal_id == proposal_id:
                 raise ChapterCandidatePipelineBlocked(
                     "状态修复没有产生新候选",
