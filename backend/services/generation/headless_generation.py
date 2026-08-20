@@ -419,6 +419,10 @@ async def generate_outline(
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    generation_plan: GenerationPlan | None = None,
+    expected_narrative_revision: int | None = None,
+    mutation_idempotency_key: str | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
     execution = await _chapter_capability_registry().execute(
         "chapter_outline",
@@ -428,6 +432,9 @@ async def generate_outline(
             authority=AcceptanceAuthority.SYSTEM,
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
+            generation_plan=generation_plan,
+            expected_narrative_revision=expected_narrative_revision,
+            mutation_idempotency_key=mutation_idempotency_key,
         ),
         call=CapabilityCall(source="job_engine"),
     )
@@ -474,6 +481,8 @@ async def generate_prose_candidate(
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    generation_plan: GenerationPlan | None = None,
 ) -> GeneratedProseCandidate:
     """Generate a persisted ProseRun candidate without accepting formal prose."""
     execution = await _chapter_capability_registry().execute(
@@ -485,6 +494,7 @@ async def generate_prose_candidate(
             acceptance_timing=AcceptanceTiming.DEFERRED,
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
+            generation_plan=generation_plan,
         ),
         call=CapabilityCall(source="job_engine"),
     )

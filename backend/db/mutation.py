@@ -587,6 +587,34 @@ async def commit_mutation(
     return await engine.execute(command)
 
 
+async def mutation_completed(
+    novel_id: str,
+    idempotency_key: str,
+    *,
+    operation: str,
+) -> bool:
+    """Read one immutable mutation outcome without replaying its command."""
+
+    normalized_key = str(idempotency_key or "").strip()
+    normalized_operation = str(operation or "").strip()
+    if not normalized_key or not normalized_operation:
+        raise ValueError("mutation completion identity is required")
+    journal = await get_database()[collections.MUTATION_JOURNALS].find_one(
+        {
+            "novel_id": to_object_id(novel_id),
+            "idempotency_key": normalized_key,
+        },
+        projection={"operation": 1, "status": 1},
+    )
+    if journal is None:
+        return False
+    if str(journal.get("operation") or "") != normalized_operation:
+        raise MutationConflictError(
+            "The idempotency key is bound to a different mutation operation"
+        )
+    return str(journal.get("status") or "") == "completed"
+
+
 async def list_recoverable_mutations(novel_id: str | None = None) -> list[dict[str, Any]]:
     query: dict[str, Any] = {
         "status": {"$in": ["intent", "running", "failed", "unsupported"]}

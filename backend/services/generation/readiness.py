@@ -19,6 +19,8 @@ from backend.services.generation.chapter_finalization import (
 )
 from backend.services.generation.chapter_candidate_authorization import (
     CANDIDATE_PIPELINE_REVISION,
+    CandidateJobGenerationPlans,
+    build_candidate_job_execution_authorization,
     build_chapter_candidate_repair_authorization,
     parse_candidate_repair_authorization,
 )
@@ -974,10 +976,15 @@ def _base_structured_generation_budget(
     )
 
 
-def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
+def _plan_work(
+    chapters: list[dict[str, Any]],
+    generation_params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     from backend.services.generation.headless_generation import (
         CHAPTER_OUTLINE_STEP,
         CHAPTER_OUTLINE_WORKFLOW,
+        OUTLINE_ADHERENCE_STEP,
+        PROSE_REMEDIATION_WORKFLOW,
         PROSE_STEP,
         PROSE_WORKFLOW,
         STATE_STEP,
@@ -994,30 +1001,50 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
 
     runtime = create_generation_runtime()
     plans = []
+    candidate_chapters = [
+        chapter for chapter in chapters if not _has_text(chapter, "content")
+    ]
+    outline_plan = None
     if any(not chapter.get("outline") for chapter in chapters):
-        plans.append(runtime.plan_structured(
+        outline_plan = runtime.plan_structured(
             WorkflowStepTarget(CHAPTER_OUTLINE_WORKFLOW, CHAPTER_OUTLINE_STEP)
-        ))
+        )
+        plans.append(outline_plan)
+    prose_text_plan = None
     if any(not _has_text(chapter, "content") for chapter in chapters):
-        plans.append(runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)))
+        prose_text_plan = runtime.plan_text(
+            WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+        )
+        plans.append(prose_text_plan)
+    state_plan = None
     if any(
         str((chapter.get("state_completion") or {}).get("status") or "missing")
         not in REUSABLE_STATE_COMPLETION_STATUSES
         for chapter in chapters
     ):
-        plans.append(runtime.plan_structured(WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)))
+        state_plan = runtime.plan_structured(
+            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        )
+        plans.append(state_plan)
+    adherence_plan = (
+        runtime.plan_structured(
+            WorkflowStepTarget(
+                PROSE_REMEDIATION_WORKFLOW,
+                OUTLINE_ADHERENCE_STEP,
+            )
+        )
+        if candidate_chapters
+        else None
+    )
+    if adherence_plan is not None:
+        plans.append(adherence_plan)
+    if candidate_chapters and state_plan is None:
+        state_plan = runtime.plan_structured(
+            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        )
+        plans.append(state_plan)
     revisions = sorted({plan.config_revision for plan in plans})
     capabilities = sorted({plan.capability_snapshot for plan in plans})
-    prose_text_plan = next(
-        (
-            plan
-            for plan in plans
-            if isinstance(plan.target, WorkflowStepTarget)
-            and plan.target.workflow_name == PROSE_WORKFLOW
-            and plan.target.step_name == PROSE_STEP
-        ),
-        None,
-    )
     single_chapters = 0
     segmented_chapters = 0
     unknown_outline_chapters = 0
@@ -1085,6 +1112,25 @@ def _plan_work(chapters: list[dict[str, Any]]) -> dict[str, Any]:
         "providers": sorted({plan.provider_alias for plan in plans}),
         "config_revision": "|".join(revisions),
         "capability_snapshot": "|".join(capabilities),
+        "chapter_candidate_job_execution_authorization": (
+            build_candidate_job_execution_authorization(
+                chapters,
+                generation_params,
+                plans=CandidateJobGenerationPlans(
+                    outline=(
+                        outline_plan
+                        if any(
+                            not chapter.get("outline")
+                            for chapter in candidate_chapters
+                        )
+                        else None
+                    ),
+                    prose=prose_text_plan,
+                    adherence=adherence_plan,
+                    state=state_plan if candidate_chapters else None,
+                ),
+            )
+        ),
         "prose_strategy": {
             "single_call_chapters": single_chapters,
             "scene_segment_chapters": segmented_chapters,
@@ -1117,7 +1163,7 @@ def _plan_work_with_prose_continuation(
         create_generation_runtime,
     )
 
-    base = _plan_work(chapters)
+    base = _plan_work(chapters, generation_params)
     values = dict(generation_params or {})
     structured_budget = _base_structured_generation_budget(chapters, values)
     chapters_needing_prose = [

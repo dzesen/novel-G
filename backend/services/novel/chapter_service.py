@@ -435,6 +435,8 @@ class ChapterService:
         outline: Dict[str, Any],
         *,
         edited_by_human: bool = False,
+        expected_narrative_revision: int | None = None,
+        idempotency_key: str | None = None,
     ) -> Dict[str, Any]:
         """接受章节细纲预览：创建 new_threads 并写入 chapter.outline（设计 §3.2 / §5.2）。
 
@@ -532,11 +534,29 @@ class ChapterService:
             ).encode("utf-8")
         ).hexdigest()
 
+        if expected_narrative_revision is not None and (
+            isinstance(expected_narrative_revision, bool)
+            or not isinstance(expected_narrative_revision, int)
+            or expected_narrative_revision < 0
+        ):
+            raise ValueError("expected narrative revision is invalid")
+        normalized_idempotency_key = str(idempotency_key or "").strip()
+        if idempotency_key is not None and (
+            not normalized_idempotency_key
+            or normalized_idempotency_key != idempotency_key
+            or len(normalized_idempotency_key) > 240
+        ):
+            raise ValueError("outline idempotency key is invalid")
+
         return await commit_mutation(
             MutationCommand(
                 novel_id=novel_id,
-                idempotency_key=f"accept-outline:{chapter_id}:{digest}",
+                idempotency_key=(
+                    normalized_idempotency_key
+                    or f"accept-outline:{chapter_id}:{digest}"
+                ),
                 operation="accept_chapter_outline",
+                expected_narrative_revision=expected_narrative_revision,
                 payload={
                     "chapter_id": chapter_id,
                     "volume_id": str(chapter["volume_id"]),

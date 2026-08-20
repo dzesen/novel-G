@@ -11,10 +11,16 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field as ModelField
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field as ModelField,
+    StrictInt,
+    field_validator,
+)
 
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
@@ -169,6 +175,22 @@ def _validate_frozen_structured_plan(
     return plan
 
 
+def _validate_frozen_text_plan(
+    plan: GenerationPlan,
+    *,
+    workflow: str,
+    step: str,
+) -> GenerationPlan:
+    target = WorkflowStepTarget(workflow, step)
+    if (
+        not isinstance(plan, GenerationPlan)
+        or plan.target != target
+        or plan.reviewer_alias is not None
+    ):
+        raise ValueError("冻结的文本生成计划与章节步骤不匹配")
+    return plan
+
+
 class AcceptanceAuthority(str, Enum):
     """调用方获准执行的落库级别。"""
 
@@ -231,14 +253,34 @@ class _ChapterGenerationCommand(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
 
+_NarrativeRevision = Annotated[
+    StrictInt,
+    ModelField(ge=0, le=9_223_372_036_854_775_807),
+]
+
+
 class OutlineGenerationCommand(_ChapterGenerationCommand):
     novel_id: str
     chapter_id: str
     authority: AcceptanceAuthority = AcceptanceAuthority.PREVIEW
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
+    generation_plan: GenerationPlan | None = None
+    expected_narrative_revision: _NarrativeRevision | None = None
+    mutation_idempotency_key: str | None = ModelField(
+        default=None,
+        min_length=1,
+        max_length=240,
+    )
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
+
+    @field_validator("mutation_idempotency_key")
+    @classmethod
+    def validate_mutation_idempotency_key(cls, value: str | None) -> str | None:
+        if value is not None and value != value.strip():
+            raise ValueError("outline mutation idempotency key is invalid")
+        return value
 
 
 class ProseGenerationCommand(_ChapterGenerationCommand):
@@ -249,6 +291,7 @@ class ProseGenerationCommand(_ChapterGenerationCommand):
     owner_id: str | None = None
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
+    generation_plan: GenerationPlan | None = None
     resume_run_id: str | None = None
     expected_run_revision: int | None = None
     confirm_uncertain_retry: bool = False
@@ -370,6 +413,7 @@ class _PreparedOutline:
     gen_kwargs: dict[str, Any]
     roster: dict[str, Any]
     runtime: Any
+    plan: GenerationPlan | None
     truncation: dict[str, Any]
 
 
@@ -560,6 +604,15 @@ class ChapterGenerationApplicationService:
             attempt_scope=command.attempt_scope,
             **runtime_kwargs,
         )
+        plan = (
+            _validate_frozen_structured_plan(
+                command.generation_plan,
+                workflow=CHAPTER_OUTLINE_WORKFLOW,
+                step=CHAPTER_OUTLINE_STEP,
+            )
+            if command.generation_plan is not None
+            else None
+        )
         return _PreparedOutline(
             command=command,
             params={
@@ -574,6 +627,7 @@ class ChapterGenerationApplicationService:
             gen_kwargs=chapter_outline_generation_kwargs(gen_kwargs),
             roster=roster,
             runtime=runtime,
+            plan=plan,
             truncation={
                 "truncated_sections": list(context.truncated_sections),
                 "dropped_item_counts": dict(context.dropped_item_counts),
@@ -601,7 +655,14 @@ class ChapterGenerationApplicationService:
             params=prepared.params,
             gen_kwargs=prepared.gen_kwargs,
             cached={},
-            deps=WorkflowDeps(runtime=prepared.runtime),
+            deps=WorkflowDeps(
+                runtime=prepared.runtime,
+                structured_plans=(
+                    {CHAPTER_OUTLINE_STEP: prepared.plan}
+                    if prepared.plan is not None
+                    else {}
+                ),
+            ),
             request_id=command.request_id or uuid4().hex[:8],
             is_disconnected=command.is_disconnected,
             log_partial_on_disconnect=self._deps.log_partial_on_disconnect,
@@ -651,7 +712,20 @@ class ChapterGenerationApplicationService:
 
             accepted = False
             if command.authority is AcceptanceAuthority.SYSTEM:
-                await self._deps.accept_outline(command.chapter_id, cleaned)
+                if (
+                    command.expected_narrative_revision is not None
+                    or command.mutation_idempotency_key is not None
+                ):
+                    await self._deps.accept_outline(
+                        command.chapter_id,
+                        cleaned,
+                        expected_narrative_revision=(
+                            command.expected_narrative_revision
+                        ),
+                        idempotency_key=command.mutation_idempotency_key,
+                    )
+                else:
+                    await self._deps.accept_outline(command.chapter_id, cleaned)
                 accepted = True
             usage = dict(cleaned_data.get("usage") or {})
             attempts = list(cleaned_data.get("attempts") or [])
@@ -1198,17 +1272,24 @@ class ChapterGenerationApplicationService:
             **runtime_kwargs,
         )
         legacy_service = None
-        try:
-            plan = runtime.plan_text(
-                WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+        if command.generation_plan is not None:
+            plan = _validate_frozen_text_plan(
+                command.generation_plan,
+                workflow=PROSE_WORKFLOW,
+                step=PROSE_STEP,
             )
-        except ValueError:
-            legacy_service = self._deps.get_legacy_service(
-                PROSE_WORKFLOW,
-                PROSE_STEP,
-            )
-            runtime = None
-            plan = None
+        else:
+            try:
+                plan = runtime.plan_text(
+                    WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
+                )
+            except ValueError:
+                legacy_service = self._deps.get_legacy_service(
+                    PROSE_WORKFLOW,
+                    PROSE_STEP,
+                )
+                runtime = None
+                plan = None
 
         policy_value = command.continuation_policy
         if policy_value is None:

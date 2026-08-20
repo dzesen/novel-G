@@ -348,23 +348,36 @@ async def _handle_candidate_chapter_failure(
     checkpoints = latest.get("candidate_pipeline_checkpoints")
     preserve = isinstance(checkpoints, list) and bool(checkpoints)
     has_uncertain = bool(latest.get("has_uncertain_attempts"))
+    candidate_code = str(getattr(exc, "code", "") or "")
+    authorization_scope_increased = (
+        candidate_code == "authorization_scope_increased"
+    )
     source_changed = diagnostic["category"] == "source_changed"
-    await repo.update_job_fields(job_id, {
+    source_changed = source_changed or (
+        candidate_code == "candidate_narrative_revision_changed"
+    )
+    fields = {
         "status": (
             "interrupted"
             if has_uncertain
             else "paused"
-            if source_changed
+            if source_changed or authorization_scope_increased
             else "failed"
         ),
         "pause_reason": (
             "uncertain_attempt"
             if has_uncertain
+            else "authorization_scope_increased"
+            if authorization_scope_increased
             else "source_changed"
             if source_changed
             else None
         ),
-        "current_chapter_id": chapter_id if preserve else None,
+        "current_chapter_id": (
+            chapter_id
+            if preserve or authorization_scope_increased
+            else None
+        ),
         "active_slot": None,
         "error": {
             "step": "candidate_pipeline",
@@ -372,7 +385,15 @@ async def _handle_candidate_chapter_failure(
             "message": str(exc),
             "attempts": attempts,
         },
-    })
+    }
+    if source_changed:
+        fields["authorization_confirmation_required"] = {
+            "status": "source_changed",
+            "requires_confirmation": True,
+            "chapter_id": chapter_id,
+            "code": candidate_code or "chapter_or_narrative_changed",
+        }
+    await repo.update_job_fields(job_id, fields)
 
 
 async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo=generation_job_repo) -> None:

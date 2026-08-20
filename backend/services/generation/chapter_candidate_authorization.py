@@ -42,6 +42,7 @@ from backend.services.generation.provider_budget import (
 from backend.services.llm.generation_runtime import (
     GenerationPlan,
     STRUCTURED_REQUEST_BUDGET_PROTOCOL,
+    StructuredOutputMode,
     WorkflowStepTarget,
 )
 
@@ -49,8 +50,12 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v3"
 )
-CANDIDATE_PIPELINE_REVISION = 8
+CANDIDATE_PIPELINE_REVISION = 9
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
+CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
+    "chapter_candidate_job_execution_authorization.v1"
+)
+CANDIDATE_JOB_GENERATION_PLAN_SCHEMA = "candidate_job_generation_plan.v1"
 PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
 PROSE_REMEDIATION_MAX_STEPS = 3
 PROSE_REMEDIATION_MAX_PLANNER_CALLS = 3
@@ -190,6 +195,109 @@ class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
         )
         if self.max_tokens_per_call != expected:
             raise ValueError("structured generation token bound changed")
+        return self
+
+
+class CandidateJobGenerationPlan(_ClosedAuthorizationModel):
+    """Closed, reconstructable identity for one initial candidate Job call."""
+
+    schema_version: Literal["candidate_job_generation_plan.v1"]
+    runtime_budget_protocol: Literal["structured_request_budget.v2"]
+    call_kind: Literal["structured", "text"]
+    workflow: str = Field(min_length=1, max_length=160)
+    step: str = Field(min_length=1, max_length=160)
+    provider_alias: str = Field(min_length=1, max_length=160)
+    provider_model: str = Field(min_length=1, max_length=240)
+    structured_output_mode: Literal[
+        "prompt_json",
+        "json_object",
+        "schema_enforced",
+    ]
+    reviewer_alias: str | None = Field(default=None, min_length=1, max_length=160)
+    timeout_seconds: _PositiveInt | None = None
+    config_revision: str = Field(min_length=1, max_length=240)
+    capability_snapshot: str = Field(min_length=1, max_length=240)
+    max_semantic_attempts: _PositiveInt
+    max_output_tokens: _PositiveInt | None = None
+    max_context_tokens: _PositiveInt | None = None
+    thinking_mode: Literal["enabled", "disabled"] | None = None
+
+    @model_validator(mode="after")
+    def validate_call_kind(self) -> "CandidateJobGenerationPlan":
+        if self.call_kind == "text":
+            if self.reviewer_alias is not None:
+                raise ValueError("text generation plan cannot use a reviewer")
+        elif self.thinking_mode is not None:
+            raise ValueError("structured generation plan cannot use thinking mode")
+        return self
+
+
+class CandidateJobExecutionAuthorization(_ClosedAuthorizationModel):
+    """Frozen Provider plans for the initial candidate-only chapter chain."""
+
+    schema_version: Literal[
+        "chapter_candidate_job_execution_authorization.v1"
+    ]
+    generation_params_digest: _Sha256
+    eligible_chapter_count: _NonNegativeInt
+    eligible_chapter_ids_digest: _Sha256
+    missing_outline_chapter_count: _NonNegativeInt
+    outline: CandidateJobGenerationPlan | None
+    prose: CandidateJobGenerationPlan | None
+    adherence: CandidateJobGenerationPlan | None
+    state: CandidateJobGenerationPlan | None
+
+    @model_validator(mode="after")
+    def validate_required_plans(self) -> "CandidateJobExecutionAuthorization":
+        from backend.services.generation.chapter_generation_application import (
+            CHAPTER_OUTLINE_STEP,
+            CHAPTER_OUTLINE_WORKFLOW,
+            OUTLINE_ADHERENCE_STEP,
+            PROSE_REMEDIATION_WORKFLOW,
+            PROSE_STEP,
+            PROSE_WORKFLOW,
+            STATE_STEP,
+            STATE_WORKFLOW,
+        )
+
+        if self.missing_outline_chapter_count > self.eligible_chapter_count:
+            raise ValueError("candidate outline count exceeds eligible chapters")
+        required = (self.prose, self.adherence, self.state)
+        if self.eligible_chapter_count == 0:
+            if self.missing_outline_chapter_count or self.outline is not None or any(
+                item is not None for item in required
+            ):
+                raise ValueError("inactive candidate execution authority is not empty")
+            return self
+        if any(item is None for item in required):
+            raise ValueError("candidate execution authority is incomplete")
+        if (self.outline is not None) != bool(self.missing_outline_chapter_count):
+            raise ValueError("candidate outline authority changed")
+        expected = (
+            (
+                self.outline,
+                "structured",
+                CHAPTER_OUTLINE_WORKFLOW,
+                CHAPTER_OUTLINE_STEP,
+            ),
+            (self.prose, "text", PROSE_WORKFLOW, PROSE_STEP),
+            (
+                self.adherence,
+                "structured",
+                PROSE_REMEDIATION_WORKFLOW,
+                OUTLINE_ADHERENCE_STEP,
+            ),
+            (self.state, "structured", STATE_WORKFLOW, STATE_STEP),
+        )
+        for plan, kind, workflow, step in expected:
+            if plan is None:
+                continue
+            if (
+                plan.call_kind != kind
+                or plan.workflow != workflow
+                or plan.step != step
+            ):
+                raise ValueError("candidate execution plan target changed")
         return self
 
 
@@ -585,6 +693,259 @@ def _mapping_digest(value: Mapping[str, Any] | None) -> str:
     except (TypeError, ValueError) as exc:
         raise ValueError("candidate repair generation params are invalid") from exc
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _candidate_job_generation_params_digest(
+    value: Mapping[str, Any] | None,
+) -> str:
+    public = dict(value or {})
+    public.pop("_internal_readiness_prose_prompt_input_bounds", None)
+    return _mapping_digest(public)
+
+
+@dataclass(frozen=True)
+class CandidateJobGenerationPlans:
+    outline: GenerationPlan | None
+    prose: GenerationPlan | None
+    adherence: GenerationPlan | None
+    state: GenerationPlan | None
+
+
+def _candidate_job_plan_projection(
+    plan: GenerationPlan,
+    *,
+    call_kind: Literal["structured", "text"],
+) -> CandidateJobGenerationPlan:
+    if not isinstance(plan, GenerationPlan) or not isinstance(
+        plan.target, WorkflowStepTarget
+    ):
+        raise ValueError("candidate Job GenerationPlan is invalid")
+    return CandidateJobGenerationPlan.model_validate({
+        "schema_version": CANDIDATE_JOB_GENERATION_PLAN_SCHEMA,
+        "runtime_budget_protocol": STRUCTURED_REQUEST_BUDGET_PROTOCOL,
+        "call_kind": call_kind,
+        "workflow": plan.target.workflow_name,
+        "step": plan.target.step_name,
+        "provider_alias": plan.provider_alias,
+        "provider_model": plan.provider_model,
+        "structured_output_mode": plan.mode.value,
+        "reviewer_alias": plan.reviewer_alias,
+        "timeout_seconds": plan.timeout_seconds,
+        "config_revision": plan.config_revision,
+        "capability_snapshot": plan.capability_snapshot,
+        "max_semantic_attempts": plan.max_semantic_attempts,
+        "max_output_tokens": plan.max_output_tokens,
+        "max_context_tokens": plan.max_context_tokens,
+        "thinking_mode": plan.thinking_mode,
+    })
+
+
+def generation_plan_from_candidate_snapshot(
+    value: CandidateJobGenerationPlan,
+) -> GenerationPlan:
+    """Rebuild the immutable runtime plan without consulting live config."""
+
+    if not isinstance(value, CandidateJobGenerationPlan):
+        raise ValueError("candidate Job plan snapshot is invalid")
+    return GenerationPlan(
+        target=WorkflowStepTarget(value.workflow, value.step),
+        provider_alias=value.provider_alias,
+        timeout_seconds=value.timeout_seconds,
+        mode=StructuredOutputMode(value.structured_output_mode),
+        reviewer_alias=value.reviewer_alias,
+        config_revision=value.config_revision,
+        capability_snapshot=value.capability_snapshot,
+        max_semantic_attempts=value.max_semantic_attempts,
+        provider_model=value.provider_model,
+        max_output_tokens=value.max_output_tokens,
+        max_context_tokens=value.max_context_tokens,
+        thinking_mode=value.thinking_mode,
+    )
+
+
+def parse_candidate_job_execution_authorization(
+    value: Any,
+) -> CandidateJobExecutionAuthorization:
+    try:
+        parsed = CandidateJobExecutionAuthorization.model_validate(value)
+    except ValidationError as exc:
+        raise ValueError("candidate Job execution authorization is invalid") from exc
+    raw_json = _canonical_json_projection(
+        dict(value) if isinstance(value, Mapping) else value,
+        field="candidate Job execution authorization",
+    )
+    canonical_json = _canonical_json_projection(
+        parsed.model_dump(mode="json"),
+        field="canonical candidate Job execution authorization",
+    )
+    if raw_json != canonical_json:
+        raise ValueError(
+            "candidate Job execution authorization requires exact JSON types"
+        )
+    return parsed
+
+
+def plan_candidate_job_generation(
+    *,
+    needs_outline: bool,
+    active: bool,
+) -> CandidateJobGenerationPlans:
+    """Resolve every initial candidate Provider plan from one runtime seam."""
+
+    if not active:
+        return CandidateJobGenerationPlans(None, None, None, None)
+    from backend.services.generation.chapter_generation_application import (
+        CHAPTER_OUTLINE_STEP,
+        CHAPTER_OUTLINE_WORKFLOW,
+        OUTLINE_ADHERENCE_STEP,
+        PROSE_REMEDIATION_WORKFLOW,
+        PROSE_STEP,
+        PROSE_WORKFLOW,
+        STATE_STEP,
+        STATE_WORKFLOW,
+    )
+    from backend.services.llm.generation_runtime import create_generation_runtime
+
+    runtime = create_generation_runtime(max_provider_retries=0)
+    return CandidateJobGenerationPlans(
+        outline=(
+            runtime.plan_structured(
+                WorkflowStepTarget(
+                    CHAPTER_OUTLINE_WORKFLOW,
+                    CHAPTER_OUTLINE_STEP,
+                )
+            )
+            if needs_outline
+            else None
+        ),
+        prose=runtime.plan_text(WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)),
+        adherence=runtime.plan_structured(
+            WorkflowStepTarget(
+                PROSE_REMEDIATION_WORKFLOW,
+                OUTLINE_ADHERENCE_STEP,
+            )
+        ),
+        state=runtime.plan_structured(
+            WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+        ),
+    )
+
+
+def build_candidate_job_execution_authorization(
+    chapters: Sequence[Mapping[str, Any]],
+    generation_params: Mapping[str, Any] | None = None,
+    *,
+    plans: CandidateJobGenerationPlans | None = None,
+) -> dict[str, Any]:
+    eligible_ids = _eligible_chapter_ids(chapters)
+    missing_outline_count = sum(
+        not bool(chapter.get("outline"))
+        for chapter in chapters
+        if not str(chapter.get("content") or "").strip()
+    )
+    resolved = plans or plan_candidate_job_generation(
+        needs_outline=bool(missing_outline_count),
+        active=bool(eligible_ids),
+    )
+    projection = CandidateJobExecutionAuthorization.model_validate({
+        "schema_version": CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA,
+        "generation_params_digest": _candidate_job_generation_params_digest(
+            generation_params
+        ),
+        "eligible_chapter_count": len(eligible_ids),
+        "eligible_chapter_ids_digest": _chapter_ids_digest(eligible_ids),
+        "missing_outline_chapter_count": missing_outline_count,
+        "outline": (
+            _candidate_job_plan_projection(
+                resolved.outline,
+                call_kind="structured",
+            ).model_dump(mode="json")
+            if resolved.outline is not None
+            else None
+        ),
+        "prose": (
+            _candidate_job_plan_projection(
+                resolved.prose,
+                call_kind="text",
+            ).model_dump(mode="json")
+            if resolved.prose is not None
+            else None
+        ),
+        "adherence": (
+            _candidate_job_plan_projection(
+                resolved.adherence,
+                call_kind="structured",
+            ).model_dump(mode="json")
+            if resolved.adherence is not None
+            else None
+        ),
+        "state": (
+            _candidate_job_plan_projection(
+                resolved.state,
+                call_kind="structured",
+            ).model_dump(mode="json")
+            if resolved.state is not None
+            else None
+        ),
+    })
+    return projection.model_dump(mode="json")
+
+
+def validate_candidate_job_execution_authorization(
+    readiness: Mapping[str, Any],
+    *,
+    chapter_id: str,
+    generation_params: Mapping[str, Any] | None,
+    live_plans: CandidateJobGenerationPlans,
+) -> CandidateJobExecutionAuthorization:
+    """Match live Provider plans to one signed readiness before reservation."""
+
+    if not readiness_chapter_uses_candidate_pipeline(
+        readiness,
+        chapter_id=chapter_id,
+    ):
+        raise ValueError("chapter has no candidate Job execution authority")
+    planning = readiness.get("planning")
+    if not isinstance(planning, Mapping):
+        raise ValueError("candidate Job readiness planning is invalid")
+    authorization = parse_candidate_job_execution_authorization(
+        planning.get("chapter_candidate_job_execution_authorization")
+    )
+    work = readiness.get("work")
+    raw_chapters = work.get("chapters") if isinstance(work, Mapping) else None
+    if not isinstance(raw_chapters, list):
+        raise ValueError("candidate Job readiness worklist is invalid")
+    eligible = tuple(
+        str(item.get("chapter_id") or "")
+        for item in raw_chapters
+        if isinstance(item, Mapping) and item.get("has_content") is False
+    )
+    if (
+        not all(eligible)
+        or len(eligible) != len(set(eligible))
+        or authorization.eligible_chapter_count != len(eligible)
+        or authorization.eligible_chapter_ids_digest
+        != _chapter_ids_digest(eligible)
+        or authorization.generation_params_digest
+        != _candidate_job_generation_params_digest(generation_params)
+    ):
+        raise ValueError("candidate Job execution scope changed")
+    expected = build_candidate_job_execution_authorization(
+        [
+            {
+                "_id": str(item.get("chapter_id") or ""),
+                "content": "" if item.get("has_content") is False else "present",
+                "outline": ({"frozen": True} if item.get("has_outline") is True else None),
+            }
+            for item in raw_chapters
+            if isinstance(item, Mapping)
+        ],
+        generation_params,
+        plans=live_plans,
+    )
+    if authorization.model_dump(mode="json") != expected:
+        raise ValueError("candidate Job Provider plan changed after readiness")
+    return authorization
 
 
 def _ordered_union(*values: Sequence[str]) -> list[str]:

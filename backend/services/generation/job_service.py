@@ -9,13 +9,18 @@ from typing import Any, Dict, List, Mapping, Optional
 from pymongo.errors import DuplicateKeyError
 
 from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.db.mutation import mutation_completed
+from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
 from backend.services.generation.chapter_pipeline import run_chapter
 from backend.services.generation.chapter_candidate_authorization import (
     authorized_candidate_repair_attempt_slots,
+    generation_plan_from_candidate_snapshot,
+    plan_candidate_job_generation,
     readiness_uses_candidate_pipeline,
+    validate_candidate_job_execution_authorization,
 )
 from backend.services.generation.chapter_candidate_job import (
     CandidateJobExecution,
@@ -344,13 +349,24 @@ class GenerationJobService:
             "exceeded_fields": exceeded_fields,
             "new_acknowledgement_codes": new_acknowledgements,
             "blocked_issue_codes": blocked,
+            "expected_narrative_revision": (
+                (report.get("resources") or {}).get("narrative_revision")
+            ),
         }
+        expected_revision = recalculation["expected_narrative_revision"]
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("outline recalculation narrative revision is invalid")
         if not candidate or exceeded_fields or new_acknowledgements or blocked:
-            return {
+            result = {
                 **recalculation,
                 "status": "confirmation_required",
                 "requires_confirmation": True,
             }
+            await generation_job_repo.update_job_fields(job_id, {
+                "readiness_recalculation": result,
+                "authorization_confirmation_required": result,
+            })
+            return result
 
         await generation_job_repo.update_job_fields(job_id, {
             "prose_continuation_authorization": candidate,
@@ -359,6 +375,7 @@ class GenerationJobService:
                 "status": "narrowed_or_unchanged",
                 "requires_confirmation": False,
             },
+            "authorization_confirmation_required": None,
         })
         return {
             **recalculation,
@@ -468,13 +485,6 @@ class GenerationJobService:
                 chapter_id=chapter_id,
                 step_prefix="",
             )
-            remaining_slots = max(0, authorized_slots - len(existing_slots))
-            await generation_job_repo.reserve_attempts(
-                job_id,
-                chapter_id,
-                remaining_slots,
-            )
-
             def build_execution(
                 *,
                 chapter_id: str,
@@ -489,10 +499,63 @@ class GenerationJobService:
                 cycles, adherence_plan, state_plan = (
                     repairs.execution_snapshot(chapter_id=chapter_id)
                 )
+                work = readiness.get("work")
+                raw_chapters = (
+                    work.get("chapters")
+                    if isinstance(work, Mapping)
+                    else None
+                )
+                snapshot = next(
+                    (
+                        item
+                        for item in (raw_chapters or [])
+                        if isinstance(item, Mapping)
+                        and item.get("chapter_id") == chapter_id
+                    ),
+                    None,
+                )
+                if not isinstance(snapshot, Mapping):
+                    raise ValueError("candidate chapter snapshot is missing")
+                live_plans = plan_candidate_job_generation(
+                    needs_outline=snapshot.get("has_outline") is False,
+                    active=True,
+                )
+                execution_authorization = (
+                    validate_candidate_job_execution_authorization(
+                        readiness,
+                        chapter_id=chapter_id,
+                        generation_params=generation_params,
+                        live_plans=live_plans,
+                    )
+                )
+                if (
+                    adherence_plan != live_plans.adherence
+                    or state_plan != live_plans.state
+                    or execution_authorization.prose is None
+                    or execution_authorization.adherence is None
+                    or execution_authorization.state is None
+                ):
+                    raise ValueError(
+                        "candidate repair and initial Provider plans diverged"
+                    )
                 return CandidateJobExecution(
                     max_repair_cycles=cycles,
-                    adherence_plan=adherence_plan,
-                    state_plan=state_plan,
+                    outline_plan=(
+                        generation_plan_from_candidate_snapshot(
+                            execution_authorization.outline
+                        )
+                        if execution_authorization.outline is not None
+                        else None
+                    ),
+                    prose_plan=generation_plan_from_candidate_snapshot(
+                        execution_authorization.prose
+                    ),
+                    adherence_plan=generation_plan_from_candidate_snapshot(
+                        execution_authorization.adherence
+                    ),
+                    state_plan=generation_plan_from_candidate_snapshot(
+                        execution_authorization.state
+                    ),
                     repair_prose_candidate=(
                         repairs.repair_prose_candidate if cycles else None
                     ),
@@ -551,6 +614,7 @@ class GenerationJobService:
             runner = ChapterCandidateJobRunner(
                 execution_id=job_id,
                 readiness=readiness,
+                authorized_attempt_slots=authorized_slots,
                 generation_params=generation_params,
                 recalculate_after_outline=(
                     lambda accepted_chapter_id, _outline:
@@ -561,6 +625,7 @@ class GenerationJobService:
                 ),
                 deps=ChapterCandidateJobRunnerDeps(
                     get_novel=novel_repo.get_novel_by_id,
+                    get_volume=volume_repo.get_volume_by_id,
                     get_chapter=chapter_repo.get_chapter_by_id,
                     list_checkpoints=(
                         generation_job_repo.list_candidate_pipeline_checkpoints
@@ -569,6 +634,7 @@ class GenerationJobService:
                         generation_job_repo.append_candidate_pipeline_checkpoint
                     ),
                     list_attempts=generation_job_repo.list_attempt_slots,
+                    reserve_attempts=generation_job_repo.reserve_attempts,
                     attempt_scope_factory=(
                         lambda target_job_id, target_chapter_id, step, slots:
                         JobAttemptScope(
@@ -579,6 +645,10 @@ class GenerationJobService:
                         )
                     ),
                     build_execution=build_execution,
+                    current_narrative_revision=(
+                        narrative_revision_store.current
+                    ),
+                    mutation_completed=mutation_completed,
                     generate_outline=generate_outline,
                     generate_prose_candidate=generate_prose_candidate,
                     review_prose_candidate=review_prose_candidate,
@@ -923,6 +993,16 @@ class GenerationJobService:
             job = await generation_job_repo.get_job(job_id)
             if not job_planner.can_resume(job["status"]):
                 raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
+            candidate_prefix = job.get("candidate_pipeline_checkpoints")
+            if (
+                job.get("pause_reason") == "source_changed"
+                and isinstance(candidate_prefix, list)
+                and candidate_prefix
+            ):
+                raise ValueError(
+                    "候选检查点绑定的 narrative revision 已失效；"
+                    "请终止该作业并以新 readiness 启动 successor 作业"
+                )
             if confirm_uncertain_retry and skip_uncertain:
                 raise ValueError(
                     "confirm_uncertain_retry and skip_uncertain are mutually exclusive"

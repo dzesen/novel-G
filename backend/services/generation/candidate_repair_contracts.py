@@ -278,6 +278,8 @@ class CandidatePipelineReplayV1:
     review_count: int
     attempt_ids: tuple[str, ...]
     truncation_count: int
+    completed_steps: tuple[str, ...]
+    truncations: tuple[tuple[str, int, int], ...]
 
 
 def candidate_checkpoint_completion_passed(
@@ -360,7 +362,21 @@ def replay_candidate_pipeline_checkpoints(
     seen_state_request_ids: set[str] = set()
     seen_state_proposal_ids: set[str] = set()
     truncation_count = 0
+    completed_steps: list[str] = []
+    truncations: list[tuple[str, int, int]] = []
     accepted_checkpoints = 0
+
+    def record_step(
+        step: str,
+        checkpoint: CandidatePipelineCheckpointV1,
+    ) -> None:
+        nonlocal truncation_count
+        completed_steps.append(step)
+        truncated = checkpoint.truncation.truncated_section_count
+        dropped = checkpoint.truncation.dropped_item_count
+        if truncated or dropped:
+            truncation_count += 1
+            truncations.append((step, truncated, dropped))
 
     def diverged(
         message: str = "Candidate pipeline completion gates diverged",
@@ -395,12 +411,6 @@ def replay_candidate_pipeline_checkpoints(
         seen_checkpoint_ids.add(checkpoint.checkpoint_id)
         seen_attempt_ids.update(checkpoint.attempt_ids)
         ordered_attempt_ids.extend(checkpoint.attempt_ids)
-        if (
-            checkpoint.truncation.truncated_section_count
-            or checkpoint.truncation.dropped_item_count
-        ):
-            truncation_count += 1
-
         if isinstance(checkpoint, ProseCandidateCheckpointV1):
             if checkpoint.origin == "initial":
                 if phase != "start":
@@ -467,6 +477,12 @@ def replay_candidate_pipeline_checkpoints(
             latest_adherence = None
             latest_state = None
             phase = "prose"
+            record_step(
+                "prose"
+                if checkpoint.origin == "initial"
+                else f"prose_repair_{checkpoint.cycle}",
+                checkpoint,
+            )
             accepted_checkpoints = sequence
             continue
 
@@ -483,6 +499,12 @@ def replay_candidate_pipeline_checkpoints(
             latest_adherence = checkpoint
             latest_state = None
             phase = "adherence"
+            record_step(
+                "outline_adherence"
+                if review_count == 1
+                else f"outline_adherence_recheck_{review_count}",
+                checkpoint,
+            )
             accepted_checkpoints = sequence
             continue
 
@@ -548,6 +570,12 @@ def replay_candidate_pipeline_checkpoints(
         seen_state_proposal_ids.add(checkpoint.proposal_id)
         latest_state = checkpoint
         phase = "state"
+        record_step(
+            "state"
+            if checkpoint.origin == "initial"
+            else f"state_repair_{checkpoint.cycle}",
+            checkpoint,
+        )
         accepted_checkpoints = sequence
 
     if require_terminal and (
@@ -581,6 +609,8 @@ def replay_candidate_pipeline_checkpoints(
         review_count=review_count,
         attempt_ids=tuple(ordered_attempt_ids),
         truncation_count=truncation_count,
+        completed_steps=tuple(completed_steps),
+        truncations=tuple(truncations),
     )
 
 

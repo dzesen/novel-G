@@ -56,6 +56,26 @@ class ChapterFinalizationEvidence(BaseModel):
     repair_cycles_used: int = Field(default=0, ge=0)
 
 
+def chapter_finalization_idempotency_key(
+    *,
+    prose_run_id: str,
+    prose_run_revision: int,
+    state_proposal_id: str,
+) -> str:
+    if not str(prose_run_id or "") or not str(state_proposal_id or ""):
+        raise ValueError("chapter finalization identity is incomplete")
+    if (
+        isinstance(prose_run_revision, bool)
+        or not isinstance(prose_run_revision, int)
+        or prose_run_revision < 0
+    ):
+        raise ValueError("chapter finalization prose revision is invalid")
+    return (
+        f"finalize-chapter-generation:{prose_run_id}:"
+        f"{prose_run_revision}:{state_proposal_id}"
+    )
+
+
 def _strict_int(
     value: Any,
     *,
@@ -283,9 +303,10 @@ class ChapterFinalizationService:
                 "正文候选与状态候选基于不同的小说版本"
             )
 
-        idempotency_key = (
-            f"finalize-chapter-generation:{prose_run_id}:"
-            f"{prose_run_revision}:{state_proposal_id}"
+        idempotency_key = chapter_finalization_idempotency_key(
+            prose_run_id=prose_run_id,
+            prose_run_revision=prose_run_revision,
+            state_proposal_id=state_proposal_id,
         )
         deterministic_child_ids = {
             key: hashlib.sha256(
