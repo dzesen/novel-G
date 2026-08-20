@@ -2043,6 +2043,7 @@ def _resume_trace(
         raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
     attempts_by_id: dict[str, CandidateAttemptSummary] = {}
     has_unresolved_uncertain_attempt = False
+    attempt_error_message: str | None = None
     for item in progress.attempts:
         if not isinstance(item, CandidateAttemptSummary):
             _preserve_resume_aggregate_floor(
@@ -2053,11 +2054,34 @@ def _resume_trace(
                 ),
                 item_usage_floor=_resume_item_usage_floor(restored, item),
             )
-            raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
+            attempt_error_message = (
+                attempt_error_message or "候选管线恢复 attempt 无效"
+            )
+            continue
         try:
             validated = CandidateAttemptSummary.model_validate(
                 item.model_dump(mode="python")
             )
+        except _UsageProjectionOverflow:
+            restored._record_usage_overflow()
+            attempt_error_message = (
+                attempt_error_message or "候选管线恢复 Token 超过 V1 上限"
+            )
+            continue
+        except Exception:
+            _preserve_resume_aggregate_floor(
+                restored,
+                aggregate_tokens=trusted_progress_tokens,
+                reason=(
+                    CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
+                ),
+                item_usage_floor=_resume_item_usage_floor(restored, item),
+            )
+            attempt_error_message = (
+                attempt_error_message or "候选管线恢复 attempt 无效"
+            )
+            continue
+        try:
             violation = _attempt_usage_violation(validated)
             if violation is not None:
                 message, reason = violation
@@ -2067,7 +2091,8 @@ def _resume_trace(
                     reason=reason,
                     item_usage_floor=_usage_component_floor(validated.usage),
                 )
-                raise _blocked_resume(restored, message)
+                attempt_error_message = attempt_error_message or message
+                continue
             existing = attempts_by_id.get(validated.attempt_id)
             if existing is not None:
                 usage_delta, _evidence_kind = _usage_delta(
@@ -2082,28 +2107,16 @@ def _resume_trace(
                     ),
                     item_usage_floor=usage_delta,
                 )
-                raise _blocked_resume(restored, "候选管线恢复 attempt 重复")
-        except _UsageProjectionOverflow as exc:
+                attempt_error_message = (
+                    attempt_error_message or "候选管线恢复 attempt 重复"
+                )
+                continue
+        except _UsageProjectionOverflow:
             restored._record_usage_overflow()
-            raise _blocked_resume(
-                restored,
-                "候选管线恢复 Token 超过 V1 上限",
-            ) from exc
-        except ChapterCandidatePipelineBlocked:
-            raise
-        except Exception as exc:
-            _preserve_resume_aggregate_floor(
-                restored,
-                aggregate_tokens=trusted_progress_tokens,
-                reason=(
-                    CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
-                ),
-                item_usage_floor=_resume_item_usage_floor(restored, item),
+            attempt_error_message = (
+                attempt_error_message or "候选管线恢复 Token 超过 V1 上限"
             )
-            raise _blocked_resume(
-                restored,
-                "候选管线恢复 attempt 无效",
-            ) from exc
+            continue
         restored.attempts.append(validated)
         attempts_by_id[validated.attempt_id] = validated
         has_unresolved_uncertain_attempt = bool(
@@ -2112,12 +2125,14 @@ def _resume_trace(
         )
         try:
             _refresh_restored_usage(restored)
-        except _UsageProjectionOverflow as exc:
+        except _UsageProjectionOverflow:
             restored._record_usage_overflow()
-            raise _blocked_resume(
-                restored,
-                "候选管线恢复 Token 超过 V1 上限",
-            ) from exc
+            attempt_error_message = (
+                attempt_error_message or "候选管线恢复 Token 超过 V1 上限"
+            )
+
+    if attempt_error_message is not None:
+        raise _blocked_resume(restored, attempt_error_message)
 
     if (
         not isinstance(progress.unattributed_usage, tuple)
