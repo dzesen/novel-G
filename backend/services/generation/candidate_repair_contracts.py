@@ -17,6 +17,11 @@ MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 256
 MAX_BSON_INT64 = 2**63 - 1
+_CANDIDATE_CHECKPOINT_LIST_LIMITS = {
+    "attempt_ids": MAX_CANDIDATE_CHECKPOINT_ATTEMPTS,
+    "issue_categories": 20,
+    "scene_coverage": 20,
+}
 
 
 class CandidatePipelineCheckpointConflict(ValueError):
@@ -174,6 +179,7 @@ def parse_candidate_pipeline_checkpoint(
 ) -> CandidatePipelineCheckpointV1:
     """Revalidate even already-built models to reject forged model_copy values."""
 
+    _validate_checkpoint_list_bounds(value)
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="python")
     if not isinstance(value, Mapping):
@@ -202,12 +208,7 @@ def parse_candidate_pipeline_checkpoint(
             expected="candidate_completion_projection.v1",
         )
 
-    list_limits = {
-        "attempt_ids": MAX_CANDIDATE_CHECKPOINT_ATTEMPTS,
-        "issue_categories": 20,
-        "scene_coverage": 20,
-    }
-    for field, limit in list_limits.items():
+    for field, limit in _CANDIDATE_CHECKPOINT_LIST_LIMITS.items():
         stored = value.get(field)
         if stored is None:
             continue
@@ -231,6 +232,25 @@ def parse_candidate_pipeline_checkpoint(
         if isinstance(stored, list):
             value[field] = tuple(stored)
     return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
+
+
+def _validate_checkpoint_list_bounds(value: Any) -> None:
+    if not isinstance(value, (BaseModel, Mapping)):
+        return
+    for field, limit in _CANDIDATE_CHECKPOINT_LIST_LIMITS.items():
+        stored = (
+            getattr(value, field, None)
+            if isinstance(value, BaseModel)
+            else value.get(field)
+        )
+        if stored is None:
+            continue
+        if not isinstance(stored, (list, tuple)):
+            raise ValueError(f"candidate checkpoint {field} is not a list")
+        if len(stored) > limit:
+            raise ValueError(
+                f"candidate checkpoint {field} exceeds its bounded length"
+            )
 
 
 def _require_contract_version(

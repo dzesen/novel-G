@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 from uuid import uuid4
 
 from pymongo import ReturnDocument
+from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db import collections
 from backend.db.base import BaseRepository
@@ -24,6 +25,22 @@ USAGE_SUMMARY_LIMIT = 100
 
 
 MAX_ACTIVE_TOKEN_RESERVATIONS = 32
+_ATOMIC_JOB_FIELDS = frozenset({"candidate_pipeline_checkpoints"})
+
+
+def _reject_atomic_field_updates(fields: Dict[str, Any]) -> None:
+    if any(
+        key == protected
+        or (
+            isinstance(key, str)
+            and key.startswith(f"{protected}.")
+        )
+        for key in fields
+        for protected in _ATOMIC_JOB_FIELDS
+    ):
+        raise ValueError(
+            "Candidate pipeline checkpoints require an atomic repository command"
+        )
 
 
 def _validated_pre_dispatch_fence(
@@ -67,6 +84,51 @@ class GenerationJobRepository(BaseRepository):
 
     async def create_job(self, data: Dict[str, Any]) -> str:
         return await self.insert_one(dict(data))
+
+    async def update_one(
+        self,
+        query: Dict[str, Any],
+        update_data: Dict[str, Any],
+        include_deleted: bool = False,
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        _reject_atomic_field_updates(update_data)
+        return await super().update_one(
+            query,
+            update_data,
+            include_deleted=include_deleted,
+            session=session,
+        )
+
+    async def update_many(
+        self,
+        query: Dict[str, Any],
+        update_data: Dict[str, Any],
+        include_deleted: bool = False,
+        session: AsyncClientSession | None = None,
+    ) -> int:
+        _reject_atomic_field_updates(update_data)
+        return await super().update_many(
+            query,
+            update_data,
+            include_deleted=include_deleted,
+            session=session,
+        )
+
+    async def increment_one(
+        self,
+        query: Dict[str, Any],
+        increments: Dict[str, int],
+        include_deleted: bool = False,
+        session: AsyncClientSession | None = None,
+    ) -> bool:
+        _reject_atomic_field_updates(increments)
+        return await super().increment_one(
+            query,
+            increments,
+            include_deleted=include_deleted,
+            session=session,
+        )
 
     async def get_job(self, job_id: str) -> Dict[str, Any]:
         doc = await self.find_one({"_id": to_object_id(job_id)})
@@ -255,10 +317,6 @@ class GenerationJobRepository(BaseRepository):
         )
 
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
-        if "candidate_pipeline_checkpoints" in fields:
-            raise ValueError(
-                "Candidate pipeline checkpoints require an atomic repository command"
-            )
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))
 
     async def append_diagnostic(
