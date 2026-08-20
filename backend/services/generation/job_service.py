@@ -6,14 +6,17 @@ import logging
 import secrets
 import time
 from dataclasses import replace
+from datetime import timedelta
 from typing import Any, Dict, List, Mapping, Optional
 
 from pymongo.errors import DuplicateKeyError
 
-from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.db.repositories.generation_job_repository import (
+    generation_job_repo,
+)
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
-from backend.db.utils import to_object_id
+from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation import job_planner
 from backend.services.generation.chapter_pipeline import (
     ChapterOutcome,
@@ -35,7 +38,14 @@ from backend.services.generation.chapter_candidate_job import (
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
     JobMutationReceiptV1,
-    StateDispatchResolutionV2,
+    StateDispatchResolutionV3,
+)
+from backend.services.generation.job_execution import (
+    JOB_EXECUTION_LEASE_SECONDS,
+    JobExecutionLeaseLost,
+    JobExecutionLeaseUnavailable,
+    JobExecutionLeaseV1,
+    bind_job_execution,
 )
 from backend.services.generation.chapter_candidate_repairs import (
     ChapterCandidateRepairApplication,
@@ -85,7 +95,6 @@ from backend.services.generation.prose_continuation import (
 logger = logging.getLogger(__name__)
 _START_LOCK: asyncio.Lock | None = None
 _START_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
-_WORKER_PROCESS_TOKEN = secrets.token_hex(32)
 
 
 def _get_start_lock() -> asyncio.Lock:
@@ -200,12 +209,12 @@ def _persisted_state_dispatch_resolution(
     *,
     job_id: str,
     job: Mapping[str, Any],
-) -> StateDispatchResolutionV2 | None:
+) -> StateDispatchResolutionV3 | None:
     raw = job.get("state_dispatch_resolution")
     if raw is None:
         return None
     try:
-        resolution = StateDispatchResolutionV2.model_validate(raw)
+        resolution = StateDispatchResolutionV3.model_validate(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "Generation job state dispatch resolution is invalid"
@@ -244,7 +253,7 @@ async def _advance_state_dispatch_resolution(
     binding: JobMutationRecoveryBindingV1,
     action: str,
     last_checkpoint_index: int | None = None,
-) -> StateDispatchResolutionV2:
+) -> StateDispatchResolutionV3:
     """Drive one explicit action through both ledgers using a durable Job phase."""
 
     job = await generation_job_repo.get_job(job_id)
@@ -305,7 +314,7 @@ async def _advance_state_dispatch_resolution(
                 resolution,
                 last_checkpoint_index=last_checkpoint_index,
             )
-        if resolution.phase not in {"job_transitioned", "worker_claimed"}:
+        if resolution.phase != "job_transitioned":
             raise ValueError("Generation job retry resolution is incomplete")
         return resolution
     if resolution.phase == "proposal_released":
@@ -449,6 +458,8 @@ def _new_job_doc(
         "attempt_reservation": None,
         "candidate_pipeline_checkpoints": [],
         "state_dispatch_resolution": None,
+        "execution_epoch": 0,
+        "execution_lease": None,
         "authorization_confirmation_required": None,
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
@@ -660,12 +671,40 @@ class GenerationJobService:
         }
 
     @staticmethod
-    def _spawn(job_id: str, control: JobControl) -> None:
-        """在当前事件循环拉起后台任务并记入注册表。测试用 monkeypatch 换成 no-op。
+    async def _spawn(job_id: str, control: JobControl) -> bool:
+        """Acquire the durable execution lease before scheduling JobEngine."""
 
-        工作清单提供者按作业 scope 装配：闭包每次读作业文档决定取整卷还是整本清单，
-        引擎对 scope 无知（设计 §3.1/§3.2）。作业的 scope/目标从不变，重读代价可忽略。
-        """
+        previous_entry = _REGISTRY.get(job_id)
+        worker_id = secrets.token_hex(32)
+        now = get_utc_now()
+        try:
+            lease = await generation_job_repo.acquire_execution_lease(
+                job_id,
+                worker_id,
+                now=now,
+                expires_at=now + timedelta(
+                    seconds=JOB_EXECUTION_LEASE_SECONDS
+                ),
+            )
+        except JobExecutionLeaseUnavailable:
+            return False
+
+        previous_task = (
+            previous_entry[0] if previous_entry is not None else None
+        )
+        if previous_task is not None and not previous_task.done():
+            previous_entry[1].abort_requested = True
+            previous_task.cancel()
+            try:
+                await previous_task
+            except (asyncio.CancelledError, JobExecutionLeaseLost):
+                pass
+            except Exception:  # noqa: BLE001 - the lease already fenced it
+                logger.exception(
+                    "[job %s] prior worker failed during fenced handoff",
+                    job_id,
+                )
+        # 工作清单提供者按作业 scope 装配；引擎本身对 scope 无知。
         async def _list_worklist():
             started_at = time.perf_counter()
             job = await generation_job_repo.get_job(job_id)
@@ -1086,8 +1125,58 @@ class GenerationJobService:
             run_candidate_chapter=_run_candidate_chapter,
             inspect_reference_card_blockers=_inspect_reference_card_blockers,
         )
-        task = asyncio.create_task(run_job(job_id, deps, control))
+        async def _heartbeat_execution(
+            owner_task: asyncio.Task[Any],
+            initial: JobExecutionLeaseV1,
+        ) -> None:
+            lease = initial
+            interval = max(1, JOB_EXECUTION_LEASE_SECONDS // 3)
+            while True:
+                await asyncio.sleep(interval)
+                now = get_utc_now()
+                renewed = await generation_job_repo.heartbeat_execution_lease(
+                    lease,
+                    now=now,
+                    expires_at=now + timedelta(
+                        seconds=JOB_EXECUTION_LEASE_SECONDS
+                    ),
+                )
+                if renewed is None:
+                    owner_task.cancel()
+                    return
+                lease = renewed
+
+        async def _run_owned_job() -> None:
+            owner_task = asyncio.current_task()
+            assert owner_task is not None
+            heartbeat_task: asyncio.Task[None] | None = None
+            try:
+                with bind_job_execution(lease):
+                    heartbeat_task = asyncio.create_task(
+                        _heartbeat_execution(owner_task, lease)
+                    )
+                    await run_job(job_id, deps, control)
+            except JobExecutionLeaseLost:
+                logger.info("[job %s] execution lease was replaced", job_id)
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                await generation_job_repo.release_execution_lease(lease)
+                current = _REGISTRY.get(job_id)
+                if current is not None and current[0] is owner_task:
+                    _REGISTRY.pop(job_id, None)
+
+        try:
+            task = asyncio.create_task(_run_owned_job())
+        except Exception:
+            await generation_job_repo.release_execution_lease(lease)
+            raise
         _REGISTRY[job_id] = (task, control)
+        return True
 
     @staticmethod
     async def resume_after_reference_card_review(
@@ -1137,15 +1226,26 @@ class GenerationJobService:
                         "Generation job mutation recovery binding diverged"
                     )
                 current_chapter_id = recovery.chapter_id
-            await generation_job_repo.update_job_fields(job_id, {
-                "status": "running",
-                "pause_reason": None,
-                "error": None,
-                "active_slot": "global",
-                "current_chapter_id": current_chapter_id,
-            })
+            previous_execution_epoch = target.get("execution_epoch", 0)
+            if (
+                type(previous_execution_epoch) is not int
+                or previous_execution_epoch < 0
+            ):
+                raise ValueError("Generation job execution epoch is invalid")
+            await generation_job_repo.transition_job_resume(
+                job_id,
+                {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "current_chapter_id": current_chapter_id,
+                },
+                previous_status="paused",
+                previous_execution_epoch=previous_execution_epoch,
+            )
         control = JobControl()
-        GenerationJobService._spawn(job_id, control)
+        await GenerationJobService._spawn(job_id, control)
         return [job_id]
 
     @staticmethod
@@ -1336,7 +1436,7 @@ class GenerationJobService:
             except DuplicateKeyError as exc:
                 raise ConflictError("已有正在运行的批量作业，请先暂停或等待其结束") from exc
         control = JobControl()
-        GenerationJobService._spawn(job_id, control)
+        await GenerationJobService._spawn(job_id, control)
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
@@ -1400,7 +1500,7 @@ class GenerationJobService:
             except DuplicateKeyError as exc:
                 raise ConflictError("已有正在运行的批量作业，请先暂停或等待其结束") from exc
         control = JobControl()
-        GenerationJobService._spawn(job_id, control)
+        await GenerationJobService._spawn(job_id, control)
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
@@ -1415,7 +1515,7 @@ class GenerationJobService:
         readiness_digest: str | None = None,
         acknowledged_warning_codes: tuple[str, ...] | list[str] | None = None,
     ) -> Dict[str, Any]:
-        retry_resolution_to_launch: StateDispatchResolutionV2 | None = None
+        retry_resolution_to_launch: StateDispatchResolutionV3 | None = None
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
             state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None
@@ -1758,10 +1858,7 @@ class GenerationJobService:
             retry_already_transitioned = bool(
                 pending_state_resolution is not None
                 and pending_state_resolution.action == "retry"
-                and pending_state_resolution.phase in {
-                    "job_transitioned",
-                    "worker_claimed",
-                }
+                and pending_state_resolution.phase == "job_transitioned"
                 and job.get("status") == "running"
             )
             if not retry_already_transitioned:
@@ -1826,6 +1923,14 @@ class GenerationJobService:
                     and not isinstance(previous_active_slot, str)
                 ):
                     raise ValueError("Generation job active slot is invalid")
+                previous_execution_epoch = job.get("execution_epoch", 0)
+                if (
+                    type(previous_execution_epoch) is not int
+                    or previous_execution_epoch < 0
+                ):
+                    raise ValueError(
+                        "Generation job execution epoch is invalid"
+                    )
                 await generation_job_repo.update_job_authorization(
                     job_id,
                     resume_fields,
@@ -1837,6 +1942,7 @@ class GenerationJobService:
                     ),
                     previous_readiness_digest=previous_readiness_digest,
                     previous_active_slot=previous_active_slot,
+                    previous_execution_epoch=previous_execution_epoch,
                 )
             else:
                 if job.get("has_uncertain_attempts") and confirm_uncertain_retry:
@@ -1844,42 +1950,27 @@ class GenerationJobService:
                         job_id,
                         "retry",
                     )
-                await generation_job_repo.update_job_fields(job_id, resume_fields)
+                previous_execution_epoch = job.get("execution_epoch", 0)
+                if (
+                    type(previous_execution_epoch) is not int
+                    or previous_execution_epoch < 0
+                ):
+                    raise ValueError(
+                        "Generation job execution epoch is invalid"
+                    )
+                await generation_job_repo.transition_job_resume(
+                    job_id,
+                    resume_fields,
+                    previous_status=str(job.get("status") or ""),
+                    previous_execution_epoch=previous_execution_epoch,
+                )
         if retry_resolution_to_launch is not None:
-            worker_claim = await (
-                generation_job_repo.claim_state_dispatch_retry_worker(
-                    job_id,
-                    retry_resolution_to_launch,
-                    _WORKER_PROCESS_TOKEN,
-                )
-            )
-            if worker_claim is None:
-                return await generation_job_repo.get_job(job_id)
             control = JobControl()
-            existing_entry = _REGISTRY.get(job_id)
-            existing_task = (
-                existing_entry[0] if existing_entry is not None else None
-            )
-            try:
-                if existing_task is None or existing_task.done():
-                    GenerationJobService._spawn(job_id, control)
-            except Exception:
-                await generation_job_repo.release_state_dispatch_retry_worker(
-                    job_id,
-                    worker_claim,
-                )
-                raise
-            await generation_job_repo.clear_state_dispatch_resolution(
-                job_id,
-                worker_claim,
-            )
+            await GenerationJobService._spawn(job_id, control)
             return await generation_job_repo.get_job(job_id)
 
         control = JobControl()
-        existing_entry = _REGISTRY.get(job_id)
-        existing_task = existing_entry[0] if existing_entry is not None else None
-        if existing_task is None or existing_task.done():
-            GenerationJobService._spawn(job_id, control)
+        await GenerationJobService._spawn(job_id, control)
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
@@ -1935,7 +2026,7 @@ class GenerationJobService:
                     job_id,
                     "abort",
                 )
-            await generation_job_repo.update_job_fields(job_id, {
+            await generation_job_repo.complete_job_abort(job_id, {
                 "status": "aborted",
                 "current_chapter_id": None,
                 "active_slot": None,

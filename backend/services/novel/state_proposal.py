@@ -98,22 +98,31 @@ def _job_mutation_binding(
     proposal: dict[str, Any],
 ) -> JobMutationRecoveryBindingV1 | None:
     audit = proposal.get("generation_audit")
-    raw = (
+    raw_audit = (
         audit.get("job_mutation_binding")
         if isinstance(audit, dict)
         else None
     )
-    if raw is None:
+    raw_top_level = proposal.get("job_mutation_binding")
+    raw_key = proposal.get("job_mutation_key")
+    if raw_audit is None and raw_top_level is None and raw_key is None:
         return None
+    if raw_audit is None or raw_top_level is None or raw_key is None:
+        raise MutationConflictError(
+            "State proposal Job mutation binding is incomplete"
+        )
     try:
-        binding = JobMutationRecoveryBindingV1.model_validate(raw)
+        binding = JobMutationRecoveryBindingV1.model_validate(raw_audit)
+        top_level = JobMutationRecoveryBindingV1.model_validate(raw_top_level)
     except (TypeError, ValueError) as exc:
         raise MutationConflictError(
             "State proposal Job mutation binding is invalid"
         ) from exc
     proposal_revision = proposal.get("narrative_revision")
     if (
-        binding.operation != "accept_chapter_state"
+        binding != top_level
+        or raw_key != binding.idempotency_key
+        or binding.operation != "accept_chapter_state"
         or binding.novel_id != str(proposal.get("novel_id") or "")
         or binding.chapter_id != str(proposal.get("chapter_id") or "")
         or type(proposal_revision) is not int
@@ -124,6 +133,52 @@ def _job_mutation_binding(
             "State proposal Job mutation binding diverged"
         )
     return binding
+
+
+def _job_mutation_binding_query(
+    binding: JobMutationRecoveryBindingV1,
+) -> dict[str, Any]:
+    """Return the canonical three-way Job authority fence for proposal CAS."""
+
+    frozen = JobMutationRecoveryBindingV1.model_validate(
+        binding.model_dump(mode="python")
+    )
+    canonical = frozen.model_dump(mode="json")
+    return {
+        "job_mutation_key": frozen.idempotency_key,
+        "job_mutation_binding": canonical,
+        "generation_audit.job_mutation_binding": canonical,
+    }
+
+
+def _merged_generation_audit(
+    proposal: dict[str, Any],
+    audit: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], JobMutationRecoveryBindingV1 | None]:
+    """Merge metadata without allowing callers to replace persisted authority."""
+
+    existing = proposal.get("generation_audit") or {}
+    if not isinstance(existing, Mapping):
+        raise StaleStatePreview("Persisted generation audit is invalid")
+    incoming = dict(deepcopy(audit or {}))
+    binding = _job_mutation_binding(proposal)
+    if "job_mutation_binding" in incoming:
+        try:
+            supplied = JobMutationRecoveryBindingV1.model_validate(
+                incoming["job_mutation_binding"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise StaleStatePreview(
+                "Generation audit Job binding is invalid"
+            ) from exc
+        if binding is None or supplied != binding:
+            raise StaleStatePreview(
+                "Generation audit Job binding cannot replace persisted authority"
+            )
+    merged = {**deepcopy(dict(existing)), **incoming}
+    if binding is not None:
+        merged["job_mutation_binding"] = binding.model_dump(mode="json")
+    return merged, binding
 
 
 def _proposal_key() -> bytes:
@@ -584,11 +639,7 @@ class StateProposalModule:
             source_content_digest=lease.snapshot.source_content_digest or "",
             expires_at=expires_at,
         )
-        generation_audit = {
-            **deepcopy(current.get("generation_audit") or {}),
-            **deepcopy(audit or {}),
-        }
-        job_binding = _job_mutation_binding(current)
+        generation_audit, job_binding = _merged_generation_audit(current, audit)
         update: dict[str, Any] = {
             "$set": {
                 "status": "proposed",
@@ -607,12 +658,15 @@ class StateProposalModule:
         }
         if job_binding is not None:
             update["$unset"] = {"expires_at": ""}
+        publish_query: dict[str, Any] = {
+            "_id": lease.proposal_id,
+            "status": "dispatched",
+            "dispatch_protocol_revision": _dispatch_protocol_query(),
+        }
+        if job_binding is not None:
+            publish_query.update(_job_mutation_binding_query(job_binding))
         published = await self.collection.find_one_and_update(
-            {
-                "_id": lease.proposal_id,
-                "status": "dispatched",
-                "dispatch_protocol_revision": _dispatch_protocol_query(),
-            },
+            publish_query,
             update,
             return_document=ReturnDocument.AFTER,
         )
@@ -635,19 +689,14 @@ class StateProposalModule:
         current = await self.collection.find_one({"_id": lease.proposal_id})
         if current is None or not _uses_current_dispatch_protocol(current):
             return
-        generation_audit = {
-            **deepcopy(current.get("generation_audit") or {}),
-            **deepcopy(audit or {}),
-        }
-        job_binding = _job_mutation_binding(current)
+        generation_audit, job_binding = _merged_generation_audit(current, audit)
         now = get_utc_now()
         if current.get("status") == "generating" and job_binding is not None:
             await self.collection.update_one(
                 {
                     "_id": lease.proposal_id,
                     "status": "generating",
-                    "job_mutation_key": job_binding.idempotency_key,
-                    "job_mutation_binding": job_binding.model_dump(mode="json"),
+                    **_job_mutation_binding_query(job_binding),
                     "dispatch_protocol_revision": _dispatch_protocol_query(),
                 },
                 {
@@ -666,12 +715,15 @@ class StateProposalModule:
                 },
             )
             return
+        failure_query: dict[str, Any] = {
+            "_id": lease.proposal_id,
+            "status": {"$in": ["generating", "dispatched"]},
+            "dispatch_protocol_revision": _dispatch_protocol_query(),
+        }
+        if job_binding is not None:
+            failure_query.update(_job_mutation_binding_query(job_binding))
         await self.collection.update_one(
-            {
-                "_id": lease.proposal_id,
-                "status": {"$in": ["generating", "dispatched"]},
-                "dispatch_protocol_revision": _dispatch_protocol_query(),
-            },
+            failure_query,
             {
                 "$set": {
                     "status": "failed",
@@ -695,15 +747,24 @@ class StateProposalModule:
         value = StateContextProjection.model_validate(
             projection
         ).model_dump(mode="json")
+        current = await self.collection.find_one({"_id": lease.proposal_id})
+        if current is None:
+            raise StaleStatePreview(
+                "State generation pre-dispatch projection lost its lease"
+            )
+        job_binding = _job_mutation_binding(current)
+        projection_query: dict[str, Any] = {
+            "_id": lease.proposal_id,
+            "status": "generating",
+            "content_digest": lease.snapshot.content_digest,
+            "narrative_revision": lease.snapshot.narrative_revision,
+            "dispatch_protocol_revision": _dispatch_protocol_query(),
+            "is_deleted": False,
+        }
+        if job_binding is not None:
+            projection_query.update(_job_mutation_binding_query(job_binding))
         result = await self.collection.update_one(
-            {
-                "_id": lease.proposal_id,
-                "status": "generating",
-                "content_digest": lease.snapshot.content_digest,
-                "narrative_revision": lease.snapshot.narrative_revision,
-                "dispatch_protocol_revision": _dispatch_protocol_query(),
-                "is_deleted": False,
-            },
+            projection_query,
             {
                 "$set": {
                     "generation_audit.state_context_projection": value,
@@ -769,11 +830,7 @@ class StateProposalModule:
                 raise StaleStatePreview(
                     "State generation Job lease has no valid acceptance expiry"
                 )
-            canonical_binding = job_binding.model_dump(mode="json")
-            query.update({
-                "job_mutation_key": job_binding.idempotency_key,
-                "job_mutation_binding": canonical_binding,
-            })
+            query.update(_job_mutation_binding_query(job_binding))
             update["$set"]["acceptance_expires_at"] = acceptance_expires_at
             update["$unset"] = {"expires_at": ""}
         dispatched = await self.collection.update_one(
@@ -794,15 +851,16 @@ class StateProposalModule:
         current = await self.collection.find_one({"_id": lease.proposal_id})
         if current is None:
             return
-        generation_audit = {
-            **deepcopy(current.get("generation_audit") or {}),
-            **deepcopy(audit),
+        generation_audit, job_binding = _merged_generation_audit(current, audit)
+        query: dict[str, Any] = {
+            "_id": lease.proposal_id,
+            "status": {"$in": ["generating", "dispatched", "proposed"]},
         }
-        await self.collection.update_one(
-            {
-                "_id": lease.proposal_id,
-                "status": {"$in": ["generating", "dispatched", "proposed"]},
-            },
+        if job_binding is not None:
+            query.update(_job_mutation_binding_query(job_binding))
+            query["dispatch_protocol_revision"] = _dispatch_protocol_query()
+        updated = await self.collection.update_one(
+            query,
             {
                 "$set": {
                     "generation_audit": generation_audit,
@@ -810,6 +868,10 @@ class StateProposalModule:
                 }
             },
         )
+        if updated.matched_count != 1:
+            raise StaleStatePreview(
+                "Generation audit lost its persisted Job authority"
+            )
 
     async def stream_preview(
         self,
@@ -1383,9 +1445,7 @@ class StateProposalModule:
             )
         expected_status = f"uncertain_{action}_acknowledged"
         status = str(proposal.get("status") or "")
-        if status == expected_status:
-            return True
-        allowed_statuses = {"dispatched", "failed"}
+        allowed_statuses = {"dispatched", "failed", expected_status}
         if action == "abort":
             allowed_statuses.update({"generating", "proposed"})
         if status not in allowed_statuses:
@@ -1397,8 +1457,7 @@ class StateProposalModule:
             {
                 "_id": proposal["_id"],
                 "status": status,
-                "job_mutation_key": frozen.idempotency_key,
-                "job_mutation_binding": frozen.model_dump(mode="json"),
+                **_job_mutation_binding_query(frozen),
                 "dispatch_protocol_revision": _dispatch_protocol_query(),
                 "is_deleted": False,
             },
@@ -1410,7 +1469,11 @@ class StateProposalModule:
                         "acknowledged_at": now,
                     },
                     "updated_at": now,
-                }
+                },
+                "$unset": {
+                    "expires_at": "",
+                    "acceptance_expires_at": "",
+                },
             },
         )
         if result.modified_count == 1:
@@ -1448,8 +1511,7 @@ class StateProposalModule:
             {
                 "_id": proposal["_id"],
                 "status": expected_status,
-                "job_mutation_key": frozen.idempotency_key,
-                "job_mutation_binding": frozen.model_dump(mode="json"),
+                **_job_mutation_binding_query(frozen),
                 "dispatch_protocol_revision": _dispatch_protocol_query(),
                 "is_deleted": False,
             },
@@ -1742,6 +1804,7 @@ class StateProposalModule:
             "narrative_revision": expected_revision,
         }
         if stored_job_binding is not None:
+            claim_query.update(_job_mutation_binding_query(stored_job_binding))
             claim_query["dispatch_protocol_revision"] = _dispatch_protocol_query()
         claimed = await self.collection.find_one_and_update(
             claim_query,
@@ -1835,9 +1898,7 @@ class StateProposalModule:
             applied_query["dispatch_protocol_revision"] = (
                 _dispatch_protocol_query()
             )
-            applied_query["generation_audit.job_mutation_binding"] = (
-                stored_job_binding.model_dump(mode="json")
-            )
+            applied_query.update(_job_mutation_binding_query(stored_job_binding))
         applied = await self.collection.find_one_and_update(
             applied_query,
             {

@@ -824,4 +824,6 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 await _pause(repo, job_id, "checkpoint")
                 return
     finally:
-        _REGISTRY.pop(job_id, None)
+        # The launcher owns lease release and registry removal; the engine only
+        # records that its fenced loop has stopped.
+        logger.debug("[job %s] engine loop exited", job_id)

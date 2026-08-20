@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from typing import Any, Dict, List
 from uuid import uuid4
 
@@ -29,12 +30,19 @@ from backend.services.generation.candidate_repair_contracts import (
     PreDispatchFenceV1,
     STATE_DISPATCH_RESOLUTION_ACTIONS,
     STATE_DISPATCH_RESOLUTION_PHASES,
-    StateDispatchResolutionV2,
+    StateDispatchResolutionV3,
     candidate_pipeline_checkpoint_digest,
     candidate_pipeline_checkpoint_ledger_digest,
     parse_candidate_pipeline_checkpoint,
     parse_candidate_pipeline_progress,
     validate_candidate_pipeline_completion_chain,
+)
+from backend.services.generation.job_execution import (
+    JOB_EXECUTION_LEASE_SECONDS,
+    JobExecutionLeaseLost,
+    JobExecutionLeaseUnavailable,
+    JobExecutionLeaseV1,
+    current_job_execution,
 )
 
 
@@ -45,6 +53,8 @@ MAX_ACTIVE_TOKEN_RESERVATIONS = 32
 _ATOMIC_JOB_FIELDS = frozenset({
     "candidate_pipeline_checkpoints",
     "expected_narrative_revision",
+    "execution_epoch",
+    "execution_lease",
     "job_mutation_recovery",
     "progress",
     "state_dispatch_resolution",
@@ -102,6 +112,10 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         raise ValueError("Job mutation recovery binding must start empty")
     if document.get("state_dispatch_resolution") is not None:
         raise ValueError("State dispatch resolution must start empty")
+    if document.get("execution_lease") is not None:
+        raise ValueError("Generation job execution lease must start empty")
+    if document.get("execution_epoch", 0) != 0:
+        raise ValueError("Generation job execution epoch must start at zero")
     revision = document.get("expected_narrative_revision")
     if revision is not None and (
         type(revision) is not int
@@ -140,6 +154,373 @@ class GenerationJobRepository(BaseRepository):
     def __init__(self) -> None:
         super().__init__(collections.GENERATION_JOBS)
 
+    @staticmethod
+    def _execution_filter(query: Mapping[str, Any]) -> dict[str, Any]:
+        """Inject the current worker lease into every owned Job operation."""
+
+        base = dict(query)
+        lease = current_job_execution()
+        if lease is None:
+            return base
+        expected_id = to_object_id(lease.job_id)
+        supplied_id = base.get("_id")
+        if supplied_id is not None and supplied_id != expected_id:
+            raise JobExecutionLeaseLost(
+                "Generation Job worker attempted to access another Job"
+            )
+        return {
+            "$and": [
+                base,
+                {
+                    "_id": expected_id,
+                    "execution_epoch": lease.epoch,
+                    "execution_lease.schema_version": (
+                        "job_execution_lease.v1"
+                    ),
+                    "execution_lease.job_id": lease.job_id,
+                    "execution_lease.worker_id": lease.worker_id,
+                    "execution_lease.expires_at": {"$gt": get_utc_now()},
+                },
+            ]
+        }
+
+    async def _collection_update_one(
+        self,
+        query: Mapping[str, Any],
+        update: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        result = await self.collection.update_one(
+            self._execution_filter(query),
+            dict(update),
+            **kwargs,
+        )
+        if result.matched_count == 0:
+            await self._assert_execution_current()
+        return result
+
+    async def _collection_find_one_and_update(
+        self,
+        query: Mapping[str, Any],
+        update: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        document = await self.collection.find_one_and_update(
+            self._execution_filter(query),
+            dict(update),
+            **kwargs,
+        )
+        if document is None:
+            await self._assert_execution_current()
+        return document
+
+    async def _assert_execution_current(self) -> None:
+        """Raise only when the task-local lease itself is no longer valid."""
+
+        lease = current_job_execution()
+        if lease is None:
+            return
+        current = await self.collection.find_one({
+            "_id": to_object_id(lease.job_id),
+            "is_deleted": False,
+            "execution_epoch": lease.epoch,
+            "execution_lease.schema_version": "job_execution_lease.v1",
+            "execution_lease.job_id": lease.job_id,
+            "execution_lease.worker_id": lease.worker_id,
+            "execution_lease.expires_at": {"$gt": get_utc_now()},
+        })
+        if current is None:
+            raise JobExecutionLeaseLost(
+                "Generation Job execution lease is no longer current"
+            )
+
+    async def acquire_execution_lease(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> JobExecutionLeaseV1:
+        """Atomically consume an optional retry receipt and own Job execution."""
+
+        if expires_at <= now:
+            raise ValueError("Generation job execution lease expiry is invalid")
+        current = await self.get_job(job_id)
+        raw_lease = current.get("execution_lease")
+        existing: JobExecutionLeaseV1 | None = None
+        if raw_lease is not None:
+            try:
+                existing = JobExecutionLeaseV1.model_validate(raw_lease)
+            except (TypeError, ValueError) as exc:
+                raise JobExecutionLeaseUnavailable(
+                    "Persisted Generation Job execution lease is invalid"
+                ) from exc
+            if existing.job_id != str(job_id):
+                raise JobExecutionLeaseUnavailable(
+                    "Persisted Generation Job execution lease changed scope"
+                )
+            if existing.expires_at > now:
+                if existing.worker_id == str(worker_id):
+                    return existing
+                raise JobExecutionLeaseUnavailable(
+                    "Generation Job already has a live execution worker"
+                )
+
+        previous_epoch = current.get("execution_epoch", 0)
+        if (
+            type(previous_epoch) is not int
+            or previous_epoch < 0
+            or previous_epoch >= _MAX_NARRATIVE_REVISION
+        ):
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job execution epoch is invalid"
+            )
+        if existing is not None and existing.epoch != previous_epoch:
+            raise JobExecutionLeaseUnavailable(
+                "Persisted Generation Job execution lease epoch diverged"
+            )
+        next_epoch = previous_epoch + 1
+        try:
+            lease = JobExecutionLeaseV1(
+                schema_version="job_execution_lease.v1",
+                job_id=str(job_id),
+                worker_id=str(worker_id),
+                epoch=next_epoch,
+                heartbeat_at=now,
+                expires_at=expires_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job execution lease command is invalid"
+            ) from exc
+
+        raw_resolution = current.get("state_dispatch_resolution")
+        resolution_query: dict[str, Any]
+        if raw_resolution is None:
+            resolution_query = {"state_dispatch_resolution": None}
+        else:
+            try:
+                resolution = StateDispatchResolutionV3.model_validate(
+                    raw_resolution
+                )
+            except (TypeError, ValueError) as exc:
+                raise JobExecutionLeaseUnavailable(
+                    "Generation Job retry launch receipt is invalid"
+                ) from exc
+            if resolution.action != "retry" or resolution.phase != "job_transitioned":
+                raise JobExecutionLeaseUnavailable(
+                    "Generation Job action is not ready to launch"
+                )
+            resolution_query = {
+                "state_dispatch_resolution": resolution.model_dump(mode="json")
+            }
+
+        epoch_query: dict[str, Any] = {"execution_epoch": previous_epoch}
+        if previous_epoch == 0:
+            epoch_query = {
+                "$or": [
+                    {"execution_epoch": 0},
+                    {"execution_epoch": {"$exists": False}},
+                ]
+            }
+        query: dict[str, Any] = {
+            "$and": [
+                {
+                    "_id": to_object_id(job_id),
+                    "is_deleted": False,
+                    "status": {"$in": ["running", "interrupted"]},
+                    **resolution_query,
+                },
+                epoch_query,
+                (
+                    {"execution_lease": existing.model_dump(mode="python")}
+                    if existing is not None
+                    else {
+                        "$or": [
+                            {"execution_lease": {"$exists": False}},
+                            {"execution_lease": None},
+                        ]
+                    }
+                ),
+            ]
+        }
+        update: dict[str, Any] = {
+            "$set": {
+                "status": "running",
+                "pause_reason": None,
+                "error": None,
+                "active_slot": "global",
+                "execution_epoch": next_epoch,
+                "execution_lease": lease.model_dump(mode="python"),
+                "updated_at": now,
+            }
+        }
+        if raw_resolution is not None:
+            update["$unset"] = {"state_dispatch_resolution": ""}
+        document = await self.collection.find_one_and_update(
+            query,
+            update,
+            return_document=ReturnDocument.AFTER,
+        )
+        if document is not None:
+            return lease
+        latest = await self.get_job(job_id)
+        try:
+            existing = JobExecutionLeaseV1.model_validate(
+                latest.get("execution_lease")
+            )
+        except (TypeError, ValueError) as exc:
+            raise JobExecutionLeaseUnavailable(
+                "Generation Job execution lease raced"
+            ) from exc
+        if existing.worker_id == worker_id and existing.job_id == str(job_id):
+            return existing
+        raise JobExecutionLeaseUnavailable(
+            "Generation Job execution lease is owned by another worker"
+        )
+
+    async def heartbeat_execution_lease(
+        self,
+        lease: JobExecutionLeaseV1,
+        *,
+        now: datetime,
+        expires_at: datetime,
+    ) -> JobExecutionLeaseV1 | None:
+        """Extend one live lease; return ``None`` after ownership is lost."""
+
+        frozen = JobExecutionLeaseV1.model_validate(
+            lease.model_dump(mode="python")
+        )
+        if expires_at <= now:
+            raise ValueError("Generation job execution heartbeat is invalid")
+        renewed = frozen.model_copy(
+            update={"heartbeat_at": now, "expires_at": expires_at}
+        )
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(frozen.job_id),
+                "is_deleted": False,
+                "status": "running",
+                "execution_epoch": frozen.epoch,
+                "execution_lease.schema_version": "job_execution_lease.v1",
+                "execution_lease.job_id": frozen.job_id,
+                "execution_lease.worker_id": frozen.worker_id,
+                "execution_lease.expires_at": {"$gt": now},
+            },
+            {
+                "$set": {
+                    "execution_lease": renewed.model_dump(mode="python"),
+                    "updated_at": now,
+                }
+            },
+        )
+        return renewed if result.modified_count == 1 else None
+
+    async def release_execution_lease(
+        self,
+        lease: JobExecutionLeaseV1,
+    ) -> bool:
+        """Release only the worker/epoch owned by the completed local task."""
+
+        frozen = JobExecutionLeaseV1.model_validate(
+            lease.model_dump(mode="python")
+        )
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(frozen.job_id),
+                "is_deleted": False,
+                "execution_epoch": frozen.epoch,
+                "execution_lease.schema_version": "job_execution_lease.v1",
+                "execution_lease.job_id": frozen.job_id,
+                "execution_lease.worker_id": frozen.worker_id,
+            },
+            {
+                "$unset": {"execution_lease": ""},
+                "$set": {"updated_at": get_utc_now()},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.collection.find_one({
+            "_id": to_object_id(frozen.job_id),
+            "is_deleted": False,
+        })
+        return bool(latest is not None and latest.get("execution_lease") is None)
+
+    async def interrupt_stale_execution(
+        self,
+        job_id: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Fence only a missing/expired worker before startup recovery writes."""
+
+        current = await self.get_job(job_id)
+        if str(current.get("status") or "") != "running":
+            return False
+        previous_epoch = current.get("execution_epoch", 0)
+        if (
+            type(previous_epoch) is not int
+            or previous_epoch < 0
+            or previous_epoch >= _MAX_NARRATIVE_REVISION
+        ):
+            return False
+        raw_lease = current.get("execution_lease")
+        if raw_lease is None:
+            lease_query: dict[str, Any] = {
+                "$or": [
+                    {"execution_lease": {"$exists": False}},
+                    {"execution_lease": None},
+                ]
+            }
+        else:
+            try:
+                lease = JobExecutionLeaseV1.model_validate(raw_lease)
+            except (TypeError, ValueError):
+                return False
+            if (
+                lease.job_id != str(job_id)
+                or lease.epoch != previous_epoch
+                or lease.expires_at > now
+            ):
+                return False
+            lease_query = {
+                "execution_lease": lease.model_dump(mode="python")
+            }
+        epoch_query: dict[str, Any] = {"execution_epoch": previous_epoch}
+        if previous_epoch == 0:
+            epoch_query = {
+                "$or": [
+                    {"execution_epoch": 0},
+                    {"execution_epoch": {"$exists": False}},
+                ]
+            }
+        result = await self.collection.update_one(
+            {
+                "$and": [
+                    {
+                        "_id": to_object_id(job_id),
+                        "is_deleted": False,
+                        "status": "running",
+                    },
+                    epoch_query,
+                    lease_query,
+                ]
+            },
+            {
+                "$inc": {"execution_epoch": 1},
+                "$unset": {"execution_lease": ""},
+                "$set": {
+                    "status": "interrupted",
+                    "pause_reason": "process_restart",
+                    "active_slot": None,
+                    "updated_at": now,
+                },
+            },
+        )
+        return result.modified_count == 1
+
     async def create_job(self, data: Dict[str, Any]) -> str:
         return await self.insert_one(dict(data))
 
@@ -163,6 +544,42 @@ class GenerationJobRepository(BaseRepository):
             session=session,
         )
 
+    async def find_one(
+        self,
+        query: Dict[str, Any],
+        include_deleted: bool = False,
+        session: AsyncClientSession | None = None,
+    ) -> Dict[str, Any] | None:
+        document = await super().find_one(
+            self._execution_filter(query),
+            include_deleted=include_deleted,
+            session=session,
+        )
+        if document is None:
+            await self._assert_execution_current()
+        return document
+
+    async def find_many(
+        self,
+        query: Dict[str, Any],
+        include_deleted: bool = False,
+        limit: int = 0,
+        skip: int = 0,
+        sort: Any = None,
+        session: AsyncClientSession | None = None,
+    ) -> List[Dict[str, Any]]:
+        documents = await super().find_many(
+            self._execution_filter(query),
+            include_deleted=include_deleted,
+            limit=limit,
+            skip=skip,
+            sort=sort,
+            session=session,
+        )
+        if not documents:
+            await self._assert_execution_current()
+        return documents
+
     async def update_one(
         self,
         query: Dict[str, Any],
@@ -171,12 +588,15 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> bool:
         _reject_atomic_field_updates(update_data)
-        return await super().update_one(
-            query,
+        updated = await super().update_one(
+            self._execution_filter(query),
             update_data,
             include_deleted=include_deleted,
             session=session,
         )
+        if not updated:
+            await self._assert_execution_current()
+        return updated
 
     async def update_many(
         self,
@@ -186,12 +606,15 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> int:
         _reject_atomic_field_updates(update_data)
-        return await super().update_many(
-            query,
+        updated = await super().update_many(
+            self._execution_filter(query),
             update_data,
             include_deleted=include_deleted,
             session=session,
         )
+        if updated == 0:
+            await self._assert_execution_current()
+        return updated
 
     async def increment_one(
         self,
@@ -201,12 +624,15 @@ class GenerationJobRepository(BaseRepository):
         session: AsyncClientSession | None = None,
     ) -> bool:
         _reject_atomic_field_updates(increments)
-        return await super().increment_one(
-            query,
+        updated = await super().increment_one(
+            self._execution_filter(query),
             increments,
             include_deleted=include_deleted,
             session=session,
         )
+        if not updated:
+            await self._assert_execution_current()
+        return updated
 
     async def bulk_write(
         self,
@@ -230,8 +656,14 @@ class GenerationJobRepository(BaseRepository):
         )
 
     async def get_job(self, job_id: str) -> Dict[str, Any]:
-        doc = await self.find_one({"_id": to_object_id(job_id)})
+        doc = await super().find_one(
+            self._execution_filter({"_id": to_object_id(job_id)})
+        )
         if doc is None:
+            if current_job_execution() is not None:
+                raise JobExecutionLeaseLost(
+                    "Generation Job execution lease is no longer current"
+                )
             raise NotFoundError(f"Generation job not found: {job_id}")
         return doc
 
@@ -468,7 +900,7 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "Candidate pipeline checkpoint sequence diverged"
             )
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -600,7 +1032,7 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "Generation job narrative revision transition is invalid"
             )
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -650,7 +1082,7 @@ class GenerationJobRepository(BaseRepository):
                 "Job mutation recovery binding belongs to another Job"
             )
         canonical = frozen.model_dump(mode="json")
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -701,7 +1133,7 @@ class GenerationJobRepository(BaseRepository):
             )
         if terminal_status not in {"failed", "aborted"}:
             raise ValueError("Job mutation recovery terminal status is invalid")
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -727,10 +1159,10 @@ class GenerationJobRepository(BaseRepository):
 
     @staticmethod
     def _validated_state_dispatch_resolution(
-        resolution: StateDispatchResolutionV2,
-    ) -> StateDispatchResolutionV2:
+        resolution: StateDispatchResolutionV3,
+    ) -> StateDispatchResolutionV3:
         try:
-            return StateDispatchResolutionV2.model_validate(
+            return StateDispatchResolutionV3.model_validate(
                 resolution.model_dump(mode="python")
             )
         except (AttributeError, TypeError, ValueError) as exc:
@@ -743,15 +1175,15 @@ class GenerationJobRepository(BaseRepository):
         job_id: str,
         binding: JobMutationRecoveryBindingV1,
         action: str,
-    ) -> StateDispatchResolutionV2:
+    ) -> StateDispatchResolutionV3:
         """Persist one immutable explicit action before touching either ledger."""
 
         try:
             frozen_binding = JobMutationRecoveryBindingV1.model_validate(
                 binding.model_dump(mode="python")
             )
-            intent = StateDispatchResolutionV2(
-                schema_version="state_dispatch_resolution.v2",
+            intent = StateDispatchResolutionV3(
+                schema_version="state_dispatch_resolution.v3",
                 binding=frozen_binding,
                 action=action,
                 phase="intent",
@@ -766,7 +1198,7 @@ class GenerationJobRepository(BaseRepository):
             )
         canonical_binding = frozen_binding.model_dump(mode="json")
         canonical_intent = intent.model_dump(mode="json")
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -777,10 +1209,12 @@ class GenerationJobRepository(BaseRepository):
                 ],
             },
             {
+                "$inc": {"execution_epoch": 1},
                 "$set": {
                     "state_dispatch_resolution": canonical_intent,
                     "updated_at": get_utc_now(),
-                }
+                },
+                "$unset": {"execution_lease": ""},
             },
         )
         if result.modified_count == 1:
@@ -788,7 +1222,7 @@ class GenerationJobRepository(BaseRepository):
         current = await self.get_job(job_id)
         raw = current.get("state_dispatch_resolution")
         try:
-            existing = StateDispatchResolutionV2.model_validate(raw)
+            existing = StateDispatchResolutionV3.model_validate(raw)
         except (TypeError, ValueError) as exc:
             raise CandidatePipelineCheckpointConflict(
                 "Persisted state dispatch resolution is invalid"
@@ -802,9 +1236,9 @@ class GenerationJobRepository(BaseRepository):
     async def advance_state_dispatch_resolution(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV2,
+        resolution: StateDispatchResolutionV3,
         next_phase: str,
-    ) -> StateDispatchResolutionV2:
+    ) -> StateDispatchResolutionV3:
         """Advance exactly one durable action phase with the Job marker fenced."""
 
         current = self._validated_state_dispatch_resolution(resolution)
@@ -820,11 +1254,11 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch resolution phase is not monotonic"
             )
-        advanced = StateDispatchResolutionV2.model_validate({
+        advanced = StateDispatchResolutionV3.model_validate({
             **current.model_dump(mode="python"),
             "phase": next_phase,
         })
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -842,7 +1276,7 @@ class GenerationJobRepository(BaseRepository):
             return advanced
         latest = await self.get_job(job_id)
         try:
-            existing = StateDispatchResolutionV2.model_validate(
+            existing = StateDispatchResolutionV3.model_validate(
                 latest.get("state_dispatch_resolution")
             )
         except (TypeError, ValueError) as exc:
@@ -858,8 +1292,8 @@ class GenerationJobRepository(BaseRepository):
     async def acknowledge_state_dispatch_attempts(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV2,
-    ) -> StateDispatchResolutionV2:
+        resolution: StateDispatchResolutionV3,
+    ) -> StateDispatchResolutionV3:
         """Resolve every live outer attempt under the durable action fence."""
 
         current = self._validated_state_dispatch_resolution(resolution)
@@ -867,13 +1301,13 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch attempts are not ready for resolution"
             )
-        advanced = StateDispatchResolutionV2.model_validate({
+        advanced = StateDispatchResolutionV3.model_validate({
             **current.model_dump(mode="python"),
             "phase": "attempts_acknowledged",
         })
         acknowledged_state = f"uncertain_{current.action}_acknowledged"
         now = get_utc_now()
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -903,7 +1337,7 @@ class GenerationJobRepository(BaseRepository):
             return advanced
         latest = await self.get_job(job_id)
         try:
-            existing = StateDispatchResolutionV2.model_validate(
+            existing = StateDispatchResolutionV3.model_validate(
                 latest.get("state_dispatch_resolution")
             )
         except (TypeError, ValueError) as exc:
@@ -919,10 +1353,10 @@ class GenerationJobRepository(BaseRepository):
     async def transition_state_dispatch_retry(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV2,
+        resolution: StateDispatchResolutionV3,
         *,
         last_checkpoint_index: int,
-    ) -> StateDispatchResolutionV2:
+    ) -> StateDispatchResolutionV3:
         """Set Job running only after both ledgers and the receipt key are resolved."""
 
         current = self._validated_state_dispatch_resolution(resolution)
@@ -938,11 +1372,11 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch retry checkpoint cursor is invalid"
             )
-        transitioned = StateDispatchResolutionV2.model_validate({
+        transitioned = StateDispatchResolutionV3.model_validate({
             **current.model_dump(mode="python"),
             "phase": "job_transitioned",
         })
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -969,7 +1403,7 @@ class GenerationJobRepository(BaseRepository):
             return transitioned
         latest = await self.get_job(job_id)
         try:
-            existing = StateDispatchResolutionV2.model_validate(
+            existing = StateDispatchResolutionV3.model_validate(
                 latest.get("state_dispatch_resolution")
             )
         except (TypeError, ValueError) as exc:
@@ -982,139 +1416,11 @@ class GenerationJobRepository(BaseRepository):
             "State dispatch retry transition raced"
         )
 
-    async def claim_state_dispatch_retry_worker(
-        self,
-        job_id: str,
-        resolution: StateDispatchResolutionV2,
-        worker_start_token: str,
-    ) -> StateDispatchResolutionV2 | None:
-        """Claim the one durable right to launch a retry worker.
-
-        A running claim owned by another process returns ``None``.  Startup
-        recovery first marks its orphaned Job interrupted, which is the only
-        state in which a new token may replace the old process token.
-        """
-
-        current = self._validated_state_dispatch_resolution(resolution)
-        try:
-            if current.phase == "job_transitioned":
-                claimed = StateDispatchResolutionV2.model_validate({
-                    **current.model_dump(mode="python"),
-                    "phase": "worker_claimed",
-                    "worker_start_token": worker_start_token,
-                })
-                allowed_statuses = ["running", "interrupted"]
-            elif current.phase == "worker_claimed":
-                if current.worker_start_token == worker_start_token:
-                    latest = await self.get_job(job_id)
-                    if latest.get("status") == "running":
-                        return current
-                claimed = StateDispatchResolutionV2.model_validate({
-                    **current.model_dump(mode="python"),
-                    "worker_start_token": worker_start_token,
-                })
-                allowed_statuses = ["interrupted"]
-            else:
-                raise ValueError("retry worker phase is invalid")
-        except (TypeError, ValueError) as exc:
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry worker claim is invalid"
-            ) from exc
-        result = await self.collection.update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "job_mutation_recovery": current.binding.model_dump(mode="json"),
-                "state_dispatch_resolution": current.model_dump(mode="json"),
-                "status": {"$in": allowed_statuses},
-            },
-            {
-                "$set": {
-                    "status": "running",
-                    "pause_reason": None,
-                    "error": None,
-                    "active_slot": "global",
-                    "state_dispatch_resolution": claimed.model_dump(mode="json"),
-                    "updated_at": get_utc_now(),
-                }
-            },
-        )
-        if result.modified_count == 1:
-            return claimed
-        latest = await self.get_job(job_id)
-        raw = latest.get("state_dispatch_resolution")
-        if raw is None and latest.get("status") == "running":
-            return None
-        try:
-            existing = StateDispatchResolutionV2.model_validate(raw)
-        except (TypeError, ValueError) as exc:
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry worker claim disappeared"
-            ) from exc
-        if existing.phase == "worker_claimed" and latest.get("status") == "running":
-            if existing.worker_start_token == worker_start_token:
-                return existing
-            return None
-        raise CandidatePipelineCheckpointConflict(
-            "State dispatch retry worker claim raced"
-        )
-
-    async def release_state_dispatch_retry_worker(
-        self,
-        job_id: str,
-        resolution: StateDispatchResolutionV2,
-    ) -> StateDispatchResolutionV2:
-        """Return a failed local launch to the durable restart boundary."""
-
-        current = self._validated_state_dispatch_resolution(resolution)
-        if current.action != "retry" or current.phase != "worker_claimed":
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry worker release is invalid"
-            )
-        released = StateDispatchResolutionV2.model_validate({
-            **current.model_dump(mode="python"),
-            "phase": "job_transitioned",
-            "worker_start_token": None,
-        })
-        result = await self.collection.update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "state_dispatch_resolution": current.model_dump(mode="json"),
-                "status": "running",
-            },
-            {
-                "$set": {
-                    "status": "interrupted",
-                    "pause_reason": "process_restart",
-                    "active_slot": None,
-                    "state_dispatch_resolution": released.model_dump(mode="json"),
-                    "updated_at": get_utc_now(),
-                }
-            },
-        )
-        if result.modified_count == 1:
-            return released
-        latest = await self.get_job(job_id)
-        try:
-            existing = StateDispatchResolutionV2.model_validate(
-                latest.get("state_dispatch_resolution")
-            )
-        except (TypeError, ValueError) as exc:
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry worker release disappeared"
-            ) from exc
-        if existing == released and latest.get("status") == "interrupted":
-            return existing
-        raise CandidatePipelineCheckpointConflict(
-            "State dispatch retry worker release raced"
-        )
-
     async def complete_state_dispatch_terminal(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV2,
-    ) -> StateDispatchResolutionV2:
+        resolution: StateDispatchResolutionV3,
+    ) -> StateDispatchResolutionV3:
         """Publish a replayable skip/abort receipt with the terminal Job state."""
 
         current = self._validated_state_dispatch_resolution(resolution)
@@ -1125,7 +1431,7 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch terminal resolution is not ready"
             )
-        terminal = StateDispatchResolutionV2.model_validate({
+        terminal = StateDispatchResolutionV3.model_validate({
             **current.model_dump(mode="python"),
             "phase": "terminal",
         })
@@ -1152,7 +1458,7 @@ class GenerationJobRepository(BaseRepository):
             "state_dispatch_resolution": terminal.model_dump(mode="json"),
             "updated_at": get_utc_now(),
         }
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1168,7 +1474,7 @@ class GenerationJobRepository(BaseRepository):
             return terminal
         latest = await self.get_job(job_id)
         try:
-            existing = StateDispatchResolutionV2.model_validate(
+            existing = StateDispatchResolutionV3.model_validate(
                 latest.get("state_dispatch_resolution")
             )
         except (TypeError, ValueError) as exc:
@@ -1179,39 +1485,6 @@ class GenerationJobRepository(BaseRepository):
             return existing
         raise CandidatePipelineCheckpointConflict(
             "State dispatch terminal transition raced"
-        )
-
-    async def clear_state_dispatch_resolution(
-        self,
-        job_id: str,
-        resolution: StateDispatchResolutionV2,
-    ) -> bool:
-        """Clear a retry receipt only after a worker has been scheduled."""
-
-        current = self._validated_state_dispatch_resolution(resolution)
-        if current.action != "retry" or current.phase != "worker_claimed":
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry completion is invalid"
-            )
-        result = await self.collection.update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "state_dispatch_resolution": current.model_dump(mode="json"),
-                "status": "running",
-            },
-            {
-                "$unset": {"state_dispatch_resolution": ""},
-                "$set": {"updated_at": get_utc_now()},
-            },
-        )
-        if result.modified_count == 1:
-            return True
-        latest = await self.get_job(job_id)
-        if latest.get("state_dispatch_resolution") is None:
-            return True
-        raise CandidatePipelineCheckpointConflict(
-            "State dispatch retry completion raced"
         )
 
     async def complete_job_mutation_chapter(
@@ -1265,7 +1538,7 @@ class GenerationJobRepository(BaseRepository):
             )
         progress["job_mutation_tokens_delta"] = tokens_delta
         canonical_binding = binding.model_dump(mode="json")
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1346,6 +1619,7 @@ class GenerationJobRepository(BaseRepository):
         previous_authorization_revision: int | None,
         previous_readiness_digest: str | None,
         previous_active_slot: str | None,
+        previous_execution_epoch: int,
     ) -> bool:
         """Rebind readiness and its revision cursor in one fenced update."""
 
@@ -1356,6 +1630,8 @@ class GenerationJobRepository(BaseRepository):
             or next_revision < 0
             or next_revision > _MAX_NARRATIVE_REVISION
             or previous_status not in {"paused", "interrupted", "failed"}
+            or type(previous_execution_epoch) is not int
+            or previous_execution_epoch < 0
             or (
                 previous_authorization_revision is not None
                 and type(previous_authorization_revision) is not int
@@ -1381,6 +1657,15 @@ class GenerationJobRepository(BaseRepository):
                 {"job_mutation_recovery": None},
             ],
         }
+        if previous_execution_epoch == 0:
+            query["$and"] = [{
+                "$or": [
+                    {"execution_epoch": 0},
+                    {"execution_epoch": {"$exists": False}},
+                ]
+            }]
+        else:
+            query["execution_epoch"] = previous_execution_epoch
         if previous_revision is None:
             query["expected_narrative_revision"] = {"$exists": False}
         else:
@@ -1393,9 +1678,11 @@ class GenerationJobRepository(BaseRepository):
             query["readiness.digest"] = {"$exists": False}
         else:
             query["readiness.digest"] = previous_readiness_digest
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             query,
             {
+                "$inc": {"execution_epoch": 1},
+                "$unset": {"execution_lease": ""},
                 "$set": {
                     **dict(fields),
                     "expected_narrative_revision": next_revision,
@@ -1407,6 +1694,96 @@ class GenerationJobRepository(BaseRepository):
             return True
         raise CandidatePipelineCheckpointConflict(
             "Generation job reauthorization lost its revision fence"
+        )
+
+    async def transition_job_resume(
+        self,
+        job_id: str,
+        fields: Mapping[str, Any],
+        *,
+        previous_status: str,
+        previous_execution_epoch: int,
+    ) -> bool:
+        """Publish a manual resume while revoking any finishing old worker."""
+
+        updates = dict(fields)
+        _reject_atomic_field_updates(updates)
+        if (
+            previous_status not in {"paused", "interrupted", "failed"}
+            or type(previous_execution_epoch) is not int
+            or previous_execution_epoch < 0
+            or updates.get("status") != "running"
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Generation job resume command is invalid"
+            )
+        epoch_query: dict[str, Any] = {
+            "execution_epoch": previous_execution_epoch
+        }
+        if previous_execution_epoch == 0:
+            epoch_query = {
+                "$or": [
+                    {"execution_epoch": 0},
+                    {"execution_epoch": {"$exists": False}},
+                ]
+            }
+        result = await self._collection_update_one(
+            {
+                "$and": [
+                    {
+                        "_id": to_object_id(job_id),
+                        "is_deleted": False,
+                        "status": previous_status,
+                        "state_dispatch_resolution": None,
+                    },
+                    epoch_query,
+                ]
+            },
+            {
+                "$inc": {"execution_epoch": 1},
+                "$unset": {"execution_lease": ""},
+                "$set": {**updates, "updated_at": get_utc_now()},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Generation job resume lost its execution fence"
+        )
+
+    async def complete_job_abort(
+        self,
+        job_id: str,
+        fields: Mapping[str, Any],
+    ) -> bool:
+        """Publish abort while atomically invalidating the active worker."""
+
+        updates = dict(fields)
+        _reject_atomic_field_updates(updates)
+        if updates.get("status") != "aborted":
+            raise CandidatePipelineCheckpointConflict(
+                "Generation job abort command is invalid"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": {"$nin": ["completed", "aborted"]},
+                "state_dispatch_resolution": None,
+            },
+            {
+                "$inc": {"execution_epoch": 1},
+                "$unset": {"execution_lease": ""},
+                "$set": {**updates, "updated_at": get_utc_now()},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        if current.get("status") == "aborted":
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Generation job abort lost its execution fence"
         )
 
     async def complete_candidate_pipeline_chapter(
@@ -1586,7 +1963,7 @@ class GenerationJobRepository(BaseRepository):
             mode="json"
         )
         value["completed_at"] = get_utc_now()
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1667,7 +2044,7 @@ class GenerationJobRepository(BaseRepository):
         job_id: str,
         event: Dict[str, Any],
     ) -> bool:
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {"_id": to_object_id(job_id), "is_deleted": False},
             {
                 "$push": {"diagnostics": {"$each": [dict(event)], "$slice": -200}},
@@ -1685,7 +2062,7 @@ class GenerationJobRepository(BaseRepository):
             raise ValueError(
                 "Mutation completion requires an atomic repository command"
             )
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1744,7 +2121,7 @@ class GenerationJobRepository(BaseRepository):
             "claimed_slots": 0,
             "created_at": get_utc_now(),
         }
-        result = await self.collection.find_one_and_update(
+        result = await self._collection_find_one_and_update(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1783,7 +2160,7 @@ class GenerationJobRepository(BaseRepository):
             "state": "claimed",
             "claimed_at": now,
         }
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1826,7 +2203,7 @@ class GenerationJobRepository(BaseRepository):
             "usage": usage.model_dump(),
             "accounted_at": now,
         }
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1859,7 +2236,7 @@ class GenerationJobRepository(BaseRepository):
 
     async def mark_attempt_uncertain(self, job_id: str, attempt_id: str, reason: str) -> bool:
         now = get_utc_now()
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1884,7 +2261,7 @@ class GenerationJobRepository(BaseRepository):
         return result.modified_count == 1
 
     async def finish_attempt_reservation(self, job_id: str, chapter_id: str) -> bool:
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1916,7 +2293,7 @@ class GenerationJobRepository(BaseRepository):
         if action not in STATE_DISPATCH_RESOLUTION_ACTIONS:
             raise ValueError("Unknown uncertain-attempt action")
         now = get_utc_now()
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -1949,7 +2326,7 @@ class GenerationJobRepository(BaseRepository):
         validated_fence = _validated_pre_dispatch_fence(fence)
         value = validated_fence.model_dump(mode="json")
         fence_path = "attempt_reservation.pre_dispatch_fence"
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -2100,7 +2477,7 @@ class GenerationJobRepository(BaseRepository):
                 "state": "claimed",
                 "reserved_at": now,
             }
-        result = await self.collection.update_one(query, update)
+        result = await self._collection_update_one(query, update)
         if result.modified_count == 1:
             return attempt_id
 
@@ -2155,7 +2532,7 @@ class GenerationJobRepository(BaseRepository):
             "accounted_at": now,
             "charged_tokens": charged,
         }
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -2207,7 +2584,7 @@ class GenerationJobRepository(BaseRepository):
     ) -> bool:
         """Freeze the reservation when a dispatched Provider result is unknown."""
         now = get_utc_now()
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -2255,7 +2632,7 @@ class GenerationJobRepository(BaseRepository):
             return False
         reserved = max(1, int(conservative_tokens))
         now = get_utc_now()
-        result = await self.collection.update_one(
+        result = await self._collection_update_one(
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
@@ -2380,6 +2757,6 @@ class GenerationJobRepository(BaseRepository):
             update["$pull"]["active_token_reservations"] = {
                 "attempt_id": str(attempt_id)
             }
-        result = await self.collection.update_one(query, update)
+        result = await self._collection_update_one(query, update)
         return result.modified_count == 1
 generation_job_repo = GenerationJobRepository()

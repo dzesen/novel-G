@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.db.utils import get_utc_now
 from backend.services.generation.failure_diagnostics import infer_job_diagnostics
 from backend.services.generation.job_service import (
     ConflictError,
@@ -342,10 +343,18 @@ async def abort_job(job_id: str):
 
 
 async def mark_running_jobs_interrupted() -> int:
-    """启动时把上次进程遗留的 running 作业置 interrupted（设计 §4.3）。返回置换数量。"""
+    """Fence only missing/expired workers; live workers may belong to another process."""
     running = await generation_job_repo.list_running_jobs()
+    interrupted_count = 0
     for job in running:
         job_id = str(job["_id"])
+        interrupted = await generation_job_repo.interrupt_stale_execution(
+            job_id,
+            now=get_utc_now(),
+        )
+        if not interrupted:
+            continue
+        interrupted_count += 1
         checkpoints = job.get("candidate_pipeline_checkpoints")
         preserve_candidate_chapter = bool(checkpoints) or isinstance(
             job.get("job_mutation_recovery"),
@@ -364,4 +373,4 @@ async def mark_running_jobs_interrupted() -> int:
             ),
             "active_slot": None,
         })
-    return len(running)
+    return interrupted_count
