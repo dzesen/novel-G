@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1333,6 +1333,38 @@ class StateProposalModule:
             "uncertain_abort_acknowledged",
         }
 
+    async def pending_job_bound_dispatch_action(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+    ) -> str | None:
+        """Recover an action frozen on the proposal before the Job intent exists."""
+
+        _frozen, proposal = await self._load_job_bound_proposal(binding)
+        if proposal is None:
+            return None
+        if not _uses_current_dispatch_protocol(proposal):
+            raise MutationConflictError(
+                "Persisted state Provider dispatch evidence is unknown"
+            )
+        status = str(proposal.get("status") or "")
+        if not status.startswith("uncertain_"):
+            return None
+        resolution = proposal.get("dispatch_resolution")
+        if not isinstance(resolution, Mapping):
+            raise MutationConflictError(
+                "Persisted state Provider dispatch action is invalid"
+            )
+        action = resolution.get("action")
+        if (
+            not isinstance(action, str)
+            or action not in STATE_DISPATCH_RESOLUTION_ACTIONS
+            or status != f"uncertain_{action}_acknowledged"
+        ):
+            raise MutationConflictError(
+                "Persisted state Provider dispatch action diverged"
+            )
+        return action
+
     async def acknowledge_job_bound_dispatch(
         self,
         binding: JobMutationRecoveryBindingV1,
@@ -1596,6 +1628,29 @@ class StateProposalModule:
             raise MutationConflictError(
                 "State proposal Provider dispatch evidence is unknown"
             )
+        raw_claim_binding = claim.get("job_mutation_binding")
+        supplied_job_binding = None
+        if raw_claim_binding is not None:
+            try:
+                supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
+                    raw_claim_binding
+                )
+            except (TypeError, ValueError) as exc:
+                raise MutationConflictError(
+                    "State proposal claim Job binding is invalid"
+                ) from exc
+        if stored_job_binding is not None and supplied_job_binding is None:
+            raise MutationConflictError(
+                "State proposal claim lost its Job binding"
+            )
+        allow_expired = (
+            supplied_job_binding is not None
+            and supplied_job_binding == stored_job_binding
+        )
+        if supplied_job_binding is not None and not allow_expired:
+            raise MutationConflictError(
+                "State proposal claim belongs to another Job authorization"
+            )
         existing = current.get("claim") or {}
         if current.get("status") in {"claimed", "applied"}:
             if (
@@ -1608,25 +1663,6 @@ class StateProposalModule:
             )
         if current.get("status") != "proposed":
             raise MutationConflictError("State proposal cannot be claimed")
-        raw_claim_binding = claim.get("job_mutation_binding")
-        supplied_job_binding = None
-        if raw_claim_binding is not None:
-            try:
-                supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
-                    raw_claim_binding
-                )
-            except (TypeError, ValueError) as exc:
-                raise MutationConflictError(
-                    "State proposal claim Job binding is invalid"
-                ) from exc
-        allow_expired = (
-            supplied_job_binding is not None
-            and supplied_job_binding == stored_job_binding
-        )
-        if supplied_job_binding is not None and not allow_expired:
-            raise MutationConflictError(
-                "State proposal claim belongs to another Job authorization"
-            )
         expires_at = current.get("expires_at") or current.get(
             "acceptance_expires_at"
         )
@@ -1753,14 +1789,54 @@ class StateProposalModule:
     ) -> None:
         proposal_id = to_object_id(str(claim["proposal_id"]))
         decision_digest = str(claim["decision_digest"])
+        current = await self.collection.find_one(
+            {"_id": proposal_id},
+            session=session,
+        )
+        if current is None:
+            raise MutationConflictError(
+                "State proposal disappeared before applied publication"
+            )
+        stored_job_binding = _job_mutation_binding(current)
+        raw_claim_binding = claim.get("job_mutation_binding")
+        supplied_job_binding: JobMutationRecoveryBindingV1 | None = None
+        if raw_claim_binding is not None:
+            try:
+                supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
+                    raw_claim_binding
+                )
+            except (TypeError, ValueError) as exc:
+                raise MutationConflictError(
+                    "State proposal applied Job binding is invalid"
+                ) from exc
+        if stored_job_binding is not None:
+            if supplied_job_binding is None:
+                raise MutationConflictError(
+                    "State proposal applied result lost its Job binding"
+                )
+            if supplied_job_binding != stored_job_binding:
+                raise MutationConflictError(
+                    "State proposal applied result belongs to another Job binding"
+                )
+            if not _uses_current_dispatch_protocol(current):
+                raise MutationConflictError(
+                    "State proposal Provider dispatch evidence is unknown"
+                )
+        elif supplied_job_binding is not None:
+            raise MutationConflictError(
+                "State proposal applied result has an unexpected Job binding"
+            )
         applied_query: dict[str, Any] = {
             "_id": proposal_id,
             "status": "claimed",
             "claim.decision_digest": decision_digest,
         }
-        if claim.get("job_mutation_binding") is not None:
+        if stored_job_binding is not None:
             applied_query["dispatch_protocol_revision"] = (
                 _dispatch_protocol_query()
+            )
+            applied_query["generation_audit.job_mutation_binding"] = (
+                stored_job_binding.model_dump(mode="json")
             )
         applied = await self.collection.find_one_and_update(
             applied_query,
@@ -1780,9 +1856,8 @@ class StateProposalModule:
         if applied is not None:
             return
         current = await self.collection.find_one({"_id": proposal_id}, session=session)
-        if (
-            claim.get("job_mutation_binding") is not None
-            and not _uses_current_dispatch_protocol(current or {})
+        if stored_job_binding is not None and not _uses_current_dispatch_protocol(
+            current or {}
         ):
             raise MutationConflictError(
                 "State proposal Provider dispatch evidence is unknown"

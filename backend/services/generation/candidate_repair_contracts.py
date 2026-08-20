@@ -110,20 +110,40 @@ StateDispatchResolutionPhase = Literal[
     "attempts_acknowledged",
     "proposal_released",
     "job_transitioned",
+    "worker_claimed",
+    "terminal",
 ]
 STATE_DISPATCH_RESOLUTION_PHASES = get_args(StateDispatchResolutionPhase)
 STATE_DISPATCH_RESOLUTION_ACTIONS = get_args(StateDispatchResolutionAction)
 
 
-class StateDispatchResolutionV1(BaseModel):
+class StateDispatchResolutionV2(BaseModel):
     """Durable phase receipt for one explicit Job-bound dispatch decision."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["state_dispatch_resolution.v1"]
+    schema_version: Literal["state_dispatch_resolution.v2"]
     binding: JobMutationRecoveryBindingV1
     action: StateDispatchResolutionAction
     phase: StateDispatchResolutionPhase
+    worker_start_token: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_action_phase(self) -> "StateDispatchResolutionV2":
+        if self.phase in {"job_transitioned", "worker_claimed"}:
+            if self.action != "retry":
+                raise ValueError("Only retry may enter the worker launch phases")
+        if self.phase == "worker_claimed":
+            if self.worker_start_token is None:
+                raise ValueError("Worker launch ownership requires a token")
+        elif self.worker_start_token is not None:
+            raise ValueError("Worker launch token is invalid for this phase")
+        if self.phase == "terminal" and self.action not in {"skip", "abort"}:
+            raise ValueError("Only skip or abort may enter the terminal phase")
+        return self
 
 
 class JobMutationReceiptV1(BaseModel):

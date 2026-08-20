@@ -29,7 +29,7 @@ from backend.services.generation.candidate_repair_contracts import (
     PreDispatchFenceV1,
     STATE_DISPATCH_RESOLUTION_ACTIONS,
     STATE_DISPATCH_RESOLUTION_PHASES,
-    StateDispatchResolutionV1,
+    StateDispatchResolutionV2,
     candidate_pipeline_checkpoint_digest,
     candidate_pipeline_checkpoint_ledger_digest,
     parse_candidate_pipeline_checkpoint,
@@ -727,10 +727,10 @@ class GenerationJobRepository(BaseRepository):
 
     @staticmethod
     def _validated_state_dispatch_resolution(
-        resolution: StateDispatchResolutionV1,
-    ) -> StateDispatchResolutionV1:
+        resolution: StateDispatchResolutionV2,
+    ) -> StateDispatchResolutionV2:
         try:
-            return StateDispatchResolutionV1.model_validate(
+            return StateDispatchResolutionV2.model_validate(
                 resolution.model_dump(mode="python")
             )
         except (AttributeError, TypeError, ValueError) as exc:
@@ -743,15 +743,15 @@ class GenerationJobRepository(BaseRepository):
         job_id: str,
         binding: JobMutationRecoveryBindingV1,
         action: str,
-    ) -> StateDispatchResolutionV1:
+    ) -> StateDispatchResolutionV2:
         """Persist one immutable explicit action before touching either ledger."""
 
         try:
             frozen_binding = JobMutationRecoveryBindingV1.model_validate(
                 binding.model_dump(mode="python")
             )
-            intent = StateDispatchResolutionV1(
-                schema_version="state_dispatch_resolution.v1",
+            intent = StateDispatchResolutionV2(
+                schema_version="state_dispatch_resolution.v2",
                 binding=frozen_binding,
                 action=action,
                 phase="intent",
@@ -788,7 +788,7 @@ class GenerationJobRepository(BaseRepository):
         current = await self.get_job(job_id)
         raw = current.get("state_dispatch_resolution")
         try:
-            existing = StateDispatchResolutionV1.model_validate(raw)
+            existing = StateDispatchResolutionV2.model_validate(raw)
         except (TypeError, ValueError) as exc:
             raise CandidatePipelineCheckpointConflict(
                 "Persisted state dispatch resolution is invalid"
@@ -802,15 +802,16 @@ class GenerationJobRepository(BaseRepository):
     async def advance_state_dispatch_resolution(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV1,
+        resolution: StateDispatchResolutionV2,
         next_phase: str,
-    ) -> StateDispatchResolutionV1:
+    ) -> StateDispatchResolutionV2:
         """Advance exactly one durable action phase with the Job marker fenced."""
 
         current = self._validated_state_dispatch_resolution(resolution)
+        preparation_phases = STATE_DISPATCH_RESOLUTION_PHASES[:4]
         try:
-            current_index = STATE_DISPATCH_RESOLUTION_PHASES.index(current.phase)
-            next_index = STATE_DISPATCH_RESOLUTION_PHASES.index(next_phase)
+            current_index = preparation_phases.index(current.phase)
+            next_index = preparation_phases.index(next_phase)
         except ValueError as exc:
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch resolution phase is invalid"
@@ -819,7 +820,10 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch resolution phase is not monotonic"
             )
-        advanced = current.model_copy(update={"phase": next_phase})
+        advanced = StateDispatchResolutionV2.model_validate({
+            **current.model_dump(mode="python"),
+            "phase": next_phase,
+        })
         result = await self.collection.update_one(
             {
                 "_id": to_object_id(job_id),
@@ -838,7 +842,7 @@ class GenerationJobRepository(BaseRepository):
             return advanced
         latest = await self.get_job(job_id)
         try:
-            existing = StateDispatchResolutionV1.model_validate(
+            existing = StateDispatchResolutionV2.model_validate(
                 latest.get("state_dispatch_resolution")
             )
         except (TypeError, ValueError) as exc:
@@ -851,25 +855,24 @@ class GenerationJobRepository(BaseRepository):
             "State dispatch resolution phase raced"
         )
 
-    async def transition_state_dispatch_retry(
+    async def acknowledge_state_dispatch_attempts(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV1,
-        fields: Dict[str, Any],
-    ) -> StateDispatchResolutionV1:
-        """Set Job running only after both ledgers and the receipt key are resolved."""
+        resolution: StateDispatchResolutionV2,
+    ) -> StateDispatchResolutionV2:
+        """Resolve every live outer attempt under the durable action fence."""
 
         current = self._validated_state_dispatch_resolution(resolution)
-        if current.action != "retry" or current.phase != "proposal_released":
+        if current.phase != "proposal_acknowledged":
             raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry is not ready to transition"
+                "State dispatch attempts are not ready for resolution"
             )
-        if fields.get("status") != "running":
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch retry target status is invalid"
-            )
-        _reject_atomic_field_updates(fields)
-        transitioned = current.model_copy(update={"phase": "job_transitioned"})
+        advanced = StateDispatchResolutionV2.model_validate({
+            **current.model_dump(mode="python"),
+            "phase": "attempts_acknowledged",
+        })
+        acknowledged_state = f"uncertain_{current.action}_acknowledged"
+        now = get_utc_now()
         result = await self.collection.update_one(
             {
                 "_id": to_object_id(job_id),
@@ -879,7 +882,82 @@ class GenerationJobRepository(BaseRepository):
             },
             {
                 "$set": {
-                    **dict(fields),
+                    "attempt_slots.$[slot].state": acknowledged_state,
+                    "attempt_slots.$[slot].updated_at": now,
+                    "active_token_reservations.$[reservation].state": (
+                        acknowledged_state
+                    ),
+                    "active_token_reservations.$[reservation].updated_at": now,
+                    "has_uncertain_attempts": False,
+                    "attempt_reservation": None,
+                    "state_dispatch_resolution": advanced.model_dump(mode="json"),
+                    "updated_at": now,
+                },
+            },
+            array_filters=[
+                {"slot.state": {"$in": ["claimed", "uncertain"]}},
+                {"reservation.state": {"$in": ["claimed", "uncertain"]}},
+            ],
+        )
+        if result.modified_count == 1:
+            return advanced
+        latest = await self.get_job(job_id)
+        try:
+            existing = StateDispatchResolutionV2.model_validate(
+                latest.get("state_dispatch_resolution")
+            )
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch attempt resolution disappeared"
+            ) from exc
+        if existing == advanced and not latest.get("has_uncertain_attempts"):
+            return existing
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch attempt resolution raced"
+        )
+
+    async def transition_state_dispatch_retry(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV2,
+        *,
+        last_checkpoint_index: int,
+    ) -> StateDispatchResolutionV2:
+        """Set Job running only after both ledgers and the receipt key are resolved."""
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        if current.action != "retry" or current.phase != "proposal_released":
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry is not ready to transition"
+            )
+        if (
+            type(last_checkpoint_index) is not int
+            or last_checkpoint_index < 0
+            or last_checkpoint_index > MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry checkpoint cursor is invalid"
+            )
+        transitioned = StateDispatchResolutionV2.model_validate({
+            **current.model_dump(mode="python"),
+            "phase": "job_transitioned",
+        })
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "job_mutation_recovery": current.binding.model_dump(mode="json"),
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+            },
+            {
+                "$set": {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "has_uncertain_attempts": False,
+                    "confirm_uncertain_prose_retry": True,
+                    "last_checkpoint_index": last_checkpoint_index,
                     "state_dispatch_resolution": transitioned.model_dump(
                         mode="json"
                     ),
@@ -891,7 +969,7 @@ class GenerationJobRepository(BaseRepository):
             return transitioned
         latest = await self.get_job(job_id)
         try:
-            existing = StateDispatchResolutionV1.model_validate(
+            existing = StateDispatchResolutionV2.model_validate(
                 latest.get("state_dispatch_resolution")
             )
         except (TypeError, ValueError) as exc:
@@ -904,13 +982,140 @@ class GenerationJobRepository(BaseRepository):
             "State dispatch retry transition raced"
         )
 
+    async def claim_state_dispatch_retry_worker(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV2,
+        worker_start_token: str,
+    ) -> StateDispatchResolutionV2 | None:
+        """Claim the one durable right to launch a retry worker.
+
+        A running claim owned by another process returns ``None``.  Startup
+        recovery first marks its orphaned Job interrupted, which is the only
+        state in which a new token may replace the old process token.
+        """
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        try:
+            if current.phase == "job_transitioned":
+                claimed = StateDispatchResolutionV2.model_validate({
+                    **current.model_dump(mode="python"),
+                    "phase": "worker_claimed",
+                    "worker_start_token": worker_start_token,
+                })
+                allowed_statuses = ["running", "interrupted"]
+            elif current.phase == "worker_claimed":
+                if current.worker_start_token == worker_start_token:
+                    latest = await self.get_job(job_id)
+                    if latest.get("status") == "running":
+                        return current
+                claimed = StateDispatchResolutionV2.model_validate({
+                    **current.model_dump(mode="python"),
+                    "worker_start_token": worker_start_token,
+                })
+                allowed_statuses = ["interrupted"]
+            else:
+                raise ValueError("retry worker phase is invalid")
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry worker claim is invalid"
+            ) from exc
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "job_mutation_recovery": current.binding.model_dump(mode="json"),
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+                "status": {"$in": allowed_statuses},
+            },
+            {
+                "$set": {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "state_dispatch_resolution": claimed.model_dump(mode="json"),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return claimed
+        latest = await self.get_job(job_id)
+        raw = latest.get("state_dispatch_resolution")
+        if raw is None and latest.get("status") == "running":
+            return None
+        try:
+            existing = StateDispatchResolutionV2.model_validate(raw)
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry worker claim disappeared"
+            ) from exc
+        if existing.phase == "worker_claimed" and latest.get("status") == "running":
+            if existing.worker_start_token == worker_start_token:
+                return existing
+            return None
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch retry worker claim raced"
+        )
+
+    async def release_state_dispatch_retry_worker(
+        self,
+        job_id: str,
+        resolution: StateDispatchResolutionV2,
+    ) -> StateDispatchResolutionV2:
+        """Return a failed local launch to the durable restart boundary."""
+
+        current = self._validated_state_dispatch_resolution(resolution)
+        if current.action != "retry" or current.phase != "worker_claimed":
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry worker release is invalid"
+            )
+        released = StateDispatchResolutionV2.model_validate({
+            **current.model_dump(mode="python"),
+            "phase": "job_transitioned",
+            "worker_start_token": None,
+        })
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "state_dispatch_resolution": current.model_dump(mode="json"),
+                "status": "running",
+            },
+            {
+                "$set": {
+                    "status": "interrupted",
+                    "pause_reason": "process_restart",
+                    "active_slot": None,
+                    "state_dispatch_resolution": released.model_dump(mode="json"),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return released
+        latest = await self.get_job(job_id)
+        try:
+            existing = StateDispatchResolutionV2.model_validate(
+                latest.get("state_dispatch_resolution")
+            )
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch retry worker release disappeared"
+            ) from exc
+        if existing == released and latest.get("status") == "interrupted":
+            return existing
+        raise CandidatePipelineCheckpointConflict(
+            "State dispatch retry worker release raced"
+        )
+
     async def complete_state_dispatch_terminal(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV1,
-        fields: Dict[str, Any],
-    ) -> bool:
-        """Publish skip/abort terminal state and clear both Job receipts atomically."""
+        resolution: StateDispatchResolutionV2,
+    ) -> StateDispatchResolutionV2:
+        """Publish a replayable skip/abort receipt with the terminal Job state."""
 
         current = self._validated_state_dispatch_resolution(resolution)
         expected_status = {"skip": "failed", "abort": "aborted"}.get(
@@ -920,11 +1125,33 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch terminal resolution is not ready"
             )
-        if fields.get("status") != expected_status:
-            raise CandidatePipelineCheckpointConflict(
-                "State dispatch terminal status is invalid"
-            )
-        _reject_atomic_field_updates(fields)
+        terminal = StateDispatchResolutionV2.model_validate({
+            **current.model_dump(mode="python"),
+            "phase": "terminal",
+        })
+        terminal_fields: dict[str, Any] = {
+            "status": expected_status,
+            "pause_reason": (
+                "uncertain_skipped" if current.action == "skip" else None
+            ),
+            "active_slot": None,
+            "current_chapter_id": None,
+            "has_uncertain_attempts": False,
+            "attempt_reservation": None,
+            "error": (
+                {
+                    "step": "uncertain_attempt",
+                    "message": (
+                        "用户选择跳过可能已发出的 Provider 请求；"
+                        "请人工检查章节后再恢复"
+                    ),
+                }
+                if current.action == "skip"
+                else None
+            ),
+            "state_dispatch_resolution": terminal.model_dump(mode="json"),
+            "updated_at": get_utc_now(),
+        }
         result = await self.collection.update_one(
             {
                 "_id": to_object_id(job_id),
@@ -933,22 +1160,23 @@ class GenerationJobRepository(BaseRepository):
                 "state_dispatch_resolution": current.model_dump(mode="json"),
             },
             {
-                "$set": {**dict(fields), "updated_at": get_utc_now()},
-                "$unset": {
-                    "job_mutation_recovery": "",
-                    "state_dispatch_resolution": "",
-                },
+                "$set": terminal_fields,
+                "$unset": {"job_mutation_recovery": ""},
             },
         )
         if result.modified_count == 1:
-            return True
+            return terminal
         latest = await self.get_job(job_id)
-        if (
-            latest.get("status") == expected_status
-            and latest.get("job_mutation_recovery") is None
-            and latest.get("state_dispatch_resolution") is None
-        ):
-            return True
+        try:
+            existing = StateDispatchResolutionV2.model_validate(
+                latest.get("state_dispatch_resolution")
+            )
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "State dispatch terminal receipt disappeared"
+            ) from exc
+        if existing == terminal and latest.get("status") == expected_status:
+            return existing
         raise CandidatePipelineCheckpointConflict(
             "State dispatch terminal transition raced"
         )
@@ -956,12 +1184,12 @@ class GenerationJobRepository(BaseRepository):
     async def clear_state_dispatch_resolution(
         self,
         job_id: str,
-        resolution: StateDispatchResolutionV1,
+        resolution: StateDispatchResolutionV2,
     ) -> bool:
         """Clear a retry receipt only after a worker has been scheduled."""
 
         current = self._validated_state_dispatch_resolution(resolution)
-        if current.action != "retry" or current.phase != "job_transitioned":
+        if current.action != "retry" or current.phase != "worker_claimed":
             raise CandidatePipelineCheckpointConflict(
                 "State dispatch retry completion is invalid"
             )
@@ -970,6 +1198,7 @@ class GenerationJobRepository(BaseRepository):
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
                 "state_dispatch_resolution": current.model_dump(mode="json"),
+                "status": "running",
             },
             {
                 "$unset": {"state_dispatch_resolution": ""},
@@ -1519,6 +1748,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "$expr": {
                     "$lte": [
                         {"$add": [{"$ifNull": ["$usage_attempt_claimed", 0]}, requested]},
@@ -1557,6 +1787,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "attempt_reservation.chapter_id": str(chapter_id),
                 "$expr": {"$and": [
                     {"$lt": [
@@ -1599,6 +1830,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "usage_attempt_ids": {"$ne": str(attempt_id)},
                 "attempt_slots": {"$elemMatch": {
                     "attempt_id": str(attempt_id),
@@ -1631,6 +1863,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "attempt_slots": {"$elemMatch": {
                     "attempt_id": str(attempt_id),
                     "state": "claimed",
@@ -1655,6 +1888,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "attempt_reservation.chapter_id": str(chapter_id),
             },
             {"$set": {"attempt_reservation": None, "updated_at": get_utc_now()}},
@@ -1683,7 +1917,11 @@ class GenerationJobRepository(BaseRepository):
             raise ValueError("Unknown uncertain-attempt action")
         now = get_utc_now()
         result = await self.collection.update_one(
-            {"_id": to_object_id(job_id), "is_deleted": False},
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "state_dispatch_resolution": None,
+            },
             {
                 "$set": {
                     "attempt_slots.$[slot].state": f"uncertain_{action}_acknowledged",
@@ -1715,6 +1953,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "attempt_reservation.chapter_id": str(chapter_id),
                 "$or": [
                     {fence_path: {"$exists": False}},
@@ -1793,6 +2032,7 @@ class GenerationJobRepository(BaseRepository):
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
             "is_deleted": False,
+            "state_dispatch_resolution": None,
             "attempt_reservation.chapter_id": str(chapter_id),
         }
         if fence is not None:
@@ -1919,6 +2159,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "usage_attempt_ids": {"$ne": str(attempt_id)},
                 "attempt_slots": {
                     "$elemMatch": {
@@ -1970,6 +2211,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "attempt_slots": {
                     "$elemMatch": {
                         "attempt_id": str(attempt_id),
@@ -2017,6 +2259,7 @@ class GenerationJobRepository(BaseRepository):
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                "state_dispatch_resolution": None,
                 "attempt_slots": {
                     "$elemMatch": {
                         "attempt_id": str(attempt_id),
