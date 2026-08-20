@@ -2104,29 +2104,87 @@ def _resume_trace(
             ] = []
             valid_variants: list[CandidateAttemptSummary] = []
             group_usage = CandidateUsageSummary()
+            group_usage_overflow = False
             for variant in variants:
                 if variant in unique_variants:
                     continue
                 unique_variants.append(variant)
-                group_usage = _conservative_usage_max(
-                    group_usage,
-                    variant.usage,
-                )
-                violation = _attempt_usage_violation(variant)
+                if not group_usage_overflow:
+                    try:
+                        group_usage = _conservative_usage_max(
+                            group_usage,
+                            variant.usage,
+                        )
+                    except _UsageProjectionOverflow:
+                        group_usage_overflow = True
+                try:
+                    violation = _attempt_usage_violation(variant)
+                except _UsageProjectionOverflow:
+                    group_usage_overflow = True
+                    continue
                 if violation is None:
                     valid_variants.append(variant)
                 elif violation not in violations:
                     violations.append(violation)
 
             representative: CandidateAttemptSummary | None = None
-            if valid_variants:
-                representative = valid_variants[0]
-                if any(
+            if group_usage_overflow:
+                representative = next(
+                    (
+                        item
+                        for item in unique_variants
+                        if item.state is CandidateAttemptState.UNCERTAIN
+                    ),
+                    unique_variants[0],
+                )
+                restored.attempts.append(representative)
+                has_unresolved_uncertain_attempt = bool(
+                    has_unresolved_uncertain_attempt
+                    or representative.state is CandidateAttemptState.UNCERTAIN
+                )
+                restored._record_usage_overflow()
+                for message, reason in violations:
+                    _preserve_resume_aggregate_floor(
+                        restored,
+                        aggregate_tokens=None,
+                        reason=reason,
+                        item_usage_floor=CandidateUsageSummary(),
+                    )
+                    attempt_error_message = attempt_error_message or message
+                if len(unique_variants) > 1:
+                    _preserve_resume_aggregate_floor(
+                        restored,
+                        aggregate_tokens=None,
+                        reason=(
+                            CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
+                        ),
+                        item_usage_floor=CandidateUsageSummary(),
+                    )
+                attempt_error_message = (
+                    attempt_error_message
+                    or "候选管线恢复 Token 超过 V1 上限"
+                )
+                continue
+            if valid_variants or len(unique_variants) > 1:
+                representative_template = (
+                    valid_variants[0]
+                    if valid_variants
+                    else unique_variants[0]
+                )
+                has_uncertain_variant = any(
                     item.state is CandidateAttemptState.UNCERTAIN
                     for item in unique_variants
-                ):
+                )
+                representative_state = representative_template.state
+                if has_uncertain_variant and group_usage.total_tokens > 0:
+                    representative_state = CandidateAttemptState.UNCERTAIN
+                representative = representative_template.model_copy(update={
+                    "state": representative_state,
+                    "usage": group_usage,
+                })
+                if _attempt_usage_violation(representative) is not None:
                     representative = representative.model_copy(
-                        update={"state": CandidateAttemptState.UNCERTAIN}
+                        update={"state": CandidateAttemptState.UNKNOWN}
                     )
                 restored.attempts.append(representative)
                 has_unresolved_uncertain_attempt = bool(
@@ -2149,11 +2207,6 @@ def _resume_trace(
 
             if len(unique_variants) > 1:
                 conflict_usage = CandidateUsageSummary()
-                if representative is not None:
-                    conflict_usage, _evidence_kind = _usage_delta(
-                        group_usage,
-                        representative.usage,
-                    )
                 _preserve_resume_aggregate_floor(
                     restored,
                     aggregate_tokens=None,
