@@ -2042,6 +2042,7 @@ def _resume_trace(
         )
         raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
     attempts_by_id: dict[str, CandidateAttemptSummary] = {}
+    attempt_indexes_by_id: dict[str, int] = {}
     has_unresolved_uncertain_attempt = False
     attempt_error_message: str | None = None
     for item in progress.attempts:
@@ -2082,24 +2083,30 @@ def _resume_trace(
             )
             continue
         try:
+            violation = _attempt_usage_violation(validated)
             existing = attempts_by_id.get(validated.attempt_id)
             if existing is not None:
+                if existing == validated:
+                    continue
                 usage_delta, _evidence_kind = _usage_delta(
                     validated.usage,
                     existing.usage,
                 )
-                if any((
-                    usage_delta.input_tokens,
-                    usage_delta.output_tokens,
-                    usage_delta.total_tokens,
-                )):
+                _preserve_resume_aggregate_floor(
+                    restored,
+                    aggregate_tokens=None,
+                    reason=(
+                        CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
+                    ),
+                    item_usage_floor=usage_delta,
+                )
+                if violation is not None:
+                    _message, reason = violation
                     _preserve_resume_aggregate_floor(
                         restored,
                         aggregate_tokens=None,
-                        reason=(
-                            CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
-                        ),
-                        item_usage_floor=usage_delta,
+                        reason=reason,
+                        item_usage_floor=CandidateUsageSummary(),
                     )
                 existing_floor = _usage_component_floor(
                     existing.usage
@@ -2107,19 +2114,38 @@ def _resume_trace(
                 current_floor = _usage_component_floor(
                     validated.usage
                 ).total_tokens
+                representative_state = (
+                    CandidateAttemptState.UNCERTAIN
+                    if (
+                        existing.state is CandidateAttemptState.UNCERTAIN
+                        or validated.state is CandidateAttemptState.UNCERTAIN
+                    )
+                    else existing.state
+                )
                 attempts_by_id[validated.attempt_id] = existing.model_copy(
                     update={
+                        "state": representative_state,
                         "usage": CandidateUsageSummary(
                             total_tokens=max(existing_floor, current_floor)
                         )
                     }
                 )
+                if representative_state is CandidateAttemptState.UNCERTAIN:
+                    has_unresolved_uncertain_attempt = True
+                    existing_index = attempt_indexes_by_id.get(
+                        validated.attempt_id
+                    )
+                    if existing_index is not None:
+                        restored.attempts[existing_index] = restored.attempts[
+                            existing_index
+                        ].model_copy(update={"state": representative_state})
                 attempt_error_message = (
-                    attempt_error_message or "候选管线恢复 attempt 重复"
+                    attempt_error_message
+                    or (violation[0] if violation is not None else None)
+                    or "候选管线恢复 attempt 重复"
                 )
                 continue
             attempts_by_id[validated.attempt_id] = validated
-            violation = _attempt_usage_violation(validated)
             if violation is not None:
                 message, reason = violation
                 _preserve_resume_aggregate_floor(
@@ -2136,6 +2162,7 @@ def _resume_trace(
                 attempt_error_message or "候选管线恢复 Token 超过 V1 上限"
             )
             continue
+        attempt_indexes_by_id[validated.attempt_id] = len(restored.attempts)
         restored.attempts.append(validated)
         has_unresolved_uncertain_attempt = bool(
             has_unresolved_uncertain_attempt
@@ -2149,20 +2176,6 @@ def _resume_trace(
                 attempt_error_message or "候选管线恢复 Token 超过 V1 上限"
             )
 
-    if attempt_error_message is not None:
-        if (
-            trusted_progress_tokens is not None
-            and trusted_progress_tokens > restored.tokens
-        ):
-            _preserve_resume_aggregate_floor(
-                restored,
-                aggregate_tokens=trusted_progress_tokens,
-                reason=(
-                    CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
-                ),
-            )
-        raise _blocked_resume(restored, attempt_error_message)
-
     if (
         not isinstance(progress.unattributed_usage, tuple)
         or len(progress.unattributed_usage)
@@ -2174,40 +2187,45 @@ def _resume_trace(
             reason=CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID,
         )
         raise _blocked_resume(restored, "候选管线恢复用量证据无效")
+    unattributed_error_message: str | None = None
     for item in progress.unattributed_usage:
         if not isinstance(item, CandidateUnattributedUsageSummary):
             _preserve_resume_aggregate_floor(
                 restored,
-                aggregate_tokens=trusted_progress_tokens,
+                aggregate_tokens=None,
                 reason=(
                     CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID
                 ),
                 item_usage_floor=_resume_item_usage_floor(restored, item),
             )
-            raise _blocked_resume(restored, "候选管线恢复用量证据无效")
+            unattributed_error_message = (
+                unattributed_error_message or "候选管线恢复用量证据无效"
+            )
+            continue
         try:
             validated = CandidateUnattributedUsageSummary.model_validate(
                 item.model_dump(mode="python")
             )
-        except _UsageProjectionOverflow as exc:
+        except _UsageProjectionOverflow:
             restored._record_usage_overflow()
-            raise _blocked_resume(
-                restored,
-                "候选管线恢复 Token 超过 V1 上限",
-            ) from exc
-        except Exception as exc:
+            unattributed_error_message = (
+                unattributed_error_message
+                or "候选管线恢复 Token 超过 V1 上限"
+            )
+            continue
+        except Exception:
             _preserve_resume_aggregate_floor(
                 restored,
-                aggregate_tokens=trusted_progress_tokens,
+                aggregate_tokens=None,
                 reason=(
                     CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID
                 ),
                 item_usage_floor=_resume_item_usage_floor(restored, item),
             )
-            raise _blocked_resume(
-                restored,
-                "候选管线恢复用量证据无效",
-            ) from exc
+            unattributed_error_message = (
+                unattributed_error_message or "候选管线恢复用量证据无效"
+            )
+            continue
         if (
             validated.reason
             is CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
@@ -2234,15 +2252,23 @@ def _resume_trace(
     )
     if trusted_progress_tokens is None:
         raise _blocked_resume(restored, "候选管线恢复 Token 无效")
-    if not has_usage_overflow and restored.tokens != trusted_progress_tokens:
-        if trusted_progress_tokens > restored.tokens:
-            _preserve_resume_aggregate_floor(
-                restored,
-                aggregate_tokens=trusted_progress_tokens,
-                reason=(
-                    CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
-                ),
-            )
+    has_token_mismatch = bool(
+        not has_usage_overflow
+        and restored.tokens != trusted_progress_tokens
+    )
+    if has_token_mismatch and trusted_progress_tokens > restored.tokens:
+        _preserve_resume_aggregate_floor(
+            restored,
+            aggregate_tokens=trusted_progress_tokens,
+            reason=(
+                CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
+            ),
+        )
+    if attempt_error_message is not None:
+        raise _blocked_resume(restored, attempt_error_message)
+    if unattributed_error_message is not None:
+        raise _blocked_resume(restored, unattributed_error_message)
+    if has_token_mismatch:
         raise _blocked_resume(
             restored,
             "候选管线恢复 Token 与调用证据不一致",
