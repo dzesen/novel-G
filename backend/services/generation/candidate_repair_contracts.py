@@ -15,8 +15,11 @@ from backend.services.generation.outline_adherence import (
 
 MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
-MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 256
+MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 512
 MAX_BSON_INT64 = 2**63 - 1
+_SAFE_ATTEMPT_ID_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+)
 _CANDIDATE_CHECKPOINT_LIST_LIMITS = {
     "attempt_ids": MAX_CANDIDATE_CHECKPOINT_ATTEMPTS,
     "issue_categories": 20,
@@ -112,8 +115,11 @@ class _CandidatePipelineCheckpointV1(_CandidateCheckpointContract):
     @model_validator(mode="after")
     def validate_attempt_identities(self) -> "_CandidatePipelineCheckpointV1":
         if any(
-            len(attempt_id) != 32
-            or any(character not in "0123456789abcdef" for character in attempt_id)
+            not 1 <= len(attempt_id) <= 128
+            or any(
+                character not in _SAFE_ATTEMPT_ID_CHARACTERS
+                for character in attempt_id
+            )
             for attempt_id in self.attempt_ids
         ):
             raise ValueError("candidate checkpoint attempt identity is invalid")

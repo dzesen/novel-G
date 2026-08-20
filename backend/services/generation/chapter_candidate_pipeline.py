@@ -1117,6 +1117,10 @@ class ChapterCandidatePipelineDeps:
         ],
         Awaitable[Mapping[str, Any]],
     ]
+    persist_checkpoint: Callable[
+        [CandidatePipelineCheckpointV1],
+        Awaitable[None],
+    ]
     repair_prose_candidate: Callable[
         [
             str,
@@ -1134,10 +1138,6 @@ class ChapterCandidatePipelineDeps:
             StateCandidateRepairRequest,
         ],
         Awaitable[StateCandidateRepairReceipt],
-    ] | None = None
-    persist_checkpoint: Callable[
-        [CandidatePipelineCheckpointV1],
-        Awaitable[None],
     ] | None = None
 
 
@@ -1404,6 +1404,16 @@ class _PipelineTrace:
         truncation_start = len(self.truncations)
         try:
             usage, summaries = _project_result_evidence(result)
+            existing_attempts = {
+                item.attempt_id: item for item in self.attempts
+            }
+            if any(
+                existing_attempts.get(item.attempt_id) == item
+                for item in summaries
+            ):
+                raise _EvidenceProjectionError(
+                    "付费步骤复用了先前步骤的 attempt_id"
+                )
             self._record_evidence(usage, summaries)
         except _EvidenceProjectionError as exc:
             if isinstance(exc, _UnattributedUsageProjectionError):
@@ -2748,12 +2758,17 @@ def _resume_trace(
         restored_attempt_ids[:len(replay.attempt_ids)]
         != replay.attempt_ids
         or len(trailing_attempts) > 1
-        or any(
-            item.state is not CandidateAttemptState.UNCERTAIN
-            for item in trailing_attempts
-        )
     ):
         raise _blocked_resume(restored, "候选管线恢复调用与检查点不一致")
+    if (
+        trailing_attempts
+        and trailing_attempts[0].state is not CandidateAttemptState.UNCERTAIN
+    ):
+        raise _blocked_resume(
+            restored,
+            "已结算候选调用缺少可恢复结果投影",
+            code="candidate_result_projection_missing",
+        )
     if replay.truncations != tuple(restored.truncations):
         raise _blocked_resume(restored, "候选管线恢复截断与检查点不一致")
     if (
@@ -3262,6 +3277,10 @@ class ChapterCandidatePipeline:
     """Hide the ordered candidate gates behind one safe orchestration interface."""
 
     def __init__(self, deps: ChapterCandidatePipelineDeps) -> None:
+        if not callable(deps.persist_checkpoint):
+            raise ValueError(
+                "candidate checkpoint persistence is required"
+            )
         self._deps = deps
 
     async def _persist_checkpoint(
@@ -3269,8 +3288,7 @@ class ChapterCandidatePipeline:
         checkpoint: CandidatePipelineCheckpointV1,
     ) -> None:
         persist = self._deps.persist_checkpoint
-        if persist is not None:
-            await persist(parse_candidate_pipeline_checkpoint(checkpoint))
+        await persist(parse_candidate_pipeline_checkpoint(checkpoint))
 
     async def _apply_prose_repair(
         self,
@@ -3304,15 +3322,14 @@ class ChapterCandidatePipeline:
         )
         _repaired_prose, repaired_source = _validate_prose_candidate(receipt)
         trace.source = repaired_source
-        if self._deps.persist_checkpoint is not None:
-            await self._persist_checkpoint(_prose_checkpoint(
-                chapter_id=chapter_id,
-                sequence=len(trace.completed_steps),
-                source=repaired_source,
-                evidence=evidence,
-                cycle=request.cycle,
-                origin="repair",
-            ))
+        await self._persist_checkpoint(_prose_checkpoint(
+            chapter_id=chapter_id,
+            sequence=len(trace.completed_steps),
+            source=repaired_source,
+            evidence=evidence,
+            cycle=request.cycle,
+            origin="repair",
+        ))
         if not _prose_repair_advanced_revision(source, repaired_source):
             raise ChapterCandidatePipelineBlocked(
                 "正文修复没有产生新候选",
@@ -3388,15 +3405,14 @@ class ChapterCandidatePipeline:
             evidence = trace.record("prose", generated.generation)
             _prose, source = _validate_prose_candidate(generated)
             trace.source = source
-            if self._deps.persist_checkpoint is not None:
-                await self._persist_checkpoint(_prose_checkpoint(
-                    chapter_id=chapter_id,
-                    sequence=len(trace.completed_steps),
-                    source=source,
-                    evidence=evidence,
-                    cycle=0,
-                    origin="initial",
-                ))
+            await self._persist_checkpoint(_prose_checkpoint(
+                chapter_id=chapter_id,
+                sequence=len(trace.completed_steps),
+                source=source,
+                evidence=evidence,
+                cycle=0,
+                origin="initial",
+            ))
         else:
             source = resume.source
             if resume.state is not None:
@@ -3479,10 +3495,7 @@ class ChapterCandidatePipeline:
                 raise ChapterCandidatePipelineBlocked(
                     "章纲符合度没有绑定正文候选"
                 )
-            if (
-                review_evidence is not None
-                and self._deps.persist_checkpoint is not None
-            ):
+            if review_evidence is not None:
                 await self._persist_checkpoint(_adherence_checkpoint(
                     chapter_id=chapter_id,
                     sequence=len(trace.completed_steps),
@@ -3561,10 +3574,7 @@ class ChapterCandidatePipeline:
                 )
             trace.state_proposal_id = proposal_id
             dropped = dict(state_result.dropped or {})
-            if (
-                state_checkpoint_context is not None
-                and self._deps.persist_checkpoint is not None
-            ):
+            if state_checkpoint_context is not None:
                 (
                     state_evidence,
                     state_origin,
@@ -3624,20 +3634,19 @@ class ChapterCandidatePipeline:
             _next_state, next_proposal_id, _next_token, _next_issues = (
                 _validate_state_shape(state_result)
             )
-            if self._deps.persist_checkpoint is not None:
-                await self._persist_checkpoint(_state_checkpoint(
-                    chapter_id=chapter_id,
-                    sequence=len(trace.completed_steps),
-                    source=source,
-                    evidence=state_evidence,
-                    cycle=cycle,
-                    origin="repair",
-                    request_id=receipt.request_id,
-                    proposal_id=next_proposal_id,
-                    dropped_reference_count=_dropped_reference_count(
-                        state_result.dropped
-                    ),
-                ))
+            await self._persist_checkpoint(_state_checkpoint(
+                chapter_id=chapter_id,
+                sequence=len(trace.completed_steps),
+                source=source,
+                evidence=state_evidence,
+                cycle=cycle,
+                origin="repair",
+                request_id=receipt.request_id,
+                proposal_id=next_proposal_id,
+                dropped_reference_count=_dropped_reference_count(
+                    state_result.dropped
+                ),
+            ))
             if next_proposal_id == proposal_id:
                 raise ChapterCandidatePipelineBlocked(
                     "状态修复没有产生新候选",
