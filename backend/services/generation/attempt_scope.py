@@ -9,6 +9,9 @@ from backend.db.repositories.generation_job_repository import (
     generation_job_repo,
 )
 from backend.llm.models import TokenUsage
+from backend.services.generation.candidate_repair_contracts import (
+    PreDispatchFenceV1,
+)
 from backend.services.llm.generation_runtime import AttemptUsage
 
 
@@ -65,31 +68,24 @@ class JobAttemptScope:
         self._attempts: dict[str, AttemptUsage] = {}
         self._uncertain: set[str] = set()
         self._persisted_states: dict[str, str] = {}
-        self._pre_dispatch_fence: dict[str, object] | None = None
+        self._pre_dispatch_fence: PreDispatchFenceV1 | None = None
         self._restore_attempt_evidence(existing_attempt_slots)
 
     async def bind_pre_dispatch_fence(
         self,
-        *,
-        receipt_id: str,
-        claim_token: str,
-        claim_epoch: int,
+        fence: PreDispatchFenceV1,
     ) -> None:
         """Fence future claims to the current durable receipt lease."""
+        if not isinstance(fence, PreDispatchFenceV1):
+            raise ValueError("pre-dispatch fence contract is required")
+        if fence.step_id != self.step_id:
+            raise ValueError("pre-dispatch fence step does not match the scope")
         await self.repo.bind_pre_dispatch_fence(
             self.job_id,
             self.chapter_id,
-            self.step_id,
-            receipt_id=receipt_id,
-            claim_token=claim_token,
-            claim_epoch=claim_epoch,
+            fence,
         )
-        self._pre_dispatch_fence = {
-            "receipt_id": str(receipt_id),
-            "claim_token": str(claim_token),
-            "claim_epoch": int(claim_epoch),
-            "step_id": self.step_id,
-        }
+        self._pre_dispatch_fence = fence
 
     def _restore_attempt_evidence(
         self,

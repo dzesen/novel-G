@@ -539,7 +539,8 @@ class StateCandidateRepairReceiptRepository:
         """Repair a receipt after the Job ledger proves zero dispatch."""
         if (
             not new_claim_token
-            or not attempt_ids
+            or type(attempt_ids) is not tuple
+            or not 1 <= len(attempt_ids) <= 64
             or len(set(attempt_ids)) != len(attempt_ids)
         ):
             raise StateCandidateRepairReceiptConflict(

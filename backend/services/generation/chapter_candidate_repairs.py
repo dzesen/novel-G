@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from backend.db.repositories.agent_runtime_repository import (
@@ -43,6 +43,9 @@ from backend.services.generation.chapter_generation_application import (
     STATE_WORKFLOW,
     StateRepairGuidance,
 )
+from backend.services.generation.candidate_repair_contracts import (
+    PreDispatchFenceV1,
+)
 from backend.services.generation.prose_remediation_runtime import (
     REMEDIATION_SCOPE_KIND,
     build_prose_remediation_runtime,
@@ -58,6 +61,15 @@ from backend.services.llm.generation_runtime import (
 
 
 _MAX_REPAIR_ATTEMPT_EVIDENCE = 64
+
+
+class FencedAttemptScope(AttemptScope, Protocol):
+    """A paid-attempt scope that can atomically fence receipt takeovers."""
+
+    async def bind_pre_dispatch_fence(
+        self,
+        fence: PreDispatchFenceV1,
+    ) -> None: ...
 
 
 class CandidateRepairRunStopped(RuntimeError):
@@ -335,15 +347,11 @@ class _StateRepairReceiptAttemptScope:
         wrapped: Any,
         *,
         receipts: Any,
-        receipt_id: str,
-        claim_token: str,
-        claim_epoch: int,
+        fence: PreDispatchFenceV1,
     ) -> None:
         self._wrapped = wrapped
         self._receipts = receipts
-        self._receipt_id = str(receipt_id)
-        self._claim_token = str(claim_token)
-        self._claim_epoch = int(claim_epoch)
+        self._fence = fence
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._wrapped, name)
@@ -351,9 +359,9 @@ class _StateRepairReceiptAttemptScope:
     async def _mark(self, attempt_id: str) -> str:
         try:
             await self._receipts.mark_dispatched(
-                receipt_id=self._receipt_id,
-                claim_token=self._claim_token,
-                claim_epoch=self._claim_epoch,
+                receipt_id=self._fence.receipt_id,
+                claim_token=self._fence.claim_token,
+                claim_epoch=self._fence.claim_epoch,
                 attempt_id=attempt_id,
             )
         except BaseException:
@@ -396,9 +404,9 @@ class _StateRepairReceiptAttemptScope:
         if callable(release):
             await release(attempt_id, reason)
         await self._receipts.release_pre_dispatch(
-            receipt_id=self._receipt_id,
-            claim_token=self._claim_token,
-            claim_epoch=self._claim_epoch,
+            receipt_id=self._fence.receipt_id,
+            claim_token=self._fence.claim_token,
+            claim_epoch=self._fence.claim_epoch,
             attempt_id=attempt_id,
         )
 
@@ -412,7 +420,7 @@ class ChapterCandidateRepairApplication:
         execution_id: str,
         readiness: Mapping[str, Any],
         generation_params: Mapping[str, Any] | None,
-        attempt_scope_factory: Callable[[str], AttemptScope],
+        attempt_scope_factory: Callable[[str], FencedAttemptScope],
         deps: ChapterCandidateRepairApplicationDeps | None = None,
     ) -> None:
         if not str(execution_id):
@@ -555,22 +563,11 @@ class ChapterCandidateRepairApplication:
         *,
         chapter_id: str,
         cycle: int,
-        receipt_id: str,
-        claim_token: str,
-        claim_epoch: int,
-        fence_bound: bool,
+        fence: PreDispatchFenceV1,
     ) -> None:
         step_id = f"candidate-state-repair:{cycle}"
-        current_fence = (
-            {
-                "receipt_id": str(receipt_id),
-                "claim_token": str(claim_token),
-                "claim_epoch": claim_epoch,
-                "step_id": step_id,
-            }
-            if fence_bound
-            else None
-        )
+        if fence.step_id != step_id:
+            raise ValueError("state repair cleanup fence does not match its cycle")
         for _attempt in range(4):
             slots = await self._raw_state_attempts(
                 chapter_id=chapter_id,
@@ -599,7 +596,7 @@ class ChapterCandidateRepairApplication:
                         chapter_id,
                         step_id,
                         attempt_id,
-                        current_pre_dispatch_fence=current_fence,
+                        current_pre_dispatch_fence=fence,
                     )
                 ) or changed
             if not changed:
@@ -1102,35 +1099,31 @@ class ChapterCandidateRepairApplication:
         claim_epoch = receipt.get("claim_epoch")
         if type(claim_epoch) is not int or claim_epoch < 1:
             raise ValueError("state repair receipt claim epoch is invalid")
-        base_attempt_scope = self._attempt_scope_factory(
-            f"candidate-state-repair:{request.cycle}"
-        )
-        bind_fence = getattr(
-            base_attempt_scope,
-            "bind_pre_dispatch_fence",
-            None,
-        )
-        fence_bound = callable(bind_fence)
-        if fence_bound:
-            await bind_fence(
-                receipt_id=str(receipt["_id"]),
-                claim_token=claim_token,
-                claim_epoch=claim_epoch,
-            )
-        await self._discard_reserved_state_attempts(
-            chapter_id=chapter_id,
-            cycle=request.cycle,
+        fence = PreDispatchFenceV1(
             receipt_id=str(receipt["_id"]),
             claim_token=claim_token,
             claim_epoch=claim_epoch,
-            fence_bound=fence_bound,
+            cycle=request.cycle,
+        )
+        base_attempt_scope = self._attempt_scope_factory(
+            f"candidate-state-repair:{request.cycle}"
+        )
+        try:
+            bind_fence = base_attempt_scope.bind_pre_dispatch_fence
+        except AttributeError as exc:
+            raise ValueError(
+                "state repair requires a fenced paid-attempt scope"
+            ) from exc
+        await bind_fence(fence)
+        await self._discard_reserved_state_attempts(
+            chapter_id=chapter_id,
+            cycle=request.cycle,
+            fence=fence,
         )
         attempt_scope = _StateRepairReceiptAttemptScope(
             base_attempt_scope,
             receipts=self._deps.state_repair_receipts,
-            receipt_id=str(receipt["_id"]),
-            claim_token=claim_token,
-            claim_epoch=claim_epoch,
+            fence=fence,
         )
         generation = await self._deps.generate_state_candidate(
             novel_id,

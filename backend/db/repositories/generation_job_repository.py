@@ -1,7 +1,6 @@
 """generation_jobs 仓储：批量作业记录的 CRUD 与进度追加。"""
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, Dict, List
 from uuid import uuid4
 
@@ -12,6 +11,9 @@ from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
+from backend.services.generation.candidate_repair_contracts import (
+    PreDispatchFenceV1,
+)
 
 
 USAGE_SUMMARY_LIMIT = 100
@@ -43,36 +45,6 @@ class AttemptCapacityExceeded(ValueError):
 
 class AttemptFenceExpired(AttemptCapacityExceeded):
     """A stale worker tried to claim against a replaced dispatch fence."""
-
-
-def _pre_dispatch_fence(
-    value: Mapping[str, Any],
-    *,
-    step_id: str,
-) -> dict[str, Any]:
-    receipt_id = value.get("receipt_id")
-    claim_token = value.get("claim_token")
-    claim_epoch = value.get("claim_epoch")
-    if (
-        not isinstance(receipt_id, str)
-        or not receipt_id
-        or len(receipt_id) > 128
-        or not isinstance(claim_token, str)
-        or not claim_token
-        or len(claim_token) > 128
-        or type(claim_epoch) is not int
-        or claim_epoch < 1
-        or claim_epoch > 1_000_000
-        or not step_id
-        or len(step_id) > 160
-    ):
-        raise ValueError("pre-dispatch fence is invalid")
-    return {
-        "receipt_id": receipt_id,
-        "claim_token": claim_token,
-        "claim_epoch": claim_epoch,
-        "step_id": str(step_id),
-    }
 
 
 class GenerationJobRepository(BaseRepository):
@@ -359,29 +331,17 @@ class GenerationJobRepository(BaseRepository):
         self,
         job_id: str,
         chapter_id: str,
-        step_id: str,
-        *,
-        receipt_id: str,
-        claim_token: str,
-        claim_epoch: int,
+        fence: PreDispatchFenceV1,
     ) -> None:
         """Publish the receipt lease into the same document used for claims.
 
         A receipt takeover is cross-collection. Publishing its token here first
         makes every later Job attempt claim a local, atomic fencing check.
         """
-        fence = _pre_dispatch_fence(
-            {
-                "receipt_id": receipt_id,
-                "claim_token": claim_token,
-                "claim_epoch": claim_epoch,
-            },
-            step_id=step_id,
-        )
-        fence_path = (
-            "attempt_reservation.pre_dispatch_fences."
-            f"{fence['receipt_id']}"
-        )
+        if not isinstance(fence, PreDispatchFenceV1):
+            raise ValueError("pre-dispatch fence contract is required")
+        value = fence.model_dump(mode="json")
+        fence_path = "attempt_reservation.pre_dispatch_fence"
         result = await self.collection.update_one(
             {
                 "_id": to_object_id(job_id),
@@ -389,19 +349,31 @@ class GenerationJobRepository(BaseRepository):
                 "attempt_reservation.chapter_id": str(chapter_id),
                 "$or": [
                     {fence_path: {"$exists": False}},
+                    {fence_path: value},
                     {
+                        f"{fence_path}.schema_version": value["schema_version"],
+                        f"{fence_path}.receipt_id": value["receipt_id"],
+                        f"{fence_path}.cycle": value["cycle"],
                         f"{fence_path}.claim_epoch": {
-                            "$lt": fence["claim_epoch"]
+                            "$lt": value["claim_epoch"]
                         }
                     },
                     {
-                        fence_path: fence,
+                        f"{fence_path}.schema_version": value["schema_version"],
+                        f"{fence_path}.cycle": {"$lt": value["cycle"]},
+                        "attempt_slots": {
+                            "$not": {
+                                "$elemMatch": {
+                                    "state": {"$in": ["claimed", "uncertain"]}
+                                }
+                            }
+                        },
                     },
                 ],
             },
             {
                 "$set": {
-                    fence_path: fence,
+                    fence_path: value,
                     "updated_at": get_utc_now(),
                 }
             },
@@ -420,7 +392,7 @@ class GenerationJobRepository(BaseRepository):
         provider_alias: str,
         conservative_tokens: int | None,
         *,
-        pre_dispatch_fence: Mapping[str, Any] | None = None,
+        pre_dispatch_fence: PreDispatchFenceV1 | None = None,
     ) -> str:
         """Atomically claim an attempt slot and reserve its worst-case tokens."""
         reserved = (
@@ -440,12 +412,13 @@ class GenerationJobRepository(BaseRepository):
             "claimed_at": now,
             "conservative_tokens": reserved,
         }
-        fence = None
+        fence: dict[str, Any] | None = None
         if pre_dispatch_fence is not None:
-            fence = _pre_dispatch_fence(
-                pre_dispatch_fence,
-                step_id=str(step_id),
-            )
+            if not isinstance(pre_dispatch_fence, PreDispatchFenceV1):
+                raise ValueError("pre-dispatch fence contract is required")
+            if pre_dispatch_fence.step_id != str(step_id):
+                raise ValueError("pre-dispatch fence step does not match the claim")
+            fence = pre_dispatch_fence.model_dump(mode="json")
             slot["pre_dispatch_fence"] = fence
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
@@ -453,24 +426,7 @@ class GenerationJobRepository(BaseRepository):
             "attempt_reservation.chapter_id": str(chapter_id),
         }
         if fence is not None:
-            fence_path = (
-                "attempt_reservation.pre_dispatch_fences."
-                f"{fence['receipt_id']}"
-            )
-            query.update({
-                f"{fence_path}.receipt_id": (
-                    fence["receipt_id"]
-                ),
-                f"{fence_path}.claim_token": (
-                    fence["claim_token"]
-                ),
-                f"{fence_path}.claim_epoch": (
-                    fence["claim_epoch"]
-                ),
-                f"{fence_path}.step_id": (
-                    fence["step_id"]
-                ),
-            })
+            query["attempt_reservation.pre_dispatch_fence"] = fence
         if reserved is None:
             # A finite job budget must never silently accept an unbounded call.
             query["token_budget"] = None
@@ -540,16 +496,10 @@ class GenerationJobRepository(BaseRepository):
 
         job = await self.get_job(job_id)
         if fence is not None:
-            active_fence = (
-                (job.get("attempt_reservation") or {}).get(
-                    "pre_dispatch_fences"
-                )
-                or {}
-            ).get(fence["receipt_id"])
-            if not isinstance(active_fence, Mapping) or any(
-                active_fence.get(field) != expected
-                for field, expected in fence.items()
-            ):
+            active_fence = (job.get("attempt_reservation") or {}).get(
+                "pre_dispatch_fence"
+            )
+            if active_fence != fence:
                 raise AttemptFenceExpired(
                     "Provider attempt dispatch fence was replaced"
                 )
@@ -731,7 +681,7 @@ class GenerationJobRepository(BaseRepository):
         step_id: str,
         attempt_id: str,
         *,
-        current_pre_dispatch_fence: Mapping[str, Any] | None = None,
+        current_pre_dispatch_fence: PreDispatchFenceV1 | None = None,
     ) -> bool:
         """Remove a cross-ledger orphan only after receipt fencing proves no dispatch."""
         job = await self.get_job(job_id)
@@ -751,33 +701,24 @@ class GenerationJobRepository(BaseRepository):
         )
         if slot is None:
             return False
-        current_fence = None
+        current_fence: dict[str, Any] | None = None
         if current_pre_dispatch_fence is not None:
-            current_fence = _pre_dispatch_fence(
-                current_pre_dispatch_fence,
-                step_id=str(step_id),
+            if not isinstance(current_pre_dispatch_fence, PreDispatchFenceV1):
+                raise ValueError("pre-dispatch fence contract is required")
+            if current_pre_dispatch_fence.step_id != str(step_id):
+                raise ValueError("pre-dispatch fence step does not match cleanup")
+            current_fence = current_pre_dispatch_fence.model_dump(mode="json")
+            active_fence = (job.get("attempt_reservation") or {}).get(
+                "pre_dispatch_fence"
             )
-            active_fence = (
-                (job.get("attempt_reservation") or {}).get(
-                    "pre_dispatch_fences"
-                )
-                or {}
-            ).get(current_fence["receipt_id"])
-            if not isinstance(active_fence, Mapping) or any(
-                active_fence.get(field) != expected
-                for field, expected in current_fence.items()
-            ):
+            if active_fence != current_fence:
                 raise AttemptFenceExpired(
                     "Pre-dispatch cleanup fence was replaced"
                 )
             slot_fence = slot.get("pre_dispatch_fence")
             if (
                 slot.get("state") == "claimed"
-                and isinstance(slot_fence, Mapping)
-                and all(
-                    slot_fence.get(field) == expected
-                    for field, expected in current_fence.items()
-                )
+                and slot_fence == current_fence
             ):
                 return False
         state = str(slot["state"])
@@ -799,24 +740,7 @@ class GenerationJobRepository(BaseRepository):
             }},
         }
         if current_fence is not None:
-            fence_path = (
-                "attempt_reservation.pre_dispatch_fences."
-                f"{current_fence['receipt_id']}"
-            )
-            query.update({
-                f"{fence_path}.receipt_id": (
-                    current_fence["receipt_id"]
-                ),
-                f"{fence_path}.claim_token": (
-                    current_fence["claim_token"]
-                ),
-                f"{fence_path}.claim_epoch": (
-                    current_fence["claim_epoch"]
-                ),
-                f"{fence_path}.step_id": (
-                    current_fence["step_id"]
-                ),
-            })
+            query["attempt_reservation.pre_dispatch_fence"] = current_fence
         update: dict[str, Any] = {
             "$pull": {"attempt_slots": {"attempt_id": str(attempt_id)}},
             "$inc": {"usage_attempt_claimed": -1},

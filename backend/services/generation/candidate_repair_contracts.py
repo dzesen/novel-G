@@ -11,6 +11,24 @@ from pydantic import BaseModel, ConfigDict, Field
 MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
 
 
+class PreDispatchFenceV1(BaseModel):
+    """One bounded receipt lease mirrored into the GenerationJob ledger."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["state_repair_pre_dispatch_fence.v1"] = (
+        "state_repair_pre_dispatch_fence.v1"
+    )
+    receipt_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    claim_token: str = Field(min_length=1, max_length=128)
+    claim_epoch: int = Field(ge=1, le=1_000_000)
+    cycle: int = Field(ge=1, le=MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES)
+
+    @property
+    def step_id(self) -> str:
+        return f"candidate-state-repair:{self.cycle}"
+
+
 class StateContextProjection(BaseModel):
     """Metadata-only context truncation evidence persisted before dispatch."""
 
