@@ -6,7 +6,13 @@ from typing import Any, Awaitable, Callable
 
 from backend.db import collections
 from backend.db.mongo import get_database
-from backend.db.mutation import MutationEngine, MutationHandlerSpec, RecoveryScope
+from backend.db.mutation import (
+    MutationCommand,
+    MutationConflictError,
+    MutationEngine,
+    MutationHandlerSpec,
+    RecoveryScope,
+)
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.novel.chapter_service import ChapterService
 from backend.services.novel.chapter_state_service import ChapterStateService
@@ -165,3 +171,90 @@ async def recover_pending_mutations(novel_id: str | None = None) -> dict[str, li
     )
     await _sync_quarantined_proposals(report)
     return report
+
+
+async def recover_bound_mutation_revision(
+    novel_id: str,
+    idempotency_key: str,
+    *,
+    operation: str,
+) -> int | None:
+    """Recover one exact Job-owned mutation and return its frozen revision receipt.
+
+    A missing journal means the mutation has not begun.  Once an intent exists,
+    the persisted command is authoritative: callers never rebuild it from an
+    expired proposal token or today's repository state.
+    """
+
+    normalized_novel_id = str(novel_id or "").strip()
+    normalized_key = str(idempotency_key or "").strip()
+    normalized_operation = str(operation or "").strip()
+    if not normalized_novel_id or not normalized_key or not normalized_operation:
+        raise ValueError("mutation recovery identity is required")
+    collection = get_database()[collections.MUTATION_JOURNALS]
+    query = {
+        "novel_id": to_object_id(normalized_novel_id),
+        "idempotency_key": normalized_key,
+        "is_deleted": False,
+    }
+    journal = await collection.find_one(query)
+    if journal is None:
+        return None
+    if str(journal.get("operation") or "") != normalized_operation:
+        raise MutationConflictError(
+            "The idempotency key is bound to a different mutation operation"
+        )
+    try:
+        command = MutationCommand.from_journal(journal)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MutationConflictError("The persisted mutation command is invalid") from exc
+    if (
+        command.novel_id != normalized_novel_id
+        or command.idempotency_key != normalized_key
+        or command.operation != normalized_operation
+        or type(command.expected_narrative_revision) is not int
+    ):
+        raise MutationConflictError("The persisted mutation identity diverged")
+    stored_digest = journal.get("command_digest")
+    if stored_digest is not None and (
+        not isinstance(stored_digest, str)
+        or stored_digest != command.digest()
+    ):
+        raise MutationConflictError("The persisted mutation command digest diverged")
+
+    status = str(journal.get("status") or "")
+    if status != "completed":
+        if status not in {"intent", "running", "failed"}:
+            raise MutationConflictError(
+                f"The persisted mutation cannot be recovered from status {status or 'missing'}"
+            )
+        spec = _executors().get((command.operation, command.version))
+        if spec is None:
+            raise MutationConflictError("The persisted mutation handler is unavailable")
+        await MutationEngine({
+            (command.operation, command.version): spec,
+        }).execute(command)
+        journal = await collection.find_one(query)
+        if journal is None or str(journal.get("status") or "") != "completed":
+            raise MutationConflictError("The persisted mutation did not complete")
+
+    receipts = journal.get("receipts")
+    revision_receipt = (
+        receipts.get("narrative_revision")
+        if isinstance(receipts, dict)
+        else None
+    )
+    revision = (
+        revision_receipt.get("revision")
+        if isinstance(revision_receipt, dict)
+        else None
+    )
+    if type(revision) is not int or revision < 1:
+        raise MutationConflictError(
+            "The persisted mutation narrative revision receipt is invalid"
+        )
+    if revision != command.expected_narrative_revision + 1:
+        raise MutationConflictError(
+            "The persisted mutation narrative revision receipt diverged"
+        )
+    return revision

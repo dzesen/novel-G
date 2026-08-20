@@ -39,8 +39,10 @@ USAGE_SUMMARY_LIMIT = 100
 MAX_ACTIVE_TOKEN_RESERVATIONS = 32
 _ATOMIC_JOB_FIELDS = frozenset({
     "candidate_pipeline_checkpoints",
+    "expected_narrative_revision",
     "progress",
 })
+_MAX_NARRATIVE_REVISION = 2**63 - 1
 
 
 def _reject_atomic_field_updates(fields: Dict[str, Any]) -> None:
@@ -86,6 +88,13 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         raise ValueError(
             "Candidate completion receipts require an atomic repository command"
         )
+    revision = document.get("expected_narrative_revision")
+    if revision is not None and (
+        type(revision) is not int
+        or revision < 0
+        or revision > _MAX_NARRATIVE_REVISION
+    ):
+        raise ValueError("Generation job narrative revision cursor is invalid")
 
 
 class TokenBudgetExceeded(ValueError):
@@ -555,6 +564,101 @@ class GenerationJobRepository(BaseRepository):
             matched = True
         return matched
 
+    async def advance_narrative_revision_cursor(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        expected_revision: int,
+        next_revision: int,
+    ) -> bool:
+        """Advance one Job-owned mutation cursor under the active chapter fence."""
+
+        normalized_chapter_id = str(chapter_id or "")
+        if (
+            not normalized_chapter_id
+            or type(expected_revision) is not int
+            or type(next_revision) is not int
+            or expected_revision < 0
+            or next_revision != expected_revision + 1
+            or next_revision > _MAX_NARRATIVE_REVISION
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Generation job narrative revision transition is invalid"
+            )
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": normalized_chapter_id,
+                "expected_narrative_revision": expected_revision,
+            },
+            {
+                "$set": {
+                    "expected_narrative_revision": next_revision,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        if (
+            str(current.get("status") or "") == "running"
+            and str(current.get("current_chapter_id") or "")
+            == normalized_chapter_id
+            and type(current.get("expected_narrative_revision")) is int
+            and current["expected_narrative_revision"] == next_revision
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Generation job narrative revision cursor changed"
+        )
+
+    async def update_job_authorization(
+        self,
+        job_id: str,
+        fields: Dict[str, Any],
+        *,
+        previous_revision: int | None,
+        next_revision: int,
+    ) -> bool:
+        """Rebind readiness and its revision cursor in one fenced update."""
+
+        _reject_atomic_field_updates(fields)
+        if (
+            (previous_revision is not None and type(previous_revision) is not int)
+            or type(next_revision) is not int
+            or next_revision < 0
+            or next_revision > _MAX_NARRATIVE_REVISION
+        ):
+            raise ValueError("Generation job reauthorization revision is invalid")
+        query: dict[str, Any] = {
+            "_id": to_object_id(job_id),
+            "is_deleted": False,
+            "candidate_pipeline_checkpoints": [],
+        }
+        if previous_revision is None:
+            query["expected_narrative_revision"] = {"$exists": False}
+        else:
+            query["expected_narrative_revision"] = previous_revision
+        result = await self.collection.update_one(
+            query,
+            {
+                "$set": {
+                    **dict(fields),
+                    "expected_narrative_revision": next_revision,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Generation job reauthorization lost its revision fence"
+        )
+
     async def complete_candidate_pipeline_chapter(
         self,
         job_id: str,
@@ -563,6 +667,8 @@ class GenerationJobRepository(BaseRepository):
         expected_checkpoints: Sequence[CandidatePipelineCheckpointV1],
         entry: CandidatePipelineProgressV1,
         tokens_delta: int,
+        expected_narrative_revision: int | None = None,
+        next_narrative_revision: int | None = None,
     ) -> bool:
         """Atomically publish progress and release exactly one checkpoint tail."""
         normalized_chapter_id = str(chapter_id or "")
@@ -583,6 +689,20 @@ class GenerationJobRepository(BaseRepository):
         ):
             raise CandidatePipelineCheckpointConflict(
                 "Candidate pipeline progress token delta is invalid"
+            )
+        revision_transition_supplied = (
+            expected_narrative_revision is not None
+            or next_narrative_revision is not None
+        )
+        if revision_transition_supplied and (
+            type(expected_narrative_revision) is not int
+            or type(next_narrative_revision) is not int
+            or expected_narrative_revision < 0
+            or next_narrative_revision != expected_narrative_revision + 1
+            or next_narrative_revision > _MAX_NARRATIVE_REVISION
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline narrative revision transition is invalid"
             )
         if (
             isinstance(expected_checkpoints, (str, bytes))
@@ -633,12 +753,35 @@ class GenerationJobRepository(BaseRepository):
             tokens_delta=tokens_delta,
         )
         job = await self.get_job(job_id)
+        current_revision = job.get("expected_narrative_revision")
+        if current_revision is not None and type(current_revision) is not int:
+            raise CandidatePipelineCheckpointConflict(
+                "Generation job narrative revision cursor is invalid"
+            )
+        if (current_revision is not None) != revision_transition_supplied:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline narrative revision transition is required"
+            )
         if self._completed_candidate_progress(
             job,
             expected_receipt=receipt,
             entry=validated_entry,
         ):
+            if (
+                revision_transition_supplied
+                and current_revision != next_narrative_revision
+            ):
+                raise CandidatePipelineCheckpointConflict(
+                    "Candidate pipeline completion revision diverged"
+                )
             return True
+        if (
+            revision_transition_supplied
+            and current_revision != expected_narrative_revision
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline narrative revision cursor changed"
+            )
         expected_scene_count, max_repair_cycles = (
             await self._candidate_completion_authority(
                 job,
@@ -706,6 +849,15 @@ class GenerationJobRepository(BaseRepository):
                 "progress.candidate_pipeline_completion.ledger_digest": {
                     "$ne": receipt.ledger_digest
                 },
+                **(
+                    {
+                        "expected_narrative_revision": (
+                            expected_narrative_revision
+                        )
+                    }
+                    if revision_transition_supplied
+                    else {}
+                ),
                 "$expr": {
                     "$lt": [
                         {
@@ -723,6 +875,15 @@ class GenerationJobRepository(BaseRepository):
                 "$set": {
                     "candidate_pipeline_checkpoints": [],
                     "current_chapter_id": None,
+                    **(
+                        {
+                            "expected_narrative_revision": (
+                                next_narrative_revision
+                            )
+                        }
+                        if revision_transition_supplied
+                        else {}
+                    ),
                     "updated_at": get_utc_now(),
                 },
             },
@@ -735,6 +896,14 @@ class GenerationJobRepository(BaseRepository):
             expected_receipt=receipt,
             entry=validated_entry,
         ):
+            if (
+                revision_transition_supplied
+                and current.get("expected_narrative_revision")
+                != next_narrative_revision
+            ):
+                raise CandidatePipelineCheckpointConflict(
+                    "Candidate pipeline completion revision diverged"
+                )
             return True
         raise CandidatePipelineCheckpointConflict(
             "Candidate pipeline completion lost its checkpoint fence"

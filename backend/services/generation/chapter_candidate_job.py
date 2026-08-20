@@ -128,7 +128,8 @@ class ChapterCandidateJobRunnerDeps:
     attempt_scope_factory: Callable[[str, str, str, Sequence[Mapping[str, Any]]], Any]
     build_execution: Callable[..., CandidateJobExecution]
     current_narrative_revision: Callable[[str], Awaitable[int]]
-    mutation_completed: Callable[..., Awaitable[bool]]
+    recover_mutation_revision: Callable[..., Awaitable[int | None]]
+    advance_narrative_revision_cursor: Callable[..., Awaitable[bool]]
     generate_outline: Callable[..., Awaitable[Any]]
     generate_prose_candidate: Callable[..., Awaitable[GeneratedProseCandidate]]
     review_prose_candidate: Callable[..., Awaitable[ChapterGenerationResult]]
@@ -141,9 +142,11 @@ class ChapterCandidateJobRunnerDeps:
 class CandidateJobScope:
     execution_id: str
     novel_id: str
+    owner_id: str
     scope: str
     volume_id: str | None
     chapter_id: str
+    chapter_volume_id: str
     order_index: int
     has_outline: bool
     scene_count: int
@@ -157,6 +160,7 @@ class CandidateJobScope:
         execution_id: str,
         novel_id: str,
         chapter_id: str,
+        expected_narrative_revision: int,
     ) -> "CandidateJobScope":
         if not all(
             ObjectId.is_valid(value)
@@ -183,12 +187,24 @@ class CandidateJobScope:
         elif volume_id is not None:
             raise ChapterCandidatePipelineBlocked("整本候选作业不得绑定卷身份")
         resources = readiness.get("resources")
-        revision = (
+        owner_id = (
+            resources.get("owner_id")
+            if isinstance(resources, Mapping)
+            else None
+        )
+        frozen_revision = (
             resources.get("narrative_revision")
             if isinstance(resources, Mapping)
             else None
         )
-        if type(revision) is not int or revision < 0:
+        if (
+            not isinstance(owner_id, str)
+            or not ObjectId.is_valid(owner_id)
+            or type(frozen_revision) is not int
+            or frozen_revision < 0
+            or type(expected_narrative_revision) is not int
+            or expected_narrative_revision < frozen_revision
+        ):
             raise ChapterCandidatePipelineBlocked(
                 "候选作业 narrative revision 无效"
             )
@@ -205,11 +221,14 @@ class CandidateJobScope:
         if len(matches) != 1:
             raise ChapterCandidatePipelineBlocked("候选作业章节身份无效")
         snapshot = matches[0]
+        chapter_volume_id = snapshot.get("volume_id")
         order_index = snapshot.get("order_index")
         has_outline = snapshot.get("has_outline")
         scene_count = snapshot.get("scene_count")
         if (
             type(order_index) is not int
+            or not isinstance(chapter_volume_id, str)
+            or not ObjectId.is_valid(chapter_volume_id)
             or type(has_outline) is not bool
             or type(scene_count) is not int
             or scene_count < 0
@@ -220,13 +239,15 @@ class CandidateJobScope:
         return cls(
             execution_id=str(execution_id),
             novel_id=novel_id,
+            owner_id=owner_id,
             scope=str(scope),
             volume_id=str(volume_id) if volume_id is not None else None,
             chapter_id=chapter_id,
+            chapter_volume_id=chapter_volume_id,
             order_index=order_index,
             has_outline=has_outline,
             scene_count=scene_count,
-            expected_narrative_revision=revision,
+            expected_narrative_revision=expected_narrative_revision,
         )
 
     def validate_documents(
@@ -238,7 +259,7 @@ class CandidateJobScope:
         if str(novel.get("_id") or "") != self.novel_id:
             raise ChapterCandidatePipelineBlocked("候选作业读取了错误小说")
         owner_id = str(novel.get("owner_id") or "")
-        if not ObjectId.is_valid(owner_id):
+        if owner_id != self.owner_id:
             raise ChapterCandidatePipelineBlocked("候选作业缺少 owner-scoped 身份")
         if (
             str(chapter.get("_id") or "") != self.chapter_id
@@ -248,6 +269,8 @@ class CandidateJobScope:
         ):
             raise ChapterCandidatePipelineBlocked("候选作业章节父子范围无效")
         chapter_volume = str(chapter.get("volume_id") or "")
+        if chapter_volume != self.chapter_volume_id:
+            raise ChapterCandidatePipelineBlocked("候选作业章节卷身份已变化")
         if self.scope == "volume" and chapter_volume != self.volume_id:
             raise ChapterCandidatePipelineBlocked("候选作业章节不属于冻结卷")
         if not chapter_volume:
@@ -399,6 +422,7 @@ class ChapterCandidateJobRunner:
         *,
         execution_id: str,
         readiness: Mapping[str, Any],
+        expected_narrative_revision: int,
         authorized_attempt_slots: int,
         generation_params: Mapping[str, Any] | None,
         recalculate_after_outline: Callable[[str, dict[str, Any]], Awaitable[Any]],
@@ -406,6 +430,12 @@ class ChapterCandidateJobRunner:
     ) -> None:
         self._execution_id = str(execution_id)
         self._readiness = dict(readiness)
+        if (
+            type(expected_narrative_revision) is not int
+            or expected_narrative_revision < 0
+        ):
+            raise ValueError("candidate Job narrative revision cursor is invalid")
+        self._expected_narrative_revision = expected_narrative_revision
         if (
             isinstance(authorized_attempt_slots, bool)
             or not isinstance(authorized_attempt_slots, int)
@@ -429,17 +459,39 @@ class ChapterCandidateJobRunner:
                 code="candidate_narrative_revision_changed",
             )
 
-    async def _mutation_completed(
+    async def _recover_mutation_revision(
         self,
         scope: CandidateJobScope,
         key: str,
         operation: str,
-    ) -> bool:
-        return await self._deps.mutation_completed(
+    ) -> int | None:
+        return await self._deps.recover_mutation_revision(
             scope.novel_id,
             key,
             operation=operation,
         )
+
+    async def _advance_revision_cursor(
+        self,
+        scope: CandidateJobScope,
+        *,
+        expected_revision: int,
+        next_revision: int,
+    ) -> None:
+        if next_revision != expected_revision + 1:
+            raise ChapterCandidatePipelineBlocked(
+                "候选作业 mutation revision receipt 无效"
+            )
+        advanced = await self._deps.advance_narrative_revision_cursor(
+            self._execution_id,
+            chapter_id=scope.chapter_id,
+            expected_revision=expected_revision,
+            next_revision=next_revision,
+        )
+        if advanced is not True:
+            raise ChapterCandidatePipelineBlocked(
+                "候选作业 narrative revision cursor 更新失败"
+            )
 
     @staticmethod
     def _repair_cycle_limit(readiness: Mapping[str, Any]) -> int:
@@ -623,6 +675,8 @@ class ChapterCandidateJobRunner:
         terminal: Any,
         order_index: int,
         tokens: int,
+        expected_narrative_revision: int,
+        next_narrative_revision: int,
     ) -> CandidateChapterOutcome:
         state_checkpoint = terminal.latest_state
         adherence_checkpoint = terminal.latest_adherence
@@ -654,6 +708,8 @@ class ChapterCandidateJobRunner:
                 ),
             ),
             checkpoints=checkpoints,
+            expected_narrative_revision=expected_narrative_revision,
+            next_narrative_revision=next_narrative_revision,
         )
 
     async def run(
@@ -669,6 +725,7 @@ class ChapterCandidateJobRunner:
             execution_id=self._execution_id,
             novel_id=str(novel_id),
             chapter_id=chapter_id,
+            expected_narrative_revision=self._expected_narrative_revision,
         )
         novel = await self._deps.get_novel(novel_id)
         current = dict(await self._deps.get_chapter(chapter_id))
@@ -707,11 +764,16 @@ class ChapterCandidateJobRunner:
                     ),
                     state_proposal_id=state_checkpoint.proposal_id,
                 )
-                if await self._mutation_completed(
+                finalization_revision = await self._recover_mutation_revision(
                     scope,
                     finalization_key,
                     "finalize_chapter_generation",
-                ):
+                )
+                if finalization_revision is not None:
+                    if finalization_revision != expected_revision + 1:
+                        raise ChapterCandidatePipelineBlocked(
+                            "候选作业终态 mutation revision receipt 无效"
+                        )
                     terminal = replay_candidate_pipeline_checkpoints(
                         checkpoints,
                         chapter_id=chapter_id,
@@ -728,6 +790,8 @@ class ChapterCandidateJobRunner:
                         terminal=terminal,
                         order_index=scope.order_index,
                         tokens=tokens,
+                        expected_narrative_revision=expected_revision,
+                        next_narrative_revision=finalization_revision,
                     )
 
         def fenced_scope(step: str) -> _NarrativeFencedAttemptScope:
@@ -774,12 +838,12 @@ class ChapterCandidateJobRunner:
                 self._execution_id,
                 chapter_id,
             )
-            outline_committed = await self._mutation_completed(
+            outline_revision = await self._recover_mutation_revision(
                 scope,
                 outline_key,
                 "accept_chapter_outline",
             )
-            if not outline_committed:
+            if outline_revision is None:
                 await self._ensure_narrative_revision(scope, expected_revision)
                 if isinstance(scenes, list) and scenes:
                     raise ChapterCandidatePipelineBlocked(
@@ -813,16 +877,26 @@ class ChapterCandidateJobRunner:
                     expected_narrative_revision=expected_revision,
                     mutation_idempotency_key=outline_key,
                 )
-                outline_committed = await self._mutation_completed(
+                outline_revision = await self._recover_mutation_revision(
                     scope,
                     outline_key,
                     "accept_chapter_outline",
                 )
-                if not outline_committed:
+                if outline_revision is None:
                     raise ChapterCandidatePipelineBlocked(
                         "候选作业章纲 mutation receipt 缺失"
                     )
-            expected_revision += 1
+            if outline_revision == expected_revision + 1:
+                await self._advance_revision_cursor(
+                    scope,
+                    expected_revision=expected_revision,
+                    next_revision=outline_revision,
+                )
+                expected_revision = outline_revision
+            elif outline_revision != expected_revision:
+                raise ChapterCandidatePipelineBlocked(
+                    "候选作业章纲 mutation revision receipt 无效"
+                )
             await self._ensure_narrative_revision(scope, expected_revision)
             current = dict(await self._deps.get_chapter(chapter_id))
             current_volume_id = str(current.get("volume_id") or "")
@@ -1005,9 +1079,28 @@ class ChapterCandidateJobRunner:
             max_repair_cycles=execution.max_repair_cycles,
             require_terminal=True,
         )
+        state_checkpoint = terminal.latest_state
+        if state_checkpoint is None:
+            raise ChapterCandidatePipelineBlocked("候选作业终态状态检查点缺失")
+        finalization_key = chapter_finalization_idempotency_key(
+            prose_run_id=terminal.current_prose.source.source_run_id,
+            prose_run_revision=terminal.current_prose.source.source_run_revision,
+            state_proposal_id=state_checkpoint.proposal_id,
+        )
+        finalization_revision = await self._recover_mutation_revision(
+            scope,
+            finalization_key,
+            "finalize_chapter_generation",
+        )
+        if finalization_revision != expected_revision + 1:
+            raise ChapterCandidatePipelineBlocked(
+                "候选作业终态 mutation revision receipt 缺失或无效"
+            )
         return self._terminal_outcome(
             checkpoints=final_checkpoints,
             terminal=terminal,
             order_index=scope.order_index,
             tokens=result.tokens,
+            expected_narrative_revision=expected_revision,
+            next_narrative_revision=finalization_revision,
         )

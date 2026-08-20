@@ -52,6 +52,8 @@ class CandidateChapterOutcome:
 
     progress: CandidatePipelineProgressV1
     checkpoints: tuple[CandidatePipelineCheckpointV1, ...]
+    expected_narrative_revision: int | None = None
+    next_narrative_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -575,6 +577,12 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                         expected_checkpoints=candidate_outcome.checkpoints,
                         entry=candidate_outcome.progress,
                         tokens_delta=0,
+                        expected_narrative_revision=(
+                            candidate_outcome.expected_narrative_revision
+                        ),
+                        next_narrative_revision=(
+                            candidate_outcome.next_narrative_revision
+                        ),
                     )
                 else:
                     outcome = await deps.run_chapter(

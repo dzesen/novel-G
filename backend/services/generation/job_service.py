@@ -9,12 +9,11 @@ from typing import Any, Dict, List, Mapping, Optional
 from pymongo.errors import DuplicateKeyError
 
 from backend.db.repositories.generation_job_repository import generation_job_repo
-from backend.db.mutation import mutation_completed
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
-from backend.services.generation.chapter_pipeline import run_chapter
+from backend.services.generation.chapter_pipeline import ChapterPipelineFailed, run_chapter
 from backend.services.generation.chapter_candidate_authorization import (
     authorized_candidate_repair_attempt_slots,
     generation_plan_from_candidate_snapshot,
@@ -60,7 +59,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
 from backend.services.generation.readiness import generation_readiness_module
 from backend.services.novel.state_completion import state_completion_module
-from backend.services.novel.state_proposal import state_proposal_module
+from backend.services.novel.state_proposal import StaleStatePreview, state_proposal_module
 from backend.services.novel.emergent_reference_card_candidates import (
     emergent_reference_card_candidate_module,
 )
@@ -86,6 +85,24 @@ def _get_start_lock() -> asyncio.Lock:
 
 class ConflictError(Exception):
     """已有在跑作业（全局单作业约束）。路由映射为 409。"""
+
+
+async def _recover_job_mutation_revision(
+    novel_id: str,
+    idempotency_key: str,
+    *,
+    operation: str,
+) -> int | None:
+    # Lazy import keeps the recovery registry from forming a service import cycle.
+    from backend.services.novel.mutation_recovery import (
+        recover_bound_mutation_revision,
+    )
+
+    return await recover_bound_mutation_revision(
+        novel_id,
+        idempotency_key,
+        operation=operation,
+    )
 
 
 class ResumeReadinessRequired(ValueError):
@@ -159,7 +176,23 @@ def _new_job_doc(
     novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity,
     readiness, outline_deviation_policy, generation_params,
 ) -> Dict[str, Any]:
-    return {
+    planning = readiness.get("planning")
+    candidate_readiness = (
+        isinstance(planning, Mapping)
+        and "chapter_candidate_pipeline_revision" in planning
+    )
+    resources = readiness.get("resources")
+    expected_revision = (
+        resources.get("narrative_revision")
+        if isinstance(resources, Mapping)
+        else None
+    )
+    if (
+        candidate_readiness
+        and (type(expected_revision) is not int or expected_revision < 0)
+    ):
+        raise ValueError("Job readiness narrative revision is invalid")
+    document = {
         "novel_id": to_object_id(novel_id), "scope": scope,
         "volume_id": to_object_id(volume_id) if volume_id else None,
         "status": "running", "pause_reason": None,
@@ -198,6 +231,9 @@ def _new_job_doc(
         ) or {}).get("authorization_revision") or 0),
         "readiness": readiness,
     }
+    if type(expected_revision) is int and expected_revision >= 0:
+        document["expected_narrative_revision"] = expected_revision
+    return document
 
 
 class GenerationJobService:
@@ -453,13 +489,52 @@ class GenerationJobService:
                     )
                 ),
             )
+
+            cursor = current_job.get("expected_narrative_revision")
+            if cursor is not None:
+                if type(cursor) is not int or cursor < 0:
+                    raise ValueError("Generation job narrative revision cursor is invalid")
+                current_revision = await narrative_revision_store.current(novel_id)
+                if current_revision != cursor:
+                    raise StaleStatePreview(
+                        "Generation job narrative revision changed before chapter execution"
+                    )
+
+            async def advance_cursor(outcome) -> None:
+                nonlocal cursor
+                if cursor is None:
+                    return
+                mutation_steps = [
+                    step
+                    for step in outcome.steps_done
+                    if step in {"outline", "prose", "state"}
+                ]
+                next_revision = await narrative_revision_store.current(novel_id)
+                if next_revision != cursor + len(mutation_steps):
+                    raise StaleStatePreview(
+                        "Generation job narrative revision changed during chapter execution"
+                    )
+                for _step in mutation_steps:
+                    await generation_job_repo.advance_narrative_revision_cursor(
+                        job_id,
+                        chapter_id=chapter_id,
+                        expected_revision=cursor,
+                        next_revision=cursor + 1,
+                    )
+                    cursor += 1
             try:
-                return await run_chapter(
-                    novel_id,
-                    chapter,
-                    deps,
-                    outline_deviation_policy=outline_deviation_policy,
-                )
+                try:
+                    outcome = await run_chapter(
+                        novel_id,
+                        chapter,
+                        deps,
+                        outline_deviation_policy=outline_deviation_policy,
+                    )
+                except ChapterPipelineFailed as exc:
+                    await advance_cursor(exc.outcome)
+                    raise
+                await advance_cursor(outcome)
+                return outcome
             finally:
                 await generation_job_repo.finish_attempt_reservation(job_id, chapter_id)
 
@@ -475,6 +550,9 @@ class GenerationJobService:
             generation_params = dict(
                 current_job.get("generation_params") or {}
             )
+            expected_revision = current_job.get("expected_narrative_revision")
+            if type(expected_revision) is not int or expected_revision < 0:
+                raise ValueError("candidate Job narrative revision cursor is invalid")
             authorized_slots = _estimate_authorized_chapter_attempt_slots(
                 current_job,
                 chapter,
@@ -614,6 +692,7 @@ class GenerationJobService:
             runner = ChapterCandidateJobRunner(
                 execution_id=job_id,
                 readiness=readiness,
+                expected_narrative_revision=expected_revision,
                 authorized_attempt_slots=authorized_slots,
                 generation_params=generation_params,
                 recalculate_after_outline=(
@@ -648,7 +727,12 @@ class GenerationJobService:
                     current_narrative_revision=(
                         narrative_revision_store.current
                     ),
-                    mutation_completed=mutation_completed,
+                    recover_mutation_revision=(
+                        _recover_job_mutation_revision
+                    ),
+                    advance_narrative_revision_cursor=(
+                        generation_job_repo.advance_narrative_revision_cursor
+                    ),
                     generate_outline=generate_outline,
                     generate_prose_candidate=generate_prose_candidate,
                     review_prose_candidate=review_prose_candidate,
@@ -1046,6 +1130,7 @@ class GenerationJobService:
                     "请明确确认可能重复计费后再重试"
                 )
             authorization_updates: Dict[str, Any] = {}
+            reauthorized_revision: int | None = None
             authorization = dict(job.get("prose_continuation_authorization") or {})
             stored_policy = ProseContinuationPolicy.from_mapping(
                 authorization.get("policy")
@@ -1123,6 +1208,31 @@ class GenerationJobService:
                     supplied_digest=readiness_digest,
                     acknowledged_warning_codes=acknowledged_warning_codes or (),
                 )
+                accepted_resources = accepted_readiness.get("resources")
+                reauthorized_revision = (
+                    accepted_resources.get("narrative_revision")
+                    if isinstance(accepted_resources, Mapping)
+                    else None
+                )
+                if (
+                    type(reauthorized_revision) is not int
+                    or reauthorized_revision < 0
+                ):
+                    accepted_planning = accepted_readiness.get("planning")
+                    if (
+                        isinstance(accepted_planning, Mapping)
+                        and "chapter_candidate_pipeline_revision"
+                        in accepted_planning
+                    ):
+                        raise ValueError(
+                            "re-authorized readiness narrative revision is invalid"
+                        )
+                    stored_revision = job.get("expected_narrative_revision")
+                    reauthorized_revision = (
+                        stored_revision
+                        if type(stored_revision) is int and stored_revision >= 0
+                        else None
+                    )
                 remaining_capacity = max(
                     int(
                         (accepted_readiness.get("planning") or {}).get(
@@ -1189,7 +1299,7 @@ class GenerationJobService:
                 await generation_job_repo.acknowledge_uncertain_attempts(job_id, "retry")
             await GenerationJobService._guard_no_running()
             # 任何 resume 把检查点窗口推进到当前 progress 长度（设计 §7）。
-            await generation_job_repo.update_job_fields(job_id, {
+            resume_fields = {
                 **authorization_updates,
                 **incomplete_prose_updates,
                 "status": "running", "pause_reason": None, "error": None,
@@ -1199,7 +1309,21 @@ class GenerationJobService:
                 ),
                 "confirm_uncertain_prose_retry": bool(confirm_uncertain_retry),
                 "last_checkpoint_index": len(job.get("progress", [])),
-            })
+            }
+            if authorization_updates and reauthorized_revision is not None:
+                previous_revision = job.get("expected_narrative_revision")
+                if previous_revision is not None and type(previous_revision) is not int:
+                    raise ValueError(
+                        "Generation job narrative revision cursor is invalid"
+                    )
+                await generation_job_repo.update_job_authorization(
+                    job_id,
+                    resume_fields,
+                    previous_revision=previous_revision,
+                    next_revision=reauthorized_revision,
+                )
+            else:
+                await generation_job_repo.update_job_fields(job_id, resume_fields)
         control = JobControl()
         GenerationJobService._spawn(job_id, control)
         return await generation_job_repo.get_job(job_id)

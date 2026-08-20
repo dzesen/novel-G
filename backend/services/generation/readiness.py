@@ -57,7 +57,7 @@ READINESS_PROSE_PROMPT_INPUT_BOUNDS_KEY = (
 
 @dataclass(frozen=True)
 class ReadinessDeps:
-    load_resource_counts: Callable[[str], Awaitable[dict[str, int]]]
+    load_resource_counts: Callable[[str], Awaitable[dict[str, Any]]]
     inspect_active_proposal: Callable[[str], Awaitable[dict[str, Any] | None]]
     plan_work: Callable[
         [list[dict[str, Any]], ProseContinuationPolicy, Mapping[str, Any] | None],
@@ -216,6 +216,7 @@ def _work_summary(chapters: list[dict[str, Any]]) -> dict[str, Any]:
         chapter_snapshots.append(
             {
                 "chapter_id": str(chapter.get("_id") or ""),
+                "volume_id": str(chapter.get("volume_id") or ""),
                 "order_index": int(chapter.get("order_index") or 0),
                 "has_outline": bool(outline),
                 "has_content": _has_text(chapter, "content"),
@@ -759,6 +760,7 @@ class GenerationReadinessModule:
             "volume_id": str(volume_id) if volume_id else None,
             "work": work,
             "resources": {
+                "owner_id": str(resources.get("owner_id") or ""),
                 **{
                     kind: int(resources.get(kind) or 0)
                     for kind in ("character", "location", "item", "rule", "lore")
@@ -808,6 +810,52 @@ class GenerationReadinessModule:
             or readiness_version != 2
         ):
             raise StaleReadiness("生成前检查版本无效，请重新检查后再启动")
+        novel_id = report.get("novel_id")
+        scope = report.get("scope")
+        volume_id = report.get("volume_id")
+        planning = report.get("planning")
+        candidate_readiness = (
+            isinstance(planning, Mapping)
+            and "chapter_candidate_pipeline_revision" in planning
+        )
+        resources = report.get("resources")
+        owner_id = resources.get("owner_id") if isinstance(resources, Mapping) else None
+        narrative_revision = (
+            resources.get("narrative_revision")
+            if isinstance(resources, Mapping)
+            else None
+        )
+        work = report.get("work")
+        raw_chapters = work.get("chapters") if isinstance(work, Mapping) else None
+        if candidate_readiness:
+            if not isinstance(novel_id, str) or not novel_id:
+                raise StaleReadiness("生成前检查小说范围无效，请重新检查")
+            if scope not in {"volume", "book"}:
+                raise StaleReadiness("生成前检查作业范围无效，请重新检查")
+            if (
+                (
+                    scope == "volume"
+                    and (not isinstance(volume_id, str) or not volume_id)
+                )
+                or (scope == "book" and volume_id is not None)
+            ):
+                raise StaleReadiness("生成前检查卷范围无效，请重新检查")
+            if (
+                not isinstance(owner_id, str)
+                or not owner_id
+                or type(narrative_revision) is not int
+                or narrative_revision < 0
+            ):
+                raise StaleReadiness("生成前检查资源范围无效，请重新检查")
+            if not isinstance(raw_chapters, list) or any(
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("chapter_id"), str)
+                or not item.get("chapter_id")
+                or not isinstance(item.get("volume_id"), str)
+                or not item.get("volume_id")
+                for item in raw_chapters
+            ):
+                raise StaleReadiness("生成前检查章节范围无效，请重新检查")
         current_digest = str(report.get("digest") or "")
         automatic_confirmation_required = any(
             item.get("code") == "automatic_continuations_require_confirmation"
@@ -840,6 +888,9 @@ class GenerationReadinessModule:
 
         return {
             "version": 2,
+            "novel_id": novel_id,
+            "scope": scope,
+            "volume_id": volume_id,
             "digest": current_digest,
             "acknowledged_warning_codes": acknowledged,
             "issues": list(report.get("issues") or []),
@@ -849,12 +900,15 @@ class GenerationReadinessModule:
         }
 
 
-async def _load_resource_counts(novel_id: str) -> dict[str, int]:
+async def _load_resource_counts(novel_id: str) -> dict[str, Any]:
     from backend.db.narrative_revision import narrative_revision_store
     from backend.db.repositories.character_repository import character_repo
+    from backend.db.repositories.novel_repository import novel_repo
     from backend.db.repositories.worldbook_repository import worldbook_repo
 
+    novel = await novel_repo.get_novel_by_id(novel_id)
     result = {
+        "owner_id": str(novel.get("owner_id") or ""),
         "character": len(await character_repo.list_cards(novel_id, "character")),
         "narrative_revision": await narrative_revision_store.current(novel_id),
     }
