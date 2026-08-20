@@ -18,15 +18,16 @@ from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     CandidatePipelineCheckpointConflict,
+    CandidatePipelineCompletionEvidenceV1,
     CandidatePipelineCompletionV1,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
     PreDispatchFenceV1,
-    StateCandidateCheckpointV1,
     candidate_pipeline_checkpoint_digest,
     candidate_pipeline_checkpoint_ledger_digest,
     parse_candidate_pipeline_checkpoint,
     parse_candidate_pipeline_progress,
+    validate_candidate_pipeline_completion_chain,
 )
 
 
@@ -280,60 +281,29 @@ class GenerationJobRepository(BaseRepository):
     @staticmethod
     def _validate_candidate_completion_chain(
         checkpoints: Sequence[CandidatePipelineCheckpointV1],
-    ) -> None:
-        if len(checkpoints) < 3 or not isinstance(
-            checkpoints[-1],
-            StateCandidateCheckpointV1,
-        ):
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion ledger is incomplete"
-            )
-        prose_indexes = [
-            index
-            for index, checkpoint in enumerate(checkpoints)
-            if checkpoint.kind == "prose_candidate"
-        ]
-        adherence_indexes = [
-            index
-            for index, checkpoint in enumerate(checkpoints)
-            if checkpoint.kind == "outline_adherence"
-        ]
-        if not prose_indexes or not adherence_indexes:
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion gates are missing"
-            )
-        prose = checkpoints[prose_indexes[-1]]
-        adherence = checkpoints[adherence_indexes[-1]]
-        state = checkpoints[-1]
+        *,
+        entry: CandidatePipelineProgressV1,
+    ) -> CandidatePipelineCompletionEvidenceV1:
+        evidence = validate_candidate_pipeline_completion_chain(
+            checkpoints,
+            chapter_id=entry.chapter_id,
+            expected_scene_count=entry.scene_coverage_count,
+            expected_repair_cycles=entry.repair_cycles_used,
+        )
         if (
-            checkpoints[0].kind != "prose_candidate"
-            or getattr(checkpoints[0], "origin", None) != "initial"
-            or prose_indexes[-1] >= adherence_indexes[-1]
-            or adherence_indexes[-1] >= len(checkpoints) - 1
-            or any(
-                checkpoint.kind == "state_candidate"
-                for checkpoint in checkpoints[:adherence_indexes[-1]]
-            )
-            or any(
-                checkpoint.kind != "state_candidate"
-                for checkpoint in checkpoints[adherence_indexes[-1] + 1:]
-            )
-            or adherence.verdict != "pass"
-            or adherence.issue_categories
-            or not adherence.scene_coverage
-            or any(
-                item.status != "covered"
-                for item in adherence.scene_coverage
-            )
-            or len({
-                item.scene_index for item in adherence.scene_coverage
-            }) != len(adherence.scene_coverage)
-            or adherence.source != prose.source
-            or state.source != prose.source
+            entry.source != evidence.prose.source
+            or entry.state_proposal_id != evidence.state.proposal_id
+            or entry.attempt_count != evidence.attempt_count
+            or entry.truncation_count != evidence.truncation_count
+            or entry.outline_issue_categories
+            != evidence.adherence.issue_categories
+            or entry.consistency_issue_count
+            != evidence.state.consistency_issue_count
         ):
             raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion gates diverged"
+                "Candidate pipeline progress does not match its checkpoint"
             )
+        return evidence
 
     async def list_candidate_pipeline_checkpoints(
         self,
@@ -571,20 +541,11 @@ class GenerationJobRepository(BaseRepository):
             raise CandidatePipelineCheckpointConflict(
                 "Candidate pipeline completion ledger is invalid"
             )
-        self._validate_candidate_completion_chain(validated_checkpoints)
-        validated_checkpoint = validated_checkpoints[-1]
-        if not isinstance(validated_checkpoint, StateCandidateCheckpointV1):
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline completion requires the scoped state checkpoint"
-            )
-        if (
-            validated_entry.source != validated_checkpoint.source
-            or validated_entry.state_proposal_id
-            != validated_checkpoint.proposal_id
-        ):
-            raise CandidatePipelineCheckpointConflict(
-                "Candidate pipeline progress does not match its checkpoint"
-            )
+        evidence = self._validate_candidate_completion_chain(
+            validated_checkpoints,
+            entry=validated_entry,
+        )
+        validated_checkpoint = evidence.state
         receipt = CandidatePipelineCompletionV1(
             schema_version="candidate_pipeline_completion.v1",
             checkpoint_id=validated_checkpoint.checkpoint_id,
@@ -607,6 +568,16 @@ class GenerationJobRepository(BaseRepository):
             entry=validated_entry,
         ):
             return True
+        raw_progress = job.get("progress")
+        if raw_progress is None:
+            raw_progress = []
+        if (
+            not isinstance(raw_progress, list)
+            or len(raw_progress) >= MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Generation job progress ledger capacity is exhausted"
+            )
         if (
             str(job.get("status") or "") != "running"
             or str(job.get("current_chapter_id") or "")
@@ -619,7 +590,10 @@ class GenerationJobRepository(BaseRepository):
             dict(job),
             chapter_id=normalized_chapter_id,
         )
-        self._validate_candidate_completion_chain(checkpoints)
+        self._validate_candidate_completion_chain(
+            checkpoints,
+            entry=validated_entry,
+        )
         if tuple(checkpoints) != validated_checkpoints:
             raise CandidatePipelineCheckpointConflict(
                 "Candidate pipeline completion ledger changed"
@@ -642,6 +616,16 @@ class GenerationJobRepository(BaseRepository):
                 ],
                 "progress.candidate_pipeline_completion.ledger_digest": {
                     "$ne": receipt.ledger_digest
+                },
+                "$expr": {
+                    "$lt": [
+                        {
+                            "$size": {
+                                "$ifNull": ["$progress", []]
+                            }
+                        },
+                        MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
+                    ]
                 },
             },
             {
@@ -691,14 +675,38 @@ class GenerationJobRepository(BaseRepository):
                 "Candidate pipeline completion requires an atomic repository command"
             )
         result = await self.collection.update_one(
-            {"_id": to_object_id(job_id), "is_deleted": False},
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "$expr": {
+                    "$lt": [
+                        {
+                            "$size": {
+                                "$ifNull": ["$progress", []]
+                            }
+                        },
+                        MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
+                    ]
+                },
+            },
             {
                 "$push": {"progress": entry},
                 "$inc": {"tokens_used": int(tokens_delta)},
                 "$set": {"updated_at": get_utc_now()},
             },
         )
-        return result.matched_count > 0
+        if result.matched_count > 0:
+            return True
+        current = await self.get_job(job_id)
+        raw_progress = current.get("progress")
+        if (
+            isinstance(raw_progress, list)
+            and len(raw_progress) >= MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES
+        ):
+            raise ValueError(
+                "Generation job progress ledger capacity is exhausted"
+            )
+        return False
 
     async def reserve_attempts(self, job_id: str, chapter_id: str, slots: int) -> Dict[str, Any]:
         """为下一章保留固定数量的 Provider 调用槽，不扩大作业总容量。"""

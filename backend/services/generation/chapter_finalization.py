@@ -20,7 +20,7 @@ from backend.services.generation.outline_adherence import (
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import ProseRunModule, prose_run_module
-from backend.services.generation.prose_completion import (
+from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
 from backend.services.novel.chapter_state_service import ChapterStateService

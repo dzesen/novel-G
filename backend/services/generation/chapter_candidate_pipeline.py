@@ -29,6 +29,8 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidateTruncationProjectionV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
+    candidate_checkpoint_adherence_passed,
+    candidate_checkpoint_completion_passed,
     candidate_pipeline_checkpoint_digest,
     is_safe_candidate_identifier,
     parse_candidate_pipeline_checkpoint,
@@ -43,7 +45,7 @@ from backend.services.generation.outline_adherence import (
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
-from backend.services.generation.prose_completion import (
+from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
 from backend.services.generation.state_repair_contracts import (
@@ -1207,7 +1209,7 @@ def _checkpoint_common(
     evidence: _RecordedStepEvidence,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "chapter_candidate_pipeline_checkpoint.v1",
+        "schema_version": "chapter_candidate_pipeline_checkpoint.v2",
         "checkpoint_id": "0" * 64,
         "sequence": sequence,
         "chapter_id": chapter_id,
@@ -1333,6 +1335,7 @@ def _state_checkpoint(
     origin: Literal["initial", "repair"],
     request_id: str,
     proposal_id: str,
+    consistency_issue_count: int,
     dropped_reference_count: int,
 ) -> StateCandidateCheckpointV1:
     return _seal_checkpoint(StateCandidateCheckpointV1(
@@ -1346,6 +1349,7 @@ def _state_checkpoint(
         origin=origin,
         request_id=request_id,
         proposal_id=proposal_id,
+        consistency_issue_count=consistency_issue_count,
         dropped_reference_count=dropped_reference_count,
     ))
 
@@ -1903,13 +1907,7 @@ def _checkpoint_step_name(
 def _checkpoint_completion_passed(
     checkpoint: ProseCandidateCheckpointV1,
 ) -> bool:
-    return completion_allows_formal_write(
-        status=checkpoint.completion.status,
-        can_write_formal_prose=(
-            checkpoint.completion.can_write_formal_prose
-        ),
-        finish_reason=checkpoint.completion.finish_reason,
-    )
+    return candidate_checkpoint_completion_passed(checkpoint)
 def _checkpoint_adherence_passed(
     checkpoint: AdherenceCandidateCheckpointV1,
     *,
@@ -1919,17 +1917,9 @@ def _checkpoint_adherence_passed(
     scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
     if not isinstance(scenes, list) or not scenes:
         return False
-    indexes = [item.scene_index for item in checkpoint.scene_coverage]
-    return bool(
-        checkpoint.verdict == "pass"
-        and not checkpoint.issue_categories
-        and len(indexes) == len(scenes)
-        and len(set(indexes)) == len(indexes)
-        and set(indexes) == set(range(1, len(scenes) + 1))
-        and all(
-            item.status == "covered"
-            for item in checkpoint.scene_coverage
-        )
+    return candidate_checkpoint_adherence_passed(
+        checkpoint,
+        expected_scene_count=len(scenes),
     )
 
 
@@ -2004,11 +1994,12 @@ def _validate_resumed_state_projection(
     *,
     checkpoint: StateCandidateCheckpointV1,
 ) -> None:
-    _state, proposal_id, _acceptance_token, _issues = _validate_state_shape(
+    _state, proposal_id, _acceptance_token, issues = _validate_state_shape(
         state_result
     )
     if (
         proposal_id != checkpoint.proposal_id
+        or len(issues) != checkpoint.consistency_issue_count
         or _dropped_reference_count(state_result.dropped)
         != checkpoint.dropped_reference_count
     ):
@@ -3651,6 +3642,7 @@ class ChapterCandidatePipeline:
                     origin=state_origin,
                     request_id=state_request_id,
                     proposal_id=proposal_id,
+                    consistency_issue_count=len(consistency_issues),
                     dropped_reference_count=_dropped_reference_count(
                         dropped
                     ),
@@ -3704,6 +3696,7 @@ class ChapterCandidatePipeline:
                 origin="repair",
                 request_id=receipt.request_id,
                 proposal_id=next_proposal_id,
+                consistency_issue_count=len(_next_issues),
                 dropped_reference_count=_dropped_reference_count(
                     state_result.dropped
                 ),

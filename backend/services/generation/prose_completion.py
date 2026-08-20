@@ -13,22 +13,11 @@ from typing import Any, Iterable, Literal
 
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 from backend.services.generation.prose_continuation import ProseContinuationPolicy
+from backend.services.generation.prose_completion_contract import (
+    completion_allows_formal_write,
+)
 from backend.services.generation.prose_protocol import CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 from backend.services.novel.chapter_service import count_chapter_words
-
-
-def completion_allows_formal_write(
-    *,
-    status: Any,
-    can_write_formal_prose: Any,
-    finish_reason: Any,
-) -> bool:
-    """Return whether the frozen completion contract permits a formal write."""
-    return bool(
-        status == "complete"
-        and can_write_formal_prose is True
-        and finish_reason == "stop"
-    )
 
 
 @dataclass(frozen=True)
