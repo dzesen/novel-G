@@ -649,17 +649,22 @@ def _usage_add(
         left.output_tokens,
         right.output_tokens,
     )
-    supplied_total = _checked_token_add(
+    left_floor = max(
         left.total_tokens,
+        _checked_token_add(left.input_tokens, left.output_tokens),
+    )
+    right_floor = max(
         right.total_tokens,
+        _checked_token_add(right.input_tokens, right.output_tokens),
+    )
+    total_tokens = _checked_token_add(
+        left_floor,
+        right_floor,
     )
     return CandidateUsageSummary(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        total_tokens=max(
-            supplied_total,
-            _checked_token_add(input_tokens, output_tokens),
-        ),
+        total_tokens=total_tokens,
     )
 
 
@@ -692,31 +697,10 @@ def _usage_delta(
 def _summed_usage_values(
     usages: tuple[CandidateUsageSummary, ...],
 ) -> CandidateUsageSummary:
-    input_tokens = 0
-    output_tokens = 0
-    supplied_total = 0
+    total = CandidateUsageSummary()
     for usage in usages:
-        input_tokens = _checked_token_add(
-            input_tokens,
-            usage.input_tokens,
-        )
-        output_tokens = _checked_token_add(
-            output_tokens,
-            usage.output_tokens,
-        )
-        supplied_total = _checked_token_add(
-            supplied_total,
-            usage.total_tokens,
-        )
-    total_tokens = max(
-        supplied_total,
-        _checked_token_add(input_tokens, output_tokens),
-    )
-    return CandidateUsageSummary(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=total_tokens,
-    )
+        total = _usage_add(total, usage)
+    return total
 
 
 def _summed_usage(
@@ -1381,19 +1365,15 @@ class _PipelineTrace:
         ):
             self.tokens = _MAX_TOKEN_COUNT
             return
-        if len(self.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
-            raise _EvidenceProjectionError(
-                "候选管线未归属用量证据超过 V1 上限"
-            )
-        self.unattributed_usage.append(
-            CandidateUnattributedUsageSummary(
-                reason=(
-                    CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
-                ),
-                usage=CandidateUsageSummary(total_tokens=_MAX_TOKEN_COUNT),
-                evidence_kind=CandidateUsageEvidenceKind.LOWER_BOUND,
-            )
+        marker = CandidateUnattributedUsageSummary(
+            reason=CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW,
+            usage=CandidateUsageSummary(total_tokens=_MAX_TOKEN_COUNT),
+            evidence_kind=CandidateUsageEvidenceKind.LOWER_BOUND,
         )
+        if len(self.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
+            self.unattributed_usage[-1] = marker
+        else:
+            self.unattributed_usage.append(marker)
         self.tokens = _MAX_TOKEN_COUNT
 
     def _classify_attempts(
@@ -1585,10 +1565,25 @@ def _checkpoint_step_name(
 def _checkpoint_completion_passed(
     checkpoint: ProseCandidateCheckpointV1,
 ) -> bool:
+    return _completion_contract_passed(
+        status=checkpoint.completion.status,
+        can_write_formal_prose=(
+            checkpoint.completion.can_write_formal_prose
+        ),
+        finish_reason=checkpoint.completion.finish_reason,
+    )
+
+
+def _completion_contract_passed(
+    *,
+    status: Any,
+    can_write_formal_prose: Any,
+    finish_reason: Any,
+) -> bool:
     return bool(
-        checkpoint.completion.status == "complete"
-        and checkpoint.completion.can_write_formal_prose is True
-        and checkpoint.completion.finish_reason == "stop"
+        status == "complete"
+        and can_write_formal_prose is True
+        and finish_reason == "stop"
     )
 
 
@@ -1707,24 +1702,63 @@ def _refresh_restored_usage(trace: _PipelineTrace) -> None:
     trace.tokens = usage.total_tokens
 
 
+def _resume_item_usage_floor(
+    trace: _PipelineTrace,
+    value: Any,
+) -> CandidateUsageSummary:
+    try:
+        raw = _as_mapping(value)
+        return _usage_component_floor(raw.get("usage"))
+    except _UsageProjectionOverflow as exc:
+        trace._record_usage_overflow()
+        raise _blocked_resume(
+            trace,
+            "候选管线恢复 Token 超过 V1 上限",
+        ) from exc
+
+
 def _preserve_resume_aggregate_floor(
     trace: _PipelineTrace,
     *,
     aggregate_tokens: int | None,
     reason: CandidateUnattributedUsageReason,
+    item_usage_floor: CandidateUsageSummary | None = None,
 ) -> None:
-    if aggregate_tokens is None:
+    if aggregate_tokens is None and item_usage_floor is None:
         return
-    if len(trace.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
-        trace._record_usage_overflow()
-        return
-    residual = max(0, aggregate_tokens - trace.tokens)
-    trace.unattributed_usage.append(CandidateUnattributedUsageSummary(
-        reason=reason,
-        usage=CandidateUsageSummary(total_tokens=residual),
-        evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+    aggregate_residual = CandidateUsageSummary(total_tokens=max(
+        0,
+        (aggregate_tokens or 0) - trace.tokens,
     ))
-    trace.tokens = max(trace.tokens, aggregate_tokens)
+    usage = _conservative_usage_max(
+        aggregate_residual,
+        item_usage_floor or CandidateUsageSummary(),
+    )
+    marker = CandidateUnattributedUsageSummary(
+        reason=reason,
+        usage=usage,
+        evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
+    )
+    if len(trace.unattributed_usage) >= _MAX_PIPELINE_UNATTRIBUTED_USAGE:
+        try:
+            previous = trace.unattributed_usage[-1]
+            trace.unattributed_usage[-1] = CandidateUnattributedUsageSummary(
+                reason=reason,
+                usage=_usage_add(previous.usage, marker.usage),
+                evidence_kind=_merge_usage_evidence_kind(
+                    previous.evidence_kind,
+                    marker.evidence_kind,
+                ),
+            )
+        except _UsageProjectionOverflow:
+            trace._record_usage_overflow()
+            return
+    else:
+        trace.unattributed_usage.append(marker)
+    try:
+        _refresh_restored_usage(trace)
+    except _UsageProjectionOverflow:
+        trace._record_usage_overflow()
 
 
 @dataclass(frozen=True)
@@ -1914,6 +1948,11 @@ def _replay_candidate_checkpoints(
                         "候选管线恢复状态修复轮次无效",
                     )
                 if checkpoint.proposal_id == latest_state.proposal_id:
+                    trace.completed_steps.append(_checkpoint_step_name(
+                        checkpoint,
+                        review_count=review_count,
+                    ))
+                    trace.repair_cycles_used = checkpoint.cycle
                     raise _blocked_resume(
                         trace,
                         "状态修复没有产生新候选",
@@ -1944,6 +1983,8 @@ def _replay_candidate_checkpoints(
             review_count=review_count,
         )
         completed_steps.append(step)
+        trace.completed_steps.append(step)
+        trace.repair_cycles_used = repair_cycles_used
         checkpoint_attempt_ids.extend(checkpoint.attempt_ids)
         truncation = checkpoint.truncation
         if truncation.truncated_section_count or truncation.dropped_item_count:
@@ -2013,6 +2054,7 @@ def _resume_trace(
                 reason=(
                     CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
                 ),
+                item_usage_floor=_resume_item_usage_floor(restored, item),
             )
             raise _blocked_resume(restored, "候选管线恢复 attempt 无效")
         try:
@@ -2043,6 +2085,7 @@ def _resume_trace(
                 reason=(
                     CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
                 ),
+                item_usage_floor=_resume_item_usage_floor(restored, item),
             )
             raise _blocked_resume(
                 restored,
@@ -2082,6 +2125,7 @@ def _resume_trace(
                 reason=(
                     CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID
                 ),
+                item_usage_floor=_resume_item_usage_floor(restored, item),
             )
             raise _blocked_resume(restored, "候选管线恢复用量证据无效")
         try:
@@ -2101,6 +2145,7 @@ def _resume_trace(
                 reason=(
                     CandidateUnattributedUsageReason.AGGREGATE_USAGE_INVALID
                 ),
+                item_usage_floor=_resume_item_usage_floor(restored, item),
             )
             raise _blocked_resume(
                 restored,
@@ -2109,44 +2154,30 @@ def _resume_trace(
         restored.unattributed_usage.append(validated)
         try:
             _refresh_restored_usage(restored)
-        except _UsageProjectionOverflow as exc:
+        except _UsageProjectionOverflow:
             restored._record_usage_overflow()
-            raise _blocked_resume(
-                restored,
-                "候选管线恢复 Token 超过 V1 上限",
-            ) from exc
+            break
 
+    has_usage_overflow = any(
+        item.reason
+        is CandidateUnattributedUsageReason.USAGE_PROJECTION_OVERFLOW
+        for item in restored.unattributed_usage
+    )
     if trusted_progress_tokens is None:
         raise _blocked_resume(restored, "候选管线恢复 Token 无效")
-    if restored.tokens != trusted_progress_tokens:
+    if not has_usage_overflow and restored.tokens != trusted_progress_tokens:
         if trusted_progress_tokens > restored.tokens:
-            restored.unattributed_usage.append(
-                CandidateUnattributedUsageSummary(
-                    reason=(
-                        CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
-                    ),
-                    usage=CandidateUsageSummary(
-                        total_tokens=trusted_progress_tokens - restored.tokens
-                    ),
-                    evidence_kind=CandidateUsageEvidenceKind.INCOMPLETE,
-                )
+            _preserve_resume_aggregate_floor(
+                restored,
+                aggregate_tokens=trusted_progress_tokens,
+                reason=(
+                    CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
+                ),
             )
-            restored.tokens = trusted_progress_tokens
         raise _blocked_resume(
             restored,
             "候选管线恢复 Token 与调用证据不一致",
         )
-    if restored.unattributed_usage:
-        raise _blocked_resume(
-            restored,
-            "候选管线恢复仍有未归属的 Token 证据",
-        )
-    if has_unresolved_uncertain_attempt:
-        raise _blocked_resume(
-            restored,
-            "候选管线恢复仍有未决 uncertain attempt",
-        )
-
     if (
         not isinstance(progress.truncations, tuple)
         or len(progress.truncations) > _MAX_PIPELINE_TRUNCATIONS
@@ -2199,6 +2230,23 @@ def _resume_trace(
                 "候选管线恢复检查点无效",
             ) from exc
 
+    try:
+        source = _validate_prose_source(resume.source)
+    except ChapterCandidatePipelineBlocked as exc:
+        exc.attach_progress(restored.snapshot())
+        raise
+    if (
+        progress.prose_run_id != source.source_run_id
+        or progress.prose_run_revision != source.source_run_revision
+        or progress.prose_content_digest != source.source_content_digest
+    ):
+        raise _blocked_resume(
+            restored,
+            "恢复检查点与正文候选身份不一致",
+        )
+    restored.source = source
+    restored.state_proposal_id = progress.state_proposal_id
+
     replay = _replay_candidate_checkpoints(
         tuple(checkpoints),
         trace=restored,
@@ -2227,16 +2275,8 @@ def _resume_trace(
     ):
         raise _blocked_resume(restored, "候选管线恢复修复轮次与检查点不一致")
 
-    try:
-        source = _validate_prose_source(resume.source)
-    except ChapterCandidatePipelineBlocked as exc:
-        exc.attach_progress(restored.snapshot())
-        raise
     if (
         _runtime_source_key(source) != _checkpoint_source_key(current_prose)
-        or progress.prose_run_id != source.source_run_id
-        or progress.prose_run_revision != source.source_run_revision
-        or progress.prose_content_digest != source.source_content_digest
         or current_prose.completion.status
         != source.completion.get("status")
         or current_prose.completion.can_write_formal_prose
@@ -2247,6 +2287,24 @@ def _resume_trace(
         raise _blocked_resume(
             restored,
             "恢复检查点与正文候选身份不一致",
+        )
+
+    restored.completed_steps = list(replay.completed_steps)
+    restored.repair_cycles_used = repair_cycles_used
+    if has_usage_overflow:
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复 Token 超过 V1 上限",
+        )
+    if restored.unattributed_usage:
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复仍有未归属的 Token 证据",
+        )
+    if has_unresolved_uncertain_attempt:
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复仍有未决 uncertain attempt",
         )
 
     if (
@@ -2314,10 +2372,6 @@ def _resume_trace(
                 "恢复检查点与状态候选身份不一致",
             )
 
-    restored.completed_steps = list(replay.completed_steps)
-    restored.repair_cycles_used = repair_cycles_used
-    restored.source = source
-    restored.state_proposal_id = progress.state_proposal_id
     last_repair_kept_digest = _prose_checkpoint_kept_digest(
         current_prose,
         previous_prose,
@@ -2659,9 +2713,10 @@ def _validate_prose_source(
 
 def _completion_passed(source: ProseCandidateSource) -> bool:
     completion = source.completion
-    return bool(
-        completion.get("can_write_formal_prose") is True
-        and completion.get("status") == "complete"
+    return _completion_contract_passed(
+        status=completion.get("status"),
+        can_write_formal_prose=completion.get("can_write_formal_prose"),
+        finish_reason=completion.get("finish_reason"),
     )
 
 
