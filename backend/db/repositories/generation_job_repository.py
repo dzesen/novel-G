@@ -21,6 +21,7 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidatePipelineCheckpointV1,
     PreDispatchFenceV1,
     StateCandidateCheckpointV1,
+    candidate_pipeline_checkpoint_digest,
     parse_candidate_pipeline_checkpoint,
 )
 
@@ -450,6 +451,9 @@ class GenerationJobRepository(BaseRepository):
             )
         receipt = CandidatePipelineCompletionV1(
             checkpoint_id=validated_checkpoint.checkpoint_id,
+            checkpoint_digest=candidate_pipeline_checkpoint_digest(
+                validated_checkpoint
+            ),
             sequence=validated_checkpoint.sequence,
             chapter_id=validated_checkpoint.chapter_id,
             source=validated_checkpoint.source,
@@ -498,8 +502,8 @@ class GenerationJobRepository(BaseRepository):
                 "is_deleted": False,
                 "status": "running",
                 "current_chapter_id": normalized_chapter_id,
-                f"candidate_pipeline_checkpoints.{len(checkpoints) - 1}.checkpoint_id": (
-                    tail.checkpoint_id
+                f"candidate_pipeline_checkpoints.{len(checkpoints) - 1}": (
+                    tail.model_dump(mode="json")
                 ),
                 "progress.candidate_pipeline_completion.checkpoint_id": {
                     "$ne": tail.checkpoint_id

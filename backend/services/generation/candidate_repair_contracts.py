@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal
 
@@ -91,6 +93,7 @@ class CandidatePipelineCompletionV1(_CandidateCheckpointContract):
         "candidate_pipeline_completion.v1"
     )
     checkpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    checkpoint_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     sequence: int = Field(
         ge=1,
         le=MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
@@ -255,6 +258,19 @@ def parse_candidate_pipeline_checkpoint(
         if isinstance(stored, list):
             value[field] = tuple(stored)
     return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
+
+
+def candidate_pipeline_checkpoint_digest(value: Any) -> str:
+    """Hash the full canonical checkpoint independently of its claimed ID."""
+
+    checkpoint = parse_candidate_pipeline_checkpoint(value)
+    encoded = json.dumps(
+        checkpoint.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_checkpoint_list_bounds(value: Any) -> tuple[str, ...]:
