@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 from backend.db.repositories.agent_runtime_repository import (
     agent_runtime_repository,
 )
+from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.repositories.prose_run_repository import prose_run_repo
+from backend.db.repositories.state_candidate_repair_receipt_repository import (
+    StateCandidateRepairResultProjection,
+    state_candidate_repair_receipt_repo,
+)
 from backend.services.agent_runtime.contracts import (
     AgentReadinessRequest,
     AgentScope,
@@ -40,6 +48,7 @@ from backend.services.generation.prose_remediation_runtime import (
     build_prose_remediation_runtime,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
+from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.llm.generation_runtime import (
     AttemptScope,
     GenerationPlan,
@@ -66,6 +75,10 @@ class CandidateRepairRunStopped(RuntimeError):
         self.attempts = [dict(item) for item in attempts]
 
 
+class _StateRepairProposalUnavailable(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class ChapterCandidateRepairApplicationDeps:
     build_remediation_runtime: Callable[..., Any]
@@ -74,6 +87,10 @@ class ChapterCandidateRepairApplicationDeps:
     find_agent_run: Callable[..., Awaitable[Mapping[str, Any] | None]]
     get_prose_run: Callable[[str, str], Awaitable[Mapping[str, Any]]]
     generate_state_candidate: Callable[..., Awaitable[ChapterGenerationResult]]
+    read_ordered_attempts: Callable[..., Awaitable[Sequence[Mapping[str, Any]]]]
+    get_state_proposal: Callable[..., Awaitable[Mapping[str, Any]]]
+    state_repair_receipts: Any
+    recover_state_proposal: Callable[..., Awaitable[Any]]
 
     @classmethod
     def production(cls) -> "ChapterCandidateRepairApplicationDeps":
@@ -90,6 +107,14 @@ class ChapterCandidateRepairApplicationDeps:
             ),
             get_prose_run=prose_run_repo.get_run,
             generate_state_candidate=generate_state_candidate,
+            read_ordered_attempts=generation_job_repo.list_attempt_slots,
+            get_state_proposal=(
+                state_proposal_module.get_owned_repair_source
+            ),
+            state_repair_receipts=state_candidate_repair_receipt_repo,
+            recover_state_proposal=(
+                state_proposal_module.recover_owned_repair_result
+            ),
         )
 
 
@@ -111,6 +136,46 @@ def _validate_execution(**kwargs: Any) -> CandidateRepairAuthorization:
 
 
 def _attempt_projection(item: Any) -> dict[str, Any]:
+    if isinstance(item, Mapping):
+        attempt_id = item.get("attempt_id")
+        provider_alias = item.get("provider_alias")
+        phase = item.get("phase")
+        usage = item.get("usage")
+        state = item.get("state")
+        usage_is_valid = isinstance(usage, Mapping) and all(
+            field in usage
+            and type(usage[field]) is int
+            and usage[field] >= 0
+            for field in ("input_tokens", "output_tokens", "total_tokens")
+        )
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or not isinstance(provider_alias, str)
+            or not provider_alias
+            or not isinstance(phase, str)
+            or not phase
+            or (state == "accounted" and not usage_is_valid)
+        ):
+            raise ValueError("candidate repair attempt evidence is invalid")
+        return {
+            "attempt_id": attempt_id,
+            "provider_alias": provider_alias,
+            "phase": phase,
+            "state": str(item.get("state") or "accounted"),
+            "usage": (
+                {
+                    field: int(usage[field])
+                    for field in (
+                        "input_tokens",
+                        "output_tokens",
+                        "total_tokens",
+                    )
+                }
+                if usage_is_valid
+                else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            ),
+        }
     raw_usage = getattr(item, "usage", None)
     if hasattr(raw_usage, "model_dump"):
         usage = raw_usage.model_dump(mode="json")
@@ -133,17 +198,41 @@ def _attempt_projection(item: Any) -> dict[str, Any]:
     }
 
 
-def _bundle_attempts(bundle: Any) -> list[dict[str, Any]]:
+def _ordered_attempt_projection(
+    raw_attempts: Sequence[Mapping[str, Any]],
+    *,
+    claimed_are_uncertain: bool = False,
+) -> list[dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
-    for call in (
-        bundle.planner_call,
-        bundle.rewrite_call,
-        bundle.adherence_call,
-    ):
-        attempts.extend(
-            _attempt_projection(item)
-            for item in tuple(getattr(call.runtime, "attempts", ()) or ())
+    charged_states = {
+        "accounted": "accounted",
+        "uncertain": "uncertain",
+        "uncertain_retry_acknowledged": "resolved_retry",
+        "uncertain_skip_acknowledged": "resolved_skip",
+    }
+    allowed_states = {*charged_states, "released_pre_dispatch", "claimed"}
+    for raw in raw_attempts:
+        state = raw.get("state")
+        if not isinstance(state, str) or state not in allowed_states:
+            raise ValueError("candidate repair attempt state is invalid")
+        if state == "released_pre_dispatch":
+            continue
+        if state == "claimed" and not claimed_are_uncertain:
+            continue
+        projection = _attempt_projection(raw)
+        projection["state"] = (
+            "uncertain" if state == "claimed" else charged_states[state]
         )
+        if state != "accounted":
+            bound = raw.get("conservative_tokens")
+            if type(bound) is not int or bound <= 0:
+                raise ValueError("candidate repair uncertain usage is invalid")
+            projection["usage"] = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": bound,
+            }
+        attempts.append(projection)
     if len(attempts) > _MAX_REPAIR_ATTEMPT_EVIDENCE:
         raise ValueError("candidate repair attempt evidence exceeds V1")
     if any(not item["attempt_id"] for item in attempts):
@@ -164,11 +253,144 @@ def _attempt_usage(attempts: Sequence[Mapping[str, Any]]) -> dict[str, int]:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError("candidate repair attempt usage is invalid")
             usage[field] += value
+            if usage[field] > 1_000_000_000:
+                raise ValueError("candidate repair attempt usage exceeds V1")
     usage["total_tokens"] = max(
         usage["total_tokens"],
         usage["input_tokens"] + usage["output_tokens"],
     )
     return usage
+
+
+def _bounded_count(value: Any, *, maximum: int) -> int:
+    if type(value) is not int or value < 0:
+        return 0
+    return min(maximum, value)
+
+
+def _truncation_projection(value: Any) -> tuple[int, int]:
+    if not isinstance(value, Mapping):
+        return 0, 0
+    if "truncated_section_count" in value or "dropped_item_count" in value:
+        return (
+            _bounded_count(value.get("truncated_section_count"), maximum=100),
+            _bounded_count(value.get("dropped_item_count"), maximum=10_000),
+        )
+    sections = value.get("truncated_sections")
+    counts = value.get("dropped_item_counts")
+    truncated = min(100, len(sections)) if isinstance(sections, list) else 0
+    dropped = 0
+    if isinstance(counts, Mapping):
+        for item in list(counts.values())[:100]:
+            dropped = min(
+                10_000,
+                dropped + _bounded_count(item, maximum=10_000),
+            )
+    return truncated, dropped
+
+
+def _dropped_reference_count(value: Any) -> int:
+    if isinstance(value, Mapping):
+        exact = value.get("dropped_reference_count")
+        if type(exact) is int:
+            return min(1_000, max(0, exact))
+        return min(
+            1_000,
+            sum(_dropped_reference_count(item) for item in value.values()),
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return min(1_000, len(value))
+    return int(bool(value))
+
+
+def _state_result_projection(
+    generation: ChapterGenerationResult,
+) -> dict[str, Any]:
+    value = generation.value
+    if not isinstance(value, Mapping):
+        raise ValueError("state repair result is not a proposal mapping")
+    proposal_id = value.get("proposal_id")
+    if not isinstance(proposal_id, str) or not proposal_id:
+        raise ValueError("state repair result has no proposal identity")
+    truncated, dropped_items = _truncation_projection(generation.truncation)
+    return StateCandidateRepairResultProjection(
+        proposal_id=proposal_id,
+        truncated_section_count=truncated,
+        dropped_item_count=dropped_items,
+        dropped_reference_count=_dropped_reference_count(generation.dropped),
+    ).model_dump(mode="json")
+
+
+class _StateRepairReceiptAttemptScope:
+    """Bind the receipt's dispatch fence to the real paid-attempt claim."""
+
+    def __init__(
+        self,
+        wrapped: Any,
+        *,
+        receipts: Any,
+        receipt_id: str,
+        claim_token: str,
+    ) -> None:
+        self._wrapped = wrapped
+        self._receipts = receipts
+        self._receipt_id = str(receipt_id)
+        self._claim_token = str(claim_token)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    async def _mark(self, attempt_id: str) -> str:
+        try:
+            await self._receipts.mark_dispatched(
+                receipt_id=self._receipt_id,
+                claim_token=self._claim_token,
+                attempt_id=attempt_id,
+            )
+        except BaseException:
+            release = getattr(self._wrapped, "release_pre_dispatch", None)
+            if callable(release):
+                await release(
+                    attempt_id,
+                    "state repair receipt dispatch fence failed",
+                )
+            raise
+        return attempt_id
+
+    async def claim(self, provider_alias: str, phase: str) -> str:
+        return await self._mark(
+            await self._wrapped.claim(provider_alias, phase)
+        )
+
+    async def claim_with_budget(
+        self,
+        provider_alias: str,
+        phase: str,
+        conservative_tokens: int | None,
+    ) -> str:
+        claim = getattr(self._wrapped, "claim_with_budget", None)
+        attempt_id = (
+            await claim(provider_alias, phase, conservative_tokens)
+            if callable(claim)
+            else await self._wrapped.claim(provider_alias, phase)
+        )
+        return await self._mark(attempt_id)
+
+    async def account(self, attempt_id: str, usage: Any) -> None:
+        await self._wrapped.account(attempt_id, usage)
+
+    async def mark_uncertain(self, attempt_id: str, reason: str) -> None:
+        await self._wrapped.mark_uncertain(attempt_id, reason)
+
+    async def release_pre_dispatch(self, attempt_id: str, reason: str) -> None:
+        release = getattr(self._wrapped, "release_pre_dispatch", None)
+        if callable(release):
+            await release(attempt_id, reason)
+        await self._receipts.release_pre_dispatch(
+            receipt_id=self._receipt_id,
+            claim_token=self._claim_token,
+            attempt_id=attempt_id,
+        )
 
 
 class ChapterCandidateRepairApplication:
@@ -215,6 +437,134 @@ class ChapterCandidateRepairApplication:
         if authorization.prose_remediation is None:
             raise ValueError("candidate repair has no prose Runtime authority")
         return authorization, bundle, adherence_plan, state_plan
+
+    def _state_receipt_identity(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        request: StateCandidateRepairRequest,
+    ) -> dict[str, Any]:
+        digest_payload = {
+            "schema_version": "state_candidate_repair_execution.v1",
+            "execution_id": self._execution_id,
+            "owner_id": str(owner_id),
+            "novel_id": str(novel_id),
+            "chapter_id": str(chapter_id),
+            "readiness_digest": str(self._readiness.get("digest") or ""),
+            "request": request.model_dump(mode="json"),
+        }
+        if not digest_payload["readiness_digest"]:
+            raise ValueError("candidate repair readiness digest is missing")
+        encoded = json.dumps(
+            digest_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return {
+            "owner_id": str(owner_id),
+            "novel_id": str(novel_id),
+            "chapter_id": str(chapter_id),
+            "execution_id": self._execution_id,
+            "cycle": request.cycle,
+            "request_digest": hashlib.sha256(
+                encoded.encode("utf-8")
+            ).hexdigest(),
+        }
+
+    async def _state_attempts(
+        self,
+        *,
+        chapter_id: str,
+        cycle: int,
+        claimed_are_uncertain: bool = False,
+    ) -> list[dict[str, Any]]:
+        return _ordered_attempt_projection(
+            await self._deps.read_ordered_attempts(
+                job_id=self._execution_id,
+                chapter_id=chapter_id,
+                step_prefix=f"candidate-state-repair:{cycle}",
+            ),
+            claimed_are_uncertain=claimed_are_uncertain,
+        )
+
+    async def _recover_state_generation(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        request: StateCandidateRepairRequest,
+        receipt: Mapping[str, Any],
+        require_result_projection: bool,
+    ) -> ChapterGenerationResult:
+        raw_projection = receipt.get("result_projection")
+        projection = (
+            StateCandidateRepairResultProjection.model_validate(raw_projection)
+            if isinstance(raw_projection, Mapping)
+            else None
+        )
+        if require_result_projection and projection is None:
+            raise ValueError("completed state repair receipt has no result")
+        recovered = await self._deps.recover_state_proposal(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            proposal_id=(projection.proposal_id if projection else None),
+            request_id=str(receipt.get("_id") or ""),
+            source_run_id=request.source_run_id,
+            source_run_revision=request.source_run_revision,
+            source_content_digest=request.source_content_digest,
+        )
+        if recovered is None:
+            raise _StateRepairProposalUnavailable(
+                "state repair proposal result is unavailable"
+            )
+        if isinstance(recovered, Mapping):
+            value = dict(recovered)
+            recovered_dropped = 0
+        else:
+            value = dict(getattr(recovered, "value", {}) or {})
+            recovered_dropped = int(
+                getattr(recovered, "dropped_reference_count", 0) or 0
+            )
+        if not value.get("proposal_id") or not value.get("acceptance_token"):
+            raise ValueError("state repair proposal result is incomplete")
+        if projection is None:
+            projection = StateCandidateRepairResultProjection(
+                proposal_id=str(value["proposal_id"]),
+                truncated_section_count=0,
+                dropped_item_count=0,
+                dropped_reference_count=min(1_000, recovered_dropped),
+            )
+        elif str(value["proposal_id"]) != projection.proposal_id:
+            raise ValueError("state repair receipt proposal identity diverged")
+        attempts = await self._state_attempts(
+            chapter_id=chapter_id,
+            cycle=request.cycle,
+        )
+        return ChapterGenerationResult(
+            stage=ChapterGenerationStage.STATE,
+            value=value,
+            usage=_attempt_usage(attempts),
+            attempts=attempts,
+            truncation={
+                "truncated_section_count": projection.truncated_section_count,
+                "dropped_item_count": projection.dropped_item_count,
+            },
+            dropped=(
+                {
+                    "dropped_reference_count": (
+                        projection.dropped_reference_count
+                    )
+                }
+                if projection.dropped_reference_count
+                else {}
+            ),
+            accepted=False,
+        )
 
     async def _source(
         self,
@@ -272,14 +622,6 @@ class ChapterCandidateRepairApplication:
         chapter_id: str,
         request: ProseCandidateRepairRequest,
     ) -> ProseCandidateRepairReceipt:
-        await self._source(
-            owner_id=owner_id,
-            novel_id=novel_id,
-            chapter_id=chapter_id,
-            run_id=request.source_run_id,
-            revision=request.source_run_revision,
-            digest=request.source_content_digest,
-        )
         authorization, bundle, _adherence_plan, _state_plan = (
             self._authorized_snapshot(
                 chapter_id=chapter_id,
@@ -296,6 +638,14 @@ class ChapterCandidateRepairApplication:
             start_request_id=start_request_id,
         )
         if existing is None:
+            await self._source(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                run_id=request.source_run_id,
+                revision=request.source_run_revision,
+                digest=request.source_content_digest,
+            )
             inspected = await bundle.runtime.inspect_readiness(
                 owner_id=owner_id,
                 request=AgentReadinessRequest(
@@ -326,7 +676,13 @@ class ChapterCandidateRepairApplication:
                 run_id=str(existing["_id"]),
             )
 
-        attempts = _bundle_attempts(bundle)
+        attempts = _ordered_attempt_projection(
+            await self._deps.read_ordered_attempts(
+                job_id=self._execution_id,
+                chapter_id=chapter_id,
+                step_prefix=f"candidate-prose-repair:{request.cycle}:",
+            )
+        )
         usage = _attempt_usage(attempts)
         if (
             view.status != "completed"
@@ -408,6 +764,59 @@ class ChapterCandidateRepairApplication:
         chapter_id: str,
         request: StateCandidateRepairRequest,
     ) -> StateCandidateRepairReceipt:
+        _authorization, _bundle, _adherence_plan, state_plan = (
+            self._authorized_snapshot(
+                chapter_id=chapter_id,
+                cycle=request.cycle,
+            )
+        )
+        identity = self._state_receipt_identity(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            request=request,
+        )
+        existing = await self._deps.state_repair_receipts.find_receipt(
+            **identity
+        )
+        if existing is not None and existing.get("state") == "completed":
+            generation = await self._recover_state_generation(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                request=request,
+                receipt=existing,
+                require_result_projection=True,
+            )
+            return StateCandidateRepairReceipt(generation=generation)
+        if existing is not None and existing.get("state") == "dispatched":
+            try:
+                generation = await self._recover_state_generation(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    chapter_id=chapter_id,
+                    request=request,
+                    receipt=existing,
+                    require_result_projection=False,
+                )
+            except _StateRepairProposalUnavailable:
+                attempts = await self._state_attempts(
+                    chapter_id=chapter_id,
+                    cycle=request.cycle,
+                    claimed_are_uncertain=True,
+                )
+                raise CandidateRepairRunStopped(
+                    "state repair Provider result is uncertain",
+                    usage=_attempt_usage(attempts),
+                    attempts=attempts,
+                ) from None
+            await self._deps.state_repair_receipts.complete_receipt(
+                receipt_id=str(existing["_id"]),
+                claim_token=str(existing.get("claim_token") or ""),
+                result_projection=_state_result_projection(generation),
+            )
+            return StateCandidateRepairReceipt(generation=generation)
+
         source = await self._source(
             owner_id=owner_id,
             novel_id=novel_id,
@@ -416,21 +825,77 @@ class ChapterCandidateRepairApplication:
             revision=request.source_run_revision,
             digest=request.source_content_digest,
         )
-        _authorization, _bundle, _adherence_plan, state_plan = (
-            self._authorized_snapshot(
+        prior = await self._deps.get_state_proposal(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            proposal_id=request.proposal_id,
+        )
+        audit = prior.get("generation_audit")
+        if (
+            str(prior.get("_id") or "") != request.proposal_id
+            or str(prior.get("owner_id") or "") != owner_id
+            or str(prior.get("novel_id") or "") != novel_id
+            or str(prior.get("chapter_id") or "") != chapter_id
+            or str(prior.get("status") or "") != "proposed"
+            or str(prior.get("source_prose_run_id") or "")
+            != request.source_run_id
+            or type(prior.get("source_prose_run_revision")) is not int
+            or prior.get("source_prose_run_revision")
+            != request.source_run_revision
+            or str(prior.get("source_content_digest") or "")
+            != request.source_content_digest
+            or not isinstance(audit, Mapping)
+            or audit.get("workflow") != STATE_WORKFLOW
+            or audit.get("step") != STATE_STEP
+            or audit.get("mode") != "system"
+        ):
+            raise ValueError("state repair proposal identity is invalid")
+        claim_token = uuid4().hex
+        receipt_state, receipt = (
+            await self._deps.state_repair_receipts.claim_receipt(
+                **identity,
+                claim_token=claim_token,
+            )
+        )
+        if receipt_state == "completed":
+            generation = await self._recover_state_generation(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                request=request,
+                receipt=receipt,
+                require_result_projection=True,
+            )
+            return StateCandidateRepairReceipt(generation=generation)
+        if receipt_state != "claimed":
+            attempts = await self._state_attempts(
                 chapter_id=chapter_id,
                 cycle=request.cycle,
+                claimed_are_uncertain=(receipt_state == "in_progress_dispatched"),
             )
+            raise CandidateRepairRunStopped(
+                f"state repair receipt is {receipt_state}",
+                usage=_attempt_usage(attempts),
+                attempts=attempts,
+            )
+        base_attempt_scope = self._attempt_scope_factory(
+            f"candidate-state-repair:{request.cycle}"
+        )
+        attempt_scope = _StateRepairReceiptAttemptScope(
+            base_attempt_scope,
+            receipts=self._deps.state_repair_receipts,
+            receipt_id=str(receipt["_id"]),
+            claim_token=claim_token,
         )
         generation = await self._deps.generate_state_candidate(
             novel_id,
             {"_id": chapter_id},
             source,
-            attempt_scope=self._attempt_scope_factory(
-                f"candidate-state-repair:{request.cycle}"
-            ),
+            attempt_scope=attempt_scope,
             generation_params=self._generation_params,
             generation_plan=state_plan,
+            request_id=str(receipt["_id"]),
             repair_guidance=StateRepairGuidance(
                 cycle=request.cycle,
                 prior_proposal_id=request.proposal_id,
@@ -445,4 +910,20 @@ class ChapterCandidateRepairApplication:
             or generation.accepted
         ):
             raise ValueError("state repair did not return a deferred candidate")
+        attempts = await self._state_attempts(
+            chapter_id=chapter_id,
+            cycle=request.cycle,
+        )
+        generation = generation.model_copy(
+            update={
+                "usage": _attempt_usage(attempts),
+                "attempts": attempts,
+            },
+            deep=True,
+        )
+        await self._deps.state_repair_receipts.complete_receipt(
+            receipt_id=str(receipt["_id"]),
+            claim_token=claim_token,
+            result_projection=_state_result_projection(generation),
+        )
         return StateCandidateRepairReceipt(generation=generation)

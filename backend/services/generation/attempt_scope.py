@@ -12,6 +12,36 @@ from backend.llm.models import TokenUsage
 from backend.services.llm.generation_runtime import AttemptUsage
 
 
+_PERSISTED_ATTEMPT_STATES = frozenset({
+    "claimed",
+    "accounted",
+    "uncertain",
+    "released_pre_dispatch",
+    "uncertain_retry_acknowledged",
+    "uncertain_skip_acknowledged",
+})
+_EVIDENCE_ATTEMPT_STATES = frozenset({
+    "accounted",
+    "uncertain",
+    "uncertain_retry_acknowledged",
+    "uncertain_skip_acknowledged",
+})
+
+
+def _strict_persisted_usage(value: object) -> TokenUsage:
+    if not isinstance(value, Mapping):
+        raise ValueError("persisted Provider attempt usage is invalid")
+    fields = ("input_tokens", "output_tokens", "total_tokens")
+    if any(
+        field not in value
+        or type(value[field]) is not int
+        or int(value[field]) < 0
+        for field in fields
+    ):
+        raise ValueError("persisted Provider attempt usage is invalid")
+    return TokenUsage(**{field: int(value[field]) for field in fields})
+
+
 class JobAttemptScope:
     """把 Runtime 的每次付费调用映射到 generation_job 的预留槽。"""
 
@@ -34,6 +64,7 @@ class JobAttemptScope:
         self._conservative_tokens: dict[str, int | None] = {}
         self._attempts: dict[str, AttemptUsage] = {}
         self._uncertain: set[str] = set()
+        self._persisted_states: dict[str, str] = {}
         self._restore_attempt_evidence(existing_attempt_slots)
 
     def _restore_attempt_evidence(
@@ -53,7 +84,11 @@ class JobAttemptScope:
                 raise ValueError("persisted Provider attempt identity is invalid")
             if attempt_id in self._claims:
                 raise ValueError("persisted Provider attempt identity is duplicated")
+            state = slot.get("state")
+            if not isinstance(state, str) or state not in _PERSISTED_ATTEMPT_STATES:
+                raise ValueError("persisted Provider attempt state is invalid")
             self._claims[attempt_id] = (provider_alias, phase)
+            self._persisted_states[attempt_id] = state
             raw_bound = slot.get("conservative_tokens")
             if raw_bound is None:
                 self._conservative_tokens[attempt_id] = None
@@ -65,15 +100,11 @@ class JobAttemptScope:
                 raise ValueError("persisted Provider attempt bound is invalid")
             else:
                 self._conservative_tokens[attempt_id] = raw_bound
-            state = str(slot.get("state") or "")
             if state == "uncertain":
                 self._uncertain.add(attempt_id)
             if state != "accounted":
                 continue
-            raw_usage = slot.get("usage")
-            if not isinstance(raw_usage, Mapping):
-                raise ValueError("persisted Provider attempt usage is invalid")
-            usage = TokenUsage.model_validate(dict(raw_usage))
+            usage = _strict_persisted_usage(slot.get("usage"))
             self._attempts[attempt_id] = AttemptUsage(
                 attempt_id=attempt_id,
                 provider_alias=provider_alias,
@@ -83,7 +114,36 @@ class JobAttemptScope:
 
     @property
     def attempts(self) -> tuple[AttemptUsage, ...]:
-        return tuple(self._attempts.values())
+        evidence: list[AttemptUsage] = []
+        for attempt_id, (provider_alias, phase) in self._claims.items():
+            state = self._persisted_states.get(attempt_id)
+            accounted = self._attempts.get(attempt_id)
+            if accounted is not None:
+                evidence.append(accounted)
+                continue
+            if state not in _EVIDENCE_ATTEMPT_STATES:
+                continue
+            conservative_tokens = self._conservative_tokens.get(attempt_id)
+            if (
+                conservative_tokens is not None
+                and (
+                    type(conservative_tokens) is not int
+                    or conservative_tokens < 0
+                )
+            ):
+                raise ValueError("persisted Provider attempt bound is invalid")
+            projected_state = {
+                "uncertain_retry_acknowledged": "resolved_retry",
+                "uncertain_skip_acknowledged": "resolved_skip",
+            }.get(state, state or "uncertain")
+            evidence.append(AttemptUsage(
+                attempt_id=attempt_id,
+                provider_alias=provider_alias,
+                phase=phase,
+                usage=TokenUsage(total_tokens=conservative_tokens or 0),
+                state=projected_state,
+            ))
+        return tuple(evidence)
 
     @property
     def claimed_attempt_ids(self) -> tuple[str, ...]:
@@ -112,6 +172,7 @@ class JobAttemptScope:
         )
         self._claims[attempt_id] = (provider_alias, phase)
         self._conservative_tokens[attempt_id] = conservative_tokens
+        self._persisted_states[attempt_id] = "claimed"
         return attempt_id
 
     async def account(self, attempt_id: str, usage: TokenUsage) -> None:
@@ -141,9 +202,11 @@ class JobAttemptScope:
             phase=phase,
             usage=effective_usage,
         )
+        self._persisted_states[attempt_id] = "accounted"
 
     async def mark_uncertain(self, attempt_id: str, reason: str) -> None:
         self._uncertain.add(attempt_id)
+        self._persisted_states[attempt_id] = "uncertain"
         conservative_tokens = self._conservative_tokens.get(attempt_id)
         if conservative_tokens is None:
             await self.repo.mark_attempt_uncertain(self.job_id, attempt_id, reason)
@@ -158,6 +221,7 @@ class JobAttemptScope:
         conservative_tokens = self._conservative_tokens.get(attempt_id)
         if conservative_tokens is None:
             return
+        self._persisted_states[attempt_id] = "released_pre_dispatch"
         await self.repo.release_attempt_budget(
             self.job_id,
             attempt_id,

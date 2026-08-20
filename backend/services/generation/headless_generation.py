@@ -548,6 +548,7 @@ async def generate_state_candidate(
     *,
     generation_plan: GenerationPlan | None = None,
     repair_guidance: StateRepairGuidance | None = None,
+    request_id: str | None = None,
 ) -> ChapterGenerationResult:
     """Extract a persisted state proposal without accepting chapter state."""
     execution = await _chapter_capability_registry().execute(
@@ -562,6 +563,7 @@ async def generate_state_candidate(
             prose_candidate=prose_candidate,
             generation_plan=generation_plan,
             repair_guidance=repair_guidance,
+            request_id=request_id,
         ),
         call=CapabilityCall(source="job_engine"),
     )

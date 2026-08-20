@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field as ModelField, field_validator
+from pydantic import BaseModel, ConfigDict, Field as ModelField
 
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
@@ -97,6 +97,9 @@ from backend.services.novel.state_proposal import (
 from backend.services.novel.outline_validation import validate_outline_ids
 from backend.services.novel.state_validation import (
     resolve_outline_character_references,
+)
+from backend.services.generation.state_repair_contracts import (
+    StateRepairDirective,
 )
 from backend.services.novel.style_controls import render_style_controls
 
@@ -189,36 +192,13 @@ class ProseCandidateSource(BaseModel):
     completion: Mapping[str, Any]
 
 
-class StateRepairGuidance(BaseModel):
+class StateRepairGuidance(StateRepairDirective):
     """Bounded, metadata-only guidance for one state-candidate regeneration."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal["state_repair_guidance.v1"] = (
         "state_repair_guidance.v1"
     )
-    cycle: int = ModelField(strict=True, ge=1, le=8)
     prior_proposal_id: str = ModelField(min_length=1, max_length=128)
-    reason_codes: tuple[
-        Literal["consistency_conflict", "invalid_internal_reference"], ...
-    ] = ModelField(min_length=1, max_length=2)
-    consistency_issue_count: int = ModelField(strict=True, ge=0, le=20)
-    affected_card_ids: tuple[str, ...] = ModelField(max_length=20)
-    dropped_reference_count: int = ModelField(strict=True, ge=0, le=1_000)
-
-    @field_validator("reason_codes", "affected_card_ids")
-    @classmethod
-    def validate_unique_items(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("state repair guidance cannot contain duplicates")
-        return value
-
-    @field_validator("affected_card_ids")
-    @classmethod
-    def validate_card_id_shape(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not item or len(item) > 64 for item in value):
-            raise ValueError("state repair card ids exceed the V1 bound")
-        return value
 
 
 def _render_state_repair_guidance(guidance: StateRepairGuidance) -> str:
@@ -761,6 +741,11 @@ class ChapterGenerationApplicationService:
                     ),
                     "model": getattr(provider_config, "model", None),
                     "mode": command.authority.value,
+                    **(
+                        {"request_id": command.request_id}
+                        if command.request_id
+                        else {}
+                    ),
                 },
             )
             inputs = await self._deps.fetch_context_inputs(

@@ -68,6 +68,22 @@ class GenerationJobRepository(BaseRepository):
     async def list_running_jobs(self) -> List[Dict[str, Any]]:
         return await self.find_many({"status": "running"})
 
+    async def list_attempt_slots(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        step_prefix: str,
+    ) -> List[Dict[str, Any]]:
+        """Read one execution's persistent attempt ledger in claim order."""
+        job = await self.get_job(job_id)
+        return [
+            dict(slot)
+            for slot in list(job.get("attempt_slots") or [])
+            if str(slot.get("chapter_id") or "") == str(chapter_id)
+            and str(slot.get("step_id") or "").startswith(step_prefix)
+        ]
+
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))
 

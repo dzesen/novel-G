@@ -34,6 +34,7 @@ AGENT_RUNTIME_EVENTS = "agent_runtime_events"
 GENERATION_JOBS = "generation_jobs"
 PROSE_RUNS = "prose_runs"
 PROSE_REMEDIATION_RECEIPTS = "prose_remediation_receipts"
+STATE_CANDIDATE_REPAIR_RECEIPTS = "state_candidate_repair_receipts"
 CHAPTER_STATE_DELTAS = "chapter_state_deltas"
 CHARACTER_STATE_SNAPSHOTS = "character_state_snapshots"
 PLOT_THREAD_EVENTS = "plot_thread_events"
@@ -70,6 +71,7 @@ ACTIVE_COLLECTIONS = frozenset({
     GENERATION_JOBS,
     PROSE_RUNS,
     PROSE_REMEDIATION_RECEIPTS,
+    STATE_CANDIDATE_REPAIR_RECEIPTS,
     CHAPTER_STATE_DELTAS,
     CHARACTER_STATE_SNAPSHOTS,
     PLOT_THREAD_EVENTS,

@@ -28,6 +28,7 @@ from backend.db.mongo import get_database
 from backend.db.mutation import MutationConflictError
 from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
+from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
 from backend.services.novel.state_completion import (
@@ -108,6 +109,12 @@ class StateProposalLease:
 
 
 @dataclass(frozen=True)
+class RecoveredStateProposal:
+    value: dict[str, Any]
+    dropped_reference_count: int
+
+
+@dataclass(frozen=True)
 class SelectAllPolicy:
     """Deterministic headless policy that accepts every selectable candidate."""
 
@@ -138,10 +145,175 @@ def add_selection_ids(candidate: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _proposal_acceptance_token(
+    *,
+    proposal_id: ObjectId,
+    content_digest: str,
+    narrative_revision: int,
+    candidate_digest: str,
+    source_content_digest: str,
+    expires_at: datetime,
+) -> str:
+    token_payload = (
+        f"{proposal_id}:{content_digest}:"
+        f"{narrative_revision}:{candidate_digest}:"
+        f"{source_content_digest}:"
+        f"{int(expires_at.replace(tzinfo=timezone.utc).timestamp())}"
+    )
+    return hmac.new(
+        _proposal_key(),
+        token_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 class StateProposalModule:
     @property
     def collection(self):
         return get_database()[collections.STATE_PREVIEWS]
+
+    async def get_owned_repair_source(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        proposal_id: str,
+    ) -> dict[str, Any]:
+        """Load one live proposal through its owner/novel/chapter boundary."""
+        novel = await novel_repo.collection.find_one(
+            {
+                "_id": to_object_id(novel_id),
+                "owner_id": to_object_id(owner_id),
+                "is_deleted": False,
+            },
+            projection={"_id": 1},
+        )
+        if novel is None:
+            raise StaleStatePreview("State proposal owner scope is invalid")
+        proposal = await self.collection.find_one({
+            "_id": to_object_id(proposal_id),
+            "novel_id": to_object_id(novel_id),
+            "chapter_id": to_object_id(chapter_id),
+            "is_deleted": False,
+        })
+        if proposal is None:
+            raise StaleStatePreview("State proposal is outside the repair scope")
+        expires_at = proposal.get("expires_at")
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
+            raise StaleStatePreview("State proposal is no longer live")
+        return {**proposal, "owner_id": to_object_id(owner_id)}
+
+    async def recover_owned_repair_result(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        proposal_id: str | None,
+        request_id: str,
+        source_run_id: str,
+        source_run_revision: int,
+        source_content_digest: str,
+    ) -> RecoveredStateProposal | None:
+        """Rebuild a live proposal token without replaying Provider work."""
+        if not request_id:
+            raise StaleStatePreview("State repair request identity is missing")
+        resolved_proposal_id = proposal_id
+        if resolved_proposal_id is None:
+            novel = await novel_repo.collection.find_one(
+                {
+                    "_id": to_object_id(novel_id),
+                    "owner_id": to_object_id(owner_id),
+                    "is_deleted": False,
+                },
+                projection={"_id": 1},
+            )
+            if novel is None:
+                raise StaleStatePreview(
+                    "State repair proposal owner scope is invalid"
+                )
+            located = await self.collection.find_one({
+                "novel_id": to_object_id(novel_id),
+                "chapter_id": to_object_id(chapter_id),
+                "status": "proposed",
+                "generation_audit.request_id": str(request_id),
+                "is_deleted": False,
+            })
+            if located is None:
+                return None
+            resolved_proposal_id = str(located["_id"])
+        proposal = await self.get_owned_repair_source(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            proposal_id=str(resolved_proposal_id),
+        )
+        audit = proposal.get("generation_audit")
+        candidate = proposal.get("candidate")
+        expires_at = proposal.get("expires_at")
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if (
+            not isinstance(audit, dict)
+            or str(audit.get("request_id") or "") != str(request_id)
+            or str(proposal.get("source_prose_run_id") or "")
+            != str(source_run_id)
+            or type(proposal.get("source_prose_run_revision")) is not int
+            or proposal.get("source_prose_run_revision")
+            != source_run_revision
+            or str(proposal.get("source_content_digest") or "")
+            != str(source_content_digest)
+            or not isinstance(candidate, dict)
+            or not isinstance(expires_at, datetime)
+        ):
+            raise StaleStatePreview(
+                "State repair proposal recovery evidence is invalid"
+            )
+        candidate_digest = _digest(candidate)
+        if candidate_digest != str(proposal.get("candidate_digest") or ""):
+            raise StaleStatePreview("State repair proposal digest is invalid")
+        token = _proposal_acceptance_token(
+            proposal_id=proposal["_id"],
+            content_digest=str(proposal.get("content_digest") or ""),
+            narrative_revision=int(proposal.get("narrative_revision") or 0),
+            candidate_digest=candidate_digest,
+            source_content_digest=str(
+                proposal.get("source_content_digest") or ""
+            ),
+            expires_at=expires_at,
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(token.encode("ascii")).hexdigest(),
+            str(proposal.get("token_digest") or ""),
+        ):
+            raise StaleStatePreview("State repair proposal token is invalid")
+        reference_resolution = audit.get("reference_resolution")
+        dropped = (
+            reference_resolution.get("dropped")
+            if isinstance(reference_resolution, dict)
+            else None
+        )
+        dropped_count = 0
+        if isinstance(dropped, dict):
+            dropped_count = min(
+                1_000,
+                sum(
+                    len(items) if isinstance(items, list) else int(bool(items))
+                    for items in dropped.values()
+                ),
+            )
+        return RecoveredStateProposal(
+            value={
+                **deepcopy(candidate),
+                "proposal_id": str(proposal["_id"]),
+                "acceptance_token": token,
+                "proposal_expires_at": expires_at.isoformat(),
+            },
+            dropped_reference_count=dropped_count,
+        )
 
     async def capture(
         self,
@@ -275,15 +447,14 @@ class StateProposalModule:
         if not isinstance(expires_at, datetime):
             raise StaleStatePreview("Generation lease has no valid expiry")
         candidate_digest = _digest(prepared)
-        token_payload = (
-            f"{lease.proposal_id}:{lease.snapshot.content_digest}:"
-            f"{lease.snapshot.narrative_revision}:{candidate_digest}:"
-            f"{lease.snapshot.source_content_digest or ''}:"
-            f"{int(expires_at.replace(tzinfo=timezone.utc).timestamp())}"
+        token = _proposal_acceptance_token(
+            proposal_id=lease.proposal_id,
+            content_digest=lease.snapshot.content_digest,
+            narrative_revision=lease.snapshot.narrative_revision,
+            candidate_digest=candidate_digest,
+            source_content_digest=lease.snapshot.source_content_digest or "",
+            expires_at=expires_at,
         )
-        token = hmac.new(
-            _proposal_key(), token_payload.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
         generation_audit = {
             **deepcopy(current.get("generation_audit") or {}),
             **deepcopy(audit or {}),

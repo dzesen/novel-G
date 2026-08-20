@@ -25,12 +25,16 @@ from backend.services.generation.outline_adherence import (
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
+from backend.services.generation.state_repair_contracts import (
+    MAX_STATE_REPAIR_CARD_ID_LENGTH,
+    MAX_STATE_REPAIR_CARD_IDS,
+    MAX_STATE_REPAIR_DROPPED_REFERENCES,
+    StateRepairDirective,
+    StateRepairReason,
+)
 
 
 _MAX_REPAIR_SCENE_INDEXES = 20
-_MAX_REPAIR_CARD_IDS = 20
-_MAX_REPAIR_CARD_ID_LENGTH = 64
-_MAX_DROPPED_REFERENCE_COUNT = 1_000
 _MAX_PIPELINE_ATTEMPTS = 512
 _MAX_PIPELINE_TRUNCATIONS = 32
 _MAX_PIPELINE_UNATTRIBUTED_USAGE = 32
@@ -44,10 +48,6 @@ STATE_REPAIR_RECEIPT_SCHEMA = "state_candidate_repair_receipt.v1"
 ProseRepairReason = Literal[
     "completion_contract_failed",
     "outline_adherence_failed",
-]
-StateRepairReason = Literal[
-    "consistency_conflict",
-    "invalid_internal_reference",
 ]
 
 
@@ -939,11 +939,10 @@ class ProseCandidateRepairReceipt(_RepairReceipt):
     source: ProseCandidateSource
 
 
-class StateCandidateRepairRequest(_RepairContract):
+class StateCandidateRepairRequest(StateRepairDirective):
     schema_version: Literal["state_candidate_repair_request.v1"] = (
         STATE_REPAIR_REQUEST_SCHEMA
     )
-    cycle: int = Field(ge=1, le=MAX_FINALIZATION_REPAIR_CYCLES)
     proposal_id: str = Field(min_length=1, max_length=128)
     source_run_id: str = Field(min_length=1, max_length=128)
     source_run_revision: int = Field(ge=0)
@@ -952,36 +951,6 @@ class StateCandidateRepairRequest(_RepairContract):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
-    reason_codes: tuple[StateRepairReason, ...] = Field(
-        min_length=1,
-        max_length=2,
-    )
-    consistency_issue_count: int = Field(ge=0, le=_MAX_REPAIR_CARD_IDS)
-    affected_card_ids: tuple[str, ...] = Field(max_length=_MAX_REPAIR_CARD_IDS)
-    dropped_reference_count: int = Field(
-        ge=0,
-        le=_MAX_DROPPED_REFERENCE_COUNT,
-    )
-
-    @field_validator("affected_card_ids")
-    @classmethod
-    def validate_card_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if (
-            len(set(value)) != len(value)
-            or any(
-                not item or len(item) > _MAX_REPAIR_CARD_ID_LENGTH
-                for item in value
-            )
-        ):
-            raise ValueError("card ids must be unique and within the V1 bound")
-        return value
-
-    @field_validator("reason_codes")
-    @classmethod
-    def validate_unique_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("repair reasons cannot contain duplicates")
-        return value
 
 
 class StateCandidateRepairReceipt(_RepairReceipt):
@@ -1631,12 +1600,15 @@ def _adherence_repair_request(
 
 def _dropped_reference_count(value: Any) -> int:
     if isinstance(value, Mapping):
+        exact_count = value.get("dropped_reference_count")
+        if type(exact_count) is int:
+            return min(MAX_STATE_REPAIR_DROPPED_REFERENCES, exact_count)
         return min(
-            _MAX_DROPPED_REFERENCE_COUNT,
+            MAX_STATE_REPAIR_DROPPED_REFERENCES,
             sum(_dropped_reference_count(item) for item in value.values()),
         )
     if isinstance(value, (list, tuple, set, frozenset)):
-        return min(_MAX_DROPPED_REFERENCE_COUNT, len(value))
+        return min(MAX_STATE_REPAIR_DROPPED_REFERENCES, len(value))
     return int(bool(value))
 
 
@@ -1653,12 +1625,12 @@ def _state_repair_request(
     issues = raw_issues if isinstance(raw_issues, list) else []
     card_ids = tuple(sorted({
         card_id
-        for item in issues[:_MAX_REPAIR_CARD_IDS]
+        for item in issues[:MAX_STATE_REPAIR_CARD_IDS]
         if isinstance(item, Mapping)
         for card_id in (item.get("card_id"),)
         if (
             isinstance(card_id, str)
-            and 0 < len(card_id) <= _MAX_REPAIR_CARD_ID_LENGTH
+            and 0 < len(card_id) <= MAX_STATE_REPAIR_CARD_ID_LENGTH
             and card_id in declared_card_ids
         )
     }))
@@ -1696,10 +1668,10 @@ def _declared_character_card_ids(
         return frozenset()
     return frozenset(
         card_id
-        for card_id in raw_ids[:_MAX_REPAIR_CARD_IDS]
+        for card_id in raw_ids[:MAX_STATE_REPAIR_CARD_IDS]
         if (
             isinstance(card_id, str)
-            and 0 < len(card_id) <= _MAX_REPAIR_CARD_ID_LENGTH
+            and 0 < len(card_id) <= MAX_STATE_REPAIR_CARD_ID_LENGTH
         )
     )
 
@@ -1785,7 +1757,7 @@ def _validate_state_shape(
         not isinstance(item, Mapping) for item in raw_issues
     ):
         raise ChapterCandidatePipelineBlocked("状态候选冲突证据格式无效")
-    if len(raw_issues) > _MAX_REPAIR_CARD_IDS:
+    if len(raw_issues) > MAX_STATE_REPAIR_CARD_IDS:
         raise ChapterCandidatePipelineBlocked("状态候选冲突数量超过 V1 上限")
     issues = tuple(dict(item) for item in raw_issues)
     return state, proposal_id, acceptance_token, issues

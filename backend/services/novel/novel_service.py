@@ -186,6 +186,9 @@ class NovelService:
             prose_remediation_receipts_repo = BaseRepository(
                 collections.PROSE_REMEDIATION_RECEIPTS
             )
+            state_candidate_repair_receipts_repo = BaseRepository(
+                collections.STATE_CANDIDATE_REPAIR_RECEIPTS
+            )
             chapter_state_deltas_repo = BaseRepository(collections.CHAPTER_STATE_DELTAS)
             character_state_snapshots_repo = BaseRepository(collections.CHARACTER_STATE_SNAPSHOTS)
             plot_thread_events_repo = BaseRepository(collections.PLOT_THREAD_EVENTS)
@@ -247,6 +250,11 @@ class NovelService:
             stats["prose_runs_deleted"] = await prose_runs_repo.hard_delete_many(query, session=session)
             stats["prose_remediation_receipts_deleted"] = (
                 await prose_remediation_receipts_repo.hard_delete_many(
+                    query, session=session
+                )
+            )
+            stats["state_candidate_repair_receipts_deleted"] = (
+                await state_candidate_repair_receipts_repo.hard_delete_many(
                     query, session=session
                 )
             )
