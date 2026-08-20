@@ -84,6 +84,23 @@ class CandidateSourceIdentityV1(_CandidateCheckpointContract):
     source_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class CandidatePipelineCompletionV1(_CandidateCheckpointContract):
+    """Stable receipt for atomically rolling one active ledger into progress."""
+
+    schema_version: Literal["candidate_pipeline_completion.v1"] = (
+        "candidate_pipeline_completion.v1"
+    )
+    checkpoint_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sequence: int = Field(
+        ge=1,
+        le=MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
+    )
+    chapter_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    source: CandidateSourceIdentityV1
+    state_proposal_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    tokens_delta: int = Field(ge=0, le=MAX_BSON_INT64)
+
+
 class CandidateCompletionProjectionV1(_CandidateCheckpointContract):
     """Only completion fields consumed by the deterministic candidate gates."""
 
