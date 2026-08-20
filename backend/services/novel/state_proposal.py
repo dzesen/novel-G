@@ -49,10 +49,26 @@ from backend.services.novel.state_validation import (
 
 PROPOSAL_TTL_SECONDS = 15 * 60
 STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION = 1
+_JOB_DISPATCH_RESOLUTION_ACTIONS = frozenset({"retry", "skip", "abort"})
 
 
 class StaleStatePreview(ValueError):
     """A proposal is missing, expired, reused, or bound to stale narrative data."""
+
+
+def _uses_current_dispatch_protocol(proposal: dict[str, Any]) -> bool:
+    revision = proposal.get("dispatch_protocol_revision")
+    return (
+        type(revision) is int
+        and revision == STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION
+    )
+
+
+def _dispatch_protocol_query() -> dict[str, Any]:
+    return {
+        "$eq": STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION,
+        "$type": "int",
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -531,7 +547,11 @@ class StateProposalModule:
             await self.ensure_current(lease.snapshot)
         except StaleStatePreview as exc:
             await self.collection.update_one(
-                {"_id": lease.proposal_id, "status": "dispatched"},
+                {
+                    "_id": lease.proposal_id,
+                    "status": "dispatched",
+                    "dispatch_protocol_revision": _dispatch_protocol_query(),
+                },
                 {
                     "$set": {
                         "status": "stale",
@@ -546,13 +566,13 @@ class StateProposalModule:
         if (
             not current
             or current.get("status") != "dispatched"
-            or type(current.get("dispatch_protocol_revision")) is not int
-            or current.get("dispatch_protocol_revision")
-            != STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION
+            or not _uses_current_dispatch_protocol(current)
         ):
             raise StaleStatePreview("Generation lease is missing or no longer active")
         prepared = add_selection_ids(candidate)
-        expires_at = current.get("expires_at")
+        expires_at = current.get("acceptance_expires_at") or current.get(
+            "expires_at"
+        )
         if not isinstance(expires_at, datetime):
             raise StaleStatePreview("Generation lease has no valid expiry")
         candidate_digest = _digest(prepared)
@@ -588,7 +608,11 @@ class StateProposalModule:
         if job_binding is not None:
             update["$unset"] = {"expires_at": ""}
         published = await self.collection.find_one_and_update(
-            {"_id": lease.proposal_id, "status": "dispatched"},
+            {
+                "_id": lease.proposal_id,
+                "status": "dispatched",
+                "dispatch_protocol_revision": _dispatch_protocol_query(),
+            },
             update,
             return_document=ReturnDocument.AFTER,
         )
@@ -609,14 +633,44 @@ class StateProposalModule:
         audit: dict[str, Any] | None = None,
     ) -> None:
         current = await self.collection.find_one({"_id": lease.proposal_id})
+        if current is None or not _uses_current_dispatch_protocol(current):
+            return
         generation_audit = {
-            **deepcopy((current or {}).get("generation_audit") or {}),
+            **deepcopy(current.get("generation_audit") or {}),
             **deepcopy(audit or {}),
         }
+        job_binding = _job_mutation_binding(current)
+        now = get_utc_now()
+        if current.get("status") == "generating" and job_binding is not None:
+            await self.collection.update_one(
+                {
+                    "_id": lease.proposal_id,
+                    "status": "generating",
+                    "job_mutation_key": job_binding.idempotency_key,
+                    "job_mutation_binding": job_binding.model_dump(mode="json"),
+                    "dispatch_protocol_revision": _dispatch_protocol_query(),
+                },
+                {
+                    "$set": {
+                        "status": "released_pre_dispatch",
+                        "failure": {
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                        "generation_audit": generation_audit,
+                        "release_reason": "state_generation_failed_before_dispatch",
+                        "released_at": now,
+                        "updated_at": now,
+                    },
+                    "$unset": {"job_mutation_key": ""},
+                },
+            )
+            return
         await self.collection.update_one(
             {
                 "_id": lease.proposal_id,
                 "status": {"$in": ["generating", "dispatched"]},
+                "dispatch_protocol_revision": _dispatch_protocol_query(),
             },
             {
                 "$set": {
@@ -626,8 +680,8 @@ class StateProposalModule:
                         "message": str(exc),
                     },
                     "generation_audit": generation_audit,
-                    "failed_at": get_utc_now(),
-                    "updated_at": get_utc_now(),
+                    "failed_at": now,
+                    "updated_at": now,
                 }
             },
         )
@@ -647,9 +701,7 @@ class StateProposalModule:
                 "status": "generating",
                 "content_digest": lease.snapshot.content_digest,
                 "narrative_revision": lease.snapshot.narrative_revision,
-                "dispatch_protocol_revision": (
-                    STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION
-                ),
+                "dispatch_protocol_revision": _dispatch_protocol_query(),
                 "is_deleted": False,
             },
             {
@@ -671,7 +723,11 @@ class StateProposalModule:
             await self.ensure_current(lease.snapshot)
         except StaleStatePreview as exc:
             await self.collection.update_one(
-                {"_id": lease.proposal_id, "status": "generating"},
+                {
+                    "_id": lease.proposal_id,
+                    "status": "generating",
+                    "dispatch_protocol_revision": _dispatch_protocol_query(),
+                },
                 {
                     "$set": {
                         "status": "stale",
@@ -681,22 +737,48 @@ class StateProposalModule:
                 },
             )
             raise
+        current = await self.collection.find_one({"_id": lease.proposal_id})
+        if (
+            current is None
+            or current.get("status") != "generating"
+            or not _uses_current_dispatch_protocol(current)
+        ):
+            raise StaleStatePreview(
+                "State generation lease could not cross the dispatch boundary"
+            )
+        job_binding = _job_mutation_binding(current)
         now = get_utc_now()
+        query: dict[str, Any] = {
+            "_id": lease.proposal_id,
+            "status": "generating",
+            "content_digest": lease.snapshot.content_digest,
+            "narrative_revision": lease.snapshot.narrative_revision,
+            "dispatch_protocol_revision": _dispatch_protocol_query(),
+            "is_deleted": False,
+        }
+        update: dict[str, Any] = {
+            "$set": {
+                "status": "dispatched",
+                "dispatched_at": now,
+                "updated_at": now,
+            }
+        }
+        if job_binding is not None:
+            acceptance_expires_at = current.get("expires_at")
+            if not isinstance(acceptance_expires_at, datetime):
+                raise StaleStatePreview(
+                    "State generation Job lease has no valid acceptance expiry"
+                )
+            canonical_binding = job_binding.model_dump(mode="json")
+            query.update({
+                "job_mutation_key": job_binding.idempotency_key,
+                "job_mutation_binding": canonical_binding,
+            })
+            update["$set"]["acceptance_expires_at"] = acceptance_expires_at
+            update["$unset"] = {"expires_at": ""}
         dispatched = await self.collection.update_one(
-            {
-                "_id": lease.proposal_id,
-                "status": "generating",
-                "content_digest": lease.snapshot.content_digest,
-                "narrative_revision": lease.snapshot.narrative_revision,
-                "is_deleted": False,
-            },
-            {
-                "$set": {
-                    "status": "dispatched",
-                    "dispatched_at": now,
-                    "updated_at": now,
-                }
-            },
+            query,
+            update,
         )
         if dispatched.matched_count != 1:
             raise StaleStatePreview(
@@ -847,6 +929,12 @@ class StateProposalModule:
         if proposal.get("status") not in {"proposed", "claimed", "applied"}:
             raise StaleStatePreview("State proposal is not available for acceptance")
         stored_job_binding = _job_mutation_binding(proposal)
+        if stored_job_binding is not None and not _uses_current_dispatch_protocol(
+            proposal
+        ):
+            raise StaleStatePreview(
+                "State proposal Provider dispatch evidence is unknown"
+            )
         allow_expired = False
         if job_mutation_binding is not None:
             try:
@@ -1181,12 +1269,10 @@ class StateProposalModule:
             job_mutation_binding=job_mutation_binding,
         )
 
-    async def recover_job_bound_result(
-        self,
+    @staticmethod
+    def _validated_job_dispatch_binding(
         binding: JobMutationRecoveryBindingV1,
-    ) -> dict[str, Any] | None:
-        """Release pre-dispatch work or load one exact published Job result."""
-
+    ) -> JobMutationRecoveryBindingV1:
         try:
             frozen = JobMutationRecoveryBindingV1.model_validate(
                 binding.model_dump(mode="python")
@@ -1199,12 +1285,19 @@ class StateProposalModule:
             raise MutationConflictError(
                 "State proposal recovery operation is invalid"
             )
+        return frozen
+
+    async def _load_job_bound_proposal(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+    ) -> tuple[JobMutationRecoveryBindingV1, dict[str, Any] | None]:
+        frozen = self._validated_job_dispatch_binding(binding)
         proposal = await self.collection.find_one({
             "job_mutation_key": frozen.idempotency_key,
             "is_deleted": False,
         })
         if proposal is None:
-            return None
+            return frozen, None
         try:
             stored = JobMutationRecoveryBindingV1.model_validate(
                 proposal.get("job_mutation_binding")
@@ -1217,12 +1310,140 @@ class StateProposalModule:
             raise MutationConflictError(
                 "Persisted state proposal belongs to another Job authorization"
             )
+        return frozen, proposal
+
+    async def has_unresolved_job_dispatch(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+    ) -> bool:
+        """Return whether one exact Job receipt needs an explicit resolution."""
+
+        _frozen, proposal = await self._load_job_bound_proposal(binding)
+        if proposal is None:
+            return False
+        if not _uses_current_dispatch_protocol(proposal):
+            raise MutationConflictError(
+                "Persisted state Provider dispatch evidence is unknown"
+            )
+        return str(proposal.get("status") or "") in {
+            "dispatched",
+            "failed",
+            "uncertain_retry_acknowledged",
+            "uncertain_skip_acknowledged",
+            "uncertain_abort_acknowledged",
+        }
+
+    async def acknowledge_job_bound_dispatch(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+        action: str,
+    ) -> bool:
+        """Persist one explicit retry/skip/abort decision without releasing its key."""
+
+        if action not in _JOB_DISPATCH_RESOLUTION_ACTIONS:
+            raise ValueError("Unknown state Provider dispatch resolution")
+        frozen, proposal = await self._load_job_bound_proposal(binding)
+        if proposal is None:
+            return False
+        if not _uses_current_dispatch_protocol(proposal):
+            raise MutationConflictError(
+                "Persisted state Provider dispatch evidence is unknown"
+            )
+        expected_status = f"uncertain_{action}_acknowledged"
         status = str(proposal.get("status") or "")
-        if status in {"generating", "dispatched"} and (
-            type(proposal.get("dispatch_protocol_revision")) is not int
-            or proposal.get("dispatch_protocol_revision")
-            != STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION
-        ):
+        if status == expected_status:
+            return True
+        if status not in {"dispatched", "failed"}:
+            raise MutationConflictError(
+                "Persisted state Provider dispatch cannot accept this resolution"
+            )
+        now = get_utc_now()
+        result = await self.collection.update_one(
+            {
+                "_id": proposal["_id"],
+                "status": status,
+                "job_mutation_key": frozen.idempotency_key,
+                "job_mutation_binding": frozen.model_dump(mode="json"),
+                "dispatch_protocol_revision": _dispatch_protocol_query(),
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "status": expected_status,
+                    "dispatch_resolution": {
+                        "action": action,
+                        "acknowledged_at": now,
+                    },
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        _frozen, current = await self._load_job_bound_proposal(frozen)
+        if current is not None and current.get("status") == expected_status:
+            return True
+        raise MutationConflictError(
+            "Persisted state Provider dispatch resolution raced"
+        )
+
+    async def release_job_bound_dispatch(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+        action: str,
+    ) -> bool:
+        """Release only a receipt carrying the same explicit resolution action."""
+
+        if action not in _JOB_DISPATCH_RESOLUTION_ACTIONS:
+            raise ValueError("Unknown state Provider dispatch resolution")
+        frozen, proposal = await self._load_job_bound_proposal(binding)
+        if proposal is None:
+            return False
+        if not _uses_current_dispatch_protocol(proposal):
+            raise MutationConflictError(
+                "Persisted state Provider dispatch evidence is unknown"
+            )
+        expected_status = f"uncertain_{action}_acknowledged"
+        if proposal.get("status") != expected_status:
+            raise MutationConflictError(
+                "Persisted state Provider dispatch resolution is not acknowledged"
+            )
+        now = get_utc_now()
+        result = await self.collection.update_one(
+            {
+                "_id": proposal["_id"],
+                "status": expected_status,
+                "job_mutation_key": frozen.idempotency_key,
+                "job_mutation_binding": frozen.model_dump(mode="json"),
+                "dispatch_protocol_revision": _dispatch_protocol_query(),
+                "is_deleted": False,
+            },
+            {
+                "$set": {
+                    "dispatch_resolution.released_at": now,
+                    "expires_at": now + timedelta(seconds=PROPOSAL_TTL_SECONDS),
+                    "updated_at": now,
+                },
+                "$unset": {"job_mutation_key": ""},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        raise MutationConflictError(
+            "Persisted state Provider dispatch resolution release raced"
+        )
+
+    async def recover_job_bound_result(
+        self,
+        binding: JobMutationRecoveryBindingV1,
+    ) -> dict[str, Any] | None:
+        """Release pre-dispatch work or load one exact published Job result."""
+
+        frozen, proposal = await self._load_job_bound_proposal(binding)
+        if proposal is None:
+            return None
+        status = str(proposal.get("status") or "")
+        if not _uses_current_dispatch_protocol(proposal):
             raise MutationConflictError(
                 "Persisted state Provider dispatch evidence is unknown"
             )
@@ -1234,9 +1455,7 @@ class StateProposalModule:
                     "status": "generating",
                     "job_mutation_key": frozen.idempotency_key,
                     "job_mutation_binding": frozen.model_dump(mode="json"),
-                    "dispatch_protocol_revision": (
-                        STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION
-                    ),
+                    "dispatch_protocol_revision": _dispatch_protocol_query(),
                     "is_deleted": False,
                 },
                 {
@@ -1260,12 +1479,26 @@ class StateProposalModule:
                 raise MutationConflictError(
                     "Persisted state proposal changed authorization during recovery"
                 )
+            if not _uses_current_dispatch_protocol(proposal):
+                raise MutationConflictError(
+                    "Persisted state Provider dispatch evidence is unknown"
+                )
             status = str(proposal.get("status") or "")
             if status == "released_pre_dispatch" and not proposal.get(
                 "job_mutation_key"
             ):
                 return None
-        if status == "dispatched":
+        if status == "uncertain_retry_acknowledged":
+            await self.release_job_bound_dispatch(frozen, "retry")
+            return None
+        if status in {
+            "uncertain_skip_acknowledged",
+            "uncertain_abort_acknowledged",
+        }:
+            raise MutationConflictError(
+                "Persisted state Provider dispatch was explicitly terminated"
+            )
+        if status in {"dispatched", "failed"}:
             raise MutationConflictError(
                 "Persisted state Provider result is unknown after dispatch"
             )

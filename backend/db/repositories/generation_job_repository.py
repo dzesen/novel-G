@@ -672,6 +672,53 @@ class GenerationJobRepository(BaseRepository):
             "Job mutation recovery binding changed"
         )
 
+    async def clear_job_mutation_recovery(
+        self,
+        job_id: str,
+        binding: JobMutationRecoveryBindingV1,
+        *,
+        terminal_status: str,
+    ) -> bool:
+        """Clear one exact terminal state-only recovery marker."""
+
+        try:
+            frozen = JobMutationRecoveryBindingV1.model_validate(
+                binding.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation recovery binding is invalid"
+            ) from exc
+        if frozen.job_id != str(job_id):
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation recovery binding belongs to another Job"
+            )
+        if terminal_status not in {"failed", "aborted"}:
+            raise ValueError("Job mutation recovery terminal status is invalid")
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": terminal_status,
+                "job_mutation_recovery": frozen.model_dump(mode="json"),
+            },
+            {
+                "$unset": {"job_mutation_recovery": ""},
+                "$set": {"updated_at": get_utc_now()},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        if (
+            str(current.get("status") or "") == terminal_status
+            and current.get("job_mutation_recovery") is None
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Job mutation recovery release lost its terminal fence"
+        )
+
     async def complete_job_mutation_chapter(
         self,
         job_id: str,
