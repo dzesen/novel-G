@@ -42,6 +42,7 @@ from backend.llm.schemas.novel_pydantic import (
 )
 from backend.llm.models import TokenUsage
 from backend.services.generation.candidate_repair_contracts import (
+    JobMutationRecoveryBindingV1,
     project_state_context,
 )
 from backend.services.generation.prose_completion import prose_completion_module
@@ -322,6 +323,7 @@ class StateGenerationCommand(_ChapterGenerationCommand):
     prose_candidate: ProseCandidateSource | None = None
     generation_plan: GenerationPlan | None = None
     repair_guidance: StateRepairGuidance | None = None
+    job_mutation_binding: JobMutationRecoveryBindingV1 | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
@@ -798,6 +800,17 @@ class ChapterGenerationApplicationService:
                     "ai_complete" if candidate is not None else None
                 ),
             )
+            binding = command.job_mutation_binding
+            if binding is not None and (
+                command.authority is not AcceptanceAuthority.SYSTEM
+                or command.acceptance_timing is not AcceptanceTiming.IMMEDIATE
+                or binding.operation != "accept_chapter_state"
+                or binding.novel_id != command.novel_id
+                or binding.chapter_id != command.chapter_id
+                or binding.expected_narrative_revision
+                != snapshot.narrative_revision
+            ):
+                raise ValueError("状态 mutation 的 Job 授权绑定无效")
             provider_alias = self._deps.resolve_provider(
                 STATE_WORKFLOW,
                 STATE_STEP,
@@ -821,6 +834,15 @@ class ChapterGenerationApplicationService:
                     **(
                         {"request_id": command.request_id}
                         if command.request_id
+                        else {}
+                    ),
+                    **(
+                        {
+                            "job_mutation_binding": binding.model_dump(
+                                mode="json"
+                            )
+                        }
+                        if binding is not None
                         else {}
                     ),
                 },

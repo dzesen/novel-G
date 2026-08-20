@@ -27,7 +27,13 @@ from backend.services.novel.emergent_reference_card_candidates import (
 )
 from backend.services.novel.volume_service import VolumeService
 from backend.services.generation.prose_runs import ProseRunModule
-from backend.services.generation.chapter_finalization import ChapterFinalizationService
+from backend.services.generation.chapter_finalization import (
+    ChapterFinalizationService,
+    parse_chapter_finalization_authorization,
+)
+from backend.services.generation.candidate_repair_contracts import (
+    JobMutationRecoveryBindingV1,
+)
 from backend.services.interop.card_import_proposal_service import (
     CardImportProposalService,
 )
@@ -174,10 +180,7 @@ async def recover_pending_mutations(novel_id: str | None = None) -> dict[str, li
 
 
 async def recover_bound_mutation_revision(
-    novel_id: str,
-    idempotency_key: str,
-    *,
-    operation: str,
+    binding: JobMutationRecoveryBindingV1,
 ) -> int | None:
     """Recover one exact Job-owned mutation and return its frozen revision receipt.
 
@@ -186,11 +189,15 @@ async def recover_bound_mutation_revision(
     expired proposal token or today's repository state.
     """
 
-    normalized_novel_id = str(novel_id or "").strip()
-    normalized_key = str(idempotency_key or "").strip()
-    normalized_operation = str(operation or "").strip()
-    if not normalized_novel_id or not normalized_key or not normalized_operation:
-        raise ValueError("mutation recovery identity is required")
+    try:
+        frozen = JobMutationRecoveryBindingV1.model_validate(
+            binding.model_dump(mode="python")
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise MutationConflictError("The Job mutation recovery binding is invalid") from exc
+    normalized_novel_id = frozen.novel_id
+    normalized_key = frozen.idempotency_key
+    normalized_operation = frozen.operation
     collection = get_database()[collections.MUTATION_JOURNALS]
     query = {
         "novel_id": to_object_id(normalized_novel_id),
@@ -213,8 +220,93 @@ async def recover_bound_mutation_revision(
         or command.idempotency_key != normalized_key
         or command.operation != normalized_operation
         or type(command.expected_narrative_revision) is not int
+        or command.expected_narrative_revision
+        != frozen.expected_narrative_revision
     ):
         raise MutationConflictError("The persisted mutation identity diverged")
+    payload = command.payload
+    if (
+        not isinstance(payload, dict)
+        or str(payload.get("chapter_id") or "") != frozen.chapter_id
+    ):
+        raise MutationConflictError("The persisted mutation chapter diverged")
+    if normalized_operation == "accept_chapter_outline":
+        expected_key = (
+            f"candidate-job-outline:{frozen.job_id}:{frozen.chapter_id}"
+        )
+        if normalized_key != expected_key:
+            raise MutationConflictError(
+                "The persisted outline mutation is not bound to this Job"
+            )
+    elif normalized_operation == "accept_chapter_state":
+        proposal_claim = payload.get("proposal_claim")
+        raw_binding = (
+            proposal_claim.get("job_mutation_binding")
+            if isinstance(proposal_claim, dict)
+            else None
+        )
+        try:
+            stored_binding = JobMutationRecoveryBindingV1.model_validate(
+                raw_binding
+            )
+        except (TypeError, ValueError) as exc:
+            raise MutationConflictError(
+                "The persisted state mutation Job binding is invalid"
+            ) from exc
+        if stored_binding != frozen:
+            raise MutationConflictError(
+                "The persisted state mutation belongs to another Job"
+            )
+    elif normalized_operation == "finalize_chapter_generation":
+        raw_authorization = payload.get("authorization")
+        if not isinstance(raw_authorization, dict) or set(
+            raw_authorization
+        ) != {
+            "job_id",
+            "readiness_digest",
+            "authorization_revision",
+            "snapshot",
+        }:
+            raise MutationConflictError(
+                "The persisted finalization authorization is invalid"
+            )
+        try:
+            snapshot = parse_chapter_finalization_authorization(
+                raw_authorization.get("snapshot")
+            )
+        except ValueError as exc:
+            raise MutationConflictError(
+                "The persisted finalization authorization is invalid"
+            ) from exc
+        authorization_revision = raw_authorization.get(
+            "authorization_revision"
+        )
+        if (
+            not isinstance(raw_authorization.get("job_id"), str)
+            or not isinstance(raw_authorization.get("readiness_digest"), str)
+            or type(authorization_revision) is not int
+            or authorization_revision
+            != snapshot["authorization_revision"]
+        ):
+            raise MutationConflictError(
+                "The persisted finalization authorization is invalid"
+            )
+        supplied = {
+            "job_id": raw_authorization.get("job_id"),
+            "readiness_digest": raw_authorization.get("readiness_digest"),
+            "authorization_revision": raw_authorization.get(
+                "authorization_revision"
+            ),
+        }
+        expected = {
+            "job_id": frozen.job_id,
+            "readiness_digest": frozen.readiness_digest,
+            "authorization_revision": frozen.authorization_revision,
+        }
+        if supplied != expected:
+            raise MutationConflictError(
+                "The persisted finalization belongs to another Job authorization"
+            )
     stored_digest = journal.get("command_digest")
     if stored_digest is not None and (
         not isinstance(stored_digest, str)

@@ -27,6 +27,9 @@ from backend.services.generation.outline_adherence import (
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
+from backend.services.generation.candidate_repair_contracts import (
+    JobMutationReceiptV1,
+)
 
 
 @dataclass
@@ -51,6 +54,7 @@ class ChapterOutcome:
     prose_completion: Dict[str, Any] = field(default_factory=dict)
     authorization_recalculation: Dict[str, Any] = field(default_factory=dict)
     requires_authorization_confirmation: bool = False
+    mutation_receipts: List[JobMutationReceiptV1] = field(default_factory=list)
 
 
 class ChapterPipelineFailed(RuntimeError):

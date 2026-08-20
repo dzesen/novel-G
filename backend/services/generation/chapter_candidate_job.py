@@ -18,6 +18,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpointV1,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
+    JobMutationRecoveryBindingV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
     parse_candidate_pipeline_checkpoint,
@@ -51,6 +52,7 @@ from backend.services.generation.chapter_generation_application import (
 from backend.services.generation.headless_generation import GeneratedProseCandidate
 from backend.services.generation.chapter_finalization import (
     chapter_finalization_idempotency_key,
+    parse_chapter_finalization_authorization,
 )
 from backend.services.generation.job_engine import CandidateChapterOutcome
 
@@ -151,6 +153,8 @@ class CandidateJobScope:
     has_outline: bool
     scene_count: int
     expected_narrative_revision: int
+    readiness_digest: str
+    finalization_authorization_revision: int
 
     @classmethod
     def from_readiness(
@@ -208,6 +212,22 @@ class CandidateJobScope:
             raise ChapterCandidatePipelineBlocked(
                 "候选作业 narrative revision 无效"
             )
+        readiness_digest = readiness.get("digest")
+        planning = readiness.get("planning")
+        try:
+            finalization_authorization = (
+                parse_chapter_finalization_authorization(
+                    planning.get("chapter_finalization_authorization")
+                    if isinstance(planning, Mapping)
+                    else None
+                )
+            )
+        except ValueError as exc:
+            raise ChapterCandidatePipelineBlocked(
+                "候选作业正式提交授权无效"
+            ) from exc
+        if not isinstance(readiness_digest, str) or not readiness_digest:
+            raise ChapterCandidatePipelineBlocked("候选作业 readiness 摘要无效")
         work = readiness.get("work")
         raw_chapters = work.get("chapters") if isinstance(work, Mapping) else None
         if not isinstance(raw_chapters, list):
@@ -248,6 +268,29 @@ class CandidateJobScope:
             has_outline=has_outline,
             scene_count=scene_count,
             expected_narrative_revision=expected_narrative_revision,
+            readiness_digest=readiness_digest,
+            finalization_authorization_revision=int(
+                finalization_authorization["authorization_revision"]
+            ),
+        )
+
+    def mutation_binding(
+        self,
+        *,
+        operation: str,
+        idempotency_key: str,
+        expected_narrative_revision: int,
+    ) -> JobMutationRecoveryBindingV1:
+        return JobMutationRecoveryBindingV1(
+            schema_version="job_mutation_recovery_binding.v1",
+            novel_id=self.novel_id,
+            job_id=self.execution_id,
+            chapter_id=self.chapter_id,
+            readiness_digest=self.readiness_digest,
+            authorization_revision=self.finalization_authorization_revision,
+            expected_narrative_revision=expected_narrative_revision,
+            operation=operation,
+            idempotency_key=idempotency_key,
         )
 
     def validate_documents(
@@ -464,11 +507,15 @@ class ChapterCandidateJobRunner:
         scope: CandidateJobScope,
         key: str,
         operation: str,
+        *,
+        expected_revision: int,
     ) -> int | None:
         return await self._deps.recover_mutation_revision(
-            scope.novel_id,
-            key,
-            operation=operation,
+            scope.mutation_binding(
+                operation=operation,
+                idempotency_key=key,
+                expected_narrative_revision=expected_revision,
+            )
         )
 
     async def _advance_revision_cursor(
@@ -768,6 +815,7 @@ class ChapterCandidateJobRunner:
                     scope,
                     finalization_key,
                     "finalize_chapter_generation",
+                    expected_revision=expected_revision,
                 )
                 if finalization_revision is not None:
                     if finalization_revision != expected_revision + 1:
@@ -842,6 +890,7 @@ class ChapterCandidateJobRunner:
                 scope,
                 outline_key,
                 "accept_chapter_outline",
+                expected_revision=expected_revision,
             )
             if outline_revision is None:
                 await self._ensure_narrative_revision(scope, expected_revision)
@@ -881,6 +930,7 @@ class ChapterCandidateJobRunner:
                     scope,
                     outline_key,
                     "accept_chapter_outline",
+                    expected_revision=expected_revision,
                 )
                 if outline_revision is None:
                     raise ChapterCandidatePipelineBlocked(
@@ -1091,6 +1141,7 @@ class ChapterCandidateJobRunner:
             scope,
             finalization_key,
             "finalize_chapter_generation",
+            expected_revision=expected_revision,
         )
         if finalization_revision != expected_revision + 1:
             raise ChapterCandidatePipelineBlocked(

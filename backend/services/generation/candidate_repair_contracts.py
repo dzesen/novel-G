@@ -81,6 +81,49 @@ class PreDispatchFenceV1(BaseModel):
         return f"candidate-state-repair:{self.cycle}"
 
 
+class JobMutationRecoveryBindingV1(BaseModel):
+    """Closed Job authority carried into one recoverable formal mutation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["job_mutation_recovery_binding.v1"] = (
+        "job_mutation_recovery_binding.v1"
+    )
+    novel_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    job_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    chapter_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    readiness_digest: str = Field(min_length=1, max_length=128)
+    authorization_revision: int = Field(ge=1, le=MAX_BSON_INT64)
+    expected_narrative_revision: int = Field(ge=0, le=MAX_BSON_INT64 - 1)
+    operation: Literal[
+        "accept_chapter_outline",
+        "accept_chapter_state",
+        "finalize_chapter_generation",
+    ]
+    idempotency_key: str = Field(min_length=1, max_length=240)
+
+
+class JobMutationReceiptV1(BaseModel):
+    """Exact revision receipt used by the Job cursor's atomic rollover."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["job_mutation_receipt.v1"] = (
+        "job_mutation_receipt.v1"
+    )
+    binding: JobMutationRecoveryBindingV1
+    next_narrative_revision: int = Field(ge=1, le=MAX_BSON_INT64)
+
+    @model_validator(mode="after")
+    def validate_revision_transition(self) -> "JobMutationReceiptV1":
+        if (
+            self.next_narrative_revision
+            != self.binding.expected_narrative_revision + 1
+        ):
+            raise ValueError("Job mutation receipt revision is invalid")
+        return self
+
+
 class StateContextProjection(BaseModel):
     """Metadata-only context truncation evidence persisted before dispatch."""
 

@@ -55,6 +55,9 @@ from backend.services.generation.chapter_capability_registry import (
 from backend.services.llm.capability_registry import CapabilityCall
 from backend.api.llm_routers.prose_router import PROSE_STEP, PROSE_WORKFLOW
 from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
+from backend.services.generation.candidate_repair_contracts import (
+    JobMutationRecoveryBindingV1,
+)
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
@@ -526,6 +529,8 @@ async def generate_state(
     chapter: Dict[str, Any],
     attempt_scope: AttemptScope | None = None,
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
 ) -> tuple[dict, dict, int, dict, list[dict[str, Any]], dict[str, Any]]:
     execution = await _chapter_capability_registry().execute(
         "chapter_state",
@@ -535,6 +540,7 @@ async def generate_state(
             authority=AcceptanceAuthority.SYSTEM,
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
+            job_mutation_binding=job_mutation_binding,
         ),
         call=CapabilityCall(source="job_engine"),
     )
@@ -690,9 +696,29 @@ def build_chapter_pipeline_deps(
     recalculate_prose_authorization: (
         Callable[[str, dict[str, Any]], Any] | None
     ) = None,
+    state_job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
 ) -> ChapterPipelineDeps:
     def scope(step: str) -> AttemptScope | None:
         return attempt_scope_factory(step) if attempt_scope_factory is not None else None
+
+    async def generate_state_step(
+        novel_id: str,
+        chapter: Dict[str, Any],
+    ):
+        if state_job_mutation_binding is None:
+            return await generate_state(
+                novel_id,
+                chapter,
+                scope("state"),
+                generation_params,
+            )
+        return await generate_state(
+            novel_id,
+            chapter,
+            scope("state"),
+            generation_params,
+            job_mutation_binding=state_job_mutation_binding,
+        )
 
     return ChapterPipelineDeps(
         generate_outline=lambda novel_id, chapter: generate_outline(
@@ -713,12 +739,7 @@ def build_chapter_pipeline_deps(
             scope("outline_adherence"),
             generation_params,
         ),
-        generate_state=lambda novel_id, chapter: generate_state(
-            novel_id,
-            chapter,
-            scope("state"),
-            generation_params,
-        ),
+        generate_state=generate_state_step,
         accept_outline=_outline_already_accepted,
         write_prose=_prose_already_accepted,
         accept_state=_state_already_accepted,

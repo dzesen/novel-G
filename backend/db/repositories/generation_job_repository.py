@@ -24,6 +24,8 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidatePipelineCompletionV1,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
+    JobMutationRecoveryBindingV1,
+    JobMutationReceiptV1,
     PreDispatchFenceV1,
     candidate_pipeline_checkpoint_digest,
     candidate_pipeline_checkpoint_ledger_digest,
@@ -40,6 +42,7 @@ MAX_ACTIVE_TOKEN_RESERVATIONS = 32
 _ATOMIC_JOB_FIELDS = frozenset({
     "candidate_pipeline_checkpoints",
     "expected_narrative_revision",
+    "job_mutation_recovery",
     "progress",
 })
 _MAX_NARRATIVE_REVISION = 2**63 - 1
@@ -82,12 +85,17 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         raise ValueError("Generation job progress ledger is invalid")
     if any(
         isinstance(item, Mapping)
-        and "candidate_pipeline_completion" in item
+        and (
+            "candidate_pipeline_completion" in item
+            or "job_mutation_receipt" in item
+        )
         for item in progress
     ):
         raise ValueError(
             "Candidate completion receipts require an atomic repository command"
         )
+    if document.get("job_mutation_recovery") is not None:
+        raise ValueError("Job mutation recovery binding must start empty")
     revision = document.get("expected_narrative_revision")
     if revision is not None and (
         type(revision) is not int
@@ -616,6 +624,175 @@ class GenerationJobRepository(BaseRepository):
             "Generation job narrative revision cursor changed"
         )
 
+    async def bind_job_mutation_recovery(
+        self,
+        job_id: str,
+        binding: JobMutationRecoveryBindingV1,
+    ) -> bool:
+        """Persist one exact state-only mutation identity before Provider work."""
+
+        try:
+            frozen = JobMutationRecoveryBindingV1.model_validate(
+                binding.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation recovery binding is invalid"
+            ) from exc
+        if frozen.job_id != str(job_id):
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation recovery binding belongs to another Job"
+            )
+        canonical = frozen.model_dump(mode="json")
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": frozen.chapter_id,
+                "expected_narrative_revision": (
+                    frozen.expected_narrative_revision
+                ),
+                "$or": [
+                    {"job_mutation_recovery": {"$exists": False}},
+                    {"job_mutation_recovery": None},
+                    {"job_mutation_recovery": canonical},
+                ],
+            },
+            {
+                "$set": {
+                    "job_mutation_recovery": canonical,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.matched_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Job mutation recovery binding changed"
+        )
+
+    async def complete_job_mutation_chapter(
+        self,
+        job_id: str,
+        *,
+        receipt: JobMutationReceiptV1,
+        entry: Mapping[str, Any],
+        tokens_delta: int,
+    ) -> bool:
+        """Publish state-only progress and advance its exact receipt atomically."""
+
+        try:
+            frozen = JobMutationReceiptV1.model_validate(
+                receipt.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation receipt is invalid"
+            ) from exc
+        binding = frozen.binding
+        if binding.job_id != str(job_id):
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation receipt belongs to another Job"
+            )
+        if (
+            type(tokens_delta) is not int
+            or tokens_delta < 0
+            or tokens_delta > _MAX_NARRATIVE_REVISION
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation progress token delta is invalid"
+            )
+        progress = dict(entry)
+        canonical_receipt = frozen.model_dump(mode="json")
+        if progress.get("job_mutation_receipt") != canonical_receipt:
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation progress receipt diverged"
+            )
+        if str(progress.get("chapter_id") or "") != binding.chapter_id:
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation progress chapter diverged"
+            )
+        supplied_tokens_delta = progress.get("job_mutation_tokens_delta")
+        if supplied_tokens_delta is not None and (
+            type(supplied_tokens_delta) is not int
+            or supplied_tokens_delta != tokens_delta
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation progress token delta diverged"
+            )
+        progress["job_mutation_tokens_delta"] = tokens_delta
+        canonical_binding = binding.model_dump(mode="json")
+        result = await self.collection.update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": binding.chapter_id,
+                "expected_narrative_revision": (
+                    binding.expected_narrative_revision
+                ),
+                "job_mutation_recovery": canonical_binding,
+                "progress": {
+                    "$not": {
+                        "$elemMatch": {
+                            "job_mutation_receipt": canonical_receipt,
+                        }
+                    }
+                },
+                "$expr": {
+                    "$lt": [
+                        {"$size": {"$ifNull": ["$progress", []]}},
+                        MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
+                    ]
+                },
+            },
+            {
+                "$push": {"progress": progress},
+                "$inc": {"tokens_used": tokens_delta},
+                "$set": {
+                    "expected_narrative_revision": (
+                        frozen.next_narrative_revision
+                    ),
+                    "current_chapter_id": None,
+                    "updated_at": get_utc_now(),
+                },
+                "$unset": {"job_mutation_recovery": ""},
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        matching_progress = [
+            dict(item)
+            for item in current.get("progress") or []
+            if isinstance(item, Mapping)
+            and item.get("job_mutation_receipt") == canonical_receipt
+        ]
+        if matching_progress:
+            def replay_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+                projected = dict(value)
+                # completed_at is display metadata, not part of the stable
+                # mutation/result identity.
+                projected.pop("completed_at", None)
+                return projected
+
+            if (
+                len(matching_progress) == 1
+                and current.get("expected_narrative_revision")
+                == frozen.next_narrative_revision
+                and current.get("job_mutation_recovery") is None
+                and replay_projection(matching_progress[0])
+                == replay_projection(progress)
+            ):
+                return True
+            raise CandidatePipelineCheckpointConflict(
+                "Job mutation completion replay diverged"
+            )
+        raise CandidatePipelineCheckpointConflict(
+            "Job mutation completion lost its revision fence"
+        )
+
     async def update_job_authorization(
         self,
         job_id: str,
@@ -623,6 +800,10 @@ class GenerationJobRepository(BaseRepository):
         *,
         previous_revision: int | None,
         next_revision: int,
+        previous_status: str,
+        previous_authorization_revision: int | None,
+        previous_readiness_digest: str | None,
+        previous_active_slot: str | None,
     ) -> bool:
         """Rebind readiness and its revision cursor in one fenced update."""
 
@@ -632,17 +813,44 @@ class GenerationJobRepository(BaseRepository):
             or type(next_revision) is not int
             or next_revision < 0
             or next_revision > _MAX_NARRATIVE_REVISION
+            or previous_status not in {"paused", "interrupted", "failed"}
+            or (
+                previous_authorization_revision is not None
+                and type(previous_authorization_revision) is not int
+            )
+            or (
+                previous_readiness_digest is not None
+                and not isinstance(previous_readiness_digest, str)
+            )
+            or (
+                previous_active_slot is not None
+                and not isinstance(previous_active_slot, str)
+            )
         ):
             raise ValueError("Generation job reauthorization revision is invalid")
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
             "is_deleted": False,
+            "status": previous_status,
+            "active_slot": previous_active_slot,
             "candidate_pipeline_checkpoints": [],
+            "$or": [
+                {"job_mutation_recovery": {"$exists": False}},
+                {"job_mutation_recovery": None},
+            ],
         }
         if previous_revision is None:
             query["expected_narrative_revision"] = {"$exists": False}
         else:
             query["expected_narrative_revision"] = previous_revision
+        if previous_authorization_revision is None:
+            query["authorization_revision"] = {"$exists": False}
+        else:
+            query["authorization_revision"] = previous_authorization_revision
+        if previous_readiness_digest is None:
+            query["readiness.digest"] = {"$exists": False}
+        else:
+            query["readiness.digest"] = previous_readiness_digest
         result = await self.collection.update_one(
             query,
             {
@@ -928,9 +1136,12 @@ class GenerationJobRepository(BaseRepository):
 
     async def append_progress(self, job_id: str, entry: Dict[str, Any], tokens_delta: int) -> bool:
         # $push progress + $inc tokens_used 在一次原子 update 内完成。
-        if "candidate_pipeline_completion" in entry:
+        if (
+            "candidate_pipeline_completion" in entry
+            or "job_mutation_receipt" in entry
+        ):
             raise ValueError(
-                "Candidate pipeline completion requires an atomic repository command"
+                "Mutation completion requires an atomic repository command"
             )
         result = await self.collection.update_one(
             {

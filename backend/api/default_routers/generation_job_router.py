@@ -347,7 +347,10 @@ async def mark_running_jobs_interrupted() -> int:
     for job in running:
         job_id = str(job["_id"])
         checkpoints = job.get("candidate_pipeline_checkpoints")
-        preserve_candidate_chapter = bool(checkpoints)
+        preserve_candidate_chapter = bool(checkpoints) or isinstance(
+            job.get("job_mutation_recovery"),
+            dict,
+        )
         uncertain = await generation_job_repo.mark_claimed_attempts_uncertain(
             job_id, "backend process interrupted before usage was recorded"
         )

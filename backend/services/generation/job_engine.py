@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -93,6 +94,12 @@ def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
     # its default empty object as if it were a completed review.
     if outcome.outline_adherence:
         progress["outline_adherence"] = outcome.outline_adherence
+    if outcome.mutation_receipts:
+        if len(outcome.mutation_receipts) != 1:
+            raise ValueError("Legacy chapter has an invalid mutation receipt count")
+        progress["job_mutation_receipt"] = outcome.mutation_receipts[0].model_dump(
+            mode="json"
+        )
     return progress
 
 
@@ -261,6 +268,11 @@ async def _handle_chapter_failure(
         occurred_at=get_utc_now(),
     )
     await _persist_diagnostic(repo, job_id, diagnostic)
+    latest_job = await repo.get_job(job_id)
+    preserve_job_mutation = isinstance(
+        latest_job.get("job_mutation_recovery"),
+        Mapping,
+    )
 
     pause_reason = {
         "token_budget_exceeded_before_dispatch": "cost_cap",
@@ -286,7 +298,7 @@ async def _handle_chapter_failure(
         await repo.update_job_fields(job_id, {
             "status": "paused",
             "pause_reason": pause_reason,
-            "current_chapter_id": None,
+            "current_chapter_id": chapter_id if preserve_job_mutation else None,
             "active_slot": None,
             "error": {
                 "step": step,
@@ -301,7 +313,7 @@ async def _handle_chapter_failure(
         await repo.update_job_fields(job_id, {
             "status": "paused",
             "pause_reason": "source_changed",
-            "current_chapter_id": None,
+            "current_chapter_id": chapter_id if preserve_job_mutation else None,
             "active_slot": None,
             "error": {
                 "step": step,
@@ -312,12 +324,11 @@ async def _handle_chapter_failure(
         })
         return
 
-    latest_job = await repo.get_job(job_id)
     has_uncertain = bool(latest_job.get("has_uncertain_attempts"))
     await repo.update_job_fields(job_id, {
         "status": "interrupted" if has_uncertain else "failed",
         "pause_reason": "uncertain_attempt" if has_uncertain else None,
-        "current_chapter_id": None,
+        "current_chapter_id": chapter_id if preserve_job_mutation else None,
         "active_slot": None,
         "error": {
             "step": step,
@@ -442,6 +453,33 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 })
                 return
             candidate_recovery = bool(raw_candidate_checkpoints)
+            raw_job_mutation_recovery = job.get("job_mutation_recovery")
+            if raw_job_mutation_recovery is not None and not isinstance(
+                raw_job_mutation_recovery,
+                Mapping,
+            ):
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "job_mutation_recovery",
+                        "message": "Job mutation recovery binding is invalid",
+                    },
+                })
+                return
+            job_mutation_recovery = raw_job_mutation_recovery is not None
+            if candidate_recovery and job_mutation_recovery:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "job_mutation_recovery",
+                        "message": "Job has conflicting recovery checkpoints",
+                    },
+                })
+                return
             if candidate_recovery and not candidate_authorized:
                 await repo.update_job_fields(job_id, {
                     "status": "failed",
@@ -452,6 +490,17 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                         "message": (
                             "Candidate checkpoints have no bound authorization"
                         ),
+                    },
+                })
+                return
+            if job_mutation_recovery and not candidate_authorized:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "job_mutation_recovery",
+                        "message": "Job mutation has no bound candidate authorization",
                     },
                 })
                 return
@@ -470,7 +519,7 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             chapters = await deps.list_worklist_chapters()
-            if candidate_recovery:
+            if candidate_recovery or job_mutation_recovery:
                 current_chapter_id = str(
                     job.get("current_chapter_id") or ""
                 )
@@ -539,6 +588,10 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 if candidate_recovery and not candidate_execution:
                     raise ValueError(
                         "Candidate checkpoints do not match the frozen chapter mode"
+                    )
+                if job_mutation_recovery and candidate_execution:
+                    raise ValueError(
+                        "State-only mutation recovery entered candidate generation"
                     )
             except ValueError as exc:
                 await repo.update_job_fields(job_id, {
@@ -712,11 +765,20 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 continue
 
             await _persist_attempts(repo, job_id, outcome.attempts)
-            await repo.append_progress(
-                job_id,
-                outcome_to_progress(outcome),
-                tokens_delta=0 if outcome.attempts else outcome.tokens,
-            )
+            progress = outcome_to_progress(outcome)
+            if outcome.mutation_receipts:
+                await repo.complete_job_mutation_chapter(
+                    job_id,
+                    receipt=outcome.mutation_receipts[0],
+                    entry=progress,
+                    tokens_delta=0 if outcome.attempts else outcome.tokens,
+                )
+            else:
+                await repo.append_progress(
+                    job_id,
+                    progress,
+                    tokens_delta=0 if outcome.attempts else outcome.tokens,
+                )
 
             if outcome.requires_authorization_confirmation:
                 await repo.update_job_fields(job_id, {

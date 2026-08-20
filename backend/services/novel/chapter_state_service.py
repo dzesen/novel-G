@@ -27,6 +27,9 @@ from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.transaction import run_mongo_write_unit
 from backend.db.mutation import MutationCommand, commit_mutation
 from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema
+from backend.services.generation.candidate_repair_contracts import (
+    JobMutationRecoveryBindingV1,
+)
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.state_validation import validate_state_ids
 from backend.services.novel.state_completion import (
@@ -356,6 +359,42 @@ class ChapterStateService:
             if proposal_claim
             else f"accept-state:{chapter_id}:{digest}"
         )
+        expected_narrative_revision: int | None = None
+        raw_job_binding = (
+            proposal_claim.get("job_mutation_binding")
+            if proposal_claim
+            else None
+        )
+        if proposal_claim and proposal_claim.get("claim_id") is not None and (
+            raw_job_binding is None
+        ):
+            raise ValueError("State mutation claim id requires a Job binding")
+        if raw_job_binding is not None:
+            try:
+                job_binding = JobMutationRecoveryBindingV1.model_validate(
+                    raw_job_binding
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "State mutation Job binding is invalid"
+                ) from exc
+            if (
+                job_binding.operation != "accept_chapter_state"
+                or job_binding.novel_id != novel_id
+                or job_binding.chapter_id != chapter_id
+                or proposal_claim.get("claim_id")
+                != job_binding.idempotency_key
+                or type(
+                    proposal_claim.get("expected_narrative_revision")
+                ) is not int
+                or proposal_claim["expected_narrative_revision"]
+                != job_binding.expected_narrative_revision
+            ):
+                raise ValueError("State mutation Job binding diverged")
+            idempotency_key = job_binding.idempotency_key
+            expected_narrative_revision = (
+                job_binding.expected_narrative_revision
+            )
         return MutationCommand(
             novel_id=novel_id,
             idempotency_key=idempotency_key,
@@ -370,6 +409,7 @@ class ChapterStateService:
             },
             before_image={"chapter_summary": chapter.get("summary", "")},
             child_ids=child_ids,
+            expected_narrative_revision=expected_narrative_revision,
         )
 
     @staticmethod

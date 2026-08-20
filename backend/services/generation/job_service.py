@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any, Dict, List, Mapping, Optional
 
 from pymongo.errors import DuplicateKeyError
@@ -13,7 +14,11 @@ from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
-from backend.services.generation.chapter_pipeline import ChapterPipelineFailed, run_chapter
+from backend.services.generation.chapter_pipeline import (
+    ChapterOutcome,
+    ChapterPipelineFailed,
+    run_chapter,
+)
 from backend.services.generation.chapter_candidate_authorization import (
     authorized_candidate_repair_attempt_slots,
     generation_plan_from_candidate_snapshot,
@@ -25,6 +30,10 @@ from backend.services.generation.chapter_candidate_job import (
     CandidateJobExecution,
     ChapterCandidateJobRunner,
     ChapterCandidateJobRunnerDeps,
+)
+from backend.services.generation.candidate_repair_contracts import (
+    JobMutationRecoveryBindingV1,
+    JobMutationReceiptV1,
 )
 from backend.services.generation.chapter_candidate_repairs import (
     ChapterCandidateRepairApplication,
@@ -88,20 +97,150 @@ class ConflictError(Exception):
 
 
 async def _recover_job_mutation_revision(
-    novel_id: str,
-    idempotency_key: str,
-    *,
-    operation: str,
+    binding: JobMutationRecoveryBindingV1,
 ) -> int | None:
     # Lazy import keeps the recovery registry from forming a service import cycle.
     from backend.services.novel.mutation_recovery import (
         recover_bound_mutation_revision,
     )
 
-    return await recover_bound_mutation_revision(
-        novel_id,
-        idempotency_key,
-        operation=operation,
+    return await recover_bound_mutation_revision(binding)
+
+
+def _state_only_job_mutation_binding(
+    *,
+    job_id: str,
+    job: Mapping[str, Any],
+    chapter_id: str,
+    expected_revision: int,
+) -> JobMutationRecoveryBindingV1:
+    readiness = job.get("readiness")
+    if not isinstance(readiness, Mapping):
+        raise ValueError("state-only Job readiness is invalid")
+    planning = readiness.get("planning")
+    finalization = parse_chapter_finalization_authorization(
+        planning.get("chapter_finalization_authorization")
+        if isinstance(planning, Mapping)
+        else None
+    )
+    novel_id = str(job.get("novel_id") or "")
+    digest = readiness.get("digest")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError("state-only Job readiness digest is invalid")
+    return JobMutationRecoveryBindingV1(
+        schema_version="job_mutation_recovery_binding.v1",
+        novel_id=novel_id,
+        job_id=str(job_id),
+        chapter_id=str(chapter_id),
+        readiness_digest=digest,
+        authorization_revision=int(finalization["authorization_revision"]),
+        expected_narrative_revision=expected_revision,
+        operation="accept_chapter_state",
+        idempotency_key=f"candidate-job-state:{job_id}:{chapter_id}",
+    )
+
+
+def _recovered_state_only_outcome(
+    chapter: Mapping[str, Any],
+    receipt: JobMutationReceiptV1,
+    attempts: List[Mapping[str, Any]],
+) -> ChapterOutcome:
+    if len(attempts) > 2_040:
+        raise StaleStatePreview(
+            "Generation job state attempt ledger exceeds its frozen bound"
+        )
+    projected_attempts: list[dict[str, Any]] = []
+    seen_attempt_ids: set[str] = set()
+    tokens = 0
+    for raw in attempts:
+        if not isinstance(raw, Mapping):
+            raise StaleStatePreview(
+                "Generation job state attempt ledger is invalid"
+            )
+        attempt_id = raw.get("attempt_id")
+        provider_alias = raw.get("provider_alias")
+        phase = raw.get("phase")
+        state = raw.get("state")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or len(attempt_id) > 128
+            or attempt_id in seen_attempt_ids
+            or not isinstance(provider_alias, str)
+            or not provider_alias
+            or len(provider_alias) > 64
+            or not isinstance(phase, str)
+            or not phase
+            or len(phase) > 64
+            or state not in {
+                "accounted",
+                "released_pre_dispatch",
+                "uncertain_retry_acknowledged",
+                "uncertain_skip_acknowledged",
+            }
+        ):
+            raise StaleStatePreview(
+                "Generation job state attempt identity is invalid"
+            )
+        seen_attempt_ids.add(attempt_id)
+        usage = raw.get("usage")
+        if usage is None and state != "accounted":
+            usage = {}
+        if not isinstance(usage, Mapping):
+            raise StaleStatePreview(
+                "Generation job state attempt usage is invalid"
+            )
+        components = (
+            usage.get("input_tokens", 0),
+            usage.get("output_tokens", 0),
+            usage.get("total_tokens", 0),
+        )
+        if any(
+            type(value) is not int
+            or value < 0
+            or value > 1_000_000_000
+            for value in components
+        ):
+            raise StaleStatePreview(
+                "Generation job state attempt usage is invalid"
+            )
+        input_tokens, output_tokens, declared_total = components
+        if (
+            state == "released_pre_dispatch"
+            and any(components)
+        ):
+            raise StaleStatePreview(
+                "Generation job released attempt has paid usage"
+            )
+        total_tokens = max(
+            declared_total,
+            input_tokens + output_tokens,
+        )
+        if total_tokens > 1_000_000_000 or tokens + total_tokens > 2**63 - 1:
+            raise StaleStatePreview(
+                "Generation job state attempt usage exceeds its bound"
+            )
+        tokens += total_tokens
+        projected_attempts.append({
+            "attempt_id": attempt_id,
+            "provider_alias": provider_alias,
+            "phase": phase,
+            "state": state,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+            },
+        })
+    return ChapterOutcome(
+        chapter_id=str(chapter.get("_id") or ""),
+        order_index=int(chapter.get("order_index") or 0),
+        steps_done=["state"],
+        steps_skipped=["outline", "prose", "outline_adherence"],
+        tokens=tokens,
+        attempts=projected_attempts,
+        summary_written=True,
+        mutation_receipts=[receipt],
     )
 
 
@@ -451,6 +590,70 @@ class GenerationJobService:
             generation_params = dict(
                 current_job.get("generation_params") or {}
             )
+            cursor = current_job.get("expected_narrative_revision")
+            state_binding: JobMutationRecoveryBindingV1 | None = None
+            recovered_receipt: JobMutationReceiptV1 | None = None
+            if cursor is not None:
+                if type(cursor) is not int or cursor < 0:
+                    raise ValueError(
+                        "Generation job narrative revision cursor is invalid"
+                    )
+                if readiness_uses_candidate_pipeline(current_job.get("readiness")):
+                    state_binding = _state_only_job_mutation_binding(
+                        job_id=job_id,
+                        job=current_job,
+                        chapter_id=chapter_id,
+                        expected_revision=cursor,
+                    )
+                    raw_binding = current_job.get("job_mutation_recovery")
+                    if raw_binding is not None:
+                        stored_binding = JobMutationRecoveryBindingV1.model_validate(
+                            raw_binding
+                        )
+                        if stored_binding != state_binding:
+                            raise StaleStatePreview(
+                                "Generation job state mutation binding changed"
+                            )
+                        await generation_job_repo.bind_job_mutation_recovery(
+                            job_id,
+                            state_binding,
+                        )
+                        recovered_revision = await _recover_job_mutation_revision(
+                            state_binding
+                        )
+                        if recovered_revision is not None:
+                            recovered_receipt = JobMutationReceiptV1(
+                                schema_version="job_mutation_receipt.v1",
+                                binding=state_binding,
+                                next_narrative_revision=recovered_revision,
+                            )
+                current_revision = await narrative_revision_store.current(novel_id)
+                expected_live_revision = (
+                    recovered_receipt.next_narrative_revision
+                    if recovered_receipt is not None
+                    else cursor
+                )
+                if current_revision != expected_live_revision:
+                    raise StaleStatePreview(
+                        "Generation job narrative revision changed before chapter execution"
+                    )
+            if recovered_receipt is not None:
+                attempts = await generation_job_repo.list_attempt_slots(
+                    job_id,
+                    chapter_id=chapter_id,
+                    step_prefix="",
+                )
+                try:
+                    return _recovered_state_only_outcome(
+                        chapter,
+                        recovered_receipt,
+                        list(attempts),
+                    )
+                finally:
+                    await generation_job_repo.finish_attempt_reservation(
+                        job_id,
+                        chapter_id,
+                    )
             slots = _estimate_authorized_chapter_attempt_slots(
                 current_job,
                 chapter,
@@ -488,40 +691,57 @@ class GenerationJobService:
                         accepted_chapter_id,
                     )
                 ),
+                state_job_mutation_binding=state_binding,
             )
+            if state_binding is not None:
+                generate_state = deps.generate_state
 
-            cursor = current_job.get("expected_narrative_revision")
-            if cursor is not None:
-                if type(cursor) is not int or cursor < 0:
-                    raise ValueError("Generation job narrative revision cursor is invalid")
-                current_revision = await narrative_revision_store.current(novel_id)
-                if current_revision != cursor:
-                    raise StaleStatePreview(
-                        "Generation job narrative revision changed before chapter execution"
-                    )
-
-            async def advance_cursor(outcome) -> None:
-                nonlocal cursor
-                if cursor is None:
-                    return
-                mutation_steps = [
-                    step
-                    for step in outcome.steps_done
-                    if step in {"outline", "prose", "state"}
-                ]
-                next_revision = await narrative_revision_store.current(novel_id)
-                if next_revision != cursor + len(mutation_steps):
-                    raise StaleStatePreview(
-                        "Generation job narrative revision changed during chapter execution"
-                    )
-                for _step in mutation_steps:
-                    await generation_job_repo.advance_narrative_revision_cursor(
+                async def generate_bound_state(
+                    bound_novel_id: str,
+                    bound_chapter: dict[str, Any],
+                ):
+                    # The marker becomes durable only when the state step is
+                    # actually about to run.  An earlier adherence pause must
+                    # not leave a phantom mutation recovery checkpoint.
+                    await generation_job_repo.bind_job_mutation_recovery(
                         job_id,
-                        chapter_id=chapter_id,
-                        expected_revision=cursor,
-                        next_revision=cursor + 1,
+                        state_binding,
                     )
-                    cursor += 1
+                    return await generate_state(
+                        bound_novel_id,
+                        bound_chapter,
+                    )
+
+                deps = replace(deps, generate_state=generate_bound_state)
+
+            async def attach_state_receipt(
+                outcome: ChapterOutcome,
+            ) -> ChapterOutcome:
+                if state_binding is None:
+                    return outcome
+                revision = await _recover_job_mutation_revision(state_binding)
+                if revision is None:
+                    if "state" in outcome.steps_done:
+                        raise StaleStatePreview(
+                            "Generation job state mutation receipt is missing"
+                        )
+                    return outcome
+                if await narrative_revision_store.current(novel_id) != revision:
+                    raise StaleStatePreview(
+                        "Generation job state mutation revision diverged"
+                    )
+                outcome.mutation_receipts.append(JobMutationReceiptV1(
+                    schema_version="job_mutation_receipt.v1",
+                    binding=state_binding,
+                    next_narrative_revision=revision,
+                ))
+                if "state" not in outcome.steps_done:
+                    outcome.steps_done.append("state")
+                outcome.steps_skipped = [
+                    step for step in outcome.steps_skipped if step != "state"
+                ]
+                outcome.summary_written = True
+                return outcome
             try:
                 try:
                     outcome = await run_chapter(
@@ -531,10 +751,12 @@ class GenerationJobService:
                         outline_deviation_policy=outline_deviation_policy,
                     )
                 except ChapterPipelineFailed as exc:
-                    await advance_cursor(exc.outcome)
+                    if state_binding is not None:
+                        recovered = await attach_state_receipt(exc.outcome)
+                        if recovered.mutation_receipts:
+                            return recovered
                     raise
-                await advance_cursor(outcome)
-                return outcome
+                return await attach_state_receipt(outcome)
             finally:
                 await generation_job_repo.finish_attempt_reservation(job_id, chapter_id)
 
@@ -1316,11 +1538,44 @@ class GenerationJobService:
                     raise ValueError(
                         "Generation job narrative revision cursor is invalid"
                     )
+                previous_authorization_revision = job.get(
+                    "authorization_revision"
+                )
+                if (
+                    previous_authorization_revision is not None
+                    and type(previous_authorization_revision) is not int
+                ):
+                    raise ValueError(
+                        "Generation job authorization revision is invalid"
+                    )
+                previous_readiness = job.get("readiness")
+                previous_readiness_digest = (
+                    previous_readiness.get("digest")
+                    if isinstance(previous_readiness, Mapping)
+                    else None
+                )
+                if (
+                    previous_readiness_digest is not None
+                    and not isinstance(previous_readiness_digest, str)
+                ):
+                    raise ValueError("Generation job readiness digest is invalid")
+                previous_active_slot = job.get("active_slot")
+                if (
+                    previous_active_slot is not None
+                    and not isinstance(previous_active_slot, str)
+                ):
+                    raise ValueError("Generation job active slot is invalid")
                 await generation_job_repo.update_job_authorization(
                     job_id,
                     resume_fields,
                     previous_revision=previous_revision,
                     next_revision=reauthorized_revision,
+                    previous_status=str(job.get("status") or ""),
+                    previous_authorization_revision=(
+                        previous_authorization_revision
+                    ),
+                    previous_readiness_digest=previous_readiness_digest,
+                    previous_active_slot=previous_active_slot,
                 )
             else:
                 await generation_job_repo.update_job_fields(job_id, resume_fields)

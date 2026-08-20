@@ -31,6 +31,7 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation.candidate_repair_contracts import (
+    JobMutationRecoveryBindingV1,
     StateContextProjection,
 )
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
@@ -73,6 +74,38 @@ def _digest(value: Any) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _job_mutation_binding(
+    proposal: dict[str, Any],
+) -> JobMutationRecoveryBindingV1 | None:
+    audit = proposal.get("generation_audit")
+    raw = (
+        audit.get("job_mutation_binding")
+        if isinstance(audit, dict)
+        else None
+    )
+    if raw is None:
+        return None
+    try:
+        binding = JobMutationRecoveryBindingV1.model_validate(raw)
+    except (TypeError, ValueError) as exc:
+        raise MutationConflictError(
+            "State proposal Job mutation binding is invalid"
+        ) from exc
+    proposal_revision = proposal.get("narrative_revision")
+    if (
+        binding.operation != "accept_chapter_state"
+        or binding.novel_id != str(proposal.get("novel_id") or "")
+        or binding.chapter_id != str(proposal.get("chapter_id") or "")
+        or type(proposal_revision) is not int
+        or binding.expected_narrative_revision
+        != proposal_revision
+    ):
+        raise MutationConflictError(
+            "State proposal Job mutation binding diverged"
+        )
+    return binding
 
 
 def _proposal_key() -> bytes:
@@ -827,6 +860,7 @@ class StateProposalModule:
             if thread["selection_id"] in selected_thread_ids
         ]
         policy = {"name": policy_name, "version": policy_version}
+        job_binding = _job_mutation_binding(proposal)
         metadata = {
             "novel_id": novel_id,
             "manual_edits": allowed_edits,
@@ -859,6 +893,11 @@ class StateProposalModule:
             },
             "confidence": (
                 "human_reviewed" if policy_name == "human_review" else "auto_accepted"
+            ),
+            **(
+                {"job_mutation_binding": job_binding.model_dump(mode="json")}
+                if job_binding is not None
+                else {}
             ),
             "state_completion": {
                 "source_content_digest": (
@@ -896,6 +935,14 @@ class StateProposalModule:
                 proposal.get("narrative_revision", proposal.get("state_revision") or 0)
             ),
             "policy": policy,
+            **(
+                {
+                    "claim_id": job_binding.idempotency_key,
+                    "job_mutation_binding": job_binding.model_dump(mode="json"),
+                }
+                if job_binding is not None
+                else {}
+            ),
         }
         existing_claim = proposal.get("claim") or {}
         if proposal.get("status") in {"claimed", "applied"} and (
@@ -944,7 +991,11 @@ class StateProposalModule:
             journal = await get_database()[collections.MUTATION_JOURNALS].find_one(
                 {
                     "novel_id": proposal["novel_id"],
-                    "idempotency_key": f"accept-state-proposal:{proposal_id}",
+                    "idempotency_key": str(
+                        stored_claim.get("claim_id")
+                        or claim.get("claim_id")
+                        or f"accept-state-proposal:{proposal_id}"
+                    ),
                 }
             )
             if journal is None:
@@ -1033,7 +1084,9 @@ class StateProposalModule:
         proposal_id = to_object_id(str(claim["proposal_id"]))
         expected_revision = int(claim["expected_narrative_revision"])
         decision_digest = str(claim["decision_digest"])
-        claim_id = f"accept-state-proposal:{proposal_id}"
+        claim_id = str(
+            claim.get("claim_id") or f"accept-state-proposal:{proposal_id}"
+        )
         current = await self.collection.find_one({"_id": proposal_id}, session=session)
         if current is None:
             raise MutationConflictError("State proposal disappeared before acceptance")
