@@ -1,11 +1,13 @@
 """generation_jobs 仓储：批量作业记录的 CRUD 与进度追加。"""
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from typing import Any, Dict, List
 from uuid import uuid4
 
 from pymongo import ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
+from pymongo.results import BulkWriteResult
 
 from backend.db import collections
 from backend.db.base import BaseRepository
@@ -128,6 +130,27 @@ class GenerationJobRepository(BaseRepository):
             increments,
             include_deleted=include_deleted,
             session=session,
+        )
+
+    async def bulk_write(
+        self,
+        operations: Sequence[Any],
+        ordered: bool = True,
+        session: AsyncClientSession | None = None,
+    ) -> BulkWriteResult | None:
+        raise ValueError(
+            "Generation job bulk writes require an atomic repository command"
+        )
+
+    async def bulk_update_one_set(
+        self,
+        updates: Iterable[tuple[Dict[str, Any], Dict[str, Any]]],
+        include_deleted: bool = False,
+        ordered: bool = True,
+        session: AsyncClientSession | None = None,
+    ) -> int:
+        raise ValueError(
+            "Generation job bulk writes require an atomic repository command"
         )
 
     async def get_job(self, job_id: str) -> Dict[str, Any]:

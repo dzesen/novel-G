@@ -179,7 +179,7 @@ def parse_candidate_pipeline_checkpoint(
 ) -> CandidatePipelineCheckpointV1:
     """Revalidate even already-built models to reject forged model_copy values."""
 
-    _validate_checkpoint_list_bounds(value)
+    bounded_list_fields = _validate_checkpoint_list_bounds(value)
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="python")
     if not isinstance(value, Mapping):
@@ -208,16 +208,8 @@ def parse_candidate_pipeline_checkpoint(
             expected="candidate_completion_projection.v1",
         )
 
-    for field, limit in _CANDIDATE_CHECKPOINT_LIST_LIMITS.items():
+    for field in bounded_list_fields:
         stored = value.get(field)
-        if stored is None:
-            continue
-        if not isinstance(stored, (list, tuple)):
-            raise ValueError(f"candidate checkpoint {field} is not a list")
-        if len(stored) > limit:
-            raise ValueError(
-                f"candidate checkpoint {field} exceeds its bounded length"
-            )
         if field == "scene_coverage":
             for item in stored:
                 if not isinstance(item, Mapping):
@@ -234,9 +226,10 @@ def parse_candidate_pipeline_checkpoint(
     return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
 
 
-def _validate_checkpoint_list_bounds(value: Any) -> None:
+def _validate_checkpoint_list_bounds(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (BaseModel, Mapping)):
-        return
+        return ()
+    bounded_fields: list[str] = []
     for field, limit in _CANDIDATE_CHECKPOINT_LIST_LIMITS.items():
         stored = (
             getattr(value, field, None)
@@ -251,6 +244,8 @@ def _validate_checkpoint_list_bounds(value: Any) -> None:
             raise ValueError(
                 f"candidate checkpoint {field} exceeds its bounded length"
             )
+        bounded_fields.append(field)
+    return tuple(bounded_fields)
 
 
 def _require_contract_version(
