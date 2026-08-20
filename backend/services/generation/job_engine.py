@@ -17,10 +17,17 @@ from backend.db.repositories.generation_job_repository import (
     generation_job_repo,
 )
 from backend.services.generation import job_planner
+from backend.services.generation.candidate_repair_contracts import (
+    CandidatePipelineCheckpointV1,
+    CandidatePipelineProgressV1,
+)
 from backend.services.generation.chapter_pipeline import (
     ChapterOutcome,
     ChapterPipelineFailed,
     IncompleteProseGeneration,
+)
+from backend.services.generation.chapter_candidate_authorization import (
+    readiness_uses_candidate_pipeline,
 )
 from backend.services.generation.failure_diagnostics import (
     build_failure_diagnostic,
@@ -39,9 +46,24 @@ class JobControl:
 
 
 @dataclass(frozen=True)
+class CandidateChapterOutcome:
+    """One fully finalized candidate chapter awaiting atomic Job progress."""
+
+    progress: CandidatePipelineProgressV1
+    checkpoints: tuple[CandidatePipelineCheckpointV1, ...]
+
+
+@dataclass(frozen=True)
 class JobEngineDeps:
     list_worklist_chapters: Callable[[], Awaitable[List[Dict[str, Any]]]]
     run_chapter: Callable[[str, Dict[str, Any]], Awaitable[ChapterOutcome]]
+
+    run_candidate_chapter: Optional[
+        Callable[
+            [str, Dict[str, Any]],
+            Awaitable[CandidateChapterOutcome],
+        ]
+    ] = None
 
     inspect_reference_card_blockers: Optional[
         Callable[[], Awaitable[Dict[str, Any] | None]]
@@ -168,6 +190,24 @@ async def _pause(repo, job_id: str, reason: str) -> None:
     })
 
 
+async def _pause_candidate_execution(
+    repo,
+    job_id: str,
+    *,
+    chapter_id: str,
+    reason: str,
+) -> None:
+    latest = await repo.get_job(job_id)
+    checkpoints = latest.get("candidate_pipeline_checkpoints")
+    preserve = isinstance(checkpoints, list) and bool(checkpoints)
+    await repo.update_job_fields(job_id, {
+        "status": "paused",
+        "pause_reason": reason,
+        "current_chapter_id": chapter_id if preserve else None,
+        "active_slot": None,
+    })
+
+
 async def _persist_attempts(repo, job_id: str, attempts: list[dict]) -> None:
     account = getattr(repo, "account_attempt", None)
     if account is None:
@@ -285,6 +325,55 @@ async def _handle_chapter_failure(
     })
 
 
+async def _handle_candidate_chapter_failure(
+    repo,
+    job_id: str,
+    chapter: Dict[str, Any],
+    exc: Exception,
+) -> None:
+    """Stop one candidate execution without discarding its durable prefix."""
+
+    chapter_id = str(chapter["_id"])
+    attempts = list(getattr(exc, "attempts", []) or [])
+    diagnostic = build_failure_diagnostic(
+        exc,
+        step="candidate_pipeline",
+        chapter_id=chapter_id,
+        attempts=attempts,
+        occurred_at=get_utc_now(),
+    )
+    await _persist_diagnostic(repo, job_id, diagnostic)
+    latest = await repo.get_job(job_id)
+    checkpoints = latest.get("candidate_pipeline_checkpoints")
+    preserve = isinstance(checkpoints, list) and bool(checkpoints)
+    has_uncertain = bool(latest.get("has_uncertain_attempts"))
+    source_changed = diagnostic["category"] == "source_changed"
+    await repo.update_job_fields(job_id, {
+        "status": (
+            "interrupted"
+            if has_uncertain
+            else "paused"
+            if source_changed
+            else "failed"
+        ),
+        "pause_reason": (
+            "uncertain_attempt"
+            if has_uncertain
+            else "source_changed"
+            if source_changed
+            else None
+        ),
+        "current_chapter_id": chapter_id if preserve else None,
+        "active_slot": None,
+        "error": {
+            "step": "candidate_pipeline",
+            "chapter_id": chapter_id,
+            "message": str(exc),
+            "attempts": attempts,
+        },
+    })
+
+
 async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo=generation_job_repo) -> None:
     """主循环。任何返回前都已把终态/暂停态持久化。"""
     try:
@@ -297,18 +386,109 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
 
             job = await repo.get_job(job_id)
 
+            try:
+                candidate_execution = readiness_uses_candidate_pipeline(
+                    job.get("readiness")
+                )
+            except ValueError as exc:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "candidate_pipeline_recovery",
+                        "message": str(exc),
+                    },
+                })
+                return
+
+            raw_candidate_checkpoints = job.get(
+                "candidate_pipeline_checkpoints",
+                [],
+            )
+            if not isinstance(raw_candidate_checkpoints, list):
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "candidate_pipeline_recovery",
+                        "message": "Candidate checkpoint ledger is invalid",
+                    },
+                })
+                return
+            candidate_recovery = bool(raw_candidate_checkpoints)
+            if candidate_recovery and not candidate_execution:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "candidate_pipeline_recovery",
+                        "message": (
+                            "Candidate checkpoints have no bound authorization"
+                        ),
+                    },
+                })
+                return
+            if candidate_execution and deps.run_candidate_chapter is None:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "candidate_pipeline_recovery",
+                        "message": "Candidate checkpoint runner is unavailable",
+                    },
+                })
+                return
+
             # 成本上限：开下一章前的软天花板。
             committed_or_reserved = int(job.get("tokens_used", 0)) + int(
                 job.get("tokens_reserved", 0) or 0
             )
-            if job_planner.over_budget(committed_or_reserved, job.get("token_budget")):
+            if (
+                not candidate_recovery
+                and job_planner.over_budget(
+                    committed_or_reserved,
+                    job.get("token_budget"),
+                )
+            ):
                 await _pause(repo, job_id, "cost_cap")
                 return
 
             chapters = await deps.list_worklist_chapters()
-            chapter = job_planner.first_needing_work(chapters)
+            if candidate_recovery:
+                current_chapter_id = str(
+                    job.get("current_chapter_id") or ""
+                )
+                chapter = next(
+                    (
+                        item
+                        for item in chapters
+                        if str(item.get("_id") or "")
+                        == current_chapter_id
+                    ),
+                    None,
+                )
+                if chapter is None:
+                    await repo.update_job_fields(job_id, {
+                        "status": "failed",
+                        "pause_reason": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": "candidate_pipeline_recovery",
+                            "message": (
+                                "Candidate checkpoint chapter is unavailable"
+                            ),
+                        },
+                    })
+                    return
+            else:
+                chapter = job_planner.first_needing_work(chapters)
             if (
-                chapter is not None
+                not candidate_recovery
+                and chapter is not None
                 and deps.inspect_reference_card_blockers is not None
             ):
                 blockers = await deps.inspect_reference_card_blockers()
@@ -341,7 +521,24 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
 
             await repo.update_job_fields(job_id, {"current_chapter_id": str(chapter["_id"])})
             try:
-                outcome = await deps.run_chapter(str(job["novel_id"]), chapter)
+                if candidate_execution:
+                    assert deps.run_candidate_chapter is not None
+                    candidate_outcome = await deps.run_candidate_chapter(
+                        str(job["novel_id"]),
+                        chapter,
+                    )
+                    await repo.complete_candidate_pipeline_chapter(
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        expected_checkpoints=candidate_outcome.checkpoints,
+                        entry=candidate_outcome.progress,
+                        tokens_delta=0,
+                    )
+                else:
+                    outcome = await deps.run_chapter(
+                        str(job["novel_id"]),
+                        chapter,
+                    )
             except TokenBudgetExceeded as exc:
                 diagnostic = build_failure_diagnostic(
                     exc,
@@ -350,7 +547,15 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     occurred_at=get_utc_now(),
                 )
                 await _persist_diagnostic(repo, job_id, diagnostic)
-                await _pause(repo, job_id, "cost_cap")
+                if candidate_execution:
+                    await _pause_candidate_execution(
+                        repo,
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        reason="cost_cap",
+                    )
+                else:
+                    await _pause(repo, job_id, "cost_cap")
                 return
 
             except AttemptCapacityExceeded as exc:
@@ -361,9 +566,25 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     occurred_at=get_utc_now(),
                 )
                 await _persist_diagnostic(repo, job_id, diagnostic)
-                await _pause(repo, job_id, "attempt_capacity")
+                if candidate_execution:
+                    await _pause_candidate_execution(
+                        repo,
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        reason="attempt_capacity",
+                    )
+                else:
+                    await _pause(repo, job_id, "attempt_capacity")
                 return
             except ChapterPipelineFailed as exc:
+                if candidate_execution:
+                    await _handle_candidate_chapter_failure(
+                        repo,
+                        job_id,
+                        chapter,
+                        exc,
+                    )
+                    return
                 incomplete = exc.__cause__
                 if not isinstance(incomplete, IncompleteProseGeneration):
                     await _handle_chapter_failure(repo, job_id, chapter, exc)
@@ -415,8 +636,30 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             except Exception as exc:  # noqa: BLE001 — fail-fast，人工 resume 即重试
-                await _handle_chapter_failure(repo, job_id, chapter, exc)
+                if candidate_execution:
+                    await _handle_candidate_chapter_failure(
+                        repo,
+                        job_id,
+                        chapter,
+                        exc,
+                    )
+                else:
+                    await _handle_chapter_failure(repo, job_id, chapter, exc)
                 return
+
+            if candidate_execution:
+                if control.pause_requested:
+                    await _pause(repo, job_id, "manual")
+                    return
+                job = await repo.get_job(job_id)
+                if job_planner.should_checkpoint(
+                    len(job["progress"]),
+                    int(job.get("last_checkpoint_index", 0)),
+                    int(job["checkpoint_interval"]),
+                ):
+                    await _pause(repo, job_id, "checkpoint")
+                    return
+                continue
 
             await _persist_attempts(repo, job_id, outcome.attempts)
             await repo.append_progress(

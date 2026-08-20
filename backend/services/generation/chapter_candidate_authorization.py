@@ -65,6 +65,42 @@ _NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 _Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
+def readiness_uses_candidate_pipeline(readiness: Any) -> bool:
+    """Select the execution protocol without allowing damaged v2 to downgrade."""
+
+    if not isinstance(readiness, Mapping):
+        return False
+    version = readiness.get("version")
+    planning = readiness.get("planning")
+    if version is not None and (
+        isinstance(version, bool) or not isinstance(version, int)
+    ):
+        raise ValueError("generation readiness version is invalid")
+    if version not in (None, 1, 2):
+        raise ValueError("generation readiness version is invalid")
+    if version in (None, 1) and not isinstance(planning, Mapping):
+        return False
+    if not isinstance(planning, Mapping):
+        raise ValueError("generation readiness planning is missing")
+    revision = planning.get("chapter_candidate_pipeline_revision")
+    authorization = planning.get(
+        "chapter_candidate_repair_authorization"
+    )
+    if version in (None, 1) and revision is None and authorization is None:
+        return False
+    if version != 2:
+        raise ValueError("candidate repair readiness version is invalid")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision != CANDIDATE_PIPELINE_REVISION
+    ):
+        raise ValueError("candidate pipeline authorization revision is invalid")
+    if not isinstance(authorization, Mapping):
+        raise ValueError("generation readiness has no candidate repair authority")
+    return True
+
+
 class _ClosedAuthorizationModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 

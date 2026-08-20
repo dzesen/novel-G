@@ -14,8 +14,8 @@ from backend.db.utils import to_object_id
 from backend.services.generation import job_planner
 from backend.services.generation.chapter_pipeline import run_chapter
 from backend.services.generation.chapter_candidate_authorization import (
-    CANDIDATE_PIPELINE_REVISION,
     authorized_candidate_repair_attempt_slots,
+    readiness_uses_candidate_pipeline,
 )
 from backend.services.generation.attempt_scope import JobAttemptScope
 from backend.services.generation.headless_generation import (
@@ -120,41 +120,9 @@ def _estimate_authorized_chapter_attempt_slots(
         generation_params,
     )
     readiness = job.get("readiness")
-    if not isinstance(readiness, Mapping):
-        # Jobs created before versioned readiness continue under their original
-        # capacity and execution path.
+    if not readiness_uses_candidate_pipeline(readiness):
         return base_slots
-    readiness_version = readiness.get("version")
-    planning = readiness.get("planning")
-    if readiness_version is not None and (
-        isinstance(readiness_version, bool)
-        or not isinstance(readiness_version, int)
-    ):
-        raise ValueError("generation readiness version is invalid")
-    if readiness_version not in (None, 1, 2):
-        raise ValueError("generation readiness version is invalid")
-    if readiness_version == 2 and not isinstance(planning, Mapping):
-        raise ValueError("generation readiness planning is missing")
-    if not isinstance(planning, Mapping):
-        return base_slots
-    pipeline_revision = planning.get("chapter_candidate_pipeline_revision")
-    has_authorization = "chapter_candidate_repair_authorization" in planning
-    if (
-        readiness_version in (None, 1)
-        and pipeline_revision is None
-        and not has_authorization
-    ):
-        return base_slots
-    if readiness_version != 2:
-        raise ValueError("candidate repair readiness version is invalid")
-    if (
-        isinstance(pipeline_revision, bool)
-        or not isinstance(pipeline_revision, int)
-        or pipeline_revision != CANDIDATE_PIPELINE_REVISION
-    ):
-        raise ValueError("candidate pipeline authorization revision is invalid")
-    if not has_authorization:
-        raise ValueError("generation readiness has no candidate repair authority")
+    assert isinstance(readiness, Mapping)
     repair_slots = authorized_candidate_repair_attempt_slots(
         readiness,
         chapter_id=str(chapter.get("_id") or ""),
