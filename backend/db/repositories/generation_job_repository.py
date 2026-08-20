@@ -22,6 +22,16 @@ USAGE_SUMMARY_LIMIT = 100
 MAX_ACTIVE_TOKEN_RESERVATIONS = 32
 
 
+def _validated_pre_dispatch_fence(
+    fence: Any,
+) -> PreDispatchFenceV1:
+    if not isinstance(fence, PreDispatchFenceV1):
+        raise ValueError("pre-dispatch fence contract is required")
+    return PreDispatchFenceV1.model_validate(
+        fence.model_dump(mode="python")
+    )
+
+
 class TokenBudgetExceeded(ValueError):
     """A Provider dispatch would exceed the explicitly authorized token budget."""
 
@@ -338,9 +348,8 @@ class GenerationJobRepository(BaseRepository):
         A receipt takeover is cross-collection. Publishing its token here first
         makes every later Job attempt claim a local, atomic fencing check.
         """
-        if not isinstance(fence, PreDispatchFenceV1):
-            raise ValueError("pre-dispatch fence contract is required")
-        value = fence.model_dump(mode="json")
+        validated_fence = _validated_pre_dispatch_fence(fence)
+        value = validated_fence.model_dump(mode="json")
         fence_path = "attempt_reservation.pre_dispatch_fence"
         result = await self.collection.update_one(
             {
@@ -414,11 +423,12 @@ class GenerationJobRepository(BaseRepository):
         }
         fence: dict[str, Any] | None = None
         if pre_dispatch_fence is not None:
-            if not isinstance(pre_dispatch_fence, PreDispatchFenceV1):
-                raise ValueError("pre-dispatch fence contract is required")
-            if pre_dispatch_fence.step_id != str(step_id):
+            validated_fence = _validated_pre_dispatch_fence(
+                pre_dispatch_fence
+            )
+            if validated_fence.step_id != str(step_id):
                 raise ValueError("pre-dispatch fence step does not match the claim")
-            fence = pre_dispatch_fence.model_dump(mode="json")
+            fence = validated_fence.model_dump(mode="json")
             slot["pre_dispatch_fence"] = fence
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
@@ -703,11 +713,12 @@ class GenerationJobRepository(BaseRepository):
             return False
         current_fence: dict[str, Any] | None = None
         if current_pre_dispatch_fence is not None:
-            if not isinstance(current_pre_dispatch_fence, PreDispatchFenceV1):
-                raise ValueError("pre-dispatch fence contract is required")
-            if current_pre_dispatch_fence.step_id != str(step_id):
+            validated_fence = _validated_pre_dispatch_fence(
+                current_pre_dispatch_fence
+            )
+            if validated_fence.step_id != str(step_id):
                 raise ValueError("pre-dispatch fence step does not match cleanup")
-            current_fence = current_pre_dispatch_fence.model_dump(mode="json")
+            current_fence = validated_fence.model_dump(mode="json")
             active_fence = (job.get("attempt_reservation") or {}).get(
                 "pre_dispatch_fence"
             )
