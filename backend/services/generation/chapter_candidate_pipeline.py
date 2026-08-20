@@ -2048,7 +2048,7 @@ def _resume_trace(
         if not isinstance(item, CandidateAttemptSummary):
             _preserve_resume_aggregate_floor(
                 restored,
-                aggregate_tokens=trusted_progress_tokens,
+                aggregate_tokens=None,
                 reason=(
                     CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
                 ),
@@ -2071,7 +2071,7 @@ def _resume_trace(
         except Exception:
             _preserve_resume_aggregate_floor(
                 restored,
-                aggregate_tokens=trusted_progress_tokens,
+                aggregate_tokens=None,
                 reason=(
                     CandidateUnattributedUsageReason.ATTEMPT_EVIDENCE_INVALID
                 ),
@@ -2082,34 +2082,53 @@ def _resume_trace(
             )
             continue
         try:
-            violation = _attempt_usage_violation(validated)
-            if violation is not None:
-                message, reason = violation
-                _preserve_resume_aggregate_floor(
-                    restored,
-                    aggregate_tokens=trusted_progress_tokens,
-                    reason=reason,
-                    item_usage_floor=_usage_component_floor(validated.usage),
-                )
-                attempt_error_message = attempt_error_message or message
-                continue
             existing = attempts_by_id.get(validated.attempt_id)
             if existing is not None:
                 usage_delta, _evidence_kind = _usage_delta(
                     validated.usage,
                     existing.usage,
                 )
-                _preserve_resume_aggregate_floor(
-                    restored,
-                    aggregate_tokens=trusted_progress_tokens,
-                    reason=(
-                        CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
-                    ),
-                    item_usage_floor=usage_delta,
+                if any((
+                    usage_delta.input_tokens,
+                    usage_delta.output_tokens,
+                    usage_delta.total_tokens,
+                )):
+                    _preserve_resume_aggregate_floor(
+                        restored,
+                        aggregate_tokens=None,
+                        reason=(
+                            CandidateUnattributedUsageReason.ATTEMPT_LEDGER_CONFLICT
+                        ),
+                        item_usage_floor=usage_delta,
+                    )
+                existing_floor = _usage_component_floor(
+                    existing.usage
+                ).total_tokens
+                current_floor = _usage_component_floor(
+                    validated.usage
+                ).total_tokens
+                attempts_by_id[validated.attempt_id] = existing.model_copy(
+                    update={
+                        "usage": CandidateUsageSummary(
+                            total_tokens=max(existing_floor, current_floor)
+                        )
+                    }
                 )
                 attempt_error_message = (
                     attempt_error_message or "候选管线恢复 attempt 重复"
                 )
+                continue
+            attempts_by_id[validated.attempt_id] = validated
+            violation = _attempt_usage_violation(validated)
+            if violation is not None:
+                message, reason = violation
+                _preserve_resume_aggregate_floor(
+                    restored,
+                    aggregate_tokens=None,
+                    reason=reason,
+                    item_usage_floor=_usage_component_floor(validated.usage),
+                )
+                attempt_error_message = attempt_error_message or message
                 continue
         except _UsageProjectionOverflow:
             restored._record_usage_overflow()
@@ -2118,7 +2137,6 @@ def _resume_trace(
             )
             continue
         restored.attempts.append(validated)
-        attempts_by_id[validated.attempt_id] = validated
         has_unresolved_uncertain_attempt = bool(
             has_unresolved_uncertain_attempt
             or validated.state is CandidateAttemptState.UNCERTAIN
@@ -2132,6 +2150,17 @@ def _resume_trace(
             )
 
     if attempt_error_message is not None:
+        if (
+            trusted_progress_tokens is not None
+            and trusted_progress_tokens > restored.tokens
+        ):
+            _preserve_resume_aggregate_floor(
+                restored,
+                aggregate_tokens=trusted_progress_tokens,
+                reason=(
+                    CandidateUnattributedUsageReason.AGGREGATE_RESIDUAL_UNATTRIBUTED
+                ),
+            )
         raise _blocked_resume(restored, attempt_error_message)
 
     if (
