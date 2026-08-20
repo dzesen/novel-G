@@ -989,6 +989,7 @@ class ChapterGenerationApplicationService:
                 data=prepared.truncation,
             )
         command = prepared.command
+        await self._deps.state_proposals.mark_dispatched(prepared.lease)
         frames = self._deps.run_workflow(
             workflow_name=STATE_WORKFLOW,
             steps=CHAPTER_STATE_STEPS,
