@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mutation import MutationConflictError
@@ -24,6 +24,10 @@ from backend.services.novel.reference_card_service import ReferenceCardService
 from backend.services.novel.character_profile import CharacterProfileSchema
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.services.auth.identity_service import Actor
+from backend.services.generation.reference_card_auto_creation_revert import (
+    AutoReferenceCardRevertDenied,
+    auto_reference_card_revert_service,
+)
 
 
 router = APIRouter(
@@ -86,6 +90,11 @@ class EmergentReferenceCardApplyRequest(BaseModel):
         min_length=1,
         max_length=100,
     )
+
+
+class AutoReferenceCardRevertRequest(BaseModel):
+    expected_narrative_revision: StrictInt = Field(ge=0)
+    inspection_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 
@@ -288,6 +297,66 @@ async def apply_emergent_reference_card_candidates(
     except MutationConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (CandidateReviewError, InvalidIdError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get(
+    "/novel/{novel_id}/candidates/{candidate_id}/auto-revert"
+)
+async def inspect_auto_created_reference_card_revert(
+    novel_id: str,
+    candidate_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+):
+    """Inspect the zero-Provider compensation gate without changing state."""
+    try:
+        return await auto_reference_card_revert_service.inspect(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            candidate_id=candidate_id,
+        )
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/novel/{novel_id}/candidates/{candidate_id}/auto-revert"
+)
+async def revert_auto_created_reference_card(
+    novel_id: str,
+    candidate_id: str,
+    req: AutoReferenceCardRevertRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+):
+    """Apply the exact inspected compensation as one replayable mutation."""
+    try:
+        return await auto_reference_card_revert_service.revert(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            candidate_id=candidate_id,
+            expected_narrative_revision=req.expected_narrative_revision,
+            inspection_digest=req.inspection_digest,
+        )
+    except AutoReferenceCardRevertDenied as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "auto_reference_card_revert_denied",
+                "message": str(exc),
+                "result": exc.result,
+            },
+        ) from exc
+    except MutationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

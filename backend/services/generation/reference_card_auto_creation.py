@@ -76,6 +76,15 @@ FORMAL_CONFLICT_FIELDS = (
 REVIEWABLE_IDENTITY_STATUSES = ("pending", "deferred")
 _HEX_64_PATTERN = r"^[0-9a-f]{64}$"
 _OBJECT_ID_PATTERN = r"^[0-9a-f]{24}$"
+_FORMAL_CARD_CONTENT_DIGEST_EXCLUDED_FIELDS = frozenset({
+    "_id",
+    "novel_id",
+    "created_at",
+    "updated_at",
+    "deleted_at",
+    "is_deleted",
+    "is_favorite",
+})
 _NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 _PositiveInt = Annotated[StrictInt, Field(ge=1)]
 ReferenceCardType = Literal["character", "location", "item", "rule", "lore"]
@@ -273,6 +282,16 @@ def _digest(value: Any) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def reference_card_content_digest(document: Mapping[str, Any]) -> str:
+    """Digest author-visible card content while excluding lifecycle metadata."""
+
+    return _digest({
+        str(key): deepcopy(value)
+        for key, value in document.items()
+        if str(key) not in _FORMAL_CARD_CONTENT_DIGEST_EXCLUDED_FIELDS
+    })
 
 
 def parse_reference_card_creation_authorization(
@@ -1285,11 +1304,24 @@ class AutoReferenceCardCreationService:
                         session=session,
                         card_id=card_id,
                     )
+                current_card = await repository.get_card(
+                    command["novel_id"],
+                    str(frozen["card_type"]),
+                    card_id,
+                    include_deleted=True,
+                    session=session,
+                )
+                formal_card_content_digest = reference_card_content_digest(
+                    current_card
+                )
                 await mutation.receipt(
                     f"card_write_{candidate_id}",
                     {
                         "card_id": card_id,
                         "projection_digest": frozen["projection_digest"],
+                        "formal_card_content_digest": (
+                            formal_card_content_digest
+                        ),
                     },
                 )
                 if self._after_card_write is not None:
@@ -1323,6 +1355,9 @@ class AutoReferenceCardCreationService:
                                     "source_mutation_id"
                                 ],
                                 "projection_digest": frozen["projection_digest"],
+                                "formal_card_content_digest": (
+                                    formal_card_content_digest
+                                ),
                                 "decided_at": now,
                             },
                             "auto_creation": {
@@ -1343,11 +1378,24 @@ class AutoReferenceCardCreationService:
                     raise MutationConflictError(
                         "Reference-card candidate changed during auto-creation"
                     )
+            else:
+                repository = get_card_repository(str(frozen["card_type"]))
+                current_card = await repository.get_card(
+                    command["novel_id"],
+                    str(frozen["card_type"]),
+                    card_id,
+                    include_deleted=True,
+                    session=session,
+                )
+                formal_card_content_digest = reference_card_content_digest(
+                    current_card
+                )
             receipt = {
                 "candidate_id": candidate_id,
                 "action": "auto_create_unique",
                 "card_id": card_id,
                 "projection_digest": frozen["projection_digest"],
+                "formal_card_content_digest": formal_card_content_digest,
             }
             await mutation.receipt(receipt_key, receipt)
             mappings.append(receipt)

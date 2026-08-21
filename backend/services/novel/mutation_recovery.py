@@ -44,6 +44,17 @@ MutationExecutor = Callable[[Any, Any], Awaitable[Any]]
 
 def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
     # 延迟构建目录，避免服务模块导入期间形成循环依赖。
+    from backend.services.generation.reference_card_auto_creation import (
+        AUTO_CREATE_MUTATION_NAME,
+        AUTO_CREATE_MUTATION_VERSION,
+        auto_reference_card_creation_service,
+    )
+    from backend.services.generation.reference_card_auto_creation_revert import (
+        AUTO_CARD_REVERT_MUTATION_NAME,
+        AUTO_CARD_REVERT_MUTATION_VERSION,
+        auto_reference_card_revert_service,
+    )
+
     callbacks: dict[tuple[str, int], MutationExecutor] = {
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
@@ -95,6 +106,12 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ),
         ("apply_card_import_proposal", 1): CardImportProposalService._execute_apply,
         ("apply_agent_revision_proposal", 1): AgentRevisionProposalService._execute_apply,
+        (AUTO_CREATE_MUTATION_NAME, AUTO_CREATE_MUTATION_VERSION): (
+            auto_reference_card_creation_service._execute_apply
+        ),
+        (AUTO_CARD_REVERT_MUTATION_NAME, AUTO_CARD_REVERT_MUTATION_VERSION): (
+            auto_reference_card_revert_service._execute_revert
+        ),
     }
     non_narrative_operations = {
         "update_novel_metadata",
@@ -103,10 +120,15 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         # recoverable command, so a rejected old digest cannot bump revision.
         "apply_card_import_proposal",
     }
+    persistent_fence_operations = {
+        AUTO_CREATE_MUTATION_NAME,
+        AUTO_CARD_REVERT_MUTATION_NAME,
+    }
     return {
         key: MutationHandlerSpec(
             callback,
             advances_narrative_revision=key[0] not in non_narrative_operations,
+            persistent_narrative_fence=key[0] in persistent_fence_operations,
         )
         for key, callback in callbacks.items()
     }
