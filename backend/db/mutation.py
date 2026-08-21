@@ -48,6 +48,13 @@ class UnsupportedMutationError(RuntimeError):
 class MutationHandlerSpec(Generic[T]):
     callback: MutationCallback[T]
     advances_narrative_revision: bool = False
+    persistent_narrative_fence: bool = False
+
+    def __post_init__(self) -> None:
+        if self.persistent_narrative_fence and not self.advances_narrative_revision:
+            raise ValueError(
+                "persistent_narrative_fence requires advances_narrative_revision"
+            )
 
 
 def _digest_value(value: Any) -> Any:
@@ -255,6 +262,7 @@ class MutationEngine:
                 command,
                 spec.callback,
                 advances_narrative_revision=spec.advances_narrative_revision,
+                persistent_narrative_fence=spec.persistent_narrative_fence,
             )
 
     async def recover(
@@ -418,14 +426,21 @@ async def _commit_mutation(
     callback: MutationCallback[T],
     *,
     advances_narrative_revision: bool = False,
+    persistent_narrative_fence: bool = False,
 ) -> T:
     """提交完整命令；standalone 崩溃后以稳定子 ID 和逐项回执安全重放。"""
+    if persistent_narrative_fence and not advances_narrative_revision:
+        raise ValueError(
+            "persistent_narrative_fence requires advances_narrative_revision"
+        )
     lock = _LOCKS.setdefault(command.idempotency_key, asyncio.Lock())
     async with lock:
         collection = get_database()[collections.MUTATION_JOURNALS]
         command_digest = command.digest()
+        standalone_fence: dict[str, Any] | None = None
 
         async def execute(session):
+            nonlocal standalone_fence
             now = get_utc_now()
             stored_command = {
                 "version": command.version,
@@ -476,6 +491,12 @@ async def _commit_mutation(
                     "The idempotency key is already bound to a different command"
                 )
             if journal.get("status") == "completed":
+                if persistent_narrative_fence and session is None:
+                    stored_fence = (journal.get("receipts") or {}).get(
+                        "narrative_write_fence"
+                    )
+                    if isinstance(stored_fence, dict):
+                        standalone_fence = deepcopy(stored_fence)
                 return deepcopy(journal.get("result"))
             await collection.update_one(
                 {"_id": journal["_id"]},
@@ -485,15 +506,49 @@ async def _commit_mutation(
             recorder = MutationRecorder(journal, session)
             if advances_narrative_revision:
                 try:
-                    revision = await narrative_revision_store.advance(
-                        command.novel_id,
-                        (
-                            f"{command.operation}@{command.version}:"
-                            f"{command.idempotency_key}:{command_digest}"
-                        ),
-                        expected_revision=command.expected_narrative_revision,
-                        session=session,
+                    operation_id = (
+                        f"{command.operation}@{command.version}:"
+                        f"{command.idempotency_key}:{command_digest}"
                     )
+                    if persistent_narrative_fence and session is None:
+                        if command.expected_narrative_revision is None:
+                            raise NarrativeRevisionConflict(
+                                "A persistent mutation fence requires an expected "
+                                "narrative revision"
+                            )
+                        fence_token = hashlib.sha256(
+                            (
+                                f"mutation-journal:{journal['_id']}:"
+                                f"{command_digest}"
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        revision, acquired_fence = await (
+                            narrative_revision_store
+                            .advance_with_persistent_mutation_fence(
+                                command.novel_id,
+                                operation_id,
+                                expected_revision=(
+                                    command.expected_narrative_revision
+                                ),
+                                fence_token=fence_token,
+                                journal_id=str(journal["_id"]),
+                                idempotency_key=command.idempotency_key,
+                                command_digest=command_digest,
+                                operation=command.operation,
+                            )
+                        )
+                        standalone_fence = deepcopy(acquired_fence)
+                        await recorder.receipt(
+                            "narrative_write_fence",
+                            acquired_fence,
+                        )
+                    else:
+                        revision = await narrative_revision_store.advance(
+                            command.novel_id,
+                            operation_id,
+                            expected_revision=command.expected_narrative_revision,
+                            session=session,
+                        )
                 except NarrativeRevisionConflict as exc:
                     await collection.update_one(
                         {"_id": journal["_id"]},
@@ -523,7 +578,7 @@ async def _commit_mutation(
             return result
 
         try:
-            return await run_mongo_write_unit(execute, command.operation)
+            result = await run_mongo_write_unit(execute, command.operation)
         except MutationConflictError:
             # 冲突属于调用者错误，不能把已存在的正确 journal 改成 failed。
             raise
@@ -569,6 +624,22 @@ async def _commit_mutation(
             else:
                 await failure_write
             raise
+        if standalone_fence is not None:
+            try:
+                await narrative_revision_store.release_persistent_mutation_fence(
+                    command.novel_id,
+                    fence=standalone_fence,
+                )
+            except Exception:
+                # Journal 已完成，不能把一次清理失败改写成业务失败。后续 writer
+                # 会在核验 completed journal 后条件清理同一 fence。
+                logger.exception(
+                    "Failed to release completed persistent mutation fence: "
+                    "operation=%s idempotency_key=%s",
+                    command.operation,
+                    command.idempotency_key,
+                )
+        return result
 
 
 async def commit_mutation(
@@ -576,12 +647,14 @@ async def commit_mutation(
     callback: MutationCallback[T],
     *,
     advances_narrative_revision: bool = True,
+    persistent_narrative_fence: bool = False,
 ) -> T:
     """旧调用者兼容入口；执行仍经过 MutationEngine 的 operation/version seam。"""
     engine = MutationEngine({
         (command.operation, command.version): MutationHandlerSpec(
             callback,
             advances_narrative_revision=advances_narrative_revision,
+            persistent_narrative_fence=persistent_narrative_fence,
         )
     })
     return await engine.execute(command)
