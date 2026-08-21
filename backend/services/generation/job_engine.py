@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 # 进程内任务注册表：job_id → (asyncio.Task, JobControl)。易失，重启即丢（设计 §4.1/§4.3）。
 _REGISTRY: Dict[str, "tuple[asyncio.Task, JobControl]"] = {}
 
+_PRE_DISPATCH_PAUSE_REASONS = {
+    "token_budget_exceeded_before_dispatch": "cost_cap",
+    "attempt_capacity_exhausted": "attempt_capacity",
+}
+
+
+def _pre_dispatch_pause_reason(code: object) -> str | None:
+    return _PRE_DISPATCH_PAUSE_REASONS.get(str(code or ""))
+
 
 @dataclass
 class JobControl:
@@ -278,10 +287,7 @@ async def _handle_chapter_failure(
         Mapping,
     )
 
-    pause_reason = {
-        "token_budget_exceeded_before_dispatch": "cost_cap",
-        "attempt_capacity_exhausted": "attempt_capacity",
-    }.get(diagnostic["code"])
+    pause_reason = _pre_dispatch_pause_reason(diagnostic["code"])
     if pause_reason is not None:
         has_partial_checkpoint = bool(
             failed_outcome is not None
@@ -361,6 +367,15 @@ async def _handle_candidate_chapter_failure(
         occurred_at=get_utc_now(),
     )
     await _persist_diagnostic(repo, job_id, diagnostic)
+    budget_pause_reason = _pre_dispatch_pause_reason(diagnostic.get("code"))
+    if budget_pause_reason is not None:
+        await _pause_candidate_execution(
+            repo,
+            job_id,
+            chapter_id=chapter_id,
+            reason=budget_pause_reason,
+        )
+        return
     latest = await repo.get_job(job_id)
     checkpoints = latest.get("candidate_pipeline_checkpoints")
     preserve = isinstance(checkpoints, list) and bool(checkpoints)
@@ -551,6 +566,11 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     return
             else:
                 chapter = job_planner.first_needing_work(chapters)
+            if chapter is not None:
+                await repo.update_job_fields(
+                    job_id,
+                    {"current_chapter_id": str(chapter["_id"])},
+                )
             reference_card_blocker_check = (
                 deps.resolve_reference_card_blockers
                 or deps.inspect_reference_card_blockers
@@ -681,7 +701,6 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 })
                 return
 
-            await repo.update_job_fields(job_id, {"current_chapter_id": str(chapter["_id"])})
             try:
                 if candidate_execution:
                     assert deps.run_candidate_chapter is not None

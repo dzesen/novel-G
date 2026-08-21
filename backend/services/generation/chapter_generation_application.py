@@ -23,7 +23,10 @@ from pydantic import (
 )
 
 from backend.db.repositories.chapter_repository import chapter_repo
-from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
+from backend.services.llm.pre_dispatch_boundaries import (
+    pre_dispatch_boundary_code,
+    restore_pre_dispatch_boundary,
+)
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.prose_run_repository import prose_run_repo
 from backend.db.utils import to_object_id
@@ -472,6 +475,56 @@ ChapterGenerationPrepared = (
     | _PreparedOutlineAdherence
     | _PreparedState
 )
+
+
+def _has_zero_pre_dispatch_evidence(data: Mapping[str, Any]) -> bool:
+    usage = data.get("usage_so_far")
+    attempts = data.get("attempts")
+    return bool(
+        isinstance(usage, Mapping)
+        and set(usage) == {
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+        }
+        and all(type(usage[key]) is int and usage[key] == 0 for key in usage)
+        and isinstance(attempts, list)
+        and not attempts
+    )
+
+
+async def _stream_prose_deltas(
+    frames: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    """Translate trusted prose SSE frames back into the typed application seam."""
+
+    emitted_generated_text = False
+    async for frame in frames:
+        parsed = parse_sse_event(frame)
+        if parsed is None:
+            continue
+        name, data = parsed
+        if name == "delta" and data.get("text"):
+            emitted_generated_text = True
+            yield str(data["text"])
+            continue
+        if name != "done" or data.get("success"):
+            continue
+        boundary = (
+            restore_pre_dispatch_boundary(
+                data.get("error_code"),
+                data.get("error"),
+            )
+            if not emitted_generated_text and _has_zero_pre_dispatch_evidence(data)
+            else None
+        )
+        if boundary is not None:
+            raise boundary
+        raise WorkflowFailed(
+            data.get("error") or "prose generation failed",
+            usage=data.get("usage_so_far"),
+            attempts=data.get("attempts"),
+        )
 
 
 class ChapterGenerationApplicationService:
@@ -1608,7 +1661,7 @@ class ChapterGenerationApplicationService:
             call_kwargs: dict[str, Any],
         ) -> AsyncIterator[str]:
             async def consume() -> AsyncIterator[str]:
-                async for frame in self._deps.stream_prose(
+                frames = self._deps.stream_prose(
                     workflow_name=PROSE_WORKFLOW,
                     step_key=PROSE_STEP,
                     prompt=call_prompt,
@@ -1618,13 +1671,9 @@ class ChapterGenerationApplicationService:
                     is_disconnected=command.is_disconnected,
                     runtime=runtime,
                     generation_plan=plan,
-                ):
-                    parsed = parse_sse_event(frame)
-                    if parsed is None:
-                        continue
-                    name, data = parsed
-                    if name == "delta" and data.get("text"):
-                        yield str(data["text"])
+                )
+                async for chunk in _stream_prose_deltas(frames):
+                    yield chunk
 
             return consume()
 
@@ -1824,7 +1873,7 @@ class ChapterGenerationApplicationService:
                         status="incomplete",
                     )
                 continuation_limited = isinstance(exc, ProseContinuationLimit)
-                budget_limited = isinstance(exc, TokenBudgetExceeded)
+                boundary_code = pre_dispatch_boundary_code(exc)
                 usage = usage_reader().model_dump()
                 await queue.put(
                     ChapterGenerationEvent(
@@ -1840,14 +1889,15 @@ class ChapterGenerationApplicationService:
                                     "continuation_limit_reached"
                                     if continuation_limited
                                     else (
-                                        "token_budget_exceeded_before_dispatch"
-                                        if budget_limited
+                                        boundary_code
+                                        if boundary_code is not None
                                         else "uncertain_provider_attempt"
                                     )
                                 )
                             ],
                             "has_uncertain_attempt": not (
-                                continuation_limited or budget_limited
+                                continuation_limited
+                                or boundary_code is not None
                             ),
                             "run_id": (
                                 str(latest_run["_id"])

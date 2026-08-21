@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
 from backend.llm.models import TokenUsage
-from backend.db.repositories.generation_job_repository import TokenBudgetExceeded
+from backend.services.llm.pre_dispatch_boundaries import (
+    AttemptCapacityExceeded,
+    TokenBudgetExceeded,
+    pre_dispatch_boundary_code,
+)
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.generation.prose_completion import ProseExecutionPlan
 from backend.services.generation.prose_continuation import (
@@ -967,9 +971,11 @@ async def execute_v3_prose_plan(
             await asyncio.shield(_notify(on_segment, terminal))
             await asyncio.shield(publish_progress())
             raise
-        except TokenBudgetExceeded:
+        except (TokenBudgetExceeded, AttemptCapacityExceeded) as exc:
             # This is a proven pre-dispatch refusal: it must pause the scene,
             # but it must never masquerade as an uncertain paid request.
+            boundary_code = pre_dispatch_boundary_code(exc)
+            assert boundary_code is not None
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
             cross_call_repeat_characters = (
@@ -985,7 +991,7 @@ async def execute_v3_prose_plan(
                 "cross_call_repeat_characters": cross_call_repeat_characters,
                 "finish_reason": "budget",
                 "raw_finish_reason": "budget",
-                "error_code": "token_budget_exceeded_before_dispatch",
+                "error_code": boundary_code,
                 "usage": TokenUsage().model_dump(),
                 "empty_output": not bool(generated),
                 "no_progress": bool(generated) and not bool(contribution),
@@ -1165,9 +1171,12 @@ async def execute_v3_prose_plan(
                 )
                 continue
 
-            if latest.get("error_code") == "token_budget_exceeded_before_dispatch":
+            if latest.get("error_code") in {
+                "token_budget_exceeded_before_dispatch",
+                "attempt_capacity_exhausted",
+            }:
                 state["status"] = "paused"
-                state["pause_reason"] = "token_budget_exceeded_before_dispatch"
+                state["pause_reason"] = latest["error_code"]
                 await publish_progress()
                 pause_reason = state["pause_reason"]
                 break

@@ -28,6 +28,9 @@ from backend.services.llm.generation_runtime import (
     WorkflowStepTarget,
     create_generation_runtime,
 )
+from backend.services.llm.pre_dispatch_boundaries import (
+    restore_pre_dispatch_boundary,
+)
 from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.services.generation.chapter_generation_application import (
@@ -507,6 +510,11 @@ async def generate_prose_candidate(
     if result.accepted:
         raise RuntimeError("deferred prose generation accepted formal content")
     completion = dict(result.completion or {})
+    boundary = restore_pre_dispatch_boundary(
+        completion.get("pause_reason"),
+    )
+    if boundary is not None:
+        raise boundary
     revision = completion.get("source_run_revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise RuntimeError("deferred prose candidate has no valid run revision")

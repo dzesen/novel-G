@@ -23,6 +23,9 @@ from backend.llm.models import TokenUsage
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.llm.workflow_runner import sse_event
 from backend.services.llm.generation_runtime import GenerationPlan, GenerationRuntime
+from backend.services.llm.pre_dispatch_boundaries import (
+    pre_dispatch_boundary_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,12 +131,16 @@ async def stream_prose(
             len(chunks),
         )
         # 已发出的 delta 留在前端手上（设计 §7.3 已说明这半章无从对账）。
-        yield sse_event("done", {
+        payload = {
             "success": False,
             "error": str(exc),
             "usage_so_far": usage_so_far.model_dump(),
             "attempts": attempt_payload,
-        })
+        }
+        boundary_code = pre_dispatch_boundary_code(exc)
+        if boundary_code is not None:
+            payload["error_code"] = boundary_code
+        yield sse_event("done", payload)
         return
 
     text = "".join(chunks)

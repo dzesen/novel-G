@@ -6,16 +6,15 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from backend.db.errors import InvalidIdError, NotFoundError
-from backend.db.repositories.generation_job_repository import (
-    AttemptCapacityExceeded,
-    TokenBudgetExceeded,
-)
 from backend.services.generation.chapter_pipeline import IncompleteProseGeneration
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     UncertainProseAttempt,
 )
 from backend.services.llm.context_builder import ContextBudgetError
+from backend.services.llm.pre_dispatch_boundaries import (
+    pre_dispatch_boundary_code,
+)
 from backend.services.novel.state_proposal import StaleStatePreview
 
 
@@ -107,6 +106,10 @@ def build_failure_diagnostic(
     code = "unclassified_failure"
     evidence = "insufficient"
     details = _attempt_details(attempt_values)
+    boundary_code = next(
+        filter(None, (pre_dispatch_boundary_code(item) for item in chain)),
+        None,
+    )
 
     incomplete = next(
         (item for item in chain if isinstance(item, IncompleteProseGeneration)),
@@ -132,13 +135,9 @@ def build_failure_diagnostic(
         category = "context_or_budget"
         code = "context_budget_exceeded"
         evidence = "confirmed"
-    elif any(isinstance(item, TokenBudgetExceeded) for item in chain):
+    elif boundary_code is not None:
         category = "context_or_budget"
-        code = "token_budget_exceeded_before_dispatch"
-        evidence = "confirmed"
-    elif any(isinstance(item, AttemptCapacityExceeded) for item in chain):
-        category = "context_or_budget"
-        code = "attempt_capacity_exhausted"
+        code = boundary_code
         evidence = "confirmed"
     elif any(isinstance(item, ProseContinuationLimit) for item in chain):
         category = "context_or_budget"

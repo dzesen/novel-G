@@ -49,6 +49,10 @@ from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
+from backend.services.llm.pre_dispatch_boundaries import (
+    AttemptCapacityExceeded,
+    TokenBudgetExceeded,
+)
 from backend.services.generation.state_repair_contracts import (
     MAX_STATE_REPAIR_CARD_ID_LENGTH,
     MAX_STATE_REPAIR_CARD_IDS,
@@ -3283,6 +3287,8 @@ class ChapterCandidatePipeline:
         except ChapterCandidatePipelineBlocked as exc:
             if not exc.has_progress:
                 exc.attach_progress(trace.snapshot())
+            raise
+        except (TokenBudgetExceeded, AttemptCapacityExceeded):
             raise
         except Exception as exc:
             try:

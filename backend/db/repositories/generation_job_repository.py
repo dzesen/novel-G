@@ -17,6 +17,10 @@ from backend.db.errors import NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
+from backend.services.llm.pre_dispatch_boundaries import (
+    AttemptCapacityExceeded,
+    TokenBudgetExceeded,
+)
 from backend.services.generation.attempt_ledger_contracts import (
     MAX_PERSISTED_ATTEMPT_TOKENS,
     validate_launchable_attempt_ledgers,
@@ -167,10 +171,6 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         or revision > _MAX_NARRATIVE_REVISION
     ):
         raise ValueError("Generation job narrative revision cursor is invalid")
-
-
-class TokenBudgetExceeded(ValueError):
-    """A Provider dispatch would exceed the explicitly authorized token budget."""
 
 
 class TokenBudgetUnbounded(TokenBudgetExceeded):
@@ -343,10 +343,6 @@ def _execution_interruption_pipeline(
             }
         },
     ]
-
-
-class AttemptCapacityExceeded(ValueError):
-    """作业固定 attempt 容量或当前章节 reservation 已耗尽。"""
 
 
 class AttemptFenceExpired(AttemptCapacityExceeded):
