@@ -338,25 +338,13 @@ class AgentCapabilityApplication:
             profile=prepared.profile,
             target=AGENT_WORKFLOW_TARGETS["novel_direction"],
             schema=CreativeDirectionResult,
-            prompts=PromptPlan(
-                native_schema_prompt=_creative_direction_prompt(
-                    user_idea=request.user_idea,
-                    number_of_chapters=request.number_of_chapters,
-                    words_per_chapter=request.words_per_chapter,
-                    instruction=request.instruction,
-                    direction_count=request.direction_count,
-                    card_context=str(card_context["text"]) if card_context else "",
-                    json_only=False,
-                ),
-                prompt_json_prompt=_creative_direction_prompt(
-                    user_idea=request.user_idea,
-                    number_of_chapters=request.number_of_chapters,
-                    words_per_chapter=request.words_per_chapter,
-                    instruction=request.instruction,
-                    direction_count=request.direction_count,
-                    card_context=str(card_context["text"]) if card_context else "",
-                    json_only=True,
-                ),
+            prompts=creative_direction_prompt_plan(
+                user_idea=request.user_idea,
+                number_of_chapters=request.number_of_chapters,
+                words_per_chapter=request.words_per_chapter,
+                instruction=request.instruction,
+                direction_count=request.direction_count,
+                card_context=str(card_context["text"]) if card_context else "",
             ),
             **build_gen_kwargs(request),
         )
@@ -848,6 +836,37 @@ def _creative_direction_prompt(
 - 这些只是预览候选，不得声称已经创建、保存或修改小说。
 - framing 简要说明原始创意最值得保留的部分和当前最关键的选择。
 {suffix}""".strip()
+
+
+def creative_direction_prompt_plan(
+    *,
+    user_idea: str,
+    number_of_chapters: int,
+    words_per_chapter: int,
+    instruction: str,
+    direction_count: int,
+    card_context: str,
+) -> PromptPlan:
+    """Build the exact production prompt pair for card-driven direction work."""
+
+    values = {
+        "user_idea": user_idea,
+        "number_of_chapters": number_of_chapters,
+        "words_per_chapter": words_per_chapter,
+        "instruction": instruction,
+        "direction_count": direction_count,
+        "card_context": card_context,
+    }
+    return PromptPlan(
+        native_schema_prompt=_creative_direction_prompt(
+            **values,
+            json_only=False,
+        ),
+        prompt_json_prompt=_creative_direction_prompt(
+            **values,
+            json_only=True,
+        ),
+    )
 
 
 def _continuity_prompt(
