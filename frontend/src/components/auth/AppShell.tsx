@@ -26,25 +26,19 @@ export function AppShell({
   children: React.ReactNode;
   modal: React.ReactNode;
 }) {
-  const { phase, user } = useAuth();
+  const { phase } = useAuth();
   const pathname = usePathname();
   const router = useRouter();
   const locale = pathname.startsWith("/en") ? "en" : "zh";
   const loginPath = `/${locale}/login`;
   const isLogin = pathname === loginPath;
-  const settingsPath = `/${locale}/settings`;
-  const isForbiddenSettings = pathname.startsWith(settingsPath) && user?.role !== "admin";
 
   useEffect(() => {
     if ((phase === "setup" || phase === "unauthenticated") && !isLogin) {
       const safeNext = pathname.startsWith(`/${locale}`) ? pathname : `/${locale}`;
       router.replace(`${loginPath}?next=${encodeURIComponent(safeNext)}`);
     }
-    if (phase === "authenticated" && isForbiddenSettings) {
-      router.replace(`/${locale}`);
-    }
   }, [
-    isForbiddenSettings,
     isLogin,
     locale,
     loginPath,
@@ -55,9 +49,6 @@ export function AppShell({
 
   if (phase === "loading") return <LoadingScreen />;
   if ((phase === "setup" || phase === "unauthenticated") && !isLogin) {
-    return <LoadingScreen />;
-  }
-  if (phase === "authenticated" && isForbiddenSettings) {
     return <LoadingScreen />;
   }
   if (isLogin) {

@@ -43,12 +43,24 @@ class AgentProfile:
     visibility: str = "shared"
     editable: bool = False
 
+    @property
+    def public_label(self) -> str:
+        if self.origin == "builtin":
+            return self.label.replace(" Agent", "生成角色")
+        return self.label
+
+    @property
+    def public_instruction(self) -> str:
+        if self.origin == "builtin":
+            return self.instruction.replace(" Agent", "生成角色")
+        return self.instruction
+
     def public_view(self) -> dict[str, Any]:
         return {
             "agent_id": self.agent_id,
-            "label": self.label,
+            "label": self.public_label,
             "description": self.description,
-            "instruction": self.instruction,
+            "instruction": self.public_instruction,
             "capabilities": list(self.capabilities),
             "origin": self.origin,
             "owner_id": self.owner_id,
@@ -611,7 +623,7 @@ def get_agent_profile(agent_id: str) -> AgentProfile:
     try:
         return _AGENT_BY_ID[agent_id]
     except KeyError as exc:
-        raise ValueError(f"未知内置 Agent: {agent_id}") from exc
+        raise ValueError(f"未知内置生成角色: {agent_id}") from exc
 
 
 def get_agent_profiles(*, capability: str | None = None) -> tuple[AgentProfile, ...]:
@@ -657,7 +669,7 @@ class AgentOrchestrator:
                 raise ValueError("agent_id 或 profile 至少需要一个")
             profile = get_agent_profile(agent_id)
         if not profile.enabled:
-            raise ValueError(f"Agent 已停用: {profile.agent_id}")
+            raise ValueError(f"生成角色已停用: {profile.agent_id}")
 
         resolved_target: GenerationTarget = target
         if profile.provider_alias:

@@ -140,7 +140,7 @@ class AgentCapabilityApplication:
     @staticmethod
     def _require_actor(call: Any) -> Any:
         if call.actor is None:
-            raise ValueError("Agent capabilities require an authenticated actor")
+            raise ValueError("Generation capabilities require an authenticated actor")
         return call.actor
 
     @staticmethod
@@ -217,7 +217,7 @@ class AgentCapabilityApplication:
             )
         else:
             if not isinstance(request, AgentScopeRequest):
-                raise TypeError(f"unsupported Agent request: {type(request)!r}")
+                raise TypeError(f"unsupported generation request: {type(request)!r}")
             await access.require_owned_novel(actor, request.novel_id)
             profile = await catalog.resolve_profile(
                 actor,
@@ -251,7 +251,7 @@ class AgentCapabilityApplication:
                     volume_id=request.volume_id,
                 )
             else:
-                raise ValueError(f"unsupported Agent capability: {capability}")
+                raise ValueError(f"unsupported generation capability: {capability}")
 
         return PreparedAgentCapability(
             capability=capability,
@@ -269,9 +269,9 @@ class AgentCapabilityApplication:
         _call: Any,
     ) -> Any:
         if prepared.capability != capability:
-            raise ValueError("prepared Agent capability does not match execution")
+            raise ValueError("prepared generation capability does not match execution")
         if request.agent_id != prepared.profile.agent_id:
-            raise ValueError("Agent profile changed after capability planning")
+            raise ValueError("Generation role changed after capability planning")
         if capability == "scene_rewrite":
             return await self._execute_scene_rewrite(request, prepared)
         if capability == "novel_direction":
@@ -600,7 +600,7 @@ def _scoped_execution_plan(
                 ),
             ),
         )
-    raise ValueError(f"unsupported scoped Agent capability: {capability}")
+    raise ValueError(f"unsupported scoped generation capability: {capability}")
 
 
 def _canonical_result(capability: str, result: Any, context: Any) -> Any:

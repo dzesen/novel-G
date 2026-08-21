@@ -20,6 +20,7 @@ import type {
   GenerationRunsNavigationTarget,
   LeftoverProseRun,
 } from "../chapters/batch/batchTypes";
+import GenerationToolWorkspace from "../agents/GenerationToolWorkspace";
 
 interface ListResponse<T> {
   data: T[];
@@ -27,7 +28,7 @@ interface ListResponse<T> {
 
 type AutoBookView = Extract<
   WritingView,
-  "readiness" | "runs" | "generation-runs" | "diagnostics"
+  "readiness" | "runs" | "generation-runs" | "diagnostics" | "retrospective"
 >;
 
 export interface AutoBookStartRequest {
@@ -70,6 +71,7 @@ const AUTO_BOOK_VIEWS: AutoBookView[] = [
   "runs",
   "generation-runs",
   "diagnostics",
+  "retrospective",
 ];
 
 export default function AutoBookWorkspace({
@@ -176,6 +178,31 @@ export default function AutoBookWorkspace({
     [onTargetValidation],
   );
 
+  const viewNav = (
+    <nav
+      aria-label={t("viewAria")}
+      className="flex min-w-0 gap-1 overflow-x-auto border-b border-border pb-2"
+    >
+      {AUTO_BOOK_VIEWS.map((item) => (
+        <button
+          key={item}
+          type="button"
+          onClick={() => onNavigateView(item)}
+          aria-current={view === item ? "page" : undefined}
+          className={[
+            "min-h-9 shrink-0 rounded-md px-3 text-xs font-medium transition-colors",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+            view === item
+              ? "bg-accent/10 text-accent"
+              : "text-muted hover:bg-surface-secondary hover:text-foreground",
+          ].join(" ")}
+        >
+          {t(`views.${item}`)}
+        </button>
+      ))}
+    </nav>
+  );
+
   if (view === "generation-runs" || view === "diagnostics") {
     return (
       <GenerationRunsWorkspace
@@ -208,6 +235,28 @@ export default function AutoBookWorkspace({
     );
   }
 
+  if (view === "retrospective") {
+    return (
+      <div className="flex h-full min-h-0 flex-col bg-background">
+        <div className="shrink-0 px-4 pt-4 sm:px-6">{viewNav}</div>
+        <div className="min-h-0 flex-1">
+          <GenerationToolWorkspace
+            novelId={novelId}
+            tools={["retrospective"]}
+            initialVolumeId={targets.volume ?? selectedVolumeId ?? undefined}
+            onScopeTargetChange={({ volume }) =>
+              onNavigateView(
+                "retrospective",
+                { volume, chapter: undefined },
+                true,
+              )
+            }
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-full min-h-0 overflow-y-auto bg-background">
       <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 sm:py-7">
@@ -228,28 +277,7 @@ export default function AutoBookWorkspace({
           </div>
         </div>
 
-        <nav
-          aria-label={t("viewAria")}
-          className="mt-4 flex min-w-0 gap-1 overflow-x-auto border-b border-border pb-2"
-        >
-          {AUTO_BOOK_VIEWS.map((item) => (
-            <button
-              key={item}
-              type="button"
-              onClick={() => onNavigateView(item)}
-              aria-current={view === item ? "page" : undefined}
-              className={[
-                "min-h-9 shrink-0 rounded-md px-3 text-xs font-medium transition-colors",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
-                view === item
-                  ? "bg-accent/10 text-accent"
-                  : "text-muted hover:bg-surface-secondary hover:text-foreground",
-              ].join(" ")}
-            >
-              {t(`views.${item}`)}
-            </button>
-          ))}
-        </nav>
+        <div className="mt-4">{viewNav}</div>
 
         <section className="py-5" aria-labelledby="auto-book-start-title">
           <div className="flex flex-wrap items-end gap-3">

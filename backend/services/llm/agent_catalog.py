@@ -53,7 +53,7 @@ class AgentCatalog:
         for definition in list_public_capability_definitions():
             if definition.capability == capability:
                 return definition
-        raise ValueError(f"未知 Agent 能力: {capability}")
+        raise ValueError(f"未知生成角色能力: {capability}")
 
     @staticmethod
     def list_provider_options() -> list[dict[str, str]]:
@@ -103,10 +103,10 @@ class AgentCatalog:
             profile = self._profile_from_document(document, actor)
         if capability and capability not in profile.capabilities:
             raise ValueError(
-                f"Agent '{agent_id}' 不支持能力 '{capability}'"
+                f"生成角色 '{agent_id}' 不支持能力 '{capability}'"
             )
         if not profile.enabled:
-            raise ValueError(f"Agent 已停用: {agent_id}")
+            raise ValueError(f"生成角色已停用: {agent_id}")
         return profile
 
     async def create_profile(
@@ -200,13 +200,13 @@ class AgentCatalog:
         capability = source.capabilities[0]
         definition = self.get_capability(capability)
         if not definition.customizable:
-            raise ValueError(f"能力 '{capability}' 不允许创建自定义 Agent")
+            raise ValueError(f"能力 '{capability}' 不允许创建自定义生成角色")
         return await self.create_profile(
             actor,
-            label=(label or f"{source.label} 副本").strip(),
+            label=(label or f"{source.public_label} 副本").strip(),
             description=source.description,
             capability=capability,
-            instruction=source.instruction,
+            instruction=source.public_instruction,
             provider_alias=source.provider_alias,
             generation_params=dict(source.generation_params),
             visibility="private",
@@ -223,9 +223,9 @@ class AgentCatalog:
                 agent_id=agent_id,
             )
             if not deleted:
-                raise NotFoundError(f"Editable Agent '{agent_id}' was not found")
+                raise NotFoundError(f"Editable generation role '{agent_id}' was not found")
             return
-        raise ValueError("内置 Agent 不能删除；可复制为自定义 Agent 后编辑")
+        raise ValueError("内置生成角色不能删除；可复制为自定义生成角色后编辑")
 
     def _validate_editable_definition(
         self,
@@ -241,20 +241,20 @@ class AgentCatalog:
     ) -> None:
         definition = self.get_capability(capability)
         if not definition.customizable:
-            raise ValueError(f"能力 '{capability}' 不允许创建自定义 Agent")
+            raise ValueError(f"能力 '{capability}' 不允许创建自定义生成角色")
         if not 2 <= len(label.strip()) <= 64:
-            raise ValueError("Agent 名称长度必须为 2 到 64 个字符")
+            raise ValueError("生成角色名称长度必须为 2 到 64 个字符")
         if len(description.strip()) > 500:
-            raise ValueError("Agent 说明不能超过 500 个字符")
+            raise ValueError("生成角色说明不能超过 500 个字符")
         if not 20 <= len(instruction.strip()) <= MAX_CUSTOM_AGENT_INSTRUCTION_CHARS:
             raise ValueError(
-                "Agent 指令长度必须为 20 到 "
+                "生成角色指令长度必须为 20 到 "
                 f"{MAX_CUSTOM_AGENT_INSTRUCTION_CHARS} 个字符"
             )
         if visibility not in {"private", "shared"}:
-            raise ValueError("Agent 可见性无效")
+            raise ValueError("生成角色可见性无效")
         if visibility == "shared" and not actor.is_admin:
-            raise ValueError("只有管理员可以创建共享 Agent")
+            raise ValueError("只有管理员可以创建共享生成角色")
         if provider_alias:
             aliases = {item["alias"] for item in self.list_provider_options()}
             if provider_alias.strip() not in aliases:
@@ -268,7 +268,7 @@ class AgentCatalog:
         unknown = set(values) - _GENERATION_PARAM_KEYS
         if unknown:
             raise ValueError(
-                f"不支持的 Agent 生成参数: {', '.join(sorted(unknown))}"
+                f"不支持的生成角色参数: {', '.join(sorted(unknown))}"
             )
         cleaned = {
             key: value

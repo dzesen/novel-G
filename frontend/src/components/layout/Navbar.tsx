@@ -30,7 +30,10 @@ export default function Navbar() {
   };
 
   const goSettings = () => {
-    router.push(`/${currentLocale}/settings`, { scroll: false });
+    const section = user?.role === "admin"
+      ? ""
+      : "?section=generation-roles";
+    router.push(`/${currentLocale}/settings${section}`, { scroll: false });
   };
 
   const goHome = () => {
@@ -138,7 +141,7 @@ export default function Navbar() {
             </button>
           )}
 
-          {user?.role === "admin" && (
+          {user && (
             <button
               onClick={goSettings}
               className="w-9 h-9 rounded-lg flex items-center justify-center text-muted hover:text-foreground hover:bg-surface-secondary border border-transparent hover:border-border transition-all duration-200"

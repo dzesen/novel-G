@@ -36,7 +36,7 @@ interface SaveConfigOptions {
   missingConfirmationTokenMessage: string;
 }
 
-export function useConfig() {
+export function useConfig(enabled = true) {
   const [pendingProviderCommands, setPendingProviderCommands] = useState<ProviderCommand[]>([]);
   const [state, setState] = useState<ConfigState>({
     config: null, workflowCatalog: [], revision: "", imagePipelineStatuses: [],
@@ -50,6 +50,7 @@ export function useConfig() {
   }, []);
 
   const fetchConfig = useCallback(async () => {
+    if (!enabled) return null;
     setState((current) => ({ ...current, loading: true, error: null }));
     const catalogPromise = apiGet<WorkflowDefinition[]>("/api/config/workflows").catch(() => []);
     try {
@@ -71,7 +72,7 @@ export function useConfig() {
       }));
       return null;
     }
-  }, []);
+  }, [enabled]);
 
   const saveConfig = useCallback(async (
     data: AppConfig,
@@ -111,10 +112,13 @@ export function useConfig() {
     }
   }, [pendingProviderCommands, state.revision, state.workflowCatalog]);
 
-  useEffect(() => { void fetchConfig(); }, [fetchConfig]);
+  useEffect(() => {
+    if (enabled) void fetchConfig();
+  }, [enabled, fetchConfig]);
 
   return {
     ...state,
+    loading: enabled && state.loading,
     imageProvidersDirty: state.config !== null && (
       fingerprintImageProviders(state.config) !== state.savedImageProvidersFingerprint
     ),

@@ -184,9 +184,9 @@ class AgentRevisionProposalService:
         try:
             source = items[source_index]
         except (IndexError, TypeError) as exc:
-            raise ValueError("Selected Agent result no longer exists") from exc
+            raise ValueError("Selected generation-role result no longer exists") from exc
         if not isinstance(source, dict):
-            raise ValueError("Selected Agent result is malformed")
+            raise ValueError("Selected generation-role result is malformed")
         return deepcopy(source)
 
     @staticmethod
@@ -299,7 +299,7 @@ class AgentRevisionProposalService:
         scope = snapshot.get("scope")
         if scope == "chapter":
             if str(target_document.get("_id")) != str(snapshot.get("chapter_id")):
-                raise ValueError("Target chapter is outside the Agent run scope")
+                raise ValueError("Target chapter is outside the generation-role run scope")
         elif scope == "volume":
             target_volume_id = (
                 str(target_document.get("_id"))
@@ -307,7 +307,7 @@ class AgentRevisionProposalService:
                 else str(target_document.get("volume_id"))
             )
             if target_volume_id != str(snapshot.get("volume_id")):
-                raise ValueError("Target asset is outside the Agent run scope")
+                raise ValueError("Target asset is outside the generation-role run scope")
 
     async def create(
         self,
@@ -322,14 +322,14 @@ class AgentRevisionProposalService:
     ) -> dict[str, Any]:
         run = await self.run_store.get_owned(actor_id=actor_id, run_id=run_id)
         if str(run.get("novel_id")) != str(novel_id):
-            raise ValueError("Agent run belongs to another novel")
+            raise ValueError("Generation-role run belongs to another novel")
         if run.get("status") != "completed":
-            raise RevisionProposalConflict("Agent run is not completed")
+            raise RevisionProposalConflict("Generation-role run is not completed")
         snapshot = run.get("context_snapshot") or {}
         captured_revision = int(snapshot.get("narrative_revision") or 0)
         if await narrative_revision_store.current(novel_id) != captured_revision:
             raise StaleRevisionProposal(
-                "小说内容已在 Agent 运行后发生变化，请重新运行 Agent"
+                "小说内容已在生成角色运行后发生变化，请重新运行生成角色"
             )
 
         source = self._source_from_run(run, source_kind, source_index)
@@ -388,7 +388,7 @@ class AgentRevisionProposalService:
         )
         if document is None:
             raise NotFoundError(
-                f"Agent revision proposal '{proposal_id}' was not found"
+                f"Revision proposal '{proposal_id}' was not found"
             )
         return document
 
@@ -446,7 +446,7 @@ class AgentRevisionProposalService:
         )
         if proposal is None:
             raise NotFoundError(
-                f"Agent revision proposal '{proposal_id}' was not found"
+                f"Revision proposal '{proposal_id}' was not found"
             )
         if proposal.get("status") == "applied":
             return {

@@ -19,6 +19,8 @@ import { StateBackfillPanel } from "../chapters/state/StateBackfillPanel";
 import StateCompletenessAuditPanel from "../chapters/state/StateCompletenessAuditPanel";
 import PlotThreadWorkspace from "../plot-threads/PlotThreadWorkspace";
 import StoryHealthWorkspace from "../story-health/StoryHealthWorkspace";
+import GenerationToolWorkspace from "../agents/GenerationToolWorkspace";
+import AgentRevisionWorkspace from "../agents/AgentRevisionWorkspace";
 
 interface ContinuityWorkspaceProps {
   novelId: string;
@@ -29,7 +31,7 @@ interface ContinuityWorkspaceProps {
     targets?: WritingRouteTargets,
     replace?: boolean,
   ) => void;
-  onOpenWriting: (chapterId: string) => void;
+  onOpenWriting: (chapterId: string, sceneIndex?: number) => void;
   onTargetValidation: (
     key: WritingTargetKey,
     value: string,
@@ -133,21 +135,21 @@ export default function ContinuityWorkspace({
   const chapterTarget = useOwnedTarget<ChapterDetail>({
     novelId,
     targetKey: "chapter",
-    targetId: targets.chapter,
+    targetId: view === "reviews" ? undefined : targets.chapter,
     path: chapterPath,
     onTargetValidation,
   });
   const volumeTarget = useOwnedTarget<VolumeSummary>({
     novelId,
     targetKey: "volume",
-    targetId: targets.volume,
+    targetId: view === "reviews" ? undefined : targets.volume,
     path: volumePath,
     onTargetValidation,
   });
   const runTarget = useOwnedTarget<AgentRun, { run: AgentRun }>({
     novelId,
     targetKey: "run",
-    targetId: targets.run,
+    targetId: view === "review-history" ? targets.run : undefined,
     path: runPath,
     selectRecord: selectAgentRun,
     onTargetValidation,
@@ -176,6 +178,8 @@ export default function ContinuityWorkspace({
       { view: "state-issues", label: t("views.stateIssues") },
       { view: "facts", label: t("views.facts") },
       { view: "threads", label: t("views.threads") },
+      { view: "reviews", label: t("views.reviews") },
+      { view: "review-history", label: t("views.reviewHistory") },
     ],
     [t],
   );
@@ -231,6 +235,57 @@ export default function ContinuityWorkspace({
   }
 
   const content = (() => {
+    if (view === "reviews") {
+      return (
+        <GenerationToolWorkspace
+          novelId={novelId}
+          tools={["continuity", "style"]}
+          initialVolumeId={targets.volume}
+          initialChapterId={targets.chapter}
+          onTargetValidation={onTargetValidation}
+          onScopeTargetChange={(nextTargets) =>
+            onNavigateView("reviews", nextTargets, true)
+          }
+          onOpenHistory={(runId) =>
+            onNavigateView("review-history", { run: runId })
+          }
+          onNavigateReference={(reference) => {
+            if (reference.kind === "fact") {
+              onNavigateView("facts", {
+                chapter: reference.chapter_id,
+                issue: reference.fact_id,
+              });
+            } else if (reference.kind === "thread") {
+              onNavigateView("threads", {
+                chapter: reference.chapter_id,
+                issue: reference.thread_id,
+              });
+            } else if (reference.chapter_id) {
+              onOpenWriting(reference.chapter_id, reference.scene_index);
+            }
+          }}
+        />
+      );
+    }
+    if (view === "review-history") {
+      return (
+        <div className="h-full overflow-y-auto bg-surface-secondary/40 p-4 md:p-6">
+          <div className="mx-auto max-w-7xl">
+            <AgentRevisionWorkspace
+              novelId={novelId}
+              volumes={[]}
+              chapters={[]}
+              source={null}
+              onClearSource={() => undefined}
+              initialRunId={targets.run}
+              initialRun={
+                runTarget.status === "ready" ? runTarget.data : undefined
+              }
+            />
+          </div>
+        </div>
+      );
+    }
     if (view === "facts") {
       return (
         <CharacterMemoryWorkspace

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { useConfig } from "@/hooks/useConfig";
+import { useAuth } from "@/components/auth/AuthProvider";
 import { DatabaseCard } from "@/components/settings/DatabaseCard";
 import { ProviderCard } from "@/components/settings/ProviderCard";
 import { ImageProviderCard } from "@/components/settings/ImageProviderCard";
@@ -11,11 +12,19 @@ import { WorkflowCard } from "@/components/settings/WorkflowCard";
 import { ThemeCard } from "@/components/settings/ThemeCard";
 import { BackupCard } from "@/components/settings/BackupCard";
 import { UserManagementCard } from "@/components/settings/UserManagementCard";
+import GenerationRoleSettings from "@/components/settings/GenerationRoleSettings";
 import { validateConfig } from "@/lib/validation";
 import type { AppConfig } from "@/types/config";
-import { useRouter, usePathname } from "next/navigation";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 
-type SettingsSection = "theme" | "users" | "database" | "backup" | "provider" | "workflow";
+type SettingsSection =
+  | "theme"
+  | "users"
+  | "database"
+  | "backup"
+  | "provider"
+  | "workflow"
+  | "generation-roles";
 type ProviderSettingsTab = "llm" | "image";
 
 const NAV_ITEMS: { key: SettingsSection; icon: React.ReactNode }[] = [
@@ -69,6 +78,16 @@ const NAV_ITEMS: { key: SettingsSection; icon: React.ReactNode }[] = [
     ),
   },
   {
+    key: "generation-roles",
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="9" cy="8" r="4" />
+        <path d="M3 21v-2a6 6 0 0 1 12 0v2" />
+        <path d="m18 3 .7 1.8L21 5.5l-2.3.7L18 8l-.7-1.8L15 5.5l2.3-.7z" />
+      </svg>
+    ),
+  },
+  {
     key: "workflow",
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -89,11 +108,24 @@ export default function SettingsContent({
   presentation = "page",
 }: SettingsContentProps) {
   const t = useTranslations("settings");
+  const { user } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
+  const searchParams = useSearchParams();
   const currentLocale = pathname.startsWith("/en") ? "en" : "zh";
   const isModal = presentation === "modal";
-  const [activeSection, setActiveSection] = useState<SettingsSection>("theme");
+  const isAdmin = user?.role === "admin";
+  const availableNavItems = isAdmin
+    ? NAV_ITEMS
+    : NAV_ITEMS.filter((item) => item.key === "generation-roles");
+  const requestedSection = searchParams.get("section");
+  const activeSection = availableNavItems.some(
+    (item) => item.key === requestedSection,
+  )
+    ? requestedSection as SettingsSection
+    : isAdmin
+      ? "theme"
+      : "generation-roles";
   const [providerSettingsTab, setProviderSettingsTab] = useState<ProviderSettingsTab>("llm");
   const showConfigActions = ["database", "provider", "workflow"].includes(activeSection);
   const {
@@ -111,7 +143,20 @@ export default function SettingsContent({
     workflowCatalog,
     setConfig,
     clearMessages,
-  } = useConfig();
+  } = useConfig(isAdmin);
+
+  useEffect(() => {
+    if (!user || isAdmin || requestedSection === "generation-roles") return;
+    const next = new URLSearchParams(searchParams.toString());
+    next.set("section", "generation-roles");
+    window.history.replaceState(null, "", `${pathname}?${next.toString()}`);
+  }, [isAdmin, pathname, requestedSection, searchParams, user]);
+
+  const selectSection = (section: SettingsSection) => {
+    const next = new URLSearchParams(searchParams.toString());
+    next.set("section", section);
+    window.history.replaceState(null, "", `${pathname}?${next.toString()}`);
+  };
 
   useEffect(() => {
     if (!isModal) return;
@@ -236,6 +281,9 @@ export default function SettingsContent({
   const renderSectionContent = () => {
     if (activeSection === "users") return <UserManagementCard />;
     if (activeSection === "backup") return <BackupCard />;
+    if (activeSection === "generation-roles") {
+      return <GenerationRoleSettings />;
+    }
     if (!config) return null;
     switch (activeSection) {
       case "theme":
@@ -316,10 +364,10 @@ export default function SettingsContent({
       ? "flex w-full shrink-0 gap-1 overflow-x-auto border-b border-border bg-surface-secondary/40 px-2 py-2 md:w-52 md:flex-col md:overflow-y-auto md:border-b-0 md:border-r md:py-3"
       : "flex w-full shrink-0 gap-1 overflow-x-auto rounded-lg border border-border bg-surface p-2 md:w-56 md:flex-col md:p-3"
     }>
-      {NAV_ITEMS.map((item) => (
+      {availableNavItems.map((item) => (
         <button
           key={item.key}
-          onClick={() => setActiveSection(item.key)}
+          onClick={() => selectSection(item.key)}
           className={`flex shrink-0 items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors md:shrink ${
             activeSection === item.key
               ? "bg-accent/10 font-medium text-accent"
@@ -327,7 +375,11 @@ export default function SettingsContent({
           }`}
         >
           <span className="shrink-0">{item.icon}</span>
-          <span className="truncate">{t(`${item.key}.title`)}</span>
+          <span className="truncate">
+            {item.key === "generation-roles"
+              ? t("generationRoles.title")
+              : t(`${item.key}.title`)}
+          </span>
         </button>
       ))}
     </nav>
@@ -348,11 +400,17 @@ export default function SettingsContent({
     </>
   );
 
-  const body = loading && activeSection !== "theme" && activeSection !== "users" && activeSection !== "backup" ? (
+  const configIndependent = [
+    "theme",
+    "users",
+    "backup",
+    "generation-roles",
+  ].includes(activeSection);
+  const body = loading && !configIndependent ? (
     <div className="flex flex-1 items-center justify-center">
       <div className="text-muted">Loading...</div>
     </div>
-  ) : !config && activeSection !== "theme" && activeSection !== "users" && activeSection !== "backup" ? (
+  ) : !config && !configIndependent ? (
     <div className="flex flex-1 items-center justify-center">
       <div className="text-muted">{error || "Failed to load"}</div>
     </div>

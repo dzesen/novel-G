@@ -124,11 +124,14 @@ async def _stage_upload(
                 raise HTTPException(
                     status_code=400,
                     detail={
+                        # Stable compatibility code: older clients still key on
+                        # the retired Studio name even though the destination is
+                        # now global generation-role settings.
                         "code": "generation_preset_requires_agent_studio",
                         "path": "$",
                         "message": (
                             "这是生成预设，不是世界书或角色卡；"
-                            "请到 Agent 工作台的管理页导入。"
+                            "请到全局设置的生成角色页导入。"
                         ),
                     },
                 )

@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
 import { ApiError, apiPost, apiPostForm, apiPostRaw } from "@/lib/api";
@@ -8,7 +10,10 @@ import {
   CardAvatarSourceUnavailable,
   isPermanentCardAvatarTransferFailure,
 } from "@/lib/cardAvatarTransfer";
-import { cardImportErrorMessage } from "@/lib/cardImportErrors";
+import {
+  cardImportErrorMessage,
+  isGenerationPresetRoutingError,
+} from "@/lib/cardImportErrors";
 import type {
   CardImportCandidate,
   CardImportConflict,
@@ -822,6 +827,8 @@ function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
   const t = useTranslations("writing.referenceCards.import");
   const tm = useTranslations("interopErrors.missingCharacterMetadata");
   const tp = useTranslations("interopErrors.generationPreset");
+  const pathname = usePathname();
+  const locale = pathname.startsWith("/en") ? "en" : "zh";
   return (
     <section
       aria-labelledby="card-import-rejections"
@@ -865,10 +872,18 @@ function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
                     metadataStripped: tm("metadataStripped"),
                     otherTextMetadata: (keywords) =>
                       tm("otherTextMetadata", { keywords }),
-                    generationPreset: tp("requiresAgentStudio"),
+                    generationPreset: tp("requiresGenerationRoles"),
                   },
                 )}
               </p>
+              {isGenerationPresetRoutingError(failure.error) && (
+                <Link
+                  href={`/${locale}/settings?section=generation-roles`}
+                  className="mt-2 inline-flex min-h-9 items-center text-xs font-semibold text-red-900 underline underline-offset-4 dark:text-red-100"
+                >
+                  {tp("openSettings")}
+                </Link>
+              )}
               {detail && (
                 <dl className="mt-2 grid gap-2 text-xs text-red-800 dark:text-red-200 sm:grid-cols-3">
                   <div>

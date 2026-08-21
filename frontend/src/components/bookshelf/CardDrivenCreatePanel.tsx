@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { Button, Card } from "@heroui/react";
@@ -11,7 +12,10 @@ import {
   deleteCardAvatarHandoffs,
   stageCardAvatarHandoff,
 } from "@/lib/cardAvatarHandoff";
-import { cardImportErrorMessage } from "@/lib/cardImportErrors";
+import {
+  cardImportErrorMessage,
+  isGenerationPresetRoutingError,
+} from "@/lib/cardImportErrors";
 import { createGeneratedWritingDraft } from "@/lib/novelCreationDraft";
 import { saveWritingDraft } from "@/lib/writingDraft";
 import type {
@@ -117,6 +121,7 @@ export default function CardDrivenCreatePanel({
   const [uploading, setUploading] = useState(false);
   const [redirecting, setRedirecting] = useState(false);
   const [error, setError] = useState("");
+  const [generationPresetRouting, setGenerationPresetRouting] = useState(false);
   const [page, setPage] = useState(0);
 
   const allCandidates = useMemo(
@@ -162,6 +167,7 @@ export default function CardDrivenCreatePanel({
   };
 
   const handlePreview = async () => {
+    setGenerationPresetRouting(false);
     if (characterFiles.length === 0) {
       setError(t("characterRequired"));
       return;
@@ -223,13 +229,14 @@ export default function CardDrivenCreatePanel({
       ).catch(() => undefined);
       const fallback =
         cause instanceof Error ? cause.message : t("previewFailed");
+      setGenerationPresetRouting(isGenerationPresetRoutingError(cause));
       setError(
         cardImportErrorMessage(cause, fallback, {
           aiGeneratedIllustration: tm("aiGeneratedIllustration"),
           metadataStripped: tm("metadataStripped"),
           otherTextMetadata: (keywords) =>
             tm("otherTextMetadata", { keywords }),
-          generationPreset: tp("requiresAgentStudio"),
+          generationPreset: tp("requiresGenerationRoles"),
         }),
       );
     } finally {
@@ -378,12 +385,20 @@ export default function CardDrivenCreatePanel({
               </div>
 
               {error && (
-                <p
+                <div
                   role="alert"
                   className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/30 dark:text-red-300"
                 >
-                  {error}
-                </p>
+                  <p>{error}</p>
+                  {generationPresetRouting && (
+                    <Link
+                      href={`/${locale}/settings?section=generation-roles`}
+                      className="mt-2 inline-flex min-h-9 items-center font-semibold underline underline-offset-4"
+                    >
+                      {tp("openSettings")}
+                    </Link>
+                  )}
+                </div>
               )}
 
               <Button

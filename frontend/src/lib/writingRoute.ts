@@ -1,7 +1,20 @@
 export const WRITING_AREA_VIEWS = {
-  blueprint: ["overview", "orientation", "story", "volumes", "chapters"],
+  blueprint: [
+    "overview",
+    "orientation",
+    "story",
+    "volumes",
+    "chapters",
+    "inspiration",
+  ],
   writing: ["chapter", "revision", "agent-suggestion"],
-  "auto-book": ["readiness", "runs", "generation-runs", "diagnostics"],
+  "auto-book": [
+    "readiness",
+    "runs",
+    "generation-runs",
+    "diagnostics",
+    "retrospective",
+  ],
   world: ["library", "factions", "relationships", "curation", "candidates"],
   continuity: [
     "overview",
@@ -10,6 +23,8 @@ export const WRITING_AREA_VIEWS = {
     "health",
     "state-issues",
     "proposals",
+    "reviews",
+    "review-history",
   ],
 } as const;
 
@@ -130,6 +145,7 @@ const LEGACY_VIEW_ROUTES: Record<
   "novel-info": { area: "blueprint", view: "overview" },
   "chapter-editor": { area: "writing", view: "chapter" },
   "agent-studio": { area: "writing", view: "revision" },
+  "agent-suggestion": { area: "continuity", view: "review-history" },
   "reference-cards": { area: "world", view: "library" },
   "faction-cards": { area: "world", view: "factions" },
   "relationship-map": { area: "world", view: "relationships" },
@@ -162,6 +178,7 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
     story: [],
     volumes: ["volume"],
     chapters: ["volume", "chapter"],
+    inspiration: ["volume", "chapter"],
   },
   writing: {
     chapter: ["volume", "chapter", "scene", "run", "visual"],
@@ -173,6 +190,7 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
     runs: ["volume", "job"],
     "generation-runs": ["chapter", "job", "event", "run"],
     diagnostics: ["chapter", "job", "event"],
+    retrospective: ["volume"],
   },
   world: {
     library: ["cardType", "card"],
@@ -188,6 +206,8 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
     health: ["volume", "chapter", "issue"],
     "state-issues": ["volume", "chapter", "issue", "run"],
     proposals: ["chapter", "issue", "run", "suggestion"],
+    reviews: ["volume", "chapter"],
+    "review-history": ["run", "suggestion"],
   },
 };
 
@@ -437,6 +457,23 @@ export function resolveWritingRoute(
 
   const requestedView =
     search.get("view") ?? WRITING_AREA_DEFAULT_VIEWS[requestedArea];
+  if (requestedArea === "writing" && requestedView === "agent-suggestion") {
+    const area = "continuity";
+    const view = "review-history";
+    const targetFailure = invalidTargetFromSearch(search, area, view);
+    if (targetFailure?.kind === "target") {
+      return invalidRouteTarget(area, targetFailure);
+    }
+    return resolveRoute(
+      {
+        area,
+        view,
+        targets: collectTargets(search, area, view),
+      },
+      "legacy",
+      search,
+    );
+  }
   if (!isWritingView(requestedArea, requestedView)) {
     return invalid(
       {

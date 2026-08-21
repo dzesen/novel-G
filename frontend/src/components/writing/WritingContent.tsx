@@ -33,7 +33,8 @@ import type { ProseRunSnapshot } from "./chapters/prose/useProseStream";
 import AutoBookWorkspace, {
   type AutoBookStartRequest,
 } from "./auto-book/AutoBookWorkspace";
-import AgentStudioWorkspace from "./agents/AgentStudioWorkspace";
+import GenerationToolWorkspace from "./agents/GenerationToolWorkspace";
+import AgentStudioMigration from "./agents/AgentStudioMigration";
 import WorldWorkspace from "./world/WorldWorkspace";
 import ContinuityWorkspace from "./continuity/ContinuityWorkspace";
 
@@ -393,7 +394,10 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
 
   const writingTabs: WorkspaceViewTab[] = [
     { view: "chapter", label: t("views.chapter") },
-    { view: "revision", label: t("views.revision") },
+  ];
+  const blueprintTabs: WorkspaceViewTab[] = [
+    { view: "overview", label: t("areas.blueprint.short") },
+    { view: "inspiration", label: t("views.inspiration") },
   ];
 
   const renderWorkspace = () => {
@@ -409,6 +413,23 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     }
 
     if (route.area === "blueprint") {
+      if (route.view === "inspiration") {
+        return (
+          <GenerationToolWorkspace
+            novelId={novelId}
+            tools={["creative"]}
+            initialVolumeId={route.targets.volume}
+            initialChapterId={route.targets.chapter}
+            onTargetValidation={validateLocatedTarget}
+            onScopeTargetChange={(targets) =>
+              navigateView("blueprint", "inspiration", targets, true)
+            }
+            onOpenHistory={(runId) =>
+              navigateView("continuity", "review-history", { run: runId })
+            }
+          />
+        );
+      }
       return <NovelInfoWorkspace mode="edit" novelId={novelId} />;
     }
 
@@ -467,30 +488,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         );
       }
       return (
-        <AgentStudioWorkspace
-          mode="edit"
-          novelId={novelId}
-          onNavigateReference={(reference) => {
-            if (reference.kind === "fact") {
-              navigateView("continuity", "facts", {
-                chapter: reference.chapter_id,
-                issue: reference.fact_id,
-              });
-            } else if (reference.kind === "thread") {
-              navigateView("continuity", "threads", {
-                chapter: reference.chapter_id,
-                issue: reference.thread_id,
-              });
-            } else {
-              navigateView("writing", "chapter", {
-                chapter: reference.chapter_id,
-                scene:
-                  reference.scene_index === undefined
-                    ? undefined
-                    : String(reference.scene_index),
-              });
-            }
-          }}
+        <AgentStudioMigration
+          locale={pathname.startsWith("/en") ? "en" : "zh"}
+          onNavigate={(area, view) => navigateView(area, view)}
         />
       );
     }
@@ -499,7 +499,12 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
       return (
         <AutoBookWorkspace
           novelId={novelId}
-          view={route.view as "readiness" | "runs" | "generation-runs" | "diagnostics"}
+          view={route.view as
+            | "readiness"
+            | "runs"
+            | "generation-runs"
+            | "diagnostics"
+            | "retrospective"}
           targets={route.targets}
           startRequest={autoBookStartRequest}
           onStartRequestConsumed={consumeAutoBookStart}
@@ -538,7 +543,13 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         onNavigateView={(view, targets, replace) =>
           navigateView("continuity", view, targets, replace)
         }
-        onOpenWriting={(chapterId) => openWriting(chapterId)}
+        onOpenWriting={(chapterId, sceneIndex) =>
+          navigateView("writing", "chapter", {
+            chapter: chapterId,
+            scene:
+              sceneIndex === undefined ? undefined : String(sceneIndex),
+          })
+        }
         onTargetValidation={validateLocatedTarget}
       />
     );
@@ -551,7 +562,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
         novelTitle={novel?.title ?? t("untitled")}
         onSelectArea={navigateArea}
       />
-      {route.area === "writing" && !invalidTarget && !runtimeInvalidTarget && (
+      {route.area === "blueprint" && !invalidTarget && !runtimeInvalidTarget && (
+        <WorkspaceViewTabs
+          label={t("viewAria")}
+          activeView={
+            route.view === "inspiration" ? "inspiration" : "overview"
+          }
+          tabs={blueprintTabs}
+          onSelect={(view) => navigateView("blueprint", view)}
+        />
+      )}
+      {route.area === "writing" && route.view === "chapter" && !invalidTarget && !runtimeInvalidTarget && (
         <WorkspaceViewTabs
           label={t("viewAria")}
           activeView={route.view}

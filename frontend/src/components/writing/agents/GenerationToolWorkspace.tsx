@@ -1,179 +1,97 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 
-import { useAuth } from "@/components/auth/AuthProvider";
-import { apiDelete, apiGet, apiPost, apiPut } from "@/lib/api";
-import {
-  constrainIllustrationPromptEdit,
-  ILLUSTRATION_FIELD_LIMITS,
-  ILLUSTRATION_TOTAL_LIMIT,
-  illustrationPromptCharacterCount,
-} from "@/lib/illustrationPrompt";
-import {
-  MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
-  MAX_CUSTOM_AGENT_OUTPUT_TOKENS,
-} from "@/lib/generationPreset";
+import { apiGet, apiPost } from "@/lib/api";
 import type {
-  AgentCapability,
-  AgentCapabilityId,
+  WritingTargetKey,
+  WritingTargetValidationSource,
+} from "@/lib/writingRoute";
+import type {
   AgentProfile,
-  AgentProviderOption,
   AgentScope,
   AgentToolMetadata,
   ContinuityEvidenceReference,
   ContinuityReviewResult,
   CreativeInspirationResult,
-  IllustrationPromptResult,
   StyleConsistencyResult,
   VolumeRetrospectiveResult,
 } from "@/types/agent";
 import type {
   ChapterSummary,
-  ReferenceCard,
   VolumeSummary,
 } from "@/types/novel";
 import AgentRevisionWorkspace, {
   type AgentRevisionSourceSelection,
 } from "./AgentRevisionWorkspace";
-import GenerationPresetImportDialog, {
-  type ImportedGenerationPresetDraft,
-} from "./GenerationPresetImportDialog";
 import { contextSectionKind } from "../generationMetadataPresentation";
 
 interface Props {
-  mode: "create" | "edit";
-  novelId?: string;
+  novelId: string;
+  tools: readonly ContextualToolTab[];
+  initialVolumeId?: string;
+  initialChapterId?: string;
+  onTargetValidation?: (
+    key: WritingTargetKey,
+    value: string,
+    valid: boolean,
+    source?: WritingTargetValidationSource,
+  ) => void;
+  onScopeTargetChange?: (targets: {
+    volume: string | undefined;
+    chapter: string | undefined;
+  }) => void;
+  onOpenHistory?: (runId: string) => void;
   onNavigateReference?: (reference: ContinuityEvidenceReference) => void;
 }
 
-type StudioTab =
+export type ContextualToolTab =
   | "creative"
   | "continuity"
   | "style"
-  | "illustration"
-  | "retrospective"
-  | "history"
-  | "management";
+  | "retrospective";
 
-type ToolScope = AgentScope | "character";
+type StudioTab = ContextualToolTab | "composer";
 
-interface AgentDraft {
-  label: string;
-  description: string;
-  capability: AgentCapabilityId;
-  instruction: string;
-  providerAlias: string;
-  temperature: string;
-  topP: string;
-  maxTokens: string;
-  presencePenalty: string;
-  frequencyPenalty: string;
-  visibility: "private" | "shared";
-  enabled: boolean;
-}
+type ToolScope = Exclude<AgentScope, "character">;
 
 const fieldClass =
   "w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none transition-colors placeholder:text-muted focus:border-accent";
 
-function emptyDraft(): AgentDraft {
-  return {
-    label: "",
-    description: "",
-    capability: "creative_inspiration",
-    instruction: "",
-    providerAlias: "",
-    temperature: "",
-    topP: "",
-    maxTokens: "",
-    presencePenalty: "",
-    frequencyPenalty: "",
-    visibility: "private",
-    enabled: true,
-  };
-}
-
-function profileToDraft(profile: AgentProfile): AgentDraft {
-  return {
-    label: profile.label,
-    description: profile.description,
-    capability: profile.capabilities[0],
-    instruction: profile.instruction,
-    providerAlias: profile.provider_alias ?? "",
-    temperature:
-      profile.generation_params.temperature == null
-        ? ""
-        : String(profile.generation_params.temperature),
-    topP:
-      profile.generation_params.top_p == null
-        ? ""
-        : String(profile.generation_params.top_p),
-    maxTokens:
-      profile.generation_params.max_tokens == null
-        ? ""
-        : String(profile.generation_params.max_tokens),
-    presencePenalty:
-      profile.generation_params.presence_penalty == null
-        ? ""
-        : String(profile.generation_params.presence_penalty),
-    frequencyPenalty:
-      profile.generation_params.frequency_penalty == null
-        ? ""
-        : String(profile.generation_params.frequency_penalty),
-    visibility: profile.visibility,
-    enabled: profile.enabled,
-  };
-}
-
-function draftPayload(draft: AgentDraft) {
-  return {
-    label: draft.label.trim(),
-    description: draft.description.trim(),
-    capability: draft.capability,
-    instruction: draft.instruction.trim(),
-    provider_alias: draft.providerAlias || null,
-    generation_params: {
-      temperature:
-        draft.temperature === "" ? null : Number(draft.temperature),
-      top_p: draft.topP === "" ? null : Number(draft.topP),
-      max_tokens: draft.maxTokens === "" ? null : Number(draft.maxTokens),
-      presence_penalty:
-        draft.presencePenalty === ""
-          ? null
-          : Number(draft.presencePenalty),
-      frequency_penalty:
-        draft.frequencyPenalty === ""
-          ? null
-          : Number(draft.frequencyPenalty),
-    },
-    visibility: draft.visibility,
-    enabled: draft.enabled,
-  };
-}
-
-export default function AgentStudioWorkspace({
+export default function GenerationToolWorkspace({
   novelId,
+  tools,
+  initialVolumeId = "",
+  initialChapterId = "",
+  onTargetValidation,
+  onScopeTargetChange,
+  onOpenHistory,
   onNavigateReference,
 }: Props) {
   const t = useTranslations("writing.agentStudio");
   const metadataT = useTranslations("writing.generationMetadata");
-  const { user } = useAuth();
-  const [tab, setTab] = useState<StudioTab>("creative");
+  const primaryTool = tools[0] ?? "creative";
+  const [tab, setTab] = useState<StudioTab>(primaryTool);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
-  const [capabilities, setCapabilities] = useState<AgentCapability[]>([]);
-  const [providers, setProviders] = useState<AgentProviderOption[]>([]);
   const [volumes, setVolumes] = useState<VolumeSummary[]>([]);
   const [chapters, setChapters] = useState<ChapterSummary[]>([]);
-  const [characterCards, setCharacterCards] = useState<ReferenceCard[]>([]);
+  const [scopeTargetsLoaded, setScopeTargetsLoaded] = useState(false);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const [scope, setScope] = useState<ToolScope>("novel");
-  const [volumeId, setVolumeId] = useState("");
-  const [chapterId, setChapterId] = useState("");
-  const [characterCardId, setCharacterCardId] = useState("");
+  const [scope, setScope] = useState<ToolScope>(
+    primaryTool === "retrospective"
+      ? "volume"
+      : primaryTool === "style" || initialChapterId
+        ? "chapter"
+        : initialVolumeId
+          ? "volume"
+          : "novel",
+  );
+  const [volumeId, setVolumeId] = useState(initialVolumeId);
+  const [chapterId, setChapterId] = useState(initialChapterId);
   const [toolAgentId, setToolAgentId] = useState("");
   const [question, setQuestion] = useState("");
   const [constraints, setConstraints] = useState("");
@@ -188,10 +106,6 @@ export default function AgentStudioWorkspace({
   const [styleResult, setStyleResult] =
     useState<StyleConsistencyResult | null>(null);
   const [styleFocus, setStyleFocus] = useState("");
-  const [illustrationResult, setIllustrationResult] =
-    useState<IllustrationPromptResult | null>(null);
-  const [illustrationFocus, setIllustrationFocus] = useState("");
-  const [targetImageModel, setTargetImageModel] = useState("");
   const [retrospectiveResult, setRetrospectiveResult] =
     useState<VolumeRetrospectiveResult | null>(null);
   const [retrospectiveFocus, setRetrospectiveFocus] = useState("");
@@ -199,30 +113,31 @@ export default function AgentStudioWorkspace({
     useState<AgentToolMetadata | null>(null);
   const [revisionSource, setRevisionSource] =
     useState<AgentRevisionSourceSelection | null>(null);
+  const routeTargetIdentity = `${initialVolumeId}:${initialChapterId}`;
+  const previousRouteTargetIdentity = useRef(routeTargetIdentity);
+  const targetRevision = useRef(0);
+  const revisionReturnTab = useRef<ContextualToolTab>(primaryTool);
 
-  const [managementFilter, setManagementFilter] = useState<
-    AgentCapabilityId | "all"
-  >("all");
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [creatingAgent, setCreatingAgent] = useState(false);
-  const [draft, setDraft] = useState<AgentDraft>(emptyDraft);
-  const [savingAgent, setSavingAgent] = useState(false);
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const [presetImportOpen, setPresetImportOpen] = useState(false);
+  const clearGeneratedOutput = useCallback(() => {
+    targetRevision.current += 1;
+    setCreativeResult(null);
+    setContinuityResult(null);
+    setStyleResult(null);
+    setRetrospectiveResult(null);
+    setToolMetadata(null);
+    setRevisionSource(null);
+    setError(null);
+    setNotice(null);
+  }, []);
 
   const loadCatalog = useCallback(async () => {
     setLoadingCatalog(true);
     setError(null);
     try {
-      const [agentResponse, capabilityResponse, providerResponse] =
-        await Promise.all([
-          apiGet<{ data: AgentProfile[] }>("/api/agents?include_disabled=true"),
-          apiGet<{ data: AgentCapability[] }>("/api/agents/capabilities"),
-          apiGet<{ data: AgentProviderOption[] }>("/api/agents/providers"),
-        ]);
-      setAgents(agentResponse.data);
-      setCapabilities(capabilityResponse.data);
-      setProviders(providerResponse.data);
+      const response = await apiGet<{ data: AgentProfile[] }>(
+        "/api/agents?include_disabled=true",
+      );
+      setAgents(response.data);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t("loadFailed"));
     } finally {
@@ -235,16 +150,49 @@ export default function AgentStudioWorkspace({
   }, [loadCatalog]);
 
   useEffect(() => {
-    if (!novelId) return;
+    if (tab === "composer") return;
+    if (!tools.includes(tab as ContextualToolTab)) {
+      setTab(tools[0] ?? "creative");
+    }
+  }, [tab, tools]);
+
+  useEffect(() => {
+    const targetChanged =
+      previousRouteTargetIdentity.current !== routeTargetIdentity;
+    previousRouteTargetIdentity.current = routeTargetIdentity;
+    setVolumeId(initialVolumeId);
+    setChapterId(initialChapterId);
+    if (targetChanged) clearGeneratedOutput();
+    if (tab === "composer") return;
+    setScope(
+      primaryTool === "retrospective"
+        ? "volume"
+        : tab === "style"
+          ? initialVolumeId && !initialChapterId
+            ? "volume"
+            : "chapter"
+          : initialChapterId
+            ? "chapter"
+            : initialVolumeId
+              ? "volume"
+              : "novel",
+    );
+  }, [
+    clearGeneratedOutput,
+    initialChapterId,
+    initialVolumeId,
+    primaryTool,
+    routeTargetIdentity,
+    tab,
+  ]);
+
+  useEffect(() => {
     let cancelled = false;
     Promise.all([
       apiGet<{ data: VolumeSummary[] }>(`/api/volumes/novel/${novelId}`),
       apiGet<{ data: ChapterSummary[] }>(`/api/chapters/novel/${novelId}`),
-      apiGet<{ data: ReferenceCard[] }>(
-        `/api/reference-cards/novel/${novelId}/character`,
-      ),
     ])
-      .then(([volumeResponse, chapterResponse, characterResponse]) => {
+      .then(([volumeResponse, chapterResponse]) => {
         if (cancelled) return;
         setVolumes(
           [...volumeResponse.data].sort(
@@ -252,15 +200,7 @@ export default function AgentStudioWorkspace({
           ),
         );
         setChapters(chapterResponse.data);
-        setCharacterCards(
-          [...characterResponse.data]
-            .filter((card) => !card.is_deleted)
-            .sort(
-              (left, right) =>
-                left.sort_order - right.sort_order ||
-                left.name.localeCompare(right.name),
-            ),
-        );
+        setScopeTargetsLoaded(true);
       })
       .catch((caught: unknown) => {
         if (!cancelled) {
@@ -272,11 +212,40 @@ export default function AgentStudioWorkspace({
     };
   }, [novelId, t]);
 
+  useEffect(() => {
+    if (!scopeTargetsLoaded || !onTargetValidation) return;
+    const selectedVolume = initialVolumeId
+      ? volumes.find((volume) => volume._id === initialVolumeId)
+      : undefined;
+    const selectedChapter = initialChapterId
+      ? chapters.find((chapter) => chapter._id === initialChapterId)
+      : undefined;
+    if (initialVolumeId) {
+      onTargetValidation("volume", initialVolumeId, Boolean(selectedVolume));
+    }
+    if (initialChapterId) {
+      onTargetValidation("chapter", initialChapterId, Boolean(selectedChapter));
+    }
+    if (initialVolumeId && initialChapterId && selectedVolume && selectedChapter) {
+      onTargetValidation(
+        "chapter",
+        initialChapterId,
+        selectedChapter.volume_id === selectedVolume._id,
+        "chapter-volume",
+      );
+    }
+  }, [
+    chapters,
+    initialChapterId,
+    initialVolumeId,
+    onTargetValidation,
+    scopeTargetsLoaded,
+    volumes,
+  ]);
+
   const activeCapability =
     tab === "retrospective"
       ? "volume_retrospective"
-      : tab === "illustration"
-        ? "illustration_prompt"
       : tab === "style"
         ? "style_consistency"
         : tab === "continuity"
@@ -319,136 +288,13 @@ export default function AgentStudioWorkspace({
 
   useEffect(() => {
     if (
+      scopeTargetsLoaded &&
       chapterId &&
       !visibleChapters.some((chapter) => chapter._id === chapterId)
     ) {
       setChapterId("");
     }
-  }, [chapterId, visibleChapters]);
-
-  const capabilityMap = useMemo(
-    () =>
-      new Map(
-        capabilities.map((capability) => [
-          capability.capability,
-          capability,
-        ]),
-      ),
-    [capabilities],
-  );
-  const selectedAgent = agents.find(
-    (agent) => agent.agent_id === selectedAgentId,
-  );
-  const filteredAgents = agents.filter(
-    (agent) =>
-      managementFilter === "all" ||
-      agent.capabilities.includes(managementFilter),
-  );
-
-  const selectManagedAgent = (profile: AgentProfile) => {
-    setCreatingAgent(false);
-    setSelectedAgentId(profile.agent_id);
-    setDraft(profileToDraft(profile));
-    setConfirmingDelete(false);
-    setNotice(null);
-  };
-
-  const startCreate = () => {
-    setCreatingAgent(true);
-    setSelectedAgentId(null);
-    setDraft(emptyDraft());
-    setConfirmingDelete(false);
-    setNotice(null);
-  };
-
-  const useImportedPresetDraft = (
-    imported: ImportedGenerationPresetDraft,
-  ) => {
-    setCreatingAgent(true);
-    setSelectedAgentId(null);
-    setDraft({
-      ...emptyDraft(),
-      ...imported,
-    });
-    setConfirmingDelete(false);
-    setPresetImportOpen(false);
-    setError(null);
-    setNotice(t("management.presetImport.draftReady"));
-  };
-
-  const reloadAndSelect = async (agentId: string) => {
-    const response = await apiGet<{ data: AgentProfile[] }>(
-      "/api/agents?include_disabled=true",
-    );
-    setAgents(response.data);
-    const profile = response.data.find((agent) => agent.agent_id === agentId);
-    if (profile) selectManagedAgent(profile);
-  };
-
-  const saveAgent = async () => {
-    setSavingAgent(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const payload = draftPayload(draft);
-      let response: { agent: AgentProfile };
-      if (creatingAgent) {
-        response = await apiPost<{ agent: AgentProfile }>(
-          "/api/agents",
-          payload,
-        );
-      } else if (selectedAgent?.editable) {
-        response = await apiPut<{ agent: AgentProfile }>(
-          `/api/agents/${selectedAgent.agent_id}`,
-          { ...payload, expected_version: selectedAgent.version },
-        );
-      } else {
-        return;
-      }
-      await reloadAndSelect(response.agent.agent_id);
-      setNotice(t("management.saved"));
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : t("saveFailed"));
-    } finally {
-      setSavingAgent(false);
-    }
-  };
-
-  const cloneAgent = async (profile: AgentProfile) => {
-    setSavingAgent(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const response = await apiPost<{ agent: AgentProfile }>(
-        `/api/agents/${profile.agent_id}/clone`,
-        {},
-      );
-      await reloadAndSelect(response.agent.agent_id);
-      setNotice(t("management.cloned"));
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : t("saveFailed"));
-    } finally {
-      setSavingAgent(false);
-    }
-  };
-
-  const deleteAgent = async () => {
-    if (!selectedAgent?.editable) return;
-    setSavingAgent(true);
-    setError(null);
-    try {
-      await apiDelete(`/api/agents/${selectedAgent.agent_id}`);
-      setSelectedAgentId(null);
-      setCreatingAgent(false);
-      setConfirmingDelete(false);
-      setNotice(t("management.deleted"));
-      await loadCatalog();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : t("saveFailed"));
-    } finally {
-      setSavingAgent(false);
-    }
-  };
+  }, [chapterId, scopeTargetsLoaded, visibleChapters]);
 
   const runTool = async () => {
     if (!novelId || !toolAgentId) return;
@@ -460,15 +306,12 @@ export default function AgentStudioWorkspace({
       setError(t("tool.chooseChapter"));
       return;
     }
-    if (scope === "character" && !characterCardId) {
-      setError(t("tool.chooseCharacter"));
-      return;
-    }
     setRunning(true);
     setError(null);
     setNotice(null);
     setToolMetadata(null);
     setRevisionSource(null);
+    const expectedTargetRevision = targetRevision.current;
     try {
       const base = {
         novel_id: novelId,
@@ -487,10 +330,10 @@ export default function AgentStudioWorkspace({
           constraints: constraints.trim(),
           idea_count: ideaCount,
         });
+        if (expectedTargetRevision !== targetRevision.current) return;
         setCreativeResult(response.result);
         setContinuityResult(null);
         setStyleResult(null);
-        setIllustrationResult(null);
         setRetrospectiveResult(null);
         setToolMetadata(response);
       } else if (tab === "continuity") {
@@ -500,10 +343,10 @@ export default function AgentStudioWorkspace({
           ...base,
           focus: focus.trim(),
         });
+        if (expectedTargetRevision !== targetRevision.current) return;
         setContinuityResult(response.result);
         setCreativeResult(null);
         setStyleResult(null);
-        setIllustrationResult(null);
         setRetrospectiveResult(null);
         setToolMetadata(response);
       } else if (tab === "style") {
@@ -513,26 +356,10 @@ export default function AgentStudioWorkspace({
           ...base,
           focus: styleFocus.trim(),
         });
+        if (expectedTargetRevision !== targetRevision.current) return;
         setStyleResult(response.result);
         setCreativeResult(null);
         setContinuityResult(null);
-        setIllustrationResult(null);
-        setRetrospectiveResult(null);
-        setToolMetadata(response);
-      } else if (tab === "illustration") {
-        const response = await apiPost<
-          { result: IllustrationPromptResult } & AgentToolMetadata
-        >("/api/llm/agent-illustration-prompt", {
-          ...base,
-          character_card_id:
-            scope === "character" ? characterCardId : null,
-          target_model: targetImageModel.trim(),
-          focus: illustrationFocus.trim(),
-        });
-        setIllustrationResult(response.result);
-        setCreativeResult(null);
-        setContinuityResult(null);
-        setStyleResult(null);
         setRetrospectiveResult(null);
         setToolMetadata(response);
       } else {
@@ -542,11 +369,11 @@ export default function AgentStudioWorkspace({
           ...base,
           focus: retrospectiveFocus.trim(),
         });
+        if (expectedTargetRevision !== targetRevision.current) return;
         setRetrospectiveResult(response.result);
         setCreativeResult(null);
         setContinuityResult(null);
         setStyleResult(null);
-        setIllustrationResult(null);
         setToolMetadata(response);
       }
     } catch (caught) {
@@ -564,30 +391,10 @@ export default function AgentStudioWorkspace({
           ? continuityResult
           : tab === "style"
             ? styleResult
-            : tab === "illustration"
-              ? illustrationResult
-              : retrospectiveResult;
+            : retrospectiveResult;
     if (!result) return;
     await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
     setNotice(t("copied"));
-  };
-
-  const illustrationCharacterCount = illustrationResult
-    ? illustrationPromptCharacterCount(illustrationResult)
-    : 0;
-
-  const updateIllustrationField = (
-    field: keyof IllustrationPromptResult,
-    rawValue: string,
-  ) => {
-    setIllustrationResult((current) => {
-      if (!current) return current;
-      return constrainIllustrationPromptEdit(
-        current,
-        field,
-        rawValue,
-      );
-    });
   };
 
   const startRevision = (
@@ -596,6 +403,7 @@ export default function AgentStudioWorkspace({
     label: string,
   ) => {
     if (!toolMetadata) return;
+    revisionReturnTab.current = tab as ContextualToolTab;
     setRevisionSource({
       runId: toolMetadata.run_id,
       sourceKind,
@@ -603,9 +411,70 @@ export default function AgentStudioWorkspace({
       label,
       contextSnapshot: toolMetadata.context_snapshot,
     });
-    setTab("history");
+    setTab("composer");
     setError(null);
     setNotice(null);
+  };
+
+  const leaveRevisionComposer = () => {
+    setRevisionSource(null);
+    setTab(revisionReturnTab.current);
+  };
+
+  const changeScope = (nextScope: ToolScope) => {
+    clearGeneratedOutput();
+    setScope(nextScope);
+    if (nextScope === "novel") {
+      setVolumeId("");
+      setChapterId("");
+      onScopeTargetChange?.({ volume: undefined, chapter: undefined });
+      return;
+    }
+    if (nextScope === "volume") {
+      setChapterId("");
+      onScopeTargetChange?.({
+        volume: volumeId || undefined,
+        chapter: undefined,
+      });
+      return;
+    }
+    onScopeTargetChange?.({
+      volume: volumeId || undefined,
+      chapter: chapterId || undefined,
+    });
+  };
+
+  const changeVolume = (nextVolumeId: string) => {
+    clearGeneratedOutput();
+    setVolumeId(nextVolumeId);
+    if (scope === "volume") {
+      onScopeTargetChange?.({
+        volume: nextVolumeId || undefined,
+        chapter: undefined,
+      });
+      return;
+    }
+    const selectedChapter = chapters.find(
+      (chapter) => chapter._id === chapterId,
+    );
+    const nextChapterId =
+      nextVolumeId && selectedChapter?.volume_id !== nextVolumeId
+        ? ""
+        : chapterId;
+    if (nextChapterId !== chapterId) setChapterId(nextChapterId);
+    onScopeTargetChange?.({
+      volume: nextVolumeId || undefined,
+      chapter: nextChapterId || undefined,
+    });
+  };
+
+  const changeChapter = (nextChapterId: string) => {
+    clearGeneratedOutput();
+    setChapterId(nextChapterId);
+    onScopeTargetChange?.({
+      volume: volumeId || undefined,
+      chapter: nextChapterId || undefined,
+    });
   };
 
   const scopeControls = (
@@ -615,46 +484,26 @@ export default function AgentStudioWorkspace({
         <select
           className={fieldClass}
           value={scope}
-          onChange={(event) => setScope(event.target.value as ToolScope)}
+          disabled={running}
+          onChange={(event) => changeScope(event.target.value as ToolScope)}
         >
-          {tab === "illustration" && (
-            <option value="character">{t("tool.scopeCharacter")}</option>
-          )}
           {tab !== "style" && tab !== "retrospective" && (
             <option value="novel">{t("tool.scopeNovel")}</option>
           )}
-          {tab !== "illustration" && (
-            <option value="volume">{t("tool.scopeVolume")}</option>
-          )}
+          <option value="volume">{t("tool.scopeVolume")}</option>
           {tab !== "retrospective" && (
             <option value="chapter">{t("tool.scopeChapter")}</option>
           )}
         </select>
       </label>
-      {scope === "character" && (
-        <label className="min-w-0 space-y-1.5 text-sm md:col-span-2">
-          <span className="text-muted">{t("tool.character")}</span>
-          <select
-            className={fieldClass}
-            value={characterCardId}
-            onChange={(event) => setCharacterCardId(event.target.value)}
-          >
-            <option value="">{t("tool.selectCharacter")}</option>
-            {characterCards.map((card) => (
-              <option key={card._id} value={card._id}>
-                {card.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
       {scope === "volume" && (
         <label className="space-y-1.5 text-sm md:col-span-2">
           <span className="text-muted">{t("tool.volume")}</span>
           <select
             className={fieldClass}
             value={volumeId}
-            onChange={(event) => setVolumeId(event.target.value)}
+            disabled={running}
+            onChange={(event) => changeVolume(event.target.value)}
           >
             <option value="">{t("tool.selectVolume")}</option>
             {volumes.map((volume) => (
@@ -675,7 +524,8 @@ export default function AgentStudioWorkspace({
             <select
               className={fieldClass}
               value={volumeId}
-              onChange={(event) => setVolumeId(event.target.value)}
+              disabled={running}
+              onChange={(event) => changeVolume(event.target.value)}
             >
               <option value="">{t("tool.allVolumes")}</option>
               {volumes.map((volume) => (
@@ -693,7 +543,8 @@ export default function AgentStudioWorkspace({
             <select
               className={fieldClass}
               value={chapterId}
-              onChange={(event) => setChapterId(event.target.value)}
+              disabled={running}
+              onChange={(event) => changeChapter(event.target.value)}
             >
               <option value="">{t("tool.selectChapter")}</option>
               {visibleChapters.map((chapter) => (
@@ -753,9 +604,7 @@ export default function AgentStudioWorkspace({
                   ? t("continuity.eyebrow")
                   : tab === "style"
                     ? t("style.eyebrow")
-                    : tab === "illustration"
-                      ? t("illustration.eyebrow")
-                      : t("retrospective.eyebrow")}
+                    : t("retrospective.eyebrow")}
             </p>
             <h2 className="mt-1 text-xl font-semibold text-foreground">
               {tab === "creative"
@@ -764,9 +613,7 @@ export default function AgentStudioWorkspace({
                   ? t("continuity.title")
                   : tab === "style"
                     ? t("style.title")
-                    : tab === "illustration"
-                      ? t("illustration.title")
-                      : t("retrospective.title")}
+                    : t("retrospective.title")}
             </h2>
             <p className="mt-2 text-sm leading-6 text-muted">
               {tab === "creative"
@@ -775,9 +622,7 @@ export default function AgentStudioWorkspace({
                   ? t("continuity.description")
                   : tab === "style"
                     ? t("style.description")
-                    : tab === "illustration"
-                      ? t("illustration.description")
-                      : t("retrospective.description")}
+                    : t("retrospective.description")}
             </p>
           </div>
 
@@ -855,37 +700,6 @@ export default function AgentStudioWorkspace({
                   placeholder={t("style.focusPlaceholder")}
                 />
               </label>
-            ) : tab === "illustration" ? (
-              <>
-                <label className="block space-y-1.5 text-sm">
-                  <span className="text-muted">
-                    {t("illustration.targetModel")}
-                  </span>
-                  <input
-                    className={fieldClass}
-                    maxLength={200}
-                    value={targetImageModel}
-                    onChange={(event) =>
-                      setTargetImageModel(event.target.value)
-                    }
-                    placeholder={t("illustration.targetModelPlaceholder")}
-                  />
-                </label>
-                <label className="block space-y-1.5 text-sm">
-                  <span className="text-muted">
-                    {t("illustration.focus")}
-                  </span>
-                  <textarea
-                    className={`${fieldClass} min-h-28 resize-y`}
-                    maxLength={2000}
-                    value={illustrationFocus}
-                    onChange={(event) =>
-                      setIllustrationFocus(event.target.value)
-                    }
-                    placeholder={t("illustration.focusPlaceholder")}
-                  />
-                </label>
-              </>
             ) : (
               <label className="block space-y-1.5 text-sm">
                 <span className="text-muted">
@@ -926,8 +740,6 @@ export default function AgentStudioWorkspace({
             <p className="text-xs leading-5 text-muted">
               {tab === "style"
                 ? t("style.previewOnlyHint")
-                : tab === "illustration"
-                  ? t("illustration.previewOnlyHint")
                 : tab === "retrospective"
                   ? t("retrospective.previewOnlyHint")
                   : t("previewOnlyHint")}
@@ -1267,56 +1079,6 @@ export default function AgentStudioWorkspace({
                 </ol>
               )}
             </div>
-          ) : tab === "illustration" && illustrationResult ? (
-            <div className="min-w-0 space-y-5">
-              {resultHeader(
-                t("illustration.resultTitle"),
-                t("illustration.editableBadge"),
-              )}
-              <p className="text-sm leading-6 text-muted">
-                {t("illustration.editHint")}
-              </p>
-              <div className="grid min-w-0 gap-x-4 gap-y-5 md:grid-cols-2">
-                {(
-                  [
-                    "subject",
-                    "appearance",
-                    "scene",
-                    "style",
-                    "negative",
-                  ] as const
-                ).map((field) => (
-                  <label
-                    key={field}
-                    className={`min-w-0 space-y-1.5 text-sm ${
-                      field === "scene" ? "md:col-span-2" : ""
-                    }`}
-                  >
-                    <span className="flex flex-wrap items-center justify-between gap-2 text-muted">
-                      <span>{t(`illustration.fields.${field}`)}</span>
-                      <span className="shrink-0 text-xs tabular-nums">
-                        {Array.from(illustrationResult[field]).length}/
-                        {ILLUSTRATION_FIELD_LIMITS[field]}
-                      </span>
-                    </span>
-                    <textarea
-                      data-testid={`illustration-${field}`}
-                      className={`${fieldClass} min-h-32 resize-y text-base leading-6 md:text-sm`}
-                      value={illustrationResult[field]}
-                      onChange={(event) =>
-                        updateIllustrationField(field, event.target.value)
-                      }
-                    />
-                  </label>
-                ))}
-              </div>
-              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-4 text-xs text-muted">
-                <span>{t("illustration.totalLimitHint")}</span>
-                <span className="tabular-nums">
-                  {illustrationCharacterCount}/{ILLUSTRATION_TOTAL_LIMIT}
-                </span>
-              </div>
-            </div>
           ) : tab === "retrospective" && retrospectiveResult ? (
             <div className="space-y-5">
               {resultHeader(t("retrospective.resultTitle"))}
@@ -1452,492 +1214,18 @@ export default function AgentStudioWorkspace({
     );
   };
 
-  const renderManagement = () => {
-    const selectedCapability = selectedAgent
-      ? capabilityMap.get(selectedAgent.capabilities[0])
-      : capabilityMap.get(draft.capability);
-    const formLocked = !creatingAgent && !selectedAgent?.editable;
-
-    return (
-      <div className="grid min-h-0 gap-5 lg:grid-cols-[minmax(16rem,0.7fr)_minmax(0,1.3fr)]">
-        <section className="rounded-lg border border-border bg-surface p-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="font-semibold text-foreground">
-                {t("management.catalogTitle")}
-              </h2>
-              <p className="mt-1 text-xs text-muted">
-                {t("management.catalogHint")}
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={() => setPresetImportOpen(true)}
-                className="rounded-lg border border-accent px-3 py-2 text-sm font-semibold text-accent hover:bg-accent/5"
-              >
-                {t("management.presetImport.openButton")}
-              </button>
-              <button
-                type="button"
-                onClick={startCreate}
-                className="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white"
-              >
-                {t("management.new")}
-              </button>
-            </div>
-          </div>
-          <select
-            className={`${fieldClass} mt-4`}
-            value={managementFilter}
-            onChange={(event) =>
-              setManagementFilter(
-                event.target.value as AgentCapabilityId | "all",
-              )
-            }
-          >
-            <option value="all">{t("management.allCapabilities")}</option>
-            {capabilities.map((capability) => (
-              <option key={capability.capability} value={capability.capability}>
-                {capability.label}
-              </option>
-            ))}
-          </select>
-          <div className="mt-4 max-h-[58vh] space-y-1 overflow-y-auto pr-1">
-            {filteredAgents.map((agent) => {
-              const active = agent.agent_id === selectedAgentId;
-              return (
-                <button
-                  key={agent.agent_id}
-                  type="button"
-                  onClick={() => selectManagedAgent(agent)}
-                  className={`w-full rounded-lg border px-3 py-3 text-left transition-colors ${
-                    active
-                      ? "border-accent bg-accent/5"
-                      : "border-transparent hover:border-border hover:bg-surface-secondary"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <span className="text-sm font-medium text-foreground">
-                      {agent.label}
-                    </span>
-                    {!agent.enabled && (
-                      <span className="rounded bg-surface-secondary px-1.5 py-0.5 text-[11px] text-muted">
-                        {t("management.disabled")}
-                      </span>
-                    )}
-                  </div>
-                  <div className="mt-1 flex flex-wrap gap-2 text-xs text-muted">
-                    <span>
-                      {capabilityMap.get(agent.capabilities[0])?.label ??
-                        agent.capabilities[0]}
-                    </span>
-                    <span>·</span>
-                    <span>
-                      {agent.origin === "builtin"
-                        ? t("management.builtin")
-                        : agent.editable
-                          ? t("management.mine")
-                          : t("management.shared")}
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="rounded-lg border border-border bg-surface p-5">
-          {!creatingAgent && !selectedAgent ? (
-            <div className="flex min-h-72 items-center justify-center text-center">
-              <div>
-                <h3 className="font-semibold text-foreground">
-                  {t("management.selectTitle")}
-                </h3>
-                <p className="mt-2 text-sm text-muted">
-                  {t("management.selectDescription")}
-                </p>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-5">
-              <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.14em] text-accent">
-                    {creatingAgent
-                      ? t("management.new")
-                      : selectedAgent?.origin === "builtin"
-                        ? t("management.builtin")
-                        : t("management.custom")}
-                  </p>
-                  <h2 className="mt-1 text-xl font-semibold text-foreground">
-                    {creatingAgent
-                      ? t("management.createTitle")
-                      : selectedAgent?.label}
-                  </h2>
-                  {selectedCapability && (
-                    <p className="mt-1 text-sm text-muted">
-                      {selectedCapability.description}
-                    </p>
-                  )}
-                </div>
-                {selectedAgent &&
-                  selectedCapability?.customizable &&
-                  !selectedAgent.editable && (
-                    <button
-                      type="button"
-                      disabled={savingAgent}
-                      onClick={() => void cloneAgent(selectedAgent)}
-                      className="rounded-lg border border-accent px-3 py-2 text-sm font-medium text-accent disabled:opacity-50"
-                    >
-                      {t("management.clone")}
-                    </button>
-                  )}
-              </div>
-
-              {formLocked && (
-                <div className="rounded-lg bg-surface-secondary px-4 py-3 text-sm leading-6 text-muted">
-                  {selectedCapability?.customizable
-                    ? t("management.readonlyCloneHint")
-                    : t("management.pipelineLockedHint")}
-                </div>
-              )}
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <label className="space-y-1.5 text-sm">
-                  <span className="text-muted">{t("management.name")}</span>
-                  <input
-                    className={fieldClass}
-                    disabled={formLocked}
-                    value={draft.label}
-                    onChange={(event) =>
-                      setDraft({ ...draft, label: event.target.value })
-                    }
-                  />
-                </label>
-                <label className="space-y-1.5 text-sm">
-                  <span className="text-muted">
-                    {t("management.capability")}
-                  </span>
-                  <select
-                    className={fieldClass}
-                    disabled={formLocked || !creatingAgent}
-                    value={draft.capability}
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        capability: event.target
-                          .value as AgentCapabilityId,
-                      })
-                    }
-                  >
-                    {(creatingAgent
-                      ? capabilities.filter((item) => item.customizable)
-                      : capabilities
-                    ).map((capability) => (
-                      <option
-                        key={capability.capability}
-                        value={capability.capability}
-                      >
-                        {capability.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="space-y-1.5 text-sm md:col-span-2">
-                  <span className="text-muted">
-                    {t("management.description")}
-                  </span>
-                  <input
-                    className={fieldClass}
-                    disabled={formLocked}
-                    value={draft.description}
-                    onChange={(event) =>
-                      setDraft({ ...draft, description: event.target.value })
-                    }
-                  />
-                </label>
-                <label className="space-y-1.5 text-sm md:col-span-2">
-                  <span className="text-muted">
-                    {t("management.instruction")}
-                  </span>
-                  <textarea
-                    className={`${fieldClass} min-h-40 resize-y font-mono text-[13px] leading-6`}
-                    disabled={formLocked}
-                    value={draft.instruction}
-                    onChange={(event) =>
-                      setDraft({ ...draft, instruction: event.target.value })
-                    }
-                    placeholder={t("management.instructionPlaceholder")}
-                  />
-                  {!formLocked && (
-                    <span className="block text-xs text-muted">
-                      {t("management.instructionHint", {
-                        current: Array.from(draft.instruction).length,
-                        maximum: MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
-                      })}
-                    </span>
-                  )}
-                </label>
-              </div>
-
-              <div className="border-t border-border pt-5">
-                <h3 className="text-sm font-semibold text-foreground">
-                  {t("management.runtimeTitle")}
-                </h3>
-                <p className="mt-1 text-xs text-muted">
-                  {t("management.runtimeHint")}
-                </p>
-                <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                  <label className="space-y-1.5 text-sm">
-                    <span className="text-muted">
-                      {t("management.provider")}
-                    </span>
-                    <select
-                      className={fieldClass}
-                      disabled={formLocked}
-                      value={draft.providerAlias}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          providerAlias: event.target.value,
-                        })
-                      }
-                    >
-                      <option value="">{t("management.inheritProvider")}</option>
-                      {providers.map((provider) => (
-                        <option key={provider.alias} value={provider.alias}>
-                          {provider.alias} · {provider.model || provider.type}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="space-y-1.5 text-sm">
-                    <span className="text-muted">temperature</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={2}
-                      step={0.1}
-                      className={fieldClass}
-                      disabled={formLocked}
-                      value={draft.temperature}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          temperature: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="space-y-1.5 text-sm">
-                    <span className="text-muted">top_p</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.1}
-                      className={fieldClass}
-                      disabled={formLocked}
-                      value={draft.topP}
-                      onChange={(event) =>
-                        setDraft({ ...draft, topP: event.target.value })
-                      }
-                    />
-                  </label>
-                  <label className="space-y-1.5 text-sm">
-                    <span className="text-muted">max_tokens</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={MAX_CUSTOM_AGENT_OUTPUT_TOKENS}
-                      step={100}
-                      className={fieldClass}
-                      disabled={formLocked}
-                      value={draft.maxTokens}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          maxTokens: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="space-y-1.5 text-sm">
-                    <span className="text-muted">
-                      {t("management.presencePenalty")}
-                    </span>
-                    <input
-                      type="number"
-                      min={-2}
-                      max={2}
-                      step={0.1}
-                      className={fieldClass}
-                      disabled={formLocked}
-                      value={draft.presencePenalty}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          presencePenalty: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-                  <label className="space-y-1.5 text-sm">
-                    <span className="text-muted">
-                      {t("management.frequencyPenalty")}
-                    </span>
-                    <input
-                      type="number"
-                      min={-2}
-                      max={2}
-                      step={0.1}
-                      className={fieldClass}
-                      disabled={formLocked}
-                      value={draft.frequencyPenalty}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          frequencyPenalty: event.target.value,
-                        })
-                      }
-                    />
-                  </label>
-                </div>
-              </div>
-
-              {!formLocked && (
-                <div className="flex flex-wrap items-center justify-between gap-4 border-t border-border pt-5">
-                  <div className="flex flex-wrap items-center gap-4">
-                    <label className="flex items-center gap-2 text-sm text-muted">
-                      <input
-                        type="checkbox"
-                        checked={draft.enabled}
-                        onChange={(event) =>
-                          setDraft({ ...draft, enabled: event.target.checked })
-                        }
-                      />
-                      {t("management.enabled")}
-                    </label>
-                    <label className="flex items-center gap-2 text-sm text-muted">
-                      <span>{t("management.visibility")}</span>
-                      <select
-                        className="rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-foreground"
-                        value={draft.visibility}
-                        onChange={(event) =>
-                          setDraft({
-                            ...draft,
-                            visibility: event.target.value as
-                              | "private"
-                              | "shared",
-                          })
-                        }
-                      >
-                        <option value="private">
-                          {t("management.private")}
-                        </option>
-                        {user?.role === "admin" && (
-                          <option value="shared">
-                            {t("management.shared")}
-                          </option>
-                        )}
-                      </select>
-                    </label>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {selectedAgent?.editable &&
-                      (confirmingDelete ? (
-                        <>
-                          <span className="text-sm text-muted">
-                            {t("management.confirmDelete")}
-                          </span>
-                          <button
-                            type="button"
-                            disabled={savingAgent}
-                            onClick={() => void deleteAgent()}
-                            className="rounded-lg border border-red-300 px-3 py-2 text-sm font-medium text-red-600 disabled:opacity-50"
-                          >
-                            {t("management.delete")}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmingDelete(false)}
-                            className="rounded-lg border border-border px-3 py-2 text-sm text-muted"
-                          >
-                            {t("management.cancel")}
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => setConfirmingDelete(true)}
-                          className="rounded-lg px-3 py-2 text-sm text-red-600"
-                        >
-                          {t("management.delete")}
-                        </button>
-                      ))}
-                    <button
-                      type="button"
-                      disabled={
-                        savingAgent ||
-                        draft.label.trim().length < 2 ||
-                        draft.instruction.trim().length < 20 ||
-                        Array.from(draft.instruction.trim()).length >
-                          MAX_CUSTOM_AGENT_INSTRUCTION_CHARS
-                      }
-                      onClick={() => void saveAgent()}
-                      className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {savingAgent
-                        ? t("management.saving")
-                        : t("management.save")}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-      </div>
-    );
-  };
+  const visibleTabs: StudioTab[] = [...tools];
 
   return (
     <div className="h-full overflow-y-auto bg-surface-secondary/40 p-4 md:p-6">
       <div className="mx-auto max-w-7xl">
-        <header className="mb-5 flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-accent">
-              {t("eyebrow")}
-            </p>
-            <h1 className="mt-1 text-2xl font-semibold tracking-tight text-foreground">
-              {t("title")}
-            </h1>
-            <p className="mt-2 max-w-3xl text-sm leading-6 text-muted">
-              {t("description")}
-            </p>
-          </div>
-          <span className="rounded-full border border-border bg-surface px-3 py-1.5 text-xs text-muted">
-            {t("skillBoundary")}
-          </span>
-        </header>
-
-        <div
-          className="mb-5 flex w-fit max-w-full gap-1 overflow-x-auto rounded-lg border border-border bg-surface p-1"
-          role="tablist"
-          aria-label={t("tabsLabel")}
-        >
-          {(
-            [
-              "creative",
-              "continuity",
-              "style",
-              "illustration",
-              "retrospective",
-              "history",
-              "management",
-            ] as StudioTab[]
-          ).map(
+        {visibleTabs.length > 1 && (
+          <div
+            className="mb-5 flex w-fit max-w-full gap-1 overflow-x-auto rounded-lg border border-border bg-surface p-1"
+            role="tablist"
+            aria-label={t("tabsLabel")}
+          >
+            {visibleTabs.map(
             (item) => (
               <button
                 key={item}
@@ -1946,20 +1234,11 @@ export default function AgentStudioWorkspace({
                 aria-selected={tab === item}
                 onClick={() => {
                   setTab(item);
-                  if (
-                    item === "style" &&
-                    (scope === "novel" || scope === "character")
-                  ) {
-                    setScope("chapter");
+                  setRevisionSource(null);
+                  if (item === "style" && scope === "novel") {
+                    changeScope("chapter");
                   } else if (item === "retrospective") {
-                    setScope("volume");
-                  } else if (item === "illustration" && scope === "volume") {
-                    setScope("novel");
-                  } else if (
-                    item !== "illustration" &&
-                    scope === "character"
-                  ) {
-                    setScope("novel");
+                    changeScope("volume");
                   }
                   setError(null);
                   setNotice(null);
@@ -1973,8 +1252,9 @@ export default function AgentStudioWorkspace({
                 {t(`tabs.${item}`)}
               </button>
             ),
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         {error && (
           <div
@@ -1997,16 +1277,19 @@ export default function AgentStudioWorkspace({
           <div className="rounded-lg border border-border bg-surface px-6 py-16 text-center text-sm text-muted">
             {t("loading")}
           </div>
-        ) : tab === "management" ? (
-          renderManagement()
-        ) : tab === "history" ? (
+        ) : tab === "composer" ? (
           novelId ? (
             <AgentRevisionWorkspace
               novelId={novelId}
               volumes={volumes}
               chapters={chapters}
               source={revisionSource}
-              onClearSource={() => setRevisionSource(null)}
+              onClearSource={leaveRevisionComposer}
+              onProposalCreated={() => {
+                const runId = revisionSource?.runId;
+                leaveRevisionComposer();
+                if (runId) onOpenHistory?.(runId);
+              }}
             />
           ) : (
             <div className="rounded-lg border border-dashed border-border bg-surface px-6 py-12 text-center text-sm text-muted">
@@ -2017,19 +1300,6 @@ export default function AgentStudioWorkspace({
           renderTool()
         )}
 
-        {presetImportOpen && (
-          <GenerationPresetImportDialog
-            capabilities={capabilities}
-            defaultCapability={
-              managementFilter !== "all" &&
-              capabilityMap.get(managementFilter)?.customizable
-                ? managementFilter
-                : "creative_inspiration"
-            }
-            onClose={() => setPresetImportOpen(false)}
-            onUseDraft={useImportedPresetDraft}
-          />
-        )}
       </div>
     </div>
   );

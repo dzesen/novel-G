@@ -191,7 +191,7 @@ async def _sync_quarantined_proposals(
         }
         if operation == "apply_agent_revision_proposal":
             update["stale_reason"] = (
-                "修订提案恢复失败，已隔离且不会继续写入；请重新运行 Agent"
+                "修订提案恢复失败，已隔离且不会继续写入；请重新运行生成角色"
             )
         await proposals.update_one(
             {

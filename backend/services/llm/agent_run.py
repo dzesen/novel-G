@@ -130,7 +130,7 @@ class AgentRunStore:
             return_document=ReturnDocument.AFTER,
         )
         if document is None:
-            raise NotFoundError(f"Agent run '{run_id}' is no longer active")
+            raise NotFoundError(f"Generation tool run '{run_id}' is no longer active")
         return _public_view(document)
 
     async def fail(
@@ -195,7 +195,7 @@ class AgentRunStore:
             }
         )
         if document is None:
-            raise NotFoundError(f"Agent run '{run_id}' was not found")
+            raise NotFoundError(f"Generation tool run '{run_id}' was not found")
         return document
 
     async def list_owned(

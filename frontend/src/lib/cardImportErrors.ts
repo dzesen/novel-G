@@ -16,6 +16,23 @@ interface MissingCharacterMetadataDetail {
   text_keywords?: unknown;
 }
 
+const GENERATION_PRESET_ROUTING_CODES = new Set([
+  "generation_preset_requires_generation_roles",
+  // Keep recognizing responses from an older backend during rolling upgrades.
+  "generation_preset_requires_agent_studio",
+]);
+
+export function isGenerationPresetRoutingError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const detail = (error as { detail?: unknown }).detail;
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) {
+    return false;
+  }
+  return GENERATION_PRESET_ROUTING_CODES.has(
+    String((detail as { code?: unknown }).code ?? ""),
+  );
+}
+
 function missingCharacterMetadataDetail(
   error: unknown,
 ): MissingCharacterMetadataDetail | null {
@@ -33,17 +50,8 @@ export function cardImportErrorMessage(
   fallback: string,
   messages: MissingCharacterMetadataMessages,
 ): string {
-  if (error && typeof error === "object") {
-    const detail = (error as { detail?: unknown }).detail;
-    if (
-      detail &&
-      typeof detail === "object" &&
-      !Array.isArray(detail) &&
-      (detail as { code?: unknown }).code ===
-        "generation_preset_requires_agent_studio"
-    ) {
-      return messages.generationPreset;
-    }
+  if (isGenerationPresetRoutingError(error)) {
+    return messages.generationPreset;
   }
   const detail = missingCharacterMetadataDetail(error);
   if (!detail) return fallback;

@@ -268,7 +268,7 @@ async def ensure_agent_context_current(context: AgentContextBundle) -> None:
     current = await narrative_revision_store.current(context.novel_id)
     if current != context.narrative_revision:
         raise StaleAgentContext(
-            "小说内容在 Agent 运行期间发生变化，请基于最新内容重新执行"
+            "小说内容在生成期间发生变化，请基于最新内容重新执行"
         )
 
 
@@ -377,17 +377,17 @@ async def build_agent_context(
 ) -> AgentContextBundle:
     """Build a deterministic, bounded evidence packet for one analysis scope."""
     if scope not in {"novel", "volume", "chapter"}:
-        raise ValueError(f"不支持的 Agent 作用范围: {scope}")
+        raise ValueError(f"不支持的生成工具作用范围: {scope}")
     if scope == "novel" and (volume_id or chapter_id):
-        raise ValueError("全书级 Agent 请求不能同时指定 volume_id 或 chapter_id")
+        raise ValueError("全书级生成工具请求不能同时指定 volume_id 或 chapter_id")
     if scope == "volume" and not volume_id:
-        raise ValueError("卷级 Agent 请求必须指定 volume_id")
+        raise ValueError("卷级生成工具请求必须指定 volume_id")
     if scope == "volume" and chapter_id:
-        raise ValueError("卷级 Agent 请求不能同时指定 chapter_id")
+        raise ValueError("卷级生成工具请求不能同时指定 chapter_id")
     if scope == "chapter" and not chapter_id:
-        raise ValueError("章节级 Agent 请求必须指定 chapter_id")
+        raise ValueError("章节级生成工具请求必须指定 chapter_id")
     if scope == "chapter" and volume_id:
-        raise ValueError("章节级 Agent 请求不能同时指定 volume_id")
+        raise ValueError("章节级生成工具请求不能同时指定 volume_id")
 
     captured_revision = await narrative_revision_store.current(novel_id)
     novel = await novel_repo.get_novel_by_id(novel_id)
@@ -631,7 +631,7 @@ async def build_agent_context(
     text = "\n\n".join(rendered)
     if await narrative_revision_store.current(novel_id) != captured_revision:
         raise StaleAgentContext(
-            "小说内容在 Agent 上下文装配期间发生变化，请重试"
+            "小说内容在生成上下文装配期间发生变化，请重试"
         )
     # Only authorize references whose stable ID was actually rendered into
     # the bounded packet. A large novel may truncate later sections; IDs from
@@ -1553,7 +1553,7 @@ async def build_style_consistency_context(
 
     if await narrative_revision_store.current(novel_id) != captured_revision:
         raise StaleAgentContext(
-            "小说内容在 Agent 上下文装配期间发生变化，请重试"
+            "小说内容在生成上下文装配期间发生变化，请重试"
         )
     context_digest = hashlib.sha256(
         json.dumps(

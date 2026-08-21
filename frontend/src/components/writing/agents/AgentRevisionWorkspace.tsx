@@ -31,6 +31,9 @@ interface Props {
   chapters: ChapterSummary[];
   source: AgentRevisionSourceSelection | null;
   onClearSource: () => void;
+  onProposalCreated?: (proposal: AgentRevisionProposal) => void;
+  initialRunId?: string;
+  initialRun?: AgentRun;
 }
 
 interface VolumeDetail extends VolumeSummary {
@@ -88,9 +91,15 @@ export default function AgentRevisionWorkspace({
   chapters,
   source,
   onClearSource,
+  onProposalCreated,
+  initialRunId,
+  initialRun,
 }: Props) {
   const t = useTranslations("writing.agentStudio.revisions");
   const [runs, setRuns] = useState<AgentRun[]>([]);
+  const [runCapabilityFilter, setRunCapabilityFilter] = useState<
+    AgentRun["capability"] | "all"
+  >("all");
   const [proposals, setProposals] = useState<AgentRevisionProposal[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,20 +131,47 @@ export default function AgentRevisionWorkspace({
           `/api/agent-tools/proposals?novel_id=${encodedNovelId}`,
         ),
       ]);
-      setRuns(runResponse.data);
+      setRuns(
+        initialRun
+          ? [
+              initialRun,
+              ...runResponse.data.filter(
+                (run) => run.run_id !== initialRun.run_id,
+              ),
+            ]
+          : runResponse.data,
+      );
       setProposals(proposalResponse.data);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t("loadFailed"));
     } finally {
       setLoading(false);
     }
-  }, [novelId, t]);
+  }, [initialRun, novelId, t]);
 
   useEffect(() => {
     void loadHistory();
   }, [loadHistory]);
 
+  useEffect(() => {
+    if (loading || !initialRunId) return;
+    const targetId = `generation-role-run-${initialRunId}`;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(targetId);
+      target?.focus({ preventScroll: true });
+      target?.scrollIntoView({ block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    initialRunId,
+    loading,
+    runs,
+  ]);
+
   const sourceRun = runs.find((run) => run.run_id === source?.runId);
+  const filteredRuns = runCapabilityFilter === "all"
+    ? runs
+    : runs.filter((run) => run.capability === runCapabilityFilter);
   const allowedChapters = useMemo(() => {
     const snapshot = source?.contextSnapshot;
     if (!snapshot) return chapters;
@@ -293,17 +329,24 @@ export default function AgentRevisionWorkspace({
             }
           : { kind: targetKind, chapter_id: targetChapterId };
     try {
-      await apiPost("/api/agent-tools/proposals", {
-        novel_id: novelId,
-        run_id: source.runId,
-        source_kind: source.sourceKind,
-        source_index: source.sourceIndex,
-        target,
-        patch: preparedPatch,
-      });
+      const response = await apiPost<{ proposal: AgentRevisionProposal }>(
+        "/api/agent-tools/proposals",
+        {
+          novel_id: novelId,
+          run_id: source.runId,
+          source_kind: source.sourceKind,
+          source_index: source.sourceIndex,
+          target,
+          patch: preparedPatch,
+        },
+      );
       setNotice(t("created"));
-      onClearSource();
-      await loadHistory();
+      if (onProposalCreated) {
+        onProposalCreated(response.proposal);
+      } else {
+        onClearSource();
+        await loadHistory();
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t("createFailed"));
     } finally {
@@ -440,11 +483,14 @@ export default function AgentRevisionWorkspace({
               </h2>
               <p className="mt-1 text-xs text-muted">
                 {t("sourceMeta", {
-                  agent: sourceRun?.agent_id ?? "Agent",
+                  agent: sourceRun?.agent_id ?? t("unknownRole"),
                   version: sourceRun?.agent_version ?? 1,
                   provider: sourceRun?.provider_alias ?? "—",
                   revision: source.contextSnapshot.narrative_revision,
                 })}
+              </p>
+              <p className="mt-2 max-w-2xl text-xs leading-5 text-amber-700 dark:text-amber-300">
+                {t("temporaryComposerNotice")}
               </p>
             </div>
             <button
@@ -652,20 +698,57 @@ export default function AgentRevisionWorkspace({
       </section>
 
       <section className="rounded-lg border border-border bg-surface p-5">
-        <h2 className="text-lg font-semibold text-foreground">
-          {t("runTitle")}
-        </h2>
-        <p className="mt-1 text-sm text-muted">{t("runDescription")}</p>
-        {!loading && runs.length === 0 ? (
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-foreground">
+              {t("runTitle")}
+            </h2>
+            <p className="mt-1 text-sm text-muted">{t("runDescription")}</p>
+          </div>
+          <label className="min-w-0 text-xs text-muted sm:min-w-56">
+            <span className="sr-only">{t("runFilter")}</span>
+            <select
+              aria-label={t("runFilter")}
+              className={fieldClass}
+              value={runCapabilityFilter}
+              onChange={(event) =>
+                setRunCapabilityFilter(
+                  event.target.value as AgentRun["capability"] | "all",
+                )
+              }
+            >
+              <option value="all">{t("allRuns")}</option>
+              {(Object.keys(RUN_CAPABILITY_LABEL_KEYS) as AgentRun["capability"][])
+                .map((capability) => (
+                  <option key={capability} value={capability}>
+                    {t(RUN_CAPABILITY_LABEL_KEYS[capability])}
+                  </option>
+                ))}
+            </select>
+          </label>
+        </div>
+        {!loading && filteredRuns.length === 0 ? (
           <p className="mt-5 rounded-lg bg-surface-secondary px-4 py-6 text-center text-sm text-muted">
-            {t("runEmpty")}
+            {runs.length === 0 ? t("runEmpty") : t("runFilteredEmpty")}
           </p>
         ) : (
           <ol className="mt-4 divide-y divide-border">
-            {runs.map((run) => (
+            {filteredRuns.map((run) => (
               <li
                 key={run.run_id}
-                className="flex flex-wrap items-start justify-between gap-3 py-3 first:pt-0 last:pb-0"
+                id={`generation-role-run-${run.run_id}`}
+                tabIndex={-1}
+                aria-current={run.run_id === initialRunId ? "true" : undefined}
+                data-testid={
+                  run.run_id === initialRunId
+                    ? "located-generation-role-run"
+                    : undefined
+                }
+                className={`flex flex-wrap items-start justify-between gap-3 py-3 outline-none first:pt-0 last:pb-0 ${
+                  run.run_id === initialRunId
+                    ? "rounded-md bg-accent/10 px-2"
+                    : ""
+                }`}
               >
                 <div>
                   <p className="text-sm font-medium text-foreground">

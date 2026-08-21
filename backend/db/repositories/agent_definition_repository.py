@@ -37,7 +37,7 @@ class AgentDefinitionRepository(BaseRepository):
         inserted_id = await self.insert_one(document)
         created = await self.collection.find_one({"_id": to_object_id(inserted_id)})
         if created is None:  # pragma: no cover - Mongo acknowledged the insert.
-            raise RuntimeError("Agent definition disappeared after creation")
+            raise RuntimeError("Generation role disappeared after creation")
         return created
 
     async def list_visible(
@@ -83,7 +83,7 @@ class AgentDefinitionRepository(BaseRepository):
             query["enabled"] = True
         document = await self.collection.find_one(query)
         if document is None:
-            raise NotFoundError(f"Agent '{agent_id}' was not found")
+            raise NotFoundError(f"Generation role '{agent_id}' was not found")
         return document
 
     async def get_owned(
@@ -101,7 +101,7 @@ class AgentDefinitionRepository(BaseRepository):
             query["is_deleted"] = False
         document = await self.collection.find_one(query)
         if document is None:
-            raise NotFoundError(f"Editable Agent '{agent_id}' was not found")
+            raise NotFoundError(f"Editable generation role '{agent_id}' was not found")
         return document
 
     async def update_owned(
@@ -138,9 +138,9 @@ class AgentDefinitionRepository(BaseRepository):
             projection={"version": 1},
         )
         if existing is None:
-            raise NotFoundError(f"Editable Agent '{agent_id}' was not found")
+            raise NotFoundError(f"Editable generation role '{agent_id}' was not found")
         raise AgentDefinitionVersionConflict(
-            f"Agent 已更新到版本 {existing.get('version', '?')}，请刷新后重试"
+            f"生成角色已更新到版本 {existing.get('version', '?')}，请刷新后重试"
         )
 
     async def soft_delete_owned(self, *, owner_id: str, agent_id: str) -> bool:
