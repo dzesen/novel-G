@@ -6,6 +6,7 @@ import { Button } from "@heroui/react";
 import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
+  type BookCompletionAudit,
   type GenerationJob,
   type GenerationRunsNavigationTarget,
   type LeftoverProseRun,
@@ -21,6 +22,11 @@ import CheckpointReview from "./CheckpointReview";
 import LeftoverProseRuns from "./LeftoverProseRuns";
 import type { ReferenceCardType } from "./referenceCardAutoCreation";
 import ReferenceCardAutomationAuditPanel from "./ReferenceCardAutomationAuditPanel";
+import BookCompletionAuditPanel from "./BookCompletionAuditPanel";
+import {
+  bookCompletionAuditMatchesJob,
+  bookCompletionResult,
+} from "./bookCompletionPresentation";
 
 interface BatchGenerationPanelProps {
   novelId: string;
@@ -34,6 +40,7 @@ interface BatchGenerationPanelProps {
   onJumpToChapter: (chapterId: string) => void;
   onQuietRefresh: () => void;
   onNavigateToMemory: () => void;
+  onNavigateToBlueprint: () => void;
   onNavigateToReferenceCards: (
     cardType?: ReferenceCardType,
     cardId?: string,
@@ -58,6 +65,7 @@ export default function BatchGenerationPanel({
   onJumpToChapter,
   onQuietRefresh,
   onNavigateToMemory,
+  onNavigateToBlueprint,
   onNavigateToReferenceCards,
   onNavigateToReferenceCardCandidates,
   onNavigateToPlotThreads,
@@ -75,6 +83,10 @@ export default function BatchGenerationPanel({
   const [dismissed, setDismissed] = useState<string | null>(null); // 已关闭的终态作业 id
   const [jobLookupError, setJobLookupError] = useState("");
   const [jobLookupRevision, setJobLookupRevision] = useState(0);
+  const [currentBookAudit, setCurrentBookAudit] =
+    useState<BookCompletionAudit | null>(null);
+  const [currentBookAuditError, setCurrentBookAuditError] = useState("");
+  const [currentBookAuditRevision, setCurrentBookAuditRevision] = useState(0);
 
 
   // 精确 job 深链优先；只有 URL 没指定 job 时才收养最近的非终态作业。
@@ -124,6 +136,40 @@ export default function BatchGenerationPanel({
     novelId,
     onJobTargetValidation,
     setJob,
+    t,
+  ]);
+
+  // A persisted completion audit is historical evidence. Completed Jobs must
+  // refresh the read-only audit before the UI may still call the book complete.
+  useEffect(() => {
+    let cancelled = false;
+    setCurrentBookAudit(null);
+    setCurrentBookAuditError("");
+    if (job?.scope !== "book" || job.status !== "completed") {
+      return () => { cancelled = true; };
+    }
+    void apiGet<BookCompletionAudit>(
+      `/api/generation-jobs/book/${encodeURIComponent(novelId)}`
+      + `/completion-audit?job_id=${encodeURIComponent(job._id)}`,
+    ).then((audit) => {
+      if (!bookCompletionAuditMatchesJob(audit, job._id)) {
+        throw new Error(t("bookAuditJobMismatch"));
+      }
+      if (!cancelled) setCurrentBookAudit(audit);
+    }).catch((reason) => {
+      if (!cancelled) {
+        setCurrentBookAuditError(
+          reason instanceof Error ? reason.message : t("bookAuditRefreshFailed"),
+        );
+      }
+    });
+    return () => { cancelled = true; };
+  }, [
+    currentBookAuditRevision,
+    job?._id,
+    job?.scope,
+    job?.status,
+    novelId,
     t,
   ]);
 
@@ -282,6 +328,20 @@ export default function BatchGenerationPanel({
   const processedChapterCount = new Set(
     job.progress.map((entry) => entry.chapter_id),
   ).size;
+  const boundCurrentBookAudit = currentBookAudit
+    && bookCompletionAuditMatchesJob(currentBookAudit, job._id)
+    ? currentBookAudit
+    : null;
+  const displayedCompletionAudit = job.scope === "book"
+    && job.status === "completed"
+    ? boundCurrentBookAudit
+    : job.completion_audit ?? null;
+  const completionResult = bookCompletionResult(job, boundCurrentBookAudit);
+  const showCompletionAudit = Boolean(
+    displayedCompletionAudit
+    && job.scope === "book"
+    && (job.status === "completed" || job.pause_reason === "final_audit"),
+  );
 
   return (
     <>
@@ -292,6 +352,49 @@ export default function BatchGenerationPanel({
       {!isResumable(job.status) && generationRunsEntry}
 
       <div className="shrink-0 border-b border-border">
+        {job.scope === "book"
+          && job.status === "completed"
+          && !boundCurrentBookAudit
+          && (
+            <div
+              role={currentBookAuditError ? "alert" : "status"}
+              className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-b border-border bg-surface-secondary px-4 py-3 text-xs text-muted"
+            >
+              <span className="min-w-0 break-words">
+                {currentBookAuditError || t("bookAuditRefreshing")}
+              </span>
+              {currentBookAuditError && (
+                <button
+                  type="button"
+                  onClick={() => setCurrentBookAuditRevision((value) => value + 1)}
+                  className="shrink-0 font-medium text-accent hover:underline"
+                >
+                  {t("retry")}
+                </button>
+              )}
+            </div>
+          )}
+        {showCompletionAudit && displayedCompletionAudit && (
+          <BookCompletionAuditPanel
+            audit={displayedCompletionAudit}
+            titleForChapter={titleForChapter}
+            onJumpToChapter={onJumpToChapter}
+            onNavigateToBlueprint={onNavigateToBlueprint}
+            onNavigateToMemory={onNavigateToMemory}
+            onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
+            onNavigateToReferenceCardCandidates={() => (
+              onNavigateToReferenceCardCandidates()
+            )}
+            onNavigateToPlotThreads={onNavigateToPlotThreads}
+            onOpenGenerationRuns={() => onOpenGenerationRuns({
+              jobId: job._id,
+              chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
+            })}
+            onRefresh={job.status === "completed"
+              ? () => setCurrentBookAuditRevision((value) => value + 1)
+              : undefined}
+          />
+        )}
         {isActive(job.status) && (
           <div className="grid gap-2 bg-surface px-4 py-3">
           <div className="flex items-center justify-between gap-3">
@@ -363,7 +466,9 @@ export default function BatchGenerationPanel({
             <p className="text-sm text-foreground">
               {job.status === "completed"
                 ? (job.scope === "book"
-                    ? t("resultCompletedBook", { count: processedChapterCount, tokens: job.tokens_used })
+                    ? completionResult === "complete"
+                      ? t("resultCompletedBook", { count: processedChapterCount, tokens: job.tokens_used })
+                      : t("resultCompletedBookUnverified", { count: processedChapterCount, tokens: job.tokens_used })
                     : t("resultCompleted", { count: processedChapterCount, tokens: job.tokens_used }))
                 : t("resultAborted")}
             </p>

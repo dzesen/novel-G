@@ -36,6 +36,7 @@ const JOB_PAUSE_REASON_KEYS = {
   reference_card_review: "reasonReferenceCardReview",
   reference_card_auto_creation_recovery: "reasonReferenceCardAutoCreationRecovery",
   reference_card_repair_exhausted: "reasonReferenceCardRepairExhausted",
+  final_audit: "reasonFinalAudit",
 } as const;
 
 export type DiagnosticReasonTranslationKey =

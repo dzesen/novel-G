@@ -19,6 +19,10 @@ from backend.services.generation.readiness import StaleReadiness
 from backend.services.generation.reference_card_auto_creation import (
     ReferenceCardAutoCreationPolicy,
 )
+from backend.services.novel.book_completion import (
+    BookCompletionReport,
+    book_completion_audit,
+)
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
@@ -207,6 +211,20 @@ async def inspect_volume_readiness(volume_id: str):
 async def inspect_book_readiness(novel_id: str):
     try:
         return await GenerationJobService.inspect_book_readiness(novel_id)
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get(
+    "/book/{novel_id}/completion-audit",
+    response_model=BookCompletionReport,
+)
+async def inspect_book_completion(
+    novel_id: str,
+    job_id: str | None = Query(default=None),
+) -> BookCompletionReport:
+    try:
+        return await book_completion_audit.inspect(novel_id, job_id=job_id)
     except Exception as exc:
         raise _handle(exc) from exc
 

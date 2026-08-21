@@ -53,6 +53,7 @@ interface AutoBookWorkspaceProps {
     valid: boolean,
   ) => void;
   onOpenWriting: (chapterId: string, run?: ProseRunSnapshot | null) => void;
+  onOpenBlueprint: () => void;
   onOpenWorld: (
     view: "library" | "curation" | "candidates",
     targets?: {
@@ -80,6 +81,7 @@ export default function AutoBookWorkspace({
   onNavigateView,
   onTargetValidation,
   onOpenWriting,
+  onOpenBlueprint,
   onOpenWorld,
   onOpenContinuity,
 }: AutoBookWorkspaceProps) {
@@ -326,6 +328,7 @@ export default function AutoBookWorkspace({
             onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}
             onQuietRefresh={() => void loadStructure(true)}
             onNavigateToMemory={() => onOpenContinuity("facts")}
+            onNavigateToBlueprint={onOpenBlueprint}
             onNavigateToReferenceCards={(cardType = "character", cardId) =>
               onOpenWorld(cardId ? "library" : "curation", {
                 cardType,

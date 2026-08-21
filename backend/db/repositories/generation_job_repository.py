@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 from uuid import uuid4
 
@@ -14,6 +14,7 @@ from pymongo.results import BulkWriteResult
 from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
+from backend.db.mongo import get_database
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
@@ -64,8 +65,12 @@ USAGE_SUMMARY_LIMIT = 100
 
 
 MAX_ACTIVE_TOKEN_RESERVATIONS = 32
+BOOK_COMPLETION_PUBLICATION_LEASE_SECONDS = 30
+BOOK_COMPLETION_PUBLICATION_SCHEMA = "book_completion_audit_publication.v1"
 _ATOMIC_JOB_FIELDS = frozenset({
     "candidate_pipeline_checkpoints",
+    "completion_audit",
+    "completion_audit_publication",
     "expected_narrative_revision",
     "execution_epoch",
     "execution_lease",
@@ -587,10 +592,22 @@ class GenerationJobRepository:
         self,
         fields: Mapping[str, Any],
     ) -> None:
-        if current_job_execution() is None:
+        lease = current_job_execution()
+        if lease is None:
             return
         await self._assert_execution_current()
         _validate_leased_runtime_patch(fields)
+        current: Mapping[str, Any] | None = None
+        if fields.get("status") == "completed":
+            current = await self.get_job(lease.job_id)
+        if (
+            fields.get("status") == "completed"
+            and current is not None
+            and current.get("scope") == "book"
+        ):
+            raise ValueError(
+                "Book Job completion audit requires its atomic publish command"
+            )
 
     async def _reject_worker_generic_mutation(self, operation: str) -> None:
         if current_job_execution() is None:
@@ -2524,6 +2541,384 @@ class GenerationJobRepository:
             "Generation job reauthorization lost its revision fence"
         )
 
+    @staticmethod
+    def _book_completion_snapshot_query(
+        job_id: str,
+        *,
+        previous_status: str,
+        previous_pause_reason: str | None,
+        previous_execution_epoch: int,
+        previous_expected_narrative_revision: int | None,
+        novel_id: str,
+    ) -> dict[str, Any]:
+        lease = current_job_execution()
+        worker_publish = lease is not None
+        if (
+            type(previous_execution_epoch) is not int
+            or previous_execution_epoch < 0
+            or previous_execution_epoch >= _MAX_NARRATIVE_REVISION
+            or (
+                previous_expected_narrative_revision is not None
+                and (
+                    type(previous_expected_narrative_revision) is not int
+                    or previous_expected_narrative_revision < 0
+                )
+            )
+            or (worker_publish and previous_status != "running")
+            or (
+                not worker_publish
+                and (
+                    previous_status not in {"paused", "failed"}
+                    or previous_pause_reason != "final_audit"
+                )
+            )
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Book completion audit publication snapshot is invalid"
+            )
+        epoch_query: dict[str, Any] = {
+            "execution_epoch": previous_execution_epoch
+        }
+        if previous_execution_epoch == 0:
+            epoch_query = {
+                "$or": [
+                    {"execution_epoch": 0},
+                    {"execution_epoch": {"$exists": False}},
+                ]
+            }
+        revision_query: dict[str, Any] = {
+            "expected_narrative_revision": (
+                previous_expected_narrative_revision
+            )
+        }
+        if previous_expected_narrative_revision is None:
+            revision_query = {
+                "$or": [
+                    {"expected_narrative_revision": {"$exists": False}},
+                    {"expected_narrative_revision": None},
+                ]
+            }
+        clauses: list[dict[str, Any]] = [
+            {
+                "_id": to_object_id(job_id),
+                "novel_id": to_object_id(novel_id),
+                "scope": "book",
+                "is_deleted": False,
+                "status": previous_status,
+                "pause_reason": previous_pause_reason,
+                "state_dispatch_resolution": None,
+            },
+            epoch_query,
+            revision_query,
+        ]
+        if not worker_publish:
+            clauses.append({
+                "$or": [
+                    {"execution_lease": {"$exists": False}},
+                    {"execution_lease": None},
+                ]
+            })
+        return {"$and": clauses}
+
+    @staticmethod
+    def _book_completion_publication_query(
+        job_id: str,
+        fence_token: str,
+        *,
+        live_after: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not str(fence_token or ""):
+            raise CandidatePipelineCheckpointConflict(
+                "Book completion audit publication token is required"
+            )
+        query: dict[str, Any] = {
+            "completion_audit_publication.schema_version": (
+                BOOK_COMPLETION_PUBLICATION_SCHEMA
+            ),
+            "completion_audit_publication.token": str(fence_token),
+            "completion_audit_publication.job_id": str(job_id),
+            "completion_audit_publication.expires_at": {"$type": "date"},
+        }
+        if live_after is not None:
+            query["completion_audit_publication.expires_at"] = {
+                "$type": "date",
+                "$gt": live_after,
+            }
+        return query
+
+    async def reserve_book_completion_audit_publication(
+        self,
+        job_id: str,
+        *,
+        fence_token: str,
+        previous_status: str,
+        previous_pause_reason: str | None,
+        previous_execution_epoch: int,
+        previous_expected_narrative_revision: int | None,
+        novel_id: str,
+    ) -> bool:
+        """Reserve the Job-local token that owns one persistent audit fence."""
+
+        now = get_utc_now()
+        query = self._book_completion_snapshot_query(
+            job_id,
+            previous_status=previous_status,
+            previous_pause_reason=previous_pause_reason,
+            previous_execution_epoch=previous_execution_epoch,
+            previous_expected_narrative_revision=(
+                previous_expected_narrative_revision
+            ),
+            novel_id=novel_id,
+        )
+        query["$and"].append({
+            "$or": [
+                {"completion_audit_publication": {"$exists": False}},
+                {"completion_audit_publication": None},
+                {
+                    "completion_audit_publication.expires_at": {
+                        "$lte": now,
+                    }
+                },
+                self._book_completion_publication_query(
+                    job_id,
+                    fence_token,
+                ),
+            ]
+        })
+        result = await self._collection_update_one(
+            query,
+            {
+                "$set": {
+                    "completion_audit_publication": {
+                        "schema_version": BOOK_COMPLETION_PUBLICATION_SCHEMA,
+                        "token": str(fence_token),
+                        "job_id": str(job_id),
+                        "expires_at": now + timedelta(
+                            seconds=BOOK_COMPLETION_PUBLICATION_LEASE_SECONDS
+                        ),
+                    },
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Book completion audit publication reservation raced"
+        )
+
+    async def renew_book_completion_audit_publication(
+        self,
+        job_id: str,
+        *,
+        fence_token: str,
+        previous_status: str,
+        previous_pause_reason: str | None,
+        previous_execution_epoch: int,
+        previous_expected_narrative_revision: int | None,
+        novel_id: str,
+    ) -> bool:
+        """Renew only an unreplaced token; stale-fence recovery may revoke it."""
+
+        now = get_utc_now()
+        query = self._book_completion_snapshot_query(
+            job_id,
+            previous_status=previous_status,
+            previous_pause_reason=previous_pause_reason,
+            previous_execution_epoch=previous_execution_epoch,
+            previous_expected_narrative_revision=(
+                previous_expected_narrative_revision
+            ),
+            novel_id=novel_id,
+        )
+        query["$and"].append(
+            self._book_completion_publication_query(job_id, fence_token)
+        )
+        result = await self._collection_update_one(
+            query,
+            {
+                "$set": {
+                    "completion_audit_publication.expires_at": (
+                        now + timedelta(
+                            seconds=BOOK_COMPLETION_PUBLICATION_LEASE_SECONDS
+                        )
+                    ),
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Book completion audit publication token was revoked"
+        )
+
+    async def publish_book_completion_audit(
+        self,
+        job_id: str,
+        report_value: Mapping[str, Any],
+        *,
+        fence_token: str,
+        previous_status: str,
+        previous_pause_reason: str | None,
+        previous_execution_epoch: int,
+        previous_expected_narrative_revision: int | None,
+    ) -> bool:
+        """Atomically publish one fenced audit against an exact Job snapshot."""
+
+        from backend.services.novel.book_completion import BookCompletionReport
+
+        try:
+            report = BookCompletionReport.model_validate(report_value)
+        except ValueError as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Book completion audit report is invalid"
+            ) from exc
+        if (
+            not fence_token
+            or report.blueprint.frozen_job_id != str(job_id)
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Book completion audit is not bound to its publication fence"
+            )
+        now = get_utc_now()
+        fenced_novel = await get_database()[collections.NOVELS].find_one(
+            {
+                "_id": to_object_id(report.novel_id),
+                "$expr": {
+                    "$eq": [
+                        {"$ifNull": ["$narrative_revision", 0]},
+                        report.narrative_revision,
+                    ]
+                },
+                "narrative_write_fence.token": str(fence_token),
+                "narrative_write_fence.resource_kind": (
+                    "book_completion_audit"
+                ),
+                "narrative_write_fence.resource_id": str(job_id),
+                "narrative_write_fence.expires_at": {"$exists": False},
+            },
+            projection={"_id": 1},
+        )
+        if fenced_novel is None:
+            raise CandidatePipelineCheckpointConflict(
+                "Book completion audit lost its narrative revision fence"
+            )
+        if report.complete:
+            status = "completed"
+            pause_reason = None
+            error = None
+        else:
+            status = "paused"
+            pause_reason = "final_audit"
+            error = {
+                "step": "final_audit",
+                "message": "Book completion audit has blocking issues",
+                "audit_digest": report.audit_digest,
+                "blocking_issue_codes": sorted({
+                    issue.code
+                    for issue in report.issues
+                    if issue.level == "blocking"
+                }),
+            }
+        update: dict[str, Any] = {
+            "$set": {
+                "status": status,
+                "pause_reason": pause_reason,
+                "current_chapter_id": None,
+                "active_slot": None,
+                "error": error,
+                "completion_audit": report.model_dump(mode="json"),
+                "updated_at": now,
+            },
+            "$unset": {"completion_audit_publication": ""},
+        }
+        if current_job_execution() is None:
+            update["$inc"] = {"execution_epoch": 1}
+            update["$unset"]["execution_lease"] = ""
+        query = self._book_completion_snapshot_query(
+            job_id,
+            previous_status=previous_status,
+            previous_pause_reason=previous_pause_reason,
+            previous_execution_epoch=previous_execution_epoch,
+            previous_expected_narrative_revision=(
+                previous_expected_narrative_revision
+            ),
+            novel_id=report.novel_id,
+        )
+        query["$and"].append(
+            self._book_completion_publication_query(
+                job_id,
+                fence_token,
+                live_after=now,
+            )
+        )
+        result = await self._collection_update_one(
+            query,
+            update,
+        )
+        if result.modified_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Book completion audit publication lost its execution fence"
+        )
+
+    async def publish_book_completion_audit_failure(
+        self,
+        job_id: str,
+        *,
+        novel_id: str,
+        fence_token: str,
+        message: str,
+        source_changed: bool,
+        previous_status: str,
+        previous_pause_reason: str | None,
+        previous_execution_epoch: int,
+        previous_expected_narrative_revision: int | None,
+    ) -> bool:
+        """Fail closed without allowing an old audit to overwrite Job control."""
+
+        pause_reason = "source_changed" if source_changed else "final_audit"
+        update: dict[str, Any] = {
+            "$set": {
+                "status": "paused" if source_changed else "failed",
+                "pause_reason": pause_reason,
+                "current_chapter_id": None,
+                "active_slot": None,
+                "error": {
+                    "step": pause_reason,
+                    "message": str(message),
+                },
+                "updated_at": get_utc_now(),
+            },
+            "$unset": {"completion_audit_publication": ""},
+        }
+        if current_job_execution() is None:
+            update["$inc"] = {"execution_epoch": 1}
+            update["$unset"]["execution_lease"] = ""
+        query = self._book_completion_snapshot_query(
+            job_id,
+            previous_status=previous_status,
+            previous_pause_reason=previous_pause_reason,
+            previous_execution_epoch=previous_execution_epoch,
+            previous_expected_narrative_revision=(
+                previous_expected_narrative_revision
+            ),
+            novel_id=novel_id,
+        )
+        query["$and"].append(
+            self._book_completion_publication_query(job_id, fence_token)
+        )
+        result = await self._collection_update_one(
+            query,
+            update,
+        )
+        if result.modified_count == 1:
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Book completion audit failure lost its execution fence"
+        )
+
     async def transition_job_resume(
         self,
         job_id: str,
@@ -2629,6 +3024,7 @@ class GenerationJobRepository:
                         ),
                         "execution_epoch": previous_epoch + 1,
                         "execution_lease": "$$REMOVE",
+                        "completion_audit_publication": "$$REMOVE",
                         "attempt_reservation": None,
                         "has_uncertain_attempts": False,
                         "status": "aborted",

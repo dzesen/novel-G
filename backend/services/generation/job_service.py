@@ -81,13 +81,18 @@ from backend.services.generation.headless_generation import (
 )
 from backend.services.generation.failure_diagnostics import summarize_jobs
 from backend.services.generation.job_engine import (
-    JobControl, JobEngineDeps, run_job, _REGISTRY,
+    JobControl,
+    JobEngineDeps,
+    _REGISTRY,
+    finalize_book_job,
+    run_job,
 )
 from backend.services.generation.outline_adherence import (
     PAUSE_FOR_REWRITE,
     validate_outline_deviation_policy,
 )
 from backend.services.novel.chapter_service import ChapterService
+from backend.services.novel.book_completion import book_completion_audit
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
@@ -1695,11 +1700,37 @@ class GenerationJobService:
                 job_id
             )
 
+        async def _inspect_book_completion(fence):
+            current_job = await generation_job_repo.get_job(job_id)
+            if current_job.get("scope") != "book":
+                raise ValueError("Book completion audit requires a book Job")
+            return await book_completion_audit.inspect(
+                str(current_job["novel_id"]),
+                job_id=str(job_id),
+                expected_narrative_revision=fence.narrative_revision,
+                publication_fence_token=fence.fence_token,
+            )
+
+        def _guard_book_completion_publication(
+            expected_narrative_revision: int | None,
+            fence_token: str,
+        ):
+            return book_completion_audit.publication_fence(
+                str(job["novel_id"]),
+                str(job_id),
+                expected_narrative_revision=expected_narrative_revision,
+                fence_token=fence_token,
+            )
+
         deps = JobEngineDeps(
             list_worklist_chapters=_list_worklist,
             run_chapter=_run_chapter,
             run_candidate_chapter=_run_candidate_chapter,
             resolve_reference_card_blockers=_resolve_reference_card_blockers,
+            inspect_book_completion=_inspect_book_completion,
+            guard_book_completion_publication=(
+                _guard_book_completion_publication
+            ),
         )
         async def _heartbeat_execution(
             owner_task: asyncio.Task[Any],
@@ -2199,6 +2230,40 @@ class GenerationJobService:
                 and pending_state_resolution is None
             ):
                 raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
+            if job.get("pause_reason") == "final_audit":
+                if (
+                    confirm_uncertain_retry
+                    or skip_uncertain
+                    or prose_continuation_policy is not None
+                    or token_budget_provided
+                    or readiness_digest is not None
+                    or acknowledged_warning_codes is not None
+                ):
+                    raise ValueError(
+                        "final audit rerun does not accept Provider authorization"
+                    )
+
+                async def inspect_completion(fence):
+                    return await book_completion_audit.inspect(
+                        str(job["novel_id"]),
+                        job_id=str(job_id),
+                        expected_narrative_revision=fence.narrative_revision,
+                        publication_fence_token=fence.fence_token,
+                    )
+
+                await finalize_book_job(
+                    generation_job_repo,
+                    job_id,
+                    job,
+                    inspect_completion,
+                    lambda expected, token: book_completion_audit.publication_fence(
+                        str(job["novel_id"]),
+                        str(job_id),
+                        expected_narrative_revision=expected,
+                        fence_token=token,
+                    ),
+                )
+                return await generation_job_repo.get_job(job_id)
             unresolved_state_dispatch = bool(
                 pending_state_resolution is not None
                 or pending_proposal_action is not None

@@ -455,6 +455,8 @@ export default function CheckpointReview({
                   ? t("resumeAfterRewrite")
                   : job.pause_reason === "source_changed"
                     ? t("resumeAfterSourceChange")
+                    : job.pause_reason === "final_audit"
+                      ? t("rerunFinalAudit")
                     : job.pause_reason === "reference_card_auto_creation_recovery"
                       ? t("resumeAutoCardRecovery")
                     : t("resume")}

@@ -8,17 +8,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol
+from uuid import uuid4
 
-from backend.db.utils import get_utc_now
+from backend.db.narrative_revision import NarrativeRevisionConflict
 from backend.db.repositories.generation_job_repository import (
     AttemptCapacityExceeded,
     TokenBudgetExceeded,
     generation_job_repo,
 )
+from backend.db.utils import get_utc_now
 from backend.services.generation import job_planner
 from backend.services.generation.candidate_repair_contracts import (
+    CandidatePipelineCheckpointConflict,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
 )
@@ -34,6 +38,8 @@ from backend.services.generation.chapter_candidate_authorization import (
 from backend.services.generation.failure_diagnostics import (
     build_failure_diagnostic,
 )
+from backend.services.generation.job_execution import JobExecutionLeaseLost
+from backend.services.novel.book_completion import BookCompletionReport
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +72,11 @@ class CandidateChapterOutcome:
     next_narrative_revision: int | None = None
 
 
+class BookCompletionPublicationFenceLike(Protocol):
+    narrative_revision: int
+    fence_token: str
+
+
 @dataclass(frozen=True)
 class JobEngineDeps:
     list_worklist_chapters: Callable[[], Awaitable[List[Dict[str, Any]]]]
@@ -85,6 +96,132 @@ class JobEngineDeps:
     resolve_reference_card_blockers: Optional[
         Callable[[], Awaitable[Dict[str, Any] | None]]
     ] = None
+
+    inspect_book_completion: Optional[
+        Callable[
+            [BookCompletionPublicationFenceLike],
+            Awaitable[BookCompletionReport | Mapping[str, Any]],
+        ]
+    ] = None
+
+    guard_book_completion_publication: Optional[
+        Callable[
+            [int | None, str],
+            AbstractAsyncContextManager[BookCompletionPublicationFenceLike],
+        ]
+    ] = None
+
+
+async def finalize_book_job(
+    repo: Any,
+    job_id: str,
+    job: Mapping[str, Any],
+    inspect_book_completion: Optional[
+        Callable[
+            [BookCompletionPublicationFenceLike],
+            Awaitable[BookCompletionReport | Mapping[str, Any]],
+        ]
+    ],
+    guard_book_completion_publication: Optional[
+        Callable[
+            [int | None, str],
+            AbstractAsyncContextManager[BookCompletionPublicationFenceLike],
+        ]
+    ],
+) -> None:
+    """Publish a terminal Job status only behind the canonical book audit."""
+
+    previous_epoch = job.get("execution_epoch", 0)
+    if type(previous_epoch) is not int or previous_epoch < 0:
+        raise ValueError("Generation Job execution epoch is invalid")
+    previous_revision = job.get("expected_narrative_revision")
+    if previous_revision is not None and (
+        type(previous_revision) is not int or previous_revision < 0
+    ):
+        raise ValueError("Generation Job narrative revision is invalid")
+    previous_status = str(job.get("status") or "")
+    previous_pause_reason = (
+        str(job.get("pause_reason"))
+        if job.get("pause_reason") is not None
+        else None
+    )
+    novel_id = str(job.get("novel_id") or "")
+    fence_token = uuid4().hex
+    snapshot = {
+        "previous_status": previous_status,
+        "previous_pause_reason": previous_pause_reason,
+        "previous_execution_epoch": previous_epoch,
+        "previous_expected_narrative_revision": previous_revision,
+        "novel_id": novel_id,
+    }
+    await repo.reserve_book_completion_audit_publication(
+        job_id,
+        fence_token=fence_token,
+        **snapshot,
+    )
+
+    try:
+        if inspect_book_completion is None:
+            raise RuntimeError("Book completion audit dependency is unavailable")
+        if guard_book_completion_publication is None:
+            raise RuntimeError(
+                "Book completion audit publication fence is unavailable"
+            )
+        async with guard_book_completion_publication(
+            previous_revision,
+            fence_token,
+        ) as fence:
+            if fence.fence_token != fence_token:
+                raise ValueError(
+                    "Book completion audit fence token does not match its Job reservation"
+                )
+            report = BookCompletionReport.model_validate(
+                await inspect_book_completion(fence)
+            )
+            if report.novel_id != str(job.get("novel_id") or ""):
+                raise ValueError(
+                    "Book completion audit novel does not match the Job"
+                )
+            if report.blueprint.frozen_job_id != str(job_id):
+                raise ValueError(
+                    "Book completion audit is not bound to the Job"
+                )
+            if report.narrative_revision != fence.narrative_revision:
+                raise NarrativeRevisionConflict(
+                    "Book completion audit revision does not match its fence"
+                )
+            await repo.renew_book_completion_audit_publication(
+                job_id,
+                fence_token=fence.fence_token,
+                **snapshot,
+            )
+            await repo.publish_book_completion_audit(
+                job_id,
+                report.model_dump(mode="json"),
+                fence_token=fence.fence_token,
+                previous_status=previous_status,
+                previous_pause_reason=previous_pause_reason,
+                previous_execution_epoch=previous_epoch,
+                previous_expected_narrative_revision=previous_revision,
+            )
+            return
+    except (
+        CandidatePipelineCheckpointConflict,
+        JobExecutionLeaseLost,
+    ):
+        raise
+    except Exception as exc:  # noqa: BLE001 - publish one fail-closed fact
+        await repo.publish_book_completion_audit_failure(
+            job_id,
+            novel_id=novel_id,
+            fence_token=fence_token,
+            message=str(exc),
+            source_changed=isinstance(exc, NarrativeRevisionConflict),
+            previous_status=previous_status,
+            previous_pause_reason=previous_pause_reason,
+            previous_execution_epoch=previous_epoch,
+            previous_expected_narrative_revision=previous_revision,
+        )
 
 
 def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
@@ -660,6 +797,15 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     })
                     return
             if chapter is None:
+                if job.get("scope") == "book":
+                    await finalize_book_job(
+                        repo,
+                        job_id,
+                        job,
+                        deps.inspect_book_completion,
+                        deps.guard_book_completion_publication,
+                    )
+                    return
                 await repo.update_job_fields(job_id, {
                     "status": "completed", "current_chapter_id": None, "active_slot": None,
                 })

@@ -508,6 +508,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           }
           onTargetValidation={validateLocatedTarget}
           onOpenWriting={openWriting}
+          onOpenBlueprint={() => navigateView("blueprint", "volumes")}
           onOpenWorld={(view, targets) =>
             navigateView("world", view, targets ?? {})
           }

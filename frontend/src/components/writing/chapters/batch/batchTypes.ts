@@ -21,7 +21,71 @@ export type PauseReason =
   | "reference_card_review"
   | "reference_card_auto_creation_recovery"
   | "reference_card_repair_exhausted"
+  | "final_audit"
   | null;
+
+export type BookCompletionIssueCategory =
+  | "structure"
+  | "prose"
+  | "state"
+  | "reference"
+  | "thread"
+  | "word_count"
+  | "semantic"
+  | "runtime";
+
+export interface BookCompletionIssue {
+  code: string;
+  category: BookCompletionIssueCategory;
+  level: "blocking" | "advisory";
+  volume_id?: string | null;
+  chapter_id?: string | null;
+  job_id?: string | null;
+  details: Record<string, unknown>;
+}
+
+export interface BookCompletionAudit {
+  schema_version: "book_completion_audit.v1";
+  novel_id: string;
+  narrative_revision: number;
+  status: "complete" | "incomplete";
+  complete: boolean;
+  read_only: true;
+  blueprint: {
+    source: "current_active_structure";
+    current_structure_digest: string;
+    frozen_job_id: string | null;
+    frozen_worklist_digest: string | null;
+    matches_frozen_worklist: boolean | null;
+  };
+  summary: {
+    volume_count: number;
+    chapter_count: number;
+    complete_chapter_count: number;
+    current_state_count: number;
+    blocking_reference_candidate_count: number;
+    unresolved_thread_count: number;
+    blocking_issue_count: number;
+    advisory_issue_count: number;
+  };
+  chapters: Array<{
+    chapter_id: string;
+    volume_id: string;
+    volume_order: number;
+    chapter_order: number;
+    outline_complete: boolean;
+    prose_status: string;
+    state_status: string;
+    content_digest: string;
+    actual_word_count: number;
+    target_word_count: number | null;
+  }>;
+  issues: BookCompletionIssue[];
+  excluded_optional_subsystems: Array<
+    "illustrations" | "exports" | "optional_agent_reports"
+  >;
+  audit_digest: string;
+}
 
 export interface GenerationRunsNavigationTarget {
   jobId?: string;
@@ -378,6 +442,7 @@ export interface GenerationJob {
   diagnostics?: GenerationDiagnostic[];
   reference_card_auto_creation_events?: ReferenceCardAutoCreationEvent[];
   reference_card_repair_events?: ReferenceCardRepairEvent[];
+  completion_audit?: BookCompletionAudit | null;
   prose_continuation_authorization?: ProseContinuationAuthorization;
   readiness?: GenerationReadiness;
   usage_attempt_capacity: number;
