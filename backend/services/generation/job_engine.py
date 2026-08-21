@@ -583,13 +583,44 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     return
                 if blockers:
                     auto_creation = blockers.get("auto_creation")
+                    requested_pause = (
+                        str(auto_creation.get("pause_reason") or "")
+                        if isinstance(auto_creation, Mapping)
+                        else ""
+                    )
+                    pause_reason = (
+                        requested_pause
+                        if requested_pause
+                        in {
+                            "reference_card_repair_exhausted",
+                            "cost_cap",
+                            "attempt_capacity",
+                            "uncertain_attempt",
+                            "source_changed",
+                        }
+                        else "reference_card_review"
+                    )
                     await repo.update_job_fields(job_id, {
                         "status": "paused",
-                        "pause_reason": "reference_card_review",
-                        "current_chapter_id": None,
+                        "pause_reason": pause_reason,
+                        "current_chapter_id": (
+                            str((blockers.get("chapter_ids") or [""])[0])
+                            if pause_reason
+                            in {
+                                "cost_cap",
+                                "attempt_capacity",
+                                "uncertain_attempt",
+                                "source_changed",
+                            }
+                            else None
+                        ),
                         "active_slot": None,
                         "error": {
-                            "step": "reference_card_review",
+                            "step": (
+                                "reference_card_review"
+                                if pause_reason == "reference_card_review"
+                                else pause_reason
+                            ),
                             "message": (
                                 "New reference-card candidates must be reviewed "
                                 "before the next chapter"

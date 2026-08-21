@@ -5,6 +5,10 @@ import type {
   ProseContinuationAuthorization,
   ProseContinuationPolicy,
 } from "../prose/proseContinuation";
+import type {
+  ReferenceCardAutoCreationPolicy,
+  ReferenceCardType,
+} from "./referenceCardAutoCreation";
 // 镜像后端 generation_job_router._serialize_job 后的 JSON 形状（设计 §8）。
 export type JobStatus =
   | "pending" | "running" | "paused"
@@ -15,6 +19,8 @@ export type PauseReason =
   | "attempt_capacity" | "uncertain_attempt" | "uncertain_skipped" | "process_restart"
   | "source_changed" | "incomplete_scene" | "authorization_scope_increased"
   | "reference_card_review"
+  | "reference_card_auto_creation_recovery"
+  | "reference_card_repair_exhausted"
   | null;
 
 export interface GenerationRunsNavigationTarget {
@@ -169,6 +175,20 @@ export interface GenerationReadiness {
       token_bound_known?: boolean;
     };
     prose_continuation_authorization?: ProseContinuationAuthorization;
+    reference_card_auto_creation_policy?: ReferenceCardAutoCreationPolicy;
+    reference_card_creation_authorization?: {
+      schema_version: "reference_card_creation_authorization.v1";
+      mode: "auto_create_unique";
+      policy_revision: 1;
+      authorization_digest: string;
+      authorization_revision: number;
+      allowed_card_types: ReferenceCardType[];
+      max_auto_creates_per_chapter: number;
+      max_auto_creates_per_book: number;
+      max_candidate_repair_cycles_per_chapter: number;
+      maximum_repair_provider_attempts_total: number;
+      maximum_repair_tokens_total: number;
+    };
   };
 }
 
@@ -219,6 +239,47 @@ export interface JobError {
   message: string;
   candidate_ids?: string[];
   candidate_names?: string[];
+  auto_creation?: {
+    outcome: "manual_review_required" | "auto_created" | "not_applicable" | "repair_exhausted";
+    pause_reason?: PauseReason;
+    created_count: number;
+    deny_reasons: string[];
+    denials: Array<{
+      candidate_id?: string;
+      reason: string;
+      evidence?: Record<string, unknown>;
+    }>;
+  };
+}
+
+export interface ReferenceCardAutoCreationEvent {
+  schema_version: "reference_card_auto_creation_event.v1";
+  event_id: string;
+  chapter_id: string;
+  actor_owner_id: string;
+  authorization_digest: string;
+  outcome: "manual_review_required" | "auto_created" | "not_applicable";
+  created_count: number;
+  mappings: Array<Record<string, unknown>>;
+  deny_reasons: string[];
+  denials: Array<Record<string, unknown>>;
+  limit_usage: Record<string, unknown>;
+  occurred_at: string;
+}
+
+export interface ReferenceCardRepairEvent {
+  schema_version: "reference_card_repair_event.v1";
+  event_id: string;
+  chapter_id: string;
+  actor_owner_id: string;
+  authorization_digest: string;
+  cycle: number;
+  outcome: "applied" | "exhausted" | "uncertain";
+  resolution?: "rewritten_unique_new" | "dependency_removed" | null;
+  reason: string;
+  proposal_digest: string;
+  source_mutation_id: string;
+  occurred_at: string;
 }
 
 export type DiagnosticCategory =
@@ -298,6 +359,8 @@ export interface GenerationJob {
   last_checkpoint_index: number;
   error: JobError | null;
   diagnostics?: GenerationDiagnostic[];
+  reference_card_auto_creation_events?: ReferenceCardAutoCreationEvent[];
+  reference_card_repair_events?: ReferenceCardRepairEvent[];
   prose_continuation_authorization?: ProseContinuationAuthorization;
   readiness?: GenerationReadiness;
   usage_attempt_capacity: number;

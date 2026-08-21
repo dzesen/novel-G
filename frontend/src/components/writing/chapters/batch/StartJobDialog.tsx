@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { apiPost } from "@/lib/api";
@@ -10,6 +10,11 @@ import OutlineGenerationParams, {
   type GenerationParams,
 } from "../outline/OutlineGenerationParams";
 import ProseContinuationControls from "../prose/ProseContinuationControls";
+import ReferenceCardAutoCreationControls from "./ReferenceCardAutoCreationControls";
+import {
+  DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY,
+  type ReferenceCardType,
+} from "./referenceCardAutoCreation";
 import {
   DEFAULT_PROSE_CONTINUATION_POLICY,
   parsePositiveInteger,
@@ -52,10 +57,18 @@ export default function StartJobDialog({
   onNavigateToReferenceCards,
 }: StartJobDialogProps) {
   const t = useTranslations("writing.batch");
+  const firstInputRef = useRef<HTMLInputElement>(null);
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [tokenBudget, setTokenBudget] = useState("");
   const [continuationPolicy, setContinuationPolicy] =
     useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
+  const [referenceCardAutoCreationPolicy, setReferenceCardAutoCreationPolicy] =
+    useState(() => ({
+      ...DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY,
+      allowed_card_types: [
+        ...DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY.allowed_card_types,
+      ],
+    }));
 
   const [outlineDeviationPolicy, setOutlineDeviationPolicy] =
     useState<OutlineDeviationPolicy>("pause_for_rewrite");
@@ -68,6 +81,7 @@ export default function StartJobDialog({
   );
   const readinessConfigurationKey = JSON.stringify({
     continuationPolicy,
+    referenceCardAutoCreationPolicy,
     tokenBudget: parsedTokenBudget,
     generationParams,
   });
@@ -89,6 +103,7 @@ export default function StartJobDialog({
         {
           token_budget: parsedTokenBudget,
           prose_continuation_policy: continuationPolicy,
+          reference_card_auto_creation_policy: referenceCardAutoCreationPolicy,
           ...toRequestParams(generationParams),
         },
       );
@@ -106,6 +121,7 @@ export default function StartJobDialog({
     continuationPolicy,
     generationParams,
     parsedTokenBudget,
+    referenceCardAutoCreationPolicy,
     readinessConfigurationKey,
     scope,
     targetId,
@@ -114,6 +130,28 @@ export default function StartJobDialog({
   useEffect(() => {
     void loadReadiness();
   }, [loadReadiness]);
+
+  useEffect(() => {
+    firstInputRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !submitting) onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose, submitting]);
+
+  const referenceCardTypeLabel = (cardType: ReferenceCardType) => {
+    switch (cardType) {
+      case "character": return t("dialogAutoCardsTypeCharacter");
+      case "location": return t("dialogAutoCardsTypeLocation");
+      case "item": return t("dialogAutoCardsTypeItem");
+      case "rule": return t("dialogAutoCardsTypeRule");
+      case "lore": return t("dialogAutoCardsTypeLore");
+    }
+  };
 
   const issueCopy = (issue: ReadinessIssue) => {
     switch (issue.code) {
@@ -200,11 +238,64 @@ export default function StartJobDialog({
           title: t("readinessIssueTokenBoundTitle"),
           body: t("readinessIssueTokenBoundBody"),
         };
+      case "batch_generation_requires_token_budget":
+        return {
+          title: t("readinessIssueBatchBudgetRequiredTitle"),
+          body: t("readinessIssueBatchBudgetRequiredBody", {
+            maximum: Number(issue.details.maximum_tokens_total ?? 0),
+          }),
+        };
+      case "batch_generation_budget_may_pause":
+        return {
+          title: t("readinessIssueBatchBudgetShortTitle"),
+          body: t("readinessIssueBatchBudgetShortBody", {
+            maximum: Number(issue.details.maximum_tokens_total ?? 0),
+            budget: Number(issue.details.token_budget ?? 0),
+          }),
+        };
+      case "reference_card_repair_budget_not_covered":
+        return {
+          title: t("readinessIssueRepairBudgetShortTitle"),
+          body: t("readinessIssueRepairBudgetShortBody", {
+            maximum: Number(issue.details.maximum_tokens_total ?? 0),
+            budget: Number(issue.details.token_budget ?? 0),
+          }),
+        };
+      case "batch_generation_token_bound_unproven":
+        return {
+          title: t("readinessIssueBatchBoundUnknownTitle"),
+          body: t("readinessIssueBatchBoundUnknownBody"),
+        };
       default:
         return {
           title: t("readinessIssueUnknownTitle"),
           body: t("readinessIssueUnknownBody"),
         };
+      case "automatic_reference_card_creation_requires_confirmation": {
+        const allowedTypes = Array.isArray(issue.details.allowed_card_types)
+          ? issue.details.allowed_card_types.filter((item): item is ReferenceCardType =>
+              typeof item === "string"
+              && ["character", "location", "item", "rule", "lore"].includes(item))
+          : [];
+        return {
+          title: t("readinessIssueAutoCardsTitle"),
+          body: t("readinessIssueAutoCardsBody", {
+            types: allowedTypes
+              .map(referenceCardTypeLabel)
+              .join(t("referenceCardNameSeparator"))
+              || t("readinessNone"),
+            perChapter: Number(issue.details.max_auto_creates_per_chapter ?? 0),
+            perBook: Number(issue.details.max_auto_creates_per_book ?? 0),
+            repair: Number(
+              issue.details.max_candidate_repair_cycles_per_chapter ?? 0,
+            ),
+            attempts: Number(
+              issue.details.maximum_repair_provider_attempts_total ?? 0,
+            ),
+            tokens: Number(issue.details.maximum_repair_tokens_total ?? 0),
+          }),
+        };
+      }
     }
   };
 
@@ -238,6 +329,7 @@ export default function StartJobDialog({
         outlineDeviationPolicy,
         generationParams: toRequestParams(generationParams),
         proseContinuationPolicy: continuationPolicy,
+        referenceCardAutoCreationPolicy,
       });
       const job = await apiPost<GenerationJob>(
         `/api/generation-jobs/${scope}/${targetId}`,
@@ -253,18 +345,23 @@ export default function StartJobDialog({
   };
 
   return (
-    <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/25 px-4 py-6">
-      <div className="flex max-h-full w-full max-w-2xl flex-col rounded-md border border-border bg-surface shadow-lg">
-        <header className="border-b border-border px-5 py-4">
-          <h3 className="text-base font-semibold text-foreground">{title}</h3>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 px-3 py-4 sm:px-4 sm:py-6">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="start-generation-title"
+        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-md border border-border bg-surface shadow-lg sm:max-h-[calc(100dvh-3rem)]"
+      >
+        <header className="border-b border-border px-4 py-3 sm:px-5 sm:py-4">
+          <h3 id="start-generation-title" className="break-words text-base font-semibold text-foreground">{title}</h3>
         </header>
 
-        <div className="grid gap-4 overflow-y-auto px-5 py-4">
+        <div className="grid min-w-0 gap-4 overflow-y-auto px-4 py-4 sm:px-5">
           <div className="grid gap-1 text-sm">
             <span className="text-xs font-medium text-muted">{targetHeading}</span>
-            <div className="rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
-              <span className="font-medium">{targetLabel}</span>
-              <span className="ml-2 text-xs text-muted">{t("dialogFillable", { count: fillableCount })}</span>
+            <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
+              <span className="min-w-0 break-words font-medium">{targetLabel}</span>
+              <span className="text-xs text-muted">{t("dialogFillable", { count: fillableCount })}</span>
             </div>
           </div>
 
@@ -272,11 +369,12 @@ export default function StartJobDialog({
             <span className="text-xs font-medium text-muted">{t("dialogCheckpointLabel")}</span>
             <input
               type="number"
+              ref={firstInputRef}
               min={1}
               max={1000}
               value={checkpointInterval}
               onChange={(e) => setCheckpointInterval(Number(e.target.value))}
-              className="min-h-9 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-accent"
+              className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
             />
             <span className="text-xs text-muted">{t("dialogCheckpointHint")}</span>
           </label>
@@ -289,7 +387,7 @@ export default function StartJobDialog({
               value={tokenBudget}
               onChange={(e) => setTokenBudget(e.target.value)}
               placeholder={t("dialogTokenPlaceholder")}
-              className="min-h-9 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-accent"
+              className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
             />
             <span className="text-xs text-muted">{t("dialogTokenHint")}</span>
           </label>
@@ -304,6 +402,12 @@ export default function StartJobDialog({
               {t("continuationBudgetRequired")}
             </p>
           )}
+
+          <ReferenceCardAutoCreationControls
+            value={referenceCardAutoCreationPolicy}
+            onChange={setReferenceCardAutoCreationPolicy}
+            disabled={submitting}
+          />
 
 
           <section className="grid gap-2">
@@ -430,6 +534,24 @@ export default function StartJobDialog({
                       lores: readiness.resources.lore,
                     })}
                   </p>
+                  {readiness.planning.reference_card_auto_creation_policy && (() => {
+                    const policy = readiness.planning.reference_card_auto_creation_policy;
+                    return (
+                      <p className="min-w-0 break-words sm:col-span-2">
+                        {t("readinessAutoCardsSummary", {
+                          status: policy.enabled
+                            ? t("readinessAutoCardsEnabled")
+                            : t("readinessAutoCardsDisabled"),
+                          types: policy.allowed_card_types
+                            .map(referenceCardTypeLabel)
+                            .join(t("referenceCardNameSeparator")),
+                          perChapter: policy.max_auto_creates_per_chapter,
+                          perBook: policy.max_auto_creates_per_book,
+                          repair: policy.max_candidate_repair_cycles_per_chapter,
+                        })}
+                      </p>
+                    );
+                  })()}
                   <p>
                     {t("readinessProviders", {
                       providers: readiness.planning.providers.join(", ") || t("readinessNone"),
@@ -559,7 +681,9 @@ export default function StartJobDialog({
                               ? t("readinessAcknowledgeAutomatic", {
                                   count: continuationPolicy.automatic_continuations_per_scene,
                                 })
-                              : issue.code === "prose_output_risk_requires_ack"
+                              : issue.code === "automatic_reference_card_creation_requires_confirmation"
+                                ? t("readinessAcknowledgeAutoCards")
+                                : issue.code === "prose_output_risk_requires_ack"
                                 ? t("readinessAcknowledgeOutputRisk")
                                 : t("readinessAcknowledge")}
                           </span>
@@ -600,7 +724,7 @@ export default function StartJobDialog({
           )}
         </div>
 
-        <footer className="flex justify-end gap-2 border-t border-border px-5 py-3">
+        <footer className="flex flex-wrap justify-end gap-2 border-t border-border px-4 py-3 sm:px-5">
           <Button variant="ghost" size="sm" onPress={onClose} isDisabled={submitting}>
             {t("dialogCancel")}
           </Button>

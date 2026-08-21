@@ -4,6 +4,7 @@ import type {
 } from "./batchTypes.ts";
 
 import type { ProseContinuationPolicy } from "../prose/proseContinuation";
+import type { ReferenceCardAutoCreationPolicy } from "./referenceCardAutoCreation.ts";
 interface StartPayloadInput {
   checkpointInterval: number;
   tokenBudget: number | null;
@@ -12,6 +13,7 @@ interface StartPayloadInput {
   outlineDeviationPolicy?: OutlineDeviationPolicy;
   generationParams?: Record<string, unknown>;
   proseContinuationPolicy?: ProseContinuationPolicy;
+  referenceCardAutoCreationPolicy?: ReferenceCardAutoCreationPolicy;
 }
 
 export function readinessAllowsStart(
@@ -34,6 +36,7 @@ export function buildAuthorizedStartPayload({
   outlineDeviationPolicy = "pause_for_rewrite",
   generationParams = {},
   proseContinuationPolicy,
+  referenceCardAutoCreationPolicy,
 }: StartPayloadInput) {
   return {
     checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
@@ -43,5 +46,8 @@ export function buildAuthorizedStartPayload({
     outline_deviation_policy: outlineDeviationPolicy,
     ...generationParams,
     ...(proseContinuationPolicy ? { prose_continuation_policy: proseContinuationPolicy } : {}),
+    ...(referenceCardAutoCreationPolicy
+      ? { reference_card_auto_creation_policy: referenceCardAutoCreationPolicy }
+      : {}),
   };
 }

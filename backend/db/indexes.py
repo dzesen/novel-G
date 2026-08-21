@@ -841,6 +841,41 @@ async def init_state_candidate_repair_receipt_indexes():
         raise
 
 
+async def init_reference_card_repair_receipt_indexes():
+    """Initialize the durable idempotency ledger for dependency repairs."""
+    try:
+        collection = get_database()[
+            collections.REFERENCE_CARD_REPAIR_RECEIPTS
+        ]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", 1),
+                    ("novel_id", 1),
+                    ("job_id", 1),
+                    ("chapter_id", 1),
+                    ("cycle", 1),
+                    ("authorization_digest", 1),
+                ],
+                unique=True,
+                name="reference_card_repair_receipt_identity",
+            ),
+            pymongo.IndexModel([
+                ("novel_id", 1),
+                ("state", 1),
+                ("updated_at", -1),
+            ]),
+            pymongo.IndexModel([("claim_expires_at", 1)]),
+        ])
+        logger.info("Initialized reference_card_repair_receipts indexes.")
+    except Exception as exc:
+        logger.error(
+            "Failed to initialize reference_card_repair_receipts indexes: %s",
+            exc,
+        )
+        raise
+
+
 async def init_image_asset_indexes():
     """Initialize owner isolation, idempotency, and listing indexes."""
     try:
@@ -1336,6 +1371,7 @@ async def init_all_indexes():
     await init_prose_run_indexes()
     await init_prose_remediation_receipt_indexes()
     await init_state_candidate_repair_receipt_indexes()
+    await init_reference_card_repair_receipt_indexes()
     await init_image_asset_indexes()
     await init_character_visual_profile_indexes()
     await init_illustration_brief_indexes()

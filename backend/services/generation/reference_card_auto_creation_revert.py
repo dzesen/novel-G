@@ -77,6 +77,7 @@ REFERENCE_DEPENDENCY_SCANNERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             collections.PROSE_RUNS,
             collections.PROSE_REMEDIATION_RECEIPTS,
             collections.STATE_CANDIDATE_REPAIR_RECEIPTS,
+            collections.REFERENCE_CARD_REPAIR_RECEIPTS,
             collections.GENERATION_TASKS,
             collections.MEMORY_FRAGMENTS,
         ),

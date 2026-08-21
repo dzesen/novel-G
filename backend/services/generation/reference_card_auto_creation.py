@@ -30,9 +30,6 @@ from backend.db.mutation import (
     MutationHandlerSpec,
 )
 from backend.db.utils import get_utc_now, to_object_id
-from backend.services.generation.chapter_candidate_job import (
-    candidate_outline_idempotency_key,
-)
 from backend.services.novel.reference_card_curation import (
     FUZZY_MATCH_THRESHOLD,
     normalize_card_name,
@@ -91,13 +88,7 @@ ReferenceCardType = Literal["character", "location", "item", "rule", "lore"]
 
 
 class ReferenceCardAutoCreationPolicy(BaseModel):
-    """User-selected readiness policy before it becomes formal authority.
-
-    Candidate repair deliberately remains closed in this slice.  Exposing a
-    positive value before its proposal-only runtime and Provider budget are
-    wired would make the readiness digest promise authority that cannot be
-    enforced end to end.
-    """
+    """User-selected readiness policy before it becomes formal authority."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -125,10 +116,8 @@ class ReferenceCardAutoCreationPolicy(BaseModel):
         )
         if not canonical_types or canonical_types != self.allowed_card_types:
             raise ValueError("allowed_card_types must be unique and canonical")
-        if self.max_candidate_repair_cycles_per_chapter != 0:
-            raise ValueError(
-                "reference-card candidate repair is not yet available"
-            )
+        if not self.enabled and self.max_candidate_repair_cycles_per_chapter:
+            raise ValueError("disabled auto-creation cannot authorize candidate repair")
         return self
 
     @classmethod
@@ -509,6 +498,7 @@ class AutoReferenceCardCreationService:
         denials: list[dict[str, Any]],
         limit_usage: Mapping[str, Any] | None,
         next_narrative_revision: int,
+        source_mutation_id: str = "",
     ) -> dict[str, Any]:
         ordered = sorted(
             denials,
@@ -528,6 +518,11 @@ class AutoReferenceCardCreationService:
             ),
             "limit_usage": dict(limit_usage or {}),
             "next_narrative_revision": int(next_narrative_revision),
+            **(
+                {"source_mutation_id": source_mutation_id}
+                if source_mutation_id
+                else {}
+            ),
         }
 
     @staticmethod
@@ -558,7 +553,12 @@ class AutoReferenceCardCreationService:
             {
                 "novel_id": to_object_id(authorization.novel_id),
                 "idempotency_key": source_mutation_id,
-                "operation": "accept_chapter_outline",
+                "operation": {
+                    "$in": [
+                        "accept_chapter_outline",
+                        "apply_reference_dependency_repair",
+                    ]
+                },
                 "status": "completed",
             }
         )
@@ -566,19 +566,47 @@ class AutoReferenceCardCreationService:
             return [], [self._source_denial("source_changed")], ""
         source_command = dict(source_journal.get("command") or {})
         source_payload = dict(source_command.get("payload") or {})
-        binding = source_payload.get("job_mutation_binding")
+        source_operation = str(source_journal.get("operation") or "")
+        if source_operation == "accept_chapter_outline":
+            binding = source_payload.get("job_mutation_binding")
+            source_authorized = (
+                isinstance(binding, Mapping)
+                and str(binding.get("schema_version") or "")
+                == "job_mutation_recovery_binding.v1"
+                and str(binding.get("novel_id") or "") == authorization.novel_id
+                and str(binding.get("job_id") or "") == job_id
+                and str(binding.get("chapter_id") or "") == chapter_id
+                and str(binding.get("readiness_digest") or "") == readiness_digest
+                and binding.get("authorization_revision")
+                == authorization.authorization_revision
+                and str(binding.get("operation") or "")
+                == "accept_chapter_outline"
+                and str(binding.get("idempotency_key") or "")
+                == source_mutation_id
+            )
+        else:
+            try:
+                repair_authorization = parse_reference_card_creation_authorization(
+                    source_payload.get("authorization")
+                )
+            except (TypeError, ValueError):
+                repair_authorization = None
+            source_authorized = (
+                repair_authorization == authorization
+                and str(source_payload.get("novel_id") or "")
+                == authorization.novel_id
+                and str(source_payload.get("job_id") or "") == job_id
+                and str(source_payload.get("readiness_digest") or "")
+                == readiness_digest
+                and source_payload.get("authorization_revision")
+                == authorization.authorization_revision
+                and type(source_payload.get("cycle")) is int
+                and 1
+                <= source_payload["cycle"]
+                <= authorization.max_candidate_repair_cycles_per_chapter
+            )
         if (
-            not isinstance(binding, Mapping)
-            or str(binding.get("schema_version") or "")
-            != "job_mutation_recovery_binding.v1"
-            or str(binding.get("novel_id") or "") != authorization.novel_id
-            or str(binding.get("job_id") or "") != job_id
-            or str(binding.get("chapter_id") or "") != chapter_id
-            or str(binding.get("readiness_digest") or "") != readiness_digest
-            or binding.get("authorization_revision")
-            != authorization.authorization_revision
-            or str(binding.get("operation") or "") != "accept_chapter_outline"
-            or str(binding.get("idempotency_key") or "") != source_mutation_id
+            not source_authorized
             or str(source_payload.get("chapter_id") or "") != chapter_id
         ):
             return [], [self._source_denial("source_changed")], ""
@@ -817,7 +845,12 @@ class AutoReferenceCardCreationService:
             {
                 "novel_id": to_object_id(novel_id),
                 "idempotency_key": str(command["source_mutation_id"]),
-                "operation": "accept_chapter_outline",
+                "operation": {
+                    "$in": [
+                        "accept_chapter_outline",
+                        "apply_reference_dependency_repair",
+                    ]
+                },
                 "status": "completed",
                 "command_digest": str(command["source_command_digest"]),
             },
@@ -1236,6 +1269,7 @@ class AutoReferenceCardCreationService:
                     if session is not None
                     else revision
                 ),
+                source_mutation_id=str(command["source_mutation_id"]),
             )
             if gate["partial_self_write"]:
                 raise AutoReferenceCardCreationRecoveryBlocked(
@@ -1407,6 +1441,7 @@ class AutoReferenceCardCreationService:
             "deny_reasons": [],
             "limit_usage": gate["limit_usage"],
             "next_narrative_revision": revision,
+            "source_mutation_id": command["source_mutation_id"],
         }
 
     async def apply_chapter(
@@ -1441,10 +1476,59 @@ class AutoReferenceCardCreationService:
                 limit_usage=None,
                 next_narrative_revision=expected_narrative_revision,
             )
-        source_mutation_id = candidate_outline_idempotency_key(job_id, chapter_id)
+        candidate_collection = get_database()[
+            collections.EMERGENT_REFERENCE_CARD_CANDIDATES
+        ]
+        source_documents = await candidate_collection.find(
+            {
+                "novel_id": to_object_id(parsed.novel_id),
+                "chapter_id": to_object_id(chapter_id),
+                "status": {"$in": sorted(REVIEWABLE_IDENTITY_STATUSES)},
+                "requires_review_before_next_chapter": True,
+                "is_deleted": False,
+            },
+            projection={"source_mutation_id": 1},
+        ).to_list(length=10)
+        if not source_documents:
+            source_documents = await candidate_collection.find(
+                {
+                    "novel_id": to_object_id(parsed.novel_id),
+                    "chapter_id": to_object_id(chapter_id),
+                    "status": "resolved",
+                    "requires_review_before_next_chapter": True,
+                    "decision.action": "auto_create_unique",
+                    "decision.job_id": str(job_id),
+                    "decision.authorization_digest": (
+                        parsed.authorization_digest
+                    ),
+                    "is_deleted": False,
+                },
+                projection={"source_mutation_id": 1},
+            ).to_list(length=10)
+        source_mutation_ids = {
+            str(item.get("source_mutation_id") or "")
+            for item in source_documents
+        }
+        if not source_documents:
+            return {
+                "status": "not_applicable",
+                "created_count": 0,
+                "mappings": [],
+                "denials": [],
+                "deny_reasons": [],
+                "limit_usage": {},
+                "next_narrative_revision": expected_narrative_revision,
+            }
+        if len(source_mutation_ids) != 1 or "" in source_mutation_ids:
+            return self._denied_result(
+                denials=[self._source_denial("source_changed")],
+                limit_usage=None,
+                next_narrative_revision=expected_narrative_revision,
+            )
+        source_mutation_id = next(iter(source_mutation_ids))
         auto_mutation_key = (
             f"auto-create-reference-cards:{job_id}:{chapter_id}:"
-            f"{parsed.authorization_digest}"
+            f"{parsed.authorization_digest}:{_digest(source_mutation_id)[:16]}"
         )
         frozen, source_denials, source_digest = await self._freeze_candidates(
             authorization=parsed,
@@ -1459,6 +1543,7 @@ class AutoReferenceCardCreationService:
                 denials=source_denials,
                 limit_usage=None,
                 next_narrative_revision=expected_narrative_revision,
+                source_mutation_id=source_mutation_id,
             )
         if not frozen:
             return {
@@ -1469,6 +1554,7 @@ class AutoReferenceCardCreationService:
                 "deny_reasons": [],
                 "limit_usage": {},
                 "next_narrative_revision": expected_narrative_revision,
+                "source_mutation_id": source_mutation_id,
             }
         payload = {
             "novel_id": str(novel_id),

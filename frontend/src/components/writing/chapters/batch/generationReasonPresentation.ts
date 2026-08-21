@@ -34,6 +34,8 @@ const JOB_PAUSE_REASON_KEYS = {
   incomplete_scene: "reasonIncompleteScene",
   authorization_scope_increased: "reasonAuthorizationScopeIncreased",
   reference_card_review: "reasonReferenceCardReview",
+  reference_card_auto_creation_recovery: "reasonReferenceCardAutoCreationRecovery",
+  reference_card_repair_exhausted: "reasonReferenceCardRepairExhausted",
 } as const;
 
 export type DiagnosticReasonTranslationKey =

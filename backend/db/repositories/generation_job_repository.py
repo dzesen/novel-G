@@ -1688,6 +1688,99 @@ class GenerationJobRepository:
             "Reference-card auto-creation cursor changed"
         )
 
+    async def record_reference_card_repair(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        expected_revision: int,
+        next_revision: int,
+        event: Mapping[str, Any],
+    ) -> bool:
+        """Persist one bounded dependency-repair outcome and cursor change."""
+
+        normalized_chapter_id = str(chapter_id or "")
+        normalized_event = dict(event)
+        event_id = str(normalized_event.get("event_id") or "")
+        outcome = str(normalized_event.get("outcome") or "")
+        resolution = normalized_event.get("resolution")
+        cycle = normalized_event.get("cycle")
+        valid_transition = (
+            next_revision == expected_revision + 1
+            if outcome == "applied"
+            else next_revision == expected_revision
+        )
+        if (
+            not normalized_chapter_id
+            or normalized_event.get("schema_version")
+            != "reference_card_repair_event.v1"
+            or str(normalized_event.get("chapter_id") or "")
+            != normalized_chapter_id
+            or not event_id
+            or len(event_id) > 200
+            or outcome not in {"applied", "exhausted", "uncertain"}
+            or (
+                resolution not in {
+                    "rewritten_unique_new",
+                    "dependency_removed",
+                }
+                if outcome == "applied"
+                else resolution is not None
+            )
+            or type(cycle) is not int
+            or cycle < 1
+            or cycle > 2
+            or type(expected_revision) is not int
+            or type(next_revision) is not int
+            or expected_revision < 0
+            or not valid_transition
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Reference-card repair event is invalid"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": normalized_chapter_id,
+                "expected_narrative_revision": expected_revision,
+                "reference_card_repair_events.event_id": {"$ne": event_id},
+            },
+            {
+                "$set": {
+                    "expected_narrative_revision": next_revision,
+                    "updated_at": get_utc_now(),
+                },
+                "$push": {
+                    "reference_card_repair_events": {
+                        "$each": [normalized_event],
+                        "$slice": -200,
+                    }
+                },
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        matching_events = [
+            item
+            for item in list(current.get("reference_card_repair_events") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("event_id") or "") == event_id
+        ]
+        if (
+            str(current.get("status") or "") == "running"
+            and str(current.get("current_chapter_id") or "")
+            == normalized_chapter_id
+            and current.get("expected_narrative_revision") == next_revision
+            and matching_events == [normalized_event]
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Reference-card repair cursor changed"
+        )
+
     async def bind_job_mutation_recovery(
         self,
         job_id: str,

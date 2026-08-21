@@ -54,6 +54,11 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         AUTO_CARD_REVERT_MUTATION_VERSION,
         auto_reference_card_revert_service,
     )
+    from backend.services.generation.reference_card_dependency_repair import (
+        REFERENCE_CARD_REPAIR_MUTATION_NAME,
+        REFERENCE_CARD_REPAIR_MUTATION_VERSION,
+        reference_card_dependency_repair_service,
+    )
 
     callbacks: dict[tuple[str, int], MutationExecutor] = {
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
@@ -112,6 +117,10 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         (AUTO_CARD_REVERT_MUTATION_NAME, AUTO_CARD_REVERT_MUTATION_VERSION): (
             auto_reference_card_revert_service._execute_revert
         ),
+        (
+            REFERENCE_CARD_REPAIR_MUTATION_NAME,
+            REFERENCE_CARD_REPAIR_MUTATION_VERSION,
+        ): reference_card_dependency_repair_service._execute_apply,
     }
     non_narrative_operations = {
         "update_novel_metadata",
@@ -123,6 +132,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
     persistent_fence_operations = {
         AUTO_CREATE_MUTATION_NAME,
         AUTO_CARD_REVERT_MUTATION_NAME,
+        REFERENCE_CARD_REPAIR_MUTATION_NAME,
     }
     return {
         key: MutationHandlerSpec(

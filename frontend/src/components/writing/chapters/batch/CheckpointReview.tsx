@@ -55,17 +55,57 @@ function Banner({ job }: { job: GenerationJob }) {
       </div>
     );
   }
-  const key = job.pause_reason
-    ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
-    : "reasonCheckpoint";
+  const isUncertainReferenceRepair = (
+    job.pause_reason === "uncertain_attempt"
+    && Boolean(job.error?.auto_creation)
+  );
+  const key = isUncertainReferenceRepair
+    ? "reasonReferenceCardRepairUncertain"
+    : job.pause_reason
+      ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
+      : "reasonCheckpoint";
   const tone =
     job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
       : job.pause_reason === "incomplete_scene"
           || job.pause_reason === "reference_card_review"
+          || job.pause_reason === "reference_card_auto_creation_recovery"
+          || job.pause_reason === "reference_card_repair_exhausted"
+          || isUncertainReferenceRepair
         ? "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
       : "border-border bg-background text-foreground";
   return <div className={`rounded-md border px-3 py-2 text-sm ${tone}`}>{t(key)}</div>;
+}
+
+function autoCreationDenialKeys(reasonCodes: string[]): string[] {
+  const keys = new Set<string>();
+  for (const code of reasonCodes) {
+    if ([
+      "pending_candidate_identity",
+      "confirmed_alias",
+      "deleted_identity",
+      "cross_type_identity",
+      "existing_name",
+      "fuzzy_identity",
+    ].includes(code)) {
+      keys.add("referenceCardAutoDeniedIdentity");
+    } else if (["field_conflict", "source_conflict"].includes(code)) {
+      keys.add("referenceCardAutoDeniedConflict");
+    } else if (code === "limit_reached") {
+      keys.add("referenceCardAutoDeniedLimit");
+    } else if ([
+      "source_changed",
+      "candidate_changed",
+      "authorization_invalid",
+      "unauthorized_type",
+      "journal_drift",
+    ].includes(code)) {
+      keys.add("referenceCardAutoDeniedChanged");
+    } else {
+      keys.add("referenceCardAutoDeniedSafety");
+    }
+  }
+  return [...keys];
 }
 
 function StepTags({ progress }: { progress: ChapterProgress }) {
@@ -338,7 +378,19 @@ export default function CheckpointReview({
 }: CheckpointReviewProps) {
   const t = useTranslations("writing.batch");
   const reviewWindow = checkpointWindow(job);
-  const hasUncertainAttempt = job.has_uncertain_attempts || job.pause_reason === "uncertain_attempt";
+  const isUncertainReferenceRepair = (
+    job.pause_reason === "uncertain_attempt"
+    && Boolean(job.error?.auto_creation)
+  );
+  const hasUncertainAttempt = !isUncertainReferenceRepair
+    && (job.has_uncertain_attempts || job.pause_reason === "uncertain_attempt");
+  const requiresReferenceCardReview = (
+    job.pause_reason === "reference_card_review"
+    || job.pause_reason === "reference_card_repair_exhausted"
+    || isUncertainReferenceRepair
+  );
+  const hasReferenceCardBoundary = Boolean(job.error?.auto_creation)
+    || requiresReferenceCardReview;
 
   const stopDiagnostic = currentStopDiagnostic(job);
   const blockingProgress = [...reviewWindow].reverse().find((progress) => {
@@ -375,7 +427,7 @@ export default function CheckpointReview({
                 {busy ? t("resuming") : t("uncertainRetry")}
               </Button>
             </>
-          ) : job.pause_reason === "reference_card_review" ? (
+          ) : requiresReferenceCardReview ? (
             <Button
               variant="primary"
               size="sm"
@@ -399,6 +451,8 @@ export default function CheckpointReview({
                   ? t("resumeAfterRewrite")
                   : job.pause_reason === "source_changed"
                     ? t("resumeAfterSourceChange")
+                    : job.pause_reason === "reference_card_auto_creation_recovery"
+                      ? t("resumeAutoCardRecovery")
                     : t("resume")}
             </Button>
           )}
@@ -406,13 +460,22 @@ export default function CheckpointReview({
       </div>
 
       <Banner job={job} />
-      {job.pause_reason === "reference_card_review"
+      {hasReferenceCardBoundary
         && job.error?.candidate_names?.length ? (
           <p className="text-xs leading-5 text-amber-800 dark:text-amber-200">
             {t("referenceCardReviewNames", {
               names: job.error.candidate_names.join(t("referenceCardNameSeparator")),
             })}
           </p>
+        ) : null}
+      {hasReferenceCardBoundary
+        && job.error?.auto_creation ? (
+          <div className="grid gap-1 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+            <p className="font-medium">{t("referenceCardAutoManualReview")}</p>
+            {autoCreationDenialKeys(job.error.auto_creation.deny_reasons).map((key) => (
+              <p key={key}>{t(key)}</p>
+            ))}
+          </div>
         ) : null}
       {(incompleteChapterId || !stopDiagnostic) && (
         <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">

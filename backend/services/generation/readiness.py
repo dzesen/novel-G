@@ -37,6 +37,10 @@ from backend.services.generation.reference_card_auto_creation import (
     ReferenceCardAutoCreationPolicy,
     build_reference_card_creation_authorization,
 )
+from backend.services.generation.reference_card_dependency_repair import (
+    build_reference_card_repair_plan_authorization,
+    parse_reference_card_repair_plan_authorization,
+)
 from backend.services.generation.provider_budget import (
     ProviderBudgetBound,
     merge_provider_bounds,
@@ -73,6 +77,10 @@ class ReadinessDeps:
     ] | None = None
     plan_candidate_repairs: Callable[
         [list[dict[str, Any]], int, int, Mapping[str, Any] | None],
+        Mapping[str, Any],
+    ] | None = None
+    plan_reference_card_repairs: Callable[
+        [list[dict[str, Any]], int, Mapping[str, Any] | None],
         Mapping[str, Any],
     ] | None = None
 
@@ -564,15 +572,55 @@ class GenerationReadinessModule:
                     )
                     for item in candidate_repair_authorization.provider_bounds
                 )
+                reference_repair_authorization = None
+                reference_provider_bounds: tuple[ProviderBudgetBound, ...] = ()
+                reference_repair_attempts = 0
+                reference_repair_tokens = 0
+                if auto_creation_policy.max_candidate_repair_cycles_per_chapter:
+                    if self._deps.plan_reference_card_repairs is None:
+                        raise ValueError(
+                            "reference-card repair planner is unavailable"
+                        )
+                    reference_repair_authorization = (
+                        parse_reference_card_repair_plan_authorization(
+                            self._deps.plan_reference_card_repairs(
+                                chapters,
+                                auto_creation_policy.
+                                max_candidate_repair_cycles_per_chapter,
+                                generation_params,
+                            )
+                        )
+                    )
+                    reference_provider_bounds = tuple(
+                        ProviderBudgetBound(
+                            provider_alias=item.provider_alias,
+                            paid_attempts=item.maximum_paid_attempts_total,
+                            tokens=item.maximum_tokens_total,
+                        )
+                        for item in reference_repair_authorization.provider_bounds
+                    )
+                    reference_repair_attempts = (
+                        reference_repair_authorization.
+                        maximum_provider_attempts_total
+                    )
+                    reference_repair_tokens = (
+                        reference_repair_authorization.maximum_tokens_total
+                    )
                 full_provider_bounds = merge_provider_bounds(
                     base_budget.provider_bounds,
                     candidate_provider_bounds,
+                    reference_provider_bounds,
                 )
                 full_token_bound = (
                     base_budget.maximum_tokens_total
                     + candidate_repair_authorization.maximum_tokens_total
+                    + reference_repair_tokens
                 )
-                full_attempt_bound = base_attempt_capacity + repair_attempts
+                full_attempt_bound = (
+                    base_attempt_capacity
+                    + repair_attempts
+                    + reference_repair_attempts
+                )
                 planning = {
                     **planning,
                     "attempt_capacity": full_attempt_bound,
@@ -585,6 +633,17 @@ class GenerationReadinessModule:
                     "chapter_candidate_repair_authorization": (
                         candidate_repair_authorization.model_dump(mode="json")
                     ),
+                    **(
+                        {
+                            "reference_card_repair_plan_authorization": (
+                                reference_repair_authorization.model_dump(
+                                    mode="json"
+                                )
+                            )
+                        }
+                        if reference_repair_authorization is not None
+                        else {}
+                    ),
                     "batch_generation_budget_coverage": {
                         "schema_version": (
                             "batch_generation_budget_coverage.v1"
@@ -594,6 +653,9 @@ class GenerationReadinessModule:
                         ),
                         "candidate_repair_maximum_tokens": (
                             candidate_repair_authorization.maximum_tokens_total
+                        ),
+                        "reference_card_repair_maximum_tokens": (
+                            reference_repair_tokens
                         ),
                         "maximum_tokens_total": full_token_bound,
                         "maximum_provider_attempts_total": full_attempt_bound,
@@ -651,6 +713,18 @@ class GenerationReadinessModule:
                             action_codes=["review_token_budget"],
                         )
                     )
+                    if reference_repair_authorization is not None:
+                        issues.append(
+                            _issue(
+                                "reference_card_repair_budget_not_covered",
+                                "blocked",
+                                details={
+                                    "maximum_tokens_total": full_token_bound,
+                                    "token_budget": token_budget,
+                                },
+                                action_codes=["set_token_budget"],
+                            )
+                        )
         except ContextBudgetError as exc:
             planning = {
                 "attempt_capacity": 0,
@@ -755,6 +829,17 @@ class GenerationReadinessModule:
             ),
         }
         if auto_creation_policy.enabled and has_work:
+            raw_reference_repair = planning.get(
+                "reference_card_repair_plan_authorization"
+            )
+            reference_repair_plan = (
+                parse_reference_card_repair_plan_authorization(
+                    raw_reference_repair
+                )
+                if auto_creation_policy.
+                max_candidate_repair_cycles_per_chapter
+                else None
+            )
             auto_creation_authorization = (
                 build_reference_card_creation_authorization(
                     owner_id=str(resources.get("owner_id") or ""),
@@ -787,6 +872,24 @@ class GenerationReadinessModule:
                         auto_creation_policy.
                         max_candidate_repair_cycles_per_chapter
                     ),
+                    repair_provider_bounds=(
+                        [
+                            item.model_dump(mode="json")
+                            for item in reference_repair_plan.provider_bounds
+                        ]
+                        if reference_repair_plan is not None
+                        else ()
+                    ),
+                    maximum_repair_provider_attempts_total=(
+                        reference_repair_plan.maximum_provider_attempts_total
+                        if reference_repair_plan is not None
+                        else 0
+                    ),
+                    maximum_repair_tokens_total=(
+                        reference_repair_plan.maximum_tokens_total
+                        if reference_repair_plan is not None
+                        else 0
+                    ),
                 )
             )
             planning["reference_card_creation_authorization"] = (
@@ -810,8 +913,16 @@ class GenerationReadinessModule:
                             auto_creation_policy.
                             max_candidate_repair_cycles_per_chapter
                         ),
-                        "maximum_repair_provider_attempts_total": 0,
-                        "maximum_repair_tokens_total": 0,
+                        "maximum_repair_provider_attempts_total": (
+                            auto_creation_authorization[
+                                "maximum_repair_provider_attempts_total"
+                            ]
+                        ),
+                        "maximum_repair_tokens_total": (
+                            auto_creation_authorization[
+                                "maximum_repair_tokens_total"
+                            ]
+                        ),
                     },
                     action_codes=["review_reference_card_auto_creation"],
                 )
@@ -1574,5 +1685,8 @@ generation_readiness_module = GenerationReadinessModule(
         plan_work=_plan_work_with_prose_continuation,
         prepare_generation_params=_prepare_generation_params,
         plan_candidate_repairs=build_chapter_candidate_repair_authorization,
+        plan_reference_card_repairs=(
+            build_reference_card_repair_plan_authorization
+        ),
     )
 )

@@ -13,6 +13,10 @@ import type {
   GenerationReadiness,
   ReadinessIssue,
 } from "./batchTypes";
+import {
+  REFERENCE_CARD_TYPES,
+  type ReferenceCardType,
+} from "./referenceCardAutoCreation";
 import { readinessAllowsStart } from "./readinessPresentation";
 
 interface ResumeJobDialogProps {
@@ -115,6 +119,66 @@ function issueCopy(
           factor: Number(issue.details.stop_factor ?? 0),
         }),
       };
+    case "automatic_reference_card_creation_requires_confirmation": {
+      const allowedTypes = Array.isArray(issue.details.allowed_card_types)
+        ? issue.details.allowed_card_types.filter((item): item is ReferenceCardType =>
+            typeof item === "string"
+            && REFERENCE_CARD_TYPES.includes(item as ReferenceCardType))
+        : [];
+      const typeLabel = (cardType: ReferenceCardType) => {
+        switch (cardType) {
+          case "character": return t("dialogAutoCardsTypeCharacter");
+          case "location": return t("dialogAutoCardsTypeLocation");
+          case "item": return t("dialogAutoCardsTypeItem");
+          case "rule": return t("dialogAutoCardsTypeRule");
+          case "lore": return t("dialogAutoCardsTypeLore");
+        }
+      };
+      return {
+        title: t("readinessIssueAutoCardsTitle"),
+        body: t("readinessIssueAutoCardsBody", {
+          types: allowedTypes.map(typeLabel).join(t("referenceCardNameSeparator"))
+            || t("readinessNone"),
+          perChapter: Number(issue.details.max_auto_creates_per_chapter ?? 0),
+          perBook: Number(issue.details.max_auto_creates_per_book ?? 0),
+          repair: Number(
+            issue.details.max_candidate_repair_cycles_per_chapter ?? 0,
+          ),
+          attempts: Number(
+            issue.details.maximum_repair_provider_attempts_total ?? 0,
+          ),
+          tokens: Number(issue.details.maximum_repair_tokens_total ?? 0),
+        }),
+      };
+    }
+    case "batch_generation_requires_token_budget":
+      return {
+        title: t("readinessIssueBatchBudgetRequiredTitle"),
+        body: t("readinessIssueBatchBudgetRequiredBody", {
+          maximum: Number(issue.details.maximum_tokens_total ?? 0),
+        }),
+      };
+    case "batch_generation_budget_may_pause":
+      return {
+        title: t("readinessIssueBatchBudgetShortTitle"),
+        body: t("readinessIssueBatchBudgetShortBody", {
+          maximum: Number(issue.details.maximum_tokens_total ?? 0),
+          budget: Number(issue.details.token_budget ?? 0),
+        }),
+      };
+    case "reference_card_repair_budget_not_covered":
+      return {
+        title: t("readinessIssueRepairBudgetShortTitle"),
+        body: t("readinessIssueRepairBudgetShortBody", {
+          maximum: Number(issue.details.maximum_tokens_total ?? 0),
+          budget: Number(issue.details.token_budget ?? 0),
+        }),
+      };
+    case "batch_generation_token_bound_unproven":
+      return {
+        title: t("readinessIssueBatchBoundUnknownTitle"),
+        body: t("readinessIssueBatchBoundUnknownBody"),
+      };
     default:
       return {
         title: t("readinessIssueUnknownTitle"),
@@ -214,6 +278,16 @@ export default function ResumeJobDialog({
   };
 
   const authorization = readiness?.planning.prose_continuation_authorization;
+  const referenceCardPolicy = readiness?.planning.reference_card_auto_creation_policy;
+  const referenceCardTypeLabel = (cardType: ReferenceCardType) => {
+    switch (cardType) {
+      case "character": return t("dialogAutoCardsTypeCharacter");
+      case "location": return t("dialogAutoCardsTypeLocation");
+      case "item": return t("dialogAutoCardsTypeItem");
+      case "rule": return t("dialogAutoCardsTypeRule");
+      case "lore": return t("dialogAutoCardsTypeLore");
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-3 py-4 sm:px-4 sm:py-6">
@@ -324,6 +398,22 @@ export default function ResumeJobDialog({
                   </div>
                 )}
 
+                {referenceCardPolicy && (
+                  <div className="rounded-md border border-border bg-background p-3 text-xs leading-5 text-muted">
+                    {t("readinessAutoCardsSummary", {
+                      status: referenceCardPolicy.enabled
+                        ? t("readinessAutoCardsEnabled")
+                        : t("readinessAutoCardsDisabled"),
+                      types: referenceCardPolicy.allowed_card_types
+                        .map(referenceCardTypeLabel)
+                        .join(t("referenceCardNameSeparator")),
+                      perChapter: referenceCardPolicy.max_auto_creates_per_chapter,
+                      perBook: referenceCardPolicy.max_auto_creates_per_book,
+                      repair: referenceCardPolicy.max_candidate_repair_cycles_per_chapter,
+                    })}
+                  </div>
+                )}
+
                 {readiness.issues.map((issue) => {
                   const copy = issueCopy(
                     issue,
@@ -370,6 +460,8 @@ export default function ResumeJobDialog({
                             ? t("readinessAcknowledgeAutomatic", {
                                 count: continuationPolicy.automatic_continuations_per_scene,
                               })
+                            : issue.code === "automatic_reference_card_creation_requires_confirmation"
+                              ? t("readinessAcknowledgeAutoCards")
                             : issue.code === "prose_output_risk_requires_ack"
                               ? t("readinessAcknowledgeOutputRisk")
                               : issue.code === "character_cards_missing"
