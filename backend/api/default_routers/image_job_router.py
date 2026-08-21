@@ -32,6 +32,17 @@ from backend.services.image.character_portrait_service import (
     PortraitJobProjection,
     character_portrait_service,
 )
+from backend.services.image.character_portrait_batch_service import (
+    CharacterPortraitBatchService,
+    PortraitBatchConflictError,
+    PortraitBatchNotFoundError,
+    PortraitBatchPlanProjection,
+    PortraitBatchPlanRequest,
+    PortraitBatchPlanStaleError,
+    PortraitBatchProjection,
+    PortraitBatchStartRequest,
+    character_portrait_batch_service,
+)
 from backend.services.image.character_visual_profile_service import (
     CharacterVisualProfileProjection,
     CharacterVisualProfileRevisionConflict,
@@ -229,6 +240,10 @@ def get_character_portrait_service() -> CharacterPortraitService:
     return character_portrait_service
 
 
+def get_character_portrait_batch_service() -> CharacterPortraitBatchService:
+    return character_portrait_batch_service
+
+
 def get_character_visual_profile_service() -> CharacterVisualProfileService:
     return character_visual_profile_service
 
@@ -281,6 +296,30 @@ def _translate_portrait_error(error: Exception) -> HTTPException:
     if isinstance(error, (PortraitConfigurationError, ValueError)):
         return HTTPException(status_code=400, detail=str(error))
     return HTTPException(status_code=500, detail="角色立绘任务处理失败")
+
+
+def _translate_portrait_batch_error(error: Exception) -> HTTPException:
+    if isinstance(error, PortraitBatchNotFoundError):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, PortraitBatchPlanStaleError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "portrait_batch_plan_stale",
+                "message": str(error),
+            },
+        )
+    if isinstance(error, PortraitBatchConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "portrait_batch_conflict",
+                "message": str(error),
+            },
+        )
+    if isinstance(error, (InvalidIdError, PortraitConfigurationError, ValueError)):
+        return HTTPException(status_code=400, detail=str(error))
+    return HTTPException(status_code=500, detail="批量立绘任务处理失败")
 
 
 def _translate_cover_error(error: Exception) -> HTTPException:
@@ -447,6 +486,136 @@ async def cancel_character_portrait_job(
         )
     except Exception as error:
         raise _translate_portrait_error(error) from error
+
+
+@router.post(
+    "/api/reference-cards/novel/{novel_id}/character/portrait-batches/plan",
+    response_model=PortraitBatchPlanProjection,
+)
+async def plan_character_portrait_batch(
+    novel_id: str,
+    request: PortraitBatchPlanRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitBatchService = Depends(
+        get_character_portrait_batch_service
+    ),
+) -> PortraitBatchPlanProjection:
+    try:
+        return await service.plan(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            request=request,
+        )
+    except Exception as error:
+        raise _translate_portrait_batch_error(error) from error
+
+
+@router.post(
+    "/api/reference-cards/novel/{novel_id}/character/portrait-batches",
+    response_model=PortraitBatchProjection,
+)
+async def start_character_portrait_batch(
+    novel_id: str,
+    request: PortraitBatchStartRequest,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitBatchService = Depends(
+        get_character_portrait_batch_service
+    ),
+) -> PortraitBatchProjection:
+    try:
+        return await service.start(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            request=request,
+        )
+    except Exception as error:
+        raise _translate_portrait_batch_error(error) from error
+
+
+@router.get(
+    "/api/reference-cards/novel/{novel_id}/character/portrait-batches/current",
+    response_model=PortraitBatchProjection | None,
+)
+async def get_current_character_portrait_batch(
+    novel_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitBatchService = Depends(
+        get_character_portrait_batch_service
+    ),
+) -> PortraitBatchProjection | None:
+    try:
+        return await service.get_current(
+            owner_id=actor.id,
+            novel_id=novel_id,
+        )
+    except Exception as error:
+        raise _translate_portrait_batch_error(error) from error
+
+
+@router.get(
+    "/api/reference-cards/novel/{novel_id}/character/portrait-batches/{batch_id}",
+    response_model=PortraitBatchProjection,
+)
+async def get_character_portrait_batch(
+    novel_id: str,
+    batch_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitBatchService = Depends(
+        get_character_portrait_batch_service
+    ),
+) -> PortraitBatchProjection:
+    try:
+        return await service.get(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            batch_id=batch_id,
+        )
+    except Exception as error:
+        raise _translate_portrait_batch_error(error) from error
+
+
+@router.post(
+    "/api/reference-cards/novel/{novel_id}/character/portrait-batches/{batch_id}/advance",
+    response_model=PortraitBatchProjection,
+)
+async def advance_character_portrait_batch(
+    novel_id: str,
+    batch_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitBatchService = Depends(
+        get_character_portrait_batch_service
+    ),
+) -> PortraitBatchProjection:
+    try:
+        return await service.advance(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            batch_id=batch_id,
+        )
+    except Exception as error:
+        raise _translate_portrait_batch_error(error) from error
+
+
+@router.post(
+    "/api/reference-cards/novel/{novel_id}/character/portrait-batches/{batch_id}/cancel",
+    response_model=PortraitBatchProjection,
+)
+async def cancel_character_portrait_batch(
+    novel_id: str,
+    batch_id: str,
+    actor: Actor = Depends(require_owned_path_resource),
+    service: CharacterPortraitBatchService = Depends(
+        get_character_portrait_batch_service
+    ),
+) -> PortraitBatchProjection:
+    try:
+        return await service.cancel(
+            owner_id=actor.id,
+            novel_id=novel_id,
+            batch_id=batch_id,
+        )
+    except Exception as error:
+        raise _translate_portrait_batch_error(error) from error
 
 
 @router.get(

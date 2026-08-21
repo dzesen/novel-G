@@ -1175,6 +1175,20 @@ async def init_image_job_indexes():
             ),
             pymongo.IndexModel(
                 [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("portrait_batch_id", pymongo.ASCENDING),
+                    ("subject_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression={
+                    "portrait_batch_id": {"$type": "objectId"},
+                    "is_deleted": False,
+                },
+                name="image_jobs_owner_portrait_batch_card_created",
+            ),
+            pymongo.IndexModel(
+                [
                     ("is_terminal", pymongo.ASCENDING),
                     ("status", pymongo.ASCENDING),
                     ("updated_at", pymongo.ASCENDING),
@@ -1186,6 +1200,48 @@ async def init_image_job_indexes():
     except Exception as exc:
         logger.error("Failed to initialize image_jobs indexes: %s", exc)
         # Idempotent submit/resume depends on the two unique indexes above.
+        raise
+
+
+async def init_image_batch_indexes():
+    """Initialize owner isolation and the one-live-batch invariant."""
+    try:
+        collection = get_database()[collections.IMAGE_BATCHES]
+        await collection.create_indexes([
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                name="image_batches_owner_novel_created",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("kind", pymongo.ASCENDING),
+                ],
+                unique=True,
+                partialFilterExpression={
+                    "is_terminal": False,
+                    "is_deleted": False,
+                },
+                name="image_batches_owner_novel_active",
+            ),
+            pymongo.IndexModel(
+                [
+                    ("is_terminal", pymongo.ASCENDING),
+                    ("status", pymongo.ASCENDING),
+                    ("updated_at", pymongo.ASCENDING),
+                ],
+                name="image_batches_status_updated",
+            ),
+        ])
+        logger.info("Initialized image_batches indexes.")
+    except Exception as exc:
+        logger.error("Failed to initialize image_batches indexes: %s", exc)
+        # Without the partial unique index two tabs could each launch a batch.
         raise
 
 
@@ -1277,5 +1333,6 @@ async def init_all_indexes():
     await init_illustration_brief_indexes()
     await init_illustration_run_indexes()
     await init_image_job_indexes()
+    await init_image_batch_indexes()
     await init_state_timeline_indexes()
     # 在这里添加其他集合的索引初始化

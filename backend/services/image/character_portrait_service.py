@@ -25,6 +25,7 @@ from backend.services.image.single_image_job_service import (
     ImageProviderSnapshot,
     ManagedAssetReaderProtocol,
     PortraitAnchorResetRequired,
+    PortraitBatchItemConflict,
     PortraitAssetProjection,
     PortraitConfigurationError,
     PortraitJobNotFoundError,
@@ -226,6 +227,7 @@ class CharacterPortraitService:
         seed: int | None = None,
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
+        portrait_batch_id: str | None = None,
     ) -> PortraitJobProjection:
         return await self._jobs.start(
             owner_id=owner_id,
@@ -235,6 +237,7 @@ class CharacterPortraitService:
             seed=seed,
             provider_alias=provider_alias,
             confirm_anchor_reset=confirm_anchor_reset,
+            portrait_batch_id=portrait_batch_id,
         )
 
     async def poll(
@@ -287,6 +290,7 @@ __all__ = [
     "ImageProviderResolverProtocol",
     "ImageProviderSnapshot",
     "PortraitAnchorResetRequired",
+    "PortraitBatchItemConflict",
     "PortraitAssetProjection",
     "PortraitConfigurationError",
     "PortraitJobNotFoundError",

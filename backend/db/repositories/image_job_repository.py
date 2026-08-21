@@ -74,6 +74,7 @@ class ImageJobRepository(BaseRepository):
             "illustration_brief_id",
             "illustration_run_id",
             "parent_asset_id",
+            "portrait_batch_id",
         ):
             value = document.get(field)
             if value is None:
@@ -402,6 +403,78 @@ class ImageJobRepository(BaseRepository):
             ),
             sort=[("created_at", DESCENDING)],
         )
+
+    async def find_owned_portrait_batch_job(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        batch_id: str,
+        card_id: str,
+    ) -> dict[str, Any] | None:
+        """Recover the one portrait job created for a frozen batch item."""
+
+        return await self.collection.find_one(
+            {
+                **self._scope(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    usage="character_portrait",
+                    subject_id=card_id,
+                ),
+                "portrait_batch_id": to_object_id(batch_id),
+            },
+            sort=[("created_at", DESCENDING)],
+        )
+
+    async def list_busy_portrait_subject_ids(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_ids: list[str] | tuple[str, ...],
+    ) -> set[str]:
+        """Return selected cards with an active or late-cleanup portrait job."""
+
+        canonical_ids = [to_object_id(card_id) for card_id in card_ids]
+        if not canonical_ids:
+            return set()
+        cursor = self.collection.find(
+            {
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "usage": "character_portrait",
+                "is_deleted": False,
+                "$and": [
+                    {
+                        "$or": [
+                            {"subject_id": {"$in": canonical_ids}},
+                            {
+                                "subject_id": {"$exists": False},
+                                "character_card_id": {"$in": canonical_ids},
+                            },
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"is_terminal": False},
+                            {"cleanup_pending": True},
+                        ]
+                    },
+                ],
+            },
+            projection={"subject_id": 1, "character_card_id": 1},
+        )
+        # One selected card may legitimately have both a current job and an
+        # older late-cleanup job. Limiting rows to the number of card ids can
+        # therefore hide a busy card that appears later in the result set.
+        documents = await cursor.to_list(length=None)
+        return {
+            str(document.get("subject_id") or document.get("character_card_id"))
+            for document in documents
+            if document.get("subject_id") is not None
+            or document.get("character_card_id") is not None
+        }
 
     async def list_anchor_dependencies(
         self,

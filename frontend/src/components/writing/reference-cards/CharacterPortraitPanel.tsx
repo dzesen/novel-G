@@ -14,6 +14,7 @@ import type {
 } from "@/types/agent";
 import type {
   AppearanceAnchor,
+  CharacterPortraitBatchDraft,
   CharacterPortraitAsset,
   CharacterPortraitJob,
   CharacterPortraitState,
@@ -28,6 +29,8 @@ interface CharacterPortraitPanelProps {
   cardId: string;
   cardName: string;
   hasUnsavedChanges: boolean;
+  batchDraft: CharacterPortraitBatchDraft | null;
+  onBatchDraftChange: (draft: CharacterPortraitBatchDraft | null) => void;
 }
 
 interface CharacterPortraitInitialData {
@@ -75,13 +78,17 @@ export default function CharacterPortraitPanel({
   cardId,
   cardName,
   hasUnsavedChanges,
+  batchDraft,
+  onBatchDraftChange,
 }: CharacterPortraitPanelProps) {
   const t = useTranslations("writing.referenceCards.portrait");
   const locale = useLocale();
   const [state, setState] = useState<CharacterPortraitState | null>(null);
   const [agents, setAgents] = useState<AgentProfile[]>([]);
   const [agentId, setAgentId] = useState("");
-  const [prompt, setPrompt] = useState<IllustrationPromptResult | null>(null);
+  const [prompt, setPrompt] = useState<IllustrationPromptResult | null>(
+    batchDraft?.prompt ?? null,
+  );
   const [loading, setLoading] = useState(true);
   const [translating, setTranslating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -207,6 +214,11 @@ export default function CharacterPortraitPanel({
   const activeJob = Boolean(
     (job && !job.terminal) || cleanupJob,
   );
+  const batchDraftMatchesPrompt = Boolean(
+    prompt &&
+      batchDraft &&
+      JSON.stringify(prompt) === JSON.stringify(batchDraft.prompt),
+  );
   const formatDuration = (seconds: number): string => {
     const rounded = Math.max(0, Math.round(seconds));
     if (rounded < 60) return t("durationSeconds", { count: rounded });
@@ -330,6 +342,25 @@ export default function CharacterPortraitPanel({
         ? constrainIllustrationPromptEdit(current, field, rawValue)
         : current,
     );
+  };
+
+  const updateBatchDraft = () => {
+    if (
+      !prompt ||
+      activeJob ||
+      anchor ||
+      hasUnsavedChanges ||
+      !provider?.available
+    ) return;
+    if (batchDraftMatchesPrompt) {
+      onBatchDraftChange(null);
+      return;
+    }
+    onBatchDraftChange({
+      card_id: cardId,
+      card_name: cardName,
+      prompt,
+    });
   };
 
   return (
@@ -610,18 +641,27 @@ export default function CharacterPortraitPanel({
           </div>
 
           {prompt && (
-            <IllustrationPromptEditor
-              prompt={prompt}
-              labels={{
-                subject: t("fields.subject"),
-                appearance: t("fields.appearance"),
-                scene: t("fields.scene"),
-                style: t("fields.style"),
-                negative: t("fields.negative"),
-              }}
-              totalLabel={(count) => t("promptCount", { count })}
-              onChange={updatePrompt}
-            />
+            <>
+              <IllustrationPromptEditor
+                prompt={prompt}
+                labels={{
+                  subject: t("fields.subject"),
+                  appearance: t("fields.appearance"),
+                  scene: t("fields.scene"),
+                  style: t("fields.style"),
+                  negative: t("fields.negative"),
+                }}
+                totalLabel={(count) => t("promptCount", { count })}
+                onChange={updatePrompt}
+              />
+              {batchDraft && (
+                <p role="status" className="mt-2 text-xs leading-5 text-muted">
+                  {batchDraftMatchesPrompt
+                    ? t("batchStaged")
+                    : t("batchDraftChanged")}
+                </p>
+              )}
+            </>
           )}
 
           <ImageJobStatusPanel
@@ -655,24 +695,45 @@ export default function CharacterPortraitPanel({
               cancelling: t("cancelling"),
             }}
             primaryAction={(
-              <Button
-              variant="primary"
-              className="bg-accent text-white hover:bg-accent-hover"
-              isDisabled={
-                !prompt ||
-                submitting ||
-                activeJob ||
-                !provider?.available ||
-                hasUnsavedChanges
-              }
-              onPress={() => void submit()}
-            >
-              {submitting
-                ? t("submitting")
-                : anchor
-                  ? t("resetAndGenerate")
-                  : t("generate")}
-              </Button>
+              <div className="flex min-w-0 flex-wrap gap-2">
+                {!anchor && (
+                  <Button
+                    variant="outline"
+                    isDisabled={
+                      !prompt ||
+                      submitting ||
+                      activeJob ||
+                      !provider?.available ||
+                      hasUnsavedChanges
+                    }
+                    onPress={updateBatchDraft}
+                  >
+                    {batchDraftMatchesPrompt
+                      ? t("removeFromBatch")
+                      : batchDraft
+                        ? t("updateBatch")
+                        : t("addToBatch")}
+                  </Button>
+                )}
+                <Button
+                  variant="primary"
+                  className="bg-accent text-white hover:bg-accent-hover"
+                  isDisabled={
+                    !prompt ||
+                    submitting ||
+                    activeJob ||
+                    !provider?.available ||
+                    hasUnsavedChanges
+                  }
+                  onPress={() => void submit()}
+                >
+                  {submitting
+                    ? t("submitting")
+                    : anchor
+                      ? t("resetAndGenerate")
+                      : t("generate")}
+                </Button>
+              </div>
             )}
             onCancel={() => void cancel()}
             onRetryCleanup={() => void retryCleanup()}

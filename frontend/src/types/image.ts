@@ -1,3 +1,5 @@
+import type { IllustrationPromptResult } from "./agent";
+
 export type ImageJobStatus =
   | "pending"
   | "submitting"
@@ -101,6 +103,86 @@ export interface CharacterPortraitState {
   warnings?: string[];
   anchor_dependencies: AppearanceAnchorDependency[];
   anchor_dependency_total: number;
+}
+
+export interface CharacterPortraitBatchDraft {
+  card_id: string;
+  card_name: string;
+  prompt: IllustrationPromptResult;
+}
+
+export interface CharacterPortraitBatchPlan {
+  plan_revision: "character-portrait-batch-plan-v1";
+  plan_digest: string;
+  provider_alias: string;
+  provider_model: string;
+  workflow_revision: string;
+  total_images: number;
+  unit_estimated_seconds: number;
+  estimated_seconds: number;
+  queue_position: number;
+  max_provider_requests: number;
+  max_concurrency: 1;
+  estimate_source: "history" | "provider_timeout";
+  warnings: string[];
+}
+
+export type CharacterPortraitBatchStatus =
+  | "running"
+  | "cancelling"
+  | "completed"
+  | "completed_with_failures"
+  | "cancelled";
+
+export type CharacterPortraitBatchItemStatus =
+  | "pending"
+  | "starting"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export interface CharacterPortraitBatchItem {
+  card_id: string;
+  card_name: string;
+  status: CharacterPortraitBatchItemStatus;
+  job_id: string | null;
+  job_status: string | null;
+  queue_position: number | null;
+  submit_count: number;
+  completed_images: number;
+  failure: ImageJobFailure | null;
+}
+
+export interface CharacterPortraitBatch {
+  batch_id: string;
+  plan_digest: string;
+  status: CharacterPortraitBatchStatus;
+  terminal: boolean;
+  cancel_requested: boolean;
+  provider_alias: string;
+  provider_model: string;
+  workflow_revision: string;
+  total_images: number;
+  unit_estimated_seconds: number;
+  estimated_seconds: number;
+  elapsed_seconds: number;
+  max_provider_requests: number;
+  submitted_requests: number;
+  request_upper_bound_exceeded: boolean;
+  max_concurrency: 1;
+  completed_images: number;
+  succeeded_items: number;
+  failed_items: number;
+  cancelled_items: number;
+  pending_items: number;
+  current_index: number | null;
+  queue_position: number | null;
+  items: CharacterPortraitBatchItem[];
+  failure: ImageJobFailure | null;
+  warnings: string[];
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface CharacterVisualReference {

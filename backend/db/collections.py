@@ -46,6 +46,7 @@ CARD_IMPORT_PROPOSALS = "card_import_proposals"
 MUTATION_JOURNALS = "mutation_journals"
 IMAGE_ASSETS = "image_assets"
 IMAGE_JOBS = "image_jobs"
+IMAGE_BATCHES = "image_batches"
 CHARACTER_VISUAL_PROFILES = "character_visual_profiles"
 ILLUSTRATION_BRIEFS = "illustration_briefs"
 ILLUSTRATION_RUNS = "illustration_runs"
@@ -83,6 +84,7 @@ ACTIVE_COLLECTIONS = frozenset({
     MUTATION_JOURNALS,
     IMAGE_ASSETS,
     IMAGE_JOBS,
+    IMAGE_BATCHES,
     CHARACTER_VISUAL_PROFILES,
     ILLUSTRATION_BRIEFS,
     ILLUSTRATION_RUNS,

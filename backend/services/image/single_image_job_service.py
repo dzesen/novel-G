@@ -74,6 +74,10 @@ class PortraitAnchorResetRequired(ValueError):
     """Replacing an existing frozen anchor requires explicit confirmation."""
 
 
+class PortraitBatchItemConflict(RuntimeError):
+    """A frozen batch item collided with an unrelated portrait job."""
+
+
 ImageJobUsage = Literal["character_portrait", "cover", "scene_illustration"]
 
 
@@ -334,6 +338,15 @@ class ImageJobRepositoryProtocol(Protocol):
         *,
         owner_id: str,
         novel_id: str,
+        card_id: str,
+    ) -> dict[str, Any] | None: ...
+
+    async def find_owned_portrait_batch_job(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        batch_id: str,
         card_id: str,
     ) -> dict[str, Any] | None: ...
 
@@ -2788,10 +2801,16 @@ class SingleImageJobService:
         seed: int | None = None,
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
+        portrait_batch_id: str | None = None,
     ) -> PortraitJobProjection:
         owner_id = _canonical_object_id(owner_id, field="owner_id")
         novel_id = _canonical_object_id(novel_id, field="novel_id")
         card_id = _canonical_object_id(card_id, field="card_id")
+        if portrait_batch_id is not None:
+            portrait_batch_id = _canonical_object_id(
+                portrait_batch_id,
+                field="portrait_batch_id",
+            )
         if not prompt.appearance:
             raise ValueError("appearance must not be empty for a character portrait")
         if seed is not None and (
@@ -2808,6 +2827,14 @@ class SingleImageJobService:
             card_id=card_id,
         )
         if active is not None:
+            if (
+                portrait_batch_id is not None
+                and str(active.get("portrait_batch_id") or "")
+                != portrait_batch_id
+            ):
+                raise PortraitBatchItemConflict(
+                    "该角色已有不属于当前批次的立绘任务"
+                )
             return _projection(active)
         pending_cleanup = await self.jobs.find_pending_cleanup_owned_job(
             owner_id=owner_id,
@@ -2815,6 +2842,14 @@ class SingleImageJobService:
             card_id=card_id,
         )
         if pending_cleanup is not None:
+            if (
+                portrait_batch_id is not None
+                and str(pending_cleanup.get("portrait_batch_id") or "")
+                != portrait_batch_id
+            ):
+                raise PortraitBatchItemConflict(
+                    "该角色仍有不属于当前批次的立绘清理任务"
+                )
             return _projection(pending_cleanup)
         current_anchor = await self.anchors.get_anchor(
             novel_id=novel_id,
@@ -2847,12 +2882,22 @@ class SingleImageJobService:
                     "descriptor": prompt.appearance,
                     "anchor_before": current_anchor,
                     "confirm_anchor_reset": confirm_anchor_reset,
+                    **(
+                        {"portrait_batch_id": portrait_batch_id}
+                        if portrait_batch_id is not None
+                        else {}
+                    ),
                 },
                 idempotency_context={
                     "anchor_before": self._canonical_anchor(
                         current_anchor
                     ),
                     "confirm_anchor_reset": confirm_anchor_reset,
+                    **(
+                        {"portrait_batch_id": portrait_batch_id}
+                        if portrait_batch_id is not None
+                        else {}
+                    ),
                 },
             ),
             provider_alias=provider_alias,

@@ -10,7 +10,12 @@ import type {
   ReferenceCard,
   ReferenceCardType,
 } from "@/types/novel";
+import type {
+  CharacterPortraitBatch,
+  CharacterPortraitBatchDraft,
+} from "@/types/image";
 import CardImportDialog from "./CardImportDialog";
+import CharacterPortraitBatchDialog from "./CharacterPortraitBatchDialog";
 import CharacterPortraitPanel from "./CharacterPortraitPanel";
 import ReferenceCardCurationDialog from "./ReferenceCardCurationDialog";
 
@@ -101,6 +106,11 @@ export default function ReferenceCardsWorkspace({
   const [favoriteError, setFavoriteError] = useState<string | null>(null);
   const [showCuration, setShowCuration] = useState(false);
   const [showCardImport, setShowCardImport] = useState(false);
+  const [showPortraitBatch, setShowPortraitBatch] = useState(false);
+  const [portraitBatchDrafts, setPortraitBatchDrafts] = useState<
+    Record<string, CharacterPortraitBatchDraft>
+  >({});
+  const [portraitPanelRevision, setPortraitPanelRevision] = useState(0);
   const [loadedCardScope, setLoadedCardScope] = useState<string | null>(null);
   const cardsRequestRef = useRef(0);
 
@@ -131,6 +141,42 @@ export default function ReferenceCardsWorkspace({
     favoritesOnly,
     search,
   ]);
+
+  const portraitBatchItems = useMemo(
+    () => Object.values(portraitBatchDrafts),
+    [portraitBatchDrafts],
+  );
+
+  const updatePortraitBatchDraft = useCallback(
+    (cardId: string, next: CharacterPortraitBatchDraft | null) => {
+      setPortraitBatchDrafts((current) => {
+        const updated = { ...current };
+        if (next) updated[cardId] = next;
+        else delete updated[cardId];
+        return updated;
+      });
+    },
+    [],
+  );
+
+  const finishPortraitBatch = useCallback(
+    (batch: CharacterPortraitBatch) => {
+      const succeededIds = new Set(
+        batch.items
+          .filter((item) => item.status === "succeeded")
+          .map((item) => item.card_id),
+      );
+      setPortraitBatchDrafts((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([cardId]) => !succeededIds.has(cardId),
+          ),
+        ),
+      );
+      setPortraitPanelRevision((current) => current + 1);
+    },
+    [],
+  );
 
   const loadCards = useCallback(async () => {
     if (!novelId || mode !== "edit") return;
@@ -253,6 +299,7 @@ export default function ReferenceCardsWorkspace({
       setSelectedId(saved._id);
       onCardTargetChange?.(saved._id);
       setDraft(createDraft(saved));
+      updatePortraitBatchDraft(saved._id, null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("saveFailed"));
     } finally {
@@ -305,6 +352,7 @@ export default function ReferenceCardsWorkspace({
         next.delete(selectedCard._id);
         return next;
       });
+      updatePortraitBatchDraft(selectedCard._id, null);
       setSelectedId(remaining[0]?._id ?? null);
       onCardTargetChange?.(remaining[0]?._id);
       setCreating(false);
@@ -430,6 +478,20 @@ export default function ReferenceCardsWorkspace({
                 {t("favoritesFirst")}
               </button>
             </div>
+          )}
+          {cardType === "character" && !showTrash && (
+            <button
+              type="button"
+              onClick={() => setShowPortraitBatch(true)}
+              className="mt-3 flex min-h-11 w-full items-center justify-between gap-3 rounded-lg border border-accent/30 bg-accent/5 px-3 py-2 text-left text-xs font-semibold text-accent transition-colors hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              <span>{t("portraitBatch.open")}</span>
+              <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5">
+                {t("portraitBatch.preparedCount", {
+                  count: portraitBatchItems.length,
+                })}
+              </span>
+            </button>
           )}
           {cardType === "character" && !showTrash && favoriteError && (
             <p
@@ -573,11 +635,17 @@ export default function ReferenceCardsWorkspace({
                 selectedCard &&
                 novelId && (
                   <CharacterPortraitPanel
-                    key={selectedCard._id}
+                    key={`${selectedCard._id}:${portraitPanelRevision}`}
                     novelId={novelId}
                     cardId={selectedCard._id}
                     cardName={selectedCard.name}
                     hasUnsavedChanges={hasUnsavedChanges}
+                    batchDraft={
+                      portraitBatchDrafts[selectedCard._id] ?? null
+                    }
+                    onBatchDraftChange={(next) =>
+                      updatePortraitBatchDraft(selectedCard._id, next)
+                    }
                   />
                 )}
               {cardType === "character" && (
@@ -698,6 +766,18 @@ export default function ReferenceCardsWorkspace({
         onClose={() => setShowCardImport(false)}
         onApplied={loadCards}
       />
+      {cardType === "character" && (
+        <CharacterPortraitBatchDialog
+          novelId={novelId}
+          isOpen={showPortraitBatch}
+          drafts={portraitBatchItems}
+          onClose={() => setShowPortraitBatch(false)}
+          onRemoveDraft={(cardId) =>
+            updatePortraitBatchDraft(cardId, null)
+          }
+          onTerminal={finishPortraitBatch}
+        />
+      )}
     </div>
   );
 }
