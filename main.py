@@ -46,6 +46,9 @@ from backend.api.default_routers.generation_job_router import (
 from backend.api.default_routers.state_timeline_router import router as state_timeline_router
 from backend.api.default_routers.auth_router import router as auth_router
 from backend.api.default_routers.card_import_router import router as card_import_router
+from backend.api.default_routers.generation_preset_router import (
+    router as generation_preset_router,
+)
 from backend.api.default_routers.card_export_router import router as card_export_router
 from backend.api.default_routers.image_job_router import router as image_job_router
 from backend.api.default_routers.illustration_brief_router import (
@@ -151,6 +154,7 @@ app.include_router(character_state_router)
 app.include_router(generation_job_router)
 app.include_router(state_timeline_router)
 app.include_router(card_import_router)
+app.include_router(generation_preset_router)
 app.include_router(card_export_router)
 app.include_router(image_job_router)
 app.include_router(illustration_brief_router)

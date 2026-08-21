@@ -100,6 +100,7 @@ export default function CardDrivenCreatePanel({
   const tc = useTranslations("create");
   const tb = useTranslations("bookshelf");
   const tm = useTranslations("interopErrors.missingCharacterMetadata");
+  const tp = useTranslations("interopErrors.generationPreset");
   const metadataT = useTranslations("writing.generationMetadata");
   const router = useRouter();
   const pathname = usePathname();
@@ -228,6 +229,7 @@ export default function CardDrivenCreatePanel({
           metadataStripped: tm("metadataStripped"),
           otherTextMetadata: (keywords) =>
             tm("otherTextMetadata", { keywords }),
+          generationPreset: tp("requiresAgentStudio"),
         }),
       );
     } finally {

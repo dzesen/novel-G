@@ -821,6 +821,7 @@ function UploadStage({
 function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
   const t = useTranslations("writing.referenceCards.import");
   const tm = useTranslations("interopErrors.missingCharacterMetadata");
+  const tp = useTranslations("interopErrors.generationPreset");
   return (
     <section
       aria-labelledby="card-import-rejections"
@@ -864,6 +865,7 @@ function UploadFailureList({ failures }: { failures: UploadFailure[] }) {
                     metadataStripped: tm("metadataStripped"),
                     otherTextMetadata: (keywords) =>
                       tm("otherTextMetadata", { keywords }),
+                    generationPreset: tp("requiresAgentStudio"),
                   },
                 )}
               </p>

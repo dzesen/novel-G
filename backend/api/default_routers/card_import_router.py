@@ -38,6 +38,10 @@ from backend.services.interop.character_card_avatar_import import (
     InvalidCharacterCardAvatar,
     character_card_avatar_import_service,
 )
+from backend.services.interop.generation_preset_adapter import (
+    GenerationPresetAdapter,
+    GenerationPresetValidationError,
+)
 from backend.services.interop.world_book_adapter import (
     MAX_WORLD_BOOK_JSON_BYTES,
     WorldBookAdapter,
@@ -108,6 +112,26 @@ async def _stage_upload(
     try:
         if declared_mime == "application/json":
             payload = await file.read(MAX_WORLD_BOOK_JSON_BYTES + 1)
+            try:
+                GenerationPresetAdapter.parse_json(
+                    payload,
+                    declared_mime=file.content_type or "",
+                    filename=file.filename,
+                )
+            except GenerationPresetValidationError:
+                pass
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "generation_preset_requires_agent_studio",
+                        "path": "$",
+                        "message": (
+                            "这是生成预设，不是世界书或角色卡；"
+                            "请到 Agent 工作台的管理页导入。"
+                        ),
+                    },
+                )
             try:
                 parsed = WorldBookAdapter.parse_json(
                     payload,

@@ -20,9 +20,19 @@ from backend.services.llm.agent_orchestrator import (
     get_agent_profile,
     get_agent_profiles,
 )
+from backend.services.llm.agent_limits import (
+    MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
+    MAX_CUSTOM_AGENT_OUTPUT_TOKENS,
+)
 
 
-_GENERATION_PARAM_KEYS = {"temperature", "top_p", "max_tokens"}
+_GENERATION_PARAM_KEYS = {
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+}
 
 
 class AgentCatalog:
@@ -236,8 +246,11 @@ class AgentCatalog:
             raise ValueError("Agent 名称长度必须为 2 到 64 个字符")
         if len(description.strip()) > 500:
             raise ValueError("Agent 说明不能超过 500 个字符")
-        if not 20 <= len(instruction.strip()) <= 4000:
-            raise ValueError("Agent 指令长度必须为 20 到 4000 个字符")
+        if not 20 <= len(instruction.strip()) <= MAX_CUSTOM_AGENT_INSTRUCTION_CHARS:
+            raise ValueError(
+                "Agent 指令长度必须为 20 到 "
+                f"{MAX_CUSTOM_AGENT_INSTRUCTION_CHARS} 个字符"
+            )
         if visibility not in {"private", "shared"}:
             raise ValueError("Agent 可见性无效")
         if visibility == "shared" and not actor.is_admin:
@@ -269,8 +282,17 @@ class AgentCatalog:
         if top_p is not None and not 0 <= float(top_p) <= 1:
             raise ValueError("top_p 必须在 0 到 1 之间")
         max_tokens = cleaned.get("max_tokens")
-        if max_tokens is not None and int(max_tokens) <= 0:
-            raise ValueError("max_tokens 必须大于 0")
+        if max_tokens is not None and not (
+            0 < int(max_tokens) <= MAX_CUSTOM_AGENT_OUTPUT_TOKENS
+        ):
+            raise ValueError(
+                "max_tokens 必须在 1 到 "
+                f"{MAX_CUSTOM_AGENT_OUTPUT_TOKENS} 之间"
+            )
+        for key in ("presence_penalty", "frequency_penalty"):
+            value = cleaned.get(key)
+            if value is not None and not -2 <= float(value) <= 2:
+                raise ValueError(f"{key} 必须在 -2 到 2 之间")
         return cleaned
 
     @staticmethod

@@ -2,6 +2,7 @@ export interface MissingCharacterMetadataMessages {
   aiGeneratedIllustration: string;
   metadataStripped: string;
   otherTextMetadata: (keywords: string) => string;
+  generationPreset: string;
 }
 
 type MissingCharacterMetadataKind =
@@ -32,6 +33,18 @@ export function cardImportErrorMessage(
   fallback: string,
   messages: MissingCharacterMetadataMessages,
 ): string {
+  if (error && typeof error === "object") {
+    const detail = (error as { detail?: unknown }).detail;
+    if (
+      detail &&
+      typeof detail === "object" &&
+      !Array.isArray(detail) &&
+      (detail as { code?: unknown }).code ===
+        "generation_preset_requires_agent_studio"
+    ) {
+      return messages.generationPreset;
+    }
+  }
   const detail = missingCharacterMetadataDetail(error);
   if (!detail) return fallback;
 

@@ -14,6 +14,10 @@ from backend.db.repositories.agent_definition_repository import (
 )
 from backend.services.auth.identity_service import Actor
 from backend.services.llm.agent_catalog import AgentCatalog, agent_catalog
+from backend.services.llm.agent_limits import (
+    MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
+    MAX_CUSTOM_AGENT_OUTPUT_TOKENS,
+)
 
 
 router = APIRouter(
@@ -28,7 +32,13 @@ class AgentGenerationDefaults(BaseModel):
 
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
-    max_tokens: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        le=MAX_CUSTOM_AGENT_OUTPUT_TOKENS,
+    )
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
 
 
 class AgentDefinitionRequest(BaseModel):
@@ -37,7 +47,10 @@ class AgentDefinitionRequest(BaseModel):
     label: str = Field(min_length=2, max_length=64)
     description: str = Field(default="", max_length=500)
     capability: str = Field(min_length=1, max_length=80)
-    instruction: str = Field(min_length=20, max_length=4000)
+    instruction: str = Field(
+        min_length=20,
+        max_length=MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
+    )
     provider_alias: str | None = Field(default=None, max_length=120)
     generation_params: AgentGenerationDefaults = Field(
         default_factory=AgentGenerationDefaults

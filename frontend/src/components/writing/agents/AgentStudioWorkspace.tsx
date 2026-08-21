@@ -11,6 +11,10 @@ import {
   ILLUSTRATION_TOTAL_LIMIT,
   illustrationPromptCharacterCount,
 } from "@/lib/illustrationPrompt";
+import {
+  MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
+  MAX_CUSTOM_AGENT_OUTPUT_TOKENS,
+} from "@/lib/generationPreset";
 import type {
   AgentCapability,
   AgentCapabilityId,
@@ -33,6 +37,9 @@ import type {
 import AgentRevisionWorkspace, {
   type AgentRevisionSourceSelection,
 } from "./AgentRevisionWorkspace";
+import GenerationPresetImportDialog, {
+  type ImportedGenerationPresetDraft,
+} from "./GenerationPresetImportDialog";
 import { contextSectionKind } from "../generationMetadataPresentation";
 
 interface Props {
@@ -61,6 +68,8 @@ interface AgentDraft {
   temperature: string;
   topP: string;
   maxTokens: string;
+  presencePenalty: string;
+  frequencyPenalty: string;
   visibility: "private" | "shared";
   enabled: boolean;
 }
@@ -78,6 +87,8 @@ function emptyDraft(): AgentDraft {
     temperature: "",
     topP: "",
     maxTokens: "",
+    presencePenalty: "",
+    frequencyPenalty: "",
     visibility: "private",
     enabled: true,
   };
@@ -102,6 +113,14 @@ function profileToDraft(profile: AgentProfile): AgentDraft {
       profile.generation_params.max_tokens == null
         ? ""
         : String(profile.generation_params.max_tokens),
+    presencePenalty:
+      profile.generation_params.presence_penalty == null
+        ? ""
+        : String(profile.generation_params.presence_penalty),
+    frequencyPenalty:
+      profile.generation_params.frequency_penalty == null
+        ? ""
+        : String(profile.generation_params.frequency_penalty),
     visibility: profile.visibility,
     enabled: profile.enabled,
   };
@@ -119,6 +138,14 @@ function draftPayload(draft: AgentDraft) {
         draft.temperature === "" ? null : Number(draft.temperature),
       top_p: draft.topP === "" ? null : Number(draft.topP),
       max_tokens: draft.maxTokens === "" ? null : Number(draft.maxTokens),
+      presence_penalty:
+        draft.presencePenalty === ""
+          ? null
+          : Number(draft.presencePenalty),
+      frequency_penalty:
+        draft.frequencyPenalty === ""
+          ? null
+          : Number(draft.frequencyPenalty),
     },
     visibility: draft.visibility,
     enabled: draft.enabled,
@@ -181,6 +208,7 @@ export default function AgentStudioWorkspace({
   const [draft, setDraft] = useState<AgentDraft>(emptyDraft);
   const [savingAgent, setSavingAgent] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [presetImportOpen, setPresetImportOpen] = useState(false);
 
   const loadCatalog = useCallback(async () => {
     setLoadingCatalog(true);
@@ -331,6 +359,21 @@ export default function AgentStudioWorkspace({
     setDraft(emptyDraft());
     setConfirmingDelete(false);
     setNotice(null);
+  };
+
+  const useImportedPresetDraft = (
+    imported: ImportedGenerationPresetDraft,
+  ) => {
+    setCreatingAgent(true);
+    setSelectedAgentId(null);
+    setDraft({
+      ...emptyDraft(),
+      ...imported,
+    });
+    setConfirmingDelete(false);
+    setPresetImportOpen(false);
+    setError(null);
+    setNotice(t("management.presetImport.draftReady"));
   };
 
   const reloadAndSelect = async (agentId: string) => {
@@ -1418,7 +1461,7 @@ export default function AgentStudioWorkspace({
     return (
       <div className="grid min-h-0 gap-5 lg:grid-cols-[minmax(16rem,0.7fr)_minmax(0,1.3fr)]">
         <section className="rounded-lg border border-border bg-surface p-4">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="font-semibold text-foreground">
                 {t("management.catalogTitle")}
@@ -1427,13 +1470,22 @@ export default function AgentStudioWorkspace({
                 {t("management.catalogHint")}
               </p>
             </div>
-            <button
-              type="button"
-              onClick={startCreate}
-              className="shrink-0 rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white"
-            >
-              {t("management.new")}
-            </button>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setPresetImportOpen(true)}
+                className="rounded-lg border border-accent px-3 py-2 text-sm font-semibold text-accent hover:bg-accent/5"
+              >
+                {t("management.presetImport.openButton")}
+              </button>
+              <button
+                type="button"
+                onClick={startCreate}
+                className="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white"
+              >
+                {t("management.new")}
+              </button>
+            </div>
           </div>
           <select
             className={`${fieldClass} mt-4`}
@@ -1620,7 +1672,10 @@ export default function AgentStudioWorkspace({
                   />
                   {!formLocked && (
                     <span className="block text-xs text-muted">
-                      {t("management.instructionHint")}
+                      {t("management.instructionHint", {
+                        current: Array.from(draft.instruction).length,
+                        maximum: MAX_CUSTOM_AGENT_INSTRUCTION_CHARS,
+                      })}
                     </span>
                   )}
                 </label>
@@ -1633,7 +1688,7 @@ export default function AgentStudioWorkspace({
                 <p className="mt-1 text-xs text-muted">
                   {t("management.runtimeHint")}
                 </p>
-                <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                   <label className="space-y-1.5 text-sm">
                     <span className="text-muted">
                       {t("management.provider")}
@@ -1695,6 +1750,7 @@ export default function AgentStudioWorkspace({
                     <input
                       type="number"
                       min={1}
+                      max={MAX_CUSTOM_AGENT_OUTPUT_TOKENS}
                       step={100}
                       className={fieldClass}
                       disabled={formLocked}
@@ -1703,6 +1759,46 @@ export default function AgentStudioWorkspace({
                         setDraft({
                           ...draft,
                           maxTokens: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="space-y-1.5 text-sm">
+                    <span className="text-muted">
+                      {t("management.presencePenalty")}
+                    </span>
+                    <input
+                      type="number"
+                      min={-2}
+                      max={2}
+                      step={0.1}
+                      className={fieldClass}
+                      disabled={formLocked}
+                      value={draft.presencePenalty}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          presencePenalty: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="space-y-1.5 text-sm">
+                    <span className="text-muted">
+                      {t("management.frequencyPenalty")}
+                    </span>
+                    <input
+                      type="number"
+                      min={-2}
+                      max={2}
+                      step={0.1}
+                      className={fieldClass}
+                      disabled={formLocked}
+                      value={draft.frequencyPenalty}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          frequencyPenalty: event.target.value,
                         })
                       }
                     />
@@ -1785,7 +1881,9 @@ export default function AgentStudioWorkspace({
                       disabled={
                         savingAgent ||
                         draft.label.trim().length < 2 ||
-                        draft.instruction.trim().length < 20
+                        draft.instruction.trim().length < 20 ||
+                        Array.from(draft.instruction.trim()).length >
+                          MAX_CUSTOM_AGENT_INSTRUCTION_CHARS
                       }
                       onClick={() => void saveAgent()}
                       className="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -1917,6 +2015,20 @@ export default function AgentStudioWorkspace({
           )
         ) : (
           renderTool()
+        )}
+
+        {presetImportOpen && (
+          <GenerationPresetImportDialog
+            capabilities={capabilities}
+            defaultCapability={
+              managementFilter !== "all" &&
+              capabilityMap.get(managementFilter)?.customizable
+                ? managementFilter
+                : "creative_inspiration"
+            }
+            onClose={() => setPresetImportOpen(false)}
+            onUseDraft={useImportedPresetDraft}
+          />
         )}
       </div>
     </div>

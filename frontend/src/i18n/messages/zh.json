@@ -685,6 +685,9 @@
     "wordsPerChapter": "每章字数"
   },
   "interopErrors": {
+    "generationPreset": {
+      "requiresAgentStudio": "这是生成预设，不是世界书或角色卡。请到 Agent 工作台的管理页导入。"
+    },
     "missingCharacterMetadata": {
       "aiGeneratedIllustration": "这是 AI 生成的插图；PNG 携带的是生成参数，不是角色数据。",
       "metadataStripped": "PNG 完全没有文本块，元数据多半在转存或压缩时被剥离。请从卡站重新下载原始文件，不要使用截图或社交平台转发的版本。",
@@ -1207,10 +1210,12 @@
         "description": "简短说明",
         "instruction": "角色指令",
         "instructionPlaceholder": "明确 Agent 的判断标准、输出偏好和不能越过的边界…",
-        "instructionHint": "能力输入、输出结构和写入权限由系统固定；这里仅定义角色策略。",
+        "instructionHint": "能力输入、输出结构和写入权限由系统固定；这里仅定义角色策略。{current}/{maximum} 字符。",
         "runtimeTitle": "模型与生成偏好",
         "runtimeHint": "留空时继承工作流和 Provider 配置。不会在这里暴露或保存 API Key。",
         "provider": "Provider",
+        "presencePenalty": "存在惩罚",
+        "frequencyPenalty": "频率惩罚",
         "inheritProvider": "继承工作流",
         "enabled": "启用",
         "visibility": "可见性",
@@ -1221,7 +1226,56 @@
         "cancel": "取消",
         "save": "保存 Agent",
         "saving": "保存中…",
-        "saved": "Agent 已保存"
+        "saved": "Agent 已保存",
+        "presetImport": {
+          "openButton": "导入生成预设",
+          "title": "导入生成预设",
+          "description": "预览 SillyTavern 生成预设，选择真正需要的提示条目，再填入一个可复核的自定义 Agent 草稿。",
+          "close": "关闭",
+          "cancel": "取消",
+          "fileLabel": "选择 JSON 预设",
+          "fileHint": "支持带 prompts 与 prompt_order 的 SillyTavern 生成预设。世界书和角色卡请继续使用资料卡导入。",
+          "safetyTitle": "导入只做预览，不会直接保存或调用模型",
+          "safetyDescription": "原 system、user、assistant 角色都会降级为普通外部文本；脚本、正则、注入位置与宏不会执行。章纲、正文和状态三条核心流水线仍不可定制。",
+          "preview": "预览预设",
+          "previewing": "正在解析…",
+          "sourceSummary": "原预设启用 {active}/{total} 个正文条目，共 {characters} 个字符。",
+          "isolationTitle": "兼容性边界",
+          "isolationSummary": "已隔离 {items} 个脚本或正则项；发现 {missing} 个缺失引用。它们不会执行，也不会被猜测补齐。",
+          "profileLabel": "提示顺序",
+          "profileOption": "顺序 {index} · 外部 ID {id}",
+          "none": "无",
+          "capabilityLabel": "用于哪项 Agent 能力",
+          "capabilityHint": "这里只列出预览型可定制能力；不会接管正式章纲、正文或状态写入。",
+          "applyParameters": "带入兼容的生成参数",
+          "noCompatibleParameters": "没有可安全带入的参数",
+          "unsupportedParameters": "以下参数只展示、不自动带入：{fields}",
+          "unassignedPrompts": "另有 {count} 个条目没有出现在所选顺序中，本次不会带入。",
+          "promptListTitle": "选择提示条目",
+          "promptListHint": "列表严格保持原顺序；可以启用原本停用的正文，但 marker、空内容和缺失引用不可选择。",
+          "restoreOriginal": "恢复原启用项",
+          "clearSelection": "清空",
+          "marker": "占位 marker",
+          "missingReference": "缺失引用",
+          "emptyContent": "空内容",
+          "originallyEnabled": "原本启用",
+          "originallyDisabled": "原本停用",
+          "sourceRole": "原角色 {role}（已降级）",
+          "selectionSummary": "已选 {selected} 项 · {current}/{maximum} 字符",
+          "instructionOverLimit": "当前为 {current} 字符，超过 {maximum} 字符上限；请取消部分条目。",
+          "chooseAnother": "重新选择文件",
+          "useDraft": "填入 Agent 草稿",
+          "draftName": "{name} 预设 Agent",
+          "draftDescription": "从 SillyTavern 生成预设“{name}”导入；原角色层级与扩展代码均已隔离。",
+          "draftReady": "预设已填入新 Agent 草稿，请复核后再保存。",
+          "errors": {
+            "notPreset": "这个 JSON 不是可识别的生成预设。请确认它包含 prompts 和 prompt_order。",
+            "tooLarge": "预设文件超过 5 MiB 上限。请移除无关扩展后重试。",
+            "fileType": "请选择扩展名为 .json 的 JSON 预设文件。",
+            "duplicateIdentifier": "预设中存在重复提示标识，无法安全判断顺序引用；请先在来源工具中修复。",
+            "previewFailed": "预设解析失败。文件可能损坏，或使用了当前不支持的结构。"
+          }
+        }
       }
     },
     "novelInfo": {

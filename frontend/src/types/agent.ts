@@ -40,6 +40,8 @@ export interface AgentProfile {
     temperature?: number;
     top_p?: number;
     max_tokens?: number;
+    presence_penalty?: number;
+    frequency_penalty?: number;
   };
   enabled: boolean;
   version: number;

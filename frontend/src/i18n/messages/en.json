@@ -685,6 +685,9 @@
     "wordsPerChapter": "Words per Chapter"
   },
   "interopErrors": {
+    "generationPreset": {
+      "requiresAgentStudio": "This is a generation preset, not a world book or character card. Import it from Agent Studio's Management tab."
+    },
     "missingCharacterMetadata": {
       "aiGeneratedIllustration": "This is an AI-generated illustration. The PNG contains generation parameters, not character data.",
       "metadataStripped": "This PNG has no text chunks. Its metadata was likely stripped during transfer or compression. Download the original file again from the card site; do not use a screenshot or a version forwarded through social media.",
@@ -1207,10 +1210,12 @@
         "description": "Short description",
         "instruction": "Role instruction",
         "instructionPlaceholder": "Define judgment criteria, output preferences, and boundaries the Agent must not cross…",
-        "instructionHint": "Capability input, output schema, and write access stay fixed in code. This field only defines role strategy.",
+        "instructionHint": "Capability input, output schema, and write access stay fixed in code. This field only defines role strategy. {current}/{maximum} characters.",
         "runtimeTitle": "Model and generation preferences",
         "runtimeHint": "Blank fields inherit workflow and Provider settings. API keys are never exposed or stored here.",
         "provider": "Provider",
+        "presencePenalty": "Presence penalty",
+        "frequencyPenalty": "Frequency penalty",
         "inheritProvider": "Inherit workflow",
         "enabled": "Enabled",
         "visibility": "Visibility",
@@ -1221,7 +1226,56 @@
         "cancel": "Cancel",
         "save": "Save Agent",
         "saving": "Saving…",
-        "saved": "Agent saved"
+        "saved": "Agent saved",
+        "presetImport": {
+          "openButton": "Import generation preset",
+          "title": "Import generation preset",
+          "description": "Preview a SillyTavern generation preset, choose the prompt entries you need, then place them in a reviewable custom Agent draft.",
+          "close": "Close",
+          "cancel": "Cancel",
+          "fileLabel": "Choose a JSON preset",
+          "fileHint": "Supports SillyTavern generation presets with prompts and prompt_order. Continue using card import for world books and character cards.",
+          "safetyTitle": "Import is preview-only and never saves or calls a model",
+          "safetyDescription": "Original system, user, and assistant roles are demoted to ordinary external text. Scripts, regex, injection positions, and macros never execute. The outline, prose, and state pipelines remain locked.",
+          "preview": "Preview preset",
+          "previewing": "Parsing…",
+          "sourceSummary": "The source enables {active} of {total} text entries, totaling {characters} characters.",
+          "isolationTitle": "Compatibility boundary",
+          "isolationSummary": "Isolated {items} script or regex items and found {missing} missing references. None execute or get guessed replacements.",
+          "profileLabel": "Prompt order",
+          "profileOption": "Order {index} · external ID {id}",
+          "none": "none",
+          "capabilityLabel": "Agent capability",
+          "capabilityHint": "Only customizable preview capabilities are available. This cannot take over formal outline, prose, or state writes.",
+          "applyParameters": "Apply compatible generation parameters",
+          "noCompatibleParameters": "No parameters can be applied safely",
+          "unsupportedParameters": "Shown but not applied: {fields}",
+          "unassignedPrompts": "Another {count} entries are absent from this order and will not be included.",
+          "promptListTitle": "Choose prompt entries",
+          "promptListHint": "The list preserves source order exactly. Disabled text can be selected, but markers, empty content, and missing references cannot.",
+          "restoreOriginal": "Restore source selection",
+          "clearSelection": "Clear",
+          "marker": "placeholder marker",
+          "missingReference": "missing reference",
+          "emptyContent": "empty content",
+          "originallyEnabled": "enabled in source",
+          "originallyDisabled": "disabled in source",
+          "sourceRole": "source role {role} (demoted)",
+          "selectionSummary": "{selected} selected · {current}/{maximum} characters",
+          "instructionOverLimit": "The draft has {current} characters, above the {maximum} limit. Deselect some entries.",
+          "chooseAnother": "Choose another file",
+          "useDraft": "Use in Agent draft",
+          "draftName": "{name} preset Agent",
+          "draftDescription": "Imported from SillyTavern generation preset “{name}”; source role hierarchy and extension code are isolated.",
+          "draftReady": "The preset is in a new Agent draft. Review it before saving.",
+          "errors": {
+            "notPreset": "This JSON is not a recognized generation preset. Check that it contains prompts and prompt_order.",
+            "tooLarge": "The preset is larger than the 5 MiB limit. Remove unrelated extensions and try again.",
+            "fileType": "Choose a JSON preset with a .json filename.",
+            "duplicateIdentifier": "The preset contains duplicate prompt identifiers, so order references are ambiguous. Fix it in the source tool first.",
+            "previewFailed": "The preset could not be parsed. It may be damaged or use an unsupported structure."
+          }
+        }
       }
     },
     "novelInfo": {
