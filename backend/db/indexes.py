@@ -565,6 +565,14 @@ async def init_emergent_reference_card_candidate_indexes():
                 ("chapter_id", pymongo.ASCENDING),
                 ("source_mutation_id", pymongo.ASCENDING),
             ]),
+            pymongo.IndexModel(
+                [
+                    ("novel_id", pymongo.ASCENDING),
+                    ("auto_creation.counted", pymongo.ASCENDING),
+                    ("chapter_id", pymongo.ASCENDING),
+                ],
+                name="emergent_reference_cards_auto_creation_count",
+            ),
         ])
         logger.info("Initialized emergent reference-card candidate indexes.")
     except Exception as exc:
