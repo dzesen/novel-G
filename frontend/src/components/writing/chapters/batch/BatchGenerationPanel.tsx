@@ -19,6 +19,8 @@ import StartJobDialog from "./StartJobDialog";
 import ResumeJobDialog, { isResumeReadinessRequired } from "./ResumeJobDialog";
 import CheckpointReview from "./CheckpointReview";
 import LeftoverProseRuns from "./LeftoverProseRuns";
+import type { ReferenceCardType } from "./referenceCardAutoCreation";
+import ReferenceCardAutomationAuditPanel from "./ReferenceCardAutomationAuditPanel";
 
 interface BatchGenerationPanelProps {
   novelId: string;
@@ -32,8 +34,11 @@ interface BatchGenerationPanelProps {
   onJumpToChapter: (chapterId: string) => void;
   onQuietRefresh: () => void;
   onNavigateToMemory: () => void;
-  onNavigateToReferenceCards: () => void;
-  onNavigateToReferenceCardCandidates: () => void;
+  onNavigateToReferenceCards: (
+    cardType?: ReferenceCardType,
+    cardId?: string,
+  ) => void;
+  onNavigateToReferenceCardCandidates: (candidateId?: string) => void;
   onNavigateToPlotThreads: () => void;
   proseRunsRevision: number;
   onOpenProseRun: (run: LeftoverProseRun) => void;
@@ -176,7 +181,7 @@ export default function BatchGenerationPanel({
         targetLabel={selectedVolume?.title ?? ""}
         fillableCount={fillableCount}
         onClose={onStartClose}
-        onNavigateToReferenceCards={onNavigateToReferenceCards}
+        onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
       />
     ) : startScope === "book" ? (
@@ -188,7 +193,7 @@ export default function BatchGenerationPanel({
         targetLabel={t("dialogBookTarget")}
         fillableCount={bookFillableCount}
         onClose={onStartClose}
-        onNavigateToReferenceCards={onNavigateToReferenceCards}
+        onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
       />
     ) : null;
@@ -367,6 +372,16 @@ export default function BatchGenerationPanel({
             </button>
           </div>
         )}
+
+        <ReferenceCardAutomationAuditPanel
+          job={job}
+          titleForChapter={titleForChapter}
+          onJumpToChapter={onJumpToChapter}
+          onNavigateToReferenceCards={onNavigateToReferenceCards}
+          onNavigateToReferenceCardCandidates={
+            onNavigateToReferenceCardCandidates
+          }
+        />
 
         {abortConfirm && (
           <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/25 px-4 py-6">

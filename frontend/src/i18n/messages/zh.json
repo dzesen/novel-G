@@ -2207,6 +2207,33 @@
       "referenceCardAutoDeniedLimit": "本章或全书的自动建卡硬上限已经达到。",
       "referenceCardAutoDeniedChanged": "候选、来源、授权或审计记录在检查期间发生变化，旧授权已拒绝执行。",
       "referenceCardAutoDeniedSafety": "候选未通过完整安全检查，因此不会自动创建。",
+      "referenceCardAuditTitle": "资料自动处理记录",
+      "referenceCardAuditSummary": "最近共 {count} 条可追溯结果，可打开来源、候选、正式资料和授权回执。",
+      "referenceCardAuditOutcome": {
+        "auto_created": "已自动创建",
+        "rewritten_unique_new": "改稿后确认为全新资料",
+        "dependency_removed": "已移除资料依赖",
+        "manual_review_required": "需要人工审核",
+        "reverted": "自动创建已撤销"
+      },
+      "referenceCardAuditDescription": {
+        "auto_created": "完整唯一性闸门已通过，已自动创建 {count} 张正式资料卡。",
+        "rewritten_unique_new": "疑难候选完成改稿，并重新通过完整唯一性闸门。",
+        "dependency_removed": "章纲改稿已移除这项未来资料依赖，没有新建资料卡。",
+        "manual_review_required": "自动流程没有取得可安全落库的唯一结果，候选保留给作者判断。",
+        "reverted": "原自动创建已通过补偿操作撤销，候选和完整审计记录仍然保留。"
+      },
+      "referenceCardAuditOpenSource": "打开来源章节：{chapter}",
+      "referenceCardAuditOpenCandidate": "打开候选（{count} 项）",
+      "referenceCardAuditOpenFormalCard": "打开正式资料卡：{type}",
+      "referenceCardAuditOpenProof": "查看授权与正式变更回执",
+      "referenceCardAuditAuthorization": "授权摘要",
+      "referenceCardAuditReadiness": "作业就绪摘要",
+      "referenceCardAuditAuthorizationRevision": "授权修订号",
+      "referenceCardAuditPolicyRevision": "策略修订版",
+      "referenceCardAuditSourceReceipt": "来源变更回执",
+      "referenceCardAuditMutationReceipt": "正式变更回执",
+      "referenceCardAuditOlderHidden": "查看另外 {count} 条较早记录",
       "resumeAutoCardRecovery": "恢复同一自动建卡变更",
       "uncertainDetail": "重试会使用新的 attempt，Provider 可能对上一次和本次都计费；跳过会把作业置为失败，供你先检查和补写当前章节。",
       "failedTitle": "本次作业尝试失败",
@@ -2470,7 +2497,7 @@
       "candidateReview": {
         "tab": "待审核",
         "title": "新资料卡候选",
-        "description": "章纲发现了故事推进中新出现的重要人物或设定。这里不会自动建卡，也不会根据名称猜测内部 ID；请逐条决定后再应用。",
+        "description": "章纲发现了故事推进中新出现的重要人物或设定。未绑定自动处理授权时仍由你逐条决定；系统永远不会根据名称猜测内部 ID。",
         "pendingCount": "待决定 {count} 条",
         "blockingCount": "其中 {count} 条会阻止下一章",
         "loading": "正在读取候选与现有资料卡…",
@@ -2492,6 +2519,22 @@
           "superseded": "已被后续候选替代"
         },
         "resolvedReadOnly": "这条候选仍保留为审计记录，但已经退出待审核队列，不能再次应用决定。",
+        "automationAudit": {
+          "outcome": {
+            "auto_created": "已自动创建",
+            "reverted": "自动创建已撤销"
+          },
+          "description": {
+            "auto_created": "候选通过完整唯一性闸门后成为正式资料卡。",
+            "reverted": "补偿操作已撤销正式卡，候选和全部回执仍保留。"
+          },
+          "openProof": "查看授权与正式变更回执",
+          "cardId": "正式资料卡 ID",
+          "authorization": "授权摘要",
+          "sourceJob": "来源作业",
+          "sourceReceipt": "来源变更回执",
+          "mutationReceipt": "正式变更回执"
+        },
         "noDescription": "章纲只确认了名称，暂无更多事实。",
         "decisionLabel": "本条处理方式",
         "decisionFor": "处理候选“{name}”",

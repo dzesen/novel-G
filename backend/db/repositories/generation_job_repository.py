@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 from uuid import uuid4
 
+from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.results import BulkWriteResult
@@ -1623,6 +1624,11 @@ class GenerationJobRepository:
         event_id = str(normalized_event.get("event_id") or "")
         outcome = str(normalized_event.get("outcome") or "")
         created_count = normalized_event.get("created_count")
+        authorization_digest = str(
+            normalized_event.get("authorization_digest") or ""
+        )
+        readiness_digest = str(normalized_event.get("readiness_digest") or "")
+        authorization_revision = normalized_event.get("authorization_revision")
         if (
             not normalized_chapter_id
             or normalized_event.get("schema_version")
@@ -1635,6 +1641,16 @@ class GenerationJobRepository:
             not in {"auto_created", "manual_review_required", "not_applicable"}
             or type(created_count) is not int
             or created_count < 0
+            or len(authorization_digest) != 64
+            or len(readiness_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in authorization_digest + readiness_digest
+            )
+            or type(authorization_revision) is not int
+            or authorization_revision < 1
+            or normalized_event.get("policy_revision")
+            != 1
             or type(expected_revision) is not int
             or type(next_revision) is not int
             or expected_revision < 0
@@ -1705,6 +1721,14 @@ class GenerationJobRepository:
         outcome = str(normalized_event.get("outcome") or "")
         resolution = normalized_event.get("resolution")
         cycle = normalized_event.get("cycle")
+        created_candidate_ids = list(
+            normalized_event.get("created_reference_card_candidate_ids") or []
+        )
+        authorization_digest = str(
+            normalized_event.get("authorization_digest") or ""
+        )
+        readiness_digest = str(normalized_event.get("readiness_digest") or "")
+        authorization_revision = normalized_event.get("authorization_revision")
         valid_transition = (
             next_revision == expected_revision + 1
             if outcome == "applied"
@@ -1721,6 +1745,7 @@ class GenerationJobRepository:
             or outcome not in {"applied", "exhausted", "uncertain"}
             or (
                 resolution not in {
+                    None,
                     "rewritten_unique_new",
                     "dependency_removed",
                 }
@@ -1730,10 +1755,37 @@ class GenerationJobRepository:
             or type(cycle) is not int
             or cycle < 1
             or cycle > 2
+            or len(authorization_digest) != 64
+            or len(readiness_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in authorization_digest + readiness_digest
+            )
+            or type(authorization_revision) is not int
+            or authorization_revision < 1
+            or normalized_event.get("policy_revision")
+            != 1
             or type(expected_revision) is not int
             or type(next_revision) is not int
             or expected_revision < 0
             or not valid_transition
+            or len(created_candidate_ids) != len(set(created_candidate_ids))
+            or any(
+                not isinstance(candidate_id, str)
+                or not ObjectId.is_valid(candidate_id)
+                for candidate_id in created_candidate_ids
+            )
+            or (
+                outcome == "applied"
+                and resolution in {None, "rewritten_unique_new"}
+                and not created_candidate_ids
+            )
+            or (
+                outcome == "applied"
+                and resolution == "dependency_removed"
+                and bool(created_candidate_ids)
+            )
+            or (outcome != "applied" and bool(created_candidate_ids))
         ):
             raise CandidatePipelineCheckpointConflict(
                 "Reference-card repair event is invalid"
@@ -1779,6 +1831,67 @@ class GenerationJobRepository:
             return True
         raise CandidatePipelineCheckpointConflict(
             "Reference-card repair cursor changed"
+        )
+
+    async def finalize_reference_card_repair_resolution(
+        self,
+        job_id: str,
+        *,
+        event_id: str,
+        resolution: str,
+    ) -> bool:
+        """Publish a repaired candidate as unique only after its full Gate."""
+
+        normalized_event_id = str(event_id or "")
+        if (
+            not normalized_event_id
+            or len(normalized_event_id) > 200
+            or resolution != "rewritten_unique_new"
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Reference-card repair resolution is invalid"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "reference_card_repair_events": {
+                    "$elemMatch": {
+                        "event_id": normalized_event_id,
+                        "outcome": "applied",
+                        "resolution": None,
+                    }
+                },
+            },
+            {
+                "$set": {
+                    "reference_card_repair_events.$.resolution": resolution,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        matching_events = [
+            item
+            for item in list(current.get("reference_card_repair_events") or [])
+            if isinstance(item, Mapping)
+            and str(item.get("event_id") or "") == normalized_event_id
+        ]
+        if (
+            len(matching_events) == 1
+            and matching_events[0].get("outcome") == "applied"
+            and matching_events[0].get("resolution") == resolution
+            and bool(
+                matching_events[0].get(
+                    "created_reference_card_candidate_ids"
+                )
+            )
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Reference-card repair resolution changed"
         )
 
     async def bind_job_mutation_recovery(

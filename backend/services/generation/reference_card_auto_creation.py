@@ -33,11 +33,11 @@ from backend.db.utils import get_utc_now, to_object_id
 from backend.services.novel.reference_card_curation import (
     FUZZY_MATCH_THRESHOLD,
     normalize_card_name,
+    parse_reference_card_candidate_source,
     validate_reference_card_candidate,
 )
 from backend.services.novel.reference_card_service import (
     get_card_repository,
-    validate_card_type,
 )
 
 
@@ -283,6 +283,100 @@ def reference_card_content_digest(document: Mapping[str, Any]) -> str:
     })
 
 
+def reference_card_projection_digest(projection: Mapping[str, Any]) -> str:
+    """Digest the exact candidate projection frozen by the creation Gate."""
+
+    return _digest(dict(projection))
+
+
+def _completed_source_narrative_revision(
+    journal: Mapping[str, Any],
+) -> int | None:
+    """Return a source receipt only when its revision transition is coherent."""
+
+    revision = (
+        (journal.get("receipts") or {})
+        .get("narrative_revision", {})
+        .get("revision")
+    )
+    if type(revision) is not int or revision < 1:
+        return None
+    command = journal.get("command")
+    expected = (
+        command.get("expected_narrative_revision")
+        if isinstance(command, Mapping)
+        else None
+    )
+    if expected is not None and (
+        type(expected) is not int
+        or expected < 0
+        or revision != expected + 1
+    ):
+        return None
+    return revision
+
+
+def _source_authorized_for_job(
+    *,
+    source_journal: Mapping[str, Any],
+    source_payload: Mapping[str, Any],
+    authorization: ReferenceCardCreationAuthorizationV1,
+    job_id: str,
+    chapter_id: str,
+    readiness_digest: str,
+) -> bool:
+    """Bind a current-Job source or an immutable source present at readiness."""
+
+    if str(source_payload.get("chapter_id") or "") != chapter_id:
+        return False
+    source_operation = str(source_journal.get("operation") or "")
+    if source_operation == "accept_chapter_outline":
+        binding = source_payload.get("job_mutation_binding")
+        bound_to_current_job = (
+            isinstance(binding, Mapping)
+            and str(binding.get("schema_version") or "")
+            == "job_mutation_recovery_binding.v1"
+            and str(binding.get("novel_id") or "") == authorization.novel_id
+            and str(binding.get("job_id") or "") == job_id
+            and str(binding.get("chapter_id") or "") == chapter_id
+            and str(binding.get("readiness_digest") or "") == readiness_digest
+            and binding.get("authorization_revision")
+            == authorization.authorization_revision
+            and str(binding.get("operation") or "")
+            == "accept_chapter_outline"
+            and str(binding.get("idempotency_key") or "")
+            == str(source_journal.get("idempotency_key") or "")
+        )
+        source_revision = _completed_source_narrative_revision(source_journal)
+        present_at_readiness = (
+            source_revision is not None
+            and source_revision <= authorization.baseline_narrative_revision
+        )
+        return bound_to_current_job or present_at_readiness
+    if source_operation != "apply_reference_dependency_repair":
+        return False
+    try:
+        repair_authorization = parse_reference_card_creation_authorization(
+            source_payload.get("authorization")
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        repair_authorization == authorization
+        and str(source_payload.get("novel_id") or "")
+        == authorization.novel_id
+        and str(source_payload.get("job_id") or "") == job_id
+        and str(source_payload.get("readiness_digest") or "")
+        == readiness_digest
+        and source_payload.get("authorization_revision")
+        == authorization.authorization_revision
+        and type(source_payload.get("cycle")) is int
+        and 1
+        <= source_payload["cycle"]
+        <= authorization.max_candidate_repair_cycles_per_chapter
+    )
+
+
 def parse_reference_card_creation_authorization(
     value: Mapping[str, Any],
 ) -> ReferenceCardCreationAuthorizationV1:
@@ -369,24 +463,6 @@ def _candidate_projection(card_type: str, value: Mapping[str, Any]) -> dict[str,
     return validate_reference_card_candidate(card_type, projected)
 
 
-def _source_candidate_parts(raw: Mapping[str, Any]) -> tuple[
-    str,
-    bool,
-    str,
-    dict[str, Any],
-]:
-    value = deepcopy(dict(raw))
-    card_type = validate_card_type(str(value.pop("card_type", "")))
-    blocking = bool(value.pop("requires_review_before_next_chapter", False))
-    evidence_summary = str(value.pop("evidence_summary", "") or "").strip()
-    return (
-        card_type,
-        blocking,
-        evidence_summary,
-        _candidate_projection(card_type, value),
-    )
-
-
 def _candidate_source_snapshot(document: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "candidate_id": str(document.get("_id") or ""),
@@ -403,6 +479,59 @@ def _candidate_source_snapshot(document: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "evidence": deepcopy(document.get("evidence") or {}),
         "reserved_card_id": str(document.get("reserved_card_id") or ""),
+    }
+
+
+def reference_card_source_candidate_evidence(
+    *,
+    source_entry: Mapping[str, Any],
+    source_payload: Mapping[str, Any],
+    candidate_document: Mapping[str, Any],
+    novel_id: str,
+    chapter_id: str,
+    source_mutation_id: str,
+) -> dict[str, Any]:
+    """Rebuild the exact immutable source projection and its three digests."""
+
+    candidate_id = str(source_entry.get("candidate_id") or "")
+    reserved_card_id = str(source_entry.get("reserved_card_id") or "")
+    raw_candidate = source_entry.get("candidate")
+    if (
+        not ObjectId.is_valid(candidate_id)
+        or not ObjectId.is_valid(reserved_card_id)
+        or not isinstance(raw_candidate, Mapping)
+    ):
+        raise ValueError("reference-card source candidate identity is invalid")
+    card_type, blocking, evidence_summary, projection = (
+        parse_reference_card_candidate_source(raw_candidate)
+    )
+    expected_snapshot = {
+        "candidate_id": candidate_id,
+        "novel_id": str(novel_id),
+        "volume_id": str(source_payload.get("volume_id") or ""),
+        "chapter_id": str(chapter_id),
+        "chapter_order": int(source_payload.get("chapter_order") or 0),
+        "source_kind": "chapter_outline",
+        "source_mutation_id": str(source_mutation_id),
+        "card_type": card_type,
+        "candidate_data": projection,
+        "requires_review_before_next_chapter": blocking,
+        "evidence": {
+            "summary": evidence_summary,
+            "chapter_id": str(chapter_id),
+            "chapter_order": int(source_payload.get("chapter_order") or 0),
+            "chapter_title": str(source_payload.get("chapter_title") or ""),
+            "source_kind": "chapter_outline",
+        },
+        "reserved_card_id": reserved_card_id,
+    }
+    if _candidate_source_snapshot(candidate_document) != expected_snapshot:
+        raise ValueError("reference-card persisted source projection changed")
+    return {
+        **expected_snapshot,
+        "source_snapshot_digest": _digest(expected_snapshot),
+        "source_candidate_digest": _digest(source_entry),
+        "projection_digest": _digest(projection),
     }
 
 
@@ -566,48 +695,13 @@ class AutoReferenceCardCreationService:
             return [], [self._source_denial("source_changed")], ""
         source_command = dict(source_journal.get("command") or {})
         source_payload = dict(source_command.get("payload") or {})
-        source_operation = str(source_journal.get("operation") or "")
-        if source_operation == "accept_chapter_outline":
-            binding = source_payload.get("job_mutation_binding")
-            source_authorized = (
-                isinstance(binding, Mapping)
-                and str(binding.get("schema_version") or "")
-                == "job_mutation_recovery_binding.v1"
-                and str(binding.get("novel_id") or "") == authorization.novel_id
-                and str(binding.get("job_id") or "") == job_id
-                and str(binding.get("chapter_id") or "") == chapter_id
-                and str(binding.get("readiness_digest") or "") == readiness_digest
-                and binding.get("authorization_revision")
-                == authorization.authorization_revision
-                and str(binding.get("operation") or "")
-                == "accept_chapter_outline"
-                and str(binding.get("idempotency_key") or "")
-                == source_mutation_id
-            )
-        else:
-            try:
-                repair_authorization = parse_reference_card_creation_authorization(
-                    source_payload.get("authorization")
-                )
-            except (TypeError, ValueError):
-                repair_authorization = None
-            source_authorized = (
-                repair_authorization == authorization
-                and str(source_payload.get("novel_id") or "")
-                == authorization.novel_id
-                and str(source_payload.get("job_id") or "") == job_id
-                and str(source_payload.get("readiness_digest") or "")
-                == readiness_digest
-                and source_payload.get("authorization_revision")
-                == authorization.authorization_revision
-                and type(source_payload.get("cycle")) is int
-                and 1
-                <= source_payload["cycle"]
-                <= authorization.max_candidate_repair_cycles_per_chapter
-            )
-        if (
-            not source_authorized
-            or str(source_payload.get("chapter_id") or "") != chapter_id
+        if not _source_authorized_for_job(
+            source_journal=source_journal,
+            source_payload=source_payload,
+            authorization=authorization,
+            job_id=job_id,
+            chapter_id=chapter_id,
+            readiness_digest=readiness_digest,
         ):
             return [], [self._source_denial("source_changed")], ""
         source_digest = str(source_journal.get("command_digest") or "")
@@ -622,6 +716,12 @@ class AutoReferenceCardCreationService:
         raw_candidates = source_payload.get("reference_card_candidates")
         if not isinstance(raw_candidates, list):
             return [], [self._source_denial("source_changed")], source_digest
+        source_candidate_receipts = {
+            str(receipt.get("candidate_id") or "")
+            for key, receipt in dict(source_journal.get("receipts") or {}).items()
+            if str(key).startswith("reference_card_candidate_")
+            and isinstance(receipt, Mapping)
+        }
         candidate_collection = database[
             collections.EMERGENT_REFERENCE_CARD_CANDIDATES
         ]
@@ -641,12 +741,9 @@ class AutoReferenceCardCreationService:
                 denials.append(self._source_denial("source_changed"))
                 continue
             candidate_id = str(raw_entry.get("candidate_id") or "")
-            reserved_card_id = str(raw_entry.get("reserved_card_id") or "")
-            raw_candidate = raw_entry.get("candidate")
             if (
                 not ObjectId.is_valid(candidate_id)
-                or not ObjectId.is_valid(reserved_card_id)
-                or not isinstance(raw_candidate, Mapping)
+                or candidate_id not in source_candidate_receipts
             ):
                 denials.append(
                     self._source_denial(
@@ -654,20 +751,6 @@ class AutoReferenceCardCreationService:
                         candidate_id=candidate_id,
                     )
                 )
-                continue
-            try:
-                card_type, blocking, evidence_summary, projection = (
-                    _source_candidate_parts(raw_candidate)
-                )
-            except (TypeError, ValueError):
-                denials.append(
-                    self._source_denial(
-                        "candidate_changed",
-                        candidate_id=candidate_id,
-                    )
-                )
-                continue
-            if not blocking:
                 continue
             document = by_id.get(candidate_id)
             if document is None:
@@ -677,6 +760,27 @@ class AutoReferenceCardCreationService:
                         candidate_id=candidate_id,
                     )
                 )
+                continue
+            try:
+                frozen_candidate = reference_card_source_candidate_evidence(
+                    source_entry=raw_entry,
+                    source_payload=source_payload,
+                    candidate_document=document,
+                    novel_id=authorization.novel_id,
+                    chapter_id=chapter_id,
+                    source_mutation_id=source_mutation_id,
+                )
+            except (TypeError, ValueError):
+                denials.append(
+                    self._source_denial(
+                        "candidate_changed",
+                        candidate_id=candidate_id,
+                    )
+                )
+                continue
+            if not frozen_candidate[
+                "requires_review_before_next_chapter"
+            ]:
                 continue
             status = str(document.get("status") or "")
             decision = dict(document.get("decision") or {})
@@ -698,43 +802,7 @@ class AutoReferenceCardCreationService:
                     )
                 )
                 continue
-            expected_evidence = {
-                "summary": evidence_summary,
-                "chapter_id": chapter_id,
-                "chapter_order": int(source_payload.get("chapter_order") or 0),
-                "chapter_title": str(source_payload.get("chapter_title") or ""),
-                "source_kind": "chapter_outline",
-            }
-            expected_snapshot = {
-                "candidate_id": candidate_id,
-                "novel_id": authorization.novel_id,
-                "volume_id": str(source_payload.get("volume_id") or ""),
-                "chapter_id": chapter_id,
-                "chapter_order": int(source_payload.get("chapter_order") or 0),
-                "source_kind": "chapter_outline",
-                "source_mutation_id": source_mutation_id,
-                "card_type": card_type,
-                "candidate_data": projection,
-                "requires_review_before_next_chapter": True,
-                "evidence": expected_evidence,
-                "reserved_card_id": reserved_card_id,
-            }
-            if _candidate_source_snapshot(document) != expected_snapshot:
-                denials.append(
-                    self._source_denial(
-                        "candidate_changed",
-                        candidate_id=candidate_id,
-                    )
-                )
-                continue
-            frozen.append(
-                {
-                    **expected_snapshot,
-                    "source_snapshot_digest": _digest(expected_snapshot),
-                    "source_candidate_digest": _digest(raw_entry),
-                    "projection_digest": _digest(projection),
-                }
-            )
+            frozen.append(frozen_candidate)
         frozen.sort(key=lambda item: item["candidate_id"])
         return frozen, denials, source_digest
 
@@ -859,7 +927,10 @@ class AutoReferenceCardCreationService:
         if source_journal is None:
             denials.append(self._source_denial("source_changed"))
             source_entries_by_id: dict[str, Mapping[str, Any]] = {}
+            source_candidate_receipts: set[str] = set()
+            source_operation = ""
         else:
+            source_operation = str(source_journal.get("operation") or "")
             try:
                 actual_source_digest = MutationCommand.from_journal(
                     source_journal
@@ -876,12 +947,30 @@ class AutoReferenceCardCreationService:
             ):
                 denials.append(self._source_denial("source_changed"))
                 source_entries_by_id = {}
+                source_candidate_receipts = set()
             else:
                 source_entries_by_id = {
                     str(entry.get("candidate_id") or ""): entry
                     for entry in raw_source_entries
                     if isinstance(entry, Mapping)
                 }
+                source_candidate_receipts = {
+                    str(receipt.get("candidate_id") or "")
+                    for key, receipt in dict(
+                        source_journal.get("receipts") or {}
+                    ).items()
+                    if str(key).startswith("reference_card_candidate_")
+                    and isinstance(receipt, Mapping)
+                }
+                if not _source_authorized_for_job(
+                    source_journal=source_journal,
+                    source_payload=source_payload,
+                    authorization=authorization,
+                    job_id=str(command["job_id"]),
+                    chapter_id=chapter_id,
+                    readiness_digest=str(command["readiness_digest"]),
+                ):
+                    denials.append(self._source_denial("source_changed"))
 
         if (
             authorization.owner_id != str(command.get("owner_id") or "")
@@ -923,6 +1012,7 @@ class AutoReferenceCardCreationService:
                 source_entry is None
                 or _digest(source_entry)
                 != str(frozen.get("source_candidate_digest") or "")
+                or candidate_id not in source_candidate_receipts
             ):
                 denials.append(
                     self._source_denial("source_changed", candidate_id=candidate_id)
@@ -1045,6 +1135,61 @@ class AutoReferenceCardCreationService:
             },
             session=session,
         ).to_list(length=None)
+        repair_predecessors: list[dict[str, Any]] = []
+        if source_operation == "apply_reference_dependency_repair":
+            frontier = {str(command["source_mutation_id"])}
+            seen_mutation_ids: set[str] = set()
+            seen_candidate_ids: set[str] = set()
+            lineage_invalid = False
+            for _depth in range(MAX_CANDIDATE_REPAIR_CYCLES_PER_CHAPTER):
+                frontier -= seen_mutation_ids
+                if not frontier:
+                    break
+                seen_mutation_ids.update(frontier)
+                predecessors = await candidate_collection.find(
+                    {
+                        "novel_id": to_object_id(novel_id),
+                        "chapter_id": to_object_id(chapter_id),
+                        "status": "superseded",
+                        "superseded_by_source_mutation_id": {
+                            "$in": sorted(frontier)
+                        },
+                        "is_deleted": False,
+                    },
+                    session=session,
+                ).to_list(length=101)
+                if len(predecessors) > 100:
+                    lineage_invalid = True
+                    break
+                next_frontier: set[str] = set()
+                for predecessor in predecessors:
+                    candidate_id = str(predecessor.get("_id") or "")
+                    if candidate_id and candidate_id not in seen_candidate_ids:
+                        repair_predecessors.append(predecessor)
+                        seen_candidate_ids.add(candidate_id)
+                    source_mutation_id = str(
+                        predecessor.get("source_mutation_id") or ""
+                    )
+                    if source_mutation_id:
+                        next_frontier.add(source_mutation_id)
+                frontier = next_frontier
+            remaining_frontier = frontier - seen_mutation_ids
+            if not lineage_invalid and remaining_frontier:
+                overflow = await candidate_collection.find_one(
+                    {
+                        "novel_id": to_object_id(novel_id),
+                        "chapter_id": to_object_id(chapter_id),
+                        "status": "superseded",
+                        "superseded_by_source_mutation_id": {
+                            "$in": sorted(remaining_frontier)
+                        },
+                        "is_deleted": False,
+                    },
+                    session=session,
+                )
+                lineage_invalid = overflow is not None
+            if lineage_invalid:
+                denials.append(self._source_denial("source_changed"))
         pending_records = [
             {
                 "kind": "candidate",
@@ -1055,7 +1200,7 @@ class AutoReferenceCardCreationService:
                 "keys": _identity_keys(document.get("candidate_data") or {}),
                 "source": document,
             }
-            for document in other_documents
+            for document in (*other_documents, *repair_predecessors)
         ]
 
         def add_denial(
@@ -1290,6 +1435,24 @@ class AutoReferenceCardCreationService:
                 "job_id": command["job_id"],
             },
         )
+        if not mutation.was_received("event_clock"):
+            occurred_at = get_utc_now()
+            occurred_at = occurred_at.replace(
+                microsecond=(occurred_at.microsecond // 1000) * 1000
+            )
+            await mutation.receipt(
+                "event_clock",
+                {"occurred_at": occurred_at},
+            )
+        occurred_at = (
+            (mutation.journal.get("receipts") or {})
+            .get("event_clock", {})
+            .get("occurred_at")
+        )
+        if not isinstance(occurred_at, datetime):
+            raise MutationConflictError(
+                "Reference-card auto-creation event clock is invalid"
+            )
         candidate_collection = get_database()[
             collections.EMERGENT_REFERENCE_CARD_CANDIDATES
         ]
@@ -1428,6 +1591,7 @@ class AutoReferenceCardCreationService:
                 "candidate_id": candidate_id,
                 "action": "auto_create_unique",
                 "card_id": card_id,
+                "card_type": str(frozen["card_type"]),
                 "projection_digest": frozen["projection_digest"],
                 "formal_card_content_digest": formal_card_content_digest,
             }
@@ -1442,7 +1606,59 @@ class AutoReferenceCardCreationService:
             "limit_usage": gate["limit_usage"],
             "next_narrative_revision": revision,
             "source_mutation_id": command["source_mutation_id"],
+            "mutation_idempotency_key": command["mutation_idempotency_key"],
+            "occurred_at": occurred_at,
         }
+
+    async def recover_applied_chapter(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        job_id: str,
+        chapter_id: str,
+        readiness_digest: str,
+        authorization_revision: int,
+        expected_narrative_revision: int,
+        authorization: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Replay one committed Gate whose Job event/cursor was not persisted."""
+
+        parsed = parse_reference_card_creation_authorization(authorization)
+        recovered_candidate = await get_database()[
+            collections.EMERGENT_REFERENCE_CARD_CANDIDATES
+        ].find_one({
+            "novel_id": to_object_id(parsed.novel_id),
+            "chapter_id": to_object_id(chapter_id),
+            "status": "resolved",
+            "requires_review_before_next_chapter": True,
+            "decision.action": "auto_create_unique",
+            "decision.job_id": str(job_id),
+            "decision.authorization_digest": parsed.authorization_digest,
+            "is_deleted": False,
+        })
+        if recovered_candidate is None:
+            return None
+        result = await self.apply_chapter(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            job_id=job_id,
+            chapter_id=chapter_id,
+            readiness_digest=readiness_digest,
+            authorization_revision=authorization_revision,
+            expected_narrative_revision=expected_narrative_revision,
+            authorization=authorization,
+        )
+        if (
+            str(result.get("status") or "") != "created"
+            or result.get("next_narrative_revision")
+            != expected_narrative_revision + 1
+            or not str(result.get("mutation_idempotency_key") or "")
+        ):
+            raise AutoReferenceCardCreationRecoveryBlocked(
+                "Committed reference-card Gate recovery changed"
+            )
+        return result
 
     async def apply_chapter(
         self,
@@ -1592,9 +1808,13 @@ class AutoReferenceCardCreationService:
             )
         })
         try:
-            return await engine.execute(command)
+            result = await engine.execute(command)
         except AutoReferenceCardCreationPolicyDenied as exc:
-            return deepcopy(exc.result)
+            result = deepcopy(exc.result)
+        return {
+            **result,
+            "mutation_idempotency_key": auto_mutation_key,
+        }
 
 
 auto_reference_card_creation_service = AutoReferenceCardCreationService()

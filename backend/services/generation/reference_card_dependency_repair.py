@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Annotated, Any, Literal
 
 from bson import ObjectId
@@ -61,7 +62,10 @@ from backend.services.novel.emergent_reference_card_candidates import (
     emergent_reference_card_candidate_module,
 )
 from backend.services.novel.outline_validation import validate_outline_ids
-from backend.services.novel.reference_card_curation import normalize_card_name
+from backend.services.novel.reference_card_curation import (
+    FUZZY_MATCH_THRESHOLD,
+    normalize_card_name,
+)
 from backend.services.llm.context_builder import fetch_roster
 
 
@@ -415,7 +419,7 @@ def _source_outline_result(snapshot: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _safe_denial_evidence(denials: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Project Gate evidence without leaking any matched formal-card identity."""
+    """Project Gate evidence without leaking identities or non-formal ids."""
 
     by_candidate: dict[str, set[str]] = {}
     for denial in denials[:100]:
@@ -424,9 +428,22 @@ def _safe_denial_evidence(denials: Sequence[Mapping[str, Any]]) -> list[dict[str
         if candidate_id and reason in REFERENCE_CARD_REPAIRABLE_DENIAL_REASONS:
             by_candidate.setdefault(candidate_id, set()).add(reason)
     return [
-        {"candidate_id": candidate_id, "reason_codes": sorted(reasons)}
-        for candidate_id, reasons in sorted(by_candidate.items())
+        {"denial_slot": index, "reason_codes": sorted(reasons)}
+        for index, (_candidate_id, reasons) in enumerate(
+            sorted(by_candidate.items()),
+            start=1,
+        )
     ]
+
+
+def _prompt_source_outline(source_outline: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only the accepted outline, never candidate-card material."""
+
+    projected = deepcopy(dict(source_outline))
+    projected["new_reference_card_candidates"] = []
+    return ChapterOutlineResultSchema.model_validate(projected).model_dump(
+        mode="json"
+    )
 
 
 def reference_card_denials_are_repairable(
@@ -452,7 +469,7 @@ def _build_prompts(
 ) -> PromptPlan:
     task = {
         "repair_cycle": cycle,
-        "source_outline": source_outline,
+        "source_outline": _prompt_source_outline(source_outline),
         "gate_denials": list(safe_denials),
     }
     base = """You are repairing one accepted chapter-outline proposal after its new reference-card dependencies failed a deterministic uniqueness Gate.
@@ -582,7 +599,13 @@ def validate_reference_card_repair_proposal(
     for candidate in proposed_candidates:
         if not candidate["requires_review_before_next_chapter"]:
             raise ValueError("reference-card repair tried to bypass candidate review")
-        if _identity_values(candidate) & source_identities:
+        proposed_identities = _identity_values(candidate)
+        if proposed_identities & source_identities or any(
+            SequenceMatcher(None, proposed_identity, source_identity).ratio()
+            >= FUZZY_MATCH_THRESHOLD
+            for proposed_identity in proposed_identities
+            for source_identity in source_identities
+        ):
             raise ValueError("reference-card repair candidate identity did not change")
     narrative_text = _story_text({
         "scenes": result["scenes"],
@@ -810,6 +833,7 @@ class ReferenceCardDependencyRepairService:
             "created_reference_card_candidate_ids": created_ids,
             "source_mutation_id": mutation.journal["idempotency_key"],
             "next_narrative_revision": revision,
+            "occurred_at": command["generated_at"],
         }
 
     async def _apply_proposal(
@@ -902,6 +926,7 @@ class ReferenceCardDependencyRepairService:
         job_id: str,
         chapter_id: str,
         readiness_digest: str,
+        expected_narrative_revision: int,
         cycle: int,
         authorization: ReferenceCardCreationAuthorizationV1,
         receipt: Mapping[str, Any],
@@ -932,6 +957,8 @@ class ReferenceCardDependencyRepairService:
             or str(payload.get("job_id") or "") != job_id
             or str(payload.get("chapter_id") or "") != chapter_id
             or str(payload.get("readiness_digest") or "") != readiness_digest
+            or command.expected_narrative_revision
+            != expected_narrative_revision
             or payload.get("cycle") != cycle
             or payload.get("authorization")
             != authorization.model_dump(mode="json")
@@ -952,6 +979,90 @@ class ReferenceCardDependencyRepairService:
             )
         }).execute(command)
 
+    @staticmethod
+    def _authorized_identity(
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        readiness: Mapping[str, Any],
+        cycle: int,
+    ) -> tuple[
+        Mapping[str, Any],
+        ReferenceCardCreationAuthorizationV1,
+        str,
+    ]:
+        planning = readiness.get("planning")
+        if not isinstance(planning, Mapping):
+            raise ValueError("reference-card repair readiness planning is invalid")
+        authorization = parse_reference_card_creation_authorization(
+            planning.get("reference_card_creation_authorization")
+        )
+        readiness_digest = str(readiness.get("digest") or "")
+        if (
+            authorization.owner_id != owner_id
+            or authorization.novel_id != novel_id
+            or chapter_id not in authorization.chapter_ids
+            or cycle < 1
+            or cycle > authorization.max_candidate_repair_cycles_per_chapter
+            or authorization.repair_tool_whitelist != (REPAIR_TOOL,)
+            or len(readiness_digest) != 64
+        ):
+            raise ValueError("reference-card repair authority changed")
+        return planning, authorization, readiness_digest
+
+    async def recover_applied_cycle(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        job_id: str,
+        chapter_id: str,
+        readiness: Mapping[str, Any],
+        expected_narrative_revision: int,
+        cycle: int,
+    ) -> dict[str, Any] | None:
+        """Recover a durable repair mutation before consulting live blockers."""
+
+        _planning, authorization, readiness_digest = self._authorized_identity(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            readiness=readiness,
+            cycle=cycle,
+        )
+        receipt = await self._deps.receipts.find_identity(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            job_id=job_id,
+            chapter_id=chapter_id,
+            cycle=cycle,
+            authorization_digest=authorization.authorization_digest,
+        )
+        if receipt is None or str(receipt.get("state") or "") != "completed":
+            return None
+        recovered = await self._recover_persisted_mutation(
+            novel_id=novel_id,
+            job_id=job_id,
+            chapter_id=chapter_id,
+            readiness_digest=readiness_digest,
+            expected_narrative_revision=expected_narrative_revision,
+            cycle=cycle,
+            authorization=authorization,
+            receipt=receipt,
+        )
+        if recovered is None:
+            return None
+        if (
+            str(recovered.get("status") or "") != "applied"
+            or recovered.get("next_narrative_revision")
+            != expected_narrative_revision + 1
+        ):
+            raise MutationConflictError(
+                "Reference-card repair recovery result changed"
+            )
+        return recovered
+
     async def repair_cycle(
         self,
         *,
@@ -967,25 +1078,19 @@ class ReferenceCardDependencyRepairService:
         attempt_scope_factory: Any,
         finish_attempt_reservation: Any,
     ) -> dict[str, Any]:
-        planning = readiness.get("planning")
-        if not isinstance(planning, Mapping):
-            raise ValueError("reference-card repair readiness planning is invalid")
-        authorization = parse_reference_card_creation_authorization(
-            planning.get("reference_card_creation_authorization")
+        planning, authorization, readiness_digest = self._authorized_identity(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            readiness=readiness,
+            cycle=cycle,
         )
         plan_authorization = parse_reference_card_repair_plan_authorization(
             planning.get("reference_card_repair_plan_authorization")
         )
-        readiness_digest = str(readiness.get("digest") or "")
         if (
-            authorization.owner_id != owner_id
-            or authorization.novel_id != novel_id
-            or chapter_id not in authorization.chapter_ids
-            or authorization.max_candidate_repair_cycles_per_chapter
+            authorization.max_candidate_repair_cycles_per_chapter
             != plan_authorization.max_cycles_per_chapter
-            or cycle < 1
-            or cycle > authorization.max_candidate_repair_cycles_per_chapter
-            or authorization.repair_tool_whitelist != (REPAIR_TOOL,)
             or tuple(
                 item.model_dump(mode="json")
                 for item in plan_authorization.provider_bounds
@@ -1000,7 +1105,6 @@ class ReferenceCardDependencyRepairService:
             != plan_authorization.maximum_tokens_total
             or plan_authorization.generation_params_digest
             != _public_generation_params_digest(generation_params)
-            or len(readiness_digest) != 64
         ):
             raise ValueError("reference-card repair authority changed")
         if not reference_card_denials_are_repairable(denials):
@@ -1027,6 +1131,7 @@ class ReferenceCardDependencyRepairService:
                     job_id=job_id,
                     chapter_id=chapter_id,
                     readiness_digest=readiness_digest,
+                    expected_narrative_revision=expected_narrative_revision,
                     cycle=cycle,
                     authorization=authorization,
                     receipt=existing_receipt,

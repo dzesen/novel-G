@@ -15,6 +15,7 @@ import {
   DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY,
   type ReferenceCardType,
 } from "./referenceCardAutoCreation";
+import { referenceCardTypeTranslationKey } from "./referenceCardAutoCreationPresentation";
 import {
   DEFAULT_PROSE_CONTINUATION_POLICY,
   parsePositiveInteger,
@@ -26,12 +27,12 @@ import type {
   GenerationJob,
   GenerationReadiness,
   OutlineDeviationPolicy,
-  ReadinessIssue,
 } from "./batchTypes";
 import {
   buildAuthorizedStartPayload,
   readinessAllowsStart,
 } from "./readinessPresentation";
+import { readinessIssueCopy } from "./readinessIssuePresentation";
 
 interface StartJobDialogProps {
   scope: "volume" | "book";
@@ -143,161 +144,8 @@ export default function StartJobDialog({
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [onClose, submitting]);
 
-  const referenceCardTypeLabel = (cardType: ReferenceCardType) => {
-    switch (cardType) {
-      case "character": return t("dialogAutoCardsTypeCharacter");
-      case "location": return t("dialogAutoCardsTypeLocation");
-      case "item": return t("dialogAutoCardsTypeItem");
-      case "rule": return t("dialogAutoCardsTypeRule");
-      case "lore": return t("dialogAutoCardsTypeLore");
-    }
-  };
-
-  const issueCopy = (issue: ReadinessIssue) => {
-    switch (issue.code) {
-      case "character_cards_missing":
-        return {
-          title: t("readinessIssueCharacterCardsMissingTitle"),
-          body: t("readinessIssueCharacterCardsMissingBody"),
-        };
-      case "world_cards_missing":
-        return {
-          title: t("readinessIssueWorldCardsMissingTitle"),
-          body: t("readinessIssueWorldCardsMissingBody"),
-        };
-      case "reference_card_proposal_pending":
-        return {
-          title: t("readinessIssueProposalPendingTitle"),
-          body: t("readinessIssueProposalPendingBody"),
-        };
-      case "provider_plan_invalid":
-        return {
-          title: t("readinessIssueProviderInvalidTitle"),
-          body: t("readinessIssueProviderInvalidBody"),
-        };
-      case "generation_context_too_large":
-        return {
-          title: t("readinessIssueContextTooLargeTitle"),
-          body: t("readinessIssueContextTooLargeBody"),
-        };
-      case "no_generation_work":
-        return {
-          title: t("readinessIssueNoWorkTitle"),
-          body: t("readinessIssueNoWorkBody"),
-        };
-      case "prose_scene_segmentation_planned":
-        return {
-          title: t("readinessIssueProseSegmentsTitle"),
-          body: t("readinessIssueProseSegmentsBody", {
-            segmented: Number(issue.details.scene_segment_chapters ?? 0),
-            unknown: Number(issue.details.unknown_outline_chapters ?? 0),
-            calls: Number(issue.details.maximum_prose_calls ?? 0),
-          }),
-        };
-      case "prose_output_risk_requires_ack":
-        return {
-          title: t("readinessIssueOutputRiskTitle"),
-          body: t("readinessIssueOutputRiskBody", {
-            count: Number(issue.details.chapter_count ?? 0),
-            target: Number(issue.details.maximum_target_words ?? 0),
-            safe: Number(issue.details.safe_output_words ?? 0),
-            calls: Number(issue.details.maximum_prose_calls ?? 0),
-            source: issue.details.output_limit_known
-              ? t("readinessCapabilityKnown")
-              : t("readinessCapabilityConservative"),
-          }),
-        };
-      case "partial_prose_requires_manual_completion":
-        return {
-          title: t("readinessIssuePartialProseTitle"),
-          body: t("readinessIssuePartialProseBody", {
-            count: Number(issue.details.chapter_count ?? 0),
-          }),
-        };
-      case "prose_scene_divergence_protection":
-        return {
-          title: t("readinessIssueDivergenceProtectionTitle"),
-          body: t("readinessIssueDivergenceProtectionBody", {
-            factor: Number(issue.details.stop_factor ?? 0),
-          }),
-        };
-      case "automatic_continuations_require_confirmation":
-        return {
-          title: t("readinessIssueAutomaticConfirmationTitle"),
-          body: t("readinessIssueAutomaticConfirmationBody", {
-            count: continuationPolicy.automatic_continuations_per_scene,
-          }),
-        };
-      case "automatic_continuations_require_token_budget":
-        return {
-          title: t("readinessIssueAutomaticBudgetTitle"),
-          body: t("readinessIssueAutomaticBudgetBody"),
-        };
-      case "prose_token_bound_unproven":
-        return {
-          title: t("readinessIssueTokenBoundTitle"),
-          body: t("readinessIssueTokenBoundBody"),
-        };
-      case "batch_generation_requires_token_budget":
-        return {
-          title: t("readinessIssueBatchBudgetRequiredTitle"),
-          body: t("readinessIssueBatchBudgetRequiredBody", {
-            maximum: Number(issue.details.maximum_tokens_total ?? 0),
-          }),
-        };
-      case "batch_generation_budget_may_pause":
-        return {
-          title: t("readinessIssueBatchBudgetShortTitle"),
-          body: t("readinessIssueBatchBudgetShortBody", {
-            maximum: Number(issue.details.maximum_tokens_total ?? 0),
-            budget: Number(issue.details.token_budget ?? 0),
-          }),
-        };
-      case "reference_card_repair_budget_not_covered":
-        return {
-          title: t("readinessIssueRepairBudgetShortTitle"),
-          body: t("readinessIssueRepairBudgetShortBody", {
-            maximum: Number(issue.details.maximum_tokens_total ?? 0),
-            budget: Number(issue.details.token_budget ?? 0),
-          }),
-        };
-      case "batch_generation_token_bound_unproven":
-        return {
-          title: t("readinessIssueBatchBoundUnknownTitle"),
-          body: t("readinessIssueBatchBoundUnknownBody"),
-        };
-      default:
-        return {
-          title: t("readinessIssueUnknownTitle"),
-          body: t("readinessIssueUnknownBody"),
-        };
-      case "automatic_reference_card_creation_requires_confirmation": {
-        const allowedTypes = Array.isArray(issue.details.allowed_card_types)
-          ? issue.details.allowed_card_types.filter((item): item is ReferenceCardType =>
-              typeof item === "string"
-              && ["character", "location", "item", "rule", "lore"].includes(item))
-          : [];
-        return {
-          title: t("readinessIssueAutoCardsTitle"),
-          body: t("readinessIssueAutoCardsBody", {
-            types: allowedTypes
-              .map(referenceCardTypeLabel)
-              .join(t("referenceCardNameSeparator"))
-              || t("readinessNone"),
-            perChapter: Number(issue.details.max_auto_creates_per_chapter ?? 0),
-            perBook: Number(issue.details.max_auto_creates_per_book ?? 0),
-            repair: Number(
-              issue.details.max_candidate_repair_cycles_per_chapter ?? 0,
-            ),
-            attempts: Number(
-              issue.details.maximum_repair_provider_attempts_total ?? 0,
-            ),
-            tokens: Number(issue.details.maximum_repair_tokens_total ?? 0),
-          }),
-        };
-      }
-    }
-  };
+  const referenceCardTypeLabel = (cardType: ReferenceCardType) =>
+    t(referenceCardTypeTranslationKey(cardType));
 
   const budgetCoverageReason = (coverage: ProseBudgetCoverage) => {
     switch (coverage.unavailable_reason) {
@@ -637,7 +485,11 @@ export default function StartJobDialog({
                 </div>
 
                 {readiness.issues.map((issue) => {
-                  const copy = issueCopy(issue);
+                  const copy = readinessIssueCopy(
+                    issue,
+                    t,
+                    continuationPolicy.automatic_continuations_per_scene,
+                  );
                   const requiresAck = issue.level === "warning_requires_ack";
                   const blocked = issue.level === "blocked";
                   return (

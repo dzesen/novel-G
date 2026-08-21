@@ -16,12 +16,12 @@ from backend.db.utils import get_utc_now, to_object_id
 from backend.services.novel.reference_card_curation import (
     merge_reference_card_data,
     normalize_card_name,
+    parse_reference_card_candidate_source,
     prepare_persisted_reference_card_candidates,
     validate_reference_card_candidate,
 )
 from backend.services.novel.reference_card_service import (
     get_card_repository,
-    validate_card_type,
 )
 from backend.db.repositories.novel_repository import novel_repo
 
@@ -82,18 +82,49 @@ def _digest(value: Any) -> str:
     ).hexdigest()
 
 
-def _candidate_parts(raw: Mapping[str, Any]) -> tuple[str, bool, str, dict[str, Any]]:
-    value = deepcopy(dict(raw))
-    card_type = validate_card_type(str(value.pop("card_type", "")))
-    requires_review = bool(
-        value.pop("requires_review_before_next_chapter", False)
-    )
-    evidence_summary = str(value.pop("evidence_summary", "") or "").strip()
-    candidate_data = validate_reference_card_candidate(card_type, value)
-    return card_type, requires_review, evidence_summary, candidate_data
-
-
 def _queue_input(document: Mapping[str, Any]) -> dict[str, Any]:
+    current_decision = document.get("decision")
+    original_decision = document.get("original_decision")
+    current_action = (
+        str(current_decision.get("action") or "")
+        if isinstance(current_decision, Mapping)
+        else ""
+    )
+    origin = (
+        original_decision
+        if current_action == "reverted"
+        and isinstance(original_decision, Mapping)
+        and str(original_decision.get("action") or "")
+        == "auto_create_unique"
+        else current_decision
+        if current_action == "auto_create_unique"
+        else None
+    )
+    automation_audit = None
+    if isinstance(origin, Mapping):
+        automation_audit = {
+            "outcome": (
+                "reverted" if current_action == "reverted" else "auto_created"
+            ),
+            "card_id": str(
+                document.get("reverted_from_card_id")
+                if current_action == "reverted"
+                else document.get("resolved_card_id")
+                or ""
+            ),
+            "authorization_digest": str(
+                origin.get("authorization_digest") or ""
+            ),
+            "source_job_id": str(origin.get("job_id") or ""),
+            "source_mutation_id": str(
+                origin.get("source_mutation_id") or ""
+            ),
+            "mutation_receipt_id": str(
+                current_decision.get("mutation_idempotency_key")
+                if isinstance(current_decision, Mapping)
+                else ""
+            ),
+        }
     return {
         "candidate_id": str(document["_id"]),
         "reserved_card_id": str(document["reserved_card_id"]),
@@ -105,6 +136,7 @@ def _queue_input(document: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "evidence": deepcopy(document.get("evidence") or {}),
         "chapter_id": str(document.get("chapter_id") or ""),
+        "automation_audit": automation_audit,
     }
 
 
@@ -161,7 +193,7 @@ class EmergentReferenceCardCandidateModule:
             if mutation.was_received(receipt_key):
                 continue
             card_type, requires_review, evidence_summary, candidate_data = (
-                _candidate_parts(item["candidate"])
+                parse_reference_card_candidate_source(item["candidate"])
             )
             document = {
                 "_id": to_object_id(candidate_id),

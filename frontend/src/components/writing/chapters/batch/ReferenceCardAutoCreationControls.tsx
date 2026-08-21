@@ -7,6 +7,7 @@ import {
   type ReferenceCardAutoCreationPolicy,
   type ReferenceCardType,
 } from "./referenceCardAutoCreation";
+import { referenceCardTypeTranslationKey } from "./referenceCardAutoCreationPresentation";
 
 interface ReferenceCardAutoCreationControlsProps {
   value: ReferenceCardAutoCreationPolicy;
@@ -26,15 +27,8 @@ export default function ReferenceCardAutoCreationControls({
   disabled = false,
 }: ReferenceCardAutoCreationControlsProps) {
   const t = useTranslations("writing.batch");
-  const labelForType = (cardType: ReferenceCardType) => {
-    switch (cardType) {
-      case "character": return t("dialogAutoCardsTypeCharacter");
-      case "location": return t("dialogAutoCardsTypeLocation");
-      case "item": return t("dialogAutoCardsTypeItem");
-      case "rule": return t("dialogAutoCardsTypeRule");
-      case "lore": return t("dialogAutoCardsTypeLore");
-    }
-  };
+  const labelForType = (cardType: ReferenceCardType) =>
+    t(referenceCardTypeTranslationKey(cardType));
   const toggleType = (cardType: ReferenceCardType, selected: boolean) => {
     const selectedTypes = new Set(value.allowed_card_types);
     if (selected) selectedTypes.add(cardType);

@@ -2207,6 +2207,33 @@
       "referenceCardAutoDeniedLimit": "The hard automatic-creation limit for this chapter or book has been reached.",
       "referenceCardAutoDeniedChanged": "The candidate, source, authorization, or audit record changed during validation, so the old authorization was rejected.",
       "referenceCardAutoDeniedSafety": "The candidate did not pass the complete safety check and will not be created automatically.",
+      "referenceCardAuditTitle": "Reference automation history",
+      "referenceCardAuditSummary": "{count} recent traceable result(s), with links to the source, candidates, formal cards, and authorization receipts.",
+      "referenceCardAuditOutcome": {
+        "auto_created": "Created automatically",
+        "rewritten_unique_new": "Rewritten and proven new",
+        "dependency_removed": "Dependency removed",
+        "manual_review_required": "Human review required",
+        "reverted": "Automatic creation reverted"
+      },
+      "referenceCardAuditDescription": {
+        "auto_created": "The full uniqueness Gate passed and created {count} formal reference card(s).",
+        "rewritten_unique_new": "The ambiguous candidate was rewritten and passed the full uniqueness Gate again.",
+        "dependency_removed": "The outline rewrite removed this future dependency without creating a reference card.",
+        "manual_review_required": "Automation did not reach a uniquely safe result, so the candidate remains for the author to decide.",
+        "reverted": "The original automatic creation was compensated; the candidate and full audit trail remain available."
+      },
+      "referenceCardAuditOpenSource": "Open source chapter: {chapter}",
+      "referenceCardAuditOpenCandidate": "Open candidate(s) ({count})",
+      "referenceCardAuditOpenFormalCard": "Open formal reference card: {type}",
+      "referenceCardAuditOpenProof": "View authorization and mutation receipts",
+      "referenceCardAuditAuthorization": "Authorization digest",
+      "referenceCardAuditReadiness": "Job readiness digest",
+      "referenceCardAuditAuthorizationRevision": "Authorization revision",
+      "referenceCardAuditPolicyRevision": "Policy revision",
+      "referenceCardAuditSourceReceipt": "Source mutation receipt",
+      "referenceCardAuditMutationReceipt": "Formal mutation receipt",
+      "referenceCardAuditOlderHidden": "Show {count} older result(s)",
       "resumeAutoCardRecovery": "Recover the same card change",
       "uncertainDetail": "Retrying uses a new attempt and the Provider may charge both calls. Skipping marks the job failed so you can inspect or complete the chapter manually.",
       "failedTitle": "This job attempt failed",
@@ -2470,7 +2497,7 @@
       "candidateReview": {
         "tab": "Review queue",
         "title": "New reference-card candidates",
-        "description": "Chapter outlines found important people or world facts introduced as the story progressed. Nothing is created automatically and names never become internal IDs; decide every item before applying.",
+        "description": "Chapter outlines found important people or world facts introduced as the story progressed. You still decide each item unless a bounded automation authorization is attached, and names never become internal IDs.",
         "pendingCount": "{count} awaiting decisions",
         "blockingCount": "{count} block the next chapter",
         "loading": "Loading candidates and existing cards…",
@@ -2492,6 +2519,22 @@
           "superseded": "Superseded by a later candidate"
         },
         "resolvedReadOnly": "This candidate remains available as an audit record, but it has left the review queue and cannot be decided again.",
+        "automationAudit": {
+          "outcome": {
+            "auto_created": "Created automatically",
+            "reverted": "Automatic creation reverted"
+          },
+          "description": {
+            "auto_created": "The candidate passed the full uniqueness Gate and became a formal reference card.",
+            "reverted": "Compensation removed the formal card while preserving the candidate and every receipt."
+          },
+          "openProof": "View authorization and mutation receipts",
+          "cardId": "Formal reference-card ID",
+          "authorization": "Authorization digest",
+          "sourceJob": "Source job",
+          "sourceReceipt": "Source mutation receipt",
+          "mutationReceipt": "Formal mutation receipt"
+        },
         "noDescription": "The outline confirmed only the name so far.",
         "decisionLabel": "Decision for this candidate",
         "decisionFor": "Decision for candidate “{name}”",

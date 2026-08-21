@@ -501,15 +501,13 @@ class GenerationJobService:
 
         job = await generation_job_repo.get_job(job_id)
         novel_id = str(job.get("novel_id") or "")
-        blockers = await emergent_reference_card_candidate_module.blocking_summary(
-            novel_id
-        )
-        if blockers is None:
-            return None
-
         policy = _persisted_reference_card_auto_creation_policy(job)
         if not policy.enabled:
-            return blockers
+            return await (
+                emergent_reference_card_candidate_module.blocking_summary(
+                    novel_id
+                )
+            )
 
         readiness = job.get("readiness")
         planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
@@ -522,9 +520,6 @@ class GenerationJobService:
             else None
         )
         current_chapter_id = str(job.get("current_chapter_id") or "")
-        blocker_chapter_ids = [
-            str(chapter_id) for chapter_id in list(blockers.get("chapter_ids") or [])
-        ]
         readiness_digest = (
             str(readiness.get("digest") or "")
             if isinstance(readiness, Mapping)
@@ -537,26 +532,174 @@ class GenerationJobService:
         )
         authorization_revision = job.get("authorization_revision")
         expected_revision = job.get("expected_narrative_revision")
-        if (
+        authority_is_valid = not (
             not isinstance(authorization, Mapping)
             or not current_chapter_id
-            or blocker_chapter_ids != [current_chapter_id]
             or len(readiness_digest) != 64
             or not owner_id
             or type(authorization_revision) is not int
             or authorization_revision < 1
             or type(expected_revision) is not int
             or expected_revision < 0
-        ):
+        )
+
+        def build_repair_event(
+            repair: Mapping[str, Any],
+            cycle: int,
+        ) -> dict[str, Any]:
+            repair_status = str(repair.get("status") or "")
+            candidate_ids = [
+                str(candidate_id)
+                for candidate_id in list(
+                    repair.get("created_reference_card_candidate_ids") or []
+                )
+            ]
             return {
-                **blockers,
-                "auto_creation": {
-                    "outcome": "manual_review_required",
-                    "created_count": 0,
-                    "deny_reasons": ["authorization_invalid"],
-                    "denials": [],
-                },
+                "schema_version": "reference_card_repair_event.v1",
+                "event_id": (
+                    f"{str((authorization or {}).get('authorization_digest') or '')}:"
+                    f"{current_chapter_id}:{cycle}"
+                ),
+                "chapter_id": current_chapter_id,
+                "actor_owner_id": owner_id,
+                "authorization_digest": str(
+                    (authorization or {}).get("authorization_digest") or ""
+                ),
+                "readiness_digest": readiness_digest,
+                "authorization_revision": authorization_revision,
+                "policy_revision": (authorization or {}).get(
+                    "policy_revision"
+                ),
+                "cycle": cycle,
+                "outcome": repair_status,
+                "resolution": (
+                    "dependency_removed"
+                    if repair_status == "applied" and not candidate_ids
+                    else None
+                ),
+                "created_reference_card_candidate_ids": candidate_ids,
+                "reason": str(repair.get("reason") or ""),
+                "proposal_digest": str(repair.get("proposal_digest") or ""),
+                "source_mutation_id": str(
+                    repair.get("source_mutation_id") or ""
+                ),
+                "occurred_at": repair.get("occurred_at") or get_utc_now(),
             }
+
+        recorded_repair_cycles = {
+            int(event.get("cycle"))
+            for event in list(job.get("reference_card_repair_events") or [])
+            if isinstance(event, Mapping)
+            and type(event.get("cycle")) is int
+            and str(event.get("chapter_id") or "") == current_chapter_id
+            and str(event.get("authorization_digest") or "")
+            == str((authorization or {}).get("authorization_digest") or "")
+        }
+        pending_repair_event = next(
+            (
+                dict(event)
+                for event in reversed(
+                    list(job.get("reference_card_repair_events") or [])
+                )
+                if isinstance(event, Mapping)
+                and str(event.get("chapter_id") or "") == current_chapter_id
+                and str(event.get("authorization_digest") or "")
+                == str((authorization or {}).get("authorization_digest") or "")
+                and event.get("outcome") == "applied"
+                and event.get("resolution") is None
+            ),
+            None,
+        )
+        pending_repair_event_id = str(
+            (pending_repair_event or {}).get("event_id") or ""
+        )
+        pending_repair_candidate_ids = {
+            str(candidate_id)
+            for candidate_id in list(
+                (pending_repair_event or {}).get(
+                    "created_reference_card_candidate_ids"
+                )
+                or []
+            )
+        }
+        pending_repair_source_mutation_id = str(
+            (pending_repair_event or {}).get("source_mutation_id") or ""
+        )
+        current_revision = expected_revision if authority_is_valid else None
+
+        def build_auto_creation_event(
+            result: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            status = str(result.get("status") or "")
+            deny_reasons = sorted({
+                str(reason) for reason in list(result.get("deny_reasons") or [])
+            })
+            outcome = (
+                "auto_created"
+                if status == "created"
+                else (
+                    "manual_review_required"
+                    if status == "denied"
+                    else "not_applicable"
+                )
+            )
+            source_mutation_id = str(result.get("source_mutation_id") or "")
+            source_tag = hashlib.sha256(
+                source_mutation_id.encode("utf-8")
+            ).hexdigest()[:16]
+            return {
+                "schema_version": "reference_card_auto_creation_event.v1",
+                "event_id": (
+                    f"{str((authorization or {}).get('authorization_digest') or '')}:"
+                    f"{current_chapter_id}:{source_tag}"
+                ),
+                "chapter_id": current_chapter_id,
+                "actor_owner_id": owner_id,
+                "authorization_digest": str(
+                    (authorization or {}).get("authorization_digest") or ""
+                ),
+                "readiness_digest": readiness_digest,
+                "authorization_revision": authorization_revision,
+                "policy_revision": (authorization or {}).get(
+                    "policy_revision"
+                ),
+                "outcome": outcome,
+                "created_count": int(result.get("created_count") or 0),
+                "mappings": list(result.get("mappings") or []),
+                "deny_reasons": deny_reasons,
+                "denials": list(result.get("denials") or []),
+                "limit_usage": dict(result.get("limit_usage") or {}),
+                "source_mutation_id": source_mutation_id,
+                "mutation_receipt_id": str(
+                    result.get("mutation_idempotency_key") or ""
+                ),
+                "occurred_at": result.get("occurred_at") or get_utc_now(),
+            }
+
+        async def record_auto_result(
+            result: Mapping[str, Any],
+            revision: int,
+        ) -> tuple[dict[str, Any], dict[str, Any], int]:
+            next_revision = result.get("next_narrative_revision")
+            if (
+                type(next_revision) is not int
+                or next_revision not in {revision, revision + 1}
+            ):
+                raise ValueError(
+                    "Reference-card auto-creation narrative revision is invalid"
+                )
+            status = str(result.get("status") or "")
+            if status not in {"created", "denied", "not_applicable"}:
+                raise ValueError("Reference-card auto-creation result is invalid")
+            event = build_auto_creation_event(result)
+            await generation_job_repo.record_reference_card_auto_creation(
+                job_id,
+                chapter_id=current_chapter_id,
+                expected_revision=revision,
+                next_revision=next_revision,
+                event=event,
+            )
+            return dict(result), event, next_revision
 
         async def apply_and_record_auto(
             revision: int,
@@ -571,60 +714,159 @@ class GenerationJobService:
                 expected_narrative_revision=revision,
                 authorization=authorization,
             )
-            next_revision = result.get("next_narrative_revision")
-            if (
-                type(next_revision) is not int
-                or next_revision not in {revision, revision + 1}
-            ):
-                raise ValueError(
-                    "Reference-card auto-creation narrative revision is invalid"
-                )
-            status = str(result.get("status") or "")
-            if status not in {"created", "denied", "not_applicable"}:
-                raise ValueError("Reference-card auto-creation result is invalid")
-            deny_reasons = sorted({
-                str(reason) for reason in list(result.get("deny_reasons") or [])
-            })
-            outcome = "auto_created" if status == "created" else (
-                "manual_review_required"
-                if status == "denied"
-                else "not_applicable"
-            )
-            source_mutation_id = str(result.get("source_mutation_id") or "")
-            source_tag = hashlib.sha256(
-                source_mutation_id.encode("utf-8")
-            ).hexdigest()[:16]
-            event = {
-                "schema_version": "reference_card_auto_creation_event.v1",
-                "event_id": (
-                    f"{str(authorization.get('authorization_digest') or '')}:"
-                    f"{current_chapter_id}:{source_tag}"
-                ),
-                "chapter_id": current_chapter_id,
-                "actor_owner_id": owner_id,
-                "authorization_digest": str(
-                    authorization.get("authorization_digest") or ""
-                ),
-                "outcome": outcome,
-                "created_count": int(result.get("created_count") or 0),
-                "mappings": list(result.get("mappings") or []),
-                "deny_reasons": deny_reasons,
-                "denials": list(result.get("denials") or []),
-                "limit_usage": dict(result.get("limit_usage") or {}),
-                "occurred_at": get_utc_now(),
+            return await record_auto_result(result, revision)
+
+        def auto_event_resolves_pending_repair(
+            event: Mapping[str, Any],
+        ) -> bool:
+            mapped_candidate_ids = {
+                str(mapping.get("candidate_id") or "")
+                for mapping in list(event.get("mappings") or [])
+                if isinstance(mapping, Mapping)
             }
-            await generation_job_repo.record_reference_card_auto_creation(
-                job_id,
-                chapter_id=current_chapter_id,
-                expected_revision=revision,
-                next_revision=next_revision,
-                event=event,
+            return bool(
+                pending_repair_event_id
+                and pending_repair_candidate_ids
+                and str(event.get("chapter_id") or "") == current_chapter_id
+                and str(event.get("authorization_digest") or "")
+                == str((authorization or {}).get("authorization_digest") or "")
+                and str(event.get("outcome") or "") == "auto_created"
+                and str(event.get("source_mutation_id") or "")
+                == pending_repair_source_mutation_id
+                and mapped_candidate_ids == pending_repair_candidate_ids
             )
-            return result, event, next_revision
+
+        async def finalize_pending_repair_from_event(
+            event: Mapping[str, Any],
+        ) -> None:
+            nonlocal pending_repair_event_id
+            if not auto_event_resolves_pending_repair(event):
+                return
+            await generation_job_repo.finalize_reference_card_repair_resolution(
+                job_id,
+                event_id=pending_repair_event_id,
+                resolution="rewritten_unique_new",
+            )
+            pending_repair_event_id = ""
+        if (
+            authority_is_valid
+            and policy.max_candidate_repair_cycles_per_chapter > 0
+        ):
+            for cycle in range(
+                1,
+                policy.max_candidate_repair_cycles_per_chapter + 1,
+            ):
+                if cycle in recorded_repair_cycles:
+                    continue
+                recovered = await (
+                    reference_card_dependency_repair_service.recover_applied_cycle(
+                        owner_id=owner_id,
+                        novel_id=novel_id,
+                        job_id=str(job_id),
+                        chapter_id=current_chapter_id,
+                        readiness=readiness,
+                        expected_narrative_revision=current_revision,
+                        cycle=cycle,
+                    )
+                )
+                if recovered is None:
+                    break
+                repair_next_revision = recovered.get(
+                    "next_narrative_revision"
+                )
+                if (
+                    str(recovered.get("status") or "") != "applied"
+                    or type(repair_next_revision) is not int
+                    or repair_next_revision != current_revision + 1
+                ):
+                    raise ValueError(
+                        "Recovered reference-card repair result is invalid"
+                    )
+                repair_event = build_repair_event(recovered, cycle)
+                await generation_job_repo.record_reference_card_repair(
+                    job_id,
+                    chapter_id=current_chapter_id,
+                    expected_revision=current_revision,
+                    next_revision=repair_next_revision,
+                    event=repair_event,
+                )
+                current_revision = repair_next_revision
+                recorded_repair_cycles.add(cycle)
+                if repair_event["resolution"] is None:
+                    pending_repair_event_id = repair_event["event_id"]
+                    pending_repair_candidate_ids = set(
+                        repair_event[
+                            "created_reference_card_candidate_ids"
+                        ]
+                    )
+                    pending_repair_source_mutation_id = str(
+                        repair_event.get("source_mutation_id") or ""
+                    )
+
+        persisted_auto_created_events = [
+            dict(event)
+            for event in list(
+                job.get("reference_card_auto_creation_events") or []
+            )
+            if isinstance(event, Mapping)
+            and str(event.get("chapter_id") or "") == current_chapter_id
+            and str(event.get("authorization_digest") or "")
+            == str((authorization or {}).get("authorization_digest") or "")
+            and str(event.get("outcome") or "") == "auto_created"
+        ]
+        for persisted_event in persisted_auto_created_events:
+            await finalize_pending_repair_from_event(persisted_event)
+
+        if authority_is_valid and not persisted_auto_created_events:
+            recovered_auto_creation = await (
+                auto_reference_card_creation_service.recover_applied_chapter(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    job_id=str(job_id),
+                    chapter_id=current_chapter_id,
+                    readiness_digest=readiness_digest,
+                    authorization_revision=authorization_revision,
+                    expected_narrative_revision=current_revision,
+                    authorization=authorization,
+                )
+            )
+            if recovered_auto_creation is not None:
+                (
+                    _recovered_result,
+                    recovered_event,
+                    current_revision,
+                ) = await record_auto_result(
+                    recovered_auto_creation,
+                    current_revision,
+                )
+                await finalize_pending_repair_from_event(recovered_event)
+
+        blockers = await emergent_reference_card_candidate_module.blocking_summary(
+            novel_id
+        )
+        if blockers is None:
+            return None
+        blocker_chapter_ids = [
+            str(chapter_id)
+            for chapter_id in list(blockers.get("chapter_ids") or [])
+        ]
+        if not authority_is_valid or blocker_chapter_ids != [current_chapter_id]:
+            return {
+                **blockers,
+                "auto_creation": {
+                    "outcome": "manual_review_required",
+                    "created_count": 0,
+                    "deny_reasons": ["authorization_invalid"],
+                    "denials": [],
+                },
+            }
+        if type(current_revision) is not int:
+            raise ValueError("Reference-card Job revision is invalid")
 
         result, event, current_revision = await apply_and_record_auto(
-            expected_revision
+            current_revision
         )
+        await finalize_pending_repair_from_event(event)
         live_blockers = (
             await emergent_reference_card_candidate_module.blocking_summary(
                 novel_id
@@ -659,6 +901,8 @@ class GenerationJobService:
             1,
             policy.max_candidate_repair_cycles_per_chapter + 1,
         ):
+            if cycle in recorded_repair_cycles:
+                continue
             async def reserve_attempt_scope(slots: int):
                 if slots != plan_authorization.generation_plan.max_semantic_attempts:
                     raise ValueError(
@@ -743,36 +987,7 @@ class GenerationJobService:
                 not in {current_revision, current_revision + 1}
             ):
                 raise ValueError("Reference-card repair result is invalid")
-            repair_event = {
-                "schema_version": "reference_card_repair_event.v1",
-                "event_id": (
-                    f"{str(authorization.get('authorization_digest') or '')}:"
-                    f"{current_chapter_id}:{cycle}"
-                ),
-                "chapter_id": current_chapter_id,
-                "actor_owner_id": owner_id,
-                "authorization_digest": str(
-                    authorization.get("authorization_digest") or ""
-                ),
-                "cycle": cycle,
-                "outcome": repair_status,
-                "resolution": (
-                    "rewritten_unique_new"
-                    if repair_status == "applied"
-                    and repair.get("created_reference_card_candidate_ids")
-                    else "dependency_removed"
-                    if repair_status == "applied"
-                    else None
-                ),
-                "reason": str(repair.get("reason") or ""),
-                "proposal_digest": str(
-                    repair.get("proposal_digest") or ""
-                ),
-                "source_mutation_id": str(
-                    repair.get("source_mutation_id") or ""
-                ),
-                "occurred_at": get_utc_now(),
-            }
+            repair_event = build_repair_event(repair, cycle)
             await generation_job_repo.record_reference_card_repair(
                 job_id,
                 chapter_id=current_chapter_id,
@@ -781,7 +996,23 @@ class GenerationJobService:
                 event=repair_event,
             )
             current_revision = repair_next_revision
+            recorded_repair_cycles.add(cycle)
             last_repair = repair
+            pending_repair_event_id = (
+                repair_event["event_id"]
+                if repair_event["resolution"] is None
+                else ""
+            )
+            pending_repair_candidate_ids = (
+                set(repair_event["created_reference_card_candidate_ids"])
+                if pending_repair_event_id
+                else set()
+            )
+            pending_repair_source_mutation_id = (
+                str(repair_event.get("source_mutation_id") or "")
+                if pending_repair_event_id
+                else ""
+            )
             if repair_status == "uncertain":
                 return {
                     **live_blockers,
@@ -805,6 +1036,7 @@ class GenerationJobService:
             result, event, current_revision = await apply_and_record_auto(
                 current_revision
             )
+            await finalize_pending_repair_from_event(event)
             live_blockers = (
                 await emergent_reference_card_candidate_module.blocking_summary(
                     novel_id

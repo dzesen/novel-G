@@ -258,12 +258,25 @@ export interface ReferenceCardAutoCreationEvent {
   chapter_id: string;
   actor_owner_id: string;
   authorization_digest: string;
-  outcome: "manual_review_required" | "auto_created" | "not_applicable";
+  readiness_digest?: string;
+  authorization_revision?: number;
+  policy_revision?: number;
+  outcome:
+    | "manual_review_required"
+    | "auto_created"
+    | "not_applicable";
   created_count: number;
-  mappings: Array<Record<string, unknown>>;
+  mappings: Array<{
+    candidate_id?: string;
+    card_id?: string;
+    card_type?: ReferenceCardType;
+    [key: string]: unknown;
+  }>;
   deny_reasons: string[];
   denials: Array<Record<string, unknown>>;
   limit_usage: Record<string, unknown>;
+  source_mutation_id?: string;
+  mutation_receipt_id?: string;
   occurred_at: string;
 }
 
@@ -273,9 +286,13 @@ export interface ReferenceCardRepairEvent {
   chapter_id: string;
   actor_owner_id: string;
   authorization_digest: string;
+  readiness_digest?: string;
+  authorization_revision?: number;
+  policy_revision?: number;
   cycle: number;
   outcome: "applied" | "exhausted" | "uncertain";
   resolution?: "rewritten_unique_new" | "dependency_removed" | null;
+  created_reference_card_candidate_ids?: string[];
   reason: string;
   proposal_digest: string;
   source_mutation_id: string;

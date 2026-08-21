@@ -390,6 +390,14 @@ export interface EmergentReferenceCardCandidate
     source_kind: "chapter_outline";
   };
   source_chapter_id: string;
+  automation_audit?: {
+    outcome: "auto_created" | "reverted";
+    card_id: string;
+    authorization_digest: string;
+    source_job_id: string;
+    source_mutation_id: string;
+    mutation_receipt_id: string;
+  } | null;
 }
 
 export interface EmergentReferenceCardReview {

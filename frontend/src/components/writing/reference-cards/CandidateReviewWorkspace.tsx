@@ -404,6 +404,43 @@ export default function CandidateReviewWorkspace({
                             ? ` · ${candidate.evidence.summary}`
                             : ""}
                         </p>
+                        {candidate.automation_audit && (
+                          <aside className="mt-3 min-w-0 rounded-lg border border-border bg-background px-3 py-3">
+                            <div className="flex min-w-0 flex-wrap items-center gap-2">
+                              <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+                                candidate.automation_audit.outcome === "reverted"
+                                  ? "border-border bg-surface-secondary text-foreground"
+                                  : "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-900/70 dark:bg-emerald-950/35 dark:text-emerald-200"
+                              }`}>
+                                {t(`automationAudit.outcome.${candidate.automation_audit.outcome}`)}
+                              </span>
+                              <span className="text-[11px] leading-5 text-muted">
+                                {t(`automationAudit.description.${candidate.automation_audit.outcome}`)}
+                              </span>
+                            </div>
+                            <details className="mt-2 min-w-0">
+                              <summary className="cursor-pointer text-xs font-medium text-accent underline-offset-4 hover:underline">
+                                {t("automationAudit.openProof")}
+                              </summary>
+                              <dl className="mt-2 grid min-w-0 gap-2 border-t border-border pt-2 text-[11px] leading-5 text-muted sm:grid-cols-2">
+                                {[
+                                  ["cardId", candidate.automation_audit.card_id],
+                                  ["authorization", candidate.automation_audit.authorization_digest],
+                                  ["sourceJob", candidate.automation_audit.source_job_id],
+                                  ["sourceReceipt", candidate.automation_audit.source_mutation_id],
+                                  ["mutationReceipt", candidate.automation_audit.mutation_receipt_id],
+                                ].filter(([, value]) => value).map(([label, value]) => (
+                                  <div key={label} className="min-w-0">
+                                    <dt className="font-medium text-foreground">
+                                      {t(`automationAudit.${label}`)}
+                                    </dt>
+                                    <dd className="break-all font-mono">{value}</dd>
+                                  </div>
+                                ))}
+                              </dl>
+                            </details>
+                          </aside>
+                        )}
                       </div>
                       <span className="shrink-0 text-xs text-muted">
                         {t(`status.${candidate.queue_status}`)}

@@ -8,7 +8,11 @@ import type {
   WritingTargetKey,
   WritingView,
 } from "@/lib/writingRoute";
-import type { ChapterSummary, VolumeSummary } from "@/types/novel";
+import type {
+  ChapterSummary,
+  ReferenceCardType,
+  VolumeSummary,
+} from "@/types/novel";
 import type { ProseRunSnapshot } from "../chapters/prose/useProseStream";
 import BatchGenerationPanel from "../chapters/batch/BatchGenerationPanel";
 import GenerationRunsWorkspace from "../chapters/batch/GenerationRunsWorkspace";
@@ -51,7 +55,11 @@ interface AutoBookWorkspaceProps {
   onOpenWriting: (chapterId: string, run?: ProseRunSnapshot | null) => void;
   onOpenWorld: (
     view: "library" | "curation" | "candidates",
-    cardType?: string,
+    targets?: {
+      cardType?: ReferenceCardType;
+      card?: string;
+      candidate?: string;
+    },
   ) => void;
   onOpenContinuity: (view: "facts" | "threads") => void;
 }
@@ -318,8 +326,18 @@ export default function AutoBookWorkspace({
             onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}
             onQuietRefresh={() => void loadStructure(true)}
             onNavigateToMemory={() => onOpenContinuity("facts")}
-            onNavigateToReferenceCards={() => onOpenWorld("curation", "character")}
-            onNavigateToReferenceCardCandidates={() => onOpenWorld("candidates", "character")}
+            onNavigateToReferenceCards={(cardType = "character", cardId) =>
+              onOpenWorld(cardId ? "library" : "curation", {
+                cardType,
+                card: cardId,
+              })
+            }
+            onNavigateToReferenceCardCandidates={(candidateId) =>
+              onOpenWorld("candidates", {
+                cardType: "character",
+                candidate: candidateId,
+              })
+            }
             onNavigateToPlotThreads={() => onOpenContinuity("threads")}
             proseRunsRevision={proseRunsRevision}
             onOpenProseRun={(run: LeftoverProseRun) => {

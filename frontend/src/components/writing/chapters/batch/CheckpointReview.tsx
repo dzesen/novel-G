@@ -13,14 +13,18 @@ import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
 import { jobPauseReasonTranslationKey } from "./generationReasonPresentation";
 import { generationStepKind } from "../../generationMetadataPresentation";
+import type { ReferenceCardType } from "./referenceCardAutoCreation";
 
 interface CheckpointReviewProps {
   job: GenerationJob;
   titleForChapter: (chapterId: string) => string;
   onJumpToChapter: (chapterId: string) => void;
   onNavigateToMemory: () => void;
-  onNavigateToReferenceCards: () => void;
-  onNavigateToReferenceCardCandidates: () => void;
+  onNavigateToReferenceCards: (
+    cardType?: ReferenceCardType,
+    cardId?: string,
+  ) => void;
+  onNavigateToReferenceCardCandidates: (candidateId?: string) => void;
   onNavigateToPlotThreads: () => void;
   onResume: () => void;
   onRetryUncertain: () => void;
@@ -432,7 +436,7 @@ export default function CheckpointReview({
               variant="primary"
               size="sm"
               className="bg-amber-700 text-white hover:bg-amber-800 dark:bg-amber-600"
-              onPress={onNavigateToReferenceCardCandidates}
+              onPress={() => onNavigateToReferenceCardCandidates()}
               isDisabled={busy}
             >
               {t("reviewReferenceCards")}
@@ -531,7 +535,7 @@ export default function CheckpointReview({
               title={titleForChapter(p.chapter_id)}
               onJump={() => onJumpToChapter(p.chapter_id)}
               onNavigateToMemory={onNavigateToMemory}
-              onNavigateToReferenceCards={onNavigateToReferenceCards}
+              onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
               onNavigateToPlotThreads={onNavigateToPlotThreads}
               isCurrentStopCause={p.chapter_id === currentStopChapterId}
             />

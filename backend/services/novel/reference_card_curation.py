@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import unicodedata
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -46,7 +47,10 @@ from backend.services.llm.generation_runtime import (
     WorkflowStepTarget,
     create_generation_runtime,
 )
-from backend.services.novel.reference_card_service import get_card_repository
+from backend.services.novel.reference_card_service import (
+    get_card_repository,
+    validate_card_type,
+)
 
 
 WORKFLOW_NAME = "create_reference_cards_by_ai"
@@ -294,6 +298,21 @@ def validate_reference_card_candidate(
     return _clean_candidate(card_type, candidate)
 
 
+def parse_reference_card_candidate_source(
+    raw: Mapping[str, Any],
+) -> tuple[str, bool, str, dict[str, Any]]:
+    """Normalize one accepted-outline candidate and its source metadata."""
+
+    value = deepcopy(dict(raw))
+    card_type = validate_card_type(str(value.pop("card_type", "")))
+    requires_review = bool(
+        value.pop("requires_review_before_next_chapter", False)
+    )
+    evidence_summary = str(value.pop("evidence_summary", "") or "").strip()
+    candidate_data = validate_reference_card_candidate(card_type, value)
+    return card_type, requires_review, evidence_summary, candidate_data
+
+
 def _prepare_candidates(
     generated: ReferenceCardCandidatesSchema,
     cards: list[dict[str, Any]],
@@ -502,6 +521,10 @@ async def prepare_persisted_reference_card_candidates(
             candidate["source_chapter_id"] = str(
                 queued.get("chapter_id") or ""
             )
+            if isinstance(queued.get("automation_audit"), Mapping):
+                candidate["automation_audit"] = deepcopy(
+                    queued["automation_audit"]
+                )
             public.append(_public_candidate(candidate))
     return public
 

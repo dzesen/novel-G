@@ -508,8 +508,8 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           }
           onTargetValidation={validateLocatedTarget}
           onOpenWriting={openWriting}
-          onOpenWorld={(view, cardType) =>
-            navigateView("world", view, cardType ? { cardType } : {})
+          onOpenWorld={(view, targets) =>
+            navigateView("world", view, targets ?? {})
           }
           onOpenContinuity={(view) => navigateView("continuity", view)}
         />
