@@ -11,7 +11,14 @@ from difflib import SequenceMatcher
 from typing import Annotated, Any, Literal
 
 from bson import ObjectId
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    model_validator,
+)
 
 from backend.db import collections
 from backend.db.errors import NotFoundError
@@ -72,6 +79,57 @@ _OBJECT_ID_PATTERN = r"^[0-9a-f]{24}$"
 _NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 _PositiveInt = Annotated[StrictInt, Field(ge=1)]
 ReferenceCardType = Literal["character", "location", "item", "rule", "lore"]
+
+
+class ReferenceCardAutoCreationPolicy(BaseModel):
+    """User-selected readiness policy before it becomes formal authority.
+
+    Candidate repair deliberately remains closed in this slice.  Exposing a
+    positive value before its proposal-only runtime and Provider budget are
+    wired would make the readiness digest promise authority that cannot be
+    enforced end to end.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: StrictBool = False
+    allowed_card_types: tuple[ReferenceCardType, ...] = CARD_TYPE_ORDER
+    max_auto_creates_per_chapter: Annotated[
+        StrictInt,
+        Field(ge=0, le=MAX_AUTO_CREATES_PER_CHAPTER),
+    ] = MAX_AUTO_CREATES_PER_CHAPTER
+    max_auto_creates_per_book: Annotated[
+        StrictInt,
+        Field(ge=0, le=MAX_AUTO_CREATES_PER_BOOK),
+    ] = MAX_AUTO_CREATES_PER_BOOK
+    max_candidate_repair_cycles_per_chapter: Annotated[
+        StrictInt,
+        Field(ge=0, le=MAX_CANDIDATE_REPAIR_CYCLES_PER_CHAPTER),
+    ] = 0
+
+    @model_validator(mode="after")
+    def validate_closed_policy(self) -> "ReferenceCardAutoCreationPolicy":
+        canonical_types = tuple(
+            card_type
+            for card_type in CARD_TYPE_ORDER
+            if card_type in self.allowed_card_types
+        )
+        if not canonical_types or canonical_types != self.allowed_card_types:
+            raise ValueError("allowed_card_types must be unique and canonical")
+        if self.max_candidate_repair_cycles_per_chapter != 0:
+            raise ValueError(
+                "reference-card candidate repair is not yet available"
+            )
+        return self
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | None,
+    ) -> "ReferenceCardAutoCreationPolicy":
+        if value is None:
+            return cls()
+        return cls.model_validate(dict(value))
 
 
 class ReferenceCardRepairProviderBoundV1(BaseModel):

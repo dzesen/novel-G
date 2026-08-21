@@ -16,6 +16,9 @@ from backend.services.generation.job_service import (
     ResumeReadinessRequired,
 )
 from backend.services.generation.readiness import StaleReadiness
+from backend.services.generation.reference_card_auto_creation import (
+    ReferenceCardAutoCreationPolicy,
+)
 from backend.api.default_routers.auth_router import require_owned_path_resource
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
@@ -85,12 +88,18 @@ class StartJobRequest(GenerationParamsMixin):
     prose_continuation_policy: ProseContinuationPolicyRequest = Field(
         default_factory=ProseContinuationPolicyRequest
     )
+    reference_card_auto_creation_policy: ReferenceCardAutoCreationPolicy = Field(
+        default_factory=ReferenceCardAutoCreationPolicy
+    )
 
 
 class BatchReadinessRequest(GenerationParamsMixin):
     token_budget: Optional[int] = Field(default=None, ge=1)
     prose_continuation_policy: ProseContinuationPolicyRequest = Field(
         default_factory=ProseContinuationPolicyRequest
+    )
+    reference_card_auto_creation_policy: ReferenceCardAutoCreationPolicy = Field(
+        default_factory=ReferenceCardAutoCreationPolicy
     )
 
 
@@ -152,6 +161,9 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
                 "prose_continuation_policy": req.prose_continuation_policy.to_domain().to_dict(),
             },
             prose_continuation_policy=req.prose_continuation_policy.to_domain(),
+            reference_card_auto_creation_policy=(
+                req.reference_card_auto_creation_policy
+            ),
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -174,6 +186,9 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
                 "prose_continuation_policy": req.prose_continuation_policy.to_domain().to_dict(),
             },
             prose_continuation_policy=req.prose_continuation_policy.to_domain(),
+            reference_card_auto_creation_policy=(
+                req.reference_card_auto_creation_policy
+            ),
         )
     except Exception as exc:
         raise _handle(exc) from exc
@@ -208,6 +223,9 @@ async def inspect_volume_readiness_with_policy(
                 req.prose_continuation_policy.to_domain()
             ),
             token_budget=req.token_budget,
+            reference_card_auto_creation_policy=(
+                req.reference_card_auto_creation_policy
+            ),
             generation_params={
                 **build_gen_kwargs(req),
                 "allow_failure_retry": req.allow_failure_retry,
@@ -232,6 +250,9 @@ async def inspect_book_readiness_with_policy(
                 req.prose_continuation_policy.to_domain()
             ),
             token_budget=req.token_budget,
+            reference_card_auto_creation_policy=(
+                req.reference_card_auto_creation_policy
+            ),
             generation_params={
                 **build_gen_kwargs(req),
                 "allow_failure_retry": req.allow_failure_retry,

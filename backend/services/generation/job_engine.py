@@ -73,6 +73,10 @@ class JobEngineDeps:
         Callable[[], Awaitable[Dict[str, Any] | None]]
     ] = None
 
+    resolve_reference_card_blockers: Optional[
+        Callable[[], Awaitable[Dict[str, Any] | None]]
+    ] = None
+
 
 def outcome_to_progress(outcome: ChapterOutcome) -> Dict[str, Any]:
     progress = {
@@ -547,14 +551,38 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     return
             else:
                 chapter = job_planner.first_needing_work(chapters)
+            reference_card_blocker_check = (
+                deps.resolve_reference_card_blockers
+                or deps.inspect_reference_card_blockers
+            )
             if (
                 not candidate_recovery
                 and not job_mutation_recovery
                 and chapter is not None
-                and deps.inspect_reference_card_blockers is not None
+                and reference_card_blocker_check is not None
             ):
-                blockers = await deps.inspect_reference_card_blockers()
+                try:
+                    blockers = await reference_card_blocker_check()
+                except Exception as exc:  # noqa: BLE001 - preserve exact recovery
+                    await repo.update_job_fields(job_id, {
+                        "status": "paused",
+                        "pause_reason": (
+                            "reference_card_auto_creation_recovery"
+                        ),
+                        # Keep the source chapter cursor so the same immutable
+                        # mutation can be resumed after a standalone crash.
+                        "active_slot": None,
+                            "error": {
+                                "step": (
+                                    "reference_card_auto_creation_recovery"
+                                ),
+                                "chapter_id": str(chapter.get("_id") or ""),
+                                "message": str(exc),
+                            },
+                    })
+                    return
                 if blockers:
+                    auto_creation = blockers.get("auto_creation")
                     await repo.update_job_fields(job_id, {
                         "status": "paused",
                         "pause_reason": "reference_card_review",
@@ -571,6 +599,11 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                             ),
                             "candidate_names": list(
                                 blockers.get("names") or []
+                            ),
+                            **(
+                                {"auto_creation": dict(auto_creation)}
+                                if isinstance(auto_creation, Mapping)
+                                else {}
                             ),
                         },
                     })

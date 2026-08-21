@@ -33,6 +33,10 @@ from backend.services.generation.prose_token_bounds import (
     positive_token_limit,
     v3_output_token_bound,
 )
+from backend.services.generation.reference_card_auto_creation import (
+    ReferenceCardAutoCreationPolicy,
+    build_reference_card_creation_authorization,
+)
 from backend.services.generation.provider_budget import (
     ProviderBudgetBound,
     merge_provider_bounds,
@@ -380,9 +384,22 @@ class GenerationReadinessModule:
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
         authorization_revision: int = 1,
+        reference_card_auto_creation_policy: (
+            ReferenceCardAutoCreationPolicy | Mapping[str, Any] | None
+        ) = None,
     ) -> dict[str, Any]:
         continuation_policy = (
             prose_continuation_policy or ProseContinuationPolicy()
+        )
+        auto_creation_policy = (
+            reference_card_auto_creation_policy
+            if isinstance(
+                reference_card_auto_creation_policy,
+                ReferenceCardAutoCreationPolicy,
+            )
+            else ReferenceCardAutoCreationPolicy.from_mapping(
+                reference_card_auto_creation_policy
+            )
         )
         work = _work_summary(chapters)
         resources = await self._deps.load_resource_counts(novel_id)
@@ -733,7 +750,72 @@ class GenerationReadinessModule:
             **planning,
             "prose_continuation_authorization": prose_authorization,
             "chapter_finalization_authorization": finalization_authorization,
+            "reference_card_auto_creation_policy": (
+                auto_creation_policy.model_dump(mode="json")
+            ),
         }
+        if auto_creation_policy.enabled and has_work:
+            auto_creation_authorization = (
+                build_reference_card_creation_authorization(
+                    owner_id=str(resources.get("owner_id") or ""),
+                    novel_id=str(novel_id),
+                    scope=scope,
+                    volume_id=volume_id,
+                    chapter_ids=(
+                        str(item.get("chapter_id") or "")
+                        for item in work.get("chapters") or []
+                    ),
+                    worklist_digest=_digest(
+                        {
+                            "scope": scope,
+                            "volume_id": volume_id,
+                            "chapters": list(work.get("chapters") or []),
+                        }
+                    ),
+                    baseline_narrative_revision=int(
+                        resources.get("narrative_revision") or 0
+                    ),
+                    authorization_revision=authorization_revision,
+                    allowed_card_types=auto_creation_policy.allowed_card_types,
+                    max_auto_creates_per_chapter=(
+                        auto_creation_policy.max_auto_creates_per_chapter
+                    ),
+                    max_auto_creates_per_book=(
+                        auto_creation_policy.max_auto_creates_per_book
+                    ),
+                    max_candidate_repair_cycles_per_chapter=(
+                        auto_creation_policy.
+                        max_candidate_repair_cycles_per_chapter
+                    ),
+                )
+            )
+            planning["reference_card_creation_authorization"] = (
+                auto_creation_authorization
+            )
+            issues.append(
+                _issue(
+                    "automatic_reference_card_creation_requires_confirmation",
+                    "warning_requires_ack",
+                    details={
+                        "allowed_card_types": list(
+                            auto_creation_policy.allowed_card_types
+                        ),
+                        "max_auto_creates_per_chapter": (
+                            auto_creation_policy.max_auto_creates_per_chapter
+                        ),
+                        "max_auto_creates_per_book": (
+                            auto_creation_policy.max_auto_creates_per_book
+                        ),
+                        "max_candidate_repair_cycles_per_chapter": (
+                            auto_creation_policy.
+                            max_candidate_repair_cycles_per_chapter
+                        ),
+                        "maximum_repair_provider_attempts_total": 0,
+                        "maximum_repair_tokens_total": 0,
+                    },
+                    action_codes=["review_reference_card_auto_creation"],
+                )
+            )
         automatic_requested = bool(
             continuation_policy.permits_automatic_continuation
             and prose_authorization.get("max_base_calls")
@@ -883,6 +965,15 @@ class GenerationReadinessModule:
             item.get("code") == "automatic_continuations_require_confirmation"
             for item in report.get("issues", [])
         )
+        auto_creation_confirmation_required = any(
+            item.get("code")
+            == "automatic_reference_card_creation_requires_confirmation"
+            for item in report.get("issues", [])
+        )
+        if auto_creation_confirmation_required and supplied_digest is None:
+            raise StaleReadiness(
+                "自动建卡必须使用当前 readiness 摘要确认后才能启动"
+            )
         if automatic_confirmation_required and supplied_digest is None:
             raise StaleReadiness(
                 "自动续写必须使用当前 readiness 摘要确认后才能启动"

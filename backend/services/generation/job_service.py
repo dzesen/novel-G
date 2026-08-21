@@ -97,6 +97,10 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     authorization_ruleset_requires_refresh,
 )
+from backend.services.generation.reference_card_auto_creation import (
+    ReferenceCardAutoCreationPolicy,
+    auto_reference_card_creation_service,
+)
 
 logger = logging.getLogger(__name__)
 _START_LOCK: asyncio.Lock | None = None
@@ -111,6 +115,19 @@ def _get_start_lock() -> asyncio.Lock:
         _START_LOCK = asyncio.Lock()
         _START_LOCK_LOOP = loop
     return _START_LOCK
+
+
+def _persisted_reference_card_auto_creation_policy(
+    job: Mapping[str, Any],
+) -> ReferenceCardAutoCreationPolicy:
+    readiness = job.get("readiness")
+    planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
+    raw_policy = (
+        planning.get("reference_card_auto_creation_policy")
+        if isinstance(planning, Mapping)
+        else None
+    )
+    return ReferenceCardAutoCreationPolicy.from_mapping(raw_policy)
 
 
 class ConflictError(Exception):
@@ -422,6 +439,7 @@ def _new_job_doc(
         "attempt_slots": [],
         "attempt_reservation": None,
         "candidate_pipeline_checkpoints": [],
+        "reference_card_auto_creation_events": [],
         "state_dispatch_resolution": None,
         "execution_epoch": 0,
         "execution_lease": None,
@@ -458,6 +476,148 @@ class GenerationJobService:
         running = await generation_job_repo.list_running_jobs()
         if not job_planner.can_start_new(len(running)):
             raise ConflictError("已有正在运行的批量作业，请先暂停或等待其结束")
+
+    @staticmethod
+    async def _resolve_reference_card_blockers(
+        job_id: str,
+    ) -> dict[str, Any] | None:
+        """Apply only readiness-bound unique creates, then return live blockers.
+
+        A disabled or legacy job follows the original manual-review path.  An
+        enabled job may consume one standalone narrative revision even when the
+        mutation Gate denies the batch, so the Job cursor and audit event are
+        persisted before the engine is allowed to pause.
+        """
+
+        job = await generation_job_repo.get_job(job_id)
+        novel_id = str(job.get("novel_id") or "")
+        blockers = await emergent_reference_card_candidate_module.blocking_summary(
+            novel_id
+        )
+        if blockers is None:
+            return None
+
+        policy = _persisted_reference_card_auto_creation_policy(job)
+        if not policy.enabled:
+            return blockers
+
+        readiness = job.get("readiness")
+        planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
+        resources = (
+            readiness.get("resources") if isinstance(readiness, Mapping) else None
+        )
+        authorization = (
+            planning.get("reference_card_creation_authorization")
+            if isinstance(planning, Mapping)
+            else None
+        )
+        current_chapter_id = str(job.get("current_chapter_id") or "")
+        blocker_chapter_ids = [
+            str(chapter_id) for chapter_id in list(blockers.get("chapter_ids") or [])
+        ]
+        readiness_digest = (
+            str(readiness.get("digest") or "")
+            if isinstance(readiness, Mapping)
+            else ""
+        )
+        owner_id = (
+            str(resources.get("owner_id") or "")
+            if isinstance(resources, Mapping)
+            else ""
+        )
+        authorization_revision = job.get("authorization_revision")
+        expected_revision = job.get("expected_narrative_revision")
+        if (
+            not isinstance(authorization, Mapping)
+            or not current_chapter_id
+            or blocker_chapter_ids != [current_chapter_id]
+            or len(readiness_digest) != 64
+            or not owner_id
+            or type(authorization_revision) is not int
+            or authorization_revision < 1
+            or type(expected_revision) is not int
+            or expected_revision < 0
+        ):
+            return {
+                **blockers,
+                "auto_creation": {
+                    "outcome": "manual_review_required",
+                    "created_count": 0,
+                    "deny_reasons": ["authorization_invalid"],
+                    "denials": [],
+                },
+            }
+
+        result = await auto_reference_card_creation_service.apply_chapter(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            job_id=str(job_id),
+            chapter_id=current_chapter_id,
+            readiness_digest=readiness_digest,
+            authorization_revision=authorization_revision,
+            expected_narrative_revision=expected_revision,
+            authorization=authorization,
+        )
+        next_revision = result.get("next_narrative_revision")
+        if (
+            type(next_revision) is not int
+            or next_revision not in {expected_revision, expected_revision + 1}
+        ):
+            raise ValueError(
+                "Reference-card auto-creation narrative revision is invalid"
+            )
+        status = str(result.get("status") or "")
+        if status not in {"created", "denied", "not_applicable"}:
+            raise ValueError("Reference-card auto-creation result is invalid")
+        deny_reasons = sorted(
+            {str(reason) for reason in list(result.get("deny_reasons") or [])}
+        )
+        outcome = "auto_created" if status == "created" else (
+            "manual_review_required" if status == "denied" else "not_applicable"
+        )
+        event = {
+            "schema_version": "reference_card_auto_creation_event.v1",
+            "event_id": (
+                f"{str(authorization.get('authorization_digest') or '')}:"
+                f"{current_chapter_id}"
+            ),
+            "chapter_id": current_chapter_id,
+            "actor_owner_id": owner_id,
+            "authorization_digest": str(
+                authorization.get("authorization_digest") or ""
+            ),
+            "outcome": outcome,
+            "created_count": int(result.get("created_count") or 0),
+            "mappings": list(result.get("mappings") or []),
+            "deny_reasons": deny_reasons,
+            "denials": list(result.get("denials") or []),
+            "limit_usage": dict(result.get("limit_usage") or {}),
+            "occurred_at": get_utc_now(),
+        }
+        await generation_job_repo.record_reference_card_auto_creation(
+            job_id,
+            chapter_id=current_chapter_id,
+            expected_revision=expected_revision,
+            next_revision=next_revision,
+            event=event,
+        )
+
+        live_blockers = (
+            await emergent_reference_card_candidate_module.blocking_summary(
+                novel_id
+            )
+        )
+        if live_blockers is None:
+            return None
+        return {
+            **live_blockers,
+            "auto_creation": {
+                "outcome": "manual_review_required",
+                "created_count": event["created_count"],
+                "deny_reasons": deny_reasons,
+                "denials": event["denials"],
+            },
+        }
 
     @staticmethod
     async def _incomplete_prose_is_resolved(job: Mapping[str, Any]) -> bool:
@@ -575,6 +735,9 @@ class GenerationJobService:
             token_budget=job.get("token_budget"),
             generation_params=generation_params,
             authorization_revision=max(1, current_revision),
+            reference_card_auto_creation_policy=(
+                _persisted_reference_card_auto_creation_policy(job)
+            ),
         )
         candidate = dict(
             (report.get("planning") or {}).get(
@@ -1077,17 +1240,16 @@ class GenerationJobService:
                     chapter_id,
                 )
 
-        async def _inspect_reference_card_blockers():
-            current_job = await generation_job_repo.get_job(job_id)
-            return await emergent_reference_card_candidate_module.blocking_summary(
-                str(current_job["novel_id"])
+        async def _resolve_reference_card_blockers():
+            return await GenerationJobService._resolve_reference_card_blockers(
+                job_id
             )
 
         deps = JobEngineDeps(
             list_worklist_chapters=_list_worklist,
             run_chapter=_run_chapter,
             run_candidate_chapter=_run_candidate_chapter,
-            inspect_reference_card_blockers=_inspect_reference_card_blockers,
+            resolve_reference_card_blockers=_resolve_reference_card_blockers,
         )
         async def _heartbeat_execution(
             owner_task: asyncio.Task[Any],
@@ -1219,6 +1381,9 @@ class GenerationJobService:
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
+        reference_card_auto_creation_policy: (
+            ReferenceCardAutoCreationPolicy | None
+        ) = None,
     ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)
         novel_id = str(volume["novel_id"])
@@ -1234,6 +1399,9 @@ class GenerationJobService:
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
             generation_params=generation_params,
+            reference_card_auto_creation_policy=(
+                reference_card_auto_creation_policy
+            ),
         )
 
     @staticmethod
@@ -1243,6 +1411,9 @@ class GenerationJobService:
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
+        reference_card_auto_creation_policy: (
+            ReferenceCardAutoCreationPolicy | None
+        ) = None,
     ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)
         chapters = await get_book_worklist(novel_id, include_content=True)
@@ -1254,6 +1425,9 @@ class GenerationJobService:
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
             generation_params=generation_params,
+            reference_card_auto_creation_policy=(
+                reference_card_auto_creation_policy
+            ),
         )
 
     @staticmethod
@@ -1331,6 +1505,9 @@ class GenerationJobService:
             token_budget=candidate_budget,
             generation_params=generation_params_snapshot,
             authorization_revision=max(1, current_revision + 1),
+            reference_card_auto_creation_policy=(
+                _persisted_reference_card_auto_creation_policy(job)
+            ),
         )
 
     @staticmethod
@@ -1340,8 +1517,11 @@ class GenerationJobService:
                                acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
                                outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                                generation_params: Mapping[str, Any] | None = None,
-                               prose_continuation_policy: ProseContinuationPolicy | None = None,
-                               ) -> Dict[str, Any]:
+                                prose_continuation_policy: ProseContinuationPolicy | None = None,
+                                reference_card_auto_creation_policy: (
+                                    ReferenceCardAutoCreationPolicy | None
+                                ) = None,
+                                ) -> Dict[str, Any]:
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
         chapters = await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
@@ -1370,6 +1550,9 @@ class GenerationJobService:
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
                 generation_params=generation_params_snapshot,
+                reference_card_auto_creation_policy=(
+                    reference_card_auto_creation_policy
+                ),
             )
             authorization = generation_readiness_module.authorize(
                 report,
@@ -1411,6 +1594,9 @@ class GenerationJobService:
                              outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                              generation_params: Mapping[str, Any] | None = None,
                              prose_continuation_policy: ProseContinuationPolicy | None = None,
+                             reference_card_auto_creation_policy: (
+                                 ReferenceCardAutoCreationPolicy | None
+                             ) = None,
                              ) -> Dict[str, Any]:
         await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
         chapters = await get_book_worklist(novel_id, include_content=True)
@@ -1434,6 +1620,9 @@ class GenerationJobService:
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
                 generation_params=generation_params_snapshot,
+                reference_card_auto_creation_policy=(
+                    reference_card_auto_creation_policy
+                ),
             )
             authorization = generation_readiness_module.authorize(
                 report,
@@ -1726,6 +1915,9 @@ class GenerationJobService:
                     token_budget=candidate_budget,
                     generation_params=generation_params_snapshot,
                     authorization_revision=max(1, current_revision + 1),
+                    reference_card_auto_creation_policy=(
+                        _persisted_reference_card_auto_creation_policy(job)
+                    ),
                 )
                 accepted_readiness = generation_readiness_module.authorize(
                     report,

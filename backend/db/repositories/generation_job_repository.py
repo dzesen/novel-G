@@ -1607,6 +1607,87 @@ class GenerationJobRepository:
             "Generation job narrative revision cursor changed"
         )
 
+    async def record_reference_card_auto_creation(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        expected_revision: int,
+        next_revision: int,
+        event: Mapping[str, Any],
+    ) -> bool:
+        """Persist one auto-create outcome with its Job revision transition."""
+
+        normalized_chapter_id = str(chapter_id or "")
+        normalized_event = dict(event)
+        event_id = str(normalized_event.get("event_id") or "")
+        outcome = str(normalized_event.get("outcome") or "")
+        created_count = normalized_event.get("created_count")
+        if (
+            not normalized_chapter_id
+            or normalized_event.get("schema_version")
+            != "reference_card_auto_creation_event.v1"
+            or str(normalized_event.get("chapter_id") or "")
+            != normalized_chapter_id
+            or not event_id
+            or len(event_id) > 200
+            or outcome
+            not in {"auto_created", "manual_review_required", "not_applicable"}
+            or type(created_count) is not int
+            or created_count < 0
+            or type(expected_revision) is not int
+            or type(next_revision) is not int
+            or expected_revision < 0
+            or next_revision not in {expected_revision, expected_revision + 1}
+        ):
+            raise CandidatePipelineCheckpointConflict(
+                "Reference-card auto-creation event is invalid"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": normalized_chapter_id,
+                "expected_narrative_revision": expected_revision,
+                "reference_card_auto_creation_events.event_id": {"$ne": event_id},
+            },
+            {
+                "$set": {
+                    "expected_narrative_revision": next_revision,
+                    "updated_at": get_utc_now(),
+                },
+                "$push": {
+                    "reference_card_auto_creation_events": {
+                        "$each": [normalized_event],
+                        "$slice": -200,
+                    }
+                },
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        matching_events = [
+            item
+            for item in list(
+                current.get("reference_card_auto_creation_events") or []
+            )
+            if isinstance(item, Mapping)
+            and str(item.get("event_id") or "") == event_id
+        ]
+        if (
+            str(current.get("status") or "") == "running"
+            and str(current.get("current_chapter_id") or "")
+            == normalized_chapter_id
+            and current.get("expected_narrative_revision") == next_revision
+            and matching_events == [normalized_event]
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Reference-card auto-creation cursor changed"
+        )
+
     async def bind_job_mutation_recovery(
         self,
         job_id: str,
