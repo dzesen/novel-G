@@ -85,16 +85,49 @@ class ImageBatchRepository(BaseRepository):
             sort=[("created_at", DESCENDING)],
         )
 
-    async def find_latest_owned_batch(
+    async def bind_starting_portrait_job(
         self,
         *,
         owner_id: str,
         novel_id: str,
-    ) -> dict[str, Any] | None:
-        return await self.collection.find_one(
-            self._scope(owner_id=owner_id, novel_id=novel_id),
-            sort=[("created_at", DESCENDING)],
+        batch_id: str,
+        card_id: str,
+        start_claim_token: str,
+        job_id: str,
+    ) -> bool:
+        bound = await self.collection.find_one_and_update(
+            {
+                "_id": to_object_id(batch_id),
+                **self._scope(owner_id=owner_id, novel_id=novel_id),
+                "is_terminal": False,
+                "cancel_requested": False,
+                "items": {
+                    "$elemMatch": {
+                        "card_id": to_object_id(card_id),
+                        "status": "starting",
+                        "start_claim_token": str(start_claim_token),
+                    }
+                },
+            },
+            {
+                "$set": {
+                    "items.$.status": "running",
+                    "items.$.job_id": str(to_object_id(job_id)),
+                    "items.$.job_status": "submitting",
+                    "items.$.queue_position": None,
+                    "items.$.submit_count": 0,
+                    "items.$.completed_images": 0,
+                    "items.$.failure": None,
+                    "items.$.start_claim_token": None,
+                    "items.$.start_claimed_at_epoch": None,
+                    "status": "running",
+                    "updated_at": get_utc_now(),
+                },
+                "$inc": {"revision": 1},
+            },
+            return_document=ReturnDocument.AFTER,
         )
+        return bound is not None
 
     async def compare_and_update_owned_batch(
         self,

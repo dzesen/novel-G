@@ -156,6 +156,24 @@ def _dependency_names(
     return tuple(sorted(values))
 
 
+def stable_model_names(
+    checkpoint_names: tuple[str, ...] | list[str],
+    *,
+    workflow_revision: str,
+) -> str:
+    """Return the bounded model identity shared by inspect and submit."""
+
+    checkpoints = tuple(sorted(checkpoint_names))
+    if len(checkpoints) == 1 and len(checkpoints[0]) <= 500:
+        return checkpoints[0]
+    if checkpoints:
+        digest = hashlib.sha256(
+            "\n".join(checkpoints).encode("utf-8")
+        ).hexdigest()
+        return f"checkpoints:sha256:{digest}"
+    return f"workflow:{workflow_revision}"
+
+
 def load_comfyui_template(
     workflow_config: ComfyUIWorkflowConfig,
     *,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -25,14 +26,19 @@ from backend.services.image.comfyui_provider import (
     ComfyUIProvider,
     build_comfyui_runtime_fingerprint,
 )
-from backend.services.image.comfyui_template import load_comfyui_template
+from backend.services.image.comfyui_template import (
+    load_comfyui_template,
+    stable_model_names,
+)
 from backend.services.image.contracts import (
     ImageCancelResult,
     ImageFailure,
     ImageGenerationRequest,
     ImageJobHandle,
+    ImageProviderExpectation,
     ImageProvider,
     ImageProviderError,
+    ImageProviderPreSubmitError,
     ImagePollResult,
 )
 from backend.services.image.managed_assets import (
@@ -78,6 +84,10 @@ class PortraitBatchItemConflict(RuntimeError):
     """A frozen batch item collided with an unrelated portrait job."""
 
 
+class _ReturnedHandleAlreadyCancelledError(PortraitJobNotFoundError):
+    """The owning record vanished and its unique returned handle was cleaned."""
+
+
 ImageJobUsage = Literal["character_portrait", "cover", "scene_illustration"]
 
 
@@ -109,6 +119,25 @@ class ImageJobPlan:
     persisted_fields: dict[str, Any]
     idempotency_context: dict[str, Any]
     illustration_lineage: IllustrationJobLineage | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImageJobSubmissionFence:
+    batch_id: str
+    start_claim_token: str
+    expected_provider: ImageProviderExpectation
+
+
+class ImageJobSubmissionGuardProtocol(Protocol):
+    async def bind_job(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        job_id: str,
+        fence: ImageJobSubmissionFence,
+    ) -> bool: ...
 
 
 class ImageCompletionError(RuntimeError):
@@ -176,6 +205,7 @@ class ImageJobProjection(BaseModel):
 
 
 class PortraitJobProjection(ImageJobProjection):
+    job_revision: int = Field(default=0, exclude=True)
     anchor: AppearanceAnchorSchema | None = None
 
 
@@ -643,7 +673,7 @@ class ConfiguredImageProviderResolver:
                 available=True,
                 timeout_seconds=resolved.timeout_seconds,
                 queue_position=len(queue.running) + len(queue.pending),
-                model=_stable_model_names(
+                model=stable_model_names(
                     loaded.checkpoint_names,
                     workflow_revision=loaded.revision,
                 ),
@@ -688,24 +718,8 @@ def _positive_prompt(prompt: IllustrationPromptResult) -> str:
     )
 
 
-def _stable_model_names(
-    checkpoint_names: tuple[str, ...] | list[str],
-    *,
-    workflow_revision: str,
-) -> str:
-    checkpoints = tuple(sorted(checkpoint_names))
-    if len(checkpoints) == 1 and len(checkpoints[0]) <= 500:
-        return checkpoints[0]
-    if checkpoints:
-        digest = hashlib.sha256(
-            "\n".join(checkpoints).encode("utf-8")
-        ).hexdigest()
-        return f"checkpoints:sha256:{digest}"
-    return f"workflow:{workflow_revision}"
-
-
 def _stable_model(handle: ImageJobHandle) -> str:
-    return _stable_model_names(
+    return stable_model_names(
         handle.audit.checkpoint_names,
         workflow_revision=handle.audit.template_revision,
     )
@@ -756,6 +770,7 @@ def _projection(document: dict[str, Any]) -> PortraitJobProjection:
     provider_alias = str(document.get("provider_alias") or "")
     return PortraitJobProjection(
         job_id=_job_id(document),
+        job_revision=max(0, int(document.get("job_revision") or 0)),
         status=public_status,
         terminal=(
             bool(document.get("is_terminal"))
@@ -922,6 +937,7 @@ class SingleImageJobService:
         jobs: ImageJobRepositoryProtocol,
         anchors: AppearanceAnchorGatewayProtocol | None,
         provider_resolver: ImageProviderResolverProtocol,
+        submission_guard: ImageJobSubmissionGuardProtocol | None = None,
         usage: ImageJobUsage = "character_portrait",
         completion_adapter: ImageJobCompletionAdapter | None = None,
         asset_consumer: ImagePollAssetConsumer | None = None,
@@ -934,6 +950,7 @@ class SingleImageJobService:
         self.jobs = jobs
         self.anchors = anchors
         self.provider_resolver = provider_resolver
+        self.submission_guard = submission_guard
         self.usage = usage
         self.completion_adapter = completion_adapter
         self.asset_consumer = asset_consumer or ImagePollAssetConsumer()
@@ -2068,7 +2085,7 @@ class SingleImageJobService:
                     provider=provider,
                     handle=handle,
                 )
-                raise PortraitJobNotFoundError(
+                raise _ReturnedHandleAlreadyCancelledError(
                     "Image job disappeared after provider submission"
                 )
             persisted_handle = current.get("handle")
@@ -2232,6 +2249,243 @@ class SingleImageJobService:
                 if fields.get("status") == "cancelling":
                     continue
                 return _projection(updated)
+
+    async def _reconcile_failed_handle_attachment(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        job_id: str,
+        handle: ImageJobHandle,
+        estimated_seconds: int | None,
+        provider: ImageProvider,
+    ) -> PortraitJobProjection:
+        """Persist a known handle before leased cancellation or recovery."""
+
+        handle_fields = self._submit_handle_fields(
+            handle,
+            estimated_seconds=estimated_seconds,
+        )
+        while True:
+            current = await self.jobs.get_owned_job(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                card_id=card_id,
+                job_id=job_id,
+            )
+            if current is None:
+                await self._cancel_returned_handle(
+                    provider=provider,
+                    handle=handle,
+                )
+                raise _ReturnedHandleAlreadyCancelledError(
+                    "Image job disappeared during handle reconciliation"
+                )
+            persisted_handle = current.get("handle")
+            if isinstance(persisted_handle, dict):
+                persisted = ImageJobHandle.model_validate(persisted_handle)
+                if persisted.prompt_id == handle.prompt_id:
+                    return _projection(current)
+                return await self._attach_submitted_handle(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    card_id=card_id,
+                    job_id=job_id,
+                    handle=handle,
+                    estimated_seconds=estimated_seconds,
+                    provider=provider,
+                )
+            if bool(current.get("is_terminal")):
+                return await self._attach_submitted_handle(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    card_id=card_id,
+                    job_id=job_id,
+                    handle=handle,
+                    estimated_seconds=estimated_seconds,
+                    provider=provider,
+                )
+            cleanup_pending = bool(current.get("cleanup_pending"))
+            try:
+                updated, won = await self._cas_or_winner(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    card_id=card_id,
+                    job_id=job_id,
+                    expected_revision=int(current.get("job_revision") or 0),
+                    fields={
+                        **handle_fields,
+                        "status": (
+                            "late_cleanup_pending"
+                            if cleanup_pending
+                            else "cancelling"
+                        ),
+                        "cancel_requested": True,
+                        **(
+                            {
+                                "cleanup_pending": True,
+                                "late_cleanup_phase": "cancel",
+                            }
+                            if cleanup_pending
+                            else {}
+                        ),
+                    },
+                )
+            except PortraitJobNotFoundError as error:
+                await self._cancel_returned_handle(
+                    provider=provider,
+                    handle=handle,
+                )
+                raise _ReturnedHandleAlreadyCancelledError(
+                    str(error)
+                ) from error
+            if won:
+                if cleanup_pending:
+                    return await self._execute_late_cleanup_cancellation(
+                        owner_id=owner_id,
+                        novel_id=novel_id,
+                        card_id=card_id,
+                        job_id=job_id,
+                        job=updated,
+                        provider=provider,
+                    )
+                return await self._execute_nonterminal_cancellation(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    card_id=card_id,
+                    job_id=job_id,
+                    job=updated,
+                    provider=provider,
+                )
+
+    async def _attach_returned_handle_durably(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        job_id: str,
+        handle: ImageJobHandle,
+        estimated_seconds: int | None,
+        provider: ImageProvider,
+    ) -> PortraitJobProjection:
+        cancellation: asyncio.CancelledError | None = None
+        attach_task = asyncio.create_task(
+            self._attach_submitted_handle(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                card_id=card_id,
+                job_id=job_id,
+                handle=handle,
+                estimated_seconds=estimated_seconds,
+                provider=provider,
+            )
+        )
+        try:
+            try:
+                attached = await asyncio.shield(attach_task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+                attached = await asyncio.shield(attach_task)
+        except _ReturnedHandleAlreadyCancelledError as error:
+            if cancellation is not None:
+                cancellation.add_note(str(error))
+                raise cancellation from error
+            raise
+        except PortraitJobNotFoundError as error:
+            cleanup_task = asyncio.create_task(
+                self._cancel_returned_handle(
+                    provider=provider,
+                    handle=handle,
+                )
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as cleanup_cancellation:
+                if cancellation is None:
+                    cancellation = cleanup_cancellation
+                await asyncio.shield(cleanup_task)
+            if cancellation is not None:
+                cancellation.add_note(str(error))
+                raise cancellation from error
+            raise
+        except Exception as attachment_error:
+            reconcile_task = asyncio.create_task(
+                self._reconcile_failed_handle_attachment(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    card_id=card_id,
+                    job_id=job_id,
+                    handle=handle,
+                    estimated_seconds=estimated_seconds,
+                    provider=provider,
+                )
+            )
+            try:
+                try:
+                    attached = await asyncio.shield(reconcile_task)
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+                    attached = await asyncio.shield(reconcile_task)
+            except Exception as reconciliation_error:
+                if cancellation is not None:
+                    cancellation.add_note(
+                        "Failed to reconcile returned image handle: "
+                        f"{type(reconciliation_error).__name__}"
+                    )
+                    raise cancellation from reconciliation_error
+                raise reconciliation_error from attachment_error
+        if cancellation is not None:
+            raise cancellation
+        return attached
+
+    async def _record_unsubmitted_failure(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        job_id: str,
+        status: Literal["failed", "cancelled"],
+        failure: ImageFailure,
+    ) -> PortraitJobProjection:
+        while True:
+            current = await self.jobs.get_owned_job(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                card_id=card_id,
+                job_id=job_id,
+            )
+            if current is None:
+                raise PortraitJobNotFoundError(
+                    "Image job disappeared before guarded submission"
+                )
+            if bool(current.get("is_terminal")):
+                return _projection(current)
+            rejected, won = await self._cas_or_winner(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                card_id=card_id,
+                job_id=job_id,
+                expected_revision=int(current.get("job_revision") or 0),
+                fields={
+                    "status": status,
+                    "is_terminal": True,
+                    "cleanup_pending": False,
+                    "late_cleanup_phase": None,
+                    "submit_count": 0,
+                    "completed_images": 0,
+                    "elapsed_seconds": self._elapsed_seconds(current),
+                    "failure": failure.model_dump(
+                        mode="json",
+                        exclude_computed_fields=True,
+                    ),
+                },
+            )
+            if won:
+                return _projection(rejected)
 
     async def _record_submit_failure(
         self,
@@ -2599,66 +2853,17 @@ class SingleImageJobService:
         )
         return _projection(completed)
 
-    async def start_job(
+    async def _start_resolved_job(
         self,
         *,
         scope: ImageJobScope,
         plan: ImageJobPlan,
-        provider_alias: str | None = None,
+        resolved: ResolvedImageProvider,
+        chosen_seed: int,
+        lineage_fields: dict[str, str],
+        submission_fence: ImageJobSubmissionFence | None,
     ) -> ImageJobProjection:
-        scope = scope.canonical()
-        if scope.usage != self.usage:
-            raise ValueError("Image job scope usage does not match the service")
         lineage = plan.illustration_lineage
-        lineage_fields: dict[str, str] = {}
-        if lineage is not None:
-            if scope.usage != "scene_illustration":
-                raise ValueError(
-                    "Illustration lineage requires scene_illustration usage"
-                )
-            if lineage.illustration_run_id != scope.subject_id:
-                raise ValueError(
-                    "Staged illustration subject_id must equal illustration_run_id"
-                )
-            lineage_fields = lineage.persisted_fields()
-            reserved_lineage_fields = {
-                "illustration_brief_id",
-                "illustration_run_id",
-                "pipeline_stage",
-                "parent_asset_id",
-            }
-            if reserved_lineage_fields & set(plan.persisted_fields):
-                raise ValueError("Illustration lineage fields are reserved")
-        if plan.seed is not None and (
-            type(plan.seed) is not int
-            or not 0 <= plan.seed <= (2**64 - 1)
-        ):
-            raise ValueError("seed must be an integer from 0 through 2^64-1")
-        active = await self.jobs.find_active_owned_job(
-            owner_id=scope.owner_id,
-            novel_id=scope.novel_id,
-            card_id=scope.subject_id,
-        )
-        if active is not None:
-            return _image_job_projection(active)
-        pending_cleanup = await self.jobs.find_pending_cleanup_owned_job(
-            owner_id=scope.owner_id,
-            novel_id=scope.novel_id,
-            card_id=scope.subject_id,
-        )
-        if pending_cleanup is not None:
-            return _image_job_projection(pending_cleanup)
-
-        chosen_seed = self._seed_factory() if plan.seed is None else plan.seed
-        if (
-            type(chosen_seed) is not int
-            or not 0 <= chosen_seed <= (2**64 - 1)
-        ):
-            raise ValueError("seed must be an integer from 0 through 2^64-1")
-        resolved = await self.provider_resolver.resolve(
-            usage=scope.usage,
-            provider_alias=provider_alias,
-        )
         idempotency_material = {
             "owner_id": scope.owner_id,
             "novel_id": scope.novel_id,
@@ -2736,26 +2941,79 @@ class SingleImageJobService:
         }
         if scope.usage == "character_portrait":
             document["character_card_id"] = scope.subject_id
-        try:
-            job = await self.jobs.create_job(document)
-        except Exception:
-            await resolved.aclose()
-            raise
-        if job.get("_was_created") is False:
-            await resolved.aclose()
-            return _image_job_projection(job)
 
-        request = ImageGenerationRequest(
-            usage=scope.usage,
-            slot_values={
-                **dict(plan.slot_values),
-                "seed": chosen_seed,
-            },
-            required_slots=plan.required_slots,
-        )
+        job: dict[str, Any] | None = None
+        created_by_this_call = False
+        provider_submit_started = False
         try:
+            create_task = asyncio.create_task(self.jobs.create_job(document))
             try:
+                job = await asyncio.shield(create_task)
+            except asyncio.CancelledError:
+                job = await asyncio.shield(create_task)
+                created_by_this_call = job.get("_was_created") is not False
+                raise
+            created_by_this_call = job.get("_was_created") is not False
+            if not created_by_this_call:
+                return _image_job_projection(job)
+
+            if submission_fence is not None:
+                bound = False
+                if self.submission_guard is not None:
+                    try:
+                        bound = await self.submission_guard.bind_job(
+                            owner_id=scope.owner_id,
+                            novel_id=scope.novel_id,
+                            card_id=scope.subject_id,
+                            job_id=_job_id(job),
+                            fence=submission_fence,
+                        )
+                    except Exception:
+                        bound = False
+                if not bound:
+                    rejected = await self._record_unsubmitted_failure(
+                        owner_id=scope.owner_id,
+                        novel_id=scope.novel_id,
+                        card_id=scope.subject_id,
+                        job_id=_job_id(job),
+                        status="cancelled",
+                        failure=ImageFailure(
+                            code="cancelled",
+                            message="批量立绘启动令牌已经失效",
+                            action=(
+                                "系统没有提交该图片；如仍需要，请重新准备批次"
+                            ),
+                        ),
+                    )
+                    return _without_portrait_fields(rejected)
+
+            request = ImageGenerationRequest(
+                usage=scope.usage,
+                slot_values={
+                    **dict(plan.slot_values),
+                    "seed": chosen_seed,
+                },
+                required_slots=plan.required_slots,
+                provider_expectation=(
+                    submission_fence.expected_provider
+                    if submission_fence is not None
+                    else None
+                ),
+            )
+            try:
+                provider_submit_started = True
                 handle = await resolved.provider.submit(request)
+            except ImageProviderPreSubmitError as error:
+                provider_submit_started = False
+                failed = await self._record_unsubmitted_failure(
+                    owner_id=scope.owner_id,
+                    novel_id=scope.novel_id,
+                    card_id=scope.subject_id,
+                    job_id=_job_id(job),
+                    status="failed",
+                    failure=error.failure,
+                )
+                return _without_portrait_fields(failed)
             except ImageProviderError as error:
                 failed = await self._record_submit_failure(
                     owner_id=scope.owner_id,
@@ -2778,7 +3036,7 @@ class SingleImageJobService:
                     ),
                 )
                 return _without_portrait_fields(failed)
-            attached = await self._attach_submitted_handle(
+            attached = await self._attach_returned_handle_durably(
                 owner_id=scope.owner_id,
                 novel_id=scope.novel_id,
                 card_id=scope.subject_id,
@@ -2788,8 +3046,113 @@ class SingleImageJobService:
                 provider=resolved.provider,
             )
             return _without_portrait_fields(attached)
+        except asyncio.CancelledError as cancelled:
+            if (
+                job is not None
+                and created_by_this_call
+                and not provider_submit_started
+            ):
+                try:
+                    await asyncio.shield(
+                        self._record_unsubmitted_failure(
+                            owner_id=scope.owner_id,
+                            novel_id=scope.novel_id,
+                            card_id=scope.subject_id,
+                            job_id=_job_id(job),
+                            status="cancelled",
+                            failure=ImageFailure(
+                                code="cancelled",
+                                message="图像任务在提交前被取消",
+                                action="系统没有提交该图片；可以安全地重新发起",
+                            ),
+                        )
+                    )
+                except Exception as cleanup_error:
+                    cancelled.add_note(
+                        "Failed to persist pre-submit cancellation: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+            raise
+
+    async def start_job(
+        self,
+        *,
+        scope: ImageJobScope,
+        plan: ImageJobPlan,
+        provider_alias: str | None = None,
+        submission_fence: ImageJobSubmissionFence | None = None,
+    ) -> ImageJobProjection:
+        scope = scope.canonical()
+        if scope.usage != self.usage:
+            raise ValueError("Image job scope usage does not match the service")
+        if submission_fence is not None and scope.usage != "character_portrait":
+            raise ValueError(
+                "Batch submission fencing is only valid for character portraits"
+            )
+        lineage = plan.illustration_lineage
+        lineage_fields: dict[str, str] = {}
+        if lineage is not None:
+            if scope.usage != "scene_illustration":
+                raise ValueError(
+                    "Illustration lineage requires scene_illustration usage"
+                )
+            if lineage.illustration_run_id != scope.subject_id:
+                raise ValueError(
+                    "Staged illustration subject_id must equal illustration_run_id"
+                )
+            lineage_fields = lineage.persisted_fields()
+            reserved_lineage_fields = {
+                "illustration_brief_id",
+                "illustration_run_id",
+                "pipeline_stage",
+                "parent_asset_id",
+            }
+            if reserved_lineage_fields & set(plan.persisted_fields):
+                raise ValueError("Illustration lineage fields are reserved")
+        if plan.seed is not None and (
+            type(plan.seed) is not int
+            or not 0 <= plan.seed <= (2**64 - 1)
+        ):
+            raise ValueError("seed must be an integer from 0 through 2^64-1")
+        active = await self.jobs.find_active_owned_job(
+            owner_id=scope.owner_id,
+            novel_id=scope.novel_id,
+            card_id=scope.subject_id,
+        )
+        if active is not None:
+            return _image_job_projection(active)
+        pending_cleanup = await self.jobs.find_pending_cleanup_owned_job(
+            owner_id=scope.owner_id,
+            novel_id=scope.novel_id,
+            card_id=scope.subject_id,
+        )
+        if pending_cleanup is not None:
+            return _image_job_projection(pending_cleanup)
+
+        chosen_seed = self._seed_factory() if plan.seed is None else plan.seed
+        if (
+            type(chosen_seed) is not int
+            or not 0 <= chosen_seed <= (2**64 - 1)
+        ):
+            raise ValueError("seed must be an integer from 0 through 2^64-1")
+        resolved = await self.provider_resolver.resolve(
+            usage=scope.usage,
+            provider_alias=provider_alias,
+        )
+        try:
+            return await self._start_resolved_job(
+                scope=scope,
+                plan=plan,
+                resolved=resolved,
+                chosen_seed=chosen_seed,
+                lineage_fields=lineage_fields,
+                submission_fence=submission_fence,
+            )
         finally:
-            await resolved.aclose()
+            try:
+                await asyncio.shield(resolved.aclose())
+            except Exception:
+                pass
 
     async def start(
         self,
@@ -2802,6 +3165,7 @@ class SingleImageJobService:
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
         portrait_batch_id: str | None = None,
+        submission_fence: ImageJobSubmissionFence | None = None,
     ) -> PortraitJobProjection:
         owner_id = _canonical_object_id(owner_id, field="owner_id")
         novel_id = _canonical_object_id(novel_id, field="novel_id")
@@ -2811,6 +3175,17 @@ class SingleImageJobService:
                 portrait_batch_id,
                 field="portrait_batch_id",
             )
+        if submission_fence is not None:
+            canonical_fence_batch_id = _canonical_object_id(
+                submission_fence.batch_id,
+                field="submission_fence.batch_id",
+            )
+            if portrait_batch_id != canonical_fence_batch_id:
+                raise ValueError(
+                    "Portrait batch id must match the submission fence"
+                )
+            if not submission_fence.start_claim_token:
+                raise ValueError("Batch submission fence token is required")
         if not prompt.appearance:
             raise ValueError("appearance must not be empty for a character portrait")
         if seed is not None and (
@@ -2835,6 +3210,16 @@ class SingleImageJobService:
                 raise PortraitBatchItemConflict(
                     "该角色已有不属于当前批次的立绘任务"
                 )
+            if (
+                submission_fence is not None
+                and str(
+                    active.get("portrait_batch_start_claim_token") or ""
+                )
+                != submission_fence.start_claim_token
+            ):
+                raise PortraitBatchItemConflict(
+                    "该角色已有不属于当前启动租约的立绘任务"
+                )
             return _projection(active)
         pending_cleanup = await self.jobs.find_pending_cleanup_owned_job(
             owner_id=owner_id,
@@ -2849,6 +3234,19 @@ class SingleImageJobService:
             ):
                 raise PortraitBatchItemConflict(
                     "该角色仍有不属于当前批次的立绘清理任务"
+                )
+            if (
+                submission_fence is not None
+                and str(
+                    pending_cleanup.get(
+                        "portrait_batch_start_claim_token"
+                    )
+                    or ""
+                )
+                != submission_fence.start_claim_token
+            ):
+                raise PortraitBatchItemConflict(
+                    "该角色仍有不属于当前启动租约的立绘清理任务"
                 )
             return _projection(pending_cleanup)
         current_anchor = await self.anchors.get_anchor(
@@ -2887,6 +3285,15 @@ class SingleImageJobService:
                         if portrait_batch_id is not None
                         else {}
                     ),
+                    **(
+                        {
+                            "portrait_batch_start_claim_token": (
+                                submission_fence.start_claim_token
+                            )
+                        }
+                        if submission_fence is not None
+                        else {}
+                    ),
                 },
                 idempotency_context={
                     "anchor_before": self._canonical_anchor(
@@ -2898,9 +3305,19 @@ class SingleImageJobService:
                         if portrait_batch_id is not None
                         else {}
                     ),
+                    **(
+                        {
+                            "portrait_batch_start_claim_token": (
+                                submission_fence.start_claim_token
+                            )
+                        }
+                        if submission_fence is not None
+                        else {}
+                    ),
                 },
             ),
             provider_alias=provider_alias,
+            submission_fence=submission_fence,
         )
         persisted = await self.jobs.get_owned_job(
             owner_id=owner_id,

@@ -28,10 +28,13 @@ from backend.services.image.comfyui_failures import (
 from backend.services.image.comfyui_template import (
     prepare_comfyui_template,
     render_comfyui_template,
+    stable_model_names,
 )
 from backend.services.image.contracts import (
     ImageArtifact,
     ImageCancelResult,
+    ImageFailure,
+    ImageFailureCode,
     ImageGenerationRequest,
     ImageInputAsset,
     ImageJobAudit,
@@ -39,6 +42,7 @@ from backend.services.image.contracts import (
     ImageOutputBindingSnapshot,
     ImagePollResult,
     ImageProviderError,
+    ImageProviderPreSubmitError,
 )
 from backend.services.novel.appearance_anchor import (
     RuntimeFingerprintSchema,
@@ -310,11 +314,42 @@ class ComfyUIProvider:
     async def submit(self, request: ImageGenerationRequest) -> ImageJobHandle:
         """只提交一次；排队护栏、上传和模板渲染都发生在 `/prompt` 之前。"""
 
-        prepared = prepare_comfyui_template(
-            self.config.workflow,
-            request,
-            template_root=self.template_root,
-        )
+        expectation = request.provider_expectation
+        try:
+            prepared = prepare_comfyui_template(
+                self.config.workflow,
+                request,
+                template_root=self.template_root,
+            )
+        except ImageProviderError as error:
+            raise ImageProviderPreSubmitError(error.failure) from error
+        if expectation is not None:
+            actual_model = stable_model_names(
+                prepared.loaded.checkpoint_names,
+                workflow_revision=prepared.loaded.revision,
+            )
+            changed = [
+                label
+                for label, expected, actual in (
+                    ("provider", expectation.alias, self.alias),
+                    ("model", expectation.model, actual_model),
+                    (
+                        "workflow_revision",
+                        expectation.workflow_revision,
+                        prepared.loaded.revision,
+                    ),
+                )
+                if expected != actual
+            ]
+            if changed:
+                raise ImageProviderPreSubmitError(
+                    ImageFailure(
+                        code=ImageFailureCode.WORKFLOW_VALIDATION_FAILED,
+                        message="图像后端配置已偏离已确认的冻结计划",
+                        action="重新核对 Provider、模型和 workflow 后再提交",
+                        details={"changed": changed},
+                    )
+                )
         try:
             queue = await self.client.get_queue()
             active_count = len(queue.running) + len(queue.pending)

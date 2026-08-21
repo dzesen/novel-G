@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import secrets
 import time
 from typing import Any, Callable, Literal, Protocol
 
@@ -24,8 +25,10 @@ from backend.services.image.character_portrait_service import (
     CharacterPortraitService,
     character_portrait_service,
 )
+from backend.services.image.contracts import ImageProviderExpectation
 from backend.services.image.single_image_job_service import (
     ConfiguredImageProviderResolver,
+    ImageJobSubmissionFence,
     ImageProviderSnapshot,
     PortraitConfigurationError,
     PortraitJobProjection,
@@ -36,6 +39,7 @@ from backend.services.novel.reference_card_service import ReferenceCardService
 
 MAX_PORTRAIT_BATCH_ITEMS = 64
 PORTRAIT_BATCH_PLAN_REVISION = "character-portrait-batch-plan-v1"
+PORTRAIT_BATCH_START_LEASE_SECONDS = 120
 
 PortraitBatchStatus = Literal[
     "running",
@@ -314,6 +318,7 @@ class PortraitExecutorProtocol(Protocol):
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
         portrait_batch_id: str | None = None,
+        submission_fence: ImageJobSubmissionFence | None = None,
     ) -> PortraitJobProjection: ...
 
     async def poll(
@@ -400,6 +405,53 @@ def _item_status_from_job(job: PortraitJobProjection) -> PortraitBatchItemStatus
     return "failed"
 
 
+def _item_from_job(
+    item: dict[str, Any],
+    job: PortraitJobProjection,
+) -> dict[str, Any]:
+    failure = _failure_from_job(job)
+    return {
+        **item,
+        "status": _item_status_from_job(job),
+        "job_id": job.job_id,
+        "job_status": job.status,
+        "job_revision": max(0, int(job.job_revision)),
+        "queue_position": job.queue_position,
+        "submit_count": max(0, int(job.submit_count)),
+        "completed_images": max(0, int(job.completed_images)),
+        "failure": (
+            failure.model_dump(mode="json") if failure is not None else None
+        ),
+        "start_claim_token": None,
+        "start_claimed_at_epoch": None,
+    }
+
+
+def _job_projection_is_stale(
+    item: dict[str, Any],
+    job: PortraitJobProjection,
+) -> bool:
+    stored_revision = item.get("job_revision")
+    return (
+        stored_revision is not None
+        and int(job.job_revision) < int(stored_revision)
+    )
+
+
+def _starting_lease_is_fresh(
+    item: dict[str, Any],
+    *,
+    now_epoch: float,
+) -> bool:
+    claimed_at = float(item.get("start_claimed_at_epoch") or 0)
+    return (
+        item.get("status") == "starting"
+        and bool(item.get("start_claim_token"))
+        and claimed_at > 0
+        and now_epoch - claimed_at < PORTRAIT_BATCH_START_LEASE_SECONDS
+    )
+
+
 def _counts(items: list[dict[str, Any]]) -> dict[str, int]:
     succeeded = sum(item.get("status") == "succeeded" for item in items)
     failed = sum(item.get("status") == "failed" for item in items)
@@ -433,6 +485,12 @@ def _projection(
         else None
     )
     started_at_epoch = float(document.get("started_at_epoch") or now_epoch)
+    finished_at_epoch = document.get("finished_at_epoch")
+    elapsed_at_epoch = (
+        float(finished_at_epoch)
+        if terminal and finished_at_epoch is not None
+        else now_epoch
+    )
     failure = document.get("failure")
     return PortraitBatchProjection(
         batch_id=_batch_id(document),
@@ -449,7 +507,7 @@ def _projection(
             int(document.get("unit_estimated_seconds") or 1),
         ),
         estimated_seconds=max(1, int(document.get("estimated_seconds") or 1)),
-        elapsed_seconds=max(0, int(now_epoch - started_at_epoch)),
+        elapsed_seconds=max(0, int(elapsed_at_epoch - started_at_epoch)),
         max_provider_requests=max(
             1,
             int(document.get("max_provider_requests") or len(items) or 1),
@@ -774,6 +832,8 @@ class CharacterPortraitBatchService:
                     "submit_count": 0,
                     "completed_images": 0,
                     "failure": None,
+                    "start_claim_token": None,
+                    "start_claimed_at_epoch": None,
                 }
                 for item in request.items
             ],
@@ -845,6 +905,48 @@ class CharacterPortraitBatchService:
             "finished_at_epoch": self._now_epoch(),
         }
 
+    async def _frozen_provider_failure(
+        self,
+        *,
+        batch: dict[str, Any],
+    ) -> PortraitBatchFailure | None:
+        try:
+            snapshot = await self.provider_inspector.inspect(
+                usage="character_portrait",
+                provider_alias=str(batch.get("provider_alias") or ""),
+            )
+        except Exception:
+            return PortraitBatchFailure(
+                code="batch_provider_snapshot_unavailable",
+                message="提交前无法重新核验已冻结的图像后端",
+                action="检查图像后端后重新准备批次；系统没有提交当前角色",
+                retryable=True,
+            )
+        if not snapshot.available:
+            return PortraitBatchFailure(
+                code="batch_provider_snapshot_unavailable",
+                message="已冻结的图像后端在提交前不可用",
+                action="恢复原图像后端后重新准备批次；系统没有提交当前角色",
+                retryable=True,
+            )
+        expected = (
+            str(batch.get("provider_alias") or ""),
+            str(batch.get("provider_model") or ""),
+            str(batch.get("workflow_revision") or ""),
+        )
+        actual = (
+            str(snapshot.alias or ""),
+            str(snapshot.model or ""),
+            str(snapshot.workflow_revision or ""),
+        )
+        if actual != expected:
+            return PortraitBatchFailure(
+                code="batch_provider_snapshot_changed",
+                message="图像后端、模型或 workflow 已偏离已确认的冻结计划",
+                action="重新打开批量立绘并核对新的 Provider、模型与 workflow",
+            )
+        return None
+
     async def _save(
         self,
         *,
@@ -880,31 +982,50 @@ class CharacterPortraitBatchService:
         index: int,
         job: PortraitJobProjection,
     ) -> PortraitBatchProjection:
-        items = [dict(item) for item in batch.get("items") or ()]
-        item = dict(items[index])
-        job_failure = _failure_from_job(job)
-        item.update(
-            {
-                "status": _item_status_from_job(job),
-                "job_id": job.job_id,
-                "job_status": job.status,
-                "queue_position": job.queue_position,
-                "submit_count": max(0, int(job.submit_count)),
-                "completed_images": max(0, int(job.completed_images)),
-                "failure": (
-                    job_failure.model_dump(mode="json")
-                    if job_failure is not None
-                    else None
-                ),
-            }
+        latest = await self.batches.get_owned_batch(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            batch_id=_batch_id(batch),
         )
-        items[index] = item
+        if latest is None:
+            raise PortraitBatchNotFoundError("批量立绘任务不存在")
+        if latest.get("is_terminal"):
+            return _projection(latest, now_epoch=self._now_epoch())
+        batch = latest
+        items = [dict(item) for item in batch.get("items") or ()]
+        if index >= len(items):
+            return _projection(batch, now_epoch=self._now_epoch())
+        current_index = max(0, int(batch.get("current_index") or 0))
+        existing_item = items[index]
+        if existing_item.get("status") in {
+            "succeeded",
+            "failed",
+            "cancelled",
+        }:
+            return _projection(batch, now_epoch=self._now_epoch())
+        existing_job_id = str(existing_item.get("job_id") or "")
+        if existing_job_id and existing_job_id != job.job_id:
+            return _projection(batch, now_epoch=self._now_epoch())
+        if _job_projection_is_stale(existing_item, job):
+            return _projection(batch, now_epoch=self._now_epoch())
+        if current_index > index and not job.terminal:
+            return _projection(batch, now_epoch=self._now_epoch())
+        projected_item = _item_from_job(existing_item, job)
+        projected_item["submit_count"] = max(
+            int(existing_item.get("submit_count") or 0),
+            int(projected_item.get("submit_count") or 0),
+        )
+        projected_item["completed_images"] = max(
+            int(existing_item.get("completed_images") or 0),
+            int(projected_item.get("completed_images") or 0),
+        )
+        items[index] = projected_item
         fields: dict[str, Any] = {
             "items": items,
             "status": "cancelling" if batch.get("cancel_requested") else "running",
         }
         if job.terminal:
-            next_index = index + 1
+            next_index = max(current_index, index + 1)
             fields["current_index"] = next_index
             if next_index >= len(items):
                 fields.update(
@@ -943,6 +1064,8 @@ class CharacterPortraitBatchService:
                     **items[index],
                     "status": "failed",
                     "failure": failure,
+                    "start_claim_token": None,
+                    "start_claimed_at_epoch": None,
                 }
         return {
             **self._terminal_fields(items=items, cancelled=False),
@@ -963,6 +1086,8 @@ class CharacterPortraitBatchService:
             **items[index],
             "status": "failed",
             "failure": failure.model_dump(mode="json"),
+            "start_claim_token": None,
+            "start_claimed_at_epoch": None,
         }
         next_index = index + 1
         fields: dict[str, Any] = {
@@ -991,6 +1116,7 @@ class CharacterPortraitBatchService:
         owner_id: str,
         novel_id: str,
         index: int,
+        start_claim_token: str | None = None,
     ) -> PortraitBatchProjection:
         items = [dict(item) for item in batch.get("items") or ()]
         item = items[index]
@@ -1016,6 +1142,55 @@ class CharacterPortraitBatchService:
                     job_id=str(recovered["_id"]),
                 )
             else:
+                if start_claim_token is None:
+                    return _projection(batch, now_epoch=self._now_epoch())
+                frozen_failure = await self._frozen_provider_failure(
+                    batch=batch,
+                )
+                latest = await self.batches.get_owned_batch(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    batch_id=_batch_id(batch),
+                )
+                if latest is None:
+                    raise PortraitBatchNotFoundError(
+                        "批量立绘任务不存在"
+                    )
+                if latest.get("is_terminal"):
+                    return _projection(latest, now_epoch=self._now_epoch())
+                latest_items = [
+                    dict(candidate) for candidate in latest.get("items") or ()
+                ]
+                if (
+                    index >= len(latest_items)
+                    or latest_items[index].get("status") != "starting"
+                    or str(
+                        latest_items[index].get("start_claim_token") or ""
+                    )
+                    != start_claim_token
+                ):
+                    return _projection(latest, now_epoch=self._now_epoch())
+                if latest.get("cancel_requested"):
+                    latest_items = self._cancel_remaining(
+                        latest_items,
+                        start=index,
+                    )
+                    updated = await self._save(
+                        batch=latest,
+                        owner_id=owner_id,
+                        novel_id=novel_id,
+                        fields=self._terminal_fields(
+                            items=latest_items,
+                            cancelled=True,
+                        ),
+                    )
+                    return _projection(
+                        updated,
+                        now_epoch=self._now_epoch(),
+                    )
+                batch = latest
+                items = latest_items
+                item = items[index]
                 counts = _counts(items)
                 if counts["submitted_requests"] >= int(
                     batch["max_provider_requests"]
@@ -1031,6 +1206,14 @@ class CharacterPortraitBatchService:
                         fields=fields,
                     )
                     return _projection(updated, now_epoch=self._now_epoch())
+                if frozen_failure is not None:
+                    return await self._record_item_failure(
+                        batch=batch,
+                        owner_id=owner_id,
+                        novel_id=novel_id,
+                        index=index,
+                        failure=frozen_failure,
+                    )
                 raw_seed = item.get("seed")
                 job = await self.portraits.start(
                     owner_id=owner_id,
@@ -1041,6 +1224,17 @@ class CharacterPortraitBatchService:
                     provider_alias=str(batch["provider_alias"]),
                     confirm_anchor_reset=False,
                     portrait_batch_id=_batch_id(batch),
+                    submission_fence=ImageJobSubmissionFence(
+                        batch_id=_batch_id(batch),
+                        start_claim_token=start_claim_token,
+                        expected_provider=ImageProviderExpectation(
+                            alias=str(batch["provider_alias"]),
+                            model=str(batch["provider_model"]),
+                            workflow_revision=str(
+                                batch["workflow_revision"]
+                            ),
+                        ),
+                    ),
                 )
         except Exception as error:
             return await self._record_item_failure(
@@ -1108,8 +1302,21 @@ class CharacterPortraitBatchService:
                     continue
                 batch = updated
                 continue
-            if status == "pending":
-                items[index] = {**items[index], "status": "starting"}
+            start_claim_token: str | None = None
+            if status == "pending" or (
+                status == "starting"
+                and not _starting_lease_is_fresh(
+                    items[index],
+                    now_epoch=self._now_epoch(),
+                )
+            ):
+                start_claim_token = secrets.token_hex(16)
+                items[index] = {
+                    **items[index],
+                    "status": "starting",
+                    "start_claim_token": start_claim_token,
+                    "start_claimed_at_epoch": self._now_epoch(),
+                }
                 claimed = await self.batches.compare_and_update_owned_batch(
                     owner_id=owner_id,
                     novel_id=novel_id,
@@ -1125,6 +1332,7 @@ class CharacterPortraitBatchService:
                 owner_id=owner_id,
                 novel_id=novel_id,
                 index=index,
+                start_claim_token=start_claim_token,
             )
         return await self.get(
             owner_id=owner_id,
@@ -1145,6 +1353,8 @@ class CharacterPortraitBatchService:
                     **items[index],
                     "status": "cancelled",
                     "failure": failure,
+                    "start_claim_token": None,
+                    "start_claimed_at_epoch": None,
                 }
         return items
 
@@ -1185,6 +1395,11 @@ class CharacterPortraitBatchService:
         if not job_id and recovered is not None:
             job_id = str(recovered["_id"])
         if not job_id:
+            if _starting_lease_is_fresh(
+                item,
+                now_epoch=self._now_epoch(),
+            ):
+                return _projection(batch, now_epoch=self._now_epoch())
             items = self._cancel_remaining(items, start=index)
             updated = await self._save(
                 batch=batch,
@@ -1217,22 +1432,10 @@ class CharacterPortraitBatchService:
                 },
             )
             return _projection(updated, now_epoch=self._now_epoch())
+        if _job_projection_is_stale(item, job):
+            return _projection(batch, now_epoch=self._now_epoch())
         if not job.terminal:
-            job_failure = _failure_from_job(job)
-            items[index] = {
-                **item,
-                "status": "running",
-                "job_id": job.job_id,
-                "job_status": job.status,
-                "queue_position": job.queue_position,
-                "submit_count": max(0, int(job.submit_count)),
-                "completed_images": max(0, int(job.completed_images)),
-                "failure": (
-                    job_failure.model_dump(mode="json")
-                    if job_failure is not None
-                    else None
-                ),
-            }
+            items[index] = _item_from_job(item, job)
             updated = await self._save(
                 batch=batch,
                 owner_id=owner_id,
@@ -1241,21 +1444,7 @@ class CharacterPortraitBatchService:
             )
             return _projection(updated, now_epoch=self._now_epoch())
 
-        job_failure = _failure_from_job(job)
-        items[index] = {
-            **item,
-            "status": _item_status_from_job(job),
-            "job_id": job.job_id,
-            "job_status": job.status,
-            "queue_position": job.queue_position,
-            "submit_count": max(0, int(job.submit_count)),
-            "completed_images": max(0, int(job.completed_images)),
-            "failure": (
-                job_failure.model_dump(mode="json")
-                if job_failure is not None
-                else None
-            ),
-        }
+        items[index] = _item_from_job(item, job)
         items = self._cancel_remaining(items, start=index + 1)
         updated = await self._save(
             batch=batch,

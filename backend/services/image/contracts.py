@@ -86,6 +86,10 @@ class ImageProviderError(RuntimeError):
         self.failure = failure
 
 
+class ImageProviderPreSubmitError(ImageProviderError):
+    """A provider rejected locally before issuing any external request."""
+
+
 class ImageInputAsset(_ContractModel):
     """仅驻留内存、供 ComfyUI 上传的参考图。"""
 
@@ -103,10 +107,19 @@ class ImageInputAsset(_ContractModel):
 ImageSlotValue = str | int | float | bool | None | ImageInputAsset
 
 
+class ImageProviderExpectation(_ContractModel):
+    """Frozen provider facts that must match the concrete submit payload."""
+
+    alias: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    workflow_revision: str = Field(min_length=1)
+
+
 class ImageGenerationRequest(_ContractModel):
     usage: Literal["character_portrait", "cover", "scene_illustration"]
     slot_values: dict[str, ImageSlotValue] = Field(default_factory=dict)
     required_slots: frozenset[str] = Field(default_factory=frozenset)
+    provider_expectation: ImageProviderExpectation | None = None
 
     @model_validator(mode="after")
     def validate_slot_names(self) -> "ImageGenerationRequest":

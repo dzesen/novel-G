@@ -9,6 +9,7 @@ from typing import Any, Callable, Protocol
 
 from backend.db.errors import NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
+from backend.db.repositories.image_batch_repository import image_batch_repo
 from backend.db.repositories.image_job_repository import image_job_repo
 from backend.db.utils import get_utc_now
 from backend.services.image.managed_assets import (
@@ -21,6 +22,8 @@ from backend.services.image.single_image_job_service import (
     ConfiguredImageProviderResolver,
     ImageAssetMetadataRepositoryProtocol,
     ImageJobRepositoryProtocol,
+    ImageJobSubmissionFence,
+    ImageJobSubmissionGuardProtocol,
     ImageProviderResolverProtocol,
     ImageProviderSnapshot,
     ManagedAssetReaderProtocol,
@@ -50,6 +53,42 @@ class ChapterLookupProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class PortraitBatchBindingRepositoryProtocol(Protocol):
+    async def bind_starting_portrait_job(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        batch_id: str,
+        card_id: str,
+        start_claim_token: str,
+        job_id: str,
+    ) -> bool: ...
+
+
+class RepositoryPortraitBatchSubmissionGuard:
+    def __init__(self, batches: PortraitBatchBindingRepositoryProtocol) -> None:
+        self.batches = batches
+
+    async def bind_job(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        card_id: str,
+        job_id: str,
+        fence: ImageJobSubmissionFence,
+    ) -> bool:
+        return await self.batches.bind_starting_portrait_job(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            batch_id=fence.batch_id,
+            card_id=card_id,
+            start_claim_token=fence.start_claim_token,
+            job_id=job_id,
+        )
+
+
 class AppearanceAnchorInUseError(RuntimeError):
     def __init__(
         self,
@@ -75,6 +114,7 @@ class CharacterPortraitService:
         jobs: ImageJobRepositoryProtocol,
         anchors: AppearanceAnchorGatewayProtocol,
         provider_resolver: ImageProviderResolverProtocol,
+        submission_guard: ImageJobSubmissionGuardProtocol | None = None,
         asset_consumer: ImagePollAssetConsumer | None = None,
         asset_reader: ManagedAssetReaderProtocol | None = None,
         asset_repository: ImageAssetMetadataRepositoryProtocol | None = None,
@@ -90,6 +130,7 @@ class CharacterPortraitService:
             jobs=jobs,
             anchors=anchors,
             provider_resolver=provider_resolver,
+            submission_guard=submission_guard,
             usage="character_portrait",
             asset_consumer=asset_consumer,
             asset_reader=asset_reader,
@@ -228,6 +269,7 @@ class CharacterPortraitService:
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
         portrait_batch_id: str | None = None,
+        submission_fence: ImageJobSubmissionFence | None = None,
     ) -> PortraitJobProjection:
         return await self._jobs.start(
             owner_id=owner_id,
@@ -238,6 +280,7 @@ class CharacterPortraitService:
             provider_alias=provider_alias,
             confirm_anchor_reset=confirm_anchor_reset,
             portrait_batch_id=portrait_batch_id,
+            submission_fence=submission_fence,
         )
 
     async def poll(
@@ -275,6 +318,9 @@ character_portrait_service = CharacterPortraitService(
     jobs=image_job_repo,
     anchors=ReferenceCardAppearanceAnchorGateway(),
     provider_resolver=ConfiguredImageProviderResolver(),
+    submission_guard=RepositoryPortraitBatchSubmissionGuard(
+        image_batch_repo
+    ),
     chapters=chapter_repo,
     now=get_utc_now,
 )
