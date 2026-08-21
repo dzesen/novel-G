@@ -1255,20 +1255,23 @@ def _equal_except_card_spec(left: Any, right: Any) -> bool:
     return _json_values_equal(left_content, right_content)
 
 
-def _nonconforming_v3_matches_v2_chara(ccv3: Any, chara: Any) -> bool:
-    """Allow a V2 fallback only when V3-only metadata is safely discardable."""
+def _v2_fallback_raw_card_with_v3_metadata(
+    ccv3: Any,
+    chara: Any,
+) -> dict[str, Any] | None:
+    """Return a V2 raw card only when bounded V3 metadata can be preserved."""
 
     if not isinstance(ccv3, dict) or not isinstance(chara, dict):
-        return False
+        return None
     if (
         ccv3.get("spec") != "chara_card_v3"
         or ccv3.get("spec_version") != "3.0"
     ):
-        return False
+        return None
     ccv3_data = ccv3.get("data")
     chara_data = chara.get("data")
     if not isinstance(ccv3_data, dict) or not isinstance(chara_data, dict):
-        return False
+        return None
 
     v2_data_keys = {
         *_CARD_REQUIRED_STRINGS,
@@ -1282,23 +1285,23 @@ def _nonconforming_v3_matches_v2_chara(ccv3: Any, chara: Any) -> bool:
         "group_only_greetings",
         "source",
     }:
-        return False
+        return None
 
     extra_keys = ccv3_data.keys() - chara_data.keys()
     if not extra_keys <= {"group_only_greetings", "source"}:
-        return False
+        return None
     if chara_data.keys() - ccv3_data.keys():
-        return False
+        return None
     if (
         "group_only_greetings" in ccv3_data
         and ccv3_data["group_only_greetings"] != []
     ):
-        return False
+        return None
     if "source" in ccv3_data and (
         not isinstance(ccv3_data["source"], list)
         or any(not isinstance(item, str) for item in ccv3_data["source"])
     ):
-        return False
+        return None
 
     normalized = deepcopy(ccv3)
     normalized["spec"] = "chara_card_v2"
@@ -1306,7 +1309,16 @@ def _nonconforming_v3_matches_v2_chara(ccv3: Any, chara: Any) -> bool:
     normalized_data = normalized["data"]
     for key in extra_keys:
         normalized_data.pop(key)
-    return _json_values_equal(normalized, chara)
+    if not _json_values_equal(normalized, chara):
+        return None
+
+    preserved = deepcopy(chara)
+    preserved_data = preserved["data"]
+    for key in ("source", "group_only_greetings"):
+        if key in ccv3_data:
+            preserved_data[key] = deepcopy(ccv3_data[key])
+    _validate_resource_limits(preserved)
+    return preserved
 
 
 def _json_values_equal(left: Any, right: Any) -> bool:
@@ -1444,9 +1456,14 @@ class CharacterCardAdapter:
                     f"chara 对照块不是有效 V2：{v2_error.message}",
                 ) from v2_error
 
-            if _equal_except_card_spec(
-                ccv3, chara
-            ) and _nonconforming_v3_matches_v2_chara(ccv3, chara):
+            fallback_raw_card = _v2_fallback_raw_card_with_v3_metadata(
+                ccv3,
+                chara,
+            )
+            if (
+                _equal_except_card_spec(ccv3, chara)
+                and fallback_raw_card is not None
+            ):
                 v2_content = deepcopy(_require_object(ccv3, ccv3_path))
                 v2_content["spec"] = "chara_card_v2"
                 v2_content["spec_version"] = "2.0"
@@ -1460,10 +1477,10 @@ class CharacterCardAdapter:
                     raw_card=_require_object(ccv3, ccv3_path),
                 )
 
-            if _nonconforming_v3_matches_v2_chara(ccv3, chara):
+            if fallback_raw_card is not None:
                 warning = (
                     "ccv3 未通过 V3 严格校验；已核对共享字段一致并采用 chara（V2），"
-                    "未使用 ccv3 专有字段"
+                    "来源仅隔离保留，不参与安全字段映射"
                 )
                 parsed_chara = replace(
                     parsed_chara,
@@ -1480,6 +1497,7 @@ class CharacterCardAdapter:
                         "ccv3 未通过 V3 严格校验；共享字段一致，"
                         "已安全采用 chara（V2）"
                     ),
+                    raw_card=fallback_raw_card,
                 )
 
             raise CharacterCardValidationError(
