@@ -522,6 +522,28 @@ class GenerationRuntime:
         if callable(release):
             await release(attempt_id, reason)
 
+    async def _account_paid_attempt(
+        self,
+        attempt_id: str,
+        observed_usage: TokenUsage,
+        conservative_tokens: int | None,
+    ) -> None:
+        account_observed = getattr(
+            self._attempt_scope,
+            "account_with_observed_usage",
+            None,
+        )
+        if callable(account_observed):
+            await account_observed(attempt_id, observed_usage.model_copy())
+            return
+        await self._attempt_scope.account(
+            attempt_id,
+            _conservative_attempt_usage(
+                observed_usage,
+                conservative_tokens,
+            ),
+        )
+
     async def _paid_call(
         self,
         plan: GenerationPlan,
@@ -561,12 +583,10 @@ class GenerationRuntime:
                 # not reuse a previous call's last_usage projection.
                 usage = _usage_snapshot(getattr(adapter, "last_usage", None))
             if _usage_has_any_value(usage) or response_is_known:
-                await self._attempt_scope.account(
+                await self._account_paid_attempt(
                     attempt_id,
-                    _conservative_attempt_usage(
-                        usage,
-                        conservative_tokens,
-                    ),
+                    usage,
+                    conservative_tokens,
                 )
             else:
                 await self._attempt_scope.mark_uncertain(attempt_id, "request failed without usage")
@@ -575,9 +595,10 @@ class GenerationRuntime:
         usage = _usage_delta(total_before, total_after)
         if not _usage_has_any_value(usage):
             usage = _usage_snapshot(getattr(adapter, "last_usage", None))
-        await self._attempt_scope.account(
+        await self._account_paid_attempt(
             attempt_id,
-            _conservative_attempt_usage(usage, conservative_tokens),
+            usage,
+            conservative_tokens,
         )
         return value
 
