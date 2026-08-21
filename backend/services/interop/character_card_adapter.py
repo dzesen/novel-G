@@ -1255,6 +1255,60 @@ def _equal_except_card_spec(left: Any, right: Any) -> bool:
     return _json_values_equal(left_content, right_content)
 
 
+def _nonconforming_v3_matches_v2_chara(ccv3: Any, chara: Any) -> bool:
+    """Allow a V2 fallback only when V3-only metadata is safely discardable."""
+
+    if not isinstance(ccv3, dict) or not isinstance(chara, dict):
+        return False
+    if (
+        ccv3.get("spec") != "chara_card_v3"
+        or ccv3.get("spec_version") != "3.0"
+    ):
+        return False
+    ccv3_data = ccv3.get("data")
+    chara_data = chara.get("data")
+    if not isinstance(ccv3_data, dict) or not isinstance(chara_data, dict):
+        return False
+
+    v2_data_keys = {
+        *_CARD_REQUIRED_STRINGS,
+        "alternate_greetings",
+        "tags",
+        "extensions",
+        "character_book",
+    }
+    if not ccv3_data.keys() <= {
+        *v2_data_keys,
+        "group_only_greetings",
+        "source",
+    }:
+        return False
+
+    extra_keys = ccv3_data.keys() - chara_data.keys()
+    if not extra_keys <= {"group_only_greetings", "source"}:
+        return False
+    if chara_data.keys() - ccv3_data.keys():
+        return False
+    if (
+        "group_only_greetings" in ccv3_data
+        and ccv3_data["group_only_greetings"] != []
+    ):
+        return False
+    if "source" in ccv3_data and (
+        not isinstance(ccv3_data["source"], list)
+        or any(not isinstance(item, str) for item in ccv3_data["source"])
+    ):
+        return False
+
+    normalized = deepcopy(ccv3)
+    normalized["spec"] = "chara_card_v2"
+    normalized["spec_version"] = "2.0"
+    normalized_data = normalized["data"]
+    for key in extra_keys:
+        normalized_data.pop(key)
+    return _json_values_equal(normalized, chara)
+
+
 def _json_values_equal(left: Any, right: Any) -> bool:
     if isinstance(left, bool) or isinstance(right, bool):
         return isinstance(left, bool) and isinstance(right, bool) and left == right
@@ -1375,13 +1429,6 @@ class CharacterCardAdapter:
 
             chara = _decode_png_card_chunk(chunks["chara"], keyword="chara")
             chara_path = _png_text_path(chunks["chara"].chunk_type, "chara")
-            if not _equal_except_card_spec(ccv3, chara):
-                raise CharacterCardValidationError(
-                    "malformed_v3_chunk",
-                    ccv3_path,
-                    f"ccv3 未通过 V3 严格校验且与 chara 有实质差异：{v3_error.message}",
-                ) from v3_error
-
             try:
                 parsed_chara = cls.parse(chara, source_container="png")
                 if parsed_chara.source_format != "v2":
@@ -1390,24 +1437,56 @@ class CharacterCardAdapter:
                         f"{chara_path}.spec",
                         "伪 V3 的 chara 对照块必须是 V2",
                     )
-                v2_content = deepcopy(_require_object(ccv3, ccv3_path))
-                v2_content["spec"] = "chara_card_v2"
-                v2_content["spec_version"] = "2.0"
-                parsed_v2 = cls.parse(v2_content, source_container="png")
             except CharacterCardValidationError as v2_error:
                 raise CharacterCardValidationError(
                     "malformed_v3_chunk",
                     ccv3_path,
-                    f"spec 改写块的内容也不是有效 V2：{v2_error.message}",
+                    f"chara 对照块不是有效 V2：{v2_error.message}",
                 ) from v2_error
 
-            return _with_png_preview(
-                parsed_v2,
-                selected_chunk="ccv3",
-                classification="pseudo_v3",
-                label="采用 ccv3，但内容实为 V2（酒馆导出的 spec 改写块）",
-                raw_card=_require_object(ccv3, ccv3_path),
-            )
+            if _equal_except_card_spec(
+                ccv3, chara
+            ) and _nonconforming_v3_matches_v2_chara(ccv3, chara):
+                v2_content = deepcopy(_require_object(ccv3, ccv3_path))
+                v2_content["spec"] = "chara_card_v2"
+                v2_content["spec_version"] = "2.0"
+                parsed_v2 = cls.parse(v2_content, source_container="png")
+
+                return _with_png_preview(
+                    parsed_v2,
+                    selected_chunk="ccv3",
+                    classification="pseudo_v3",
+                    label="采用 ccv3，但内容实为 V2（酒馆导出的 spec 改写块）",
+                    raw_card=_require_object(ccv3, ccv3_path),
+                )
+
+            if _nonconforming_v3_matches_v2_chara(ccv3, chara):
+                warning = (
+                    "ccv3 未通过 V3 严格校验；已核对共享字段一致并采用 chara（V2），"
+                    "未使用 ccv3 专有字段"
+                )
+                parsed_chara = replace(
+                    parsed_chara,
+                    compatibility_warnings=(
+                        *parsed_chara.compatibility_warnings,
+                        warning,
+                    ),
+                )
+                return _with_png_preview(
+                    parsed_chara,
+                    selected_chunk="chara",
+                    classification="v2",
+                    label=(
+                        "ccv3 未通过 V3 严格校验；共享字段一致，"
+                        "已安全采用 chara（V2）"
+                    ),
+                )
+
+            raise CharacterCardValidationError(
+                "malformed_v3_chunk",
+                ccv3_path,
+                f"ccv3 未通过 V3 严格校验且与 chara 有实质差异：{v3_error.message}",
+            ) from v3_error
 
         return _with_png_preview(
             parsed_v3,
