@@ -23,6 +23,7 @@ from backend.services.llm.generation_runtime import (
     ExplicitProviderTarget,
     GenerationTarget,
     PromptPlan,
+    WorkflowStepTarget,
 )
 
 
@@ -660,7 +661,14 @@ class AgentOrchestrator:
 
         resolved_target: GenerationTarget = target
         if profile.provider_alias:
-            resolved_target = ExplicitProviderTarget(profile.provider_alias)
+            if isinstance(target, WorkflowStepTarget):
+                resolved_target = WorkflowStepTarget(
+                    target.workflow_name,
+                    target.step_name,
+                    provider_alias=profile.provider_alias,
+                )
+            else:
+                resolved_target = ExplicitProviderTarget(profile.provider_alias)
         plan = self.runtime.plan_structured(resolved_target)
         profiled_prompts = PromptPlan(
             native_schema_prompt=apply_resolved_agent_profile(

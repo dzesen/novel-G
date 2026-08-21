@@ -113,6 +113,7 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
             WorkflowStepDefinition(
                 name="direction",
                 label_key="settings.workflow.steps.direction",
+                thinking_mode="disabled",
             ),
         ),
     ),

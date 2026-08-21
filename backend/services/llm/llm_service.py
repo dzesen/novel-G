@@ -184,10 +184,12 @@ class LLMService:
     ) -> str:
         """请求 Provider 的 JSON Object 模式并返回原始 JSON 文本。"""
         self._begin_request()
+        metadata = dict(kwargs.pop("metadata", None) or {})
+        metadata["structured_output"] = "json_object"
         request = self._make_request(
             prompt,
             system_prompt,
-            metadata={"structured_output": "json_object"},
+            metadata=metadata,
             **kwargs,
         )
         async with _provider_request_slot(self._provider_name, self._max_concurrency):
