@@ -272,8 +272,6 @@ async def recover_bound_mutation_revision(
         or command.idempotency_key != normalized_key
         or command.operation != normalized_operation
         or type(command.expected_narrative_revision) is not int
-        or command.expected_narrative_revision
-        != frozen.expected_narrative_revision
     ):
         raise MutationConflictError("The persisted mutation identity diverged")
     payload = command.payload
@@ -282,6 +280,7 @@ async def recover_bound_mutation_revision(
         or str(payload.get("chapter_id") or "") != frozen.chapter_id
     ):
         raise MutationConflictError("The persisted mutation chapter diverged")
+    authoritative_binding = frozen
     if normalized_operation == "accept_chapter_outline":
         expected_key = (
             f"candidate-job-outline:{frozen.job_id}:{frozen.chapter_id}"
@@ -298,10 +297,14 @@ async def recover_bound_mutation_revision(
             raise MutationConflictError(
                 "The persisted outline mutation Job binding is invalid"
             ) from exc
-        if stored_binding != frozen:
+        stable_fields = {"expected_narrative_revision"}
+        if stored_binding.model_dump(exclude=stable_fields) != frozen.model_dump(
+            exclude=stable_fields
+        ):
             raise MutationConflictError(
                 "The persisted outline mutation belongs to another Job authorization"
             )
+        authoritative_binding = stored_binding
     elif normalized_operation == "accept_chapter_state":
         proposal_claim = payload.get("proposal_claim")
         raw_binding = (
@@ -371,6 +374,11 @@ async def recover_bound_mutation_revision(
             raise MutationConflictError(
                 "The persisted finalization belongs to another Job authorization"
             )
+    if (
+        command.expected_narrative_revision
+        != authoritative_binding.expected_narrative_revision
+    ):
+        raise MutationConflictError("The persisted mutation identity diverged")
     stored_digest = journal.get("command_digest")
     if stored_digest is not None and (
         not isinstance(stored_digest, str)
