@@ -2612,10 +2612,14 @@ class GenerationJobService:
             authorization_confirmation_required = bool(
                 job.get("authorization_confirmation_required")
             )
+            source_change_requires_reauthorization = (
+                job.get("pause_reason") == "source_changed"
+            )
             authorization_settings_changed = (
                 prose_continuation_policy is not None
                 or token_budget_provided
                 or authorization_confirmation_required
+                or source_change_requires_reauthorization
                 or (
                     authorization_ruleset_changed
                     and not (confirm_uncertain_retry or skip_uncertain)

@@ -141,7 +141,11 @@ export default function ResumeJobDialog({
               {t("resumeReadinessTitle")}
             </h3>
             <p className="mt-1 text-xs leading-5 text-muted">
-              {t("resumeReadinessDescription")}
+              {t(
+                job.pause_reason === "source_changed"
+                  ? "resumeReadinessSourceChangedDescription"
+                  : "resumeReadinessDescription",
+              )}
             </p>
           </div>
           <button

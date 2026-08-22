@@ -428,6 +428,18 @@ export default function CheckpointReview({
           )}
         </h3>
         <div className="flex flex-wrap justify-end gap-2">
+          {job.pause_reason === "source_changed"
+            && !requiresSuccessor
+            && currentStopChapterId ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onPress={() => onJumpToChapter(currentStopChapterId)}
+                isDisabled={busy}
+              >
+                {t("sourceChangedOpenChapter")}
+              </Button>
+            ) : null}
           <Button variant="outline" size="sm" onPress={onAbort} isDisabled={busy}>
             {t("abort")}
           </Button>
@@ -470,7 +482,7 @@ export default function CheckpointReview({
             <Button
               variant="primary"
               size="sm"
-              className="bg-accent text-white hover:bg-accent-hover"
+              className="max-w-full whitespace-normal bg-accent text-white hover:bg-accent-hover"
               onPress={onResume}
               isDisabled={busy}
             >

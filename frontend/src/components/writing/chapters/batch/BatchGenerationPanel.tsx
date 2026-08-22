@@ -290,6 +290,7 @@ export default function BatchGenerationPanel({
     if (
       job.pause_reason === "cost_cap"
       || job.pause_reason === "authorization_scope_increased"
+      || job.pause_reason === "source_changed"
     ) {
       setResumeReviewOpen(true);
       return;

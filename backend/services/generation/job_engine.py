@@ -467,6 +467,16 @@ async def _handle_chapter_failure(
                 "chapter_id": chapter_id,
                 "message": "Source changed during generation",
                 "attempts": attempts,
+                "reason_codes": [
+                    "narrative_revision_changed",
+                    "reauthorization_required",
+                ],
+            },
+            "authorization_confirmation_required": {
+                "status": "source_changed",
+                "requires_confirmation": True,
+                "chapter_id": chapter_id,
+                "code": "chapter_or_narrative_changed",
             },
         })
         return
@@ -556,6 +566,10 @@ async def _handle_candidate_chapter_failure(
         },
     }
     if source_changed:
+        fields["error"]["reason_codes"] = [
+            "narrative_revision_changed",
+            "successor_required" if preserve else "reauthorization_required",
+        ]
         fields["authorization_confirmation_required"] = {
             "status": "source_changed",
             "requires_confirmation": True,
