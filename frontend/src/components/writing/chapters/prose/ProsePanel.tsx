@@ -27,6 +27,12 @@ import {
   proseReasonTranslationKey,
   proseRequiresPartialAcknowledgement,
 } from "./prosePresentation";
+import {
+  buildProseDiscardPayload,
+  proseRunActionsBlocked,
+  proseRunConfirmationResetRequired,
+  submitProseRunMutation,
+} from "./proseRunMutation";
 import ProseContinuationControls from "./ProseContinuationControls";
 import {
   DEFAULT_PROSE_CONTINUATION_POLICY,
@@ -62,6 +68,7 @@ export default function ProsePanel({
   const t = useTranslations("writing.prose");
   const stream = useProseStream();
   const hydrateRun = stream.hydrate;
+  const resetStream = stream.reset;
   const [params, setParams] = useState<GenerationParams>(EMPTY_GENERATION_PARAMS);
   const [continuationPolicy, setContinuationPolicy] =
     useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
@@ -77,11 +84,25 @@ export default function ProsePanel({
   const [uncertainRetryArmed, setUncertainRetryArmed] = useState(false);
   const [restoreLoading, setRestoreLoading] = useState(true);
   const [accepting, setAccepting] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
   const [actionError, setActionError] = useState("");
+  const [syncError, setSyncError] = useState("");
+  const [syncNotice, setSyncNotice] = useState("");
+  const [conflictRequiresSync, setConflictRequiresSync] = useState(false);
   const [initialRunResolved, setInitialRunResolved] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
 
   const running = stream.status === "running";
+  const mutationPending = accepting || discarding;
+  const runActionsBlocked = proseRunActionsBlocked({
+    restoreLoading,
+    streamStatus: stream.status,
+    conflictRequiresSync,
+    mutationPending,
+  });
+  const manualSyncRequired = !restoreLoading && (
+    conflictRequiresSync || stream.status === "cancelled"
+  );
   const hasText = stream.text.length > 0;
   const incomplete = hasText && (
     stream.status === "cancelled"
@@ -149,19 +170,27 @@ export default function ProsePanel({
     };
   }, []);
 
-  const restoreActive = useCallback(async () => {
+  const restoreActive = useCallback(async ({
+    clearWhenMissing = false,
+  }: {
+    clearWhenMissing?: boolean;
+  } = {}): Promise<ProseRunSnapshot | null> => {
     setRestoreLoading(true);
     try {
       const run = await apiGet<ProseRunSnapshot | null>(
         `/api/llm/prose-runs/chapter/${chapterId}`,
       );
-      if (run) hydrateRun(run);
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
+      if (run) {
+        hydrateRun(run);
+      } else if (clearWhenMissing) {
+        resetStream();
+      }
+      setConflictRequiresSync(false);
+      return run;
     } finally {
       setRestoreLoading(false);
     }
-  }, [chapterId, hydrateRun]);
+  }, [chapterId, hydrateRun, resetStream]);
 
   useEffect(() => {
     if (initialRun) {
@@ -169,16 +198,43 @@ export default function ProsePanel({
       setRestoreLoading(false);
       return;
     }
-    void restoreActive();
+    void restoreActive().catch((error: unknown) => {
+      setActionError(error instanceof Error ? error.message : String(error));
+    });
   }, [hydrateRun, initialRun, restoreActive]);
 
   useEffect(() => {
-    if (stream.status === "cancelled") void restoreActive();
-  }, [restoreActive, stream.status]);
+    if (stream.status !== "cancelled") return;
+    setSyncError("");
+    setSyncNotice("");
+    void restoreActive({ clearWhenMissing: true }).catch(() => {
+      setSyncError(t("restoreFailed"));
+    });
+  }, [restoreActive, stream.status, t]);
+
+  const retryRunSync = async () => {
+    setSyncError("");
+    setSyncNotice("");
+    try {
+      await restoreActive({ clearWhenMissing: true });
+      setSyncNotice(t("syncComplete"));
+    } catch {
+      setSyncError(t("restoreFailed"));
+    }
+  };
+
+  const resetRunConfirmationLocks = () => {
+    setPartialArmed(false);
+    setOverwriteArmed(false);
+    setUncertainRetryArmed(false);
+  };
 
   const accept = async () => {
-    if (!hasText || running) return;
+    if (!hasText || running || runActionsBlocked) return;
+    const runId = stream.runId;
+    const runRevision = stream.runRevision;
     setActionError("");
+    setSyncNotice("");
     if (selectedInitialRun?.can_accept_partial === false) {
       setActionError(t("leftoverAcceptUnavailable"));
       return;
@@ -191,22 +247,38 @@ export default function ProsePanel({
       setOverwriteArmed(true);
       return;
     }
-    if (!stream.runId || stream.runRevision == null) {
+    if (!runId || runRevision == null) {
       setActionError(t("runMissing"));
       return;
     }
     setAccepting(true);
     try {
-      await apiPost(
-        `/api/llm/prose-runs/${stream.runId}/accept`,
-        buildProseAcceptPayload({
-          novelId,
-          chapterId,
-          runId: stream.runId,
-          runRevision: stream.runRevision,
-          partial: partialAcceptance,
-        }),
-      );
+      const outcome = await submitProseRunMutation({
+        mutate: () => apiPost(
+          `/api/llm/prose-runs/${runId}/accept`,
+          buildProseAcceptPayload({
+            novelId,
+            chapterId,
+            runId,
+            runRevision,
+            partial: partialAcceptance,
+          }),
+        ),
+        refresh: () => restoreActive({ clearWhenMissing: true }),
+      });
+      if (outcome.status !== "success") {
+        setInitialRunResolved(true);
+        if (proseRunConfirmationResetRequired(outcome.status)) {
+          resetRunConfirmationLocks();
+        }
+        if (outcome.status === "conflict_refreshed") {
+          setSyncNotice(t("runConflictRefreshed"));
+        } else {
+          setConflictRequiresSync(true);
+          setSyncError(t("runConflictRefreshFailed"));
+        }
+        return;
+      }
       onAccepted(
         stream.text,
         partialAcceptance ? "partial_manual_required" : "ai_complete",
@@ -215,9 +287,6 @@ export default function ProsePanel({
       onClose();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
-      if (!selectedInitialRun) {
-        await restoreActive();
-      }
     } finally {
       setAccepting(false);
     }
@@ -276,6 +345,7 @@ export default function ProsePanel({
   ]);
 
   const startGeneration = async () => {
+    if (runActionsBlocked) return;
     // 保险栓在每次重新生成时复位：上一份预览已被新的一轮取代，
     // 针对它的确认不该延续到下一份（2a Task 7 就栽在栓不复位上）。
     setOverwriteArmed(false);
@@ -337,26 +407,53 @@ export default function ProsePanel({
   };
 
   const discard = async () => {
+    if (runActionsBlocked) return;
+    const runId = stream.runId;
+    const runRevision = stream.runRevision;
     setActionError("");
-    if (stream.runId && stream.runRevision == null) {
-      setActionError(t("runMissing"));
-      return;
-    }
-    if (stream.runId) {
+    setSyncNotice("");
+    if (runId) {
+      if (runRevision == null) {
+        setActionError(t("runMissing"));
+        return;
+      }
+      const expectedRunRevision = runRevision;
+      setDiscarding(true);
       try {
-        await apiPost(`/api/llm/prose-runs/${stream.runId}/discard`, {
-          novel_id: novelId,
-          chapter_id: chapterId,
-          expected_run_revision: stream.runRevision,
+        const outcome = await submitProseRunMutation({
+          mutate: () => apiPost(
+            `/api/llm/prose-runs/${runId}/discard`,
+            buildProseDiscardPayload({
+              novelId,
+              chapterId,
+              runRevision: expectedRunRevision,
+            }),
+          ),
+          refresh: () => restoreActive({ clearWhenMissing: true }),
         });
+        if (outcome.status !== "success") {
+          setInitialRunResolved(true);
+          if (proseRunConfirmationResetRequired(outcome.status)) {
+            resetRunConfirmationLocks();
+          }
+          if (outcome.status === "conflict_refreshed") {
+            setSyncNotice(t("runConflictRefreshed"));
+          } else {
+            setConflictRequiresSync(true);
+            setSyncError(t("runConflictRefreshFailed"));
+          }
+          return;
+        }
       } catch (error) {
         setActionError(error instanceof Error ? error.message : String(error));
         return;
+      } finally {
+        setDiscarding(false);
       }
     }
     // 保险栓是面板本地状态，不属于 stream，stream.reset() 清不到它——
     // 两边要一起复位，否则会同屏出现"空状态提示"与"覆盖警告"互相矛盾的界面。
-    stream.reset();
+    resetStream();
     setOverwriteArmed(false);
     setPartialArmed(false);
     setUncertainRetryArmed(false);
@@ -418,7 +515,7 @@ export default function ProsePanel({
         onKeyDown={handleDialogKeyDown}
         className="flex max-h-full w-full max-w-5xl flex-col rounded-md border border-border bg-surface shadow-lg"
       >
-        <header className="flex items-start justify-between gap-3 border-b border-border px-5 py-4">
+        <header className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0">
             <h3
               id="prose-panel-title"
@@ -440,8 +537,7 @@ export default function ProsePanel({
                 className="bg-accent text-white hover:bg-accent-hover"
                 onPress={() => void startGeneration()}
                 isDisabled={
-                  restoreLoading
-                  || accepting
+                  runActionsBlocked
                   || selectedInitialRun?.can_resume === false
                   || (automaticContinuationsEnabled && continuationReadinessLoading)
                 }
@@ -462,12 +558,48 @@ export default function ProsePanel({
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          {(restoreLoading || syncNotice || syncError) && (
+            <section
+              data-testid="prose-run-sync-state"
+              aria-busy={restoreLoading}
+              aria-live="polite"
+              className="mb-4 grid gap-2"
+            >
+              {restoreLoading && (
+                <Notice tone="info">
+                  <span role="status">{t("syncingRun")}</span>
+                </Notice>
+              )}
+              {syncNotice && (
+                <Notice tone="warning">
+                  <span role="status">{syncNotice}</span>
+                </Notice>
+              )}
+              {syncError && (
+                <Notice tone="error">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span role="alert">{syncError}</span>
+                    {manualSyncRequired && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onPress={() => void retryRunSync()}
+                        isDisabled={restoreLoading}
+                      >
+                        {t("retrySync")}
+                      </Button>
+                    )}
+                  </div>
+                </Notice>
+              )}
+            </section>
+          )}
           <div className="mb-4 grid gap-3">
             <ProseContinuationControls
               idPrefix="single-prose"
               value={continuationPolicy}
               onChange={setContinuationPolicy}
-              disabled={running || restoreLoading || accepting}
+              disabled={running || runActionsBlocked}
             />
             <OutlineGenerationParams value={params} onChange={setParams} />
             {automaticContinuationsEnabled && (
@@ -496,7 +628,7 @@ export default function ProsePanel({
                     min={1}
                     inputMode="numeric"
                     value={continuationBudget}
-                    disabled={running || restoreLoading || accepting}
+                    disabled={running || runActionsBlocked}
                     onChange={(event) => setContinuationBudget(event.target.value)}
                     placeholder={t("continuationBudgetPlaceholder")}
                     className="min-h-9 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
@@ -512,8 +644,7 @@ export default function ProsePanel({
                     onClick={() => void inspectContinuationReadiness()}
                     disabled={
                       running
-                      || restoreLoading
-                      || accepting
+                      || runActionsBlocked
                       || continuationReadinessLoading
                       || !continuationBudgetValue
                     }
@@ -566,8 +697,7 @@ export default function ProsePanel({
                     checked={automaticContinuationsConfirmed}
                     disabled={
                       running
-                      || restoreLoading
-                      || accepting
+                      || runActionsBlocked
                       || !continuationReadinessIsCurrent
                       || !continuationReadiness?.token_bound_known
                     }
@@ -688,7 +818,7 @@ export default function ProsePanel({
           )}
         </div>
 
-        <footer className="flex justify-end gap-2 border-t border-border px-5 py-3">
+        <footer className="flex flex-wrap justify-end gap-2 border-t border-border px-5 py-3">
           <Button
             variant="ghost"
             size="sm"
@@ -697,11 +827,11 @@ export default function ProsePanel({
               (!hasText && !stream.runId)
               || (Boolean(stream.runId) && stream.runRevision == null)
               || running
-              || accepting
+              || runActionsBlocked
               || selectedInitialRun?.can_discard === false
             }
           >
-            {t("discard")}
+            {discarding ? t("discarding") : t("discard")}
           </Button>
           <Button
             variant="primary"
@@ -711,8 +841,7 @@ export default function ProsePanel({
             isDisabled={
               !hasText
               || running
-              || accepting
-              || restoreLoading
+              || runActionsBlocked
               || selectedInitialRun?.can_accept_partial === false
             }
           >
