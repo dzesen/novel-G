@@ -2387,6 +2387,7 @@ class GenerationJobService:
         retry_resolution_to_launch: StateDispatchResolutionV3 | None = None
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            job_mutation_recovery_binding: JobMutationRecoveryBindingV1 | None = None
             state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None
             raw_job_mutation_recovery = job.get("job_mutation_recovery")
             if raw_job_mutation_recovery is not None:
@@ -2398,6 +2399,7 @@ class GenerationJobService:
                     raise ValueError(
                         "Generation job mutation recovery binding is invalid"
                     ) from exc
+                job_mutation_recovery_binding = candidate_binding
                 if candidate_binding.operation == "accept_chapter_state":
                     state_dispatch_binding = _validated_state_dispatch_binding(
                         job_id=job_id,
@@ -2597,6 +2599,9 @@ class GenerationJobService:
                 )
             authorization_updates: Dict[str, Any] = {}
             reauthorized_revision: int | None = None
+            resolved_job_mutation_recovery: (
+                JobMutationRecoveryBindingV1 | None
+            ) = None
             authorization = dict(job.get("prose_continuation_authorization") or {})
             stored_policy = ProseContinuationPolicy.from_mapping(
                 authorization.get("policy")
@@ -2649,6 +2654,31 @@ class GenerationJobService:
                     readiness_digest=readiness_digest,
                     generation_params=generation_params_snapshot,
                 )
+                if job_mutation_recovery_binding is not None:
+                    recovered_revision = await _recover_job_mutation_revision(
+                        job_mutation_recovery_binding
+                    )
+                    current_narrative_revision = await (
+                        narrative_revision_store.current(
+                            str(job["novel_id"])
+                        )
+                    )
+                    if recovered_revision is None:
+                        raise ValueError(
+                            "当前作业仍有未完成的章节正式写回，不能替换旧快照；"
+                            "请先处理当前章节，或终止旧作业后重新预检"
+                        )
+                    if (
+                        recovered_revision
+                        <= job_mutation_recovery_binding.expected_narrative_revision
+                        or current_narrative_revision < recovered_revision
+                    ):
+                        raise ValueError(
+                            "Generation job mutation recovery revision is invalid"
+                        )
+                    resolved_job_mutation_recovery = (
+                        job_mutation_recovery_binding
+                    )
                 current_revision = max(
                     int(job.get("authorization_revision") or 0),
                     int(authorization.get("authorization_revision") or 0),
@@ -2858,18 +2888,25 @@ class GenerationJobService:
                     raise ValueError(
                         "Generation job execution epoch is invalid"
                     )
+                update_authorization_kwargs: dict[str, Any] = {
+                    "previous_revision": previous_revision,
+                    "next_revision": reauthorized_revision,
+                    "previous_status": str(job.get("status") or ""),
+                    "previous_authorization_revision": (
+                        previous_authorization_revision
+                    ),
+                    "previous_readiness_digest": previous_readiness_digest,
+                    "previous_active_slot": previous_active_slot,
+                    "previous_execution_epoch": previous_execution_epoch,
+                }
+                if resolved_job_mutation_recovery is not None:
+                    update_authorization_kwargs[
+                        "resolved_job_mutation_recovery"
+                    ] = resolved_job_mutation_recovery
                 await generation_job_repo.update_job_authorization(
                     job_id,
                     resume_fields,
-                    previous_revision=previous_revision,
-                    next_revision=reauthorized_revision,
-                    previous_status=str(job.get("status") or ""),
-                    previous_authorization_revision=(
-                        previous_authorization_revision
-                    ),
-                    previous_readiness_digest=previous_readiness_digest,
-                    previous_active_slot=previous_active_slot,
-                    previous_execution_epoch=previous_execution_epoch,
+                    **update_authorization_kwargs,
                 )
             else:
                 if job.get("has_uncertain_attempts") and confirm_uncertain_retry:

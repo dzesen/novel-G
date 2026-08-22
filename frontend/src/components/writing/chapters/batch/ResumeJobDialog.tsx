@@ -50,7 +50,8 @@ export default function ResumeJobDialog({
   const [acknowledgedCodes, setAcknowledgedCodes] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
+  const [readinessError, setReadinessError] = useState("");
+  const [submissionError, setSubmissionError] = useState("");
   const parsedTokenBudget = parsePositiveInteger(tokenBudget);
   const configurationKey = useMemo(() => JSON.stringify({
     tokenBudget: parsedTokenBudget,
@@ -61,7 +62,7 @@ export default function ResumeJobDialog({
 
   const loadReadiness = useCallback(async () => {
     setLoading(true);
-    setError("");
+    setReadinessError("");
     try {
       const report = await apiPost<GenerationReadiness>(
         `/api/generation-jobs/${job._id}/readiness`,
@@ -73,7 +74,7 @@ export default function ResumeJobDialog({
     } catch (loadError) {
       setReadiness(null);
       setReadinessConfiguration(null);
-      setError(loadError instanceof Error ? loadError.message : String(loadError));
+      setReadinessError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
       setLoading(false);
     }
@@ -103,7 +104,7 @@ export default function ResumeJobDialog({
       )
     ) return;
     setSubmitting(true);
-    setError("");
+    setSubmissionError("");
     try {
       const resumed = await apiPost<GenerationJob>(
         `/api/generation-jobs/${job._id}/resume`,
@@ -115,7 +116,9 @@ export default function ResumeJobDialog({
       );
       onSubmitted(resumed);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : String(submitError));
+      setSubmissionError(
+        submitError instanceof Error ? submitError.message : String(submitError),
+      );
       await loadReadiness();
     } finally {
       setSubmitting(false);
@@ -124,6 +127,7 @@ export default function ResumeJobDialog({
 
   const authorization = readiness?.planning.prose_continuation_authorization;
   const referenceCardPolicy = readiness?.planning.reference_card_auto_creation_policy;
+  const visibleError = submissionError || readinessError;
   const referenceCardTypeLabel = (cardType: ReferenceCardType) =>
     t(referenceCardTypeTranslationKey(cardType));
 
@@ -179,7 +183,10 @@ export default function ResumeJobDialog({
               min={1}
               inputMode="numeric"
               value={tokenBudget}
-              onChange={(event) => setTokenBudget(event.target.value)}
+              onChange={(event) => {
+                setTokenBudget(event.target.value);
+                setSubmissionError("");
+              }}
               placeholder={t("dialogTokenPlaceholder")}
               disabled={submitting}
               className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent disabled:opacity-60 sm:text-sm"
@@ -324,9 +331,9 @@ export default function ResumeJobDialog({
             )}
           </section>
 
-          {error && (
+          {visibleError && (
             <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
-              {error}
+              {visibleError}
             </p>
           )}
         </div>

@@ -2465,10 +2465,23 @@ class GenerationJobRepository:
         previous_readiness_digest: str | None,
         previous_active_slot: str | None,
         previous_execution_epoch: int,
+        resolved_job_mutation_recovery: (
+            JobMutationRecoveryBindingV1 | None
+        ) = None,
     ) -> bool:
         """Rebind readiness and its revision cursor in one fenced update."""
 
         _reject_atomic_field_updates(fields)
+        resolved_binding: JobMutationRecoveryBindingV1 | None = None
+        if resolved_job_mutation_recovery is not None:
+            try:
+                resolved_binding = JobMutationRecoveryBindingV1.model_validate(
+                    resolved_job_mutation_recovery.model_dump(mode="python")
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Resolved generation job mutation recovery is invalid"
+                ) from exc
         if (
             (previous_revision is not None and type(previous_revision) is not int)
             or type(next_revision) is not int
@@ -2491,17 +2504,36 @@ class GenerationJobRepository:
             )
         ):
             raise ValueError("Generation job reauthorization revision is invalid")
+        if resolved_binding is not None and (
+            resolved_binding.job_id != str(job_id)
+            or resolved_binding.expected_narrative_revision != previous_revision
+            or resolved_binding.authorization_revision
+            != previous_authorization_revision
+            or resolved_binding.readiness_digest != previous_readiness_digest
+        ):
+            raise ValueError(
+                "Resolved generation job mutation recovery does not match "
+                "the previous authorization"
+            )
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
             "is_deleted": False,
             "status": previous_status,
             "active_slot": previous_active_slot,
             "candidate_pipeline_checkpoints": [],
-            "$or": [
+        }
+        if resolved_binding is None:
+            query["$or"] = [
                 {"job_mutation_recovery": {"$exists": False}},
                 {"job_mutation_recovery": None},
-            ],
-        }
+            ]
+        else:
+            query.update({
+                "novel_id": to_object_id(resolved_binding.novel_id),
+                "current_chapter_id": resolved_binding.chapter_id,
+                "job_mutation_recovery": resolved_binding.model_dump(mode="json"),
+                "state_dispatch_resolution": None,
+            })
         if previous_execution_epoch == 0:
             query["$and"] = [{
                 "$or": [
@@ -2523,11 +2555,14 @@ class GenerationJobRepository:
             query["readiness.digest"] = {"$exists": False}
         else:
             query["readiness.digest"] = previous_readiness_digest
+        unset_fields = {"execution_lease": ""}
+        if resolved_binding is not None:
+            unset_fields["job_mutation_recovery"] = ""
         result = await self._collection_update_one(
             query,
             {
                 "$inc": {"execution_epoch": 1},
-                "$unset": {"execution_lease": ""},
+                "$unset": unset_fields,
                 "$set": {
                     **dict(fields),
                     "expected_narrative_revision": next_revision,
