@@ -1,8 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslations } from "next-intl";
+import { Button } from "@/components/ui/Button";
+import { IconButton } from "@/components/ui/IconButton";
+import { useDismissableLayer } from "@/components/ui/useDismissableLayer";
 import type { ChapterDraft } from "@/types/novel";
+import type { ChapterWorkspaceLayoutControls } from "./ChapterWorkspaceLayout";
 
 export type ChapterSaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
@@ -20,18 +24,154 @@ interface ChapterEditorPaneProps {
   onDelete: () => Promise<void>;
   onExport: () => void;
   onExportNovel: () => void;
-  onOpenChapterOutline: () => void;
-  onOpenProse: () => void;
-  /** 无已接受细纲时禁用 AI 写正文：没有 outline 上下文包会退化（设计 §6）。 */
-  canGenerateProse: boolean;
-  onOpenSceneIllustration: () => void;
-  /** 场景提示词只允许读取已接受章细纲声明的正式角色卡 ID。 */
-  canGenerateSceneIllustration: boolean;
-  onOpenStateBackfill: () => void;
-  /** chapter.content 为空时禁用 AI 状态回填：后端读库里的正文，没正文就没得回填（2b-2 设计 §4.1）。 */
-  hasContent: boolean;
   /** flushDraft 因标题为空被拒绝、面板未能打开时的提示文案；非空时渲染在按钮下方。 */
   stateBackfillBlocked: string;
+  workspaceControls: ChapterWorkspaceLayoutControls;
+}
+
+function DirectoryIcon() {
+  return (
+    <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 5h5M4 12h5M4 19h5M12 5h8M12 12h8M12 19h8" />
+    </svg>
+  );
+}
+
+function ContextIcon() {
+  return (
+    <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v5M12 8h.01" />
+    </svg>
+  );
+}
+
+function AssistantIcon() {
+  return (
+    <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="m12 3 1.1 3.3a4 4 0 0 0 2.6 2.6L19 10l-3.3 1.1a4 4 0 0 0-2.6 2.6L12 17l-1.1-3.3a4 4 0 0 0-2.6-2.6L5 10l3.3-1.1a4 4 0 0 0 2.6-2.6Z" />
+      <path d="m18.5 16 .5 1.5a2 2 0 0 0 1.5 1.5l-1.5.5a2 2 0 0 0-1.5 1.5l-.5-1.5a2 2 0 0 0-1.5-1.5l1.5-.5a2 2 0 0 0 1.5-1.5Z" />
+    </svg>
+  );
+}
+
+function MoreIcon() {
+  return (
+    <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+      <circle cx="5" cy="12" r="1.5" />
+      <circle cx="12" cy="12" r="1.5" />
+      <circle cx="19" cy="12" r="1.5" />
+    </svg>
+  );
+}
+
+function DirectoryAccess({
+  workspaceControls,
+}: {
+  workspaceControls: ChapterWorkspaceLayoutControls;
+}) {
+  const tw = useTranslations("writing.chapterEditor.workspace");
+  return (
+    <>
+      <IconButton
+        label={tw("openDirectory")}
+        size="sm"
+        className="md:hidden"
+        onClick={workspaceControls.openDirectory}
+      >
+        <DirectoryIcon />
+      </IconButton>
+      <span className="hidden md:inline-flex">
+        <IconButton
+          label={workspaceControls.directoryVisible ? tw("hideDirectory") : tw("showDirectory")}
+          size="sm"
+          selected={workspaceControls.directoryVisible}
+          onClick={workspaceControls.toggleDirectory}
+        >
+          <DirectoryIcon />
+        </IconButton>
+      </span>
+    </>
+  );
+}
+
+function EditorPlaceholder({
+  label,
+  workspaceControls,
+  centered = false,
+  children,
+}: {
+  label: string;
+  workspaceControls: ChapterWorkspaceLayoutControls;
+  centered?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <section className="flex min-h-0 flex-1 flex-col bg-surface" aria-label={label}>
+      <header className="flex min-h-12 shrink-0 items-center border-b border-border px-3 sm:px-5">
+        <DirectoryAccess workspaceControls={workspaceControls} />
+      </header>
+      <div className={centered ? "flex min-h-80 flex-1 flex-col items-center justify-center px-6 text-center" : "min-h-0 flex-1"}>
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function EditorActionsMenu({
+  onExport,
+  onExportNovel,
+}: {
+  onExport: () => void;
+  onExportNovel: () => void;
+}) {
+  const t = useTranslations("writing.chapterEditor");
+  const tw = useTranslations("writing.chapterEditor.workspace");
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const closeMenu = useCallback(() => setOpen(false), []);
+
+  useDismissableLayer(open, rootRef, triggerRef, closeMenu);
+
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <IconButton
+        ref={triggerRef}
+        label={tw("moreActions")}
+        size="sm"
+        selected={open}
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <MoreIcon />
+      </IconButton>
+      {open && (
+        <div className="absolute right-0 top-[calc(100%+0.4rem)] z-30 w-44 rounded-lg border border-border bg-surface p-1.5 shadow-dialog">
+          <button
+            type="button"
+            onClick={() => {
+              onExport();
+              closeMenu();
+            }}
+            className="min-h-9 w-full rounded-md px-3 text-left text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            {t("exportChapter")}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onExportNovel();
+              closeMenu();
+            }}
+            className="min-h-9 w-full rounded-md px-3 text-left text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            {t("exportNovel")}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function SaveStateLabel({ state }: { state: ChapterSaveState }) {
@@ -59,21 +199,11 @@ export default function ChapterEditorPane({
   onDelete,
   onExport,
   onExportNovel,
-  onOpenChapterOutline,
-  onOpenProse,
-  canGenerateProse,
-  onOpenSceneIllustration,
-  canGenerateSceneIllustration,
-  onOpenStateBackfill,
-  hasContent,
   stateBackfillBlocked,
+  workspaceControls,
 }: ChapterEditorPaneProps) {
   const t = useTranslations("writing.chapterEditor");
-  const tOutline = useTranslations("writing.outline");
-  const tProse = useTranslations("writing.prose");
-  const tSceneIllustration = useTranslations("writing.sceneIllustration");
-  // stateBackfill 是顶层命名空间，与上面几个 writing.* 的 t() 不同源，需单独取。
-  const tStateBackfill = useTranslations("stateBackfill");
+  const tw = useTranslations("writing.chapterEditor.workspace");
   const [showSummary, setShowSummary] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -85,41 +215,41 @@ export default function ChapterEditorPane({
 
   if (loading) {
     return (
-      <main className="flex min-h-0 flex-1 flex-col bg-surface" aria-label={t("loading")}>
+      <EditorPlaceholder label={t("loading")} workspaceControls={workspaceControls}>
         <div className="border-b border-border px-6 py-5">
           <div className="h-8 w-2/5 animate-pulse rounded-lg bg-border/45" />
           <div className="mt-3 h-4 w-1/4 animate-pulse rounded bg-border/30" />
         </div>
-        <div className="mx-auto w-full max-w-[76ch] flex-1 space-y-3 px-6 py-8">
+        <div className="mx-auto w-full max-w-[76ch] space-y-3 px-6 py-8">
           {[80, 100, 92, 70, 98, 88].map((width, index) => (
             <div key={index} className="h-4 animate-pulse rounded bg-border/30" style={{ width: `${width}%` }} />
           ))}
         </div>
-      </main>
+      </EditorPlaceholder>
     );
   }
 
   if (loadError) {
     return (
-      <main className="flex min-h-80 flex-1 flex-col items-center justify-center bg-surface px-6 text-center">
+      <EditorPlaceholder label={t("loadFailed")} workspaceControls={workspaceControls} centered>
         <p className="text-sm font-medium text-foreground">{t("loadFailed")}</p>
         <p className="mt-1 text-xs text-muted">{t("loadFailedDescription")}</p>
         <button type="button" onClick={onRetryLoad} className="mt-4 rounded-lg border border-border px-3 py-1.5 text-sm text-foreground hover:bg-surface-secondary">
           {t("retry")}
         </button>
-      </main>
+      </EditorPlaceholder>
     );
   }
 
   if (!chapterId || !draft) {
     return (
-      <main className="flex min-h-80 flex-1 flex-col items-center justify-center bg-surface px-6 text-center">
+      <EditorPlaceholder label={t("selectChapterTitle")} workspaceControls={workspaceControls} centered>
         <svg aria-hidden="true" width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4" className="text-muted/70">
           <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20" />
         </svg>
         <p className="mt-4 text-sm font-medium text-foreground">{t("selectChapterTitle")}</p>
         <p className="mt-1 max-w-sm text-xs leading-5 text-muted">{t("selectChapterDescription")}</p>
-      </main>
+      </EditorPlaceholder>
     );
   }
 
@@ -135,78 +265,25 @@ export default function ChapterEditorPane({
   };
 
   return (
-    <main className="flex min-h-0 flex-1 flex-col bg-surface">
-      <header className="border-b border-border px-4 py-3 sm:px-6">
-        <div className="flex min-w-0 flex-col gap-3 xl:flex-row xl:items-start">
+    <section className="flex h-full min-h-0 flex-1 flex-col bg-surface">
+      <header className="border-b border-border px-3 py-3 sm:px-5">
+        <div className="flex min-w-0 items-center gap-2">
           <input
             value={draft.title}
             onChange={(event) => onChange({ title: event.target.value })}
-            className="min-w-0 flex-1 border-0 bg-transparent p-0 text-xl font-semibold text-foreground outline-none placeholder:text-muted focus:ring-0"
+            className="min-w-0 flex-1 border-0 bg-transparent p-0 text-lg font-semibold text-foreground outline-none placeholder:text-muted focus:ring-0 sm:text-xl"
             placeholder={t("chapterTitlePlaceholder")}
             aria-label={t("chapterTitle")}
           />
-          <div className="flex flex-wrap items-center gap-2 xl:max-w-[36rem] xl:justify-end">
-            <button
-              type="button"
-              onClick={onOpenChapterOutline}
-              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              {tOutline("chapterTitle")}
-            </button>
-            <button
-              type="button"
-              onClick={onOpenProse}
-              disabled={!canGenerateProse}
-              title={canGenerateProse ? undefined : tProse("needOutline")}
-              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
-            >
-              {tProse("title")}
-            </button>
-            <button
-              type="button"
-              onClick={onOpenSceneIllustration}
-              disabled={!canGenerateSceneIllustration}
-              title={
-                canGenerateSceneIllustration
-                  ? undefined
-                  : tSceneIllustration("needOutline")
-              }
-              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
-            >
-              {tSceneIllustration("openButton")}
-            </button>
-            <button
-              type="button"
-              onClick={onOpenStateBackfill}
-              disabled={!hasContent}
-              title={hasContent ? undefined : tStateBackfill("needContent")}
-              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
-            >
-              {tStateBackfill("openButton")}
-            </button>
-            <button
-              type="button"
-              onClick={onExportNovel}
-              className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted transition-colors hover:bg-surface-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              {t("exportNovel")}
-            </button>
-            <button
-              type="button"
-              onClick={onExport}
-              className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted transition-colors hover:bg-surface-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              {t("exportChapter")}
-            </button>
-            <button
-              type="button"
-              onClick={onSave}
-              disabled={saveState === "saving" || !draft.title.trim()}
-              className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
-            >
-              {t("saveNow")}
-            </button>
-          </div>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={onSave}
+            disabled={saveState === "saving" || !draft.title.trim()}
+          >
+            {t("saveNow")}
+          </Button>
+          <EditorActionsMenu onExport={onExport} onExportNovel={onExportNovel} />
         </div>
 
         {stateBackfillBlocked && (
@@ -215,7 +292,35 @@ export default function ChapterEditorPane({
           </p>
         )}
 
-        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-2">
+          <div className="flex items-center gap-0.5 border-r border-border pr-2">
+            <DirectoryAccess workspaceControls={workspaceControls} />
+            <IconButton
+              label={tw("openContext")}
+              size="sm"
+              className="xl:hidden"
+              onClick={workspaceControls.openContext}
+            >
+              <ContextIcon />
+            </IconButton>
+            <span className="hidden xl:inline-flex">
+              <IconButton
+                label={workspaceControls.contextVisible ? tw("hideContext") : tw("showContext")}
+                size="sm"
+                selected={workspaceControls.contextVisible}
+                onClick={workspaceControls.toggleContext}
+              >
+                <ContextIcon />
+              </IconButton>
+            </span>
+            <IconButton
+              label={tw("openAssistant")}
+              size="sm"
+              onClick={workspaceControls.openAssistant}
+            >
+              <AssistantIcon />
+            </IconButton>
+          </div>
           <label className="flex items-center gap-2 text-xs text-muted">
             <span>{t("status")}</span>
             <select
@@ -231,14 +336,14 @@ export default function ChapterEditorPane({
           <span className="text-xs tabular-nums text-muted">{t("wordCount", { count: wordCount })}</span>
           <SaveStateLabel state={saveState} />
           {updatedAt && (
-            <span className="text-[11px] text-muted/90">
+            <span className="text-[11px] text-muted">
               {t("lastSaved", { time: new Date(updatedAt).toLocaleString() })}
             </span>
           )}
           <button
             type="button"
             onClick={() => setShowSummary((value) => !value)}
-            className="ml-auto text-xs text-muted hover:text-foreground"
+            className="ml-auto min-h-8 rounded-md px-2 text-xs text-muted hover:bg-surface-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
           >
             {showSummary ? t("hideSummary") : t("showSummary")}
           </button>
@@ -257,11 +362,11 @@ export default function ChapterEditorPane({
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto bg-background/35">
-        <div className="mx-auto flex min-h-full w-full max-w-[78ch] flex-col px-5 py-6 sm:px-8 sm:py-8">
+        <div className="mx-auto flex min-h-full w-full max-w-[72ch] flex-col px-5 py-6 sm:px-8 sm:py-9">
           <textarea
             value={draft.content}
             onChange={(event) => onChange({ content: event.target.value })}
-            className="min-h-[65vh] w-full flex-1 resize-none border-0 bg-transparent p-0 text-[16px] leading-8 text-foreground outline-none placeholder:text-muted focus:ring-0"
+            className="min-h-[65vh] w-full flex-1 resize-none border-0 bg-transparent p-0 font-writing text-[17px] leading-[2.05] text-foreground outline-none placeholder:text-muted focus:ring-0"
             placeholder={t("contentPlaceholder")}
             spellCheck
             aria-label={t("content")}
@@ -287,6 +392,6 @@ export default function ChapterEditorPane({
           </button>
         )}
       </footer>
-    </main>
+    </section>
   );
 }

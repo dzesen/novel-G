@@ -147,7 +147,7 @@ export default function ChapterNavigator({
   };
 
   return (
-    <aside className="flex h-full max-h-none w-full shrink-0 flex-col border-b border-border bg-surface-secondary/45 md:max-h-[44vh] lg:max-h-none lg:w-72 lg:border-b-0 lg:border-r">
+    <div className="flex h-full min-h-0 w-full flex-col bg-surface-secondary/45">
       <div className="border-b border-border px-3 py-3">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
@@ -211,7 +211,7 @@ export default function ChapterNavigator({
             type="button"
             onClick={() => void submitVolume()}
             disabled={!volumeTitle.trim() || creatingVolume}
-            className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
+            className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-on-accent transition-colors hover:bg-accent-hover hover:text-on-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50"
           >
             {creatingVolume ? t("creating") : t("create")}
           </button>
@@ -538,6 +538,6 @@ export default function ChapterNavigator({
           </details>
         )}
       </div>
-    </aside>
+    </div>
   );
 }

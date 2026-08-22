@@ -18,6 +18,9 @@ import type {
 } from "@/types/novel";
 import ChapterEditorPane, { type ChapterSaveState } from "./ChapterEditorPane";
 import ChapterNavigator from "./ChapterNavigator";
+import ChapterAssistantPanel from "./ChapterAssistantPanel";
+import ChapterContextInspector from "./ChapterContextInspector";
+import ChapterWorkspaceLayout from "./ChapterWorkspaceLayout";
 import {
   chapterToDraft,
   clearLocalChapterDraft,
@@ -77,8 +80,6 @@ interface ProseRunLocator {
   chapter_id: string;
   status: string;
 }
-
-type MobileChapterPane = "structure" | "editor";
 
 export default function ChapterWorkspace({
   mode,
@@ -147,8 +148,6 @@ export default function ChapterWorkspace({
     message: string;
   } | null>(null);
   const [runLookupRevision, setRunLookupRevision] = useState(0);
-  const [mobilePane, setMobilePane] =
-    useState<MobileChapterPane>("editor");
 
   const revisionRef = useRef(0);
   const selectedChapterIdRef = useRef<string | null>(initialChapterId ?? null);
@@ -650,7 +649,6 @@ export default function ChapterWorkspace({
   };
 
   const selectChapter = (chapterId: string, updateRoute = true) => {
-    setMobilePane("editor");
     const chapter = chapters.find((item) => item._id === chapterId);
     if (!chapter) {
       onChapterTargetValidation(chapterId, false);
@@ -901,10 +899,6 @@ export default function ChapterWorkspace({
     );
   }
 
-  const mobilePaneLabels: Record<MobileChapterPane, string> = {
-    structure: t("mobileStructure"),
-    editor: t("mobileEditor"),
-  };
   const visibleRunTargetAudit =
     runTargetAudit?.chapter_id === initialChapterId
     && runTargetAudit?.run_id === initialRunId
@@ -918,28 +912,6 @@ export default function ChapterWorkspace({
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
-      <nav
-        aria-label={t("mobilePaneNavigation")}
-        className="grid shrink-0 grid-cols-2 border-b border-border bg-surface p-1.5 md:hidden"
-      >
-        {(["structure", "editor"] as const).map((pane) => (
-          <button
-            key={pane}
-            type="button"
-            onClick={() => setMobilePane(pane)}
-            aria-pressed={mobilePane === pane}
-            className={[
-              "min-h-11 rounded-md px-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
-              mobilePane === pane
-                ? "bg-accent/10 text-accent"
-                : "text-muted hover:bg-surface-secondary hover:text-foreground",
-            ].join(" ")}
-          >
-            {mobilePaneLabels[pane]}
-          </button>
-        ))}
-      </nav>
-
       {visibleRunTargetAudit && initialChapterId && (
         <div
           role="status"
@@ -991,75 +963,104 @@ export default function ChapterWorkspace({
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <div
-          className={[
-            mobilePane === "structure" ? "flex" : "hidden md:flex",
-            "min-h-0 w-full flex-1 lg:w-auto lg:flex-none",
-          ].join(" ")}
-        >
-          <ChapterNavigator
-            volumes={volumes}
-            deletedVolumes={volumeTrash}
-            chapters={chapters}
-            trash={trash}
-            selectedChapterId={selectedChapterId}
-            selectedVolumeId={selectedVolumeId}
-            loading={structureLoading}
-            onSelectChapter={selectChapter}
-            onSelectVolume={setSelectedVolumeId}
-            onCreateVolume={createVolume}
-            onCreateChapter={createChapter}
-            onRestoreChapter={restoreChapter}
-            onDeleteVolume={deleteVolume}
-            onRestoreVolume={restoreVolume}
-            onHardDeleteVolume={hardDeleteVolume}
-            onBulkDeleteChapters={bulkDeleteChapters}
-            onOpenVolumeOutline={() => setVolumeOutlineOpen(true)}
-            onStartVolumeJob={() => {
-              onStartAutoBook("volume", selectedVolumeId ?? undefined);
-            }}
-            onStartBookJob={() => {
-              onStartAutoBook("book");
-            }}
-          />
-        </div>
-        <div
-          className={[
-            mobilePane === "editor" ? "flex" : "hidden md:flex",
-            "min-h-0 min-w-0 flex-1 flex-col",
-          ].join(" ")}
-        >
-          <ChapterEditorPane
-          chapterId={selectedChapterId}
-          draft={draft}
-          wordCount={wordCount}
-          updatedAt={updatedAt}
-          loading={chapterLoading}
-          loadError={chapterLoadError}
-          saveState={saveState}
-          onChange={changeDraft}
-          onSave={saveNow}
-          onRetryLoad={() => selectedChapterId && void loadChapter(selectedChapterId)}
-          onDelete={deleteChapter}
-          onExport={exportChapter}
-          onExportNovel={() => void exportNovel()}
-          onOpenChapterOutline={() => setChapterOutlineOpen(true)}
-          onOpenProse={() => {
-            setPendingProseOpen(null);
-            setInitialProseRun(null);
-            setProseOpen(true);
-          }}
-          canGenerateProse={Boolean(chapterOutline)}
-          onOpenSceneIllustration={() =>
-            setSceneIllustrationOpen(true)
-          }
-          canGenerateSceneIllustration={Boolean(chapterOutline)}
-          onOpenStateBackfill={() => void openStateBackfill()}
-          hasContent={Boolean(draft?.content?.trim())}
-          stateBackfillBlocked={stateBackfillBlocked}
+      <div className="min-h-0 flex-1">
+        <ChapterWorkspaceLayout
+          renderDirectory={(controls) => (
+            <ChapterNavigator
+              volumes={volumes}
+              deletedVolumes={volumeTrash}
+              chapters={chapters}
+              trash={trash}
+              selectedChapterId={selectedChapterId}
+              selectedVolumeId={selectedVolumeId}
+              loading={structureLoading}
+              onSelectChapter={(chapterId) => {
+                selectChapter(chapterId);
+                controls.closeDrawer();
+              }}
+              onSelectVolume={setSelectedVolumeId}
+              onCreateVolume={createVolume}
+              onCreateChapter={async (volumeId) => {
+                await createChapter(volumeId);
+                controls.closeDrawer();
+              }}
+              onRestoreChapter={async (chapterId) => {
+                await restoreChapter(chapterId);
+                controls.closeDrawer();
+              }}
+              onDeleteVolume={deleteVolume}
+              onRestoreVolume={restoreVolume}
+              onHardDeleteVolume={hardDeleteVolume}
+              onBulkDeleteChapters={bulkDeleteChapters}
+              onOpenVolumeOutline={() => {
+                controls.closeDrawer();
+                setVolumeOutlineOpen(true);
+              }}
+              onStartVolumeJob={() => {
+                controls.closeDrawer();
+                onStartAutoBook("volume", selectedVolumeId ?? undefined);
+              }}
+              onStartBookJob={() => {
+                controls.closeDrawer();
+                onStartAutoBook("book");
+              }}
+            />
+          )}
+          renderEditor={(controls) => (
+            <ChapterEditorPane
+              chapterId={selectedChapterId}
+              draft={draft}
+              wordCount={wordCount}
+              updatedAt={updatedAt}
+              loading={chapterLoading}
+              loadError={chapterLoadError}
+              saveState={saveState}
+              onChange={changeDraft}
+              onSave={saveNow}
+              onRetryLoad={() => selectedChapterId && void loadChapter(selectedChapterId)}
+              onDelete={deleteChapter}
+              onExport={exportChapter}
+              onExportNovel={() => void exportNovel()}
+              stateBackfillBlocked={stateBackfillBlocked}
+              workspaceControls={controls}
+            />
+          )}
+          renderContext={() => (
+            <ChapterContextInspector
+              chapterId={selectedChapterId}
+              draft={draft}
+              outline={chapterOutline}
+              wordCount={wordCount}
+              saveState={saveState}
+              updatedAt={updatedAt}
+            />
+          )}
+          renderAssistant={(controls) => (
+            <ChapterAssistantPanel
+              onOpenChapterOutline={() => {
+                controls.closeDrawer();
+                setChapterOutlineOpen(true);
+              }}
+              onOpenProse={() => {
+                controls.closeDrawer();
+                setPendingProseOpen(null);
+                setInitialProseRun(null);
+                setProseOpen(true);
+              }}
+              canGenerateProse={Boolean(chapterOutline)}
+              onOpenSceneIllustration={() => {
+                controls.closeDrawer();
+                setSceneIllustrationOpen(true);
+              }}
+              canGenerateSceneIllustration={Boolean(chapterOutline)}
+              onOpenStateBackfill={() => {
+                controls.closeDrawer();
+                void openStateBackfill();
+              }}
+              hasContent={Boolean(draft?.content?.trim())}
+            />
+          )}
         />
-        </div>
       </div>
 
       {volumeOutlineOpen && novelId && (
