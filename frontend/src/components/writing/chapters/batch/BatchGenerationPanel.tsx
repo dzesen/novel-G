@@ -109,13 +109,21 @@ export default function BatchGenerationPanel({
     useState<BookCompletionAudit | null>(null);
   const [currentBookAuditError, setCurrentBookAuditError] = useState("");
   const [currentBookAuditRevision, setCurrentBookAuditRevision] = useState(0);
+  const currentJobHidden = Boolean(
+    job
+    && isTerminal(job.status)
+    && (
+      dismissed === job._id
+      || (job.status === "aborted" && !initialJobId)
+    ),
+  );
   const jobStatusByProseRun = useMemo(
-    () => currentJobStatusByProseRun(job ? [job] : []),
-    [job],
+    () => currentJobStatusByProseRun(job && !currentJobHidden ? [job] : []),
+    [currentJobHidden, job],
   );
 
 
-  // 精确 job 深链优先；只有 URL 没指定 job 时才收养最近的非终态作业。
+  // 精确 job 深链优先；URL 未指定 job 时只检查最新作业，避免越过已结束作业复活旧任务。
   useEffect(() => {
     let cancelled = false;
     setJob(null);
@@ -139,10 +147,9 @@ export default function BatchGenerationPanel({
         }
         const jobs = await apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`);
         if (cancelled) return;
-        const adopted = jobs
-          .filter((j) => !isTerminal(j.status))
+        const latest = [...jobs]
           .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-        if (adopted) setJob(adopted);
+        if (latest && !isTerminal(latest.status)) setJob(latest);
       } catch (reason) {
         if (cancelled) return;
         if (
@@ -301,10 +308,12 @@ export default function BatchGenerationPanel({
   const confirmAbort = () => {
     if (!job || !abortIntent) return;
     const intent = abortIntent;
+    const abortedJobId = job._id;
     const successorScope = job.scope;
     const successorVolumeId = job.volume_id ?? undefined;
     void control("abort").then((succeeded) => {
       if (!succeeded) return;
+      if (intent === "abort") setDismissed(abortedJobId);
       dismissAbortConfirmation(intent === "abort");
       if (intent === "successor") {
         onOpenSuccessorReadiness(successorScope, successorVolumeId);
@@ -375,7 +384,9 @@ export default function BatchGenerationPanel({
   const generationRunsEntry = (
     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-surface px-4 py-2.5">
       <p className="min-w-0 text-xs leading-5 text-muted">
-        {job?.diagnostics?.length || job?.error || job?.pause_reason === "incomplete_scene"
+        {!job || currentJobHidden
+          ? t("generationRunsNoCurrent")
+          : job.diagnostics?.length || job.error || job.pause_reason === "incomplete_scene"
           ? t("generationRunsExceptionEntry")
           : t("generationRunsEntryDescription")}
       </p>
@@ -425,7 +436,7 @@ export default function BatchGenerationPanel({
   );
 
   // 残留草稿是小说级状态，即使没有作业或终态条已关闭也必须常驻发现。
-  if (!job || (isTerminal(job.status) && dismissed === job._id)) {
+  if (!job || currentJobHidden) {
     return (
       <>
         {dialog}

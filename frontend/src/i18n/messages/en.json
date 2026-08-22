@@ -2406,6 +2406,7 @@
       "readinessIssueUnknownBody": "A more specific explanation is not available. Run the check again; if it persists, review this attempt in Generation records.",
       "progressTitle": "Generation progress",
       "generationRunsEntryDescription": "Inspect generation jobs, incomplete prose, and diagnostics in Generation runs.",
+      "generationRunsNoCurrent": "There is no job to recover. Finished jobs remain available in Generation runs.",
       "generationRunsExceptionEntry": "This generation has an exception or recovery point. Inspect it in Generation runs.",
       "generationRunsOpen": "View generation runs",
       "generationRunsOpenDiagnostic": "View this diagnosis in generation runs",

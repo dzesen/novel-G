@@ -2406,6 +2406,7 @@
       "readinessIssueUnknownBody": "系统暂时无法给出更具体的说明。请重新检查；若仍出现，请在生成记录中查看本次诊断。",
       "progressTitle": "生成进度",
       "generationRunsEntryDescription": "可在“生成记录”查看作业、未完成正文与诊断信息。",
+      "generationRunsNoCurrent": "当前没有需要恢复的作业；已结束的任务可在“生成记录”中查看。",
       "generationRunsExceptionEntry": "当前生成存在异常或恢复点，请到“生成记录”查看。",
       "generationRunsOpen": "查看生成记录",
       "generationRunsOpenDiagnostic": "在生成记录中查看本条诊断",
