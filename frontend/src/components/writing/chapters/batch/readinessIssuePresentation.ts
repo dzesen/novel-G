@@ -14,6 +14,11 @@ export function readinessIssueCopy(
   continuationCount: number,
 ) {
   switch (issue.code) {
+    case "world_baseline_confirmation_required":
+      return {
+        title: t("readinessIssueWorldBaselineTitle"),
+        body: t("readinessIssueWorldBaselineBody"),
+      };
     case "character_cards_missing":
       return {
         title: t("readinessIssueCharacterCardsMissingTitle"),

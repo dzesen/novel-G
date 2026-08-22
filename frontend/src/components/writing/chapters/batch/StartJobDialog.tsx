@@ -6,7 +6,6 @@ import { Button } from "@heroui/react";
 import { apiPost } from "@/lib/api";
 import OutlineGenerationParams, {
   EMPTY_GENERATION_PARAMS,
-  toRequestParams,
   type GenerationParams,
 } from "../outline/OutlineGenerationParams";
 import ProseContinuationControls from "../prose/ProseContinuationControls";
@@ -33,6 +32,25 @@ import {
   readinessAllowsStart,
 } from "./readinessPresentation";
 import { readinessIssueCopy } from "./readinessIssuePresentation";
+import {
+  START_JOB_STAGES,
+  batchGenerationOverrides,
+  checkpointIntervalAllowsNext,
+  initialAuthorizationAllowsNext,
+  nextStartJobStage,
+  previousStartJobStage,
+  type StartJobStage,
+} from "./startJobFlow";
+
+const FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "summary",
+  "a[href]",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
 
 interface StartJobDialogProps {
   scope: "volume" | "book";
@@ -44,6 +62,7 @@ interface StartJobDialogProps {
   onSubmitted: (job: GenerationJob) => void;
   onClose: () => void;
   onNavigateToReferenceCards: () => void;
+  onNavigateToWorldBaseline: () => void;
 }
 
 export default function StartJobDialog({
@@ -56,9 +75,13 @@ export default function StartJobDialog({
   onSubmitted,
   onClose,
   onNavigateToReferenceCards,
+  onNavigateToWorldBaseline,
 }: StartJobDialogProps) {
   const t = useTranslations("writing.batch");
+  const dialogRef = useRef<HTMLDivElement>(null);
   const firstInputRef = useRef<HTMLInputElement>(null);
+  const stageHeadingRef = useRef<HTMLHeadingElement>(null);
+  const [stage, setStage] = useState<StartJobStage>("authorization");
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [tokenBudget, setTokenBudget] = useState("");
   const [continuationPolicy, setContinuationPolicy] =
@@ -80,32 +103,35 @@ export default function StartJobDialog({
   const automaticContinuationsEnabled = permitsAutomaticContinuation(
     continuationPolicy,
   );
+  const generationOverrides = batchGenerationOverrides(generationParams);
   const readinessConfigurationKey = JSON.stringify({
     continuationPolicy,
     referenceCardAutoCreationPolicy,
     tokenBudget: parsedTokenBudget,
     generationParams,
+    outlineDeviationPolicy,
   });
   const [submitting, setSubmitting] = useState(false);
   const [readiness, setReadiness] = useState<GenerationReadiness | null>(null);
-  const [readinessLoading, setReadinessLoading] = useState(true);
+  const [readinessLoading, setReadinessLoading] = useState(false);
   const [readinessConfiguration, setReadinessConfiguration] = useState<string | null>(null);
   const readinessIsCurrent = Boolean(readiness)
     && readinessConfiguration === readinessConfigurationKey;
   const [acknowledgedCodes, setAcknowledgedCodes] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
 
-  const loadReadiness = useCallback(async () => {
+  const loadReadiness = useCallback(async (preserveError = false) => {
     setReadinessLoading(true);
-    setError("");
+    if (!preserveError) setError("");
     try {
       const report = await apiPost<GenerationReadiness>(
         `/api/generation-jobs/${scope}/${targetId}/readiness`,
         {
           token_budget: parsedTokenBudget,
+          outline_deviation_policy: outlineDeviationPolicy,
           prose_continuation_policy: continuationPolicy,
           reference_card_auto_creation_policy: referenceCardAutoCreationPolicy,
-          ...toRequestParams(generationParams),
+          ...generationOverrides,
         },
       );
       setReadiness(report);
@@ -114,14 +140,17 @@ export default function StartJobDialog({
     } catch (err) {
       setReadiness(null);
       setReadinessConfiguration(null);
-      setError(err instanceof Error ? err.message : String(err));
+      if (!preserveError) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
       setReadinessLoading(false);
     }
   }, [
     continuationPolicy,
-    generationParams,
+    generationOverrides,
     parsedTokenBudget,
+    outlineDeviationPolicy,
     referenceCardAutoCreationPolicy,
     readinessConfigurationKey,
     scope,
@@ -129,23 +158,69 @@ export default function StartJobDialog({
   ]);
 
   useEffect(() => {
-    void loadReadiness();
-  }, [loadReadiness]);
-
-  useEffect(() => {
-    firstInputRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !submitting) onClose();
+    const keepFocusInsideDialog = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !submitting) {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+      ).filter((element) => element.getClientRects().length > 0);
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialog.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    window.addEventListener("keydown", keepFocusInsideDialog);
+    return () => window.removeEventListener("keydown", keepFocusInsideDialog);
   }, [onClose, submitting]);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      if (stage === "authorization") firstInputRef.current?.focus();
+      else stageHeadingRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [stage]);
 
   const referenceCardTypeLabel = (cardType: ReferenceCardType) =>
     t(referenceCardTypeTranslationKey(cardType));
+
+  const generationOverrideSummary = [
+    generationParams.temperature !== null
+      ? t("dialogConfirmationParamTemperature", { value: generationParams.temperature })
+      : null,
+    generationParams.top_p !== null
+      ? t("dialogConfirmationParamTopP", { value: generationParams.top_p })
+      : null,
+    generationParams.max_tokens !== null
+      ? t("dialogConfirmationParamMaxTokens", { value: generationParams.max_tokens })
+      : null,
+    generationParams.presence_penalty !== null
+      ? t("dialogConfirmationParamPresencePenalty", { value: generationParams.presence_penalty })
+      : null,
+    generationParams.frequency_penalty !== null
+      ? t("dialogConfirmationParamFrequencyPenalty", { value: generationParams.frequency_penalty })
+      : null,
+    generationParams.allow_failure_retry
+      ? t("dialogConfirmationParamRetryEnabled")
+      : t("dialogConfirmationParamRetryDisabled"),
+  ].filter((value): value is string => value !== null);
 
   const budgetCoverageReason = (coverage: ProseBudgetCoverage) => {
     switch (coverage.unavailable_reason) {
@@ -175,7 +250,7 @@ export default function StartJobDialog({
         readiness,
         acknowledgedCodes,
         outlineDeviationPolicy,
-        generationParams: toRequestParams(generationParams),
+        generationParams: generationOverrides,
         proseContinuationPolicy: continuationPolicy,
         referenceCardAutoCreationPolicy,
       });
@@ -185,149 +260,331 @@ export default function StartJobDialog({
       );
       onSubmitted(job);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      await loadReadiness();
+      const startError = err instanceof Error ? err.message : String(err);
+      setError(startError);
+      await loadReadiness(true);
+      setError(startError);
+      setStage("readiness");
     } finally {
       setSubmitting(false);
     }
   };
 
+  const advance = async () => {
+    if (stage === "authorization") {
+      if (!initialAuthorizationAllowsNext(parsedTokenBudget)) return;
+      setStage(nextStartJobStage(stage));
+      return;
+    }
+    if (stage === "behavior") {
+      if (!checkpointIntervalAllowsNext(checkpointInterval)) return;
+      setStage("readiness");
+      await loadReadiness();
+      return;
+    }
+    if (
+      stage === "readiness"
+      && readiness
+      && readinessIsCurrent
+      && readinessAllowsStart(readiness, acknowledgedCodes)
+    ) {
+      setStage(nextStartJobStage(stage));
+    }
+  };
+
+  const goBack = () => {
+    if (submitting) return;
+    setError("");
+    setStage(previousStartJobStage(stage));
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 px-3 py-4 sm:px-4 sm:py-6">
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="start-generation-title"
+        tabIndex={-1}
         className="flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-md border border-border bg-surface shadow-lg sm:max-h-[calc(100dvh-3rem)]"
       >
         <header className="border-b border-border px-4 py-3 sm:px-5 sm:py-4">
           <h3 id="start-generation-title" className="break-words text-base font-semibold text-foreground">{title}</h3>
+          <ol
+            aria-label={t("dialogStageAria")}
+            className="mt-3 grid grid-cols-4 gap-1"
+          >
+            {START_JOB_STAGES.map((item, index) => {
+              const currentIndex = START_JOB_STAGES.indexOf(stage);
+              const isCurrent = item === stage;
+              const isComplete = index < currentIndex;
+              return (
+                <li key={item} className="min-w-0">
+                  <div
+                    aria-current={isCurrent ? "step" : undefined}
+                    className={[
+                      "h-1 rounded-full",
+                      isCurrent || isComplete ? "bg-accent" : "bg-border",
+                    ].join(" ")}
+                  />
+                  <span className={[
+                    "mt-1 block truncate text-[10px] sm:text-xs",
+                    isCurrent
+                      ? "font-medium text-foreground"
+                      : "text-warm-700 dark:text-muted",
+                  ].join(" ")}
+                  >
+                    {t(`dialogStages.${item}`)}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
         </header>
 
         <div className="grid min-w-0 gap-4 overflow-y-auto px-4 py-4 sm:px-5">
           <div className="grid gap-1 text-sm">
-            <span className="text-xs font-medium text-muted">{targetHeading}</span>
+            <span className="text-xs font-medium text-warm-700 dark:text-muted">{targetHeading}</span>
             <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
               <span className="min-w-0 break-words font-medium">{targetLabel}</span>
-              <span className="text-xs text-muted">{t("dialogFillable", { count: fillableCount })}</span>
+              <span className="text-xs text-warm-700 dark:text-muted">{t("dialogFillable", { count: fillableCount })}</span>
             </div>
           </div>
 
-          <label className="grid gap-1 text-sm">
-            <span className="text-xs font-medium text-muted">{t("dialogCheckpointLabel")}</span>
-            <input
-              type="number"
-              ref={firstInputRef}
-              min={1}
-              max={1000}
-              value={checkpointInterval}
-              onChange={(e) => setCheckpointInterval(Number(e.target.value))}
-              className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
-            />
-            <span className="text-xs text-muted">{t("dialogCheckpointHint")}</span>
-          </label>
+          {stage === "authorization" && (
+            <>
+              <section className="rounded-md border border-accent/30 bg-accent/5 px-3 py-2.5">
+                <h4
+                  ref={stageHeadingRef}
+                  tabIndex={-1}
+                  className="text-sm font-semibold text-foreground outline-none"
+                >
+                  {t("dialogAuthorizationTitle")}
+                </h4>
+                <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
+                  {t("dialogAuthorizationDescription")}
+                </p>
+              </section>
 
-          <label className="grid gap-1 text-sm">
-            <span className="text-xs font-medium text-muted">{t("dialogTokenLabel")}</span>
-            <input
-              type="number"
-              min={1}
-              value={tokenBudget}
-              onChange={(e) => setTokenBudget(e.target.value)}
-              placeholder={t("dialogTokenPlaceholder")}
-              className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
-            />
-            <span className="text-xs text-muted">{t("dialogTokenHint")}</span>
-          </label>
-          <ProseContinuationControls
-            idPrefix="batch-prose"
-            value={continuationPolicy}
-            onChange={setContinuationPolicy}
-            disabled={submitting}
-          />
-          {automaticContinuationsEnabled && !parsedTokenBudget && (
-            <p role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
-              {t("continuationBudgetRequired")}
-            </p>
+              <div className="grid gap-1 text-sm">
+                <label htmlFor="batch-token-budget" className="text-xs font-medium text-warm-700 dark:text-muted">
+                  {t("dialogTokenLabel")}
+                </label>
+                <input
+                  id="batch-token-budget"
+                  type="number"
+                  ref={firstInputRef}
+                  min={1}
+                  value={tokenBudget}
+                  onChange={(e) => setTokenBudget(e.target.value)}
+                  placeholder={t("dialogTokenPlaceholder")}
+                  aria-invalid={tokenBudget !== "" && !parsedTokenBudget}
+                  aria-describedby="batch-token-budget-hint"
+                  className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
+                />
+                <span id="batch-token-budget-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">{t("dialogTokenHint")}</span>
+              </div>
+              {!parsedTokenBudget && (
+                <p role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
+                  {t("dialogTokenRequired")}
+                </p>
+              )}
+
+              <label className="flex cursor-pointer items-start gap-3 rounded-md border border-border bg-background px-3 py-3">
+                <input
+                  type="checkbox"
+                  checked={generationParams.allow_failure_retry}
+                  onChange={(event) => setGenerationParams((current) => ({
+                    ...current,
+                    allow_failure_retry: event.target.checked,
+                  }))}
+                  className="mt-0.5 size-4 shrink-0"
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-foreground">
+                    {t("dialogRetryPermission")}
+                  </span>
+                  <span className="mt-1 block text-xs leading-5 text-warm-700 dark:text-muted">
+                    {t("dialogRetryPermissionHint")}
+                  </span>
+                </span>
+              </label>
+
+              <details className="group rounded-md border border-border bg-background px-3 py-2.5">
+                <summary className="cursor-pointer list-none text-sm font-medium text-foreground marker:hidden focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
+                  <span className="flex min-w-0 items-center justify-between gap-3">
+                    <span>{t("dialogContinuationPermission")}</span>
+                    <span className="flex shrink-0 items-center gap-2 text-xs font-normal text-warm-700 dark:text-muted">
+                      <span>
+                        {t("dialogContinuationPermissionValue", {
+                          count: continuationPolicy.automatic_continuations_per_scene,
+                        })}
+                      </span>
+                      <svg aria-hidden="true" viewBox="0 0 20 20" className="size-4 transition-transform group-open:rotate-180">
+                        <path d="m5 7.5 5 5 5-5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.75" />
+                      </svg>
+                    </span>
+                  </span>
+                  <span className="mt-1 block text-xs font-normal leading-5 text-warm-700 dark:text-muted">
+                    {t("dialogPermissionOpenHint")}
+                  </span>
+                </summary>
+                <div className="mt-3 border-t border-border pt-3">
+                  <ProseContinuationControls
+                    idPrefix="batch-prose"
+                    value={continuationPolicy}
+                    onChange={setContinuationPolicy}
+                    disabled={submitting}
+                  />
+                </div>
+              </details>
+              {automaticContinuationsEnabled && !parsedTokenBudget && (
+                <p role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
+                  {t("continuationBudgetRequired")}
+                </p>
+              )}
+
+              <details className="group rounded-md border border-border bg-background px-3 py-2.5">
+                <summary className="cursor-pointer list-none text-sm font-medium text-foreground marker:hidden focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
+                  <span className="flex min-w-0 items-center justify-between gap-3">
+                    <span>{t("dialogReferenceCardPermission")}</span>
+                    <span className="flex shrink-0 items-center gap-2 text-xs font-normal text-warm-700 dark:text-muted">
+                      <span>
+                        {referenceCardAutoCreationPolicy.enabled
+                          ? t("readinessAutoCardsEnabled")
+                          : t("readinessAutoCardsDisabled")}
+                      </span>
+                      <svg aria-hidden="true" viewBox="0 0 20 20" className="size-4 transition-transform group-open:rotate-180">
+                        <path d="m5 7.5 5 5 5-5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.75" />
+                      </svg>
+                    </span>
+                  </span>
+                  <span className="mt-1 block text-xs font-normal leading-5 text-warm-700 dark:text-muted">
+                    {t("dialogPermissionOpenHint")}
+                  </span>
+                </summary>
+                <div className="mt-3 border-t border-border pt-3">
+                  <ReferenceCardAutoCreationControls
+                    value={referenceCardAutoCreationPolicy}
+                    onChange={setReferenceCardAutoCreationPolicy}
+                    disabled={submitting}
+                  />
+                </div>
+              </details>
+
+              <fieldset className="grid gap-2 rounded-md border border-border bg-background p-3">
+                <legend className="px-1 text-xs font-medium text-warm-700 dark:text-muted">
+                  {t("dialogDeviationPolicyLabel")}
+                </legend>
+                <label className="flex cursor-pointer items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="outline-deviation-policy"
+                    value="pause_for_rewrite"
+                    checked={outlineDeviationPolicy === "pause_for_rewrite"}
+                    onChange={() => setOutlineDeviationPolicy("pause_for_rewrite")}
+                    className="mt-0.5 size-4"
+                  />
+                  <span>
+                    <span className="font-medium text-foreground">
+                      {t("dialogDeviationPauseTitle")}
+                    </span>
+                    <span className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted">
+                      {t("dialogDeviationPauseBody")}
+                    </span>
+                  </span>
+                </label>
+                <label className="flex cursor-pointer items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="outline-deviation-policy"
+                    value="accept_and_continue"
+                    checked={outlineDeviationPolicy === "accept_and_continue"}
+                    onChange={() => setOutlineDeviationPolicy("accept_and_continue")}
+                    className="mt-0.5 size-4"
+                  />
+                  <span>
+                    <span className="font-medium text-foreground">
+                      {t("dialogDeviationContinueTitle")}
+                    </span>
+                    <span className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted">
+                      {t("dialogDeviationContinueBody")}
+                    </span>
+                  </span>
+                </label>
+                <p className="border-t border-border pt-2 text-xs leading-5 text-warm-700 dark:text-muted">
+                  {t("dialogDeviationCostHint")}
+                </p>
+              </fieldset>
+            </>
           )}
 
-          <ReferenceCardAutoCreationControls
-            value={referenceCardAutoCreationPolicy}
-            onChange={setReferenceCardAutoCreationPolicy}
-            disabled={submitting}
-          />
+          {stage === "behavior" && (
+            <>
+              <section className="rounded-md border border-border bg-background px-3 py-2.5">
+                <h4
+                  ref={stageHeadingRef}
+                  tabIndex={-1}
+                  className="text-sm font-semibold text-foreground outline-none"
+                >
+                  {t("dialogBehaviorTitle")}
+                </h4>
+                <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
+                  {t("dialogBehaviorDescription")}
+                </p>
+              </section>
 
+              <div className="grid gap-1 text-sm">
+                <label htmlFor="batch-checkpoint-interval" className="text-xs font-medium text-warm-700 dark:text-muted">
+                  {t("dialogCheckpointLabel")}
+                </label>
+                <input
+                  id="batch-checkpoint-interval"
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={checkpointInterval}
+                  onChange={(e) => setCheckpointInterval(Number(e.target.value))}
+                  aria-invalid={!checkpointIntervalAllowsNext(checkpointInterval)}
+                  aria-describedby="batch-checkpoint-interval-hint"
+                  className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
+                />
+                <span id="batch-checkpoint-interval-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">{t("dialogCheckpointHint")}</span>
+                {!checkpointIntervalAllowsNext(checkpointInterval) && (
+                  <span role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
+                    {t("dialogCheckpointInvalid")}
+                  </span>
+                )}
+              </div>
 
-          <section className="grid gap-2">
-            <OutlineGenerationParams
-              value={generationParams}
-              onChange={setGenerationParams}
-            />
-            <p className="px-1 text-xs leading-5 text-muted">
-              {t("dialogGenerationParamsHint")}
-            </p>
-            {generationParams.system_prompt !== null && (
-              <p
-                role="note"
-                className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300"
-              >
-                {t("dialogSystemPromptScopeHint")}
-              </p>
-            )}
-          </section>
+              <section className="grid gap-2">
+                <OutlineGenerationParams
+                  value={generationParams}
+                  onChange={setGenerationParams}
+                  showSystemPrompt={false}
+                  showFailureRetry={false}
+                />
+                <p className="px-1 text-xs leading-5 text-warm-700 dark:text-muted">
+                  {t("dialogGenerationParamsHint")}
+                </p>
+              </section>
 
-          <fieldset className="grid gap-2 rounded-md border border-border bg-background p-3">
-            <legend className="px-1 text-xs font-medium text-muted">
-              {t("dialogDeviationPolicyLabel")}
-            </legend>
-            <label className="flex cursor-pointer items-start gap-2 text-sm">
-              <input
-                type="radio"
-                name="outline-deviation-policy"
-                value="pause_for_rewrite"
-                checked={outlineDeviationPolicy === "pause_for_rewrite"}
-                onChange={() => setOutlineDeviationPolicy("pause_for_rewrite")}
-                className="mt-0.5 size-4"
-              />
-              <span>
-                <span className="font-medium text-foreground">
-                  {t("dialogDeviationPauseTitle")}
-                </span>
-                <span className="mt-0.5 block text-xs leading-5 text-muted">
-                  {t("dialogDeviationPauseBody")}
-                </span>
-              </span>
-            </label>
-            <label className="flex cursor-pointer items-start gap-2 text-sm">
-              <input
-                type="radio"
-                name="outline-deviation-policy"
-                value="accept_and_continue"
-                checked={outlineDeviationPolicy === "accept_and_continue"}
-                onChange={() => setOutlineDeviationPolicy("accept_and_continue")}
-                className="mt-0.5 size-4"
-              />
-              <span>
-                <span className="font-medium text-foreground">
-                  {t("dialogDeviationContinueTitle")}
-                </span>
-                <span className="mt-0.5 block text-xs leading-5 text-muted">
-                  {t("dialogDeviationContinueBody")}
-                </span>
-              </span>
-            </label>
-            <p className="border-t border-border pt-2 text-xs leading-5 text-muted">
-              {t("dialogDeviationCostHint")}
-            </p>
-          </fieldset>
+            </>
+          )}
 
-          <section aria-labelledby="generation-readiness-title" className="border-t border-border pt-4">
+          {stage === "readiness" && (
+          <section aria-labelledby="generation-readiness-title" className="min-w-0">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h4 id="generation-readiness-title" className="text-sm font-semibold text-foreground">
+                <h4
+                  ref={stageHeadingRef}
+                  id="generation-readiness-title"
+                  tabIndex={-1}
+                  className="text-sm font-semibold text-foreground outline-none"
+                >
                   {t("readinessTitle")}
                 </h4>
-                <p className="mt-1 text-xs leading-5 text-muted">{t("readinessDescription")}</p>
+                <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">{t("readinessDescription")}</p>
               </div>
               {!readinessLoading && (
                 <button
@@ -347,7 +604,7 @@ export default function StartJobDialog({
 
 
             {readinessLoading && (
-              <p role="status" className="mt-3 text-sm text-muted">{t("readinessLoading")}</p>
+              <p role="status" className="mt-3 text-sm text-warm-700 dark:text-muted">{t("readinessLoading")}</p>
             )}
 
             {readiness && !readinessLoading && (
@@ -362,7 +619,7 @@ export default function StartJobDialog({
                             ? t("stepProse")
                             : t("stepState")}
                       </p>
-                      <p className="mt-1 text-xs text-muted">
+                      <p className="mt-1 text-xs text-warm-700 dark:text-muted">
                         {t("readinessWorkCounts", {
                           generate: readiness.work.steps[step].generate,
                           reuse: readiness.work.steps[step].reuse,
@@ -372,7 +629,7 @@ export default function StartJobDialog({
                   ))}
                 </div>
 
-                <div className="grid gap-1 text-xs text-muted sm:grid-cols-2">
+                <div className="grid gap-1 text-xs text-warm-700 dark:text-muted sm:grid-cols-2">
                   <p>
                     {t("readinessResources", {
                       characters: readiness.resources.character,
@@ -556,6 +813,18 @@ export default function StartJobDialog({
                           {t("readinessOpenCards")}
                         </button>
                       )}
+                      {issue.action_codes.includes("open_world_baseline") && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onNavigateToWorldBaseline();
+                          }}
+                          className="mt-2 text-xs font-medium text-accent hover:underline"
+                        >
+                          {t("readinessOpenWorldBaseline")}
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -568,6 +837,98 @@ export default function StartJobDialog({
               </div>
             )}
           </section>
+          )}
+
+          {stage === "confirmation" && readiness && (
+            <section aria-labelledby="generation-confirmation-title" className="grid gap-3">
+              <div className="rounded-md border border-accent/30 bg-accent/5 px-3 py-2.5">
+                <h4
+                  ref={stageHeadingRef}
+                  id="generation-confirmation-title"
+                  tabIndex={-1}
+                  className="text-sm font-semibold text-foreground outline-none"
+                >
+                  {t("dialogConfirmationTitle")}
+                </h4>
+                <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
+                  {t("dialogConfirmationDescription")}
+                </p>
+              </div>
+              <dl className="grid gap-px overflow-hidden rounded-md border border-border bg-border text-sm sm:grid-cols-2">
+                <div className="min-w-0 bg-background p-3">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationScope")}</dt>
+                  <dd className="mt-1 break-words font-medium text-foreground">{targetLabel}</dd>
+                </div>
+                <div className="min-w-0 bg-background p-3">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationWork")}</dt>
+                  <dd className="mt-1 font-medium text-foreground">
+                    {t("dialogConfirmationWorkValue", { count: readiness.work.chapter_count })}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationBudget")}</dt>
+                  <dd className="mt-1 font-medium tabular-nums text-foreground">
+                    {t("dialogConfirmationBudgetValue", { budget: parsedTokenBudget ?? 0 })}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationCalls")}</dt>
+                  <dd className="mt-1 font-medium tabular-nums text-foreground">
+                    {t("dialogConfirmationCallsValue", { count: readiness.planning.attempt_capacity })}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationCheckpoint")}</dt>
+                  <dd className="mt-1 font-medium text-foreground">
+                    {t("dialogConfirmationCheckpointValue", { count: checkpointInterval })}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationContinuation")}</dt>
+                  <dd className="mt-1 text-xs leading-5 text-foreground">
+                    {t("dialogConfirmationContinuationValue", {
+                      count: continuationPolicy.automatic_continuations_per_scene,
+                    })}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3 sm:col-span-2">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationCards")}</dt>
+                  <dd className="mt-1 text-xs leading-5 text-foreground">
+                    {referenceCardAutoCreationPolicy.enabled
+                      ? t("dialogConfirmationCardsEnabledValue", {
+                          types: referenceCardAutoCreationPolicy.allowed_card_types
+                            .map(referenceCardTypeLabel)
+                            .join(t("referenceCardNameSeparator")),
+                          perChapter: referenceCardAutoCreationPolicy.max_auto_creates_per_chapter,
+                          perBook: referenceCardAutoCreationPolicy.max_auto_creates_per_book,
+                          repair: referenceCardAutoCreationPolicy.max_candidate_repair_cycles_per_chapter,
+                        })
+                      : t("dialogConfirmationCardsDisabledValue")}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3 sm:col-span-2">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationDeviation")}</dt>
+                  <dd className="mt-1 text-xs leading-5 text-foreground">
+                    {outlineDeviationPolicy === "pause_for_rewrite"
+                      ? t("dialogDeviationPauseTitle")
+                      : t("dialogDeviationContinueTitle")}
+                  </dd>
+                </div>
+                <div className="min-w-0 bg-background p-3 sm:col-span-2">
+                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationGeneration")}</dt>
+                  <dd className="mt-1 text-xs leading-5 text-foreground">
+                    {generationOverrideSummary.join(t("dialogConfirmationParameterSeparator"))}
+                    <span className="mt-1 block text-warm-700 dark:text-muted">
+                      {t("dialogConfirmationProtectedPrompt")}
+                    </span>
+                  </dd>
+                </div>
+              </dl>
+              <p className="text-xs leading-5 text-warm-700 dark:text-muted">
+                {t("dialogConfirmationFinalHint")}
+              </p>
+            </section>
+          )}
 
           {error && (
             <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
@@ -580,21 +941,51 @@ export default function StartJobDialog({
           <Button variant="ghost" size="sm" onPress={onClose} isDisabled={submitting}>
             {t("dialogCancel")}
           </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            className="bg-accent text-white hover:bg-accent-hover"
-            onPress={() => void submit()}
-            isDisabled={
-              submitting
-              || readinessLoading
-              || !readiness
-              || !readinessIsCurrent
-              || !readinessAllowsStart(readiness, acknowledgedCodes)
-            }
-          >
-            {submitting ? t("dialogStarting") : t("dialogStart")}
-          </Button>
+          {stage !== "authorization" && (
+            <Button variant="outline" size="sm" onPress={goBack} isDisabled={submitting}>
+              {t("dialogBack")}
+            </Button>
+          )}
+          {stage === "confirmation" ? (
+            <Button
+              variant="primary"
+              size="sm"
+              className="bg-accent text-white hover:bg-accent-hover"
+              onPress={() => void submit()}
+              isDisabled={
+                submitting
+                || !readiness
+                || !readinessIsCurrent
+                || !readinessAllowsStart(readiness, acknowledgedCodes)
+              }
+            >
+              {submitting ? t("dialogStarting") : t("dialogStart")}
+            </Button>
+          ) : (
+            <Button
+              variant="primary"
+              size="sm"
+              className="bg-accent text-white hover:bg-accent-hover"
+              onPress={() => void advance()}
+              isDisabled={
+                submitting
+                || readinessLoading
+                || (stage === "authorization" && !initialAuthorizationAllowsNext(parsedTokenBudget))
+                || (stage === "behavior" && !checkpointIntervalAllowsNext(checkpointInterval))
+                || (stage === "readiness" && (
+                  !readiness
+                  || !readinessIsCurrent
+                  || !readinessAllowsStart(readiness, acknowledgedCodes)
+                ))
+              }
+            >
+              {stage === "behavior"
+                ? t("dialogRunReadiness")
+                : stage === "readiness"
+                  ? t("dialogReviewAuthorization")
+                  : t("dialogNext")}
+            </Button>
+          )}
         </footer>
       </div>
     </div>

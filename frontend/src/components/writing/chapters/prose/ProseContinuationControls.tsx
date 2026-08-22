@@ -102,14 +102,14 @@ export default function ProseContinuationControls({
         >
           {t("continuationSettingsTitle")}
         </h4>
-        <p className="mt-1 text-xs leading-5 text-muted">
+        <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
           {t("continuationSettingsDescription")}
         </p>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="grid gap-1 text-sm">
-          <span className="text-xs font-medium text-muted">
+          <span className="text-xs font-medium text-warm-700 dark:text-muted">
             {t("continuationAutomaticLabel")}
           </span>
           <input
@@ -125,7 +125,7 @@ export default function ProseContinuationControls({
             onBlur={commitAutomatic}
             className="min-h-9 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
           />
-          <span className="text-xs leading-5 text-muted">
+          <span className="text-xs leading-5 text-warm-700 dark:text-muted">
             {t("continuationAutomaticHint", {
               minimum: MIN_AUTOMATIC_CONTINUATIONS_PER_SCENE,
               maximum: MAX_AUTOMATIC_CONTINUATIONS_PER_SCENE,
@@ -134,7 +134,7 @@ export default function ProseContinuationControls({
         </label>
 
         <label className="grid gap-1 text-sm">
-          <span className="text-xs font-medium text-muted">
+          <span className="text-xs font-medium text-warm-700 dark:text-muted">
             {t("continuationTargetLabel")}
           </span>
           <input
@@ -150,7 +150,7 @@ export default function ProseContinuationControls({
             onBlur={commitTarget}
             className="min-h-9 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
           />
-          <span className="text-xs leading-5 text-muted">
+          <span className="text-xs leading-5 text-warm-700 dark:text-muted">
             {t("continuationTargetHint", {
               minimum: MIN_CONTINUATION_TARGET_WORDS,
               maximum: MAX_CONTINUATION_TARGET_WORDS,

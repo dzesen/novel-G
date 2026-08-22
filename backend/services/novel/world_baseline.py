@@ -60,6 +60,34 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+async def _current_structure_digest(novel_id: str) -> str:
+    """Hash only active volume/chapter topology, never generated prose or outlines."""
+    database = get_database()
+    novel_obj_id = to_object_id(novel_id)
+    volumes = await database[collections.VOLUMES].find(
+        {"novel_id": novel_obj_id, "is_deleted": False},
+        projection={
+            "_id": 1,
+            "order_index": 1,
+            "chapter_range": 1,
+            "chapter_count": 1,
+        },
+    ).sort([("order_index", 1), ("_id", 1)]).to_list(length=None)
+    chapters = await database[collections.CHAPTERS].find(
+        {"novel_id": novel_obj_id, "is_deleted": False},
+        projection={
+            "_id": 1,
+            "volume_id": 1,
+            "order_index": 1,
+        },
+    ).sort([("order_index", 1), ("_id", 1)]).to_list(length=None)
+    return _digest({
+        "projection_revision": "world_baseline_structure.v1",
+        "volumes": volumes,
+        "chapters": chapters,
+    })
+
+
 async def _material_snapshot(novel_id: str, structure_digest: str) -> dict[str, Any]:
     database = get_database()
     novel_obj_id = to_object_id(novel_id)
@@ -106,7 +134,7 @@ async def _material_snapshot(novel_id: str, structure_digest: str) -> dict[str, 
         "counts": counts,
         "material_digest": _digest(
             {
-                "projection_revision": "world_baseline_projection.v1",
+                "projection_revision": "world_baseline_projection.v2",
                 "structure_digest": structure_digest,
                 "markers": markers,
             }
@@ -128,7 +156,10 @@ async def _pending_decisions(novel_id: str) -> dict[str, int]:
         ),
         "card_import_proposals": (
             collections.CARD_IMPORT_PROPOSALS,
-            {"status": {"$in": ["pending_review", "applying"]}},
+            # A pending preview has not changed formal material and may be
+            # safely abandoned by closing its dialog. Only a mutation already
+            # being applied blocks the baseline confirmation.
+            {"status": "applying"},
         ),
     }
     result: dict[str, int] = {}
@@ -163,12 +194,13 @@ class WorldBaselineService:
                 },
             }
 
-        structure_digest = str(requirement.get("structure_digest") or "")
-        if not structure_digest:
+        requirement_digest = str(requirement.get("structure_digest") or "")
+        if not requirement_digest:
             raise WorldBaselineError(
                 "blueprint_structure_incomplete",
                 "卷章结构证据不完整，无法确认世界资料基线。",
             )
+        structure_digest = await _current_structure_digest(novel_id)
         material = await _material_snapshot(novel_id, structure_digest)
         pending = await _pending_decisions(novel_id)
         baseline = novel.get("world_baseline")
@@ -223,7 +255,13 @@ class WorldBaselineService:
                 "world_baseline_confirmation_not_available",
                 "这本旧书没有待确认的世界资料初始化步骤。",
             )
-        structure_digest = str(requirement.get("structure_digest") or "")
+        requirement_digest = str(requirement.get("structure_digest") or "")
+        if not requirement_digest:
+            raise WorldBaselineError(
+                "blueprint_structure_incomplete",
+                "卷章结构证据不完整，无法确认世界资料基线。",
+            )
+        structure_digest = await _current_structure_digest(novel_id)
         pending = await _pending_decisions(novel_id)
         if any(pending.values()):
             raise WorldBaselineError(
@@ -234,7 +272,7 @@ class WorldBaselineService:
         baseline = {
             "schema_version": "world_baseline.v1",
             "structure_digest": structure_digest,
-            "projection_revision": "world_baseline_projection.v1",
+            "projection_revision": "world_baseline_projection.v2",
             "material_digest": material["material_digest"],
             "counts": material["counts"],
             "decisions": {

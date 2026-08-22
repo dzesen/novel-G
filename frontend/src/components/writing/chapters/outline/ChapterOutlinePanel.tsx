@@ -212,6 +212,7 @@ export default function ChapterOutlinePanel({
             <OutlineGenerationParams
               value={params}
               onChange={setParams}
+              showSystemPrompt={false}
               maxTokensLimit={20_000}
               maxTokensEnableValue={20_000}
               maxTokensStep={1}

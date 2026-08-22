@@ -16,7 +16,9 @@ from backend.llm.base_client import BaseLLMClient
 from backend.llm.config import LLMProviderConfig
 from backend.llm.exceptions import (
     LLMAuthError,
+    LLMConnectionError,
     LLMError,
+    LLMHTTPStatusError,
     LLMRateLimitError,
     LLMResponseError,
     LLMSchemaUnsupportedError,
@@ -197,8 +199,16 @@ class OpenAICompatibleClient(BaseLLMClient):
             return LLMRateLimitError(str(exc), **kwargs)
         if isinstance(exc, openai.APITimeoutError):
             return LLMTimeoutError(str(exc), **kwargs)
+        if isinstance(exc, openai.APIConnectionError):
+            return LLMConnectionError(str(exc), **kwargs)
+        if isinstance(exc, openai.APIStatusError):
+            return LLMHTTPStatusError(
+                str(exc),
+                status_code=getattr(exc, "status_code", None),
+                **kwargs,
+            )
         if isinstance(exc, openai.APIError):
-            return LLMResponseError(str(exc), **kwargs)
+            return LLMError(str(exc), **kwargs)
         return LLMError(str(exc), **kwargs)
 
     def _raise_mapped_schema_error(

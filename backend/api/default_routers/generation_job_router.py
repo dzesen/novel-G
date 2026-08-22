@@ -1,6 +1,7 @@
 """批量生成作业的 HTTP 端点（轮询式，无 SSE）。设计 §9.2。"""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -40,6 +41,109 @@ router = APIRouter(
 
 _ID_FIELDS = ("_id", "novel_id", "volume_id", "current_chapter_id")
 _OUTLINE_ADHERENCE_VERDICTS = frozenset(("pass", "warn", "fail"))
+_AUTO_CREATION_OUTCOMES = frozenset((
+    "manual_review_required",
+    "auto_created",
+    "not_applicable",
+    "repair_exhausted",
+))
+
+
+def _safe_error_text(value: Any, *, limit: int = 160) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
+
+
+def _safe_error_text_list(
+    value: Any,
+    *,
+    item_limit: int = 160,
+    count_limit: int = 100,
+) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:count_limit]:
+        text = _safe_error_text(item, limit=item_limit)
+        if text is not None:
+            result.append(text)
+    return result
+
+
+def _serialize_auto_creation(value: Any) -> Dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    outcome = _safe_error_text(value.get("outcome"), limit=40)
+    if outcome not in _AUTO_CREATION_OUTCOMES:
+        return None
+    created_count = value.get("created_count")
+    if isinstance(created_count, bool) or not isinstance(created_count, int):
+        created_count = 0
+    result: Dict[str, Any] = {
+        "outcome": outcome,
+        "created_count": max(0, created_count),
+        "deny_reasons": _safe_error_text_list(
+            value.get("deny_reasons"),
+            item_limit=80,
+            count_limit=50,
+        ),
+    }
+    pause_reason = _safe_error_text(value.get("pause_reason"), limit=80)
+    if pause_reason is not None:
+        result["pause_reason"] = pause_reason
+    denials: list[Dict[str, str]] = []
+    raw_denials = value.get("denials")
+    if isinstance(raw_denials, list):
+        for raw_denial in raw_denials[:100]:
+            if not isinstance(raw_denial, Mapping):
+                continue
+            reason = _safe_error_text(raw_denial.get("reason"), limit=80)
+            if reason is None:
+                continue
+            denial = {"reason": reason}
+            candidate_id = _safe_error_text(
+                raw_denial.get("candidate_id"),
+                limit=100,
+            )
+            if candidate_id is not None:
+                denial["candidate_id"] = candidate_id
+            denials.append(denial)
+    result["denials"] = denials
+    return result
+
+
+def _serialize_job_error(value: Any) -> Dict[str, Any] | None:
+    """Project recovery metadata without returning raw exception/provider text."""
+    if not isinstance(value, Mapping):
+        return None
+    result: Dict[str, Any] = {}
+    for field, limit in (
+        ("step", 80),
+        ("chapter_id", 100),
+        ("audit_digest", 128),
+    ):
+        text = _safe_error_text(value.get(field), limit=limit)
+        if text is not None:
+            result[field] = text
+    for field, item_limit, count_limit in (
+        ("candidate_ids", 100, 100),
+        ("candidate_names", 160, 100),
+        ("reason_codes", 100, 50),
+        ("blocking_issue_codes", 100, 100),
+    ):
+        items = _safe_error_text_list(
+            value.get(field),
+            item_limit=item_limit,
+            count_limit=count_limit,
+        )
+        if items:
+            result[field] = items
+    auto_creation = _serialize_auto_creation(value.get("auto_creation"))
+    if auto_creation is not None:
+        result["auto_creation"] = auto_creation
+    return result or None
 
 
 def _serialize_outline_adherence(value: Any) -> Optional[Dict[str, Any]]:
@@ -59,6 +163,14 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if job is None:
         return None
     out = dict(job)
+    out.pop("batch_authorization_contract", None)
+    raw_generation_params = out.get("generation_params")
+    if isinstance(raw_generation_params, Mapping):
+        safe_generation_params = dict(raw_generation_params)
+        safe_generation_params.pop("system_prompt", None)
+        out["generation_params"] = safe_generation_params
+    else:
+        out["generation_params"] = {}
     for f in _ID_FIELDS:
         if out.get(f) is not None:
             out[f] = str(out[f])
@@ -77,13 +189,24 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         progress.append(entry)
     out["progress"] = progress
     out["diagnostics"] = infer_job_diagnostics(out)
+    out["error"] = _serialize_job_error(out.get("error"))
     return out
 
 
-class StartJobRequest(GenerationParamsMixin):
+class ProtectedBatchGenerationParamsMixin(GenerationParamsMixin):
+    """Bounded knobs only; protected chapter workflows reject prompt overrides."""
+
+    system_prompt: None = Field(default=None)
+    allow_failure_retry: bool = Field(
+        default=False,
+        description="是否显式允许沿用 Provider 配置进行传输层失败自动重试",
+    )
+
+
+class StartJobRequest(ProtectedBatchGenerationParamsMixin):
     checkpoint_interval: int = Field(default=5, ge=1, le=1000)
-    token_budget: Optional[int] = Field(default=None, ge=1)
-    readiness_digest: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    token_budget: int = Field(ge=1)
+    readiness_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     acknowledged_warning_codes: list[str] = Field(default_factory=list, max_length=50)
     outline_deviation_policy: Literal[
         "pause_for_rewrite",
@@ -97,8 +220,12 @@ class StartJobRequest(GenerationParamsMixin):
     )
 
 
-class BatchReadinessRequest(GenerationParamsMixin):
+class BatchReadinessRequest(ProtectedBatchGenerationParamsMixin):
     token_budget: Optional[int] = Field(default=None, ge=1)
+    outline_deviation_policy: Literal[
+        "pause_for_rewrite",
+        "accept_and_continue",
+    ] = "pause_for_rewrite"
     prose_continuation_policy: ProseContinuationPolicyRequest = Field(
         default_factory=ProseContinuationPolicyRequest
     )
@@ -237,6 +364,7 @@ async def inspect_volume_readiness_with_policy(
     try:
         return await GenerationJobService.inspect_volume_readiness(
             volume_id,
+            outline_deviation_policy=req.outline_deviation_policy,
             prose_continuation_policy=(
                 req.prose_continuation_policy.to_domain()
             ),
@@ -264,6 +392,7 @@ async def inspect_book_readiness_with_policy(
     try:
         return await GenerationJobService.inspect_book_readiness(
             novel_id,
+            outline_deviation_policy=req.outline_deviation_policy,
             prose_continuation_policy=(
                 req.prose_continuation_policy.to_domain()
             ),

@@ -4,7 +4,9 @@ from backend.llm.base_client import BaseLLMClient
 from backend.llm.config import LLMConfig, LLMProviderConfig, get_llm_config, get_provider_config
 from backend.llm.exceptions import (
     LLMAuthError,
+    LLMConnectionError,
     LLMError,
+    LLMHTTPStatusError,
     LLMRateLimitError,
     LLMResponseError,
     LLMSchemaError,
@@ -30,6 +32,8 @@ __all__ = [
     "TokenUsage",
     "LLMError",
     "LLMAuthError",
+    "LLMConnectionError",
+    "LLMHTTPStatusError",
     "LLMRateLimitError",
     "LLMTimeoutError",
     "LLMResponseError",

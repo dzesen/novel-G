@@ -601,7 +601,11 @@ export default function ProsePanel({
               onChange={setContinuationPolicy}
               disabled={running || runActionsBlocked}
             />
-            <OutlineGenerationParams value={params} onChange={setParams} />
+            <OutlineGenerationParams
+              value={params}
+              onChange={setParams}
+              showSystemPrompt={false}
+            />
             {automaticContinuationsEnabled && (
               <section
                 aria-labelledby="single-prose-readiness-title"

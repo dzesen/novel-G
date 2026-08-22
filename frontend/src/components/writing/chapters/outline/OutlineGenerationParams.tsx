@@ -42,12 +42,16 @@ export function toRequestParams(params: GenerationParams): Record<string, unknow
 export default function OutlineGenerationParams({
   value,
   onChange,
+  showSystemPrompt = true,
+  showFailureRetry = true,
   maxTokensLimit = 200_000,
   maxTokensEnableValue = 4_096,
   maxTokensStep = 256,
 }: {
   value: GenerationParams;
   onChange: (next: GenerationParams) => void;
+  showSystemPrompt?: boolean;
+  showFailureRetry?: boolean;
   maxTokensLimit?: number;
   maxTokensEnableValue?: number;
   maxTokensStep?: number;
@@ -99,12 +103,14 @@ export default function OutlineGenerationParams({
             }
             onValueChange={(v) => set("max_tokens", v)}
           />
-          <SwitchParam
-            label={t("paramAllowFailureRetry")}
-            description={t("paramAllowFailureRetryHint")}
-            value={value.allow_failure_retry}
-            onChange={(enabled) => set("allow_failure_retry", enabled)}
-          />
+          {showFailureRetry && (
+            <SwitchParam
+              label={t("paramAllowFailureRetry")}
+              description={t("paramAllowFailureRetryHint")}
+              value={value.allow_failure_retry}
+              onChange={(enabled) => set("allow_failure_retry", enabled)}
+            />
+          )}
           <OptionalSliderParam
             label={t("paramPresencePenalty")}
             value={value.presence_penalty}
@@ -123,13 +129,15 @@ export default function OutlineGenerationParams({
             onToggle={(enabled) => set("frequency_penalty", enabled ? 0 : null)}
             onValueChange={(v) => set("frequency_penalty", v)}
           />
-          <OptionalTextParam
-            label={t("paramSystemPrompt")}
-            value={value.system_prompt}
-            placeholder={t("paramSystemPromptPlaceholder")}
-            onToggle={(enabled) => set("system_prompt", enabled ? "" : null)}
-            onValueChange={(v) => set("system_prompt", v)}
-          />
+          {showSystemPrompt && (
+            <OptionalTextParam
+              label={t("paramSystemPrompt")}
+              value={value.system_prompt}
+              placeholder={t("paramSystemPromptPlaceholder")}
+              onToggle={(enabled) => set("system_prompt", enabled ? "" : null)}
+              onValueChange={(v) => set("system_prompt", v)}
+            />
+          )}
         </div>
       )}
     </div>

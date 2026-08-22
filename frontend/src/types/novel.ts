@@ -464,6 +464,8 @@ export interface EmergentReferenceCardApplyResult {
     card_id: string | null;
   }>;
   resumed_job_ids: string[];
+  resume_status: "resumed" | "not_resumed" | "deferred";
+  resume_reason_codes: string[];
 }
 
 export interface CharacterCardAvatarImportResult {

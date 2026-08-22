@@ -114,7 +114,6 @@ export interface JobGenerationParams {
   max_tokens?: number;
   presence_penalty?: number;
   frequency_penalty?: number;
-  system_prompt?: string;
   allow_failure_retry?: boolean;
   prose_continuation_policy?: ProseContinuationPolicy;
 }
@@ -299,8 +298,7 @@ export interface ChapterProgress {
 
 export interface JobError {
   step: string;
-  chapter_id: string;
-  message: string;
+  chapter_id?: string;
   candidate_ids?: string[];
   candidate_names?: string[];
   auto_creation?: {
@@ -379,9 +377,13 @@ export type DiagnosticEvidence =
 
 export interface GenerationDiagnostic {
   schema_version: number;
+  event_id?: string;
+  fingerprint?: string;
   category: DiagnosticCategory;
   code: string;
   evidence: DiagnosticEvidence;
+  impact?: string;
+  action_codes?: string[];
   source: "runtime" | "historical_inference";
   step: string;
   chapter_id: string;
@@ -418,6 +420,8 @@ export interface GenerationDiagnosticsSummary {
   affected_job_count: number;
   event_count: number;
   inferred_event_count: number;
+  insufficient_event_count?: number;
+  unresolved_event_count?: number;
   categories: DiagnosticCategorySummary[];
   recent_events: Array<GenerationDiagnostic & { job_id: string }>;
 }

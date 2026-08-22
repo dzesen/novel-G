@@ -392,10 +392,16 @@ class GenerationReadinessModule:
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
         authorization_revision: int = 1,
+        outline_deviation_policy: str = "pause_for_rewrite",
         reference_card_auto_creation_policy: (
             ReferenceCardAutoCreationPolicy | Mapping[str, Any] | None
         ) = None,
     ) -> dict[str, Any]:
+        if outline_deviation_policy not in {
+            "pause_for_rewrite",
+            "accept_and_continue",
+        }:
+            raise ValueError("outline deviation policy is invalid")
         continuation_policy = (
             prose_continuation_policy or ProseContinuationPolicy()
         )
@@ -990,6 +996,7 @@ class GenerationReadinessModule:
             "novel_id": str(novel_id),
             "scope": scope,
             "volume_id": str(volume_id) if volume_id else None,
+            "outline_deviation_policy": outline_deviation_policy,
             "work": work,
             "resources": {
                 "owner_id": str(resources.get("owner_id") or ""),
@@ -1046,6 +1053,7 @@ class GenerationReadinessModule:
         novel_id = report.get("novel_id")
         scope = report.get("scope")
         volume_id = report.get("volume_id")
+        outline_deviation_policy = report.get("outline_deviation_policy")
         planning = report.get("planning")
         candidate_readiness = (
             isinstance(planning, Mapping)
@@ -1065,6 +1073,11 @@ class GenerationReadinessModule:
                 raise StaleReadiness("生成前检查小说范围无效，请重新检查")
             if scope not in {"volume", "book"}:
                 raise StaleReadiness("生成前检查作业范围无效，请重新检查")
+            if outline_deviation_policy not in {
+                "pause_for_rewrite",
+                "accept_and_continue",
+            }:
+                raise StaleReadiness("生成前检查偏纲处置权限无效，请重新检查")
             if (
                 (
                     scope == "volume"
@@ -1133,6 +1146,7 @@ class GenerationReadinessModule:
             "novel_id": novel_id,
             "scope": scope,
             "volume_id": volume_id,
+            "outline_deviation_policy": outline_deviation_policy,
             "digest": current_digest,
             "acknowledged_warning_codes": acknowledged,
             "issues": list(report.get("issues") or []),

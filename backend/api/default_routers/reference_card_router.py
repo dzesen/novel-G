@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,6 +31,7 @@ from backend.services.generation.reference_card_auto_creation_revert import (
 )
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/reference-cards",
     tags=["reference-cards"],
@@ -280,11 +282,27 @@ async def apply_emergent_reference_card_candidates(
         )
         from backend.services.generation.job_service import GenerationJobService
 
-        result["resumed_job_ids"] = (
-            await GenerationJobService.resume_after_reference_card_review(
-                novel_id
+        try:
+            resume_outcome = (
+                await GenerationJobService.resume_after_reference_card_review(
+                    novel_id
+                )
             )
-        )
+        except Exception:  # noqa: BLE001 - the human decision already committed
+            logger.exception(
+                "Automatic batch resume failed after reference-card review",
+                extra={"novel_id": novel_id},
+            )
+            result["resumed_job_ids"] = []
+            result["resume_status"] = "deferred"
+            result["resume_reason_codes"] = [
+                "automatic_resume_failed",
+                "manual_resume_required",
+            ]
+        else:
+            result["resumed_job_ids"] = resume_outcome["resumed_job_ids"]
+            result["resume_status"] = resume_outcome["status"]
+            result["resume_reason_codes"] = resume_outcome["reason_codes"]
         return result
     except StaleCandidateReview as exc:
         raise HTTPException(

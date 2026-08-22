@@ -1,11 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
-import { apiPostSSE } from "@/lib/api";
+import { apiPost, apiPostSSE } from "@/lib/api";
 import {
-  buildBlueprintRegenerationRequest,
+  buildBlueprintRegenerationReadinessRequest,
+  buildBlueprintRegenerationStartRequest,
   inspectBlueprintRegeneration,
 } from "@/lib/blueprintGeneration";
 import type {
@@ -21,6 +27,33 @@ interface BlueprintRegenerationPanelProps {
 
 type DialogStage = "confirm" | "running" | "review";
 type StepStatus = "pending" | "running" | "done" | "error";
+
+interface BlueprintRegenerationReadiness {
+  version: 1;
+  status: "ready" | "blocked";
+  digest: string;
+  token_budget: number;
+  maximum_provider_attempts: number;
+  maximum_tokens_total: number;
+  token_bound_known: boolean;
+  budget_covers_conservative_maximum: boolean;
+  providers: Array<{
+    step: AICreateStepKey;
+    provider_alias: string;
+    provider_model: string;
+    maximum_attempts: number;
+  }>;
+  issues: Array<{ code: string; level: string }>;
+}
+
+const FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "a[href]",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
 
 const STEP_KEYS: AICreateStepKey[] = [
   "expand_idea",
@@ -46,7 +79,15 @@ export default function BlueprintRegenerationPanel({
     draft._creationOrigin === "ai_idea" ||
     draft._creationOrigin === "tavern_cards";
   const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
   const [stage, setStage] = useState<DialogStage>("confirm");
+  const [tokenBudget, setTokenBudget] = useState("");
+  const [readiness, setReadiness] =
+    useState<BlueprintRegenerationReadiness | null>(null);
+  const [readinessLoading, setReadinessLoading] = useState(false);
   const [candidate, setCandidate] = useState<AICreateResponse | null>(null);
   const [error, setError] = useState("");
   const [stepStatuses, setStepStatuses] = useState<
@@ -58,10 +99,25 @@ export default function BlueprintRegenerationPanel({
     novel_meta: "pending",
   }));
 
+  const parsedTokenBudget = /^\d+$/.test(tokenBudget)
+    ? Number(tokenBudget)
+    : 0;
+  const validTokenBudget = Number.isSafeInteger(parsedTokenBudget)
+    && parsedTokenBudget > 0;
+
+  useEffect(() => {
+    if (!open) return;
+    headingRef.current?.focus();
+  }, [open, stage]);
+
   if (!originSupportsRegeneration) return null;
 
   const openDialog = () => {
+    returnFocusRef.current = document.activeElement as HTMLElement | null;
     setStage("confirm");
+    setTokenBudget("");
+    setReadiness(null);
+    setReadinessLoading(false);
     setCandidate(null);
     setError("");
     setStepStatuses({
@@ -76,12 +132,71 @@ export default function BlueprintRegenerationPanel({
   const closeDialog = () => {
     if (stage === "running") return;
     setOpen(false);
+    queueMicrotask(() => (returnFocusRef.current ?? triggerRef.current)?.focus());
+  };
+
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape" && stage !== "running") {
+      event.preventDefault();
+      closeDialog();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+    ).filter((element) => element.getClientRects().length > 0);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialog.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  const inspectReadiness = async () => {
+    const currentInspection = inspectBlueprintRegeneration(draft);
+    if (!currentInspection.allowed || !validTokenBudget) return;
+    setReadinessLoading(true);
+    setReadiness(null);
+    setError("");
+    try {
+      const report = await apiPost<BlueprintRegenerationReadiness>(
+        "/api/llm/regenerate-blueprint/readiness",
+        buildBlueprintRegenerationReadinessRequest(
+          currentInspection.source,
+          parsedTokenBudget,
+        ),
+      );
+      setReadiness(report);
+      if (report.status !== "ready") {
+        setError(t("readinessBlocked"));
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("readinessFailed"));
+    } finally {
+      setReadinessLoading(false);
+    }
   };
 
   const startRegeneration = async () => {
     const currentInspection = inspectBlueprintRegeneration(draft);
     if (!currentInspection.allowed) {
       setError(t(`blocked.${currentInspection.blocked_code}`));
+      return;
+    }
+    if (!readiness || readiness.status !== "ready" || !validTokenBudget) {
+      setError(t("readinessRequired"));
       return;
     }
 
@@ -98,8 +213,12 @@ export default function BlueprintRegenerationPanel({
 
     try {
       await apiPostSSE(
-        "/api/llm/create-novel-by-ai",
-        buildBlueprintRegenerationRequest(currentInspection.source),
+        "/api/llm/regenerate-blueprint",
+        buildBlueprintRegenerationStartRequest(
+          currentInspection.source,
+          parsedTokenBudget,
+          readiness.digest,
+        ),
         (event, data) => {
           if (event === "step" && isStepKey(data.step)) {
             const status = data.status;
@@ -124,6 +243,7 @@ export default function BlueprintRegenerationPanel({
             return;
           }
           setStage("confirm");
+          setReadiness(null);
           setError(
             typeof data.error === "string" && data.error.trim()
               ? data.error
@@ -133,10 +253,12 @@ export default function BlueprintRegenerationPanel({
       );
       if (!receivedTerminalEvent) {
         setStage("confirm");
+        setReadiness(null);
         setError(t("connectionEnded"));
       }
     } catch (cause) {
       setStage("confirm");
+      setReadiness(null);
       setError(cause instanceof Error ? cause.message : t("failed"));
     }
   };
@@ -145,6 +267,7 @@ export default function BlueprintRegenerationPanel({
     if (!candidate) return;
     onAccept(candidate);
     setOpen(false);
+    queueMicrotask(() => (returnFocusRef.current ?? triggerRef.current)?.focus());
   };
 
   return (
@@ -164,6 +287,7 @@ export default function BlueprintRegenerationPanel({
           </p>
         </div>
         <Button
+          ref={triggerRef}
           variant="secondary"
           className="w-full shrink-0 sm:w-auto"
           isDisabled={!inspection.allowed}
@@ -175,10 +299,13 @@ export default function BlueprintRegenerationPanel({
 
       {open && inspection.allowed && (
         <div
+          ref={dialogRef}
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-3 py-4 sm:px-6"
           role="dialog"
           aria-modal="true"
           aria-labelledby="blueprint-regeneration-title"
+          tabIndex={-1}
+          onKeyDown={handleDialogKeyDown}
         >
           <div
             className="flex max-h-full w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-border bg-background shadow-xl"
@@ -190,8 +317,10 @@ export default function BlueprintRegenerationPanel({
                   {t(`stage.${stage}.eyebrow`)}
                 </p>
                 <h2
+                  ref={headingRef}
                   id="blueprint-regeneration-title"
-                  className="mt-1 text-lg font-semibold text-foreground"
+                  tabIndex={-1}
+                  className="mt-1 text-lg font-semibold text-foreground outline-none"
                 >
                   {t(`stage.${stage}.title`)}
                 </h2>
@@ -229,6 +358,72 @@ export default function BlueprintRegenerationPanel({
                   <div className="rounded-xl border border-warning/40 bg-warning/5 p-4 text-sm leading-6 text-foreground">
                     {t("replacementWarning")}
                   </div>
+                  <section className="rounded-xl border border-accent/35 bg-accent/[0.04] p-4">
+                    <h3 className="text-sm font-semibold text-foreground">
+                      {t("authorizationTitle")}
+                    </h3>
+                    <p className="mt-1 text-xs leading-5 text-muted">
+                      {t("authorizationDescription")}
+                    </p>
+                    <label
+                      htmlFor="blueprint-regeneration-token-budget"
+                      className="mt-4 block text-xs font-medium text-foreground"
+                    >
+                      {t("tokenBudgetLabel")}
+                    </label>
+                    <input
+                      id="blueprint-regeneration-token-budget"
+                      type="number"
+                      min={1}
+                      value={tokenBudget}
+                      onChange={(event) => {
+                        setTokenBudget(event.target.value);
+                        setReadiness(null);
+                        setError("");
+                      }}
+                      aria-invalid={tokenBudget !== "" && !validTokenBudget}
+                      aria-describedby="blueprint-regeneration-token-budget-hint"
+                      className="mt-1 min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
+                    />
+                    <p
+                      id="blueprint-regeneration-token-budget-hint"
+                      className="mt-1 text-xs leading-5 text-muted"
+                    >
+                      {t("tokenBudgetHint")}
+                    </p>
+                    {tokenBudget !== "" && !validTokenBudget && (
+                      <p role="note" className="mt-2 text-xs text-danger">
+                        {t("tokenBudgetInvalid")}
+                      </p>
+                    )}
+                    {readiness && (
+                      <dl className="mt-4 grid gap-2 border-t border-border pt-4 text-xs sm:grid-cols-3">
+                        <div>
+                          <dt className="text-muted">{t("maximumCalls")}</dt>
+                          <dd className="mt-1 font-semibold tabular-nums text-foreground">
+                            {readiness.maximum_provider_attempts}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-muted">{t("providerCount")}</dt>
+                          <dd className="mt-1 font-semibold tabular-nums text-foreground">
+                            {new Set(readiness.providers.map((item) => item.provider_alias)).size}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt className="text-muted">{t("conservativeMaximum")}</dt>
+                          <dd className="mt-1 font-semibold tabular-nums text-foreground">
+                            {readiness.maximum_tokens_total.toLocaleString()}
+                          </dd>
+                        </div>
+                      </dl>
+                    )}
+                    {readiness && !readiness.budget_covers_conservative_maximum && (
+                      <p role="note" className="mt-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
+                        {t("budgetMayStop")}
+                      </p>
+                    )}
+                  </section>
                   {error && (
                     <p
                       role="alert"
@@ -307,13 +502,24 @@ export default function BlueprintRegenerationPanel({
                   <Button variant="ghost" onPress={closeDialog}>
                     {t("keepCurrent")}
                   </Button>
-                  <Button
-                    variant="primary"
-                    className="bg-accent text-white hover:bg-accent-hover"
-                    onPress={() => void startRegeneration()}
-                  >
-                    {t("confirmPaidCall")}
-                  </Button>
+                  {readiness?.status === "ready" ? (
+                    <Button
+                      variant="primary"
+                      className="bg-accent text-white hover:bg-accent-hover"
+                      onPress={() => void startRegeneration()}
+                    >
+                      {t("confirmPaidCall")}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="primary"
+                      className="bg-accent text-white hover:bg-accent-hover"
+                      isDisabled={!validTokenBudget || readinessLoading}
+                      onPress={() => void inspectReadiness()}
+                    >
+                      {readinessLoading ? t("checkingReadiness") : t("checkReadiness")}
+                    </Button>
+                  )}
                 </>
               )}
               {stage === "running" && (

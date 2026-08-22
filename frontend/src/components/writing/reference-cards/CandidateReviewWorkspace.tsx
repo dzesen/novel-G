@@ -263,7 +263,11 @@ export default function CandidateReviewWorkspace({
         },
       );
       setSuccess(
-        result.resumed_job_ids.length
+        result.resume_status === "deferred"
+          ? result.resume_reason_codes.includes("successor_required")
+            ? t("appliedSuccessorRequired")
+            : t("appliedResumeDeferred")
+          : result.resumed_job_ids.length
           ? t("appliedAndResumed")
           : t("applied"),
       );

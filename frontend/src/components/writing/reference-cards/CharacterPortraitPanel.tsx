@@ -194,7 +194,7 @@ export default function CharacterPortraitPanel({
       Array.from(
         new Set([
           ...(state?.warnings ?? []),
-          ...(state?.provider.warnings ?? []),
+          ...(state?.provider?.warnings ?? []),
           ...(job?.warnings ?? []),
           ...(job?.provider?.warnings ?? []),
         ]),

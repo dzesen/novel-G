@@ -22,6 +22,25 @@ class LLMTimeoutError(LLMError):
     """请求超时。"""
 
 
+class LLMConnectionError(LLMError):
+    """Provider 连接建立或传输链路失败。"""
+
+
+class LLMHTTPStatusError(LLMError):
+    """Provider 返回非成功 HTTP 状态，但没有更具体的安全分类。"""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status_code: int | None = None,
+        provider: str = "",
+        model: str = "",
+    ) -> None:
+        self.status_code = status_code
+        super().__init__(message, provider=provider, model=model)
+
+
 class LLMResponseError(LLMError):
     """响应内容解析失败。"""
 

@@ -43,7 +43,7 @@ export default function ReferenceCardAutoCreationControls({
 
   return (
     <fieldset className="grid min-w-0 gap-3 rounded-md border border-border bg-background p-3 sm:p-4">
-      <legend className="px-1 text-xs font-medium text-muted">
+      <legend className="px-1 text-xs font-medium text-warm-700 dark:text-muted">
         {t("dialogAutoCardsTitle")}
       </legend>
       <label className="flex min-w-0 cursor-pointer items-start gap-3">
@@ -64,7 +64,7 @@ export default function ReferenceCardAutoCreationControls({
           <span className="block text-sm font-medium text-foreground">
             {t("dialogAutoCardsEnable")}
           </span>
-          <span className="mt-0.5 block text-xs leading-5 text-muted">
+          <span className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted">
             {value.enabled
               ? t("dialogAutoCardsEnabledBody")
               : t("dialogAutoCardsDisabledBody")}
@@ -75,7 +75,7 @@ export default function ReferenceCardAutoCreationControls({
       {value.enabled && (
         <div className="grid min-w-0 gap-3 border-t border-border pt-3">
           <div className="grid gap-2">
-            <p className="text-xs font-medium text-muted">
+            <p className="text-xs font-medium text-warm-700 dark:text-muted">
               {t("dialogAutoCardsTypes")}
             </p>
             <div className="flex flex-wrap gap-x-4 gap-y-2" role="group" aria-label={t("dialogAutoCardsTypes")}>
@@ -96,14 +96,14 @@ export default function ReferenceCardAutoCreationControls({
                 );
               })}
             </div>
-            <p className="text-xs leading-5 text-muted">
+            <p className="text-xs leading-5 text-warm-700 dark:text-muted">
               {t("dialogAutoCardsTypesHint")}
             </p>
           </div>
 
           <div className="grid min-w-0 gap-3 sm:grid-cols-2">
             <label className="grid min-w-0 gap-1 text-sm">
-              <span className="text-xs font-medium text-muted">
+              <span className="text-xs font-medium text-warm-700 dark:text-muted">
                 {t("dialogAutoCardsPerChapter")}
               </span>
               <input
@@ -125,7 +125,7 @@ export default function ReferenceCardAutoCreationControls({
               />
             </label>
             <label className="grid min-w-0 gap-1 text-sm">
-              <span className="text-xs font-medium text-muted">
+              <span className="text-xs font-medium text-warm-700 dark:text-muted">
                 {t("dialogAutoCardsPerBook")}
               </span>
               <input
@@ -147,14 +147,14 @@ export default function ReferenceCardAutoCreationControls({
               />
             </label>
           </div>
-          <p className="text-xs leading-5 text-muted">
+          <p className="text-xs leading-5 text-warm-700 dark:text-muted">
             {t("dialogAutoCardsLimitHint", {
               perChapter: REFERENCE_CARD_AUTO_CREATION_HARD_LIMITS.perChapter,
               perBook: REFERENCE_CARD_AUTO_CREATION_HARD_LIMITS.perBook,
             })}
           </p>
           <label className="grid min-w-0 gap-1 text-sm">
-            <span className="text-xs font-medium text-muted">
+            <span className="text-xs font-medium text-warm-700 dark:text-muted">
               {t("dialogAutoCardsRepairLabel")}
             </span>
             <select
@@ -174,7 +174,7 @@ export default function ReferenceCardAutoCreationControls({
               <option value={1}>{t("dialogAutoCardsRepairOnce")}</option>
               <option value={2}>{t("dialogAutoCardsRepairTwice")}</option>
             </select>
-            <span className="text-xs leading-5 text-muted">
+            <span className="text-xs leading-5 text-warm-700 dark:text-muted">
               {t("dialogAutoCardsRepairHint", {
                 selected: value.max_candidate_repair_cycles_per_chapter,
                 hard: REFERENCE_CARD_AUTO_CREATION_HARD_LIMITS.repairCyclesPerChapter,

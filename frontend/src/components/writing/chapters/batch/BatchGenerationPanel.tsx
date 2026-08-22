@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { ApiError, apiGet, apiPost } from "@/lib/api";
@@ -28,7 +28,13 @@ import {
   bookCompletionResult,
 } from "./bookCompletionPresentation";
 
+const ABORT_DIALOG_FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
 interface BatchGenerationPanelProps {
+  surface: "start" | "runs";
   novelId: string;
   initialJobId?: string;
   onJobTargetValidation: (jobId: string, valid: boolean) => void;
@@ -41,6 +47,7 @@ interface BatchGenerationPanelProps {
   onQuietRefresh: () => void;
   onNavigateToMemory: () => void;
   onNavigateToBlueprint: () => void;
+  onNavigateToWorldBaseline: () => void;
   onNavigateToReferenceCards: (
     cardType?: ReferenceCardType,
     cardId?: string,
@@ -51,9 +58,11 @@ interface BatchGenerationPanelProps {
   onOpenProseRun: (run: LeftoverProseRun) => void;
   onStartFreshProse: (chapterId: string) => void;
   onOpenGenerationRuns: (target?: GenerationRunsNavigationTarget) => void;
+  onJobStarted?: (job: GenerationJob) => void;
 }
 
 export default function BatchGenerationPanel({
+  surface,
   novelId,
   initialJobId,
   onJobTargetValidation,
@@ -66,6 +75,7 @@ export default function BatchGenerationPanel({
   onQuietRefresh,
   onNavigateToMemory,
   onNavigateToBlueprint,
+  onNavigateToWorldBaseline,
   onNavigateToReferenceCards,
   onNavigateToReferenceCardCandidates,
   onNavigateToPlotThreads,
@@ -73,12 +83,16 @@ export default function BatchGenerationPanel({
   onOpenProseRun,
   onStartFreshProse,
   onOpenGenerationRuns,
+  onJobStarted,
 }: BatchGenerationPanelProps) {
   const t = useTranslations("writing.batch");
   const { job, error: pollError, setJob } = useGenerationJob({ onProgress: onQuietRefresh });
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
   const [abortConfirm, setAbortConfirm] = useState(false);
+  const abortDialogRef = useRef<HTMLDivElement>(null);
+  const abortCancelRef = useRef<HTMLButtonElement>(null);
+  const abortTriggerRef = useRef<HTMLElement | null>(null);
   const [resumeReviewOpen, setResumeReviewOpen] = useState(false);
   const [dismissed, setDismissed] = useState<string | null>(null); // 已关闭的终态作业 id
   const [jobLookupError, setJobLookupError] = useState("");
@@ -95,6 +109,9 @@ export default function BatchGenerationPanel({
     setJob(null);
     setDismissed(null);
     setJobLookupError("");
+    if (surface === "start") {
+      return () => { cancelled = true; };
+    }
     void (async () => {
       try {
         if (initialJobId) {
@@ -136,6 +153,7 @@ export default function BatchGenerationPanel({
     novelId,
     onJobTargetValidation,
     setJob,
+    surface,
     t,
   ]);
 
@@ -179,24 +197,76 @@ export default function BatchGenerationPanel({
   const control = async (
     action: "pause" | "resume" | "abort",
     body: Record<string, boolean> = {},
-  ) => {
-    if (!job) return;
+  ): Promise<boolean> => {
+    if (!job) return false;
     setControlBusy(true);
     setControlError(null);
     try {
       const next = await apiPost<GenerationJob>(`/api/generation-jobs/${job._id}/${action}`, body);
       setJob(next);
+      return true;
     } catch (err) {
       if (action === "resume" && isResumeReadinessRequired(err)) {
         setResumeReviewOpen(true);
-        return;
+        return false;
       }
       // resume 可能 409（别处有在跑作业）；原样展示（设计 §7.4）。
       setControlError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setControlBusy(false);
     }
   };
+
+  const openAbortConfirmation = useCallback(() => {
+    abortTriggerRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setAbortConfirm(true);
+  }, []);
+
+  const closeAbortConfirmation = useCallback(() => {
+    if (controlBusy) return;
+    setAbortConfirm(false);
+    window.requestAnimationFrame(() => {
+      if (abortTriggerRef.current?.isConnected) abortTriggerRef.current.focus();
+    });
+  }, [controlBusy]);
+
+  useEffect(() => {
+    if (!abortConfirm) return;
+    abortCancelRef.current?.focus();
+    const containFocus = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !controlBusy) {
+        event.preventDefault();
+        closeAbortConfirmation();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const dialog = abortDialogRef.current;
+      if (!dialog) return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(ABORT_DIALOG_FOCUSABLE_SELECTOR),
+      ).filter((element) => element.getClientRects().length > 0);
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialog.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", containFocus);
+    return () => window.removeEventListener("keydown", containFocus);
+  }, [abortConfirm, closeAbortConfirmation, controlBusy]);
 
   const requestResume = () => {
     if (!job) return;
@@ -228,7 +298,13 @@ export default function BatchGenerationPanel({
         fillableCount={fillableCount}
         onClose={onStartClose}
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
-        onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
+        onNavigateToWorldBaseline={onNavigateToWorldBaseline}
+        onSubmitted={(started) => {
+          setDismissed(null);
+          setJob(started);
+          onStartClose();
+          onJobStarted?.(started);
+        }}
       />
     ) : startScope === "book" ? (
       <StartJobDialog
@@ -240,9 +316,19 @@ export default function BatchGenerationPanel({
         fillableCount={bookFillableCount}
         onClose={onStartClose}
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
-        onSubmitted={(started) => { setDismissed(null); setJob(started); onStartClose(); }}
+        onNavigateToWorldBaseline={onNavigateToWorldBaseline}
+        onSubmitted={(started) => {
+          setDismissed(null);
+          setJob(started);
+          onStartClose();
+          onJobStarted?.(started);
+        }}
       />
     ) : null;
+
+  if (surface === "start") {
+    return dialog;
+  }
   const resumeDialog = resumeReviewOpen && job ? (
     <ResumeJobDialog
       job={job}
@@ -413,7 +499,7 @@ export default function BatchGenerationPanel({
               <Button variant="outline" size="sm" onPress={() => void control("pause")} isDisabled={controlBusy}>
                 {controlBusy ? t("pausing") : t("pause")}
               </Button>
-              <Button variant="outline" size="sm" onPress={() => setAbortConfirm(true)} isDisabled={controlBusy}>
+              <Button variant="outline" size="sm" onPress={openAbortConfirmation} isDisabled={controlBusy}>
                 {t("abort")}
               </Button>
             </div>
@@ -451,7 +537,7 @@ export default function BatchGenerationPanel({
             onResume={requestResume}
             onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
             onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
-            onAbort={() => setAbortConfirm(true)}
+            onAbort={openAbortConfirmation}
             busy={controlBusy}
             controlError={controlError}
             onOpenGenerationRuns={() => onOpenGenerationRuns({
@@ -489,22 +575,48 @@ export default function BatchGenerationPanel({
         />
 
         {abortConfirm && (
-          <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/25 px-4 py-6">
-            <div className="w-full max-w-sm rounded-md border border-border bg-surface p-5 shadow-lg">
-              <h4 className="text-sm font-semibold text-foreground">{t("abortConfirmTitle")}</h4>
-              <p className="mt-2 text-xs leading-5 text-muted">{t("abortConfirmBody")}</p>
-              <div className="mt-4 flex justify-end gap-2">
-                <Button variant="ghost" size="sm" onPress={() => setAbortConfirm(false)} isDisabled={controlBusy}>
-                  {t("abortConfirmNo")}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onPress={() => { void control("abort").then(() => setAbortConfirm(false)); }}
-                  isDisabled={controlBusy}
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4 py-6">
+            <div
+              ref={abortDialogRef}
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="abort-generation-title"
+              aria-describedby="abort-generation-description"
+              tabIndex={-1}
+              className="w-full max-w-sm rounded-md border border-border bg-surface p-5 shadow-lg"
+            >
+              <h4 id="abort-generation-title" className="text-sm font-semibold text-foreground">{t("abortConfirmTitle")}</h4>
+              <p id="abort-generation-description" className="mt-2 text-xs leading-5 text-warm-700 dark:text-muted">{t("abortConfirmBody")}</p>
+              {controlError && (
+                <p
+                  role="alert"
+                  className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs leading-5 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
                 >
-                  {t("abortConfirmYes")}
-                </Button>
+                  {t("controlError", { message: controlError })}
+                </p>
+              )}
+              <div className="mt-4 flex justify-end gap-2">
+                <button
+                  ref={abortCancelRef}
+                  type="button"
+                  onClick={closeAbortConfirmation}
+                  disabled={controlBusy}
+                  className="min-h-9 rounded-md px-3 text-sm font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:opacity-60"
+                >
+                  {t("abortConfirmNo")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void control("abort").then((succeeded) => {
+                      if (succeeded) closeAbortConfirmation();
+                    });
+                  }}
+                  disabled={controlBusy}
+                  className="min-h-9 rounded-md border border-red-300 bg-red-50 px-3 text-sm font-semibold text-red-800 hover:bg-red-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-600 disabled:opacity-60 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
+                >
+                  {controlBusy ? t("aborting") : t("abortConfirmYes")}
+                </button>
               </div>
             </div>
           </div>

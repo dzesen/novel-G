@@ -68,6 +68,9 @@ from backend.services.generation.prose_run_attempt_scope import (
     ProseRunAttemptScope,
 )
 from backend.services.generation.prose_runs import prose_run_module
+from backend.services.generation.protected_generation_params import (
+    validate_protected_generation_params,
+)
 from backend.services.generation.outline_adherence import (
     normalize_outline_adherence,
 )
@@ -165,7 +168,6 @@ _GENERATION_OVERRIDE_KEYS = frozenset(
         "max_tokens",
         "presence_penalty",
         "frequency_penalty",
-        "system_prompt",
     }
 )
 
@@ -563,6 +565,8 @@ class ChapterGenerationApplicationService:
         ),
     ) -> ChapterGenerationPrepared:
         """Resolve the real chapter context before a capability is dispatched."""
+
+        validate_protected_generation_params(command.generation_params)
 
         if isinstance(command, OutlineGenerationCommand):
             return await self._prepare_outline(command)

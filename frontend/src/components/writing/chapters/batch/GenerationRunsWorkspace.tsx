@@ -7,18 +7,13 @@ import type { WritingTargetKey } from "@/lib/writingRoute";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
   type GenerationDiagnostic,
-  type GenerationDiagnosticsSummary,
   type GenerationJob,
   type GenerationRunsNavigationTarget,
-  type LeftoverProseRun,
   isActive,
   isResumable,
   isTerminal,
 } from "./batchTypes";
-import GenerationDiagnosticsPanel, {
-  DiagnosticEventSummary,
-} from "./GenerationDiagnosticsPanel";
-import LeftoverProseRuns from "./LeftoverProseRuns";
+import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import ResumeJobDialog, { isResumeReadinessRequired } from "./ResumeJobDialog";
 import {
   finishReasonTranslationKey,
@@ -31,7 +26,6 @@ import {
 import {
   aggregateChapterProgress,
   currentJobReasonCode,
-  currentJobStatusByProseRun,
   diagnosticHistoryState,
   newestDiagnostics,
 } from "./generationRunsPresentation";
@@ -118,8 +112,7 @@ interface GenerationRunsWorkspaceProps {
   onNavigate: (target: GenerationRunsNavigationTarget) => void;
   onClose: () => void;
   onJumpToChapter: (chapterId: string) => void;
-  onOpenProseRun: (run: LeftoverProseRun) => void;
-  onStartFreshProse: (chapterId: string) => void;
+  readOnly?: boolean;
 }
 
 type ScopeFilter = "all" | "chapter" | "book" | "volume";
@@ -130,6 +123,7 @@ function eventLocator(
   event: GenerationDiagnostic,
   index: number,
 ): string {
+  if (event.event_id) return event.event_id;
   return [
     jobId,
     event.occurred_at ?? "",
@@ -325,8 +319,7 @@ export default function GenerationRunsWorkspace({
   onNavigate,
   onClose,
   onJumpToChapter,
-  onOpenProseRun,
-  onStartFreshProse,
+  readOnly = false,
 }: GenerationRunsWorkspaceProps) {
   const t = useTranslations("writing.generationRuns");
   const tBatch = useTranslations("writing.batch");
@@ -335,13 +328,10 @@ export default function GenerationRunsWorkspace({
   const headingRef = useRef<HTMLHeadingElement>(null);
   const loadRequestRef = useRef(0);
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
-  const [diagnostics, setDiagnostics] =
-    useState<GenerationDiagnosticsSummary | null>(null);
   const [proseRuns, setProseRuns] = useState<ProseRunTelemetry[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
   const [exactRunLookup, setExactRunLookup] = useState<{
     requestedId: string | null;
@@ -376,14 +366,10 @@ export default function GenerationRunsWorkspace({
     if (initial) setLoading(true);
     else setRefreshing(true);
     setLoadError(null);
-    setDiagnosticsError(null);
     setTelemetryError(null);
 
-    const [jobsResult, diagnosticsResult, telemetryResult] = await Promise.allSettled([
+    const [jobsResult, telemetryResult] = await Promise.allSettled([
       apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`),
-      apiGet<GenerationDiagnosticsSummary>(
-        `/api/generation-jobs/novel/${novelId}/diagnostics?limit=30`,
-      ),
       apiGet<ProseRunTelemetry[]>(
         `/api/llm/prose-runs/novel/${novelId}/telemetry?limit=100`,
       ),
@@ -395,11 +381,6 @@ export default function GenerationRunsWorkspace({
     } else {
       setLoadError(t("loadError"));
     }
-    if (diagnosticsResult.status === "fulfilled") {
-      setDiagnostics(diagnosticsResult.value);
-    } else {
-      setDiagnosticsError(tBatch("diagnosticsLoadError"));
-    }
     if (telemetryResult.status === "fulfilled") {
       setProseRuns(telemetryResult.value);
     } else {
@@ -407,7 +388,7 @@ export default function GenerationRunsWorkspace({
     }
     setLoading(false);
     setRefreshing(false);
-  }, [novelId, t, tBatch]);
+  }, [novelId, t]);
 
   useEffect(() => {
     void load(true);
@@ -537,10 +518,6 @@ export default function GenerationRunsWorkspace({
   const orderedDiagnostics = useMemo(
     () => newestDiagnostics(selectedJob?.diagnostics),
     [selectedJob],
-  );
-  const draftJobStatuses = useMemo(
-    () => currentJobStatusByProseRun(jobs),
-    [jobs],
   );
   const selectedChapter = target.chapterId
     ? chapters.find((chapter) => chapter._id === target.chapterId) ?? null
@@ -903,17 +880,19 @@ export default function GenerationRunsWorkspace({
                       {t("detailStatus", { status: statusLabel(selectedJob.status, t) })}
                     </p>
                   </div>
-                  <JobActionButtons
-                    job={selectedJob}
-                    busy={actionJobId === selectedJob._id}
-                    abortArmed={abortArmed === selectedJob._id}
-                    onPause={() => void control(selectedJob, "pause")}
-                    onResume={() => requestResume(selectedJob)}
-                    onRetryUncertain={() => void control(selectedJob, "resume", { confirm_uncertain_retry: true })}
-                    onSkipUncertain={() => void control(selectedJob, "resume", { skip_uncertain: true })}
-                    onAbort={() => requestAbort(selectedJob)}
-                    t={tBatch}
-                  />
+                  {!readOnly && (
+                    <JobActionButtons
+                      job={selectedJob}
+                      busy={actionJobId === selectedJob._id}
+                      abortArmed={abortArmed === selectedJob._id}
+                      onPause={() => void control(selectedJob, "pause")}
+                      onResume={() => requestResume(selectedJob)}
+                      onRetryUncertain={() => void control(selectedJob, "resume", { confirm_uncertain_retry: true })}
+                      onSkipUncertain={() => void control(selectedJob, "resume", { skip_uncertain: true })}
+                      onAbort={() => requestAbort(selectedJob)}
+                      t={tBatch}
+                    />
+                  )}
                 </div>
 
                 {actionError && (
@@ -1286,24 +1265,6 @@ export default function GenerationRunsWorkspace({
           </div>
         </section>
 
-        <div className="mt-4 grid gap-4 xl:grid-cols-2">
-          <GenerationDiagnosticsPanel
-            summary={diagnostics}
-            loading={loading || refreshing}
-            error={diagnosticsError}
-            onRetry={() => void load()}
-            embedded
-          />
-          <LeftoverProseRuns
-            key={novelId}
-            novelId={novelId}
-            chapters={chapters}
-            refreshKey={String(proseRunsRevision)}
-            jobStatusByRun={draftJobStatuses}
-            onOpenRun={onOpenProseRun}
-            onStartFresh={onStartFreshProse}
-          />
-        </div>
       </div>
     </main>
   );

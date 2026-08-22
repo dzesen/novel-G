@@ -203,6 +203,30 @@ export function buildBlueprintRegenerationRequest(
   };
 }
 
+export function buildBlueprintRegenerationReadinessRequest(
+  source: BlueprintGenerationSource,
+  tokenBudget: number,
+) {
+  return {
+    ...buildBlueprintRegenerationRequest(source),
+    token_budget: tokenBudget,
+    allow_failure_retry: false,
+  };
+}
+
+export function buildBlueprintRegenerationStartRequest(
+  source: BlueprintGenerationSource,
+  tokenBudget: number,
+  readinessDigest: string,
+) {
+  return {
+    ...buildBlueprintRegenerationRequest(source),
+    token_budget: tokenBudget,
+    readiness_digest: readinessDigest,
+    allow_failure_retry: false,
+  };
+}
+
 /** 把已确认的新候选作为一个整体写回，同时保留来源绑定与非生成设置。 */
 export function applyRegeneratedBlueprint(
   draft: WritingDraft,

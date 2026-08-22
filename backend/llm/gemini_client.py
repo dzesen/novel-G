@@ -5,15 +5,18 @@ from __future__ import annotations
 import time
 from typing import Any, AsyncGenerator, Callable
 
+import httpx
 from google import genai
-from google.genai import types
+from google.genai import errors as genai_errors, types
 from pydantic import BaseModel
 
 from backend.llm.base_client import BaseLLMClient
 from backend.llm.config import LLMProviderConfig
 from backend.llm.exceptions import (
     LLMAuthError,
+    LLMConnectionError,
     LLMError,
+    LLMHTTPStatusError,
     LLMRateLimitError,
     LLMResponseError,
     LLMSchemaUnsupportedError,
@@ -83,29 +86,66 @@ class GeminiClient(BaseLLMClient):
         return types.GenerateContentConfig(**kwargs)
 
     @staticmethod
-    def _exception_search_text(exc: Exception) -> str:
-        """汇总异常链的类型与消息，兼容 httpx.ReadTimeout 这类空消息异常。"""
-        parts: list[str] = []
+    def _exception_chain(exc: Exception) -> list[BaseException]:
+        """Return typed exception evidence without inspecting message text."""
+        chain: list[BaseException] = []
         current: BaseException | None = exc
         seen: set[int] = set()
         while current is not None and id(current) not in seen:
             seen.add(id(current))
-            parts.append(type(current).__name__)
-            parts.append(str(current))
+            chain.append(current)
             current = current.__cause__ or current.__context__
-        return " ".join(parts).lower()
+        return chain
 
     def _map_error(self, exc: Exception, model: str = "") -> LLMError:
         """将 Gemini SDK 异常映射为自定义异常。"""
         kwargs = {"provider": self.provider_name, "model": model}
-        exc_str = self._exception_search_text(exc)
-        if "api_key" in exc_str or "authentication" in exc_str or "permission" in exc_str:
-            return LLMAuthError(str(exc), **kwargs)
-        if "rate" in exc_str or "quota" in exc_str or "resource_exhausted" in exc_str:
-            return LLMRateLimitError(str(exc), **kwargs)
-        if "timeout" in exc_str or "deadline" in exc_str:
+        chain = self._exception_chain(exc)
+        response_error = next(
+            (
+                item
+                for item in chain
+                if isinstance(item, genai_errors.UnknownApiResponseError)
+            ),
+            None,
+        )
+        if response_error is not None:
+            return LLMResponseError(str(exc), **kwargs)
+        status_error = next(
+            (
+                item
+                for item in chain
+                if isinstance(
+                    item,
+                    (genai_errors.ClientError, genai_errors.ServerError),
+                )
+            ),
+            None,
+        )
+        if status_error is not None:
+            status_code = getattr(status_error, "code", None)
+            if status_code in {401, 403}:
+                return LLMAuthError(str(exc), **kwargs)
+            if status_code == 429:
+                return LLMRateLimitError(str(exc), **kwargs)
+            return LLMHTTPStatusError(
+                str(exc),
+                status_code=status_code if isinstance(status_code, int) else None,
+                **kwargs,
+            )
+        if any(
+            isinstance(item, (TimeoutError, httpx.TimeoutException))
+            for item in chain
+        ):
             return LLMTimeoutError(str(exc), **kwargs)
-        return LLMResponseError(str(exc), **kwargs)
+        if any(
+            isinstance(item, (ConnectionError, httpx.NetworkError, httpx.ProxyError))
+            for item in chain
+        ):
+            return LLMConnectionError(str(exc), **kwargs)
+        if any(isinstance(item, httpx.ProtocolError) for item in chain):
+            return LLMResponseError(str(exc), **kwargs)
+        return LLMError(str(exc), **kwargs)
 
     @staticmethod
     def _extract_usage(usage_metadata: Any) -> TokenUsage:

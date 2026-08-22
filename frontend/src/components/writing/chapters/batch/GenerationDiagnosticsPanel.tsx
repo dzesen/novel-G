@@ -8,7 +8,11 @@ import type {
   GenerationDiagnosticsSummary,
 } from "./batchTypes";
 import { finishReasonTranslationKey } from "../prose/prosePresentation";
-import { diagnosticReasonTranslationKey } from "./generationReasonPresentation";
+import {
+  diagnosticActionTranslationKey,
+  diagnosticImpactTranslationKey,
+  diagnosticReasonTranslationKey,
+} from "./generationReasonPresentation";
 
 function useDiagnosticCopy() {
   const t = useTranslations("writing.batch");
@@ -63,7 +67,24 @@ function useDiagnosticCopy() {
     }
   };
 
-  return { categoryLabel, evidenceLabel, reasonLabel, stepLabel };
+  const impactLabel = (impact: string) => {
+    const key = diagnosticImpactTranslationKey(impact);
+    return key ? t(key) : t("diagnosticsImpactUnknown");
+  };
+
+  const actionLabel = (action: string) => {
+    const key = diagnosticActionTranslationKey(action);
+    return key ? t(key) : null;
+  };
+
+  return {
+    actionLabel,
+    categoryLabel,
+    evidenceLabel,
+    impactLabel,
+    reasonLabel,
+    stepLabel,
+  };
 }
 
 export function DiagnosticEventSummary({
@@ -72,7 +93,14 @@ export function DiagnosticEventSummary({
   event: GenerationDiagnostic;
 }) {
   const t = useTranslations("writing.batch");
-  const { categoryLabel, evidenceLabel, reasonLabel, stepLabel } =
+  const {
+    actionLabel,
+    categoryLabel,
+    evidenceLabel,
+    impactLabel,
+    reasonLabel,
+    stepLabel,
+  } =
     useDiagnosticCopy();
   const requested = Number(event.details.requested_word_count);
   const actual = Number(event.details.actual_word_count);
@@ -83,26 +111,39 @@ export function DiagnosticEventSummary({
     : [];
   const finishReason = String(event.details.finish_reason ?? "");
   const rawFinishReason = String(event.details.raw_finish_reason ?? "");
+  const actions = (event.action_codes ?? [])
+    .map(actionLabel)
+    .filter((value): value is string => Boolean(value));
 
   return (
     <div className="min-w-0">
       <p className="text-sm font-medium text-foreground">
         {categoryLabel(event.category)}
       </p>
-      <p className="mt-0.5 text-xs leading-5 text-muted">
+      <p className="mt-0.5 text-xs leading-5 text-warm-700 dark:text-muted">
         {t("diagnosticsEventSummary", {
           reason: reasonLabel(event.code),
           evidence: evidenceLabel(event.evidence),
           step: stepLabel(event.step),
         })}
       </p>
+      {event.impact && (
+        <p className="mt-1 text-xs leading-5 text-foreground">
+          {t("diagnosticsImpactSummary", { impact: impactLabel(event.impact) })}
+        </p>
+      )}
+      {actions.length > 0 && (
+        <p className="text-xs leading-5 text-warm-700 dark:text-muted">
+          {t("diagnosticsActionSummary", { actions: actions.join(t("diagnosticsActionSeparator")) })}
+        </p>
+      )}
       {Number.isFinite(requested) && Number.isFinite(actual) && requested > 0 && (
-        <p className="text-xs leading-5 text-muted">
+        <p className="text-xs leading-5 text-warm-700 dark:text-muted">
           {t("diagnosticsProseMetrics", { actual, requested })}
         </p>
       )}
       {Number.isFinite(scenes) && Number.isFinite(completedScenes) && scenes > 0 && (
-        <p className="text-xs leading-5 text-muted">
+        <p className="text-xs leading-5 text-warm-700 dark:text-muted">
           {t("diagnosticsSceneMetrics", {
             completed: completedScenes,
             total: scenes,
@@ -110,14 +151,14 @@ export function DiagnosticEventSummary({
         </p>
       )}
       {(finishReason || rawFinishReason) && (
-        <p className="break-words text-xs leading-5 text-muted">
+        <p className="break-words text-xs leading-5 text-warm-700 dark:text-muted">
           {t("diagnosticsFinishReason", {
             reason: t(finishReasonTranslationKey(finishReason || rawFinishReason)),
           })}
         </p>
       )}
       {providers.length > 0 && (
-        <p className="break-words text-xs leading-5 text-muted">
+        <p className="break-words text-xs leading-5 text-warm-700 dark:text-muted">
           {t("diagnosticsProviders", { providers: providers.join(", ") })}
         </p>
       )}
@@ -130,6 +171,9 @@ interface GenerationDiagnosticsPanelProps {
   error: string | null;
   onRetry: () => void;
   embedded?: boolean;
+  onOpenEvent?: (
+    event: GenerationDiagnosticsSummary["recent_events"][number],
+  ) => void;
 }
 
 export default function GenerationDiagnosticsPanel({
@@ -138,6 +182,7 @@ export default function GenerationDiagnosticsPanel({
   error,
   onRetry,
   embedded = false,
+  onOpenEvent,
 }: GenerationDiagnosticsPanelProps) {
   const t = useTranslations("writing.batch");
   const { categoryLabel } = useDiagnosticCopy();
@@ -158,7 +203,7 @@ export default function GenerationDiagnosticsPanel({
           >
             {t("diagnosticsTitle")}
           </h3>
-          <p className="mt-0.5 max-w-[70ch] text-xs leading-5 text-muted">
+          <p className="mt-0.5 max-w-[70ch] text-xs leading-5 text-warm-700 dark:text-muted">
             {t("diagnosticsDescription")}
           </p>
         </div>
@@ -191,7 +236,7 @@ export default function GenerationDiagnosticsPanel({
       )}
 
       {!error && loading && !summary && (
-        <p role="status" className="mt-3 text-xs text-muted">
+        <p role="status" className="mt-3 text-xs text-warm-700 dark:text-muted">
           {t("diagnosticsLoading")}
         </p>
       )}
@@ -199,12 +244,12 @@ export default function GenerationDiagnosticsPanel({
       {!error && summary && (
         <div className="mt-3">
           {summary.event_count === 0 ? (
-            <p className="text-xs leading-5 text-muted">
+            <p className="text-xs leading-5 text-warm-700 dark:text-muted">
               {t("diagnosticsEmpty", { jobs: summary.window_job_count })}
             </p>
           ) : (
             <>
-              <p className="text-xs leading-5 text-muted">
+              <p className="text-xs leading-5 text-warm-700 dark:text-muted">
                 {t("diagnosticsWindowSummary", {
                   events: summary.event_count,
                   jobs: summary.affected_job_count,
@@ -212,9 +257,16 @@ export default function GenerationDiagnosticsPanel({
                 })}
               </p>
               {summary.inferred_event_count > 0 && (
-                <p className="mt-0.5 text-[11px] leading-5 text-muted">
+                <p className="mt-0.5 text-[11px] leading-5 text-warm-700 dark:text-muted">
                   {t("diagnosticsInferenceSummary", {
                     count: summary.inferred_event_count,
+                  })}
+                </p>
+              )}
+              {(summary.insufficient_event_count ?? 0) > 0 && (
+                <p className="mt-0.5 text-[11px] leading-5 text-amber-800 dark:text-amber-200">
+                  {t("diagnosticsInsufficientSummary", {
+                    count: summary.insufficient_event_count ?? 0,
                   })}
                 </p>
               )}
@@ -228,7 +280,7 @@ export default function GenerationDiagnosticsPanel({
                     <dt className="truncate text-xs font-medium text-foreground">
                       {categoryLabel(item.category)}
                     </dt>
-                    <dd className="mt-0.5 text-[11px] leading-5 text-muted">
+                    <dd className="mt-0.5 text-[11px] leading-5 text-warm-700 dark:text-muted">
                       {t("diagnosticsCategoryCounts", {
                         events: item.event_count,
                         jobs: item.job_count,
@@ -240,16 +292,29 @@ export default function GenerationDiagnosticsPanel({
 
               {summary.recent_events.length > 0 && (
                 <details className="mt-3 border-t border-border pt-3">
-                  <summary className="cursor-pointer text-xs font-medium text-foreground marker:text-muted">
+                  <summary className="cursor-pointer text-xs font-medium text-foreground marker:text-warm-700 dark:marker:text-muted">
                     {t("diagnosticsRecent")}
                   </summary>
                   <div className="mt-2 divide-y divide-border">
                     {summary.recent_events.slice(0, 5).map((event, index) => (
                       <div
-                        key={`${event.job_id}-${event.occurred_at ?? index}`}
+                        key={event.event_id ?? `${event.job_id}-${event.occurred_at ?? index}`}
                         className="py-2"
                       >
-                        <DiagnosticEventSummary event={event} />
+                        {onOpenEvent ? (
+                          <button
+                            type="button"
+                            onClick={() => onOpenEvent(event)}
+                            className="block w-full rounded-sm px-1 py-1 text-left hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                          >
+                            <DiagnosticEventSummary event={event} />
+                            <span className="mt-1 block text-xs font-medium text-accent">
+                              {t("diagnosticsOpenRecord")}
+                            </span>
+                          </button>
+                        ) : (
+                          <DiagnosticEventSummary event={event} />
+                        )}
                       </div>
                     ))}
                   </div>

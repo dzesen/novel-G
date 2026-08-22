@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Literal, Mapping
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -20,6 +22,7 @@ from backend.api.llm_routers._common import (
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
 from backend.llm.config import get_llm_config
+from backend.llm.models import TokenUsage
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
     WorkflowStep,
@@ -27,6 +30,8 @@ from backend.services.llm.workflow_runner import (
 )
 from backend.services.llm.generation_runtime import (
     PromptPlan,
+    AttemptUsage,
+    GenerationPlan,
     WorkflowStepTarget,
     create_generation_runtime,
     create_workflow_runtime,
@@ -189,6 +194,245 @@ class AICreateNovelRequest(GenerationParamsMixin):
     cached_steps: AICreateCachedSteps | None = None
 
 
+class BlueprintRegenerationRequest(AICreateNovelRequest):
+    """Whole-blueprint rerun with a fixed, explicitly budgeted authority."""
+
+    cached_steps: None = Field(default=None)
+    system_prompt: None = Field(default=None)
+    allow_failure_retry: Literal[False] = False
+    max_tokens: int = Field(default=16_384, ge=1, le=200_000)
+    token_budget: int = Field(ge=1, le=2**63 - 1)
+
+
+class BlueprintRegenerationStartRequest(BlueprintRegenerationRequest):
+    readiness_digest: str = Field(min_length=64, max_length=64)
+
+
+class _BlueprintBudgetBoundary(ValueError):
+    provider_request_not_dispatched = True
+
+
+class _BlueprintAttemptScope:
+    """Atomically reserve every Provider request inside one fixed workflow."""
+
+    def __init__(self, *, maximum_attempts: int, token_budget: int) -> None:
+        self.maximum_attempts = int(maximum_attempts)
+        self.token_budget = int(token_budget)
+        self._lock = asyncio.Lock()
+        self._claims: dict[str, tuple[str, str]] = {}
+        self._reservations: dict[str, int] = {}
+        self._attempts: dict[str, AttemptUsage] = {}
+        self._uncertain: set[str] = set()
+        self._consumed_tokens = 0
+
+    @property
+    def attempts(self) -> tuple[AttemptUsage, ...]:
+        return tuple(self._attempts.values())
+
+    @property
+    def claimed_attempt_ids(self) -> tuple[str, ...]:
+        return tuple(self._claims)
+
+    @property
+    def uncertain_attempt_ids(self) -> tuple[str, ...]:
+        return tuple(self._uncertain)
+
+    async def claim(self, provider_alias: str, phase: str) -> str:
+        return await self.claim_with_budget(provider_alias, phase, None)
+
+    async def claim_with_budget(
+        self,
+        provider_alias: str,
+        phase: str,
+        conservative_tokens: int | None,
+    ) -> str:
+        if (
+            conservative_tokens is None
+            or isinstance(conservative_tokens, bool)
+            or int(conservative_tokens) <= 0
+        ):
+            raise _BlueprintBudgetBoundary(
+                "blueprint generation has no conservative token bound"
+            )
+        bound = int(conservative_tokens)
+        async with self._lock:
+            if len(self._claims) >= self.maximum_attempts:
+                raise _BlueprintBudgetBoundary(
+                    "blueprint generation attempt capacity exhausted"
+                )
+            reserved = sum(self._reservations.values())
+            if self._consumed_tokens + reserved + bound > self.token_budget:
+                raise _BlueprintBudgetBoundary(
+                    "blueprint generation token budget exhausted before dispatch"
+                )
+            attempt_id = uuid4().hex
+            self._claims[attempt_id] = (str(provider_alias), str(phase))
+            self._reservations[attempt_id] = bound
+            return attempt_id
+
+    async def account(self, attempt_id: str, usage: TokenUsage) -> None:
+        async with self._lock:
+            if attempt_id in self._attempts:
+                return
+            provider_alias, phase = self._claims[attempt_id]
+            reserved = self._reservations.pop(attempt_id, 0)
+            actual = max(
+                int(usage.total_tokens or 0),
+                int(usage.input_tokens or 0) + int(usage.output_tokens or 0),
+            )
+            accounted = actual if actual > 0 else reserved
+            self._consumed_tokens += accounted
+            self._attempts[attempt_id] = AttemptUsage(
+                attempt_id=attempt_id,
+                provider_alias=provider_alias,
+                phase=phase,
+                usage=TokenUsage(
+                    input_tokens=max(0, int(usage.input_tokens or 0)),
+                    output_tokens=max(0, int(usage.output_tokens or 0)),
+                    total_tokens=accounted,
+                ),
+            )
+
+    async def mark_uncertain(self, attempt_id: str, reason: str) -> None:
+        del reason
+        async with self._lock:
+            if attempt_id in self._uncertain:
+                return
+            provider_alias, phase = self._claims[attempt_id]
+            reserved = self._reservations.pop(attempt_id, 0)
+            self._consumed_tokens += reserved
+            self._uncertain.add(attempt_id)
+            self._attempts[attempt_id] = AttemptUsage(
+                attempt_id=attempt_id,
+                provider_alias=provider_alias,
+                phase=phase,
+                usage=TokenUsage(total_tokens=reserved),
+                state="uncertain",
+            )
+
+    async def release_pre_dispatch(self, attempt_id: str, reason: str) -> None:
+        del reason
+        async with self._lock:
+            self._reservations.pop(attempt_id, None)
+            self._claims.pop(attempt_id, None)
+
+
+def _blueprint_regeneration_snapshot(
+    req: BlueprintRegenerationRequest,
+    *,
+    runtime,
+) -> tuple[
+    dict[str, Any],
+    dict[str, GenerationPlan],
+    dict[str, Any],
+]:
+    plans = {
+        step.key: runtime.plan_structured(
+            WorkflowStepTarget(WORKFLOW_NAME, step.resolved_config_key)
+        )
+        for step in AI_CREATE_STEPS
+    }
+    plan_items: list[dict[str, Any]] = []
+    maximum_provider_attempts = 0
+    maximum_tokens_total = 0
+    token_bound_known = True
+    for step in AI_CREATE_STEPS:
+        plan = plans[step.key]
+        output_bound = req.max_tokens or plan.max_output_tokens
+        context_bound = plan.max_context_tokens
+        attempts = int(plan.max_semantic_attempts)
+        maximum_provider_attempts += attempts
+        if output_bound is None or context_bound is None:
+            token_bound_known = False
+        else:
+            maximum_tokens_total += attempts * (
+                int(output_bound) + int(context_bound)
+            )
+        plan_items.append({
+            "step": step.key,
+            "provider_alias": plan.provider_alias,
+            "provider_model": plan.provider_model,
+            "mode": plan.mode.value,
+            "reviewer_alias": plan.reviewer_alias,
+            "config_revision": plan.config_revision,
+            "capability_snapshot": plan.capability_snapshot,
+            "maximum_attempts": attempts,
+            "max_output_tokens": output_bound,
+            "max_context_tokens": context_bound,
+        })
+    source = {
+        "user_idea": req.user_idea,
+        "number_of_chapters": req.number_of_chapters,
+        "words_per_chapter": req.words_per_chapter,
+        "creative_direction": (
+            req.creative_direction.model_dump(mode="json")
+            if req.creative_direction is not None
+            else None
+        ),
+    }
+    prompts = dict(_load_prompts().get(WORKFLOW_NAME, {}))
+    authorization_snapshot = {
+        "version": 1,
+        "workflow": "blueprint_regeneration",
+        "source": source,
+        "token_budget": req.token_budget,
+        "generation_params": {
+            **build_gen_kwargs(req),
+            "allow_failure_retry": False,
+        },
+        "maximum_provider_attempts": maximum_provider_attempts,
+        "maximum_tokens_total": maximum_tokens_total,
+        "token_bound_known": token_bound_known,
+        "plans": plan_items,
+        "prompt_revision": hashlib.sha256(
+            json.dumps(
+                prompts,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            authorization_snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    report = {
+        "version": 1,
+        "status": "ready" if token_bound_known else "blocked",
+        "digest": digest,
+        "token_budget": req.token_budget,
+        "maximum_provider_attempts": maximum_provider_attempts,
+        "maximum_tokens_total": maximum_tokens_total,
+        "token_bound_known": token_bound_known,
+        "budget_covers_conservative_maximum": bool(
+            token_bound_known and req.token_budget >= maximum_tokens_total
+        ),
+        "providers": [
+            {
+                "step": item["step"],
+                "provider_alias": item["provider_alias"],
+                "provider_model": item["provider_model"],
+                "maximum_attempts": item["maximum_attempts"],
+            }
+            for item in plan_items
+        ],
+        "issues": (
+            []
+            if token_bound_known
+            else [{
+                "code": "blueprint_token_bound_unproven",
+                "level": "blocked",
+            }]
+        ),
+    }
+    return report, plans, prompts
+
+
 class GenerateCoreFactionsRequest(GenerationParamsMixin):
     """基于已保存小说生成核心阵营预览的请求。"""
 
@@ -311,6 +555,110 @@ async def rewrite_novel_field(req: dict[str, Any]):
             "code": "blueprint_field_rewrite_retired",
             "message": "逐字段 AI 改写已停用，请使用整份蓝图重新生成。",
         },
+    )
+
+
+@router.post("/regenerate-blueprint/readiness")
+async def inspect_blueprint_regeneration_readiness(
+    req: BlueprintRegenerationRequest,
+) -> dict[str, Any]:
+    """Plan the fixed four-step rerun without dispatching a Provider request."""
+    try:
+        runtime = create_workflow_runtime(max_provider_retries=0)
+        report, _plans, _prompts = _blueprint_regeneration_snapshot(
+            req,
+            runtime=runtime,
+        )
+        return report
+    except Exception as exc:
+        logger.warning(
+            "[blueprint_regeneration] readiness planning failed type=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "blueprint_regeneration_plan_invalid",
+                "message": "当前 Provider 或工作流计划无法完成蓝图预检。",
+            },
+        ) from exc
+
+
+@router.post("/regenerate-blueprint")
+async def regenerate_blueprint(
+    req: BlueprintRegenerationStartRequest,
+    request: Request,
+):
+    """Execute the exact zero-cost preview inside hard attempt/token ceilings."""
+    planning_runtime = create_workflow_runtime(max_provider_retries=0)
+    try:
+        report, plans, frozen_prompts = _blueprint_regeneration_snapshot(
+            req,
+            runtime=planning_runtime,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blueprint_regeneration_readiness_stale",
+                "message": "Provider 或工作流计划已变化，请重新预检。",
+            },
+        ) from exc
+    if report["status"] != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blueprint_regeneration_token_bound_unproven",
+                "message": "当前 Provider 缺少可证明的 token 上界。",
+            },
+        )
+    if req.readiness_digest != report["digest"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "blueprint_regeneration_readiness_stale",
+                "message": "蓝图重新生成预检已过期，请重新检查后再启动。",
+            },
+        )
+
+    scope = _BlueprintAttemptScope(
+        maximum_attempts=int(report["maximum_provider_attempts"]),
+        token_budget=req.token_budget,
+    )
+    execution_runtime = create_workflow_runtime(
+        attempt_scope=scope,
+        max_provider_retries=0,
+    )
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for frame in run_workflow(
+            workflow_name=WORKFLOW_NAME,
+            steps=AI_CREATE_STEPS,
+            prompts=frozen_prompts,
+            params={
+                "user_idea": _build_creation_idea(
+                    req.user_idea,
+                    req.creative_direction,
+                ),
+                "number_of_chapters": req.number_of_chapters,
+                "words_per_chapter": req.words_per_chapter,
+            },
+            gen_kwargs=build_gen_kwargs(req),
+            cached={},
+            deps=WorkflowDeps(
+                runtime=execution_runtime,
+                structured_plans=plans,
+            ),
+            request_id=uuid4().hex[:8],
+            is_disconnected=request.is_disconnected,
+            log_partial_on_disconnect=False,
+        ):
+            yield frame
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

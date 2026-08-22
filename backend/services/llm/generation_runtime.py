@@ -1049,7 +1049,15 @@ def create_generation_runtime(
 
 def create_workflow_runtime(
     *,
+    attempt_scope: AttemptScope | None = None,
     max_provider_retries: int | None = None,
 ) -> GenerationRuntime:
     """Create the single supported workflow execution runtime."""
-    return create_generation_runtime(max_provider_retries=max_provider_retries)
+    if attempt_scope is None:
+        return create_generation_runtime(
+            max_provider_retries=max_provider_retries,
+        )
+    return create_generation_runtime(
+        attempt_scope=attempt_scope,
+        max_provider_retries=max_provider_retries,
+    )

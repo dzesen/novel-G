@@ -1,4 +1,4 @@
-"""Strict authorization contracts for post-outline Job narrowing."""
+"""Strict persisted authorization contracts for protected generation Jobs."""
 
 from __future__ import annotations
 
@@ -32,6 +32,40 @@ _HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 
 class _ClosedModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class BatchGenerationAuthorizationContractV1(_ClosedModel):
+    """Proof that the current start/resume API received explicit paid authority."""
+
+    schema_version: Literal["batch_generation_authorization.v1"]
+    explicit_readiness_digest_confirmed: Literal[True]
+    readiness_digest: str = Field(pattern=_HEX_DIGEST_PATTERN)
+    token_budget: int = Field(ge=1, le=MAX_BSON_INT64)
+    protected_generation_params_revision: Literal[
+        "protected_generation_params.v1"
+    ]
+
+
+def build_batch_generation_authorization_contract(
+    *,
+    readiness_digest: str,
+    token_budget: int,
+) -> dict[str, Any]:
+    return BatchGenerationAuthorizationContractV1(
+        schema_version="batch_generation_authorization.v1",
+        explicit_readiness_digest_confirmed=True,
+        readiness_digest=readiness_digest,
+        token_budget=token_budget,
+        protected_generation_params_revision="protected_generation_params.v1",
+    ).model_dump(mode="json")
+
+
+def parse_batch_generation_authorization_contract(
+    value: Any,
+) -> BatchGenerationAuthorizationContractV1:
+    if not isinstance(value, Mapping):
+        raise ValueError("batch generation authorization contract is invalid")
+    return BatchGenerationAuthorizationContractV1.model_validate(value)
 
 
 class ProseContinuationPolicySnapshotV1(_ClosedModel):

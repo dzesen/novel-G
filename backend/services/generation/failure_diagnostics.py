@@ -3,9 +3,24 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime
+from hashlib import sha256
+import json
 from typing import Any, Iterable, Mapping
+from uuid import uuid4
 
 from backend.db.errors import InvalidIdError, NotFoundError
+from backend.llm.exceptions import (
+    LLMAuthError,
+    LLMConnectionError,
+    LLMError,
+    LLMHTTPStatusError,
+    LLMRateLimitError,
+    LLMResponseError,
+    LLMSchemaError,
+    LLMSchemaUnsupportedError,
+    LLMStructuredValidationError,
+    LLMTimeoutError,
+)
 from backend.services.generation.chapter_pipeline import IncompleteProseGeneration
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
@@ -41,6 +56,121 @@ _SAFE_COMPLETION_KEYS = (
     "completion_reason",
     "mode",
 )
+
+
+def _exception_family(chain: Iterable[BaseException]) -> str:
+    """Return a bounded family name without retaining exception messages."""
+    values = list(chain)
+    checks: tuple[tuple[type[BaseException], str], ...] = (
+        (LLMStructuredValidationError, "structured_output"),
+        (LLMSchemaUnsupportedError, "provider_schema_unsupported"),
+        (LLMSchemaError, "structured_output"),
+        (LLMAuthError, "provider_auth"),
+        (LLMRateLimitError, "provider_rate_limit"),
+        (LLMTimeoutError, "provider_timeout"),
+        (LLMConnectionError, "provider_connection"),
+        (LLMHTTPStatusError, "provider_http_status"),
+        (LLMResponseError, "provider_response"),
+        (json.JSONDecodeError, "structured_output"),
+        (TimeoutError, "transport_timeout"),
+        (ConnectionError, "transport_connection"),
+        (ValueError, "validation"),
+        (RuntimeError, "runtime"),
+        (LLMError, "provider"),
+    )
+    for expected, family in checks:
+        if any(isinstance(item, expected) for item in values):
+            return family
+    return "unknown"
+
+
+def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
+    """Map a diagnosis to a stable user-visible impact and recovery actions."""
+    if category == "model_output_incomplete":
+        return (
+            "formal_prose_not_written",
+            ["open_incomplete_prose", "review_provider_output_limit"],
+        )
+    if category == "provider_or_transport":
+        if code == "provider_authentication_failed":
+            return "generation_step_not_committed", ["open_provider_settings"]
+        if code == "provider_rate_limited":
+            return (
+                "generation_step_not_committed",
+                ["retry_after_provider_check", "open_provider_settings"],
+            )
+        return (
+            "generation_step_not_committed",
+            ["retry_generation_step", "open_provider_settings"],
+        )
+    if category == "validation_logic":
+        if code == "structured_output_invalid":
+            return (
+                "generated_result_rejected",
+                ["review_generation_record", "retry_generation_step"],
+            )
+        return "generated_result_rejected", ["review_generation_record"]
+    if category == "source_changed":
+        return (
+            "authorization_snapshot_stale",
+            ["refresh_generation_readiness", "restart_generation_job"],
+        )
+    if category == "context_or_budget":
+        return "generation_paused_before_commit", ["review_generation_authorization"]
+    if category == "user_action":
+        return "job_stopped_by_user", []
+    return "cause_not_identified", ["review_generation_record"]
+
+
+def _fingerprint(event: Mapping[str, Any]) -> str:
+    details = event.get("details")
+    family = details.get("exception_family") if isinstance(details, Mapping) else ""
+    material = "|".join((
+        _safe_text(event.get("category"), limit=80),
+        _safe_text(event.get("code"), limit=100),
+        _safe_text(event.get("step"), limit=60),
+        _safe_text(family, limit=60),
+    ))
+    return sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _event_identity(
+    event: Mapping[str, Any],
+    *,
+    job_id: str,
+    index: int,
+) -> str:
+    existing = _safe_text(event.get("event_id"), limit=80)
+    if existing:
+        return existing
+    occurred_at = event.get("occurred_at") or event.get("created_at") or ""
+    material = "|".join((
+        job_id,
+        str(index),
+        _safe_text(event.get("category"), limit=80),
+        _safe_text(event.get("code"), limit=100),
+        _safe_text(event.get("chapter_id"), limit=80),
+        _safe_text(occurred_at, limit=100),
+    ))
+    return sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def _enrich_event(
+    event: Mapping[str, Any],
+    *,
+    job_id: str,
+    index: int,
+) -> dict[str, Any]:
+    enriched = dict(event)
+    impact, action_codes = _diagnostic_outcome(
+        _safe_text(enriched.get("category"), limit=80),
+        _safe_text(enriched.get("code"), limit=100),
+    )
+    enriched.setdefault("impact", impact)
+    enriched.setdefault("action_codes", action_codes)
+    enriched.setdefault("fingerprint", _fingerprint(enriched))
+    enriched["event_id"] = _event_identity(enriched, job_id=job_id, index=index)
+    return enriched
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -106,6 +236,7 @@ def build_failure_diagnostic(
     code = "unclassified_failure"
     evidence = "insufficient"
     details = _attempt_details(attempt_values)
+    details["exception_family"] = _exception_family(chain)
     boundary_code = next(
         filter(None, (pre_dispatch_boundary_code(item) for item in chain)),
         None,
@@ -115,7 +246,17 @@ def build_failure_diagnostic(
         (item for item in chain if isinstance(item, IncompleteProseGeneration)),
         None,
     )
-    if incomplete is not None:
+    if (
+        incomplete is not None
+        and str(incomplete.completion.get("completion_reason") or "")
+        == "outline_revision_stale"
+    ):
+        completion = dict(incomplete.completion)
+        category = "source_changed"
+        code = "outline_revision_stale"
+        evidence = "confirmed"
+        details.update(_safe_completion(completion))
+    elif incomplete is not None:
         completion = dict(incomplete.completion)
         category = "model_output_incomplete"
         code = _safe_text(
@@ -151,6 +292,58 @@ def build_failure_diagnostic(
         category = "provider_or_transport"
         code = "provider_attempt_uncertain"
         evidence = "confirmed"
+    elif any(isinstance(item, LLMStructuredValidationError) for item in chain):
+        category = "validation_logic"
+        code = "structured_output_invalid"
+        evidence = "confirmed"
+    elif any(isinstance(item, LLMSchemaUnsupportedError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_schema_unsupported"
+        evidence = "confirmed"
+    elif any(isinstance(item, LLMSchemaError) for item in chain):
+        category = "validation_logic"
+        code = "structured_output_invalid"
+        evidence = "confirmed"
+    elif any(isinstance(item, json.JSONDecodeError) for item in chain):
+        category = "validation_logic"
+        code = "structured_output_invalid"
+        evidence = "confirmed"
+    elif any(isinstance(item, LLMAuthError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_authentication_failed"
+        evidence = "confirmed"
+    elif any(isinstance(item, LLMRateLimitError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_rate_limited"
+        evidence = "confirmed"
+    elif any(isinstance(item, (LLMTimeoutError, TimeoutError)) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_timeout"
+        evidence = (
+            "confirmed"
+            if any(isinstance(item, LLMTimeoutError) for item in chain)
+            else "strong_inference"
+        )
+    elif any(isinstance(item, LLMConnectionError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_connection_failed"
+        evidence = "confirmed"
+    elif any(isinstance(item, ConnectionError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_connection_failed"
+        evidence = "strong_inference"
+    elif any(isinstance(item, LLMHTTPStatusError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_http_status_error"
+        evidence = "confirmed"
+    elif any(isinstance(item, LLMResponseError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_response_invalid"
+        evidence = "confirmed"
+    elif any(isinstance(item, LLMError) for item in chain):
+        category = "provider_or_transport"
+        code = "provider_or_transport_failure"
+        evidence = "insufficient"
     elif any(isinstance(item, ValueError) for item in chain):
         category = "validation_logic"
         code = "validation_rejected"
@@ -160,16 +353,21 @@ def build_failure_diagnostic(
         code = "provider_or_transport_failure"
         evidence = "strong_inference"
 
+    impact, action_codes = _diagnostic_outcome(category, code)
     event = {
         "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+        "event_id": uuid4().hex,
         "category": category,
         "code": code,
         "evidence": evidence,
+        "impact": impact,
+        "action_codes": action_codes,
         "source": "runtime",
         "step": _safe_text(step, limit=60) or "run_chapter",
         "chapter_id": _safe_text(chapter_id, limit=80),
         "details": details,
     }
+    event["fingerprint"] = _fingerprint(event)
     if occurred_at is not None:
         event["occurred_at"] = occurred_at
     return event
@@ -241,11 +439,18 @@ def _historical_failure(job: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 def infer_job_diagnostics(job: Mapping[str, Any]) -> list[dict[str, Any]]:
+    job_id = _safe_text(job.get("_id"), limit=80)
     persisted = job.get("diagnostics")
     if isinstance(persisted, list) and persisted:
-        return [dict(item) for item in persisted if isinstance(item, Mapping)]
+        return [
+            _enrich_event(item, job_id=job_id, index=index)
+            for index, item in enumerate(persisted)
+            if isinstance(item, Mapping)
+        ]
     inferred = _historical_failure(job)
-    return [inferred] if inferred is not None else []
+    return [
+        _enrich_event(inferred, job_id=job_id, index=0)
+    ] if inferred is not None else []
 
 
 def summarize_jobs(
@@ -258,6 +463,8 @@ def summarize_jobs(
     all_events: list[tuple[str, dict[str, Any]]] = []
     affected_jobs: set[str] = set()
     inferred_count = 0
+    insufficient_count = 0
+    unresolved_count = 0
 
     for job in selected:
         job_id = _safe_text(job.get("_id"), limit=80)
@@ -271,6 +478,10 @@ def summarize_jobs(
             affected_jobs.add(job_id)
             if event.get("source") == "historical_inference":
                 inferred_count += 1
+            if event.get("evidence") == "insufficient":
+                insufficient_count += 1
+            if event.get("category") == "unknown_system":
+                unresolved_count += 1
 
     categories = []
     for category in CATEGORY_ORDER:
@@ -298,6 +509,8 @@ def summarize_jobs(
         "affected_job_count": len(affected_jobs),
         "event_count": len(all_events),
         "inferred_event_count": inferred_count,
+        "insufficient_event_count": insufficient_count,
+        "unresolved_event_count": unresolved_count,
         "categories": categories,
         "recent_events": recent_events,
     }

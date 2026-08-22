@@ -4,11 +4,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import secrets
 import time
 from dataclasses import replace
 from datetime import timedelta
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional, TypedDict
 
 from pymongo.errors import DuplicateKeyError
 
@@ -54,6 +55,8 @@ from backend.services.generation.job_execution import (
 )
 from backend.services.generation.job_authorization_contracts import (
     OutlineAuthorizationRecalculationCommandV1,
+    build_batch_generation_authorization_contract,
+    parse_batch_generation_authorization_contract,
     parse_prose_authorization,
     prose_authorization_digest,
     prose_authorization_scope,
@@ -107,6 +110,9 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     authorization_ruleset_requires_refresh,
 )
+from backend.services.generation.protected_generation_params import (
+    validate_protected_generation_params,
+)
 from backend.services.generation.reference_card_auto_creation import (
     ReferenceCardAutoCreationPolicy,
     auto_reference_card_creation_service,
@@ -120,6 +126,11 @@ from backend.services.generation.reference_card_dependency_repair import (
 logger = logging.getLogger(__name__)
 _START_LOCK: asyncio.Lock | None = None
 _START_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
+_READINESS_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SUCCESSOR_REQUIRED_MESSAGE = (
+    "该历史作业缺少当前受保护的预算或 readiness 授权；"
+    "请终止该作业并以新 readiness 启动 successor"
+)
 
 
 def _get_start_lock() -> asyncio.Lock:
@@ -147,6 +158,90 @@ def _persisted_reference_card_auto_creation_policy(
 
 class ConflictError(Exception):
     """已有在跑作业（全局单作业约束）。路由映射为 409。"""
+
+
+class ReferenceCardReviewResumeOutcome(TypedDict):
+    """Safe post-commit projection for automatic batch resume."""
+
+    resumed_job_ids: List[str]
+    status: Literal["resumed", "not_resumed", "deferred"]
+    reason_codes: List[str]
+
+
+def _validate_start_authorization(
+    *,
+    token_budget: int | None,
+    readiness_digest: str | None,
+    generation_params: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    params = validate_protected_generation_params(generation_params)
+    if (
+        isinstance(token_budget, bool)
+        or not isinstance(token_budget, int)
+        or token_budget <= 0
+        or not isinstance(readiness_digest, str)
+        or _READINESS_DIGEST_PATTERN.fullmatch(readiness_digest) is None
+    ):
+        raise ValueError(
+            "批量生成必须先确认正整数 token 预算与当前 64 位 readiness digest"
+        )
+    return params
+
+
+def _validate_resumable_job_authorization(
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    params = validate_protected_generation_params(
+        job.get("generation_params")
+    )
+    token_budget = job.get("token_budget")
+    readiness = job.get("readiness")
+    if (
+        isinstance(token_budget, bool)
+        or not isinstance(token_budget, int)
+        or token_budget <= 0
+        or not isinstance(readiness, Mapping)
+    ):
+        raise ValueError(_SUCCESSOR_REQUIRED_MESSAGE)
+    digest = readiness.get("digest")
+    if (
+        not isinstance(digest, str)
+        or _READINESS_DIGEST_PATTERN.fullmatch(digest) is None
+    ):
+        raise ValueError(_SUCCESSOR_REQUIRED_MESSAGE)
+    try:
+        contract = parse_batch_generation_authorization_contract(
+            job.get("batch_authorization_contract")
+        )
+        if (
+            contract.token_budget != token_budget
+            or contract.readiness_digest != digest
+        ):
+            raise ValueError("batch authorization contract changed")
+        if not readiness_uses_candidate_pipeline(readiness):
+            raise ValueError("legacy execution protocol")
+        expected_volume_id = (
+            str(job.get("volume_id"))
+            if job.get("volume_id") is not None
+            else None
+        )
+        if (
+            readiness.get("novel_id") != str(job.get("novel_id") or "")
+            or readiness.get("scope") != str(job.get("scope") or "")
+            or readiness.get("volume_id") != expected_volume_id
+        ):
+            raise ValueError("readiness scope changed")
+        acknowledged = readiness.get("acknowledged_warning_codes") or []
+        if not isinstance(acknowledged, list):
+            raise ValueError("readiness acknowledgements are invalid")
+        generation_readiness_module.authorize(
+            dict(readiness),
+            supplied_digest=digest,
+            acknowledged_warning_codes=acknowledged,
+        )
+    except ValueError as exc:
+        raise ValueError(_SUCCESSOR_REQUIRED_MESSAGE) from exc
+    return params
 
 
 async def _recover_job_mutation_revision(
@@ -420,7 +515,11 @@ def _estimate_authorized_chapter_attempt_slots(
 def _new_job_doc(
     novel_id, scope, volume_id, checkpoint_interval, token_budget, attempt_capacity,
     readiness, outline_deviation_policy, generation_params,
+    confirmed_readiness_digest,
 ) -> Dict[str, Any]:
+    protected_generation_params = validate_protected_generation_params(
+        generation_params
+    )
     planning = readiness.get("planning")
     candidate_readiness = (
         isinstance(planning, Mapping)
@@ -437,6 +536,13 @@ def _new_job_doc(
         and (type(expected_revision) is not int or expected_revision < 0)
     ):
         raise ValueError("Job readiness narrative revision is invalid")
+    readiness_digest = readiness.get("digest")
+    if readiness_digest != confirmed_readiness_digest:
+        raise ValueError("Job readiness digest diverged from explicit confirmation")
+    authorization_contract = build_batch_generation_authorization_contract(
+        readiness_digest=confirmed_readiness_digest,
+        token_budget=token_budget,
+    )
     document = {
         "novel_id": to_object_id(novel_id), "scope": scope,
         "volume_id": to_object_id(volume_id) if volume_id else None,
@@ -470,7 +576,8 @@ def _new_job_doc(
         ),
         # 请求级参数是作业快照的一部分。暂停/恢复只重读这份快照，不会被
         # 后续页面操作覆盖；未设置的键仍由每次调用时选中的 Provider 默认值兜底。
-        "generation_params": dict(generation_params or {}),
+        "generation_params": protected_generation_params,
+        "batch_authorization_contract": authorization_contract,
         "prose_continuation_authorization": dict(
             ((readiness.get("planning") or {}).get(
                 "prose_continuation_authorization"
@@ -506,6 +613,7 @@ class GenerationJobService:
         """
 
         job = await generation_job_repo.get_job(job_id)
+        protected_generation_params = _validate_resumable_job_authorization(job)
         novel_id = str(job.get("novel_id") or "")
         policy = _persisted_reference_card_auto_creation_policy(job)
         if not policy.enabled:
@@ -897,7 +1005,7 @@ class GenerationJobService:
                 },
             }
 
-        generation_params = dict(job.get("generation_params") or {})
+        generation_params = protected_generation_params
         plan_authorization = parse_reference_card_repair_plan_authorization(
             planning.get("reference_card_repair_plan_authorization")
         )
@@ -1138,6 +1246,7 @@ class GenerationJobService:
         pause; it is never persisted as an implicit expansion.
         """
         job = await generation_job_repo.get_job(job_id)
+        protected_generation_params = _validate_resumable_job_authorization(job)
         authorization = dict(job.get("prose_continuation_authorization") or {})
         current_authorization = parse_prose_authorization(authorization)
         current_revision = job.get("authorization_revision")
@@ -1170,12 +1279,12 @@ class GenerationJobService:
 
         policy = ProseContinuationPolicy.from_mapping(
             authorization.get("policy")
-            or (job.get("generation_params") or {}).get(
+            or protected_generation_params.get(
                 "prose_continuation_policy"
             )
         )
         generation_params = {
-            **dict(job.get("generation_params") or {}),
+            **protected_generation_params,
             "prose_continuation_policy": policy.to_dict(),
         }
         report = await generation_readiness_module.inspect(
@@ -1187,6 +1296,9 @@ class GenerationJobService:
                 else None
             ),
             chapters=chapters,
+            outline_deviation_policy=str(
+                job.get("outline_deviation_policy") or PAUSE_FOR_REWRITE
+            ),
             prose_continuation_policy=policy,
             token_budget=job.get("token_budget"),
             generation_params=generation_params,
@@ -1251,6 +1363,8 @@ class GenerationJobService:
     async def _spawn(job_id: str, control: JobControl) -> bool:
         """Acquire the durable execution lease before scheduling JobEngine."""
 
+        job = await generation_job_repo.get_job(job_id)
+        _validate_resumable_job_authorization(job)
         previous_entry = _REGISTRY.get(job_id)
         worker_id = secrets.token_hex(32)
         now = get_utc_now()
@@ -1308,8 +1422,8 @@ class GenerationJobService:
         async def _run_chapter(novel_id: str, chapter: Dict[str, Any]):
             chapter_id = str(chapter["_id"])
             current_job = await generation_job_repo.get_job(job_id)
-            generation_params = dict(
-                current_job.get("generation_params") or {}
+            generation_params = _validate_resumable_job_authorization(
+                current_job
             )
             cursor = current_job.get("expected_narrative_revision")
             state_binding: JobMutationRecoveryBindingV1 | None = None
@@ -1489,12 +1603,12 @@ class GenerationJobService:
         ):
             chapter_id = str(chapter["_id"])
             current_job = await generation_job_repo.get_job(job_id)
+            generation_params = _validate_resumable_job_authorization(
+                current_job
+            )
             readiness = current_job.get("readiness")
             if not isinstance(readiness, Mapping):
                 raise ValueError("candidate Job readiness is invalid")
-            generation_params = dict(
-                current_job.get("generation_params") or {}
-            )
             expected_revision = current_job.get("expected_narrative_revision")
             if type(expected_revision) is not int or expected_revision < 0:
                 raise ValueError("candidate Job narrative revision cursor is invalid")
@@ -1790,18 +1904,26 @@ class GenerationJobService:
     @staticmethod
     async def resume_after_reference_card_review(
         novel_id: str,
-    ) -> List[str]:
+    ) -> ReferenceCardReviewResumeOutcome:
         """Resume the latest job paused only for a now-cleared card review."""
         if await emergent_reference_card_candidate_module.blocking_summary(
             novel_id
         ):
-            return []
+            return {
+                "resumed_job_ids": [],
+                "status": "not_resumed",
+                "reason_codes": ["blocking_candidates_remaining"],
+            }
         job_id: str | None = None
         async with _get_start_lock():
             if await emergent_reference_card_candidate_module.blocking_summary(
                 novel_id
             ):
-                return []
+                return {
+                    "resumed_job_ids": [],
+                    "status": "not_resumed",
+                    "reason_codes": ["blocking_candidates_remaining"],
+                }
             jobs = await generation_job_repo.list_jobs_by_novel(novel_id)
             target = next(
                 (
@@ -1827,7 +1949,11 @@ class GenerationJobService:
                 None,
             )
             if target is None:
-                return []
+                return {
+                    "resumed_job_ids": [],
+                    "status": "not_resumed",
+                    "reason_codes": ["no_eligible_paused_job"],
+                }
             job_id = str(target["_id"])
             expected_revision = target.get("expected_narrative_revision")
             current_revision = await narrative_revision_store.current(novel_id)
@@ -1844,14 +1970,50 @@ class GenerationJobService:
                         "active_slot": None,
                         "error": {
                             "step": "source_changed",
-                            "message": (
-                                "Reference-card decisions changed the narrative; "
-                                "new readiness authorization is required"
-                            ),
+                            "reason_codes": [
+                                "narrative_revision_changed",
+                                "successor_required",
+                            ],
                         },
                     },
                 )
-                return []
+                return {
+                    "resumed_job_ids": [],
+                    "status": "deferred",
+                    "reason_codes": [
+                        "narrative_revision_changed",
+                        "successor_required",
+                    ],
+                }
+            try:
+                _validate_resumable_job_authorization(target)
+            except ValueError:
+                # The human card decision was already committed by the caller.
+                # A legacy Job must not turn that successful mutation into an
+                # HTTP 500; keep it paused and require a newly authorized Job.
+                await generation_job_repo.update_job_fields(
+                    job_id,
+                    {
+                        "status": "paused",
+                        "pause_reason": "source_changed",
+                        "active_slot": None,
+                        "error": {
+                            "step": "source_changed",
+                            "reason_codes": [
+                                "authorization_invalid_or_missing",
+                                "successor_required",
+                            ],
+                        },
+                    },
+                )
+                return {
+                    "resumed_job_ids": [],
+                    "status": "deferred",
+                    "reason_codes": [
+                        "authorization_invalid_or_missing",
+                        "successor_required",
+                    ],
+                }
             await GenerationJobService._guard_no_running()
             current_chapter_id = None
             raw_recovery = target.get("job_mutation_recovery")
@@ -1892,12 +2054,17 @@ class GenerationJobService:
             )
         control = JobControl()
         await GenerationJobService._spawn(job_id, control)
-        return [job_id]
+        return {
+            "resumed_job_ids": [job_id],
+            "status": "resumed",
+            "reason_codes": [],
+        }
 
     @staticmethod
     async def inspect_volume_readiness(
         volume_id: str,
         *,
+        outline_deviation_policy: str = PAUSE_FOR_REWRITE,
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
@@ -1905,6 +2072,9 @@ class GenerationJobService:
             ReferenceCardAutoCreationPolicy | None
         ) = None,
     ) -> Dict[str, Any]:
+        protected_generation_params = validate_protected_generation_params(
+            generation_params
+        )
         volume = await volume_repo.get_volume_by_id(volume_id)
         novel_id = str(volume["novel_id"])
         chapters = await ChapterService.get_chapters_by_volume(
@@ -1916,9 +2086,10 @@ class GenerationJobService:
             scope="volume",
             volume_id=volume_id,
             chapters=chapters,
+            outline_deviation_policy=outline_deviation_policy,
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
-            generation_params=generation_params,
+            generation_params=protected_generation_params,
             reference_card_auto_creation_policy=(
                 reference_card_auto_creation_policy
             ),
@@ -1928,6 +2099,7 @@ class GenerationJobService:
     async def inspect_book_readiness(
         novel_id: str,
         *,
+        outline_deviation_policy: str = PAUSE_FOR_REWRITE,
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
@@ -1935,6 +2107,9 @@ class GenerationJobService:
             ReferenceCardAutoCreationPolicy | None
         ) = None,
     ) -> Dict[str, Any]:
+        protected_generation_params = validate_protected_generation_params(
+            generation_params
+        )
         await novel_repo.get_novel_by_id(novel_id)
         chapters = await get_book_worklist(novel_id, include_content=True)
         return await generation_readiness_module.inspect(
@@ -1942,9 +2117,10 @@ class GenerationJobService:
             scope="book",
             volume_id=None,
             chapters=chapters,
+            outline_deviation_policy=outline_deviation_policy,
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
-            generation_params=generation_params,
+            generation_params=protected_generation_params,
             reference_card_auto_creation_policy=(
                 reference_card_auto_creation_policy
             ),
@@ -1970,6 +2146,9 @@ class GenerationJobService:
         job = await generation_job_repo.get_job(job_id)
         if not job_planner.can_resume(job["status"]):
             raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
+        protected_generation_params = _validate_resumable_job_authorization(
+            job
+        )
         if job.get("has_uncertain_attempts"):
             raise ValueError(
                 "存在结果不确定的 Provider 请求，请先选择重试或跳过"
@@ -1977,7 +2156,7 @@ class GenerationJobService:
         authorization = dict(job.get("prose_continuation_authorization") or {})
         stored_policy = ProseContinuationPolicy.from_mapping(
             authorization.get("policy")
-            or (job.get("generation_params") or {}).get(
+            or protected_generation_params.get(
                 "prose_continuation_policy"
             )
         )
@@ -1994,7 +2173,7 @@ class GenerationJobService:
             token_budget if token_budget_provided else job.get("token_budget")
         )
         generation_params_snapshot = {
-            **dict(job.get("generation_params") or {}),
+            **protected_generation_params,
             "prose_continuation_policy": candidate_policy.to_dict(),
         }
         current_revision = max(
@@ -2021,6 +2200,9 @@ class GenerationJobService:
                 else None
             ),
             chapters=chapters,
+            outline_deviation_policy=str(
+                job.get("outline_deviation_policy") or PAUSE_FOR_REWRITE
+            ),
             prose_continuation_policy=candidate_policy,
             token_budget=candidate_budget,
             generation_params=generation_params_snapshot,
@@ -2042,6 +2224,11 @@ class GenerationJobService:
                                     ReferenceCardAutoCreationPolicy | None
                                 ) = None,
                                 ) -> Dict[str, Any]:
+        protected_generation_params = _validate_start_authorization(
+            token_budget=token_budget,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
         volume = await volume_repo.get_volume_by_id(volume_id)  # 不存在抛 NotFoundError
         novel_id = str(volume["novel_id"])
         chapters = await ChapterService.get_chapters_by_volume(volume_id, include_content=True)
@@ -2059,7 +2246,7 @@ class GenerationJobService:
                 prose_continuation_policy or ProseContinuationPolicy()
             )
             generation_params_snapshot = {
-                **dict(generation_params or {}),
+                **protected_generation_params,
                 "prose_continuation_policy": continuation_policy.to_dict(),
             }
             report = await generation_readiness_module.inspect(
@@ -2067,6 +2254,7 @@ class GenerationJobService:
                 scope="volume",
                 volume_id=volume_id,
                 chapters=chapters,
+                outline_deviation_policy=outline_deviation_policy,
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
                 generation_params=generation_params_snapshot,
@@ -2098,6 +2286,7 @@ class GenerationJobService:
                         token_budget, capacity, authorization,
                         outline_deviation_policy,
                         generation_params_snapshot,
+                        readiness_digest,
                     )
                 )
             except DuplicateKeyError as exc:
@@ -2118,6 +2307,11 @@ class GenerationJobService:
                                  ReferenceCardAutoCreationPolicy | None
                              ) = None,
                              ) -> Dict[str, Any]:
+        protected_generation_params = _validate_start_authorization(
+            token_budget=token_budget,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
         await novel_repo.get_novel_by_id(novel_id)  # 不存在抛 NotFoundError → 404
         chapters = await get_book_worklist(novel_id, include_content=True)
         if job_planner.first_needing_work(chapters) is None:
@@ -2129,7 +2323,7 @@ class GenerationJobService:
                 prose_continuation_policy or ProseContinuationPolicy()
             )
             generation_params_snapshot = {
-                **dict(generation_params or {}),
+                **protected_generation_params,
                 "prose_continuation_policy": continuation_policy.to_dict(),
             }
             report = await generation_readiness_module.inspect(
@@ -2137,6 +2331,7 @@ class GenerationJobService:
                 scope="book",
                 volume_id=None,
                 chapters=chapters,
+                outline_deviation_policy=outline_deviation_policy,
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
                 generation_params=generation_params_snapshot,
@@ -2168,6 +2363,7 @@ class GenerationJobService:
                         token_budget, capacity, authorization,
                         outline_deviation_policy,
                         generation_params_snapshot,
+                        readiness_digest,
                     )
                 )
             except DuplicateKeyError as exc:
@@ -2232,6 +2428,9 @@ class GenerationJobService:
                 and pending_state_resolution is None
             ):
                 raise ValueError(f"作业当前状态 {job['status']} 不可恢复")
+            protected_generation_params = _validate_resumable_job_authorization(
+                job
+            )
             if job.get("pause_reason") == "final_audit":
                 if (
                     confirm_uncertain_retry
@@ -2401,7 +2600,7 @@ class GenerationJobService:
             authorization = dict(job.get("prose_continuation_authorization") or {})
             stored_policy = ProseContinuationPolicy.from_mapping(
                 authorization.get("policy")
-                or (job.get("generation_params") or {}).get(
+                or protected_generation_params.get(
                     "prose_continuation_policy"
                 )
             )
@@ -2438,9 +2637,14 @@ class GenerationJobService:
                     token_budget if token_budget_provided else job.get("token_budget")
                 )
                 generation_params_snapshot = {
-                    **dict(job.get("generation_params") or {}),
+                    **protected_generation_params,
                     "prose_continuation_policy": candidate_policy.to_dict(),
                 }
+                generation_params_snapshot = _validate_start_authorization(
+                    token_budget=candidate_budget,
+                    readiness_digest=readiness_digest,
+                    generation_params=generation_params_snapshot,
+                )
                 current_revision = max(
                     int(job.get("authorization_revision") or 0),
                     int(authorization.get("authorization_revision") or 0),
@@ -2465,6 +2669,9 @@ class GenerationJobService:
                         else None
                     ),
                     chapters=chapters,
+                    outline_deviation_policy=str(
+                        job.get("outline_deviation_policy") or PAUSE_FOR_REWRITE
+                    ),
                     prose_continuation_policy=candidate_policy,
                     token_budget=candidate_budget,
                     generation_params=generation_params_snapshot,
@@ -2518,6 +2725,12 @@ class GenerationJobService:
                 authorization_updates = {
                     "token_budget": candidate_budget,
                     "generation_params": generation_params_snapshot,
+                    "batch_authorization_contract": (
+                        build_batch_generation_authorization_contract(
+                            readiness_digest=readiness_digest,
+                            token_budget=candidate_budget,
+                        )
+                    ),
                     "prose_continuation_authorization": dict(
                         (accepted_readiness.get("planning") or {}).get(
                             "prose_continuation_authorization"

@@ -15,7 +15,9 @@ from backend.llm.base_client import BaseLLMClient
 from backend.llm.config import LLMProviderConfig
 from backend.llm.exceptions import (
     LLMAuthError,
+    LLMConnectionError,
     LLMError,
+    LLMHTTPStatusError,
     LLMRateLimitError,
     LLMResponseError,
     LLMSchemaUnsupportedError,
@@ -106,8 +108,16 @@ class ClaudeClient(BaseLLMClient):
             return LLMRateLimitError(str(exc), **kwargs)
         if isinstance(exc, anthropic.APITimeoutError):
             return LLMTimeoutError(str(exc), **kwargs)
+        if isinstance(exc, anthropic.APIConnectionError):
+            return LLMConnectionError(str(exc), **kwargs)
+        if isinstance(exc, anthropic.APIStatusError):
+            return LLMHTTPStatusError(
+                str(exc),
+                status_code=getattr(exc, "status_code", None),
+                **kwargs,
+            )
         if isinstance(exc, anthropic.APIError):
-            return LLMResponseError(str(exc), **kwargs)
+            return LLMError(str(exc), **kwargs)
         return LLMError(str(exc), **kwargs)
 
     @staticmethod

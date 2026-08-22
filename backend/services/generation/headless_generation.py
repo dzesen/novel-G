@@ -69,6 +69,9 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
+from backend.services.generation.protected_generation_params import (
+    validate_protected_generation_params,
+)
 from backend.services.novel.style_controls import render_style_controls
 
 _GENERATION_OVERRIDE_KEYS = frozenset({
@@ -77,7 +80,6 @@ _GENERATION_OVERRIDE_KEYS = frozenset({
     "max_tokens",
     "presence_penalty",
     "frequency_penalty",
-    "system_prompt",
 })
 
 
@@ -92,7 +94,7 @@ class GeneratedProseCandidate:
 def _generation_options(
     generation_params: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    values = dict(generation_params or {})
+    values = validate_protected_generation_params(generation_params)
     overrides = {
         key: value
         for key, value in values.items()
