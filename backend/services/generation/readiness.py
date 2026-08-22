@@ -414,6 +414,23 @@ class GenerationReadinessModule:
         proposal = await self._deps.inspect_active_proposal(novel_id)
         issues: list[dict[str, Any]] = []
 
+        world_baseline_state = str(
+            resources.get("world_baseline_state") or "not_required_legacy"
+        )
+        if world_baseline_state in {
+            "required",
+            "stale",
+            "blocked_pending_decisions",
+        }:
+            issues.append(
+                _issue(
+                    "world_baseline_confirmation_required",
+                    "blocked",
+                    details={"state": world_baseline_state},
+                    action_codes=["open_world_baseline"],
+                )
+            )
+
         has_work = any(
             counts["generate"] > 0 for counts in work["steps"].values()
         )
@@ -983,6 +1000,7 @@ class GenerationReadinessModule:
                 "narrative_revision": int(
                     resources.get("narrative_revision") or 0
                 ),
+                "world_baseline_state": world_baseline_state,
             },
             "active_proposal": (
                 {
@@ -1129,12 +1147,15 @@ async def _load_resource_counts(novel_id: str) -> dict[str, Any]:
     from backend.db.repositories.character_repository import character_repo
     from backend.db.repositories.novel_repository import novel_repo
     from backend.db.repositories.worldbook_repository import worldbook_repo
+    from backend.services.novel.world_baseline import WorldBaselineService
 
     novel = await novel_repo.get_novel_by_id(novel_id)
+    world_baseline = await WorldBaselineService.inspect(novel_id)
     result = {
         "owner_id": str(novel.get("owner_id") or ""),
         "character": len(await character_repo.list_cards(novel_id, "character")),
         "narrative_revision": await narrative_revision_store.current(novel_id),
+        "world_baseline_state": world_baseline["state"],
     }
     for card_type in ("location", "item", "rule", "lore"):
         result[card_type] = len(await worldbook_repo.list_cards(novel_id, card_type))

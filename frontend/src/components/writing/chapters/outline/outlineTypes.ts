@@ -125,6 +125,7 @@ export interface AcceptVolumeOutlineResponse {
   volume_count: number;
   chapter_count: number;
   volume_ids: string[];
+  next_route: { area: "world"; view: "baseline" };
 }
 
 export interface AcceptChapterOutlineResponse {

@@ -28,7 +28,10 @@ import {
 } from "./chapterUtils";
 import VolumeOutlinePanel from "./outline/VolumeOutlinePanel";
 import ChapterOutlinePanel from "./outline/ChapterOutlinePanel";
-import type { StoredChapterOutline } from "./outline/outlineTypes";
+import type {
+  AcceptVolumeOutlineResponse,
+  StoredChapterOutline,
+} from "./outline/outlineTypes";
 import ProsePanel from "./prose/ProsePanel";
 import type { ProseRunSnapshot } from "./prose/useProseStream";
 import SceneIllustrationPanel from "./SceneIllustrationPanel";
@@ -50,6 +53,9 @@ interface ChapterWorkspaceProps {
   onRunTargetChange: (runId?: string) => void;
   onOpenRunAudit: (chapterId: string, runId: string) => void;
   onOpenStateProposal: (chapterId: string) => void;
+  onStructureAccepted: (
+    nextRoute: AcceptVolumeOutlineResponse["next_route"],
+  ) => void;
   onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
@@ -90,6 +96,7 @@ export default function ChapterWorkspace({
   onRunTargetChange,
   onOpenRunAudit,
   onOpenStateProposal,
+  onStructureAccepted,
   onStartAutoBook,
   proseOpenRequest,
   onProseOpenRequestConsumed,
@@ -1069,6 +1076,7 @@ export default function ChapterWorkspace({
               })
             );
             void loadStructure();
+            onStructureAccepted(result.next_route);
           }}
         />
       )}

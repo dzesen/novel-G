@@ -125,6 +125,46 @@ export type ReferenceCardType =
   | "rule"
   | "lore";
 
+export type WorldBaselineDomain =
+  | ReferenceCardType
+  | "factions"
+  | "relationships";
+
+export type WorldBaselineDecision = "reviewed" | "not_applicable";
+
+export type WorldBaselineDecisions = Record<
+  WorldBaselineDomain,
+  WorldBaselineDecision
+>;
+
+export type WorldBaselineDecisionDraft = Partial<WorldBaselineDecisions>;
+
+export type WorldBaselineCounts = Record<WorldBaselineDomain, number>;
+
+export interface WorldBaselinePendingDecisions {
+  reference_card_proposals: number;
+  emergent_candidates: number;
+  card_import_proposals: number;
+}
+
+export type WorldBaselineState =
+  | "not_required_legacy"
+  | "required"
+  | "blocked_pending_decisions"
+  | "stale"
+  | "current";
+
+export interface WorldBaselineView {
+  schema_version: "world_baseline_view.v1";
+  state: WorldBaselineState;
+  counts: WorldBaselineCounts;
+  decisions: WorldBaselineDecisionDraft;
+  pending_decisions: WorldBaselinePendingDecisions;
+  stale_reasons: string[];
+  confirmed_at: string | null;
+  next_route: { area: "auto-book"; view: "readiness" } | null;
+}
+
 export interface CharacterProfile {
   aliases: string[];
   portrayal_context: string;

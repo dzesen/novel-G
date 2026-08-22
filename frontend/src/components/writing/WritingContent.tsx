@@ -481,6 +481,9 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
                 suggestion: undefined,
               })
             }
+            onStructureAccepted={(nextRoute) =>
+              navigateView(nextRoute.area, nextRoute.view)
+            }
             onStartAutoBook={openAutoBook}
             proseOpenRequest={proseOpenRequest}
             onProseOpenRequestConsumed={consumeProseOpen}
@@ -532,6 +535,10 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
             navigateView("world", view, targets, replace)
           }
           onTargetValidation={validateLocatedTarget}
+          onContinueToAutoBook={() =>
+            navigateView("auto-book", "readiness")
+          }
+          onOpenWriting={() => navigateView("writing", "chapter")}
         />
       );
     }

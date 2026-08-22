@@ -883,6 +883,7 @@
         "reviews": "生成审阅",
         "reviewHistory": "审阅与运行记录",
         "library": "资料库",
+        "baseline": "资料初始化",
         "factions": "势力",
         "relationships": "关系",
         "candidates": "资料候选",
@@ -920,6 +921,69 @@
       "continuityTargetBody": "目标链接已被安全保留，但当前版本不会猜测对应事实或提案。可先查看确定性故事健康或人物状态与事实。",
       "openHealth": "查看故事健康",
       "openFacts": "查看人物状态与事实"
+    },
+    "worldBaseline": {
+      "title": "完成世界资料初始化",
+      "description": "逐类确认当前资料是否足以支撑这份卷章结构。这里不调用模型，也不会要求每类资料都非空。",
+      "stageAria": "成书准备进度",
+      "stages": {
+        "structure": "卷章结构已确认",
+        "review": "复核世界资料",
+        "ready": "自动成书预检"
+      },
+      "loading": "正在读取当前世界资料基线…",
+      "loadFailed": "世界资料基线暂时无法读取。没有执行确认，也没有调用模型。",
+      "retry": "重新读取",
+      "states": {
+        "requiredTitle": "需要完成首次复核",
+        "requiredBody": "为七类世界资料分别选择“已复核”或“本书不适用”，再冻结这份结构对应的资料基线。",
+        "staleTitle": "资料或卷章结构已变化",
+        "staleBody": "上次确认的基线已不再匹配当前正式资料。请按最新数量重新复核。",
+        "blockedTitle": "先处理尚未落定的资料决策",
+        "blockedBody": "候选、提案或导入仍在等待决定。处理完成后再回来确认，避免把未定资料冻结进基线。",
+        "currentTitle": "世界资料基线已确认",
+        "currentBody": "当前正式资料与卷章结构相匹配，可以进入自动成书的零付费预检。",
+        "legacyTitle": "旧书无需补做初始化",
+        "legacyBody": "这部旧书沿用既有写作路径；新启动或扩大自动成书授权时仍会执行当前预检。"
+      },
+      "staleReasons": {
+        "blueprint_structure_changed": "卷章结构已变化",
+        "world_materials_changed": "正式世界资料已变化"
+      },
+      "decisionsTitle": "逐类复核",
+      "decisionsDescription": "数量是当前正式资料的事实快照。选择“不适用”只表示本书无需该类资料，不会删除已有内容。",
+      "domains": {
+        "character": { "label": "角色", "description": "人物身份、别名与塑造资料" },
+        "location": { "label": "地点", "description": "场景空间与地理资料" },
+        "item": { "label": "物品", "description": "关键道具与物件资料" },
+        "rule": { "label": "规则", "description": "世界运行规则与限制" },
+        "lore": { "label": "设定", "description": "历史、文化与背景资料" },
+        "factions": { "label": "势力", "description": "阵营、目标与冲突资料" },
+        "relationships": { "label": "势力关系", "description": "势力之间的正式关系" }
+      },
+      "count": "{count} 项正式资料",
+      "openDomain": "打开{domain}",
+      "decisionAria": "{domain}复核结论",
+      "reviewed": "已复核",
+      "notApplicable": "本书不适用",
+      "legacyDecision": "沿用既有路径",
+      "pendingTitle": "还有 {count} 项资料决策待处理",
+      "pendingBody": "待决资料不会被静默纳入或排除。请到资料库完成处理后再确认基线。",
+      "pending": {
+        "referenceCardProposals": "资料提案 {count}",
+        "emergentCandidates": "正文候选 {count}",
+        "cardImportProposals": "导入提案 {count}"
+      },
+      "openPending": "处理待决资料",
+      "remaining": "还需明确 {count} 类资料",
+      "confirmHint": "确认只记录当前资料快照与人工结论，不调用模型、不产生付费请求。",
+      "confirm": "确认世界资料基线",
+      "confirming": "正在确认…",
+      "confirmFailed": "确认失败。当前选择仍保留，请按提示处理后重试。",
+      "confirmedAt": "确认时间 {time}",
+      "continueAutoBook": "进入自动成书预检",
+      "manualWritingHint": "世界资料初始化只约束新的自动成书启动，不阻止作者手动写作。",
+      "openWriting": "继续手动写作"
     },
     "continuity": {
       "locatingTarget": "正在核对连续性目标…",

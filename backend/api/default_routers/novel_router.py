@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.novel.novel_service import NovelService
@@ -30,6 +30,11 @@ from backend.services.novel.card_driven_creation_service import (
 from backend.services.novel.style_controls import (
     StyleControlsSchema,
     normalize_style_controls,
+)
+from backend.services.novel.world_baseline import (
+    WORLD_BASELINE_DECISION_KEYS,
+    WorldBaselineError,
+    WorldBaselineService,
 )
 
 router = APIRouter(prefix="/api/novels", tags=["novels"])
@@ -131,6 +136,27 @@ class StatusUpdate(BaseModel):
     status: str
 
 
+class ConfirmWorldBaselineRequest(BaseModel):
+    decisions: Dict[
+        Literal[
+            "character",
+            "location",
+            "item",
+            "rule",
+            "lore",
+            "factions",
+            "relationships",
+        ],
+        Literal["reviewed", "not_applicable"],
+    ]
+
+    @model_validator(mode="after")
+    def validate_complete_decisions(self):
+        if set(self.decisions) != set(WORLD_BASELINE_DECISION_KEYS):
+            raise ValueError("every world-baseline domain requires a decision")
+        return self
+
+
 @router.post("/create")
 async def create_novel(
     req: CreateNovelRequest,
@@ -206,6 +232,56 @@ async def get_deleted_novels(actor: Actor = Depends(require_actor)):
             "total_word_count": novel.get("current_word_count", 0)
         }
     return {"data": novels}
+
+
+@router.get("/{novel_id}/world-baseline")
+async def inspect_world_baseline(
+    novel_id: str,
+    actor: Actor = Depends(require_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
+    try:
+        await access.require_owned_novel(actor, novel_id)
+        return await WorldBaselineService.inspect(novel_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, WorldBaselineError) as exc:
+        detail = (
+            {"code": exc.code, "message": str(exc)}
+            if isinstance(exc, WorldBaselineError)
+            else str(exc)
+        )
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+
+@router.post("/{novel_id}/world-baseline/confirm")
+async def confirm_world_baseline(
+    novel_id: str,
+    req: ConfirmWorldBaselineRequest,
+    actor: Actor = Depends(require_csrf_actor),
+    access: NovelAccessService = Depends(get_novel_access_service),
+):
+    try:
+        await access.require_owned_novel(actor, novel_id)
+        return await WorldBaselineService.confirm(
+            novel_id,
+            decisions=req.decisions,
+            confirmed_by=actor.id,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidIdError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except WorldBaselineError as exc:
+        status_code = (
+            400
+            if exc.code == "world_baseline_decisions_incomplete"
+            else 409
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
 
 @router.get("/{novel_id}")
 async def get_novel(

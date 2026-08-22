@@ -14,6 +14,7 @@ import WorkspaceViewTabs, {
 import FactionCardsWorkspace from "../factions/FactionCardsWorkspace";
 import ReferenceCardsDestination from "../reference-cards/ReferenceCardsDestination";
 import RelationshipWorkspace from "../relationships/RelationshipWorkspace";
+import WorldBaselineWorkspace from "./WorldBaselineWorkspace";
 
 interface WorldWorkspaceProps {
   novelId: string;
@@ -29,6 +30,8 @@ interface WorldWorkspaceProps {
     value: string,
     valid: boolean,
   ) => void;
+  onContinueToAutoBook: () => void;
+  onOpenWriting: () => void;
 }
 
 function parseReferenceCardType(value?: string): ReferenceCardType {
@@ -44,10 +47,13 @@ export default function WorldWorkspace({
   targets,
   onNavigateView,
   onTargetValidation,
+  onContinueToAutoBook,
+  onOpenWriting,
 }: WorldWorkspaceProps) {
   const t = useTranslations("writing.navigation");
   const referenceCardType = parseReferenceCardType(targets.cardType);
   const tabs: WorkspaceViewTab[] = [
+    { view: "baseline", label: t("views.baseline") },
     { view: "library", label: t("views.library") },
     { view: "factions", label: t("views.factions") },
     { view: "relationships", label: t("views.relationships") },
@@ -57,6 +63,25 @@ export default function WorldWorkspace({
     : view;
 
   const content = (() => {
+    if (view === "baseline") {
+      return (
+        <WorldBaselineWorkspace
+          novelId={novelId}
+          onOpenDomain={(domain) => {
+            if (domain === "factions" || domain === "relationships") {
+              onNavigateView(domain);
+              return;
+            }
+            onNavigateView("library", { cardType: domain });
+          }}
+          onOpenPending={(destination) =>
+            onNavigateView(destination, { cardType: "character" })
+          }
+          onContinueToAutoBook={onContinueToAutoBook}
+          onOpenWriting={onOpenWriting}
+        />
+      );
+    }
     if (view === "factions") {
       return (
         <FactionCardsWorkspace

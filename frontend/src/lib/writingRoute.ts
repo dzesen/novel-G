@@ -15,7 +15,14 @@ export const WRITING_AREA_VIEWS = {
     "diagnostics",
     "retrospective",
   ],
-  world: ["library", "factions", "relationships", "curation", "candidates"],
+  world: [
+    "baseline",
+    "library",
+    "factions",
+    "relationships",
+    "curation",
+    "candidates",
+  ],
   continuity: [
     "overview",
     "facts",
@@ -193,6 +200,7 @@ const VIEW_TARGETS: Record<WritingArea, Record<string, readonly WritingTargetKey
     retrospective: ["volume"],
   },
   world: {
+    baseline: [],
     library: ["cardType", "card"],
     factions: ["card"],
     relationships: ["card"],

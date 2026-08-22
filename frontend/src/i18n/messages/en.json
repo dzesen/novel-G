@@ -883,6 +883,7 @@
         "reviews": "Generation Reviews",
         "reviewHistory": "Reviews & Run History",
         "library": "Library",
+        "baseline": "Initialize world data",
         "factions": "Factions",
         "relationships": "Relationships",
         "candidates": "Candidates",
@@ -920,6 +921,69 @@
       "continuityTargetBody": "The target link remains intact, but this version will not guess which fact or proposal it means. Open deterministic story health or character state and facts instead.",
       "openHealth": "Open story health",
       "openFacts": "Open character state & facts"
+    },
+    "worldBaseline": {
+      "title": "Initialize world data",
+      "description": "Confirm whether each world-data domain is ready for this volume and chapter structure. This makes no model calls and does not require every domain to contain records.",
+      "stageAria": "Book preparation progress",
+      "stages": {
+        "structure": "Structure confirmed",
+        "review": "Review world data",
+        "ready": "Auto-book readiness"
+      },
+      "loading": "Loading the current world-data baseline…",
+      "loadFailed": "The world-data baseline is temporarily unavailable. Nothing was confirmed and no model was called.",
+      "retry": "Reload",
+      "states": {
+        "requiredTitle": "Initial review required",
+        "requiredBody": "Choose Reviewed or Not needed for this book for all seven domains, then freeze the baseline for this structure.",
+        "staleTitle": "World data or structure changed",
+        "staleBody": "The previous baseline no longer matches the current formal data. Review the latest counts again.",
+        "blockedTitle": "Resolve unsettled world-data decisions first",
+        "blockedBody": "Candidates, proposals, or imports are awaiting decisions. Resolve them before confirmation so unsettled material is not frozen into the baseline.",
+        "currentTitle": "World-data baseline confirmed",
+        "currentBody": "The current formal data matches the volume and chapter structure. You can continue to zero-cost auto-book readiness.",
+        "legacyTitle": "No initialization required for this existing book",
+        "legacyBody": "This book keeps its existing writing path. A current readiness check still runs before any new or expanded auto-book authorization."
+      },
+      "staleReasons": {
+        "blueprint_structure_changed": "The volume and chapter structure changed",
+        "world_materials_changed": "Formal world data changed"
+      },
+      "decisionsTitle": "Review every domain",
+      "decisionsDescription": "Counts are a factual snapshot of formal data. Choosing Not needed does not delete existing content.",
+      "domains": {
+        "character": { "label": "Characters", "description": "Character identities, aliases, and portrayal data" },
+        "location": { "label": "Locations", "description": "Scene spaces and geographic data" },
+        "item": { "label": "Items", "description": "Important props and objects" },
+        "rule": { "label": "Rules", "description": "World rules, systems, and constraints" },
+        "lore": { "label": "Lore", "description": "History, culture, and background" },
+        "factions": { "label": "Factions", "description": "Groups, goals, and conflicts" },
+        "relationships": { "label": "Faction relationships", "description": "Formal relationships between factions" }
+      },
+      "count": "{count} formal records",
+      "openDomain": "Open {domain}",
+      "decisionAria": "Review decision for {domain}",
+      "reviewed": "Reviewed",
+      "notApplicable": "Not needed for this book",
+      "legacyDecision": "Keep existing path",
+      "pendingTitle": "{count} world-data decisions remain",
+      "pendingBody": "Unsettled material will not be silently included or excluded. Resolve it in the library before confirming the baseline.",
+      "pending": {
+        "referenceCardProposals": "Reference proposals {count}",
+        "emergentCandidates": "Prose candidates {count}",
+        "cardImportProposals": "Import proposals {count}"
+      },
+      "openPending": "Resolve pending data",
+      "remaining": "Choose a decision for {count} more domains",
+      "confirmHint": "Confirmation records only the current snapshot and your decisions. It makes no model calls and has no cost.",
+      "confirm": "Confirm world-data baseline",
+      "confirming": "Confirming…",
+      "confirmFailed": "Confirmation failed. Your selections remain; follow the guidance and try again.",
+      "confirmedAt": "Confirmed {time}",
+      "continueAutoBook": "Continue to auto-book readiness",
+      "manualWritingHint": "World-data initialization gates only new auto-book starts. It does not block author-led writing.",
+      "openWriting": "Continue manual writing"
     },
     "continuity": {
       "locatingTarget": "Checking the continuity target…",

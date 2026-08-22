@@ -217,6 +217,20 @@ class VolumeService:
                     novel_id, command["novel_stats_after"], session=session
                 )
                 await mutation.receipt("novel_stats", command["novel_stats_after"])
+            requirement = command.get("world_baseline_requirement")
+            if requirement:
+                await novel_repo.update_novel_info(
+                    novel_id,
+                    {
+                        "world_baseline_requirement": requirement,
+                        "world_baseline": None,
+                    },
+                    session=session,
+                )
+                await mutation.receipt(
+                    "world_baseline_requirement",
+                    {"structure_digest": requirement["structure_digest"]},
+                )
             return dict(command["result"])
         except Exception:
             logger.error(
@@ -290,6 +304,7 @@ class VolumeService:
             "volume_count": len(prepared_volumes),
             "chapter_count": total_chapters,
             "volume_ids": volume_ids,
+            "next_route": {"area": "world", "view": "baseline"},
         }
         return await commit_mutation(
             MutationCommand(
@@ -300,6 +315,10 @@ class VolumeService:
                 payload={
                     "volumes": prepared_volumes,
                     "result": result,
+                    "world_baseline_requirement": {
+                        "schema_version": "world_baseline_requirement.v1",
+                        "structure_digest": digest,
+                    },
                 },
                 before_image={"novel": novel},
                 child_ids=child_ids,
