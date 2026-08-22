@@ -717,6 +717,14 @@ class CandidateJobGenerationPlans:
     state: GenerationPlan | None
 
 
+@dataclass(frozen=True)
+class CandidateJobGenerationRequirements:
+    """Provider-plan requirements derived from the entire frozen worklist."""
+
+    active: bool
+    needs_outline: bool
+
+
 def _candidate_job_plan_projection(
     plan: GenerationPlan,
     *,
@@ -789,6 +797,25 @@ def parse_candidate_job_execution_authorization(
             "candidate Job execution authorization requires exact JSON types"
         )
     return parsed
+
+
+def candidate_job_generation_requirements(
+    readiness: Mapping[str, Any],
+) -> CandidateJobGenerationRequirements:
+    """Resolve plan requirements without narrowing them to the current chapter."""
+
+    if not readiness_uses_candidate_pipeline(readiness):
+        raise ValueError("readiness has no candidate Job execution authority")
+    planning = readiness.get("planning")
+    if not isinstance(planning, Mapping):
+        raise ValueError("candidate Job readiness planning is invalid")
+    authorization = parse_candidate_job_execution_authorization(
+        planning.get("chapter_candidate_job_execution_authorization")
+    )
+    return CandidateJobGenerationRequirements(
+        active=authorization.eligible_chapter_count > 0,
+        needs_outline=authorization.missing_outline_chapter_count > 0,
+    )
 
 
 def plan_candidate_job_generation(

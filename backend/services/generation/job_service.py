@@ -29,6 +29,7 @@ from backend.services.generation.chapter_pipeline import (
 )
 from backend.services.generation.chapter_candidate_authorization import (
     authorized_candidate_repair_attempt_slots,
+    candidate_job_generation_requirements,
     generation_plan_from_candidate_snapshot,
     plan_candidate_job_generation,
     readiness_uses_candidate_pipeline,
@@ -1538,9 +1539,10 @@ class GenerationJobService:
                 )
                 if not isinstance(snapshot, Mapping):
                     raise ValueError("candidate chapter snapshot is missing")
+                requirements = candidate_job_generation_requirements(readiness)
                 live_plans = plan_candidate_job_generation(
-                    needs_outline=snapshot.get("has_outline") is False,
-                    active=True,
+                    needs_outline=requirements.needs_outline,
+                    active=requirements.active,
                 )
                 execution_authorization = (
                     validate_candidate_job_execution_authorization(
