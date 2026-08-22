@@ -28,6 +28,7 @@ import type {
   AICreateRequest,
   AICreateResponse,
   AICreateStepKey,
+  BlueprintGenerationSource,
   CardImportDirectionReference,
 } from "@/types/novel";
 import type {
@@ -40,9 +41,7 @@ import type {
 interface AICreateStepperProps {
   onComplete: (
     result: AICreateResponse,
-    chapters: number,
-    wordsPerChapter: number,
-    creativeDirection: CreativeDirectionSelection | null,
+    source: BlueprintGenerationSource,
   ) => void;
   cardImports?: CardImportDirectionReference[];
   requireDirector?: boolean;
@@ -444,12 +443,10 @@ export default function AICreateStepper({
             if (data.success && data.result) {
               const res = data.result as AICreateResponse;
               setResult(res);
-              onComplete(
-                res,
-                input.number_of_chapters,
-                input.words_per_chapter,
-                input.creative_direction,
-              );
+              onComplete(res, {
+                schema_version: "blueprint_generation_source.v1",
+                ...input,
+              });
             }
           }
         },

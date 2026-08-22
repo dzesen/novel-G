@@ -1,8 +1,5 @@
-import type { NovelRewriteFieldKey } from "@/lib/novelFields";
 import type { StoredChapterOutline } from "@/components/writing/chapters/outline/outlineTypes";
 import type { CreativeDirectionSelection } from "@/types/agent";
-
-export type { NovelRewriteFieldKey } from "@/lib/novelFields";
 
 export interface StyleControls {
   narrative_person?: "first" | "third";
@@ -460,45 +457,6 @@ export interface ReferenceCardCurationProposal {
   apply_result?: ReferenceCardCurationResult;
 }
 
-export interface RewriteChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  target_field: NovelRewriteFieldKey;
-  content: string;
-  provider?: string;
-  status?: "failed";
-  error_message?: string;
-  created_at: string;
-}
-
-export interface RewriteFieldRevision {
-  id: string;
-  value: string | string[];
-  source: "initial" | "manual" | "ai";
-  instruction?: string;
-  created_at: string;
-}
-
-export interface WritingDraftRewriteState {
-  messagesByField: Partial<Record<NovelRewriteFieldKey, RewriteChatMessage[]>>;
-  revisionsByField: Partial<Record<NovelRewriteFieldKey, RewriteFieldRevision[]>>;
-  activeRevisionIdByField: Partial<Record<NovelRewriteFieldKey, string>>;
-}
-
-export interface RewriteNovelFieldRequest {
-  provider: string;
-  target_field: NovelRewriteFieldKey;
-  instruction: string;
-  current_value: string | string[];
-  context: Record<string, unknown>;
-  chat_history: Pick<RewriteChatMessage, "role" | "content">[];
-}
-
-export interface RewriteNovelFieldResponse {
-  target_field: NovelRewriteFieldKey;
-  value: string | string[];
-}
-
 export type FactionRelationType =
   | "hostile"
   | "allied"
@@ -639,11 +597,21 @@ export type AICreateCachedSteps = Partial<{
   novel_meta: AICreateResponse["novel_meta"];
 }>;
 
+/** 冻结整份蓝图重新生成所需的原始来源；不得从作者后续编辑反推。 */
+export interface BlueprintGenerationSource {
+  schema_version: "blueprint_generation_source.v1";
+  user_idea: string;
+  number_of_chapters: number;
+  words_per_chapter: number;
+  creative_direction: CreativeDirectionSelection | null;
+  card_imports: CardImportDirectionReference[];
+}
+
 /** 统一建书草稿，用于三种入口向 Writing 蓝图确认页传递数据。 */
 export interface WritingDraft extends CreateNovelRequest {
   _fromAI?: boolean;
   _draftSchemaVersion?: 1;
   _creationOrigin?: "blank" | "ai_idea" | "tavern_cards";
-  _rewriteState?: WritingDraftRewriteState;
+  _generationSource?: BlueprintGenerationSource;
   card_avatar_proposal_ids?: string[];
 }

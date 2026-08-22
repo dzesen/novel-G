@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
-from typing import Any, AsyncGenerator, Literal
+from typing import Any, AsyncGenerator
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -20,14 +19,13 @@ from backend.api.llm_routers._common import (
 )
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
-from backend.llm.config import get_llm_config, get_provider_config
+from backend.llm.config import get_llm_config
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
     WorkflowStep,
     run_workflow,
 )
 from backend.services.llm.generation_runtime import (
-    ExplicitProviderTarget,
     PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
@@ -38,7 +36,6 @@ from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
 from backend.services.novel.faction_service import FactionService
 from backend.llm.prompts.prompt_selector import (
     CORE_FACTIONS_PROMPT_NAME,
-    REWRITE_NOVEL_FIELD_PROMPT_NAME,
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
@@ -61,80 +58,6 @@ WORKFLOW_NAME = "create_novel_by_ai"
 FACTIONS_WORKFLOW_NAME = "create_factions_by_ai"
 CREATE_CORE_FACTIONS_STEP_NAME = "create_core_factions"
 logger = logging.getLogger(__name__)
-
-NovelRewriteFieldKey = Literal[
-    "title",
-    "subtitle",
-    "genre",
-    "tags",
-    "plot",
-    "core_idea",
-    "tone",
-    "target_audience",
-    "introduction",
-    "summary",
-    "core_seed",
-    "worldview",
-    "writing_style",
-    "narrative_pov",
-    "era_background",
-]
-
-REWRITABLE_NOVEL_FIELDS: set[str] = {
-    "title",
-    "subtitle",
-    "genre",
-    "tags",
-    "plot",
-    "core_idea",
-    "tone",
-    "target_audience",
-    "introduction",
-    "summary",
-    "core_seed",
-    "worldview",
-    "writing_style",
-    "narrative_pov",
-    "era_background",
-}
-
-REWRITE_CONTEXT_FIELDS: tuple[str, ...] = (
-    "title",
-    "subtitle",
-    "genre",
-    "tags",
-    "tone",
-    "target_audience",
-    "core_idea",
-    "core_seed",
-    "writing_style",
-    "narrative_pov",
-    "era_background",
-    "number_of_chapters",
-    "words_per_chapter",
-)
-
-FIELD_LABELS: dict[str, str] = {
-    "title": "标题",
-    "subtitle": "副标题",
-    "genre": "类型",
-    "tags": "标签",
-    "plot": "主线剧情",
-    "core_idea": "核心创意",
-    "tone": "基调",
-    "target_audience": "目标读者",
-    "introduction": "引言",
-    "summary": "简介",
-    "core_seed": "核心种子",
-    "worldview": "世界观",
-    "writing_style": "写作风格",
-    "narrative_pov": "叙事视角",
-    "era_background": "时代背景",
-}
-
-NARRATIVE_POV_VALUES: set[str] = {"第一人称", "第三人称有限视角", "全知视角"}
-TAG_SPLIT_RE = re.compile(r"[\n,，、;；]+")
-
 
 def _load_prompts() -> dict:
     """读取当前生效的 prompt 定义文件。"""
@@ -266,214 +189,10 @@ class AICreateNovelRequest(GenerationParamsMixin):
     cached_steps: AICreateCachedSteps | None = None
 
 
-class NovelRewriteChatMessage(BaseModel):
-    """单条创建态字段改写对话消息。"""
-
-    role: Literal["user", "assistant"]
-    content: str = Field(..., min_length=1, max_length=8000)
-
-
-class NovelFieldRewriteRequest(BaseModel):
-    """创建态字段改写请求。"""
-
-    provider: str = Field(..., min_length=1)
-    target_field: NovelRewriteFieldKey
-    instruction: str = Field(..., min_length=1, max_length=4000)
-    current_value: str | list[str] = ""
-    context: dict[str, Any] = Field(default_factory=dict)
-    chat_history: list[NovelRewriteChatMessage] = Field(default_factory=list)
-
-
-class NovelFieldRewriteResult(BaseModel):
-    """创建态字段改写结果。"""
-
-    target_field: NovelRewriteFieldKey
-    value: str | list[str]
-
-
 class GenerateCoreFactionsRequest(GenerationParamsMixin):
     """基于已保存小说生成核心阵营预览的请求。"""
 
     novel_id: str = Field(..., min_length=1)
-
-
-def _validate_rewrite_provider(provider: str):
-    """校验指定 Provider 能否用于创建态字段改写。
-
-    Args:
-        provider: 前端选择的 Provider 别名。
-
-    Returns:
-        已解析的 Provider 配置。
-
-    Raises:
-        HTTPException: Provider 不存在或未启用时抛出 400。
-    """
-    alias = provider.strip()
-    llm_cfg = get_llm_config()
-    if alias not in llm_cfg.providers:
-        raise HTTPException(status_code=400, detail=f"Provider 不存在: {alias}")
-
-    provider_config = get_provider_config(alias)
-    if not provider_config.enabled:
-        raise HTTPException(status_code=400, detail=f"Provider 未启用: {alias}")
-
-    return provider_config
-
-
-def _format_rewrite_value(value: str | list[str]) -> str:
-    """将字段值格式化为提示词中的可读文本。
-
-    Args:
-        value: 当前字段值，标签字段可能是字符串列表。
-
-    Returns:
-        可直接放入提示词的文本。
-    """
-    if isinstance(value, list):
-        return "、".join(str(item).strip() for item in value if str(item).strip())
-    return str(value or "").strip()
-
-
-def _compact_rewrite_context(context: dict[str, Any], target_field: str) -> dict[str, Any]:
-    """过滤创建草稿上下文，只保留用户可见且非目标字段的小说创建字段。
-
-    Args:
-        context: 前端提交的完整创建草稿上下文。
-        target_field: 当前正在改写的目标字段。
-
-    Returns:
-        供 LLM 参考的上下文字典。
-    """
-    compact: dict[str, Any] = {}
-    for field in REWRITE_CONTEXT_FIELDS:
-        # 目标字段已经通过 current_value 独立传入，避免同一长文本在 prompt 中重复出现。
-        if field != target_field and field in context:
-            compact[field] = context[field]
-    return compact
-
-
-def _format_rewrite_history(history: list[NovelRewriteChatMessage]) -> str:
-    """将字段历史对话压缩成提示词片段。
-
-    Args:
-        history: 当前目标字段的历史消息列表。
-
-    Returns:
-        可读的历史对话文本；无历史时返回占位说明。
-    """
-    if not history:
-        return "无"
-
-    lines: list[str] = []
-    for message in history[-12:]:
-        role_label = "用户" if message.role == "user" else "AI"
-        lines.append(f"{role_label}: {message.content.strip()}")
-    return "\n".join(lines)
-
-
-def _build_rewrite_prompt(req: NovelFieldRewriteRequest, *, use_json_schema: bool) -> str:
-    """构造创建态字段改写提示词。
-
-    Args:
-        req: 字段改写请求模型。
-        use_json_schema: 当前 Provider 是否支持结构化输出。
-
-    Returns:
-        发送给 LLM 的完整提示词。
-    """
-    prompts = _load_prompts().get(REWRITE_NOVEL_FIELD_PROMPT_NAME, {})
-    field_label = FIELD_LABELS[req.target_field]
-    context_json = json.dumps(
-        _compact_rewrite_context(req.context, req.target_field),
-        ensure_ascii=False,
-        indent=2,
-    )
-    current_value = _format_rewrite_value(req.current_value)
-    history_text = _format_rewrite_history(req.chat_history)
-    suffix_key = (
-        "rewrite_novel_field_prompt_with_schema_suffix"
-        if use_json_schema
-        else "rewrite_novel_field_prompt_without_schema_suffix"
-    )
-
-    prompt_base = prompts["rewrite_novel_field_prompt_base"].format(
-        target_field_label=field_label,
-        target_field=req.target_field,
-        instruction=req.instruction.strip(),
-        current_value=current_value or "无",
-        context_json=context_json,
-        history_text=history_text,
-    )
-    prompt_suffix = prompts[suffix_key].format(target_field=req.target_field)
-    return f"{prompt_base}\n{prompt_suffix}".strip()
-
-
-def _normalize_rewrite_value(target_field: NovelRewriteFieldKey, value: str | list[str]) -> str | list[str]:
-    """归一化 LLM 返回的字段值。
-
-    Args:
-        target_field: 当前改写目标字段。
-        value: LLM 返回的原始字段值。
-
-    Returns:
-        可直接返回给前端并写入表单的字段值。
-
-    Raises:
-        ValueError: 返回值为空或不满足字段约束时抛出。
-    """
-    if target_field not in REWRITABLE_NOVEL_FIELDS:
-        raise ValueError(f"不支持改写字段: {target_field}")
-
-    if target_field == "tags":
-        raw_items = value if isinstance(value, list) else TAG_SPLIT_RE.split(str(value))
-        tags: list[str] = []
-        for item in raw_items:
-            tag = str(item).strip()
-            if tag and tag not in tags:
-                tags.append(tag)
-        if not tags:
-            raise ValueError("标签改写结果不能为空")
-        return tags[:8]
-
-    if isinstance(value, list):
-        text = "\n".join(str(item).strip() for item in value if str(item).strip())
-    else:
-        text = str(value).strip()
-
-    if not text:
-        raise ValueError(f"{FIELD_LABELS[target_field]}改写结果不能为空")
-
-    if target_field == "narrative_pov" and text not in NARRATIVE_POV_VALUES:
-        allowed = "、".join(sorted(NARRATIVE_POV_VALUES))
-        raise ValueError(f"叙事视角只能为: {allowed}")
-
-    return text
-
-
-def _normalize_rewrite_result(
-    target_field: NovelRewriteFieldKey,
-    result: NovelFieldRewriteResult,
-) -> NovelFieldRewriteResult:
-    """校验并归一化完整改写结果。
-
-    Args:
-        target_field: 请求中的目标字段。
-        result: LLM 返回并解析后的改写结果。
-
-    Returns:
-        字段一致且值已归一化的改写结果。
-
-    Raises:
-        ValueError: 字段不一致或字段值非法时抛出。
-    """
-    if result.target_field != target_field:
-        raise ValueError(f"AI 返回字段不一致: {result.target_field}")
-
-    return NovelFieldRewriteResult(
-        target_field=target_field,
-        value=_normalize_rewrite_value(target_field, result.value),
-    )
 
 
 def _build_core_factions_prompt(novel: dict[str, Any], *, use_json_schema: bool) -> str:
@@ -576,56 +295,23 @@ async def generate_core_factions(req: GenerateCoreFactionsRequest):
 
 
 @router.post("/rewrite-novel-field")
-async def rewrite_novel_field(req: NovelFieldRewriteRequest):
-    """使用指定 Provider 改写创建态小说信息中的单个字段。
+async def rewrite_novel_field(req: dict[str, Any]):
+    """保留一个兼容周期的退役端点，不再触发任何付费调用。
 
     Args:
         req: 前端提交的字段改写请求。
 
     Returns:
-        包含目标字段和改写后字段值的响应字典。
+        此端点始终抛出 410。
     """
-    _validate_rewrite_provider(req.provider)
-    runtime = create_generation_runtime()
-    plan = runtime.plan_structured(ExplicitProviderTarget(req.provider))
-    request_id = uuid4().hex[:8]
-    logger.info(
-        "[rewrite_novel_field] request_id=%s provider=%s field=%s json_schema=%s",
-        request_id,
-        req.provider,
-        req.target_field,
-        plan.mode.value,
+    del req
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "blueprint_field_rewrite_retired",
+            "message": "逐字段 AI 改写已停用，请使用整份蓝图重新生成。",
+        },
     )
-
-    try:
-        generated = await runtime.generate_structured(
-            plan,
-            NovelFieldRewriteResult,
-            PromptPlan(
-                native_schema_prompt=_build_rewrite_prompt(req, use_json_schema=True),
-                prompt_json_prompt=_build_rewrite_prompt(req, use_json_schema=False),
-            ),
-        )
-        parsed_result = NovelFieldRewriteResult.model_validate(generated.value.model_dump())
-        normalized_result = _normalize_rewrite_result(req.target_field, parsed_result)
-        return normalized_result.model_dump()
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        logger.warning(
-            "[rewrite_novel_field] request_id=%s invalid_result=%s",
-            request_id,
-            exc,
-        )
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception(
-            "[rewrite_novel_field] request_id=%s failed provider=%s field=%s",
-            request_id,
-            req.provider,
-            req.target_field,
-        )
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/create-novel-by-ai")
@@ -672,4 +358,3 @@ async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-

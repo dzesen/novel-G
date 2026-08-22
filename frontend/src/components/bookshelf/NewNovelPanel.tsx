@@ -18,8 +18,10 @@ import {
   saveWritingDraft,
   type StoredWritingDraft,
 } from "@/lib/writingDraft";
-import type { CreativeDirectionSelection } from "@/types/agent";
-import type { AICreateResponse } from "@/types/novel";
+import type {
+  AICreateResponse,
+  BlueprintGenerationSource,
+} from "@/types/novel";
 
 interface NewNovelPanelProps {
   onCancel: () => void;
@@ -57,15 +59,11 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
 
   const handleAIComplete = (
     result: AICreateResponse,
-    chapters: number,
-    wordsPerChapter: number,
-    creativeDirection: CreativeDirectionSelection | null,
+    generationSource: BlueprintGenerationSource,
   ) => {
     const draft = createGeneratedWritingDraft({
       result,
-      chapters,
-      wordsPerChapter,
-      creativeDirection,
+      generationSource,
       origin: "ai_idea",
     });
     const draftId = saveWritingDraft(draft);

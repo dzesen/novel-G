@@ -1317,6 +1317,55 @@
         "tavern_cards": "Started from: Tavern cards",
         "legacy": "Started from: legacy creation draft"
       },
+      "regeneration": {
+        "eyebrow": "Whole-version candidate",
+        "title": "Regenerate the entire blueprint",
+        "description": "Rerun the blueprint from the originally confirmed idea and direction. The result appears as a candidate and never overwrites your edits automatically.",
+        "open": "Regenerate blueprint",
+        "close": "Close",
+        "stage": {
+          "confirm": {
+            "eyebrow": "Step 1 of 3",
+            "title": "Confirm generation source"
+          },
+          "running": {
+            "eyebrow": "Step 2 of 3",
+            "title": "Generating a new candidate"
+          },
+          "review": {
+            "eyebrow": "Step 3 of 3",
+            "title": "Compare and choose"
+          }
+        },
+        "confirmDescription": "This run uses the original idea, scale, and confirmed direction frozen at creation time. Your later field edits are never reused as hidden input.",
+        "source": {
+          "idea": "Original idea",
+          "chapters": "Planned chapters",
+          "words": "Target words per chapter"
+        },
+        "replacementWarning": "Confirming starts a new AI blueprint generation. Even after it succeeds, you must choose “Use new blueprint”; the current version remains unchanged until then.",
+        "confirmPaidCall": "Confirm and call AI",
+        "keepCurrent": "Keep current blueprint",
+        "runningDescription": "All four steps run from the beginning without reusing the previous result. Keep this page open, then compare the candidate when it finishes.",
+        "runningHint": "Generation is in progress. The current blueprint will not change.",
+        "reviewDescription": "This preview shows the title, summary, and main plot. Accepting the candidate updates every AI-generated blueprint field as one version.",
+        "current": "Current blueprint",
+        "candidate": "New candidate",
+        "acceptCandidate": "Use new blueprint",
+        "failed": "Blueprint regeneration failed. The current blueprint was not changed.",
+        "connectionEnded": "The generation connection ended before a complete candidate arrived. The current blueprint was not changed.",
+        "steps": {
+          "expand_idea": "Expand the complete story",
+          "extract_idea": "Extract the creative direction",
+          "core_seed": "Generate the story core",
+          "novel_meta": "Generate book settings"
+        },
+        "blocked": {
+          "blueprint_regeneration_not_available": "Blank blueprints and legacy drafts do not have a verifiable AI source, so they cannot be regenerated safely.",
+          "blueprint_source_binding_stale": "This draft is missing its complete original generation source. Return to the creation entry to avoid an incorrect paid call.",
+          "card_import_binding_stale": "The Tavern-card review no longer matches the original generation source. The AI call was blocked; return to the creation entry and review the cards again."
+        }
+      },
       "editTitle": "Novel Information",
       "noDraftTitle": "This blueprint link is no longer valid",
       "noDraft": "The linked draft could not be found. Start a blank blueprint now, or return to the unified entry and choose another method.",
@@ -3252,30 +3301,6 @@
       "noDescription": "No relationship notes yet",
       "detail": "Relationship details",
       "intensity": "Intensity {value}/5"
-    },
-    "rewriteAssistant": {
-      "title": "AI Rewrite",
-      "draftSaved": "Draft",
-      "draftLocal": "Local",
-      "emptyMessages": "Choose a field and enter your edit request",
-      "placeholder": "Describe how you want this part changed...",
-      "provider": "Provider",
-      "field": "Content",
-      "version": "Version",
-      "currentVersion": "Current",
-      "versionLabel": "Version {index}",
-      "undoVersion": "Back to previous version",
-      "redoVersion": "Restore next version",
-      "collapsePanel": "Collapse panel",
-      "expandPanel": "Expand panel",
-      "send": "Send",
-      "retry": "Retry",
-      "sending": "Rewriting...",
-      "requestFailed": "This request failed",
-      "loadingProviders": "Loading",
-      "noProvider": "No Provider",
-      "loadProvidersFailed": "Failed to load Providers",
-      "rewriteFailed": "Rewrite failed"
     },
     "factions": {
       "title": "Factions",

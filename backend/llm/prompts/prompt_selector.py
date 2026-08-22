@@ -21,7 +21,6 @@ PROMPT_DIR = Path(__file__).resolve().parent
 CUSTOM_PROMPT_FILENAME = "prompt.yaml"
 DEFAULT_PROMPT_FILENAME = "prompt_default.yaml"
 WORKFLOW_NAME = "create_novel_by_ai"
-REWRITE_NOVEL_FIELD_PROMPT_NAME = "rewrite_novel_field"
 CORE_FACTIONS_PROMPT_NAME = "create_factions_by_ai"
 REFERENCE_CARDS_PROMPT_NAME = "create_reference_cards_by_ai"
 VOLUME_OUTLINE_PROMPT_NAME = "create_volume_outline_by_ai"
@@ -47,12 +46,6 @@ REQUIRED_CREATE_NOVEL_PROMPT_KEYS: tuple[str, ...] = (
     "novel_meta_prompt_base",
     "novel_meta_prompt_with_schema_suffix",
     "novel_meta_prompt_without_schema_suffix",
-)
-
-REQUIRED_REWRITE_NOVEL_FIELD_PROMPT_KEYS: tuple[str, ...] = (
-    "rewrite_novel_field_prompt_base",
-    "rewrite_novel_field_prompt_with_schema_suffix",
-    "rewrite_novel_field_prompt_without_schema_suffix",
 )
 
 REQUIRED_CORE_FACTIONS_PROMPT_KEYS: tuple[str, ...] = (
@@ -107,7 +100,6 @@ REQUIRED_LLM_PROVIDER_TEST_PROMPT_KEYS: tuple[str, ...] = (
 
 REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
     WORKFLOW_NAME: REQUIRED_CREATE_NOVEL_PROMPT_KEYS,
-    REWRITE_NOVEL_FIELD_PROMPT_NAME: REQUIRED_REWRITE_NOVEL_FIELD_PROMPT_KEYS,
     CORE_FACTIONS_PROMPT_NAME: REQUIRED_CORE_FACTIONS_PROMPT_KEYS,
     REFERENCE_CARDS_PROMPT_NAME: REQUIRED_REFERENCE_CARDS_PROMPT_KEYS,
     VOLUME_OUTLINE_PROMPT_NAME: REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS,
@@ -139,15 +131,6 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "words_per_chapter",
         "core_seed",
     },
-    "rewrite_novel_field_prompt_base": {
-        "target_field_label",
-        "target_field",
-        "instruction",
-        "current_value",
-        "context_json",
-        "history_text",
-    },
-    "rewrite_novel_field_prompt_without_schema_suffix": {"target_field"},
     "create_core_factions_prompt_base": {
         "plot",
         "genre",

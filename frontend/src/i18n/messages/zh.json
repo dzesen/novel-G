@@ -1317,6 +1317,55 @@
         "tavern_cards": "起点：酒馆卡驱动",
         "legacy": "起点：旧版创建草稿"
       },
+      "regeneration": {
+        "eyebrow": "整版候选",
+        "title": "重新生成整份蓝图",
+        "description": "从最初确认的创意和方向完整重跑蓝图。新结果会先作为候选展示，不会直接覆盖当前编辑。",
+        "open": "重新生成蓝图",
+        "close": "关闭",
+        "stage": {
+          "confirm": {
+            "eyebrow": "第 1 步，共 3 步",
+            "title": "确认生成来源"
+          },
+          "running": {
+            "eyebrow": "第 2 步，共 3 步",
+            "title": "正在生成新候选"
+          },
+          "review": {
+            "eyebrow": "第 3 步，共 3 步",
+            "title": "对比并决定是否采用"
+          }
+        },
+        "confirmDescription": "本次会使用建书时冻结的原始创意、篇幅和已确认方向，不会把你后来编辑的字段偷偷当作新输入。",
+        "source": {
+          "idea": "原始创意",
+          "chapters": "计划章节数",
+          "words": "每章目标字数"
+        },
+        "replacementWarning": "确认后会发起一次新的 AI 蓝图生成。生成成功仍需你再次选择“采用新蓝图”，当前内容在此之前保持不变。",
+        "confirmPaidCall": "确认并调用 AI",
+        "keepCurrent": "保留当前蓝图",
+        "runningDescription": "四个步骤会从头执行，不复用上一次结果。请保持页面打开，完成后再对比候选。",
+        "runningHint": "生成进行中，完成前不会改动当前蓝图。",
+        "reviewDescription": "这里先展示标题、简介和主线剧情。采用候选时，所有 AI 生成的蓝图字段会作为一个整体更新。",
+        "current": "当前蓝图",
+        "candidate": "新候选",
+        "acceptCandidate": "采用新蓝图",
+        "failed": "蓝图重新生成失败，当前蓝图未受影响。",
+        "connectionEnded": "生成连接提前结束，没有收到完整候选。当前蓝图未受影响。",
+        "steps": {
+          "expand_idea": "扩写完整故事",
+          "extract_idea": "提炼创意方向",
+          "core_seed": "生成故事核心",
+          "novel_meta": "生成书籍设定"
+        },
+        "blocked": {
+          "blueprint_regeneration_not_available": "空白蓝图和旧版草稿没有可验证的 AI 来源，不能安全重新生成。",
+          "blueprint_source_binding_stale": "这份草稿缺少完整的原始生成来源。为避免错误付费调用，请返回建书入口重新开始。",
+          "card_import_binding_stale": "酒馆卡审核结果已与最初生成来源不一致。系统已阻止调用 AI，请返回建书入口重新确认卡片。"
+        }
+      },
       "editTitle": "小说信息",
       "noDraftTitle": "这个蓝图链接已失效",
       "noDraft": "没有找到链接指向的草稿。你可以立即建立空白蓝图，或返回统一入口选择其他方式。",
@@ -3252,30 +3301,6 @@
       "noDescription": "暂无关系说明",
       "detail": "关系详情",
       "intensity": "关系强度 {value}/5"
-    },
-    "rewriteAssistant": {
-      "title": "AI 改写",
-      "draftSaved": "草稿",
-      "draftLocal": "本地",
-      "emptyMessages": "选择字段并输入修改需求",
-      "placeholder": "输入你想如何修改这部分内容...",
-      "provider": "Provider",
-      "field": "内容",
-      "version": "版本",
-      "currentVersion": "当前",
-      "versionLabel": "版本 {index}",
-      "undoVersion": "撤回到上一版本",
-      "redoVersion": "恢复到下一版本",
-      "collapsePanel": "折叠对话框",
-      "expandPanel": "展开对话框",
-      "send": "发送",
-      "retry": "重试",
-      "sending": "改写中...",
-      "requestFailed": "该请求失败",
-      "loadingProviders": "加载中",
-      "noProvider": "无可用 Provider",
-      "loadProvidersFailed": "Provider 加载失败",
-      "rewriteFailed": "改写失败"
     },
     "factions": {
       "title": "势力卡",

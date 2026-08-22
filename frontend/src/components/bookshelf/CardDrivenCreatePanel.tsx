@@ -20,13 +20,13 @@ import { createGeneratedWritingDraft } from "@/lib/novelCreationDraft";
 import { saveWritingDraft } from "@/lib/writingDraft";
 import type {
   AICreateResponse,
+  BlueprintGenerationSource,
   CardImportCandidate,
   CardImportCreationSelection,
   CardImportDecision,
   CardImportDirectionReference,
   CardImportProposal,
 } from "@/types/novel";
-import type { CreativeDirectionSelection } from "@/types/agent";
 import { referenceMatchKind } from "../writing/generationMetadataPresentation";
 
 interface CardDrivenCreatePanelProps {
@@ -259,19 +259,16 @@ export default function CardDrivenCreatePanel({
 
   const handleAIComplete = (
     result: AICreateResponse,
-    chapters: number,
-    wordsPerChapter: number,
-    creativeDirection: CreativeDirectionSelection | null,
+    generationSource: BlueprintGenerationSource,
   ) => {
+    const creativeDirection = generationSource.creative_direction;
     if (!creativeDirection?.card_context_digest) {
       setError(t("directionBindingMissing"));
       return;
     }
     const draft = createGeneratedWritingDraft({
       result,
-      chapters,
-      wordsPerChapter,
-      creativeDirection,
+      generationSource,
       origin: "tavern_cards",
       cardCreationId: newCreationId(),
       cardImports: creationSelections,

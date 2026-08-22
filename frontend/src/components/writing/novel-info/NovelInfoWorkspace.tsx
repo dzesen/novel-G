@@ -20,12 +20,12 @@ import {
   isPermanentCardAvatarTransferFailure,
 } from "@/lib/cardAvatarTransfer";
 import { createBlankWritingDraft } from "@/lib/novelCreationDraft";
+import { applyRegeneratedBlueprint } from "@/lib/blueprintGeneration";
 import type {
+  AICreateResponse,
   CreateNovelRequest,
   NovelDetail,
-  NovelRewriteFieldKey,
   WritingDraft,
-  WritingDraftRewriteState,
 } from "@/types/novel";
 import {
   clearWritingDraft,
@@ -33,9 +33,8 @@ import {
   saveWritingDraft,
   updateWritingDraft,
 } from "@/lib/writingDraft";
-import { normalizeRewriteState } from "@/lib/rewriteDraftState";
 import NovelInfoSection, { type SectionKey } from "./NovelInfoSection";
-import NovelRewriteAssistant from "./NovelRewriteAssistant";
+import BlueprintRegenerationPanel from "./BlueprintRegenerationPanel";
 import StickyActionBar from "./StickyActionBar";
 import NovelCoverPanel from "./NovelCoverPanel";
 
@@ -87,7 +86,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
     (updater: (prev: Record<string, unknown>) => Record<string, unknown>) => {
       setData((prev) => {
         const nextData = updater(prev);
-        // 创建态表单是本地草稿驱动，任何字段和改写状态变化都立即写回草稿。
+        // 创建态表单由本地草稿驱动，字段变化和整版候选确认都立即写回。
         persistCreateDraft(nextData);
         return nextData;
       });
@@ -246,23 +245,13 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
     updateCreateData((prev) => ({ ...prev, [field]: value }));
   };
 
-  const handleRewriteStateChange = (rewriteState: WritingDraftRewriteState) => {
-    updateCreateData((prev) => ({
-      ...prev,
-      _rewriteState: normalizeRewriteState(rewriteState),
-    }));
-  };
-
-  const handleApplyRewrite = (
-    field: NovelRewriteFieldKey,
-    value: string | string[],
-    rewriteState: WritingDraftRewriteState,
-  ) => {
-    updateCreateData((prev) => ({
-      ...prev,
-      [field]: value,
-      _rewriteState: normalizeRewriteState(rewriteState),
-    }));
+  const handleAcceptRegeneratedBlueprint = (candidate: AICreateResponse) => {
+    updateCreateData((prev) =>
+      applyRegeneratedBlueprint(
+        prev as unknown as WritingDraft,
+        candidate,
+      ) as unknown as Record<string, unknown>,
+    );
   };
 
   const returnToCreationMethods = () => {
@@ -419,6 +408,12 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
             )}
           </Fragment>
         ))}
+        {mode === "create" && (
+          <BlueprintRegenerationPanel
+            draft={data as unknown as WritingDraft}
+            onAccept={handleAcceptRegeneratedBlueprint}
+          />
+        )}
       </div>
 
       {/* Sticky action bar - create mode */}
@@ -441,14 +436,6 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
         </StickyActionBar>
       )}
 
-      {mode === "create" && (
-        <NovelRewriteAssistant
-          data={data}
-          rewriteState={normalizeRewriteState(data._rewriteState as WritingDraftRewriteState | undefined)}
-          onApplyRewrite={handleApplyRewrite}
-          onRewriteStateChange={handleRewriteStateChange}
-        />
-      )}
     </div>
   );
 }

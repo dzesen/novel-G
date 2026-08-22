@@ -1,6 +1,6 @@
-import type { CreativeDirectionSelection } from "@/types/agent";
 import type {
   AICreateResponse,
+  BlueprintGenerationSource,
   CardImportCreationSelection,
   WritingDraft,
 } from "@/types/novel";
@@ -13,9 +13,7 @@ export type NovelCreationOrigin = NonNullable<
 
 interface GeneratedDraftOptions {
   result: AICreateResponse;
-  chapters: number;
-  wordsPerChapter: number;
-  creativeDirection: CreativeDirectionSelection | null;
+  generationSource: BlueprintGenerationSource;
   origin: Exclude<NovelCreationOrigin, "blank">;
   cardCreationId?: string;
   cardImports?: CardImportCreationSelection[];
@@ -36,9 +34,7 @@ export function createBlankWritingDraft(): WritingDraft {
 /** 把 AI 创意或卡驱动结果归一为同一份可编辑蓝图草稿。 */
 export function createGeneratedWritingDraft({
   result,
-  chapters,
-  wordsPerChapter,
-  creativeDirection,
+  generationSource,
   origin,
   cardCreationId,
   cardImports,
@@ -66,10 +62,13 @@ export function createGeneratedWritingDraft({
     tone: result.extract_idea.tone,
     target_audience: result.extract_idea.target_audience,
     core_idea: result.extract_idea.core_idea,
-    number_of_chapters: chapters,
-    words_per_chapter: wordsPerChapter,
+    number_of_chapters: generationSource.number_of_chapters,
+    words_per_chapter: generationSource.words_per_chapter,
     creation_mode: "ai",
-    ...(creativeDirection && { creative_direction: creativeDirection }),
+    _generationSource: generationSource,
+    ...(generationSource.creative_direction && {
+      creative_direction: generationSource.creative_direction,
+    }),
     ...(cardCreationId && { card_creation_id: cardCreationId }),
     ...(cardImports && { card_imports: cardImports }),
     ...(cardAvatarProposalIds && {

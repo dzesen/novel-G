@@ -1,13 +1,6 @@
-import type { CreativeDirectionSelection } from "@/types/agent";
-import type { CardImportDirectionReference } from "@/types/novel";
+import type { BlueprintGenerationSource } from "@/types/novel";
 
-export interface AICreateCacheInput {
-  user_idea: string;
-  number_of_chapters: number;
-  words_per_chapter: number;
-  creative_direction: CreativeDirectionSelection | null;
-  card_imports: CardImportDirectionReference[];
-}
+export type AICreateCacheInput = Omit<BlueprintGenerationSource, "schema_version">;
 
 export interface AICreateCacheIdentityRecord {
   input: AICreateCacheInput;
