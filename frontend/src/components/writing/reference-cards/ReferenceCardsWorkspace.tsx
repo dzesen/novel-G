@@ -581,7 +581,7 @@ export default function ReferenceCardsWorkspace({
         </div>
       </aside>
 
-      <main className="min-h-0 flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         {showTrash ? (
           <div className="flex min-h-full items-center justify-center px-6 text-center text-sm text-muted">{t("trashHint")}</div>
         ) : creating || selectedCard ? (
@@ -752,7 +752,7 @@ export default function ReferenceCardsWorkspace({
             </div>
           </div>
         )}
-      </main>
+      </div>
       <ReferenceCardCurationDialog
         novelId={novelId}
         defaultCardType={cardType}

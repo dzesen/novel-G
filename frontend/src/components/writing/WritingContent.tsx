@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { useTranslations } from "next-intl";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { apiGet } from "@/lib/api";
@@ -21,22 +22,43 @@ import {
 } from "@/lib/writingRoute";
 import { buildUserStorageKey } from "@/lib/userStorage";
 import type { NovelDetail } from "@/types/novel";
+import { WorkspaceLoading } from "@/components/ui/WorkspaceLoading";
 import WritingNavigation from "./WritingNavigation";
 import WorkspaceViewTabs, {
   type WorkspaceViewTab,
 } from "./WorkspaceViewTabs";
-import NovelInfoWorkspace from "./novel-info/NovelInfoWorkspace";
-import ChapterWorkspace, {
-  type ProseOpenRequest,
-} from "./chapters/ChapterWorkspace";
+import type { ProseOpenRequest } from "./chapters/ChapterWorkspace";
 import type { ProseRunSnapshot } from "./chapters/prose/useProseStream";
-import AutoBookWorkspace, {
-  type AutoBookStartRequest,
-} from "./auto-book/AutoBookWorkspace";
-import GenerationToolWorkspace from "./agents/GenerationToolWorkspace";
-import AgentStudioMigration from "./agents/AgentStudioMigration";
-import WorldWorkspace from "./world/WorldWorkspace";
-import ContinuityWorkspace from "./continuity/ContinuityWorkspace";
+import type { AutoBookStartRequest } from "./auto-book/AutoBookWorkspace";
+
+const ChapterWorkspace = dynamic(
+  () => import("./chapters/ChapterWorkspace"),
+  { loading: WorkspaceLoading },
+);
+const AutoBookWorkspace = dynamic(
+  () => import("./auto-book/AutoBookWorkspace"),
+  { loading: WorkspaceLoading },
+);
+const GenerationToolWorkspace = dynamic(
+  () => import("./agents/GenerationToolWorkspace"),
+  { loading: WorkspaceLoading },
+);
+const AgentStudioMigration = dynamic(
+  () => import("./agents/AgentStudioMigration"),
+  { loading: WorkspaceLoading },
+);
+const WorldWorkspace = dynamic(
+  () => import("./world/WorldWorkspace"),
+  { loading: WorkspaceLoading },
+);
+const ContinuityWorkspace = dynamic(
+  () => import("./continuity/ContinuityWorkspace"),
+  { loading: WorkspaceLoading },
+);
+const NovelInfoWorkspace = dynamic(
+  () => import("./novel-info/NovelInfoWorkspace"),
+  { loading: WorkspaceLoading },
+);
 
 interface WritingContentProps {
   mode: "create" | "edit";
@@ -105,7 +127,7 @@ function NovelLoadFailure({
 }) {
   const t = useTranslations("writing.navigation");
   return (
-    <div className="grid h-[calc(100vh-3.5rem)] place-items-center overflow-y-auto bg-background px-5 py-10">
+    <div className="grid h-[100dvh] place-items-center overflow-y-auto bg-background px-5 py-10">
       <section className="w-full max-w-xl border-y border-border py-8">
         <h1 className="text-xl font-semibold text-foreground">
           {t("novelUnavailableTitle")}
@@ -375,7 +397,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
 
   if (!routeReady) {
     return (
-      <div className="grid h-[calc(100vh-3.5rem)] place-items-center bg-background px-6 text-center text-sm text-muted">
+      <div className="grid h-[100dvh] place-items-center bg-background px-6 text-center text-sm text-muted">
         {t("loadingRoute")}
       </div>
     );
@@ -392,9 +414,6 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
     );
   }
 
-  const writingTabs: WorkspaceViewTab[] = [
-    { view: "chapter", label: t("views.chapter") },
-  ];
   const blueprintTabs: WorkspaceViewTab[] = [
     { view: "overview", label: t("areas.blueprint.short") },
     { view: "inspiration", label: t("views.inspiration") },
@@ -563,7 +582,7 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   };
 
   return (
-    <div className="flex h-[calc(100vh-3.5rem)] min-h-0 flex-col bg-background">
+    <div className="writing-workspace flex h-[100dvh] min-h-0 flex-col bg-background">
       <WritingNavigation
         activeArea={route.area}
         novelTitle={novel?.title ?? t("untitled")}
@@ -577,14 +596,6 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
           }
           tabs={blueprintTabs}
           onSelect={(view) => navigateView("blueprint", view)}
-        />
-      )}
-      {route.area === "writing" && route.view === "chapter" && !invalidTarget && !runtimeInvalidTarget && (
-        <WorkspaceViewTabs
-          label={t("viewAria")}
-          activeView={route.view}
-          tabs={writingTabs}
-          onSelect={(view) => navigateView("writing", view)}
         />
       )}
       <main className="min-h-0 min-w-0 flex-1 overflow-hidden">

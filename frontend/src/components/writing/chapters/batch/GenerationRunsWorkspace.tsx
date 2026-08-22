@@ -647,7 +647,7 @@ export default function GenerationRunsWorkspace({
   }, [load, target.runId]);
 
   return (
-    <main className="flex h-full min-h-0 flex-col bg-surface" aria-labelledby="generation-runs-title">
+    <section className="flex h-full min-h-0 flex-col bg-surface" aria-labelledby="generation-runs-title">
       {resumeReviewJob && (
         <ResumeJobDialog
           job={resumeReviewJob}
@@ -1266,6 +1266,6 @@ export default function GenerationRunsWorkspace({
         </section>
 
       </div>
-    </main>
+    </section>
   );
 }

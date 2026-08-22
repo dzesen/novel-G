@@ -45,7 +45,7 @@ export default function GenerationDiagnosticsWorkspace({
   }, [load]);
 
   return (
-    <main
+    <section
       className="flex h-full min-h-0 flex-col bg-surface"
       aria-labelledby="auto-book-diagnostics-title"
     >
@@ -105,6 +105,6 @@ export default function GenerationDiagnosticsWorkspace({
           {t("diagnosticsPrivacyHint")}
         </p>
       </div>
-    </main>
+    </section>
   );
 }

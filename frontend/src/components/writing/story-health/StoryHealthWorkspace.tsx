@@ -197,7 +197,7 @@ export default function StoryHealthWorkspace({
         )}
       </header>
 
-      <main className="flex flex-col gap-8 p-6">
+      <div className="flex flex-col gap-8 p-6">
         {error && (
           <div
             role="alert"
@@ -460,7 +460,7 @@ export default function StoryHealthWorkspace({
             </p>
           </>
         )}
-      </main>
+      </div>
     </div>
   );
 }

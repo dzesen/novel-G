@@ -32,6 +32,8 @@ export function AppShell({
   const locale = pathname.startsWith("/en") ? "en" : "zh";
   const loginPath = `/${locale}/login`;
   const isLogin = pathname === loginPath;
+  const isSavedWritingWorkspace =
+    /^\/(?:zh|en)\/writing\/(?!new(?:\/|$))[^/]+(?:\/|$)/.test(pathname);
 
   useEffect(() => {
     if ((phase === "setup" || phase === "unauthenticated") && !isLogin) {
@@ -53,6 +55,14 @@ export function AppShell({
   }
   if (isLogin) {
     return <main className="min-h-screen">{children}</main>;
+  }
+  if (isSavedWritingWorkspace) {
+    return (
+      <>
+        {children}
+        {modal}
+      </>
+    );
   }
 
   return (

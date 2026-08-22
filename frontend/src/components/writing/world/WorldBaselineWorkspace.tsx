@@ -183,7 +183,7 @@ export default function WorldBaselineWorkspace({
         : "border-accent/35 bg-accent/[0.04]";
 
   return (
-    <main className="h-full overflow-y-auto bg-background">
+    <div className="h-full overflow-y-auto bg-background">
       <div className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
         <header className="max-w-3xl">
           <h1 className="text-balance text-2xl font-semibold tracking-[-0.02em] text-foreground sm:text-3xl">
@@ -395,7 +395,7 @@ export default function WorldBaselineWorkspace({
           </aside>
         </div>
       </div>
-    </main>
+    </div>
   );
 }
 
