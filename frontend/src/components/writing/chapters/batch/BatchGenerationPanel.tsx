@@ -27,6 +27,7 @@ import {
   bookCompletionAuditMatchesJob,
   bookCompletionResult,
 } from "./bookCompletionPresentation";
+import { currentJobStatusByProseRun } from "./generationRunsPresentation";
 
 const ABORT_DIALOG_FOCUSABLE_SELECTOR = [
   "button:not([disabled])",
@@ -101,6 +102,10 @@ export default function BatchGenerationPanel({
     useState<BookCompletionAudit | null>(null);
   const [currentBookAuditError, setCurrentBookAuditError] = useState("");
   const [currentBookAuditRevision, setCurrentBookAuditRevision] = useState(0);
+  const jobStatusByProseRun = useMemo(
+    () => currentJobStatusByProseRun(job ? [job] : []),
+    [job],
+  );
 
 
   // 精确 job 深链优先；只有 URL 没指定 job 时才收养最近的非终态作业。
@@ -386,6 +391,7 @@ export default function BatchGenerationPanel({
         job?.status ?? "none",
         job?.error?.chapter_id ?? "none",
       ].join(":")}
+      jobStatusByRun={jobStatusByProseRun}
       onOpenRun={onOpenProseRun}
       onStartFresh={onStartFreshProse}
     />
