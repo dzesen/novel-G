@@ -243,7 +243,10 @@ class VolumeService:
 
     @staticmethod
     async def accept_volume_outline(
-        novel_id: str, volumes: List[Dict[str, Any]]
+        novel_id: str,
+        volumes: List[Dict[str, Any]],
+        *,
+        expected_narrative_revision: int | None = None,
     ) -> Dict[str, Any]:
         """接受分卷大纲，并以持久化稳定 ID 支持 standalone 中断续作。"""
         novel = await novel_repo.get_novel_by_id(novel_id)
@@ -311,7 +314,7 @@ class VolumeService:
                 novel_id=novel_id,
                 idempotency_key=f"accept-volume-outline:{novel_id}:{digest}",
                 operation="accept_volume_outline",
-                version=2,
+                version=3 if expected_narrative_revision is not None else 2,
                 payload={
                     "volumes": prepared_volumes,
                     "result": result,
@@ -322,8 +325,12 @@ class VolumeService:
                 },
                 before_image={"novel": novel},
                 child_ids=child_ids,
+                expected_narrative_revision=expected_narrative_revision,
             ),
             VolumeService._execute_accept_volume_outline,
+            persistent_narrative_fence=(
+                expected_narrative_revision is not None
+            ),
         )
 
     # 查询（透传）

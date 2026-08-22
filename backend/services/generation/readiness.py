@@ -388,6 +388,7 @@ class GenerationReadinessModule:
         scope: str,
         volume_id: str | None,
         chapters: list[dict[str, Any]],
+        book_structure_initialization: Mapping[str, Any] | None = None,
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
@@ -416,18 +417,46 @@ class GenerationReadinessModule:
             )
         )
         work = _work_summary(chapters)
+        structure_snapshot = (
+            dict(book_structure_initialization)
+            if scope == "book"
+            and isinstance(book_structure_initialization, Mapping)
+            else None
+        )
+        structure_state = str(
+            (structure_snapshot or {}).get("state") or "not_applicable"
+        )
+        structure_work = (
+            dict(structure_snapshot.get("work") or {})
+            if structure_snapshot is not None
+            else {}
+        )
+        if structure_snapshot is not None:
+            work["structure"] = structure_work
         resources = await self._deps.load_resource_counts(novel_id)
         proposal = await self._deps.inspect_active_proposal(novel_id)
         issues: list[dict[str, Any]] = []
 
+        has_chapter_work = any(
+            counts["generate"] > 0 for counts in work["steps"].values()
+        )
+        has_structure_work = bool(
+            structure_state == "missing"
+            and int(structure_work.get("generate") or 0) > 0
+        )
+        has_work = has_chapter_work or has_structure_work
+
         world_baseline_state = str(
             resources.get("world_baseline_state") or "not_required_legacy"
         )
-        if world_baseline_state in {
-            "required",
-            "stale",
-            "blocked_pending_decisions",
-        }:
+        if (
+            not has_structure_work
+            and world_baseline_state in {
+                "required",
+                "stale",
+                "blocked_pending_decisions",
+            }
+        ):
             issues.append(
                 _issue(
                     "world_baseline_confirmation_required",
@@ -437,10 +466,74 @@ class GenerationReadinessModule:
                 )
             )
 
-        has_work = any(
-            counts["generate"] > 0 for counts in work["steps"].values()
-        )
-        if not chapters or not has_work:
+        if structure_state == "missing":
+            issues.append(
+                _issue(
+                    "book_structure_initialization_required",
+                    "warning_requires_ack",
+                    details={
+                        "target_chapter_count": int(
+                            structure_work.get("target_chapter_count") or 0
+                        )
+                    },
+                    action_codes=["review_book_structure_initialization"],
+                )
+            )
+        elif structure_state == "partial":
+            issues.append(
+                _issue(
+                    "book_structure_partial",
+                    "blocked",
+                    action_codes=["review_book_structure"],
+                )
+            )
+        elif structure_state == "deleted_conflict":
+            issues.append(
+                _issue(
+                    "book_structure_in_trash",
+                    "blocked",
+                    details={
+                        "deleted_volume_count": int(
+                            (structure_snapshot or {}).get(
+                                "deleted_volume_count"
+                            )
+                            or 0
+                        ),
+                        "deleted_chapter_count": int(
+                            (structure_snapshot or {}).get(
+                                "deleted_chapter_count"
+                            )
+                            or 0
+                        ),
+                    },
+                    action_codes=["review_book_structure_trash"],
+                )
+            )
+        elif structure_state == "invalid_target":
+            issues.append(
+                _issue(
+                    "book_structure_target_invalid",
+                    "blocked",
+                    action_codes=["review_novel_blueprint"],
+                )
+            )
+        elif structure_state == "provider_invalid":
+            issues.append(
+                _issue(
+                    "provider_plan_invalid",
+                    "blocked",
+                    details={"step": "volume_outline"},
+                    action_codes=["open_provider_settings"],
+                )
+            )
+
+        structure_has_specific_blocker = structure_state in {
+            "partial",
+            "deleted_conflict",
+            "invalid_target",
+            "provider_invalid",
+        }
+        if not has_work and not structure_has_specific_blocker:
             issues.append(
                 _issue(
                     "no_generation_work",
@@ -521,7 +614,7 @@ class GenerationReadinessModule:
             int(resources.get(kind) or 0)
             for kind in ("location", "item", "rule", "lore")
         )
-        if has_work and world_count == 0:
+        if has_chapter_work and world_count == 0:
             issues.append(
                 _issue(
                     "world_cards_missing",
@@ -541,23 +634,31 @@ class GenerationReadinessModule:
                     continuation_policy,
                     generation_params,
                 )
-            planning = self._deps.plan_work(
-                chapters,
-                continuation_policy,
-                planning_generation_params,
-            ) if has_work else {
-                "attempt_capacity": 0,
-                "providers": [],
-                "config_revision": "",
-                "capability_snapshot": "",
-            }
+            if has_chapter_work:
+                planning = self._deps.plan_work(
+                    chapters,
+                    continuation_policy,
+                    planning_generation_params,
+                )
+            elif has_structure_work:
+                planning = {
+                    **dict((structure_snapshot or {}).get("planning") or {}),
+                    "book_structure_initialization": structure_snapshot,
+                }
+            else:
+                planning = {
+                    "attempt_capacity": 0,
+                    "providers": [],
+                    "config_revision": "",
+                    "capability_snapshot": "",
+                }
             finalization_authorization = (
                 build_chapter_finalization_authorization(
                     authorization_revision=authorization_revision,
                 )
             )
 
-            if has_work and self._deps.plan_candidate_repairs is not None:
+            if has_chapter_work and self._deps.plan_candidate_repairs is not None:
                 candidate_repair_authorization = (
                     parse_candidate_repair_authorization(
                         self._deps.plan_candidate_repairs(
@@ -748,6 +849,78 @@ class GenerationReadinessModule:
                                 action_codes=["set_token_budget"],
                             )
                         )
+            elif has_structure_work:
+                base_budget = _parse_base_generation_budget(
+                    planning.get("base_generation_budget")
+                )
+                base_attempt_capacity = _strict_non_negative_budget_int(
+                    planning.get("attempt_capacity"),
+                    field="book structure attempt capacity",
+                )
+                if (
+                    base_attempt_capacity
+                    != base_budget.maximum_provider_attempts_total
+                ):
+                    raise ValueError("book structure attempt capacity changed")
+                maximum_tokens_total = base_budget.maximum_tokens_total
+                planning["batch_generation_budget_coverage"] = {
+                    "schema_version": "batch_generation_budget_coverage.v1",
+                    "base_generation_maximum_tokens": maximum_tokens_total,
+                    "candidate_repair_maximum_tokens": 0,
+                    "reference_card_repair_maximum_tokens": 0,
+                    "maximum_tokens_total": maximum_tokens_total,
+                    "maximum_provider_attempts_total": base_attempt_capacity,
+                    "provider_bounds": [
+                        {
+                            "provider_alias": item.provider_alias,
+                            "maximum_paid_attempts_total": item.paid_attempts,
+                            "maximum_tokens_total": item.tokens,
+                        }
+                        for item in base_budget.provider_bounds
+                    ],
+                    "token_bound_known": base_budget.token_bound_known,
+                    "token_budget": token_budget,
+                    "covers_full_job_authority": bool(
+                        base_budget.token_bound_known
+                        and token_budget is not None
+                        and token_budget >= maximum_tokens_total
+                    ),
+                }
+                if not base_budget.token_bound_known:
+                    issues.append(
+                        _issue(
+                            "batch_generation_token_bound_unproven",
+                            "blocked",
+                            action_codes=["review_provider_settings"],
+                        )
+                    )
+                if maximum_tokens_total > 0 and token_budget is None:
+                    issues.append(
+                        _issue(
+                            "batch_generation_requires_token_budget",
+                            "blocked",
+                            details={
+                                "maximum_tokens_total": maximum_tokens_total
+                            },
+                            action_codes=["set_token_budget"],
+                        )
+                    )
+                elif (
+                    maximum_tokens_total > 0
+                    and token_budget is not None
+                    and token_budget < maximum_tokens_total
+                ):
+                    issues.append(
+                        _issue(
+                            "book_structure_budget_not_covered",
+                            "blocked",
+                            details={
+                                "maximum_tokens_total": maximum_tokens_total,
+                                "token_budget": token_budget,
+                            },
+                            action_codes=["review_token_budget"],
+                        )
+                    )
         except ContextBudgetError as exc:
             planning = {
                 "attempt_capacity": 0,
@@ -851,7 +1024,7 @@ class GenerationReadinessModule:
                 auto_creation_policy.model_dump(mode="json")
             ),
         }
-        if auto_creation_policy.enabled and has_work:
+        if auto_creation_policy.enabled and has_chapter_work:
             raw_reference_repair = planning.get(
                 "reference_card_repair_plan_authorization"
             )

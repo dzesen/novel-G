@@ -92,6 +92,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("hard_delete_volume", 1): VolumeService._execute_hard_delete_volume,
         ("accept_volume_outline", 1): VolumeService._execute_accept_volume_outline,
         ("accept_volume_outline", 2): VolumeService._execute_accept_volume_outline,
+        ("accept_volume_outline", 3): VolumeService._execute_accept_volume_outline,
         ("create_volume", 1): VolumeService._execute_create_volume,
         ("create_volume", 2): VolumeService._execute_create_volume,
         ("update_volume", 1): VolumeService._execute_update_volume,
@@ -134,11 +135,17 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         AUTO_CARD_REVERT_MUTATION_NAME,
         REFERENCE_CARD_REPAIR_MUTATION_NAME,
     }
+    persistent_fence_handlers = {
+        ("accept_volume_outline", 3),
+    }
     return {
         key: MutationHandlerSpec(
             callback,
             advances_narrative_revision=key[0] not in non_narrative_operations,
-            persistent_narrative_fence=key[0] in persistent_fence_operations,
+            persistent_narrative_fence=(
+                key[0] in persistent_fence_operations
+                or key in persistent_fence_handlers
+            ),
         )
         for key, callback in callbacks.items()
     }

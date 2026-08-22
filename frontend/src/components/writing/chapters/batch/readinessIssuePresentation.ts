@@ -14,6 +14,39 @@ export function readinessIssueCopy(
   continuationCount: number,
 ) {
   switch (issue.code) {
+    case "book_structure_initialization_required":
+      return {
+        title: t("readinessIssueStructureRequiredTitle"),
+        body: t("readinessIssueStructureRequiredBody", {
+          count: Number(issue.details.target_chapter_count ?? 0),
+        }),
+      };
+    case "book_structure_partial":
+      return {
+        title: t("readinessIssueStructurePartialTitle"),
+        body: t("readinessIssueStructurePartialBody"),
+      };
+    case "book_structure_in_trash":
+      return {
+        title: t("readinessIssueStructureTrashTitle"),
+        body: t("readinessIssueStructureTrashBody", {
+          volumes: Number(issue.details.deleted_volume_count ?? 0),
+          chapters: Number(issue.details.deleted_chapter_count ?? 0),
+        }),
+      };
+    case "book_structure_target_invalid":
+      return {
+        title: t("readinessIssueStructureTargetTitle"),
+        body: t("readinessIssueStructureTargetBody"),
+      };
+    case "book_structure_budget_not_covered":
+      return {
+        title: t("readinessIssueStructureBudgetTitle"),
+        body: t("readinessIssueStructureBudgetBody", {
+          maximum: Number(issue.details.maximum_tokens_total ?? 0),
+          budget: Number(issue.details.token_budget ?? 0),
+        }),
+      };
     case "world_baseline_confirmation_required":
       return {
         title: t("readinessIssueWorldBaselineTitle"),

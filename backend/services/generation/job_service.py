@@ -100,6 +100,10 @@ from backend.services.novel.book_completion import book_completion_audit
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
+from backend.services.generation.book_structure_initialization import (
+    initialize_book_structure as execute_book_structure_initialization,
+    inspect_book_structure_initialization,
+)
 from backend.services.generation.readiness import generation_readiness_module
 from backend.services.novel.state_completion import state_completion_module
 from backend.services.novel.state_proposal import StaleStatePreview, state_proposal_module
@@ -547,7 +551,12 @@ def _new_job_doc(
         "novel_id": to_object_id(novel_id), "scope": scope,
         "volume_id": to_object_id(volume_id) if volume_id else None,
         "status": "running", "pause_reason": None,
-        "checkpoint_interval": int(checkpoint_interval), "token_budget": token_budget,
+        "checkpoint_interval": (
+            int(checkpoint_interval)
+            if checkpoint_interval is not None
+            else None
+        ),
+        "token_budget": token_budget,
         "tokens_used": 0, "current_chapter_id": None, "progress": [],
         "tokens_reserved": 0,
         "active_token_reservations": [],
@@ -2129,11 +2138,16 @@ class GenerationJobService:
         )
         await novel_repo.get_novel_by_id(novel_id)
         chapters = await get_book_worklist(novel_id, include_content=True)
+        structure_initialization = await inspect_book_structure_initialization(
+            novel_id,
+            generation_params=protected_generation_params,
+        )
         return await generation_readiness_module.inspect(
             novel_id=novel_id,
             scope="book",
             volume_id=None,
             chapters=chapters,
+            book_structure_initialization=structure_initialization,
             outline_deviation_policy=outline_deviation_policy,
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
@@ -2142,6 +2156,66 @@ class GenerationJobService:
                 reference_card_auto_creation_policy
             ),
         )
+
+    @staticmethod
+    async def initialize_book_structure(
+        novel_id: str,
+        *,
+        token_budget: int | None,
+        readiness_digest: str | None,
+        acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
+        outline_deviation_policy: str = PAUSE_FOR_REWRITE,
+        generation_params: Mapping[str, Any] | None = None,
+        prose_continuation_policy: ProseContinuationPolicy | None = None,
+        reference_card_auto_creation_policy: (
+            ReferenceCardAutoCreationPolicy | None
+        ) = None,
+    ) -> Dict[str, Any]:
+        """Create initial volume/chapter stubs under the reviewed book digest."""
+
+        protected_generation_params = _validate_start_authorization(
+            token_budget=token_budget,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
+        continuation_policy = (
+            prose_continuation_policy or ProseContinuationPolicy()
+        )
+        generation_params_snapshot = {
+            **protected_generation_params,
+            "prose_continuation_policy": continuation_policy.to_dict(),
+        }
+        async with _get_start_lock():
+            await GenerationJobService._guard_no_running()
+            report = await GenerationJobService.inspect_book_readiness(
+                novel_id,
+                outline_deviation_policy=outline_deviation_policy,
+                prose_continuation_policy=continuation_policy,
+                token_budget=token_budget,
+                generation_params=generation_params_snapshot,
+                reference_card_auto_creation_policy=(
+                    reference_card_auto_creation_policy
+                ),
+            )
+            authorization = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            planning = authorization.get("planning")
+            structure_authorization = (
+                planning.get("book_structure_initialization")
+                if isinstance(planning, Mapping)
+                else None
+            )
+            if not isinstance(structure_authorization, Mapping):
+                raise ValueError("当前整书预检不包含待生成的卷章结构")
+            return await execute_book_structure_initialization(
+                novel_id,
+                authorization=structure_authorization,
+                token_budget=token_budget,
+                generation_params=generation_params_snapshot,
+            )
 
     @staticmethod
     async def inspect_resume_readiness(
@@ -2230,7 +2304,7 @@ class GenerationJobService:
         )
 
     @staticmethod
-    async def start_volume_job(volume_id: str, checkpoint_interval: int,
+    async def start_volume_job(volume_id: str, checkpoint_interval: Optional[int],
                                token_budget: Optional[int], *,
                                readiness_digest: str | None = None,
                                acknowledged_warning_codes: tuple[str, ...] | list[str] = (),
@@ -2313,7 +2387,7 @@ class GenerationJobService:
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
-    async def start_book_job(novel_id: str, checkpoint_interval: int,
+    async def start_book_job(novel_id: str, checkpoint_interval: Optional[int],
                              token_budget: Optional[int], *,
                              readiness_digest: str | None = None,
                              acknowledged_warning_codes: tuple[str, ...] | list[str] = (),

@@ -189,6 +189,25 @@ export interface ReadinessStepCounts {
   reuse: number;
 }
 
+export interface ReadinessStructureCounts extends ReadinessStepCounts {
+  target_chapter_count: number;
+}
+
+export interface BookStructureInitializationResult {
+  schema_version: "book_structure_initialization_result.v1";
+  volume_count: number;
+  chapter_count: number;
+  volume_ids: string[];
+  next_route: {
+    area: "world";
+    view: "baseline";
+  };
+  usage: {
+    attempt_count: number;
+    total_tokens: number;
+  };
+}
+
 export interface GenerationReadiness {
   version: number;
   novel_id: string;
@@ -200,6 +219,7 @@ export interface GenerationReadiness {
   work: {
     chapter_count: number;
     steps: Record<"outline" | "prose" | "state", ReadinessStepCounts>;
+    structure?: ReadinessStructureCounts;
   };
   resources: Record<"character" | "location" | "item" | "rule" | "lore", number> & {
     narrative_revision: number;
@@ -209,6 +229,11 @@ export interface GenerationReadiness {
     providers: string[];
     config_revision?: string;
     capability_snapshot?: string;
+    book_structure_initialization?: {
+      schema_version: "book_structure_initialization.v1";
+      state: string;
+      target_chapter_count: number;
+    };
     prose_strategy?: {
       single_call_chapters: number;
       scene_segment_chapters: number;
@@ -444,7 +469,7 @@ export interface GenerationJob {
   volume_id: string | null;
   status: JobStatus;
   pause_reason: PauseReason;
-  checkpoint_interval: number;
+  checkpoint_interval: number | null;
   outline_deviation_policy?: OutlineDeviationPolicy;
   generation_params?: JobGenerationParams;
   token_budget: number | null;

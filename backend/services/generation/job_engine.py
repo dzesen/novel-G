@@ -1002,7 +1002,11 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 if job_planner.should_checkpoint(
                     len(job["progress"]),
                     int(job.get("last_checkpoint_index", 0)),
-                    int(job["checkpoint_interval"]),
+                    (
+                        int(job["checkpoint_interval"])
+                        if job.get("checkpoint_interval") is not None
+                        else None
+                    ),
                 ):
                     await _pause(repo, job_id, "checkpoint")
                     return
@@ -1062,8 +1066,15 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             job = await repo.get_job(job_id)
-            if job_planner.should_checkpoint(len(job["progress"]), int(job.get("last_checkpoint_index", 0)),
-                                             int(job["checkpoint_interval"])):
+            if job_planner.should_checkpoint(
+                len(job["progress"]),
+                int(job.get("last_checkpoint_index", 0)),
+                (
+                    int(job["checkpoint_interval"])
+                    if job.get("checkpoint_interval") is not None
+                    else None
+                ),
+            ):
                 await _pause(repo, job_id, "checkpoint")
                 return
     finally:

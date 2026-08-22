@@ -46,8 +46,9 @@ export function initialAuthorizationAllowsNext(
     && tokenBudget > 0;
 }
 
-export function checkpointIntervalAllowsNext(value: number): boolean {
-  return Number.isInteger(value) && value >= 1 && value <= 1000;
+export function checkpointIntervalAllowsNext(value: number | null): boolean {
+  return value === null
+    || (Number.isInteger(value) && value >= 1 && value <= 1000);
 }
 
 export function nextStartJobStage(stage: StartJobStage): StartJobStage {

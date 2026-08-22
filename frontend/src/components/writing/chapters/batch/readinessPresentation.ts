@@ -6,7 +6,7 @@ import type {
 import type { ProseContinuationPolicy } from "../prose/proseContinuation";
 import type { ReferenceCardAutoCreationPolicy } from "./referenceCardAutoCreation.ts";
 interface StartPayloadInput {
-  checkpointInterval: number;
+  checkpointInterval: number | null;
   tokenBudget: number | null;
   readiness: GenerationReadiness;
   acknowledgedCodes: Set<string>;
@@ -39,7 +39,9 @@ export function buildAuthorizedStartPayload({
   referenceCardAutoCreationPolicy,
 }: StartPayloadInput) {
   return {
-    checkpoint_interval: Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
+    checkpoint_interval: checkpointInterval === null
+      ? null
+      : Math.min(1000, Math.max(1, Math.floor(checkpointInterval) || 1)),
     token_budget: tokenBudget,
     readiness_digest: readiness.digest,
     acknowledged_warning_codes: [...acknowledgedCodes].sort(),

@@ -18,7 +18,6 @@ from backend.api.llm_routers._common import (
     GenerationParamsMixin,
     build_gen_kwargs,
     build_runtime_kwargs,
-    safe_novel_text,
 )
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
@@ -28,7 +27,6 @@ from backend.llm.prompts.prompt_selector import (
     VOLUME_OUTLINE_PROMPT_NAME,
     load_prompt_config,
 )
-from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
     ChapterGenerationApplicationDeps,
@@ -48,7 +46,6 @@ from backend.services.llm.context_builder import (
 )
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
-    WorkflowStep,
     run_workflow,
     sse_comment,
     sse_event,
@@ -56,6 +53,11 @@ from backend.services.llm.workflow_runner import (
 from backend.services.llm.generation_runtime import create_workflow_runtime
 from backend.services.llm.outline_generation import CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS
 from backend.services.novel.chapter_service import ChapterService
+from backend.services.generation.volume_outline_generation import (
+    VOLUME_OUTLINE_STEPS,
+    VOLUME_OUTLINE_WORKFLOW,
+    volume_outline_params,
+)
 
 from backend.api.default_routers.auth_router import require_owned_body_resource
 
@@ -66,30 +68,8 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 
-VOLUME_OUTLINE_WORKFLOW = "create_volume_outline_by_ai"
-
-
 def _load_prompts() -> dict:
     return load_prompt_config()
-
-
-VOLUME_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
-    WorkflowStep(
-        key="volume_outline",
-        schema=VolumeOutlineResultSchema,
-        prompt_args=lambda ctx: {
-            "number_of_chapters": ctx.params["number_of_chapters"],
-            "title": ctx.params["title"],
-            "genre": ctx.params["genre"],
-            "tone": ctx.params["tone"],
-            "core_idea": ctx.params["core_idea"],
-            "core_seed": ctx.params["core_seed"],
-            "summary": ctx.params["summary"],
-            "worldview": ctx.params["worldview"],
-            "plot": ctx.params["plot"],
-        },
-    ),
-)
 
 class VolumeOutlineRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
@@ -145,17 +125,7 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
     except InvalidIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    params = {
-        "number_of_chapters": novel.get("number_of_chapters") or 100,
-        "title": safe_novel_text(novel, "title"),
-        "genre": safe_novel_text(novel, "genre", "未分类"),
-        "tone": safe_novel_text(novel, "tone"),
-        "core_idea": safe_novel_text(novel, "core_idea"),
-        "core_seed": safe_novel_text(novel, "core_seed"),
-        "summary": safe_novel_text(novel, "summary"),
-        "worldview": safe_novel_text(novel, "worldview"),
-        "plot": safe_novel_text(novel, "plot"),
-    }
+    params = volume_outline_params(novel)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         deps = WorkflowDeps(

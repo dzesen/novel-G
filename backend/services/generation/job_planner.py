@@ -47,9 +47,18 @@ def order_book_chapters(chapters: List[Dict[str, Any]],
     return sorted(chapters, key=_key)
 
 
-def should_checkpoint(progress_len: int, last_checkpoint_index: int, interval: int) -> bool:
-    """距上次检查点已满 interval 章。任何 resume 会把 last_checkpoint_index 推进到当前
-    progress 长度（设计 §7），故此处只需判增量。"""
+def should_checkpoint(
+    progress_len: int,
+    last_checkpoint_index: int,
+    interval: Optional[int],
+) -> bool:
+    """距上次检查点已满 interval 章；None 表示不按章数设置定期检查点。
+
+    任何 resume 会把 last_checkpoint_index 推进到当前 progress 长度（设计 §7），
+    故此处只需判增量。
+    """
+    if interval is None:
+        return False
     return (progress_len - last_checkpoint_index) >= interval
 
 

@@ -44,6 +44,7 @@ interface BatchGenerationPanelProps {
   selectedVolumeId: string | null;
   volumes: VolumeSummary[];
   chapters: ChapterSummary[];
+  structureLoaded: boolean;
   startScope: "volume" | "book" | null;
   onStartClose: () => void;
   onJumpToChapter: (chapterId: string) => void;
@@ -76,6 +77,7 @@ export default function BatchGenerationPanel({
   selectedVolumeId,
   volumes,
   chapters,
+  structureLoaded,
   startScope,
   onStartClose,
   onJumpToChapter,
@@ -337,9 +339,11 @@ export default function BatchGenerationPanel({
         targetHeading={t("dialogVolumeLabel")}
         targetLabel={selectedVolume?.title ?? ""}
         fillableCount={fillableCount}
+        requiresStructureInitialization={false}
         onClose={onStartClose}
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onNavigateToWorldBaseline={onNavigateToWorldBaseline}
+        onNavigateToBookStructure={onNavigateToBlueprint}
         onSubmitted={(started) => {
           setDismissed(null);
           setJob(started);
@@ -355,9 +359,18 @@ export default function BatchGenerationPanel({
         targetHeading={t("dialogBookLabel")}
         targetLabel={t("dialogBookTarget")}
         fillableCount={bookFillableCount}
+        requiresStructureInitialization={
+          structureLoaded && volumes.length === 0 && chapters.length === 0
+        }
         onClose={onStartClose}
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onNavigateToWorldBaseline={onNavigateToWorldBaseline}
+        onNavigateToBookStructure={onNavigateToBlueprint}
+        onStructureInitialized={() => {
+          onQuietRefresh();
+          onStartClose();
+          onNavigateToWorldBaseline();
+        }}
         onSubmitted={(started) => {
           setDismissed(null);
           setJob(started);

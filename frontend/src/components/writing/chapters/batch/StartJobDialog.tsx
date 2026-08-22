@@ -23,6 +23,7 @@ import {
   type ProseContinuationPolicy,
 } from "../prose/proseContinuation";
 import type {
+  BookStructureInitializationResult,
   GenerationJob,
   GenerationReadiness,
   OutlineDeviationPolicy,
@@ -59,10 +60,13 @@ interface StartJobDialogProps {
   targetHeading: string;    // 目标区小标题（"目标卷" / "目标"）
   targetLabel: string;      // 目标展示名（卷名 / "全书"）
   fillableCount: number;
+  requiresStructureInitialization?: boolean;
   onSubmitted: (job: GenerationJob) => void;
+  onStructureInitialized?: (result: BookStructureInitializationResult) => void;
   onClose: () => void;
   onNavigateToReferenceCards: () => void;
   onNavigateToWorldBaseline: () => void;
+  onNavigateToBookStructure: () => void;
 }
 
 export default function StartJobDialog({
@@ -72,10 +76,13 @@ export default function StartJobDialog({
   targetHeading,
   targetLabel,
   fillableCount,
+  requiresStructureInitialization = false,
   onSubmitted,
+  onStructureInitialized,
   onClose,
   onNavigateToReferenceCards,
   onNavigateToWorldBaseline,
+  onNavigateToBookStructure,
 }: StartJobDialogProps) {
   const t = useTranslations("writing.batch");
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -83,6 +90,7 @@ export default function StartJobDialog({
   const stageHeadingRef = useRef<HTMLHeadingElement>(null);
   const [stage, setStage] = useState<StartJobStage>("authorization");
   const [checkpointInterval, setCheckpointInterval] = useState(5);
+  const [periodicCheckpointsEnabled, setPeriodicCheckpointsEnabled] = useState(true);
   const [tokenBudget, setTokenBudget] = useState("");
   const [continuationPolicy, setContinuationPolicy] =
     useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
@@ -104,6 +112,9 @@ export default function StartJobDialog({
     continuationPolicy,
   );
   const generationOverrides = batchGenerationOverrides(generationParams);
+  const effectiveCheckpointInterval = periodicCheckpointsEnabled
+    ? checkpointInterval
+    : null;
   const readinessConfigurationKey = JSON.stringify({
     continuationPolicy,
     referenceCardAutoCreationPolicy,
@@ -119,6 +130,18 @@ export default function StartJobDialog({
     && readinessConfiguration === readinessConfigurationKey;
   const [acknowledgedCodes, setAcknowledgedCodes] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
+  const structureFlow = scope === "book" && (
+    readiness
+      ? Number(readiness.work.structure?.generate ?? 0) > 0
+        || Boolean(
+          readiness.work.structure
+          && readiness.work.chapter_count === 0,
+        )
+      : requiresStructureInitialization
+  );
+  const structureTargetChapterCount = Number(
+    readiness?.work.structure?.target_chapter_count ?? 0,
+  );
 
   const loadReadiness = useCallback(async (preserveError = false) => {
     setReadinessLoading(true);
@@ -245,7 +268,7 @@ export default function StartJobDialog({
     setError("");
     try {
       const payload = buildAuthorizedStartPayload({
-        checkpointInterval,
+        checkpointInterval: structureFlow ? null : effectiveCheckpointInterval,
         tokenBudget: parsedTokenBudget,
         readiness,
         acknowledgedCodes,
@@ -254,11 +277,19 @@ export default function StartJobDialog({
         proseContinuationPolicy: continuationPolicy,
         referenceCardAutoCreationPolicy,
       });
-      const job = await apiPost<GenerationJob>(
-        `/api/generation-jobs/${scope}/${targetId}`,
-        payload,
-      );
-      onSubmitted(job);
+      if (structureFlow) {
+        const result = await apiPost<BookStructureInitializationResult>(
+          `/api/generation-jobs/book/${targetId}/initialize-structure`,
+          payload,
+        );
+        onStructureInitialized?.(result);
+      } else {
+        const job = await apiPost<GenerationJob>(
+          `/api/generation-jobs/${scope}/${targetId}`,
+          payload,
+        );
+        onSubmitted(job);
+      }
     } catch (err) {
       const startError = err instanceof Error ? err.message : String(err);
       setError(startError);
@@ -277,7 +308,7 @@ export default function StartJobDialog({
       return;
     }
     if (stage === "behavior") {
-      if (!checkpointIntervalAllowsNext(checkpointInterval)) return;
+      if (!checkpointIntervalAllowsNext(effectiveCheckpointInterval)) return;
       setStage("readiness");
       await loadReadiness();
       return;
@@ -347,7 +378,15 @@ export default function StartJobDialog({
             <span className="text-xs font-medium text-warm-700 dark:text-muted">{targetHeading}</span>
             <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
               <span className="min-w-0 break-words font-medium">{targetLabel}</span>
-              <span className="text-xs text-warm-700 dark:text-muted">{t("dialogFillable", { count: fillableCount })}</span>
+              <span className="text-xs text-warm-700 dark:text-muted">
+                {structureFlow
+                  ? structureTargetChapterCount > 0
+                    ? t("dialogStructureTargetCount", {
+                        count: structureTargetChapterCount,
+                      })
+                    : t("dialogStructureTargetPending")
+                  : t("dialogFillable", { count: fillableCount })}
+              </span>
             </div>
           </div>
 
@@ -359,10 +398,14 @@ export default function StartJobDialog({
                   tabIndex={-1}
                   className="text-sm font-semibold text-foreground outline-none"
                 >
-                  {t("dialogAuthorizationTitle")}
+                  {structureFlow
+                    ? t("dialogStructureAuthorizationTitle")
+                    : t("dialogAuthorizationTitle")}
                 </h4>
                 <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
-                  {t("dialogAuthorizationDescription")}
+                  {structureFlow
+                    ? t("dialogStructureAuthorizationDescription")
+                    : t("dialogAuthorizationDescription")}
                 </p>
               </section>
 
@@ -410,6 +453,8 @@ export default function StartJobDialog({
                 </span>
               </label>
 
+              {!structureFlow && (
+              <>
               <details className="group rounded-md border border-border bg-background px-3 py-2.5">
                 <summary className="cursor-pointer list-none text-sm font-medium text-foreground marker:hidden focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
                   <span className="flex min-w-0 items-center justify-between gap-3">
@@ -516,6 +561,8 @@ export default function StartJobDialog({
                   {t("dialogDeviationCostHint")}
                 </p>
               </fieldset>
+              </>
+              )}
             </>
           )}
 
@@ -527,35 +574,94 @@ export default function StartJobDialog({
                   tabIndex={-1}
                   className="text-sm font-semibold text-foreground outline-none"
                 >
-                  {t("dialogBehaviorTitle")}
+                  {structureFlow
+                    ? t("dialogStructureBehaviorTitle")
+                    : t("dialogBehaviorTitle")}
                 </h4>
                 <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
-                  {t("dialogBehaviorDescription")}
+                  {structureFlow
+                    ? t("dialogStructureBehaviorDescription")
+                    : t("dialogBehaviorDescription")}
                 </p>
               </section>
 
-              <div className="grid gap-1 text-sm">
-                <label htmlFor="batch-checkpoint-interval" className="text-xs font-medium text-warm-700 dark:text-muted">
+              {!structureFlow && (
+              <fieldset className="grid gap-3 rounded-md border border-border bg-background p-3">
+                <legend className="px-1 text-xs font-medium text-warm-700 dark:text-muted">
                   {t("dialogCheckpointLabel")}
-                </label>
-                <input
-                  id="batch-checkpoint-interval"
-                  type="number"
-                  min={1}
-                  max={1000}
-                  value={checkpointInterval}
-                  onChange={(e) => setCheckpointInterval(Number(e.target.value))}
-                  aria-invalid={!checkpointIntervalAllowsNext(checkpointInterval)}
-                  aria-describedby="batch-checkpoint-interval-hint"
-                  className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
-                />
-                <span id="batch-checkpoint-interval-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">{t("dialogCheckpointHint")}</span>
-                {!checkpointIntervalAllowsNext(checkpointInterval) && (
-                  <span role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
-                    {t("dialogCheckpointInvalid")}
+                </legend>
+                <label className="flex cursor-pointer items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="periodic-checkpoint-policy"
+                    checked={periodicCheckpointsEnabled}
+                    onChange={() => setPeriodicCheckpointsEnabled(true)}
+                    aria-label={t("dialogCheckpointPeriodicTitle")}
+                    aria-describedby="batch-checkpoint-periodic-hint"
+                    className="mt-0.5 size-4 shrink-0"
+                  />
+                  <span className="min-w-0">
+                    <span className="font-medium text-foreground">
+                      {t("dialogCheckpointPeriodicTitle")}
+                    </span>
+                    <span
+                      id="batch-checkpoint-periodic-hint"
+                      className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted"
+                    >
+                      {t("dialogCheckpointPeriodicBody")}
+                    </span>
                   </span>
+                </label>
+                <label className="flex cursor-pointer items-start gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name="periodic-checkpoint-policy"
+                    checked={!periodicCheckpointsEnabled}
+                    onChange={() => setPeriodicCheckpointsEnabled(false)}
+                    aria-label={t("dialogCheckpointDisabledTitle")}
+                    aria-describedby="batch-checkpoint-disabled-hint"
+                    className="mt-0.5 size-4 shrink-0"
+                  />
+                  <span className="min-w-0">
+                    <span className="font-medium text-foreground">
+                      {t("dialogCheckpointDisabledTitle")}
+                    </span>
+                    <span
+                      id="batch-checkpoint-disabled-hint"
+                      className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted"
+                    >
+                      {t("dialogCheckpointDisabledBody")}
+                    </span>
+                  </span>
+                </label>
+                {periodicCheckpointsEnabled && (
+                  <div className="grid gap-1 border-t border-border pt-3 text-sm">
+                    <label htmlFor="batch-checkpoint-interval" className="text-xs font-medium text-warm-700 dark:text-muted">
+                      {t("dialogCheckpointIntervalLabel")}
+                    </label>
+                    <input
+                      id="batch-checkpoint-interval"
+                      type="number"
+                      min={1}
+                      max={1000}
+                      value={checkpointInterval}
+                      onChange={(e) => setCheckpointInterval(Number(e.target.value))}
+                      aria-invalid={!checkpointIntervalAllowsNext(checkpointInterval)}
+                      aria-describedby="batch-checkpoint-interval-hint"
+                      className="min-h-10 w-full rounded-md border border-border bg-surface px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
+                    />
+                    <span id="batch-checkpoint-interval-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">
+                      {t("dialogCheckpointHint")}
+                    </span>
+                    {!checkpointIntervalAllowsNext(checkpointInterval) && (
+                      <span role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
+                        {t("dialogCheckpointInvalid")}
+                      </span>
+                    )}
+                  </div>
                 )}
-              </div>
+              </fieldset>
+              )}
 
               <section className="grid gap-2">
                 <OutlineGenerationParams
@@ -565,7 +671,9 @@ export default function StartJobDialog({
                   showFailureRetry={false}
                 />
                 <p className="px-1 text-xs leading-5 text-warm-700 dark:text-muted">
-                  {t("dialogGenerationParamsHint")}
+                  {structureFlow
+                    ? t("dialogStructureGenerationParamsHint")
+                    : t("dialogGenerationParamsHint")}
                 </p>
               </section>
 
@@ -609,25 +717,49 @@ export default function StartJobDialog({
 
             {readiness && !readinessLoading && (
               <div className="mt-3 grid gap-3">
-                <div className="grid gap-3 rounded-md border border-border bg-background p-3 sm:grid-cols-3">
-                  {(["outline", "prose", "state"] as const).map((step) => (
-                    <div key={step}>
-                      <p className="text-xs font-medium text-foreground">
-                        {step === "outline"
-                          ? t("stepOutline")
-                          : step === "prose"
-                            ? t("stepProse")
-                            : t("stepState")}
+                {structureFlow && readiness.work.structure ? (
+                  <div className="grid min-w-0 gap-2 rounded-md border border-accent/30 bg-accent/5 p-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("readinessStructureTitle")}
                       </p>
-                      <p className="mt-1 text-xs text-warm-700 dark:text-muted">
-                        {t("readinessWorkCounts", {
-                          generate: readiness.work.steps[step].generate,
-                          reuse: readiness.work.steps[step].reuse,
+                      <p className="mt-1 break-words text-xs leading-5 text-warm-700 dark:text-muted">
+                        {t("readinessStructureDescription", {
+                          count: readiness.work.structure.target_chapter_count,
                         })}
                       </p>
                     </div>
-                  ))}
-                </div>
+                    <p className="text-xs font-medium tabular-nums text-accent sm:text-end">
+                      {t("readinessWorkCounts", {
+                        generate: readiness.work.structure.generate,
+                        reuse: readiness.work.structure.reuse,
+                      })}
+                    </p>
+                    <p className="text-xs leading-5 text-warm-700 dark:text-muted sm:col-span-2">
+                      {t("readinessStructureNext")}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid gap-3 rounded-md border border-border bg-background p-3 sm:grid-cols-3">
+                    {(["outline", "prose", "state"] as const).map((step) => (
+                      <div key={step}>
+                        <p className="text-xs font-medium text-foreground">
+                          {step === "outline"
+                            ? t("stepOutline")
+                            : step === "prose"
+                              ? t("stepProse")
+                              : t("stepState")}
+                        </p>
+                        <p className="mt-1 text-xs text-warm-700 dark:text-muted">
+                          {t("readinessWorkCounts", {
+                            generate: readiness.work.steps[step].generate,
+                            reuse: readiness.work.steps[step].reuse,
+                          })}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 <div className="grid gap-1 text-xs text-warm-700 dark:text-muted sm:grid-cols-2">
                   <p>
@@ -639,7 +771,7 @@ export default function StartJobDialog({
                       lores: readiness.resources.lore,
                     })}
                   </p>
-                  {readiness.planning.reference_card_auto_creation_policy && (() => {
+                  {!structureFlow && readiness.planning.reference_card_auto_creation_policy && (() => {
                     const policy = readiness.planning.reference_card_auto_creation_policy;
                     return (
                       <p className="min-w-0 break-words sm:col-span-2">
@@ -663,7 +795,7 @@ export default function StartJobDialog({
                       attempts: readiness.planning.attempt_capacity,
                     })}
                   </p>
-                  {readiness.planning.prose_strategy && (
+                  {!structureFlow && readiness.planning.prose_strategy && (
                     <>
                       <p className="sm:col-span-2">
                         {t("readinessProseStrategy", {
@@ -688,7 +820,7 @@ export default function StartJobDialog({
                       )}
                     </>
                   )}
-                  {readiness.planning.prose_continuation_authorization && (
+                  {!structureFlow && readiness.planning.prose_continuation_authorization && (
                     <>
                       <p className="sm:col-span-2">
                         {t("readinessContinuationCalls", {
@@ -790,6 +922,12 @@ export default function StartJobDialog({
                               ? t("readinessAcknowledgeAutomatic", {
                                   count: continuationPolicy.automatic_continuations_per_scene,
                                 })
+                              : issue.code === "book_structure_initialization_required"
+                                ? t("readinessAcknowledgeStructure", {
+                                    count: Number(
+                                      issue.details.target_chapter_count ?? 0,
+                                    ),
+                                  })
                               : issue.code === "automatic_reference_card_creation_requires_confirmation"
                                 ? t("readinessAcknowledgeAutoCards")
                                 : issue.code === "prose_output_risk_requires_ack"
@@ -825,6 +963,22 @@ export default function StartJobDialog({
                           {t("readinessOpenWorldBaseline")}
                         </button>
                       )}
+                      {issue.action_codes.some((code) =>
+                        code === "review_book_structure"
+                        || code === "review_book_structure_trash"
+                        || code === "review_novel_blueprint"
+                      ) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onNavigateToBookStructure();
+                          }}
+                          className="mt-2 text-xs font-medium text-accent hover:underline"
+                        >
+                          {t("readinessOpenBookStructure")}
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -848,10 +1002,14 @@ export default function StartJobDialog({
                   tabIndex={-1}
                   className="text-sm font-semibold text-foreground outline-none"
                 >
-                  {t("dialogConfirmationTitle")}
+                  {structureFlow
+                    ? t("dialogStructureConfirmationTitle")
+                    : t("dialogConfirmationTitle")}
                 </h4>
                 <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
-                  {t("dialogConfirmationDescription")}
+                  {structureFlow
+                    ? t("dialogStructureConfirmationDescription")
+                    : t("dialogConfirmationDescription")}
                 </p>
               </div>
               <dl className="grid gap-px overflow-hidden rounded-md border border-border bg-border text-sm sm:grid-cols-2">
@@ -862,7 +1020,13 @@ export default function StartJobDialog({
                 <div className="min-w-0 bg-background p-3">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationWork")}</dt>
                   <dd className="mt-1 font-medium text-foreground">
-                    {t("dialogConfirmationWorkValue", { count: readiness.work.chapter_count })}
+                    {structureFlow
+                      ? t("dialogStructureConfirmationWorkValue", {
+                          count: structureTargetChapterCount,
+                        })
+                      : t("dialogConfirmationWorkValue", {
+                          count: readiness.work.chapter_count,
+                        })}
                   </dd>
                 </div>
                 <div className="min-w-0 bg-background p-3">
@@ -877,10 +1041,16 @@ export default function StartJobDialog({
                     {t("dialogConfirmationCallsValue", { count: readiness.planning.attempt_capacity })}
                   </dd>
                 </div>
+                {!structureFlow && (
+                <>
                 <div className="min-w-0 bg-background p-3">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationCheckpoint")}</dt>
                   <dd className="mt-1 font-medium text-foreground">
-                    {t("dialogConfirmationCheckpointValue", { count: checkpointInterval })}
+                    {effectiveCheckpointInterval === null
+                      ? t("dialogConfirmationCheckpointDisabledValue")
+                      : t("dialogConfirmationCheckpointValue", {
+                          count: effectiveCheckpointInterval,
+                        })}
                   </dd>
                 </div>
                 <div className="min-w-0 bg-background p-3">
@@ -891,6 +1061,9 @@ export default function StartJobDialog({
                     })}
                   </dd>
                 </div>
+                </>
+                )}
+                {!structureFlow && (
                 <div className="min-w-0 bg-background p-3 sm:col-span-2">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationCards")}</dt>
                   <dd className="mt-1 text-xs leading-5 text-foreground">
@@ -906,6 +1079,8 @@ export default function StartJobDialog({
                       : t("dialogConfirmationCardsDisabledValue")}
                   </dd>
                 </div>
+                )}
+                {!structureFlow && (
                 <div className="min-w-0 bg-background p-3 sm:col-span-2">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationDeviation")}</dt>
                   <dd className="mt-1 text-xs leading-5 text-foreground">
@@ -914,18 +1089,23 @@ export default function StartJobDialog({
                       : t("dialogDeviationContinueTitle")}
                   </dd>
                 </div>
+                )}
                 <div className="min-w-0 bg-background p-3 sm:col-span-2">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationGeneration")}</dt>
                   <dd className="mt-1 text-xs leading-5 text-foreground">
                     {generationOverrideSummary.join(t("dialogConfirmationParameterSeparator"))}
                     <span className="mt-1 block text-warm-700 dark:text-muted">
-                      {t("dialogConfirmationProtectedPrompt")}
+                      {structureFlow
+                        ? t("dialogStructureConfirmationProtectedPrompt")
+                        : t("dialogConfirmationProtectedPrompt")}
                     </span>
                   </dd>
                 </div>
               </dl>
               <p className="text-xs leading-5 text-warm-700 dark:text-muted">
-                {t("dialogConfirmationFinalHint")}
+                {structureFlow
+                  ? t("dialogStructureConfirmationFinalHint")
+                  : t("dialogConfirmationFinalHint")}
               </p>
             </section>
           )}
@@ -959,7 +1139,13 @@ export default function StartJobDialog({
                 || !readinessAllowsStart(readiness, acknowledgedCodes)
               }
             >
-              {submitting ? t("dialogStarting") : t("dialogStart")}
+              {structureFlow
+                ? submitting
+                  ? t("dialogStructureStarting")
+                  : t("dialogStructureStart")
+                : submitting
+                  ? t("dialogStarting")
+                  : t("dialogStart")}
             </Button>
           ) : (
             <Button
@@ -971,7 +1157,9 @@ export default function StartJobDialog({
                 submitting
                 || readinessLoading
                 || (stage === "authorization" && !initialAuthorizationAllowsNext(parsedTokenBudget))
-                || (stage === "behavior" && !checkpointIntervalAllowsNext(checkpointInterval))
+                || (stage === "behavior" && !checkpointIntervalAllowsNext(
+                  effectiveCheckpointInterval,
+                ))
                 || (stage === "readiness" && (
                   !readiness
                   || !readinessIsCurrent

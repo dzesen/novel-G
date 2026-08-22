@@ -11,6 +11,11 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.utils import get_utc_now
 from backend.services.generation.failure_diagnostics import infer_job_diagnostics
+from backend.services.generation.book_structure_initialization import (
+    BookStructureBudgetBoundary,
+    BookStructureInitializationFailed,
+    BookStructureInitializationStale,
+)
 from backend.services.generation.job_relations import related_prose_run_ids
 from backend.services.generation.job_service import (
     ConflictError,
@@ -206,7 +211,7 @@ class ProtectedBatchGenerationParamsMixin(GenerationParamsMixin):
 
 
 class StartJobRequest(ProtectedBatchGenerationParamsMixin):
-    checkpoint_interval: int = Field(default=5, ge=1, le=1000)
+    checkpoint_interval: Optional[int] = Field(default=5, ge=1, le=1000)
     token_budget: int = Field(ge=1)
     readiness_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     acknowledged_warning_codes: list[str] = Field(default_factory=list, max_length=50)
@@ -259,6 +264,30 @@ class ResumeJobRequest(BaseModel):
 
 
 def _handle(exc: Exception) -> HTTPException:
+    if isinstance(exc, BookStructureInitializationStale):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "book_structure_initialization_stale",
+                "message": str(exc),
+            },
+        )
+    if isinstance(exc, BookStructureBudgetBoundary):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "book_structure_budget_boundary",
+                "message": str(exc),
+            },
+        )
+    if isinstance(exc, BookStructureInitializationFailed):
+        return HTTPException(
+            status_code=502,
+            detail={
+                "code": "book_structure_initialization_failed",
+                "message": str(exc),
+            },
+        )
     if isinstance(exc, ResumeReadinessRequired):
         return HTTPException(
             status_code=409,
@@ -326,6 +355,35 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
     except Exception as exc:
         raise _handle(exc) from exc
     return _serialize_job(job)
+
+
+@router.post("/book/{novel_id}/initialize-structure")
+async def initialize_book_structure(novel_id: str, req: StartJobRequest):
+    """Generate the initial volume/chapter stubs under signed readiness."""
+
+    try:
+        return await GenerationJobService.initialize_book_structure(
+            novel_id=novel_id,
+            token_budget=req.token_budget,
+            readiness_digest=req.readiness_digest,
+            acknowledged_warning_codes=req.acknowledged_warning_codes,
+            outline_deviation_policy=req.outline_deviation_policy,
+            generation_params={
+                **build_gen_kwargs(req),
+                "allow_failure_retry": req.allow_failure_retry,
+                "prose_continuation_policy": (
+                    req.prose_continuation_policy.to_domain().to_dict()
+                ),
+            },
+            prose_continuation_policy=(
+                req.prose_continuation_policy.to_domain()
+            ),
+            reference_card_auto_creation_policy=(
+                req.reference_card_auto_creation_policy
+            ),
+        )
+    except Exception as exc:
+        raise _handle(exc) from exc
 
 
 @router.get("/volume/{volume_id}/readiness")

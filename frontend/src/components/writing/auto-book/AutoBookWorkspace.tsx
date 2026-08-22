@@ -416,7 +416,7 @@ export default function AutoBookWorkspace({
             <button
               type="button"
               onClick={() => openStartDialog("book")}
-              disabled={loading}
+              disabled={loading || Boolean(loadError)}
               className="min-h-10 rounded-md border border-border bg-surface px-4 text-sm font-semibold text-foreground transition-colors hover:bg-surface-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
             >
               {t("startBook")}
@@ -458,6 +458,9 @@ export default function AutoBookWorkspace({
             selectedVolumeId={selectedVolumeId}
             volumes={volumes}
             chapters={chapters}
+            structureLoaded={
+              structureLoadedNovelId === novelId && !loadError
+            }
             startScope={purpose === "start" ? startScope : null}
             onStartClose={closeStartDialog}
             onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}
