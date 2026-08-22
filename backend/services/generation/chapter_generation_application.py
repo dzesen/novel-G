@@ -48,6 +48,9 @@ from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
     project_state_context,
 )
+from backend.services.generation.cancellation_cleanup import (
+    drain_cancellation_cleanup,
+)
 from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
@@ -1857,7 +1860,7 @@ class ChapterGenerationApplicationService:
                 )
             except asyncio.CancelledError:
                 if latest_run is not None and owner_id is not None:
-                    await asyncio.shield(
+                    await drain_cancellation_cleanup(
                         self._deps.prose_run_repo.mark_status(
                             run_id=str(latest_run["_id"]),
                             owner_id=owner_id,

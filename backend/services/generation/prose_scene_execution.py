@@ -21,6 +21,9 @@ from backend.services.llm.pre_dispatch_boundaries import (
 )
 from backend.llm.stream_terminal import normalize_finish_reason
 from backend.services.generation.prose_completion import ProseExecutionPlan
+from backend.services.generation.cancellation_cleanup import (
+    drain_cancellation_cleanup,
+)
 from backend.services.generation.prose_continuation import (
     MIN_AUTOMATIC_CONTINUATIONS_BEFORE_DIVERGENCE_STOP,
     SCENE_DIVERGENCE_STOP_FACTOR,
@@ -953,6 +956,10 @@ async def execute_v3_prose_plan(
             cross_call_repeat_characters = (
                 _longest_exact_common_substring_characters(current_text, contribution)
             )
+            try:
+                observed_usage = usage_reader()
+            except Exception:
+                observed_usage = TokenUsage()
             terminal = {
                 **checkpoint,
                 "status": "incomplete",
@@ -963,13 +970,18 @@ async def execute_v3_prose_plan(
                 "cross_call_repeat_characters": cross_call_repeat_characters,
                 "finish_reason": "cancelled",
                 "raw_finish_reason": "cancelled",
+                "usage": observed_usage.model_dump(),
                 "empty_output": not bool(generated),
                 "no_progress": bool(generated) and not bool(contribution),
             }
             by_sequence[sequence] = terminal
             refresh_scene(scene_index)
-            await asyncio.shield(_notify(on_segment, terminal))
-            await asyncio.shield(publish_progress())
+
+            async def persist_cancelled_checkpoint() -> None:
+                await _notify(on_segment, terminal)
+                await publish_progress()
+
+            await drain_cancellation_cleanup(persist_cancelled_checkpoint())
             raise
         except (TokenBudgetExceeded, AttemptCapacityExceeded) as exc:
             # This is a proven pre-dispatch refusal: it must pause the scene,
