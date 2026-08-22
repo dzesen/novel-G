@@ -50,7 +50,7 @@ export const FOREST_THEME: ThemePreset = {
     "--color-surface": "#ffffff",
     "--color-surface-secondary": "#f7f2e6",
     "--color-border": "#DCCCAC",
-    "--color-muted": "#7d8a6c",
+    "--color-muted": "#657255",
   },
   dark: {
     "--background": "#1a2015",
@@ -97,7 +97,7 @@ export const WARM_THEME: ThemePreset = {
     "--color-surface": "#ffffff",
     "--color-surface-secondary": "#f7f2eb",
     "--color-border": "#e2d6c6",
-    "--color-muted": "#8c7e6e",
+    "--color-muted": "#746657",
   },
   dark: {
     "--background": "#1a1510",

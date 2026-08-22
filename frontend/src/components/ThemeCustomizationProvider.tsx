@@ -56,6 +56,31 @@ function applyColors(colors: ThemeColors) {
   for (const [key, value] of Object.entries(colors)) {
     root.style.setProperty(key, value);
   }
+  root.style.setProperty(
+    "--color-on-accent",
+    readableTextColor(colors["--color-accent"]),
+  );
+  root.style.setProperty(
+    "--color-on-accent-hover",
+    readableTextColor(colors["--color-accent-hover"]),
+  );
+  root.style.setProperty("--color-focus", colors["--color-accent"]);
+}
+
+function readableTextColor(background: string): "#ffffff" | "#16120d" {
+  const match = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(background);
+  if (!match) return "#ffffff";
+  const channels = match.slice(1).map((value) => Number.parseInt(value, 16) / 255);
+  const [red, green, blue] = channels.map((value) => (
+    value <= 0.04045
+      ? value / 12.92
+      : ((value + 0.055) / 1.055) ** 2.4
+  ));
+  const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  const whiteContrast = 1.05 / (luminance + 0.05);
+  const darkLuminance = 0.0064;
+  const darkContrast = (luminance + 0.05) / (darkLuminance + 0.05);
+  return whiteContrast >= darkContrast ? "#ffffff" : "#16120d";
 }
 
 function readStorage<T>(key: string): T | null {
