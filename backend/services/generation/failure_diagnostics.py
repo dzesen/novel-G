@@ -22,6 +22,9 @@ from backend.llm.exceptions import (
     LLMTimeoutError,
 )
 from backend.services.generation.chapter_pipeline import IncompleteProseGeneration
+from backend.services.generation.chapter_candidate_pipeline import (
+    ChapterCandidatePipelineBlocked,
+)
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     UncertainProseAttempt,
@@ -56,6 +59,11 @@ _SAFE_COMPLETION_KEYS = (
     "completion_reason",
     "mode",
 )
+_CANDIDATE_REPAIR_EXHAUSTED_CODES = {
+    "completion": "candidate_completion_repair_exhausted",
+    "outline_adherence": "candidate_adherence_repair_exhausted",
+    "state": "candidate_state_repair_exhausted",
+}
 
 
 def _exception_family(chain: Iterable[BaseException]) -> str:
@@ -104,6 +112,15 @@ def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
             ["retry_generation_step", "open_provider_settings"],
         )
     if category == "validation_logic":
+        if code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values():
+            return (
+                "candidate_not_committed",
+                [
+                    "open_affected_chapter",
+                    "refresh_generation_readiness",
+                    "restart_generation_job",
+                ],
+            )
         if code == "structured_output_invalid":
             return (
                 "generated_result_rejected",
@@ -221,6 +238,64 @@ def _attempt_details(attempts: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     return details
 
 
+def _safe_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _safe_object_ids(values: Any, *, limit: int = 20) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    result: list[str] = []
+    for value in values[:limit]:
+        text = str(value or "")
+        if (
+            len(text) == 24
+            and all(character in "0123456789abcdef" for character in text)
+            and text not in result
+        ):
+            result.append(text)
+    return result
+
+
+def _candidate_exception_details(
+    failure: ChapterCandidatePipelineBlocked,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    gate = getattr(failure, "gate", None)
+    if gate in _CANDIDATE_REPAIR_EXHAUSTED_CODES:
+        details["candidate_gate"] = gate
+    repair_cycles_used = _safe_non_negative_int(
+        failure.progress.repair_cycles_used
+    )
+    repair_limit = _safe_non_negative_int(getattr(failure, "repair_limit", None))
+    if repair_cycles_used is not None:
+        details["repair_cycles_used"] = repair_cycles_used
+    if repair_limit is not None:
+        details["repair_cycles_limit"] = repair_limit
+    for field in ("consistency_issue_count", "dropped_reference_count"):
+        value = _safe_non_negative_int(getattr(failure, field, None))
+        if value is not None:
+            details[field] = value
+    affected_card_ids = _safe_object_ids(
+        getattr(failure, "affected_card_ids", ())
+    )
+    if affected_card_ids:
+        details["affected_card_ids"] = affected_card_ids
+    prose_run_id = str(failure.progress.prose_run_id or "")
+    if len(prose_run_id) == 24 and all(
+        character in "0123456789abcdef" for character in prose_run_id
+    ):
+        details["prose_run_id"] = prose_run_id
+    prose_run_revision = _safe_non_negative_int(
+        failure.progress.prose_run_revision
+    )
+    if prose_run_revision is not None:
+        details["prose_run_revision"] = prose_run_revision
+    return details
+
+
 def build_failure_diagnostic(
     exc: BaseException,
     *,
@@ -264,6 +339,21 @@ def build_failure_diagnostic(
         )
         evidence = "confirmed"
         details.update(_safe_completion(completion))
+    elif any(
+        isinstance(item, ChapterCandidatePipelineBlocked)
+        and item.code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values()
+        for item in chain
+    ):
+        failure = next(
+            item
+            for item in chain
+            if isinstance(item, ChapterCandidatePipelineBlocked)
+            and item.code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values()
+        )
+        category = "validation_logic"
+        code = failure.code
+        evidence = "confirmed"
+        details.update(_candidate_exception_details(failure))
     elif any(isinstance(item, StaleStatePreview) for item in chain):
         category = "source_changed"
         code = "chapter_or_narrative_changed"
@@ -438,16 +528,167 @@ def _historical_failure(job: Mapping[str, Any]) -> dict[str, Any] | None:
         "occurred_at": job.get("updated_at") or job.get("created_at"),
     }
 
+
+def _candidate_repair_limit(job: Mapping[str, Any]) -> int | None:
+    readiness = job.get("readiness")
+    planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
+    if not isinstance(planning, Mapping):
+        return None
+    repair = planning.get("candidate_repair_authorization")
+    if isinstance(repair, Mapping):
+        limit = _safe_non_negative_int(
+            repair.get("max_repair_cycles_per_chapter")
+        )
+        if limit is not None:
+            return limit
+    finalization = planning.get("chapter_finalization_authorization")
+    if isinstance(finalization, Mapping):
+        return _safe_non_negative_int(finalization.get("max_repair_cycles"))
+    return None
+
+
+def _candidate_checkpoint_projection(
+    job: Mapping[str, Any],
+    *,
+    chapter_id: str,
+) -> dict[str, Any] | None:
+    repair_limit = _candidate_repair_limit(job)
+    if repair_limit is None:
+        return None
+    raw = job.get("candidate_pipeline_checkpoints")
+    if not isinstance(raw, list):
+        return None
+    checkpoints = [
+        item
+        for item in raw[-100:]
+        if isinstance(item, Mapping)
+        and _safe_text(item.get("chapter_id"), limit=80) == chapter_id
+    ]
+    if not checkpoints:
+        return None
+    checkpoints.sort(key=lambda item: (
+        _safe_non_negative_int(item.get("sequence")) or 0
+    ))
+    latest = checkpoints[-1]
+    cycle = _safe_non_negative_int(latest.get("cycle"))
+    if cycle is None or cycle < repair_limit:
+        return None
+
+    gate: str | None = None
+    details: dict[str, Any] = {
+        "repair_cycles_used": cycle,
+        "repair_cycles_limit": repair_limit,
+    }
+    kind = latest.get("kind")
+    if kind == "state_candidate":
+        issue_count = _safe_non_negative_int(
+            latest.get("consistency_issue_count")
+        )
+        dropped_count = _safe_non_negative_int(
+            latest.get("dropped_reference_count")
+        )
+        if (issue_count or 0) > 0 or (dropped_count or 0) > 0:
+            gate = "state"
+            details["consistency_issue_count"] = issue_count or 0
+            details["dropped_reference_count"] = dropped_count or 0
+    elif kind == "outline_adherence":
+        coverage = latest.get("scene_coverage")
+        coverage_failed = isinstance(coverage, (list, tuple)) and any(
+            isinstance(item, Mapping) and item.get("status") != "covered"
+            for item in coverage[:20]
+        )
+        categories = latest.get("issue_categories")
+        if (
+            latest.get("verdict") != "pass"
+            or bool(categories)
+            or coverage_failed
+        ):
+            gate = "outline_adherence"
+            if isinstance(categories, (list, tuple)):
+                details["outline_issue_categories"] = [
+                    _safe_text(value, limit=60) for value in categories[:20]
+                ]
+    elif kind == "prose_candidate":
+        completion = latest.get("completion")
+        if isinstance(completion, Mapping) and (
+            completion.get("status") != "complete"
+            or completion.get("can_write_formal_prose") is not True
+            or completion.get("finish_reason") != "stop"
+        ):
+            gate = "completion"
+            details.update(_safe_completion(completion))
+    if gate is None:
+        return None
+
+    details["candidate_gate"] = gate
+    source = latest.get("source")
+    if isinstance(source, Mapping):
+        run_ids = _safe_object_ids([source.get("source_run_id")], limit=1)
+        if run_ids:
+            details["prose_run_id"] = run_ids[0]
+        revision = _safe_non_negative_int(source.get("source_run_revision"))
+        if revision is not None:
+            details["prose_run_revision"] = revision
+    return {
+        "code": _CANDIDATE_REPAIR_EXHAUSTED_CODES[gate],
+        "details": details,
+    }
+
+
+def _enrich_candidate_checkpoint_failure(
+    event: Mapping[str, Any],
+    *,
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = dict(event)
+    if (
+        _safe_text(value.get("step"), limit=60) != "candidate_pipeline"
+        or _safe_text(value.get("code"), limit=100)
+        not in {
+            "validation_rejected",
+            "candidate_gate_blocked",
+            "historical_unclassified_failure",
+        }
+    ):
+        return value
+    projection = _candidate_checkpoint_projection(
+        job,
+        chapter_id=_safe_text(value.get("chapter_id"), limit=80),
+    )
+    if projection is None:
+        return value
+    existing_details = value.get("details")
+    value["details"] = {
+        **(dict(existing_details) if isinstance(existing_details, Mapping) else {}),
+        **projection["details"],
+    }
+    value["category"] = "validation_logic"
+    value["code"] = projection["code"]
+    value["evidence"] = "confirmed"
+    impact, actions = _diagnostic_outcome("validation_logic", projection["code"])
+    value["impact"] = impact
+    value["action_codes"] = actions
+    value.pop("fingerprint", None)
+    return value
+
 def infer_job_diagnostics(job: Mapping[str, Any]) -> list[dict[str, Any]]:
     job_id = _safe_text(job.get("_id"), limit=80)
     persisted = job.get("diagnostics")
     if isinstance(persisted, list) and persisted:
+        values = [item for item in persisted if isinstance(item, Mapping)]
         return [
-            _enrich_event(item, job_id=job_id, index=index)
-            for index, item in enumerate(persisted)
-            if isinstance(item, Mapping)
+            _enrich_event(
+                _enrich_candidate_checkpoint_failure(item, job=job)
+                if index == len(values) - 1
+                else item,
+                job_id=job_id,
+                index=index,
+            )
+            for index, item in enumerate(values)
         ]
     inferred = _historical_failure(job)
+    if inferred is not None:
+        inferred = _enrich_candidate_checkpoint_failure(inferred, job=job)
     return [
         _enrich_event(inferred, job_id=job_id, index=0)
     ] if inferred is not None else []

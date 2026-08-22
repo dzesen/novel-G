@@ -405,6 +405,15 @@ export interface GenerationDiagnostic {
     attempt_count?: number;
     provider_aliases?: string[];
     provider_models?: string[];
+    candidate_gate?: "completion" | "outline_adherence" | "state";
+    repair_cycles_used?: number;
+    repair_cycles_limit?: number;
+    consistency_issue_count?: number;
+    dropped_reference_count?: number;
+    affected_card_ids?: string[];
+    outline_issue_categories?: string[];
+    prose_run_id?: string;
+    prose_run_revision?: number;
     [key: string]: unknown;
   };
 }
@@ -446,6 +455,7 @@ export interface GenerationJob {
   last_checkpoint_index: number;
   error: JobError | null;
   diagnostics?: GenerationDiagnostic[];
+  related_prose_run_ids?: string[];
   reference_card_auto_creation_events?: ReferenceCardAutoCreationEvent[];
   reference_card_repair_events?: ReferenceCardRepairEvent[];
   completion_audit?: BookCompletionAudit | null;

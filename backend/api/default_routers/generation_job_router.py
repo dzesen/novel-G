@@ -11,6 +11,7 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.utils import get_utc_now
 from backend.services.generation.failure_diagnostics import infer_job_diagnostics
+from backend.services.generation.job_relations import related_prose_run_ids
 from backend.services.generation.job_service import (
     ConflictError,
     GenerationJobService,
@@ -189,6 +190,7 @@ def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         progress.append(entry)
     out["progress"] = progress
     out["diagnostics"] = infer_job_diagnostics(out)
+    out["related_prose_run_ids"] = list(related_prose_run_ids(out))
     out["error"] = _serialize_job_error(out.get("error"))
     return out
 

@@ -62,6 +62,8 @@ function useDiagnosticCopy() {
         return t("stepState");
       case "outline_adherence":
         return t("stepOutlineAdherence");
+      case "candidate_pipeline":
+        return t("diagnosticsStepCandidatePipeline");
       default:
         return t("diagnosticsStepJob");
     }
@@ -114,19 +116,43 @@ export function DiagnosticEventSummary({
   const actions = (event.action_codes ?? [])
     .map(actionLabel)
     .filter((value): value is string => Boolean(value));
+  const repairCyclesUsed = Number(event.details.repair_cycles_used);
+  const repairCyclesLimit = Number(event.details.repair_cycles_limit);
+  const consistencyIssueCount = Number(event.details.consistency_issue_count);
+  const droppedReferenceCount = Number(event.details.dropped_reference_count);
+  const candidateGate = event.details.candidate_gate;
 
   return (
     <div className="min-w-0">
       <p className="text-sm font-medium text-foreground">
-        {categoryLabel(event.category)}
+        {reasonLabel(event.code)}
       </p>
       <p className="mt-0.5 text-xs leading-5 text-warm-700 dark:text-muted">
-        {t("diagnosticsEventSummary", {
-          reason: reasonLabel(event.code),
+        {t("diagnosticsEventContext", {
+          category: categoryLabel(event.category),
           evidence: evidenceLabel(event.evidence),
           step: stepLabel(event.step),
         })}
       </p>
+      {candidateGate && Number.isFinite(repairCyclesUsed)
+        && Number.isFinite(repairCyclesLimit) && (
+        <p className="mt-1 text-xs leading-5 text-foreground">
+          {t("diagnosticsCandidateRepairUsage", {
+            used: repairCyclesUsed,
+            limit: repairCyclesLimit,
+          })}
+        </p>
+      )}
+      {candidateGate === "state"
+        && Number.isFinite(consistencyIssueCount)
+        && Number.isFinite(droppedReferenceCount) && (
+        <p className="text-xs leading-5 text-warm-700 dark:text-muted">
+          {t("diagnosticsCandidateStateEvidence", {
+            issues: consistencyIssueCount,
+            dropped: droppedReferenceCount,
+          })}
+        </p>
+      )}
       {event.impact && (
         <p className="mt-1 text-xs leading-5 text-foreground">
           {t("diagnosticsImpactSummary", { impact: impactLabel(event.impact) })}

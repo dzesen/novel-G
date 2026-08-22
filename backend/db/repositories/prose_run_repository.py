@@ -121,6 +121,11 @@ class ProseRunRepository(BaseRepository):
             "has_uncertain_attempt": False,
             "provider_attempt_count": 0,
         }
+        generation_job_id = document.get("generation_job_id")
+        if generation_job_id is None:
+            prepared.pop("generation_job_id", None)
+        else:
+            prepared["generation_job_id"] = to_object_id(generation_job_id)
         try:
             run_id = await self.insert_one(prepared)
         except DuplicateKeyError as exc:
@@ -182,6 +187,8 @@ class ProseRunRepository(BaseRepository):
         limit: int = 100,
         skip: int = 0,
         chapter_id: str | None = None,
+        generation_job_id: str | None = None,
+        related_run_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         """List user-owned runs for metadata-only operational inspection."""
         query: dict[str, Any] = {
@@ -190,6 +197,17 @@ class ProseRunRepository(BaseRepository):
         }
         if chapter_id is not None:
             query["chapter_id"] = to_object_id(chapter_id)
+        if generation_job_id is not None:
+            associations: list[dict[str, Any]] = [{
+                "generation_job_id": to_object_id(generation_job_id),
+            }]
+            if related_run_ids:
+                associations.append({
+                    "_id": {
+                        "$in": [to_object_id(run_id) for run_id in related_run_ids]
+                    },
+                })
+            query["$or"] = associations
         return await self.find_many(
             query,
             limit=max(1, int(limit)),

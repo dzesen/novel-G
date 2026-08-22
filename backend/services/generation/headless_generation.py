@@ -493,6 +493,7 @@ async def generate_prose_candidate(
     generation_params: Mapping[str, Any] | None = None,
     *,
     generation_plan: GenerationPlan | None = None,
+    generation_job_id: str | None = None,
 ) -> GeneratedProseCandidate:
     """Generate a persisted ProseRun candidate without accepting formal prose."""
     execution = await _chapter_capability_registry().execute(
@@ -505,6 +506,7 @@ async def generate_prose_candidate(
             generation_params=dict(generation_params or {}),
             attempt_scope=attempt_scope,
             generation_plan=generation_plan,
+            generation_job_id=generation_job_id,
         ),
         call=CapabilityCall(source="job_engine"),
     )

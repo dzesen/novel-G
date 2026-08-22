@@ -1749,6 +1749,23 @@ class GenerationJobService:
                     ),
                 )
 
+            async def generate_job_prose_candidate(
+                target_novel_id,
+                target_chapter,
+                attempt_scope=None,
+                generation_params=None,
+                *,
+                generation_plan=None,
+            ):
+                return await generate_prose_candidate(
+                    target_novel_id,
+                    target_chapter,
+                    attempt_scope,
+                    generation_params,
+                    generation_plan=generation_plan,
+                    generation_job_id=job_id,
+                )
+
             runner = ChapterCandidateJobRunner(
                 execution_id=job_id,
                 readiness=readiness,
@@ -1794,7 +1811,7 @@ class GenerationJobService:
                         generation_job_repo.advance_narrative_revision_cursor
                     ),
                     generate_outline=generate_outline,
-                    generate_prose_candidate=generate_prose_candidate,
+                    generate_prose_candidate=generate_job_prose_candidate,
                     review_prose_candidate=review_prose_candidate,
                     generate_state_candidate=generate_state_candidate,
                     recover_state_candidate=(

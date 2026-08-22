@@ -26,6 +26,9 @@ const DIAGNOSTIC_REASON_KEYS = {
   invalid_internal_id: "diagnosticsReasonInvalidId",
   historical_invalid_internal_id: "diagnosticsReasonInvalidId",
   validation_rejected: "diagnosticsReasonValidation",
+  candidate_completion_repair_exhausted: "diagnosticsReasonCandidateCompletionExhausted",
+  candidate_adherence_repair_exhausted: "diagnosticsReasonCandidateAdherenceExhausted",
+  candidate_state_repair_exhausted: "diagnosticsReasonCandidateStateExhausted",
   historical_completion_contract_failed: "diagnosticsReasonCompletion",
   completion_contract_failed: "diagnosticsReasonCompletion",
   job_aborted: "diagnosticsReasonAborted",
@@ -39,6 +42,7 @@ const DIAGNOSTIC_IMPACT_KEYS = {
   generation_paused_before_commit: "diagnosticsImpactPaused",
   job_stopped_by_user: "diagnosticsImpactUserStopped",
   cause_not_identified: "diagnosticsImpactUnknown",
+  candidate_not_committed: "diagnosticsImpactCandidateNotCommitted",
 } as const;
 
 const DIAGNOSTIC_ACTION_KEYS = {
@@ -51,6 +55,7 @@ const DIAGNOSTIC_ACTION_KEYS = {
   refresh_generation_readiness: "diagnosticsActionRefreshReadiness",
   restart_generation_job: "diagnosticsActionRestartJob",
   review_generation_authorization: "diagnosticsActionReviewAuthorization",
+  open_affected_chapter: "diagnosticsActionOpenAffectedChapter",
 } as const;
 
 const JOB_PAUSE_REASON_KEYS = {

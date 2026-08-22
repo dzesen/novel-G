@@ -302,6 +302,10 @@ class ProseGenerationCommand(_ChapterGenerationCommand):
     generation_params: Mapping[str, Any] = ModelField(default_factory=dict)
     attempt_scope: Any | None = None
     generation_plan: GenerationPlan | None = None
+    generation_job_id: str | None = ModelField(
+        default=None,
+        pattern=r"^[0-9a-f]{24}$",
+    )
     resume_run_id: str | None = None
     expected_run_revision: int | None = None
     confirm_uncertain_retry: bool = False
@@ -1583,6 +1587,7 @@ class ChapterGenerationApplicationService:
                             else None
                         ),
                     },
+                    generation_job_id=command.generation_job_id,
                     run_id=prepared.resume_run_id,
                     expected_revision=prepared.expected_run_revision,
                     confirm_uncertain_retry=(

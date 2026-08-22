@@ -1046,11 +1046,21 @@ class ChapterCandidatePipelineBlocked(ValueError):
         *,
         code: str = "candidate_gate_blocked",
         progress: ChapterCandidatePipelineProgress | None = None,
+        gate: Literal["completion", "outline_adherence", "state"] | None = None,
+        repair_limit: int | None = None,
+        consistency_issue_count: int | None = None,
+        dropped_reference_count: int | None = None,
+        affected_card_ids: tuple[str, ...] = (),
     ) -> None:
         super().__init__(message)
         self.code = code
         self.progress = progress or ChapterCandidatePipelineProgress()
         self._progress_attached = progress is not None
+        self.gate = gate
+        self.repair_limit = repair_limit
+        self.consistency_issue_count = consistency_issue_count
+        self.dropped_reference_count = dropped_reference_count
+        self.affected_card_ids = affected_card_ids
 
     def attach_progress(self, progress: ChapterCandidatePipelineProgress) -> None:
         self.progress = progress
@@ -2990,17 +3000,10 @@ def _state_repair_request(
 ) -> StateCandidateRepairRequest:
     raw_issues = state.get("consistency_issues")
     issues = raw_issues if isinstance(raw_issues, list) else []
-    card_ids = tuple(sorted({
-        card_id
-        for item in issues[:MAX_STATE_REPAIR_CARD_IDS]
-        if isinstance(item, Mapping)
-        for card_id in (item.get("card_id"),)
-        if (
-            isinstance(card_id, str)
-            and 0 < len(card_id) <= MAX_STATE_REPAIR_CARD_ID_LENGTH
-            and card_id in declared_card_ids
-        )
-    }))
+    card_ids = _state_issue_card_ids(
+        issues,
+        declared_card_ids=declared_card_ids,
+    )
     dropped_count = _dropped_reference_count(dropped)
     reason_codes: list[StateRepairReason] = []
     if issues:
@@ -3020,6 +3023,24 @@ def _state_repair_request(
         affected_card_ids=card_ids,
         dropped_reference_count=dropped_count,
     )
+
+
+def _state_issue_card_ids(
+    issues: list[Any] | tuple[dict[str, Any], ...],
+    *,
+    declared_card_ids: frozenset[str],
+) -> tuple[str, ...]:
+    return tuple(sorted({
+        card_id
+        for item in issues[:MAX_STATE_REPAIR_CARD_IDS]
+        if isinstance(item, Mapping)
+        for card_id in (item.get("card_id"),)
+        if (
+            isinstance(card_id, str)
+            and 0 < len(card_id) <= MAX_STATE_REPAIR_CARD_ID_LENGTH
+            and card_id in declared_card_ids
+        )
+    }))
 
 
 def _declared_character_card_ids(
@@ -3126,10 +3147,28 @@ def _prose_repair_advanced_revision(
     )
 
 
-def _next_repair_cycle(used: int, limit: int) -> int:
+def _next_repair_cycle(
+    used: int,
+    limit: int,
+    *,
+    gate: Literal["completion", "outline_adherence", "state"],
+    consistency_issue_count: int | None = None,
+    dropped_reference_count: int | None = None,
+    affected_card_ids: tuple[str, ...] = (),
+) -> int:
     if used >= limit:
         raise ChapterCandidatePipelineBlocked(
-            "候选仍未通过闸门，已达到授权的修复次数上限"
+            "候选仍未通过闸门，已达到授权的修复次数上限",
+            code={
+                "completion": "candidate_completion_repair_exhausted",
+                "outline_adherence": "candidate_adherence_repair_exhausted",
+                "state": "candidate_state_repair_exhausted",
+            }[gate],
+            gate=gate,
+            repair_limit=limit,
+            consistency_issue_count=consistency_issue_count,
+            dropped_reference_count=dropped_reference_count,
+            affected_card_ids=affected_card_ids,
         )
     return used + 1
 
@@ -3363,6 +3402,7 @@ class ChapterCandidatePipeline:
                 cycle = _next_repair_cycle(
                     trace.repair_cycles_used,
                     repair_limit,
+                    gate="completion",
                 )
                 source, last_repair_kept_digest = (
                     await self._apply_prose_repair(
@@ -3438,6 +3478,7 @@ class ChapterCandidatePipeline:
                 cycle = _next_repair_cycle(
                     trace.repair_cycles_used,
                     repair_limit,
+                    gate="outline_adherence",
                 )
                 source, last_repair_kept_digest = (
                     await self._apply_prose_repair(
@@ -3524,6 +3565,13 @@ class ChapterCandidatePipeline:
             cycle = _next_repair_cycle(
                 trace.repair_cycles_used,
                 repair_limit,
+                gate="state",
+                consistency_issue_count=len(consistency_issues),
+                dropped_reference_count=_dropped_reference_count(dropped),
+                affected_card_ids=_state_issue_card_ids(
+                    consistency_issues,
+                    declared_card_ids=_declared_character_card_ids(chapter),
+                ),
             )
             request = _state_repair_request(
                 cycle=cycle,

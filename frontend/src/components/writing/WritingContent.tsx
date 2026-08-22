@@ -373,13 +373,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   );
 
   const openWriting = useCallback(
-    (chapterId: string, run?: ProseRunSnapshot | null) => {
+    (
+      chapterId: string,
+      run?: ProseRunSnapshot | null,
+      targetRunId?: string,
+    ) => {
       if (run !== undefined) {
         setProseOpenRequest({ requestId: Date.now(), chapterId, run });
       }
       navigateView("writing", "chapter", {
         chapter: chapterId,
-        run: run?.run_id ?? run?._id,
+        run: targetRunId ?? run?.run_id ?? run?._id,
       });
     },
     [navigateView],

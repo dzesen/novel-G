@@ -15,6 +15,7 @@ from backend.db.repositories.agent_runtime_repository import (
     agent_runtime_repository,
 )
 from backend.db.repositories.chapter_repository import chapter_repo
+from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.repositories.prose_run_repository import (
     CURRENT_PROSE_RUN_STATUSES,
     prose_run_repo,
@@ -25,6 +26,7 @@ from backend.services.generation.prose_protocol import (
     is_scene_continuation_v3_family,
 )
 from backend.services.generation.prose_generation import UncertainProseAttempt
+from backend.services.generation.job_relations import related_prose_run_ids
 from backend.services.llm.context_builder import normalize_outline_references
 from backend.services.novel.chapter_service import count_chapter_words
 from backend.services.novel.derived_stats import derived_stats
@@ -79,7 +81,13 @@ def serialize_prose_run(document: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
     result = dict(document)
     result["assembled_text"] = prose_run_draft_text(document)
-    for field in ("_id", "owner_id", "novel_id", "chapter_id"):
+    for field in (
+        "_id",
+        "owner_id",
+        "novel_id",
+        "chapter_id",
+        "generation_job_id",
+    ):
         if result.get(field) is not None:
             result[field] = str(result[field])
     return result
@@ -282,6 +290,11 @@ def serialize_prose_run_telemetry(document: dict[str, Any]) -> dict[str, Any]:
         "run_id": str(document["_id"]),
         "novel_id": str(document["novel_id"]),
         "chapter_id": str(document["chapter_id"]),
+        "generation_job_id": (
+            str(document["generation_job_id"])
+            if document.get("generation_job_id") is not None
+            else None
+        ),
         "revision": _safe_non_negative_int(document.get("revision")),
         "status": str(document.get("status") or "unknown"),
         "provider": {
@@ -381,6 +394,7 @@ class ProseRunModule:
         context_text: str,
         plan: ProseExecutionPlan,
         provider_plan: dict[str, Any],
+        generation_job_id: str | None = None,
         run_id: str | None = None,
         expected_revision: int | None = None,
         confirm_uncertain_retry: bool = False,
@@ -393,6 +407,12 @@ class ProseRunModule:
         replace_revision: int | None = None
         if run_id:
             existing = await prose_run_repo.get_run(run_id, owner_id)
+            if (
+                generation_job_id is not None
+                and str(existing.get("generation_job_id") or "")
+                != generation_job_id
+            ):
+                raise ValueError("正文草稿不属于当前生成作业")
             if (
                 str(existing.get("chapter_id")) != str(chapter_id)
                 or existing.get("outline_revision") != outline_revision
@@ -516,6 +536,7 @@ class ProseRunModule:
                 "owner_id": owner_id,
                 "novel_id": novel_id,
                 "chapter_id": chapter_id,
+                "generation_job_id": generation_job_id,
                 "outline_revision": outline_revision,
                 "prose_continuation_authorization": dict(authorization or {}),
                 "authorization_revision": int(
@@ -648,14 +669,25 @@ class ProseRunModule:
         limit: int = 100,
         skip: int = 0,
         chapter_id: str | None = None,
+        generation_job_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return user-owned, metadata-only prose-run inspection records."""
+        related_run_ids: tuple[str, ...] = ()
+        if generation_job_id is not None:
+            job = await generation_job_repo.get_job(generation_job_id)
+            if str(job.get("novel_id") or "") != novel_id:
+                raise NotFoundError(
+                    f"Generation job not found for novel: {generation_job_id}"
+                )
+            related_run_ids = related_prose_run_ids(job)
         runs = await prose_run_repo.list_telemetry_by_novel(
             owner_id=owner_id,
             novel_id=novel_id,
             limit=limit,
             skip=skip,
             chapter_id=chapter_id,
+            generation_job_id=generation_job_id,
+            related_run_ids=related_run_ids,
         )
         return [serialize_prose_run_telemetry(run) for run in runs]
 

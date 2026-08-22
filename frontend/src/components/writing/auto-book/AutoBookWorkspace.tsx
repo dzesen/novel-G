@@ -55,7 +55,11 @@ interface AutoBookWorkspaceProps {
     value: string,
     valid: boolean,
   ) => void;
-  onOpenWriting: (chapterId: string, run?: ProseRunSnapshot | null) => void;
+  onOpenWriting: (
+    chapterId: string,
+    run?: ProseRunSnapshot | null,
+    runId?: string,
+  ) => void;
   onOpenBlueprint: () => void;
   onOpenWorld: (
     view: "library" | "curation" | "candidates" | "baseline",
@@ -279,7 +283,16 @@ export default function AutoBookWorkspace({
               )
             }
             onClose={() => onNavigateView("runs", {}, true)}
-            onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}
+            onOpenReadiness={(job) => onNavigateView(
+              "readiness",
+              job.scope === "volume" && job.volume_id
+                ? { volume: job.volume_id }
+                : {},
+              true,
+            )}
+            onJumpToChapter={(chapterId, runId) =>
+              onOpenWriting(chapterId, undefined, runId)
+            }
             readOnly
           />
         </div>

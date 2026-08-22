@@ -751,6 +751,12 @@ async def init_prose_run_indexes():
                 ("updated_at", -1),
             ]),
             pymongo.IndexModel([("novel_id", 1), ("updated_at", -1)]),
+            pymongo.IndexModel([
+                ("owner_id", 1),
+                ("novel_id", 1),
+                ("generation_job_id", 1),
+                ("updated_at", -1),
+            ]),
             pymongo.IndexModel([("lease.expires_at", 1)]),
             # Status is included in the partial filter so legacy runs created
             # before this index are protected without a schema backfill.

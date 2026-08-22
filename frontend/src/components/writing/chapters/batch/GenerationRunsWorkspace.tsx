@@ -34,6 +34,7 @@ interface ProseRunTelemetry {
   run_id: string;
   novel_id: string;
   chapter_id: string;
+  generation_job_id: string | null;
   revision: number;
   status: string;
   provider: { alias: string; model: string };
@@ -111,7 +112,8 @@ interface GenerationRunsWorkspaceProps {
   ) => void;
   onNavigate: (target: GenerationRunsNavigationTarget) => void;
   onClose: () => void;
-  onJumpToChapter: (chapterId: string) => void;
+  onOpenReadiness: (job: GenerationJob) => void;
+  onJumpToChapter: (chapterId: string, runId?: string) => void;
   readOnly?: boolean;
 }
 
@@ -318,6 +320,7 @@ export default function GenerationRunsWorkspace({
   onTargetValidation,
   onNavigate,
   onClose,
+  onOpenReadiness,
   onJumpToChapter,
   readOnly = false,
 }: GenerationRunsWorkspaceProps) {
@@ -368,10 +371,12 @@ export default function GenerationRunsWorkspace({
     setLoadError(null);
     setTelemetryError(null);
 
+    const telemetryParams = new URLSearchParams({ limit: "100" });
+    if (target.jobId) telemetryParams.set("job_id", target.jobId);
     const [jobsResult, telemetryResult] = await Promise.allSettled([
       apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`),
       apiGet<ProseRunTelemetry[]>(
-        `/api/llm/prose-runs/novel/${novelId}/telemetry?limit=100`,
+        `/api/llm/prose-runs/novel/${novelId}/telemetry?${telemetryParams}`,
       ),
     ]);
     if (requestId !== loadRequestRef.current) return;
@@ -388,7 +393,7 @@ export default function GenerationRunsWorkspace({
     }
     setLoading(false);
     setRefreshing(false);
-  }, [novelId, t]);
+  }, [novelId, t, target.jobId]);
 
   useEffect(() => {
     void load(true);
@@ -417,9 +422,17 @@ export default function GenerationRunsWorkspace({
       `/api/llm/prose-runs/${encodeURIComponent(runId)}/telemetry`,
     ).then((run) => {
       if (cancelled) return;
+      const relatedRunIds = target.jobId
+        ? jobs.find((job) => job._id === target.jobId)?.related_prose_run_ids ?? []
+        : [];
       const valid = run.run_id === runId
         && run.novel_id === novelId
-        && (!target.chapterId || run.chapter_id === target.chapterId);
+        && (!target.chapterId || run.chapter_id === target.chapterId)
+        && (
+          !target.jobId
+          || run.generation_job_id === target.jobId
+          || relatedRunIds.includes(runId)
+        );
       onTargetValidation("run", runId, valid);
       setExactRunLookup({
         requestedId: runId,
@@ -449,10 +462,12 @@ export default function GenerationRunsWorkspace({
     return () => { cancelled = true; };
   }, [
     exactRunLookupRevision,
+    jobs,
     novelId,
     onTargetValidation,
     t,
     target.chapterId,
+    target.jobId,
     target.runId,
   ]);
 
@@ -535,7 +550,7 @@ export default function GenerationRunsWorkspace({
       : []
     : target.chapterId
       ? filteredTelemetry.filter((run) => run.chapter_id === target.chapterId)
-      : filteredTelemetry.slice(0, 12);
+      : filteredTelemetry.slice(0, target.jobId ? 100 : 12);
   const telemetryFilteredOut = !target.runId && Boolean(target.chapterId)
     && proseRuns.some((run) => run.chapter_id === target.chapterId)
     && selectedTelemetry.length === 0;
@@ -545,6 +560,23 @@ export default function GenerationRunsWorkspace({
       (event, index) => eventLocator(selectedJob._id, event, index) === target.eventId,
     ) ?? null;
   }, [selectedJob, target.eventId]);
+  const currentBlocker = selectedJob
+    && ["failed", "interrupted", "paused"].includes(selectedJob.status)
+    ? orderedDiagnostics[0]?.event ?? null
+    : null;
+  const currentBlockerIndex = currentBlocker && selectedJob
+    ? (selectedJob.diagnostics ?? []).indexOf(currentBlocker)
+    : -1;
+  const currentBlockerLocator = currentBlocker && selectedJob
+    ? eventLocator(
+        selectedJob._id,
+        currentBlocker,
+        Math.max(0, currentBlockerIndex),
+      )
+    : null;
+  const currentBlockerRunId = typeof currentBlocker?.details.prose_run_id === "string"
+    ? currentBlocker.details.prose_run_id
+    : null;
   const missingJob = Boolean(target.jobId)
     && !loading
     && !loadError
@@ -901,6 +933,60 @@ export default function GenerationRunsWorkspace({
                   </p>
                 )}
 
+                {currentBlocker && (
+                  <section
+                    aria-labelledby="generation-run-current-blocker-title"
+                    className="rounded-md border border-amber-300 bg-amber-50/70 p-3 dark:border-amber-900/70 dark:bg-amber-950/20"
+                  >
+                    <h4
+                      id="generation-run-current-blocker-title"
+                      className="text-sm font-semibold text-foreground"
+                    >
+                      {t("currentBlockerTitle")}
+                    </h4>
+                    <div className="mt-2">
+                      <DiagnosticEventSummary event={currentBlocker} />
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {currentBlocker.chapter_id && (
+                        <button
+                          type="button"
+                          onClick={() => onJumpToChapter(
+                            currentBlocker.chapter_id,
+                            currentBlockerRunId ?? undefined,
+                          )}
+                          className="min-h-9 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                        >
+                          {t("resolveOpenChapter")}
+                        </button>
+                      )}
+                      {currentBlockerRunId && currentBlockerLocator && (
+                        <button
+                          type="button"
+                          onClick={() => onNavigate({
+                            jobId: selectedJob._id,
+                            chapterId: currentBlocker.chapter_id || undefined,
+                            eventId: currentBlockerLocator,
+                            runId: currentBlockerRunId,
+                          })}
+                          className="min-h-9 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                        >
+                          {t("resolveInspectRun")}
+                        </button>
+                      )}
+                      {currentBlocker.action_codes?.includes("restart_generation_job") && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenReadiness(selectedJob)}
+                          className="min-h-9 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white hover:bg-accent-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                        >
+                          {t("resolveReturnToReadiness")}
+                        </button>
+                      )}
+                    </div>
+                  </section>
+                )}
+
                 <dl className="grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-3">
                   <div className="min-w-0 rounded-md border border-border bg-surface p-3">
                     <dt className="text-muted">{t("detailCreated")}</dt>
@@ -979,7 +1065,9 @@ export default function GenerationRunsWorkspace({
                   <div className="mt-2 grid gap-2">
                     {selectedChapterProgress.length === 0 && (
                       <p className="rounded-md border border-dashed border-border px-3 py-3 text-xs text-muted">
-                        {t("chaptersEmpty")}
+                        {currentBlocker?.step === "candidate_pipeline"
+                          ? t("chaptersEmptyCandidate")
+                          : t("chaptersEmpty")}
                       </p>
                     )}
                     {selectedChapterProgress.map((progress) => {
@@ -1067,6 +1155,9 @@ export default function GenerationRunsWorkspace({
                                   jobId: selectedJob._id,
                                   chapterId: event.chapter_id || undefined,
                                   eventId: locator,
+                                  runId: typeof event.details.prose_run_id === "string"
+                                    ? event.details.prose_run_id
+                                    : undefined,
                                 })}
                                 className={`block w-full px-3 py-3 text-left hover:bg-surface-secondary ${
                                   target.eventId === locator ? "bg-accent/10" : ""
@@ -1107,9 +1198,13 @@ export default function GenerationRunsWorkspace({
                 {t("telemetryTitle")}
               </h3>
               <p className="mt-1 text-xs leading-5 text-muted">
-                {target.chapterId && selectedChapter
-                  ? t("telemetryChapterDescription", { title: selectedChapter.title })
-                  : t("telemetryDescription")}
+                {target.jobId
+                  ? target.chapterId && selectedChapter
+                    ? t("telemetryJobChapterDescription", { title: selectedChapter.title })
+                    : t("telemetryJobDescription")
+                  : target.chapterId && selectedChapter
+                    ? t("telemetryChapterDescription", { title: selectedChapter.title })
+                    : t("telemetryDescription")}
               </p>
             </div>
             {target.chapterId && (
@@ -1120,7 +1215,7 @@ export default function GenerationRunsWorkspace({
                 }
                 className="shrink-0 text-xs font-medium text-accent hover:underline"
               >
-                {t("clearChapter")}
+                {target.jobId ? t("clearJobChapter") : t("clearChapter")}
               </button>
             )}
           </div>

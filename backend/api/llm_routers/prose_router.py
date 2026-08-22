@@ -309,6 +309,7 @@ async def list_prose_run_telemetry(
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     chapter_id: str | None = Query(default=None),
+    job_id: str | None = Query(default=None),
 ):
     """List metadata-only prose-run telemetry; never return prose or prompts."""
     actor = getattr(request.state, "actor", None)
@@ -321,7 +322,10 @@ async def list_prose_run_telemetry(
             limit=limit,
             skip=offset,
             chapter_id=chapter_id,
+            generation_job_id=job_id,
         )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InvalidIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
