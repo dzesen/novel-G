@@ -2535,6 +2535,7 @@
       "leftoverView": "Review draft",
       "leftoverResume": "Resume writing",
       "resumeAfterSourceChange": "Recheck current content and resume",
+      "startSuccessor": "Recheck current content and create a new job",
       "leftoverAcceptPartial": "Accept partial prose",
       "leftoverDiscardRestart": "Discard and restart",
       "leftoverDiscardConfirm": "Discard this draft and open a clean generation panel? The draft is not deleted, but it will leave the unfinished list.",
@@ -2543,6 +2544,7 @@
       "leftoverConfirmDiscard": "Discard and restart",
       "reviewTitle": "Checkpoint review",
       "reviewRecoveryTitle": "Resume batch generation",
+      "reviewSuccessorTitle": "Restart batch generation",
       "checkpointWordCount": "Prose: {actual} actual / {target} target words ({ratio}×)",
       "checkpointWordCountOverrun": "Clearly above the target. This is review-only and will not reject prose or pause the job.",
       "reasonCheckpoint": "Reached a planned checkpoint. Review this window, then resume.",
@@ -2553,6 +2555,7 @@
       "reasonManual": "Paused manually.",
       "reasonInterrupted": "The previous run was interrupted. If a Provider request may have been sent, explicitly retry or skip it to avoid silent duplicate charges.",
       "reasonSourceChanged": "The chapter or narrative state was edited or deleted during generation. The author's latest content was preserved and the job paused; resume explicitly after reviewing it.",
+      "reasonSourceChangedSuccessor": "The current content replaced the old snapshot, so this job cannot continue. Completed chapters and the author's edits are preserved; end the old job, then run a new preflight against the current content.",
       "reasonAuthorizationScopeIncreased": "The accepted outline increased the remaining prose call or token bound beyond the original authorization. No prose has been generated yet; review the new resume authorization before continuing.",
       "reasonReferenceCardReview": "The outline introduced reference-card candidates required by a later chapter. The job paused before the next model call; review them and the original job will resume automatically when all blockers are resolved.",
       "reasonReferenceCardAutoCreationRecovery": "The safe card-creation result was not fully recorded on the job. The job paused before another model call; retrying only recovers the same authorized change and cannot expand its scope or create duplicates.",
@@ -2699,7 +2702,11 @@
       "abortConfirmBody": "This immediately cuts off the running generation; the current half-chapter is discarded. Completed chapters are kept.",
       "abortConfirmYes": "Abort",
       "aborting": "Aborting…",
-      "abortConfirmNo": "Cancel"
+      "abortConfirmNo": "Cancel",
+      "successorConfirmTitle": "Start again from the current content?",
+      "successorConfirmBody": "This job is bound to an obsolete content snapshot and cannot continue. Ending it will not delete or roll back completed chapters or author edits, and will not call a Provider. You will then review a new preflight and start confirmation for the same scope.",
+      "successorConfirmYes": "End old job and run preflight",
+      "successorPreparing": "Preparing a new preflight…"
     },
     "prose": {
       "title": "AI Write Chapter",

@@ -27,12 +27,17 @@ interface CheckpointReviewProps {
   onNavigateToReferenceCardCandidates: (candidateId?: string) => void;
   onNavigateToPlotThreads: () => void;
   onResume: () => void;
+  onStartSuccessor: () => void;
   onRetryUncertain: () => void;
   onSkipUncertain: () => void;
   onAbort: () => void;
   busy: boolean;
   controlError: string | null;
   onOpenGenerationRuns: () => void;
+}
+
+function requiresSuccessorJob(job: GenerationJob): boolean {
+  return job.error?.reason_codes?.includes("successor_required") ?? false;
 }
 
 function Banner({ job }: { job: GenerationJob }) {
@@ -63,7 +68,9 @@ function Banner({ job }: { job: GenerationJob }) {
     job.pause_reason === "uncertain_attempt"
     && Boolean(job.error?.auto_creation)
   );
-  const key = isUncertainReferenceRepair
+  const key = requiresSuccessorJob(job)
+    ? "reasonSourceChangedSuccessor"
+    : isUncertainReferenceRepair
     ? "reasonReferenceCardRepairUncertain"
     : job.pause_reason
       ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
@@ -373,6 +380,7 @@ export default function CheckpointReview({
   onNavigateToReferenceCardCandidates,
   onNavigateToPlotThreads,
   onResume,
+  onStartSuccessor,
   onRetryUncertain,
   onSkipUncertain,
   onAbort,
@@ -395,6 +403,7 @@ export default function CheckpointReview({
   );
   const hasReferenceCardBoundary = Boolean(job.error?.auto_creation)
     || requiresReferenceCardReview;
+  const requiresSuccessor = requiresSuccessorJob(job);
 
   const stopDiagnostic = currentStopDiagnostic(job);
   const blockingProgress = [...reviewWindow].reverse().find((progress) => {
@@ -410,7 +419,13 @@ export default function CheckpointReview({
     <div className="grid gap-3 border-b border-border bg-surface-secondary/40 px-4 py-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <h3 className="text-sm font-semibold text-foreground">
-          {t(job.pause_reason === "checkpoint" ? "reviewTitle" : "reviewRecoveryTitle")}
+          {t(
+            requiresSuccessor
+              ? "reviewSuccessorTitle"
+              : job.pause_reason === "checkpoint"
+                ? "reviewTitle"
+                : "reviewRecoveryTitle",
+          )}
         </h3>
         <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" size="sm" onPress={onAbort} isDisabled={busy}>
@@ -440,6 +455,16 @@ export default function CheckpointReview({
               isDisabled={busy}
             >
               {t("reviewReferenceCards")}
+            </Button>
+          ) : requiresSuccessor ? (
+            <Button
+              variant="primary"
+              size="sm"
+              className="max-w-full whitespace-normal bg-accent text-white hover:bg-accent-hover"
+              onPress={onStartSuccessor}
+              isDisabled={busy}
+            >
+              {t("startSuccessor")}
             </Button>
           ) : (
             <Button

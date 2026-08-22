@@ -196,6 +196,20 @@ export default function AutoBookWorkspace({
       if (startTriggerRef.current?.isConnected) startTriggerRef.current.focus();
     });
   };
+  const openSuccessorReadiness = useCallback((
+    scope: "volume" | "book",
+    volumeId?: string,
+  ) => {
+    startTriggerRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    if (volumeId) setSelectedVolumeId(volumeId);
+    setStartScope(scope === "volume" && !volumeId ? null : scope);
+    onNavigateView(
+      "readiness",
+      scope === "volume" && volumeId ? { volume: volumeId } : {},
+    );
+  }, [onNavigateView]);
 
   const viewNav = (
     <nav
@@ -457,6 +471,7 @@ export default function AutoBookWorkspace({
               onOpenWriting(run.chapter_id, run);
             }}
             onStartFreshProse={(chapterId) => onOpenWriting(chapterId, null)}
+            onOpenSuccessorReadiness={openSuccessorReadiness}
             onOpenGenerationRuns={(target) =>
               onNavigateView("generation-runs", {
                 job: target?.jobId,

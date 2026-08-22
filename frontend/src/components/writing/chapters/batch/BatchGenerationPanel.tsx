@@ -34,6 +34,8 @@ const ABORT_DIALOG_FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
 
+type AbortIntent = "abort" | "successor";
+
 interface BatchGenerationPanelProps {
   surface: "start" | "runs";
   novelId: string;
@@ -58,6 +60,10 @@ interface BatchGenerationPanelProps {
   proseRunsRevision: number;
   onOpenProseRun: (run: LeftoverProseRun) => void;
   onStartFreshProse: (chapterId: string) => void;
+  onOpenSuccessorReadiness: (
+    scope: "volume" | "book",
+    volumeId?: string,
+  ) => void;
   onOpenGenerationRuns: (target?: GenerationRunsNavigationTarget) => void;
   onJobStarted?: (job: GenerationJob) => void;
 }
@@ -83,6 +89,7 @@ export default function BatchGenerationPanel({
   proseRunsRevision,
   onOpenProseRun,
   onStartFreshProse,
+  onOpenSuccessorReadiness,
   onOpenGenerationRuns,
   onJobStarted,
 }: BatchGenerationPanelProps) {
@@ -90,7 +97,7 @@ export default function BatchGenerationPanel({
   const { job, error: pollError, setJob } = useGenerationJob({ onProgress: onQuietRefresh });
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState<string | null>(null);
-  const [abortConfirm, setAbortConfirm] = useState(false);
+  const [abortIntent, setAbortIntent] = useState<AbortIntent | null>(null);
   const abortDialogRef = useRef<HTMLDivElement>(null);
   const abortCancelRef = useRef<HTMLButtonElement>(null);
   const abortTriggerRef = useRef<HTMLElement | null>(null);
@@ -223,23 +230,28 @@ export default function BatchGenerationPanel({
     }
   };
 
-  const openAbortConfirmation = useCallback(() => {
+  const openAbortConfirmation = useCallback((intent: AbortIntent) => {
     abortTriggerRef.current = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
-    setAbortConfirm(true);
+    setAbortIntent(intent);
+  }, []);
+
+  const dismissAbortConfirmation = useCallback((restoreFocus: boolean) => {
+    setAbortIntent(null);
+    if (!restoreFocus) return;
+    window.requestAnimationFrame(() => {
+      if (abortTriggerRef.current?.isConnected) abortTriggerRef.current.focus();
+    });
   }, []);
 
   const closeAbortConfirmation = useCallback(() => {
     if (controlBusy) return;
-    setAbortConfirm(false);
-    window.requestAnimationFrame(() => {
-      if (abortTriggerRef.current?.isConnected) abortTriggerRef.current.focus();
-    });
-  }, [controlBusy]);
+    dismissAbortConfirmation(true);
+  }, [controlBusy, dismissAbortConfirmation]);
 
   useEffect(() => {
-    if (!abortConfirm) return;
+    if (!abortIntent) return;
     abortCancelRef.current?.focus();
     const containFocus = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !controlBusy) {
@@ -271,7 +283,7 @@ export default function BatchGenerationPanel({
     };
     window.addEventListener("keydown", containFocus);
     return () => window.removeEventListener("keydown", containFocus);
-  }, [abortConfirm, closeAbortConfirmation, controlBusy]);
+  }, [abortIntent, closeAbortConfirmation, controlBusy]);
 
   const requestResume = () => {
     if (!job) return;
@@ -283,6 +295,20 @@ export default function BatchGenerationPanel({
       return;
     }
     void control("resume");
+  };
+
+  const confirmAbort = () => {
+    if (!job || !abortIntent) return;
+    const intent = abortIntent;
+    const successorScope = job.scope;
+    const successorVolumeId = job.volume_id ?? undefined;
+    void control("abort").then((succeeded) => {
+      if (!succeeded) return;
+      dismissAbortConfirmation(intent === "abort");
+      if (intent === "successor") {
+        onOpenSuccessorReadiness(successorScope, successorVolumeId);
+      }
+    });
   };
 
   // accepted state delta 不在章节列表响应里；真实工作量由 readiness 报告决定。
@@ -505,7 +531,7 @@ export default function BatchGenerationPanel({
               <Button variant="outline" size="sm" onPress={() => void control("pause")} isDisabled={controlBusy}>
                 {controlBusy ? t("pausing") : t("pause")}
               </Button>
-              <Button variant="outline" size="sm" onPress={openAbortConfirmation} isDisabled={controlBusy}>
+              <Button variant="outline" size="sm" onPress={() => openAbortConfirmation("abort")} isDisabled={controlBusy}>
                 {t("abort")}
               </Button>
             </div>
@@ -541,9 +567,10 @@ export default function BatchGenerationPanel({
             }
             onNavigateToPlotThreads={onNavigateToPlotThreads}
             onResume={requestResume}
+            onStartSuccessor={() => openAbortConfirmation("successor")}
             onRetryUncertain={() => void control("resume", { confirm_uncertain_retry: true })}
             onSkipUncertain={() => void control("resume", { skip_uncertain: true })}
-            onAbort={openAbortConfirmation}
+            onAbort={() => openAbortConfirmation("abort")}
             busy={controlBusy}
             controlError={controlError}
             onOpenGenerationRuns={() => onOpenGenerationRuns({
@@ -580,7 +607,7 @@ export default function BatchGenerationPanel({
           }
         />
 
-        {abortConfirm && (
+        {abortIntent && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4 py-6">
             <div
               ref={abortDialogRef}
@@ -589,10 +616,14 @@ export default function BatchGenerationPanel({
               aria-labelledby="abort-generation-title"
               aria-describedby="abort-generation-description"
               tabIndex={-1}
-              className="w-full max-w-sm rounded-md border border-border bg-surface p-5 shadow-lg"
+              className="max-h-[calc(100dvh-3rem)] w-full max-w-sm overflow-y-auto rounded-md border border-border bg-surface p-5 shadow-lg"
             >
-              <h4 id="abort-generation-title" className="text-sm font-semibold text-foreground">{t("abortConfirmTitle")}</h4>
-              <p id="abort-generation-description" className="mt-2 text-xs leading-5 text-warm-700 dark:text-muted">{t("abortConfirmBody")}</p>
+              <h4 id="abort-generation-title" className="text-sm font-semibold text-foreground">
+                {t(abortIntent === "successor" ? "successorConfirmTitle" : "abortConfirmTitle")}
+              </h4>
+              <p id="abort-generation-description" className="mt-2 text-xs leading-5 text-warm-700 dark:text-muted">
+                {t(abortIntent === "successor" ? "successorConfirmBody" : "abortConfirmBody")}
+              </p>
               {controlError && (
                 <p
                   role="alert"
@@ -601,7 +632,7 @@ export default function BatchGenerationPanel({
                   {t("controlError", { message: controlError })}
                 </p>
               )}
-              <div className="mt-4 flex justify-end gap-2">
+              <div className="mt-4 flex flex-wrap justify-end gap-2">
                 <button
                   ref={abortCancelRef}
                   type="button"
@@ -613,15 +644,13 @@ export default function BatchGenerationPanel({
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    void control("abort").then((succeeded) => {
-                      if (succeeded) closeAbortConfirmation();
-                    });
-                  }}
+                  onClick={confirmAbort}
                   disabled={controlBusy}
                   className="min-h-9 rounded-md border border-red-300 bg-red-50 px-3 text-sm font-semibold text-red-800 hover:bg-red-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-600 disabled:opacity-60 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
                 >
-                  {controlBusy ? t("aborting") : t("abortConfirmYes")}
+                  {controlBusy
+                    ? t(abortIntent === "successor" ? "successorPreparing" : "aborting")
+                    : t(abortIntent === "successor" ? "successorConfirmYes" : "abortConfirmYes")}
                 </button>
               </div>
             </div>

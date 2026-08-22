@@ -298,6 +298,8 @@ export interface ChapterProgress {
 
 export interface JobError {
   step: string;
+  message?: string;
+  reason_codes?: string[];
   chapter_id?: string;
   candidate_ids?: string[];
   candidate_names?: string[];

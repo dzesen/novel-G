@@ -2535,6 +2535,7 @@
       "leftoverView": "查看草稿",
       "leftoverResume": "继续续写",
       "resumeAfterSourceChange": "按当前内容重新检查并继续",
+      "startSuccessor": "按当前内容重新预检并创建新作业",
       "leftoverAcceptPartial": "接受部分正文",
       "leftoverDiscardRestart": "丢弃并重开",
       "leftoverDiscardConfirm": "确认丢弃这份草稿并打开干净的生成面板？草稿不会被删除，但会退出未完成列表。",
@@ -2543,6 +2544,7 @@
       "leftoverConfirmDiscard": "确认丢弃并重开",
       "reviewTitle": "检查点复核",
       "reviewRecoveryTitle": "恢复批量生成",
+      "reviewSuccessorTitle": "重新开始批量生成",
       "checkpointWordCount": "正文实际 {actual} / 目标 {target} 字（{ratio}×）",
       "checkpointWordCountOverrun": "明显超出目标；此提示仅供复核，不会拒绝正文或暂停作业。",
       "reasonCheckpoint": "已到计划检查点。复核本窗口后可继续。",
@@ -2553,6 +2555,7 @@
       "reasonManual": "已手动暂停。",
       "reasonInterrupted": "上次意外中断。若请求可能已发往 Provider，必须明确选择重试或跳过，以免无提示地重复计费。",
       "reasonSourceChanged": "生成期间章节或叙事状态已被修改或删除。已保留作者的最新内容并暂停；确认当前内容后再显式继续。",
+      "reasonSourceChangedSuccessor": "当前内容已经取代旧快照，原作业无法继续。已完成章节和作者修改均会保留；请结束旧作业，再按当前内容重新预检。",
       "reasonAuthorizationScopeIncreased": "接受章纲后，剩余正文的最大调用次数或 token 上界超出了原授权。当前尚未生成正文；请查看新的继续授权后再决定。",
       "reasonReferenceCardReview": "章纲发现了下一章会依赖的新资料卡候选，当前已在下一次模型调用前暂停。请先完成候选审核；全部解决后原任务会自动继续。",
       "reasonReferenceCardAutoCreationRecovery": "安全自动建卡的结果尚未完整写回作业记录。系统已在下一次模型调用前暂停；重试只会恢复同一个已授权变更，不会扩大范围或重复建卡。",
@@ -2699,7 +2702,11 @@
       "abortConfirmBody": "将立即掐断在跑的生成，当前半章作废。已完成的章保留。",
       "abortConfirmYes": "中止",
       "aborting": "正在中止…",
-      "abortConfirmNo": "取消"
+      "abortConfirmNo": "取消",
+      "successorConfirmTitle": "使用当前内容重新开始？",
+      "successorConfirmBody": "旧作业绑定的内容快照已经失效，不能继续。结束旧作业不会删除或回退已完成章节和作者修改，也不会调用 Provider；随后将为相同范围打开新的预检与启动确认。",
+      "successorConfirmYes": "结束旧作业并重新预检",
+      "successorPreparing": "正在准备重新预检…"
     },
     "prose": {
       "title": "AI 写正文",
