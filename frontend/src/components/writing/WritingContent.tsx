@@ -365,8 +365,17 @@ export default function WritingContent({ mode, novelId }: WritingContentProps) {
   );
 
   const openAutoBook = useCallback(
-    (scope: "volume" | "book", volumeId?: string) => {
-      setAutoBookStartRequest({ requestId: Date.now(), scope, volumeId });
+    (
+      scope: "volume" | "book",
+      volumeId?: string,
+      preferWorldAutoSupplement = false,
+    ) => {
+      setAutoBookStartRequest({
+        requestId: Date.now(),
+        scope,
+        volumeId,
+        preferWorldAutoSupplement,
+      });
       navigateView("auto-book", "readiness", volumeId ? { volume: volumeId } : {});
     },
     [navigateView],

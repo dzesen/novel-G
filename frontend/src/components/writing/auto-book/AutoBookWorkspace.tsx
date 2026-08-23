@@ -37,6 +37,7 @@ export interface AutoBookStartRequest {
   requestId: number;
   scope: "volume" | "book";
   volumeId?: string;
+  preferWorldAutoSupplement?: boolean;
 }
 
 interface AutoBookWorkspaceProps {
@@ -104,6 +105,8 @@ export default function AutoBookWorkspace({
     targets.volume ?? null,
   );
   const [startScope, setStartScope] = useState<"volume" | "book" | null>(null);
+  const [preferWorldAutoSupplement, setPreferWorldAutoSupplement] =
+    useState(false);
   const startTriggerRef = useRef<HTMLElement | null>(null);
   const [proseRunsRevision, setProseRunsRevision] = useState(0);
   const structureRequestRef = useRef(0);
@@ -172,6 +175,9 @@ export default function AutoBookWorkspace({
     startTriggerRef.current = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
+    setPreferWorldAutoSupplement(
+      Boolean(startRequest.preferWorldAutoSupplement),
+    );
     setStartScope(startRequest.scope);
     onStartRequestConsumed();
   }, [onStartRequestConsumed, startRequest]);
@@ -192,10 +198,12 @@ export default function AutoBookWorkspace({
     startTriggerRef.current = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
+    setPreferWorldAutoSupplement(false);
     setStartScope(scope);
   };
   const closeStartDialog = () => {
     setStartScope(null);
+    setPreferWorldAutoSupplement(false);
     window.requestAnimationFrame(() => {
       if (startTriggerRef.current?.isConnected) startTriggerRef.current.focus();
     });
@@ -208,6 +216,7 @@ export default function AutoBookWorkspace({
       ? document.activeElement
       : null;
     if (volumeId) setSelectedVolumeId(volumeId);
+    setPreferWorldAutoSupplement(false);
     setStartScope(scope === "volume" && !volumeId ? null : scope);
     onNavigateView(
       "readiness",
@@ -462,9 +471,10 @@ export default function AutoBookWorkspace({
               structureLoadedNovelId === novelId && !loadError
             }
             startScope={purpose === "start" ? startScope : null}
+            preferWorldAutoSupplement={preferWorldAutoSupplement}
             onStartClose={closeStartDialog}
             onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}
-            onQuietRefresh={() => void loadStructure(true)}
+            onQuietRefresh={() => loadStructure(true)}
             onNavigateToMemory={() => onOpenContinuity("facts")}
             onNavigateToBlueprint={onOpenBlueprint}
             onNavigateToWorldBaseline={() => onOpenWorld("baseline")}

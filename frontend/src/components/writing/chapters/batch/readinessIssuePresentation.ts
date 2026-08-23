@@ -52,6 +52,11 @@ export function readinessIssueCopy(
         title: t("readinessIssueWorldBaselineTitle"),
         body: t("readinessIssueWorldBaselineBody"),
       };
+    case "empty_world_auto_supplement_requires_confirmation":
+      return {
+        title: t("readinessIssueEmptyWorldSupplementTitle"),
+        body: t("readinessIssueEmptyWorldSupplementBody"),
+      };
     case "character_cards_missing":
       return {
         title: t("readinessIssueCharacterCardsMissingTitle"),

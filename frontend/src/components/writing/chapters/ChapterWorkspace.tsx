@@ -39,6 +39,7 @@ import ProsePanel from "./prose/ProsePanel";
 import type { ProseRunSnapshot } from "./prose/useProseStream";
 import SceneIllustrationPanel from "./SceneIllustrationPanel";
 import type { LeftoverProseRun } from "./batch/batchTypes";
+import BlueprintCompletionDialog from "./BlueprintCompletionDialog";
 
 interface ChapterWorkspaceProps {
   mode: "create" | "edit";
@@ -59,7 +60,11 @@ interface ChapterWorkspaceProps {
   onStructureAccepted: (
     nextRoute: AcceptVolumeOutlineResponse["next_route"],
   ) => void;
-  onStartAutoBook: (scope: "volume" | "book", volumeId?: string) => void;
+  onStartAutoBook: (
+    scope: "volume" | "book",
+    volumeId?: string,
+    preferWorldAutoSupplement?: boolean,
+  ) => void;
   proseOpenRequest?: ProseOpenRequest | null;
   onProseOpenRequestConsumed: () => void;
 }
@@ -129,6 +134,8 @@ export default function ChapterWorkspace({
   const [loadedChapterId, setLoadedChapterId] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<ChapterSaveState>("idle");
   const [volumeOutlineOpen, setVolumeOutlineOpen] = useState(false);
+  const [blueprintCompletion, setBlueprintCompletion] =
+    useState<AcceptVolumeOutlineResponse | null>(null);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
   const [proseOpen, setProseOpen] = useState(false);
   const [sceneIllustrationOpen, setSceneIllustrationOpen] =
@@ -1077,7 +1084,29 @@ export default function ChapterWorkspace({
               })
             );
             void loadStructure();
-            onStructureAccepted(result.next_route);
+            setBlueprintCompletion(result);
+          }}
+        />
+      )}
+
+      {blueprintCompletion && (
+        <BlueprintCompletionDialog
+          volumeCount={blueprintCompletion.volume_count}
+          chapterCount={blueprintCompletion.chapter_count}
+          onManual={() => setBlueprintCompletion(null)}
+          onVolume={() => {
+            const firstVolumeId = blueprintCompletion.volume_ids[0];
+            setBlueprintCompletion(null);
+            onStartAutoBook("volume", firstVolumeId, true);
+          }}
+          onBook={() => {
+            setBlueprintCompletion(null);
+            onStartAutoBook("book", undefined, true);
+          }}
+          onReviewWorld={() => {
+            const nextRoute = blueprintCompletion.next_route;
+            setBlueprintCompletion(null);
+            onStructureAccepted(nextRoute);
           }}
         />
       )}

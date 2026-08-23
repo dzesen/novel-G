@@ -53,3 +53,10 @@ export function buildAuthorizedStartPayload({
       : {}),
   };
 }
+
+export function readinessChapterCount(
+  readiness: GenerationReadiness | null,
+  fallback: number,
+): number {
+  return readiness ? readiness.work.chapter_count : fallback;
+}

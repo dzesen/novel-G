@@ -2417,11 +2417,16 @@ class GenerationJobService:
                 **protected_generation_params,
                 "prose_continuation_policy": continuation_policy.to_dict(),
             }
+            structure_initialization = await inspect_book_structure_initialization(
+                novel_id,
+                generation_params=generation_params_snapshot,
+            )
             report = await generation_readiness_module.inspect(
                 novel_id=novel_id,
                 scope="book",
                 volume_id=None,
                 chapters=chapters,
+                book_structure_initialization=structure_initialization,
                 outline_deviation_policy=outline_deviation_policy,
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,

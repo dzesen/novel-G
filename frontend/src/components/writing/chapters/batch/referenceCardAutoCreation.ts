@@ -29,3 +29,15 @@ export const DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY: ReferenceCardAutoCreat
   max_auto_creates_per_book: REFERENCE_CARD_AUTO_CREATION_HARD_LIMITS.perBook,
   max_candidate_repair_cycles_per_chapter: 0,
 };
+
+export function initialReferenceCardAutoCreationPolicy(
+  preferWorldAutoSupplement = false,
+): ReferenceCardAutoCreationPolicy {
+  return {
+    ...DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY,
+    enabled: preferWorldAutoSupplement,
+    allowed_card_types: [
+      ...DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY.allowed_card_types,
+    ],
+  };
+}

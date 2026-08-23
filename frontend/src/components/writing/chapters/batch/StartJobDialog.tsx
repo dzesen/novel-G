@@ -11,7 +11,7 @@ import OutlineGenerationParams, {
 import ProseContinuationControls from "../prose/ProseContinuationControls";
 import ReferenceCardAutoCreationControls from "./ReferenceCardAutoCreationControls";
 import {
-  DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY,
+  initialReferenceCardAutoCreationPolicy,
   type ReferenceCardType,
 } from "./referenceCardAutoCreation";
 import { referenceCardTypeTranslationKey } from "./referenceCardAutoCreationPresentation";
@@ -30,6 +30,7 @@ import type {
 } from "./batchTypes";
 import {
   buildAuthorizedStartPayload,
+  readinessChapterCount,
   readinessAllowsStart,
 } from "./readinessPresentation";
 import { readinessIssueCopy } from "./readinessIssuePresentation";
@@ -60,9 +61,15 @@ interface StartJobDialogProps {
   targetHeading: string;    // 目标区小标题（"目标卷" / "目标"）
   targetLabel: string;      // 目标展示名（卷名 / "全书"）
   fillableCount: number;
+  preferWorldAutoSupplement?: boolean;
   requiresStructureInitialization?: boolean;
   onSubmitted: (job: GenerationJob) => void;
-  onStructureInitialized?: (result: BookStructureInitializationResult) => void;
+  onStructureInitialized?: (
+    result: BookStructureInitializationResult,
+  ) => void | Promise<void>;
+  onReadinessLoaded?: (
+    readiness: GenerationReadiness,
+  ) => void | Promise<void>;
   onClose: () => void;
   onNavigateToReferenceCards: () => void;
   onNavigateToWorldBaseline: () => void;
@@ -76,9 +83,11 @@ export default function StartJobDialog({
   targetHeading,
   targetLabel,
   fillableCount,
+  preferWorldAutoSupplement = false,
   requiresStructureInitialization = false,
   onSubmitted,
   onStructureInitialized,
+  onReadinessLoaded,
   onClose,
   onNavigateToReferenceCards,
   onNavigateToWorldBaseline,
@@ -95,12 +104,9 @@ export default function StartJobDialog({
   const [continuationPolicy, setContinuationPolicy] =
     useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
   const [referenceCardAutoCreationPolicy, setReferenceCardAutoCreationPolicy] =
-    useState(() => ({
-      ...DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY,
-      allowed_card_types: [
-        ...DEFAULT_REFERENCE_CARD_AUTO_CREATION_POLICY.allowed_card_types,
-      ],
-    }));
+    useState(() => initialReferenceCardAutoCreationPolicy(
+      preferWorldAutoSupplement,
+    ));
 
   const [outlineDeviationPolicy, setOutlineDeviationPolicy] =
     useState<OutlineDeviationPolicy>("pause_for_rewrite");
@@ -130,6 +136,7 @@ export default function StartJobDialog({
     && readinessConfiguration === readinessConfigurationKey;
   const [acknowledgedCodes, setAcknowledgedCodes] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const structureFlow = scope === "book" && (
     readiness
       ? Number(readiness.work.structure?.generate ?? 0) > 0
@@ -141,6 +148,10 @@ export default function StartJobDialog({
   );
   const structureTargetChapterCount = Number(
     readiness?.work.structure?.target_chapter_count ?? 0,
+  );
+  const effectiveChapterCount = readinessChapterCount(
+    readiness,
+    fillableCount,
   );
 
   const loadReadiness = useCallback(async (preserveError = false) => {
@@ -160,6 +171,7 @@ export default function StartJobDialog({
       setReadiness(report);
       setReadinessConfiguration(readinessConfigurationKey);
       setAcknowledgedCodes(new Set());
+      await onReadinessLoaded?.(report);
     } catch (err) {
       setReadiness(null);
       setReadinessConfiguration(null);
@@ -174,6 +186,7 @@ export default function StartJobDialog({
     generationOverrides,
     parsedTokenBudget,
     outlineDeviationPolicy,
+    onReadinessLoaded,
     referenceCardAutoCreationPolicy,
     readinessConfigurationKey,
     scope,
@@ -282,7 +295,18 @@ export default function StartJobDialog({
           `/api/generation-jobs/book/${targetId}/initialize-structure`,
           payload,
         );
-        onStructureInitialized?.(result);
+        await onStructureInitialized?.(result);
+        setReadiness(null);
+        setReadinessConfiguration(null);
+        setAcknowledgedCodes(new Set());
+        setReferenceCardAutoCreationPolicy(
+          initialReferenceCardAutoCreationPolicy(true),
+        );
+        setStage("authorization");
+        setNotice(t("dialogStructureCreatedContinue", {
+          volumes: result.volume_count,
+          chapters: result.chapter_count,
+        }));
       } else {
         const job = await apiPost<GenerationJob>(
           `/api/generation-jobs/${scope}/${targetId}`,
@@ -385,10 +409,19 @@ export default function StartJobDialog({
                         count: structureTargetChapterCount,
                       })
                     : t("dialogStructureTargetPending")
-                  : t("dialogFillable", { count: fillableCount })}
+                  : t("dialogFillable", { count: effectiveChapterCount })}
               </span>
             </div>
           </div>
+
+          {notice && (
+            <p
+              role="status"
+              className="rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2.5 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-100"
+            >
+              {notice}
+            </p>
+          )}
 
           {stage === "authorization" && (
             <>

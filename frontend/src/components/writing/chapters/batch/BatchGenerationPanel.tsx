@@ -46,9 +46,10 @@ interface BatchGenerationPanelProps {
   chapters: ChapterSummary[];
   structureLoaded: boolean;
   startScope: "volume" | "book" | null;
+  preferWorldAutoSupplement: boolean;
   onStartClose: () => void;
   onJumpToChapter: (chapterId: string) => void;
-  onQuietRefresh: () => void;
+  onQuietRefresh: () => Promise<void>;
   onNavigateToMemory: () => void;
   onNavigateToBlueprint: () => void;
   onNavigateToWorldBaseline: () => void;
@@ -79,6 +80,7 @@ export default function BatchGenerationPanel({
   chapters,
   structureLoaded,
   startScope,
+  preferWorldAutoSupplement,
   onStartClose,
   onJumpToChapter,
   onQuietRefresh,
@@ -339,6 +341,8 @@ export default function BatchGenerationPanel({
         targetHeading={t("dialogVolumeLabel")}
         targetLabel={selectedVolume?.title ?? ""}
         fillableCount={fillableCount}
+        preferWorldAutoSupplement={preferWorldAutoSupplement}
+        onReadinessLoaded={onQuietRefresh}
         requiresStructureInitialization={false}
         onClose={onStartClose}
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
@@ -359,6 +363,8 @@ export default function BatchGenerationPanel({
         targetHeading={t("dialogBookLabel")}
         targetLabel={t("dialogBookTarget")}
         fillableCount={bookFillableCount}
+        preferWorldAutoSupplement={preferWorldAutoSupplement}
+        onReadinessLoaded={onQuietRefresh}
         requiresStructureInitialization={
           structureLoaded && volumes.length === 0 && chapters.length === 0
         }
@@ -366,10 +372,8 @@ export default function BatchGenerationPanel({
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onNavigateToWorldBaseline={onNavigateToWorldBaseline}
         onNavigateToBookStructure={onNavigateToBlueprint}
-        onStructureInitialized={() => {
-          onQuietRefresh();
-          onStartClose();
-          onNavigateToWorldBaseline();
+        onStructureInitialized={async () => {
+          await onQuietRefresh();
         }}
         onSubmitted={(started) => {
           setDismissed(null);

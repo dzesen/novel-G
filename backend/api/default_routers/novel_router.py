@@ -1,4 +1,6 @@
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Dict, List, Literal, Optional
 
@@ -303,7 +305,7 @@ async def get_novel(
             "chapter_count": novel.get("current_chapter_count", 0),
             "total_word_count": novel.get("current_word_count", 0)
         }
-        return novel
+        return jsonable_encoder(novel, custom_encoder={ObjectId: str})
     except NotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except InvalidIdError as e:

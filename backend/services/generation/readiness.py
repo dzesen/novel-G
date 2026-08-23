@@ -449,6 +449,25 @@ class GenerationReadinessModule:
         world_baseline_state = str(
             resources.get("world_baseline_state") or "not_required_legacy"
         )
+        world_material_count = sum(
+            int(resources.get(kind) or 0)
+            for kind in (
+                "character",
+                "location",
+                "item",
+                "rule",
+                "lore",
+                "factions",
+                "relationships",
+            )
+        )
+        empty_world_auto_supplement = bool(
+            not has_structure_work
+            and has_chapter_work
+            and world_baseline_state == "required"
+            and world_material_count == 0
+            and auto_creation_policy.enabled
+        )
         if (
             not has_structure_work
             and world_baseline_state in {
@@ -457,14 +476,28 @@ class GenerationReadinessModule:
                 "blocked_pending_decisions",
             }
         ):
-            issues.append(
-                _issue(
-                    "world_baseline_confirmation_required",
-                    "blocked",
-                    details={"state": world_baseline_state},
-                    action_codes=["open_world_baseline"],
+            if empty_world_auto_supplement:
+                issues.append(
+                    _issue(
+                        "empty_world_auto_supplement_requires_confirmation",
+                        "warning_requires_ack",
+                        details={
+                            "allowed_card_types": list(
+                                auto_creation_policy.allowed_card_types
+                            )
+                        },
+                        action_codes=["review_reference_card_auto_creation"],
+                    )
                 )
-            )
+            else:
+                issues.append(
+                    _issue(
+                        "world_baseline_confirmation_required",
+                        "blocked",
+                        details={"state": world_baseline_state},
+                        action_codes=["open_world_baseline"],
+                    )
+                )
 
         if structure_state == "missing":
             issues.append(
@@ -1020,6 +1053,7 @@ class GenerationReadinessModule:
             **planning,
             "prose_continuation_authorization": prose_authorization,
             "chapter_finalization_authorization": finalization_authorization,
+            "empty_world_auto_supplement": empty_world_auto_supplement,
             "reference_card_auto_creation_policy": (
                 auto_creation_policy.model_dump(mode="json")
             ),
@@ -1331,21 +1365,29 @@ class GenerationReadinessModule:
 
 async def _load_resource_counts(novel_id: str) -> dict[str, Any]:
     from backend.db.narrative_revision import narrative_revision_store
-    from backend.db.repositories.character_repository import character_repo
     from backend.db.repositories.novel_repository import novel_repo
-    from backend.db.repositories.worldbook_repository import worldbook_repo
     from backend.services.novel.world_baseline import WorldBaselineService
 
     novel = await novel_repo.get_novel_by_id(novel_id)
     world_baseline = await WorldBaselineService.inspect(novel_id)
+    material_counts = dict(world_baseline.get("counts") or {})
     result = {
         "owner_id": str(novel.get("owner_id") or ""),
-        "character": len(await character_repo.list_cards(novel_id, "character")),
+        **{
+            key: int(material_counts.get(key) or 0)
+            for key in (
+                "character",
+                "location",
+                "item",
+                "rule",
+                "lore",
+                "factions",
+                "relationships",
+            )
+        },
         "narrative_revision": await narrative_revision_store.current(novel_id),
         "world_baseline_state": world_baseline["state"],
     }
-    for card_type in ("location", "item", "rule", "lore"):
-        result[card_type] = len(await worldbook_repo.list_cards(novel_id, card_type))
     return result
 
 
