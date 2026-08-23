@@ -44,6 +44,7 @@ from backend.llm.schemas.novel_pydantic import (
     ChapterStateResultSchema,
 )
 from backend.llm.models import TokenUsage
+from backend.llm.stream_terminal import INCOMPLETE_FINISH_REASONS
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
     project_state_context,
@@ -502,6 +503,25 @@ def _has_zero_pre_dispatch_evidence(data: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_reported_incomplete_terminal(data: Mapping[str, Any]) -> bool:
+    """Distinguish an exhausted Provider stream from a raised stream error.
+
+    ``stream_prose`` reports terminal finish reasons such as ``length`` or
+    ``error`` with a complete usage receipt and ``completion_status``.  Those
+    frames must reach the scene executor, which persists the draft and applies
+    its continuation/pause policy.  Raised transport/provider exceptions use
+    ``usage_so_far`` instead and still become ``WorkflowFailed`` below.
+    """
+
+    return bool(
+        data.get("completion_status") == "incomplete"
+        and data.get("finish_reason")
+        in INCOMPLETE_FINISH_REASONS
+        and isinstance(data.get("usage"), Mapping)
+        and "usage_so_far" not in data
+    )
+
+
 async def _stream_prose_deltas(
     frames: AsyncIterator[str],
 ) -> AsyncIterator[str]:
@@ -518,6 +538,8 @@ async def _stream_prose_deltas(
             yield str(data["text"])
             continue
         if name != "done" or data.get("success"):
+            continue
+        if _is_reported_incomplete_terminal(data):
             continue
         boundary = (
             restore_pre_dispatch_boundary(

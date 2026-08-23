@@ -20,7 +20,10 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, AsyncGenerator
 
 from backend.llm.models import TokenUsage
-from backend.llm.stream_terminal import normalize_finish_reason
+from backend.llm.stream_terminal import (
+    INCOMPLETE_FINISH_REASONS,
+    normalize_finish_reason,
+)
 from backend.services.llm.workflow_runner import sse_event
 from backend.services.llm.generation_runtime import GenerationPlan, GenerationRuntime
 from backend.services.llm.pre_dispatch_boundaries import (
@@ -167,13 +170,7 @@ async def stream_prose(
         len(text),
         usage.model_dump().get("total_tokens"),
     )
-    terminal_incomplete = finish_reason in {
-        "length",
-        "content_filter",
-        "tool_call",
-        "cancelled",
-        "error",
-    }
+    terminal_incomplete = finish_reason in INCOMPLETE_FINISH_REASONS
     payload = {
         "success": not terminal_incomplete,
         "text": text,

@@ -14,6 +14,14 @@ FinishReason = Literal[
     "unreported",
 ]
 
+INCOMPLETE_FINISH_REASONS: frozenset[FinishReason] = frozenset({
+    "length",
+    "content_filter",
+    "tool_call",
+    "cancelled",
+    "error",
+})
+
 
 def normalize_finish_reason(raw_reason: Any) -> FinishReason:
     raw = str(raw_reason or "").strip().lower().replace("-", "_").replace(" ", "_")
