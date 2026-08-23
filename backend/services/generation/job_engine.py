@@ -37,6 +37,7 @@ from backend.services.generation.chapter_candidate_authorization import (
 )
 from backend.services.generation.failure_diagnostics import (
     build_failure_diagnostic,
+    incomplete_prose_pre_dispatch_boundary_code,
 )
 from backend.services.generation.job_execution import JobExecutionLeaseLost
 from backend.services.novel.book_completion import BookCompletionReport
@@ -998,14 +999,13 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     progress,
                     tokens_delta=0 if attempts else outcome.tokens,
                 )
-                budget_blocked = (
-                    checkpoint["pause_reason"]
-                    == "token_budget_exceeded_before_dispatch"
-                    or "token_budget_exceeded_before_dispatch"
-                    in checkpoint["reason_codes"]
+                boundary_pause_reason = _pre_dispatch_pause_reason(
+                    incomplete_prose_pre_dispatch_boundary_code(
+                        incomplete.completion
+                    )
                 )
-                if budget_blocked:
-                    await _pause(repo, job_id, "cost_cap")
+                if boundary_pause_reason is not None:
+                    await _pause(repo, job_id, boundary_pause_reason)
                     return
                 await repo.update_job_fields(job_id, {
                     "status": "paused",

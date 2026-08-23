@@ -39,6 +39,7 @@ from backend.services.generation.reference_card_auto_creation import (
 from backend.services.llm.context_builder import ContextBudgetError
 from backend.services.llm.pre_dispatch_boundaries import (
     pre_dispatch_boundary_code,
+    restore_pre_dispatch_boundary,
 )
 from backend.services.novel.state_proposal import StaleStatePreview
 
@@ -104,7 +105,34 @@ class ActiveFailureEventResolution:
     kind: ActiveFailureKind | None = None
 
 
-def _authorized_repair_cycle_limit(job: Mapping[str, Any]) -> int | None:
+def incomplete_prose_pre_dispatch_boundary_code(
+    completion: Mapping[str, Any],
+) -> str | None:
+    """Restore only a canonical boundary recorded by the prose runtime."""
+
+    raw_reason_codes = completion.get("reason_codes")
+    reason_codes = (
+        list(raw_reason_codes)
+        if isinstance(raw_reason_codes, (list, tuple))
+        else []
+    )
+    for raw_code in (
+        completion.get("pause_reason"),
+        completion.get("completion_reason"),
+        *reason_codes,
+    ):
+        restored = restore_pre_dispatch_boundary(raw_code)
+        if restored is not None:
+            return pre_dispatch_boundary_code(restored)
+    return None
+
+
+def _repair_event_matches_authority(
+    event: Mapping[str, Any],
+    job: Mapping[str, Any],
+    *,
+    require_final_cycle: bool,
+) -> bool:
     readiness = job.get("readiness")
     planning = (
         readiness.get("planning")
@@ -119,9 +147,61 @@ def _authorized_repair_cycle_limit(job: Mapping[str, Any]) -> int | None:
     try:
         parsed = parse_reference_card_creation_authorization(authorization)
     except (TypeError, ValueError):
-        return None
-    limit = parsed.max_candidate_repair_cycles_per_chapter
-    return limit if limit > 0 else None
+        return False
+    if not isinstance(readiness, Mapping):
+        return False
+    readiness_digest = readiness.get("digest")
+    chapter_id = str(event.get("chapter_id") or "")
+    cycle = event.get("cycle")
+    event_authorization_revision = event.get("authorization_revision")
+    job_authorization_revision = job.get("authorization_revision")
+    event_policy_revision = event.get("policy_revision")
+    if (
+        not isinstance(readiness_digest, str)
+        or len(readiness_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in readiness_digest
+        )
+        or type(cycle) is not int
+        or cycle < 1
+        or cycle > parsed.max_candidate_repair_cycles_per_chapter
+        or (require_final_cycle and cycle != parsed.max_candidate_repair_cycles_per_chapter)
+        or type(event_authorization_revision) is not int
+        or type(job_authorization_revision) is not int
+        or type(event_policy_revision) is not int
+    ):
+        return False
+    work = readiness.get("work")
+    raw_chapters = (
+        work.get("chapters")
+        if isinstance(work, Mapping)
+        else None
+    )
+    if not isinstance(raw_chapters, list) or any(
+        not isinstance(item, Mapping) for item in raw_chapters
+    ):
+        return False
+    readiness_chapter_ids = tuple(
+        str(item.get("chapter_id") or "") for item in raw_chapters
+    )
+    job_volume_id = str(job.get("volume_id") or "") or None
+    return bool(
+        str(job.get("novel_id") or "") == parsed.novel_id
+        and str(job.get("scope") or "") == parsed.scope
+        and job_volume_id == parsed.volume_id
+        and readiness_chapter_ids == parsed.chapter_ids
+        and chapter_id in parsed.chapter_ids
+        and str(event.get("actor_owner_id") or "") == parsed.owner_id
+        and str(event.get("authorization_digest") or "")
+        == parsed.authorization_digest
+        and str(event.get("readiness_digest") or "") == readiness_digest
+        and event_authorization_revision == parsed.authorization_revision
+        and job_authorization_revision == parsed.authorization_revision
+        and event_policy_revision == parsed.policy_revision
+        and str(event.get("event_id") or "")
+        == f"{parsed.authorization_digest}:{chapter_id}:{cycle}"
+    )
 
 
 def _event_matches_pause_reason(
@@ -155,14 +235,22 @@ def _event_matches_pause_reason(
         )
     if pause_reason == "incomplete_scene":
         return is_diagnostic and category == "model_output_incomplete"
-    if pause_reason == "uncertain_attempt":
+    if pause_reason in {"uncertain_attempt", "uncertain_skipped"}:
         return bool(
             (
                 is_diagnostic
                 and category == "provider_or_transport"
                 and code == "provider_attempt_uncertain"
             )
-            or (is_repair and outcome == "uncertain")
+            or (
+                is_repair
+                and outcome == "uncertain"
+                and _repair_event_matches_authority(
+                    event,
+                    job,
+                    require_final_cycle=False,
+                )
+            )
         )
     if pause_reason == "process_restart":
         return bool(
@@ -178,13 +266,11 @@ def _event_matches_pause_reason(
     if pause_reason == "reference_card_repair_exhausted":
         return bool(
             is_repair
-            and (
-                outcome == "exhausted"
-                or (
-                    outcome == "applied"
-                    and type(event.get("cycle")) is int
-                    and event["cycle"] == _authorized_repair_cycle_limit(job)
-                )
+            and outcome in {"applied", "exhausted"}
+            and _repair_event_matches_authority(
+                event,
+                job,
+                require_final_cycle=True,
             )
         )
     return False
@@ -527,6 +613,11 @@ def build_failure_diagnostic(
         (item for item in chain if isinstance(item, IncompleteProseGeneration)),
         None,
     )
+    incomplete_boundary_code = (
+        incomplete_prose_pre_dispatch_boundary_code(incomplete.completion)
+        if incomplete is not None
+        else None
+    )
     if (
         incomplete is not None
         and str(incomplete.completion.get("completion_reason") or "")
@@ -535,6 +626,12 @@ def build_failure_diagnostic(
         completion = dict(incomplete.completion)
         category = "source_changed"
         code = "outline_revision_stale"
+        evidence = "confirmed"
+        details.update(_safe_completion(completion))
+    elif incomplete is not None and incomplete_boundary_code is not None:
+        completion = dict(incomplete.completion)
+        category = "context_or_budget"
+        code = incomplete_boundary_code
         evidence = "confirmed"
         details.update(_safe_completion(completion))
     elif incomplete is not None:

@@ -3499,6 +3499,22 @@ class GenerationJobRepository:
         job_id: str,
         event: Dict[str, Any],
     ) -> bool:
+        event_id = self._validated_diagnostic_event_id(event)
+        result = await self._collection_update_one(
+            {"_id": to_object_id(job_id), "is_deleted": False},
+            {
+                "$push": {"diagnostics": {"$each": [dict(event)], "$slice": -200}},
+                "$set": {
+                    "diagnostic_schema_version": 1,
+                    "current_failure_event_id": event_id,
+                    "updated_at": get_utc_now(),
+                },
+            },
+        )
+        return result.matched_count > 0
+
+    @staticmethod
+    def _validated_diagnostic_event_id(event: Mapping[str, Any]) -> str:
         event_id = event.get("event_id")
         if (
             not isinstance(event_id, str)
@@ -3507,11 +3523,38 @@ class GenerationJobRepository:
             or len(event_id) > 240
         ):
             raise ValueError("Generation diagnostic event id is invalid")
+        return event_id
+
+    async def pause_for_source_change(
+        self,
+        job_id: str,
+        *,
+        diagnostic: Mapping[str, Any],
+        error: Mapping[str, Any],
+    ) -> bool:
+        """Atomically bind a source-change pause to its owning diagnostic."""
+
+        event_id = self._validated_diagnostic_event_id(diagnostic)
+        if (
+            diagnostic.get("schema_version") != 1
+            or str(diagnostic.get("category") or "") != "source_changed"
+            or str(error.get("step") or "") != "source_changed"
+        ):
+            raise ValueError("Source-change diagnostic contract is invalid")
         result = await self._collection_update_one(
             {"_id": to_object_id(job_id), "is_deleted": False},
             {
-                "$push": {"diagnostics": {"$each": [dict(event)], "$slice": -200}},
+                "$push": {
+                    "diagnostics": {
+                        "$each": [dict(diagnostic)],
+                        "$slice": -200,
+                    }
+                },
                 "$set": {
+                    "status": "paused",
+                    "pause_reason": "source_changed",
+                    "active_slot": None,
+                    "error": dict(error),
                     "diagnostic_schema_version": 1,
                     "current_failure_event_id": event_id,
                     "updated_at": get_utc_now(),
