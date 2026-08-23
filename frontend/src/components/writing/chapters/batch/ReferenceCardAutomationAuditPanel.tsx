@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import type { GenerationJob } from "./batchTypes";
 import type { ReferenceCardType } from "./referenceCardAutoCreation";
@@ -13,11 +14,12 @@ interface ReferenceCardAutomationAuditProps {
   job: GenerationJob;
   titleForChapter: (chapterId: string) => string;
   onJumpToChapter: (chapterId: string) => void;
-  onNavigateToReferenceCards: (
+  onNavigateToReferenceCards?: (
     cardType?: ReferenceCardType,
     cardId?: string,
   ) => void;
-  onNavigateToReferenceCardCandidates: (candidateId?: string) => void;
+  onNavigateToReferenceCardCandidates?: (candidateId?: string) => void;
+  highlightedEventId?: string;
 }
 
 const MAX_VISIBLE_EVENTS = 8;
@@ -42,15 +44,17 @@ function AuditRow({
   onJumpToChapter,
   onNavigateToReferenceCards,
   onNavigateToReferenceCardCandidates,
+  highlighted,
 }: {
   item: ReferenceCardAutomationAuditItem;
   titleForChapter: (chapterId: string) => string;
   onJumpToChapter: (chapterId: string) => void;
-  onNavigateToReferenceCards: (
+  onNavigateToReferenceCards?: (
     cardType?: ReferenceCardType,
     cardId?: string,
   ) => void;
-  onNavigateToReferenceCardCandidates: (candidateId?: string) => void;
+  onNavigateToReferenceCardCandidates?: (candidateId?: string) => void;
+  highlighted: boolean;
 }) {
   const t = useTranslations("writing.batch");
   const typeT = useTranslations("writing.referenceCards.types");
@@ -72,9 +76,22 @@ function AuditRow({
     || item.sourceMutationId
     || item.mutationReceiptId,
   );
+  const rowRef = useRef<HTMLLIElement>(null);
+  useEffect(() => {
+    if (highlighted) {
+      rowRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [highlighted]);
 
   return (
-    <li className="grid min-w-0 gap-2 border-t border-border px-3 py-3 first:border-t-0 sm:px-4">
+    <li
+      ref={rowRef}
+      data-automation-event-id={item.eventId}
+      aria-current={highlighted ? "true" : undefined}
+      className={`grid min-w-0 gap-2 border-t border-border px-3 py-3 first:border-t-0 sm:px-4 ${
+        highlighted ? "bg-accent/10 ring-2 ring-inset ring-accent" : ""
+      }`}
+    >
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${outcomeTone(item.outcome)}`}>
           {t(`referenceCardAuditOutcome.${item.outcome}`)}
@@ -98,7 +115,7 @@ function AuditRow({
         >
           {t("referenceCardAuditOpenSource", { chapter: chapterTitle })}
         </button>
-        {firstCandidateId && (
+        {firstCandidateId && onNavigateToReferenceCardCandidates && (
           <button
             type="button"
             onClick={() => onNavigateToReferenceCardCandidates(firstCandidateId)}
@@ -109,7 +126,7 @@ function AuditRow({
             })}
           </button>
         )}
-        {item.formalCardTargets.map((target) => (
+        {onNavigateToReferenceCards && item.formalCardTargets.map((target) => (
           <button
             key={`${target.cardType}:${target.cardId}`}
             type="button"
@@ -194,11 +211,18 @@ export default function ReferenceCardAutomationAuditPanel({
   onJumpToChapter,
   onNavigateToReferenceCards,
   onNavigateToReferenceCardCandidates,
+  highlightedEventId,
 }: ReferenceCardAutomationAuditProps) {
   const t = useTranslations("writing.batch");
   const items = buildReferenceCardAutomationAudit(job);
   if (items.length === 0) return null;
-  const hiddenCount = Math.max(0, items.length - MAX_VISIBLE_EVENTS);
+  const highlightedItem = items.find(
+    (item) => item.eventId === highlightedEventId,
+  );
+  const orderedItems = highlightedItem
+    ? [highlightedItem, ...items.filter((item) => item !== highlightedItem)]
+    : items;
+  const hiddenCount = Math.max(0, orderedItems.length - MAX_VISIBLE_EVENTS);
 
   return (
     <section
@@ -219,7 +243,7 @@ export default function ReferenceCardAutomationAuditPanel({
         </div>
       </div>
       <ol>
-        {items.slice(0, MAX_VISIBLE_EVENTS).map((item) => (
+        {orderedItems.slice(0, MAX_VISIBLE_EVENTS).map((item) => (
           <AuditRow
             key={`${item.outcome}:${item.eventId}`}
             item={item}
@@ -229,6 +253,7 @@ export default function ReferenceCardAutomationAuditPanel({
             onNavigateToReferenceCardCandidates={
               onNavigateToReferenceCardCandidates
             }
+            highlighted={item.eventId === highlightedEventId}
           />
         ))}
       </ol>
@@ -238,7 +263,7 @@ export default function ReferenceCardAutomationAuditPanel({
             {t("referenceCardAuditOlderHidden", { count: hiddenCount })}
           </summary>
           <ol className="border-t border-border">
-            {items.slice(MAX_VISIBLE_EVENTS).map((item) => (
+            {orderedItems.slice(MAX_VISIBLE_EVENTS).map((item) => (
               <AuditRow
                 key={`${item.outcome}:${item.eventId}`}
                 item={item}
@@ -248,6 +273,7 @@ export default function ReferenceCardAutomationAuditPanel({
                 onNavigateToReferenceCardCandidates={
                   onNavigateToReferenceCardCandidates
                 }
+                highlighted={item.eventId === highlightedEventId}
               />
             ))}
           </ol>

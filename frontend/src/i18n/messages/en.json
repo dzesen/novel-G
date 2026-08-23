@@ -2722,6 +2722,7 @@
       "bookAuditJobMismatch": "This audit evidence belongs to a different whole-book Job, so it cannot prove book completion.",
       "bookAuditActions": {
         "blueprint": "Open book blueprint",
+        "world_baseline": "Review world baseline",
         "chapter": "Open chapter",
         "memory": "Check continuity and state",
         "reference_cards": "Check world material",
@@ -2761,6 +2762,10 @@
         "generationSourceChanged": "Formal prose or narrative state changed concurrently during generation and remains unresolved.",
         "referenceCardRepairExhausted": "Reference-candidate repair exhausted its authorized cycles and still needs a human decision.",
         "repairCheckpointUnresolved": "An interrupted candidate repair or state-write checkpoint remains unresolved.",
+        "worldBaselineNotCurrent": "The world-material baseline is unconfirmed or stale after structure or material changes.",
+        "currentFailureEventMissing": "The active generation failure has no locatable diagnostic event and is treated as incomplete.",
+        "currentFailureEventInvalid": "The active failure points to an event that does not belong uniquely to this Job.",
+        "generationFailureActive": "This Job still has an unresolved generation failure.",
         "unknown": "Found {count} audit blocker(s) this version cannot explain. Inspect generation records."
       },
       "resultAborted": "Job aborted.",

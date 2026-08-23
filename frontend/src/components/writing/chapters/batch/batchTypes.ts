@@ -57,6 +57,14 @@ export interface BookCompletionAudit {
     frozen_job_id: string | null;
     frozen_worklist_digest: string | null;
     matches_frozen_worklist: boolean | null;
+    world_baseline_state?:
+      | "required"
+      | "current"
+      | "stale"
+      | "blocked_pending_decisions"
+      | "not_required_legacy"
+      | "invalid";
+    world_baseline_confirmed_at?: string | null;
   };
   summary: {
     volume_count: number;

@@ -526,15 +526,20 @@ export default function BatchGenerationPanel({
             titleForChapter={titleForChapter}
             onJumpToChapter={onJumpToChapter}
             onNavigateToBlueprint={onNavigateToBlueprint}
+            onNavigateToWorldBaseline={onNavigateToWorldBaseline}
             onNavigateToMemory={onNavigateToMemory}
             onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
-            onNavigateToReferenceCardCandidates={() => (
-              onNavigateToReferenceCardCandidates()
+            onNavigateToReferenceCardCandidates={(candidateId) => (
+              onNavigateToReferenceCardCandidates(candidateId)
             )}
             onNavigateToPlotThreads={onNavigateToPlotThreads}
-            onOpenGenerationRuns={() => onOpenGenerationRuns({
-              jobId: job._id,
-              chapterId: job.current_chapter_id ?? job.error?.chapter_id ?? undefined,
+            onOpenGenerationRuns={(target) => onOpenGenerationRuns({
+              jobId: target?.jobId ?? job._id,
+              chapterId: target?.chapterId
+                ?? job.current_chapter_id
+                ?? job.error?.chapter_id
+                ?? undefined,
+              eventId: target?.eventId,
             })}
             onRefresh={job.status === "completed"
               ? () => setCurrentBookAuditRevision((value) => value + 1)

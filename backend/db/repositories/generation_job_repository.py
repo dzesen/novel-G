@@ -266,6 +266,7 @@ def _execution_interruption_pipeline(
 ) -> list[dict[str, Any]]:
     """Publish one complete execution takeover without an unfenced tail write."""
 
+    interruption_event_id = f"execution-interruption:{previous_epoch + 1}"
     pending_or_uncertain = {
         "$or": [
             {"$eq": ["$has_uncertain_attempts", True]},
@@ -289,6 +290,48 @@ def _execution_interruption_pipeline(
                 ]
             },
         ]
+    }
+    interruption_diagnostic = {
+        "schema_version": 1,
+        "event_id": interruption_event_id,
+        "category": {
+            "$cond": [
+                pending_or_uncertain,
+                "provider_or_transport",
+                "unknown_system",
+            ]
+        },
+        "code": {
+            "$cond": [
+                pending_or_uncertain,
+                "provider_attempt_uncertain",
+                "process_restart",
+            ]
+        },
+        "evidence": "confirmed",
+        "source": "runtime",
+        "step": "execution_recovery",
+        "chapter_id": {"$ifNull": ["$current_chapter_id", None]},
+        "occurred_at": now,
+        "impact": {
+            "$cond": [
+                pending_or_uncertain,
+                "provider_attempt_outcome_unknown",
+                "execution_interrupted_before_stable_state",
+            ]
+        },
+        "action_codes": {
+            "$cond": [
+                pending_or_uncertain,
+                ["review_provider_attempt", "resume_generation_job"],
+                ["resume_generation_job"],
+            ]
+        },
+        "details": {
+            "execution_epoch": previous_epoch + 1,
+            "has_uncertain_attempts": pending_or_uncertain,
+            "reason": reason,
+        },
     }
     return [
         {
@@ -344,6 +387,25 @@ def _execution_interruption_pipeline(
                 },
                 "active_slot": None,
                 "has_uncertain_attempts": pending_or_uncertain,
+                "diagnostics": {
+                    "$slice": [
+                        {
+                            "$concatArrays": [
+                                {
+                                    "$cond": [
+                                        {"$isArray": "$diagnostics"},
+                                        "$diagnostics",
+                                        [],
+                                    ]
+                                },
+                                [interruption_diagnostic],
+                            ]
+                        },
+                        -200,
+                    ]
+                },
+                "diagnostic_schema_version": 1,
+                "current_failure_event_id": interruption_event_id,
                 "updated_at": now,
             }
         },
@@ -2415,6 +2477,7 @@ class GenerationJobRepository:
                         frozen.next_narrative_revision
                     ),
                     "current_chapter_id": None,
+                    "current_failure_event_id": None,
                     "updated_at": get_utc_now(),
                 },
                 "$unset": {"job_mutation_recovery": ""},
@@ -2863,6 +2926,7 @@ class GenerationJobRepository:
                 "current_chapter_id": None,
                 "active_slot": None,
                 "error": error,
+                "current_failure_event_id": None,
                 "completion_audit": report.model_dump(mode="json"),
                 "updated_at": now,
             },
@@ -3295,6 +3359,7 @@ class GenerationJobRepository:
                 "$set": {
                     "candidate_pipeline_checkpoints": [],
                     "current_chapter_id": None,
+                    "current_failure_event_id": None,
                     **(
                         {
                             "expected_narrative_revision": (
@@ -3434,16 +3499,35 @@ class GenerationJobRepository:
         job_id: str,
         event: Dict[str, Any],
     ) -> bool:
+        event_id = event.get("event_id")
+        if (
+            not isinstance(event_id, str)
+            or not event_id
+            or event_id != event_id.strip()
+            or len(event_id) > 240
+        ):
+            raise ValueError("Generation diagnostic event id is invalid")
         result = await self._collection_update_one(
             {"_id": to_object_id(job_id), "is_deleted": False},
             {
                 "$push": {"diagnostics": {"$each": [dict(event)], "$slice": -200}},
-                "$set": {"diagnostic_schema_version": 1, "updated_at": get_utc_now()},
+                "$set": {
+                    "diagnostic_schema_version": 1,
+                    "current_failure_event_id": event_id,
+                    "updated_at": get_utc_now(),
+                },
             },
         )
         return result.matched_count > 0
 
-    async def append_progress(self, job_id: str, entry: Dict[str, Any], tokens_delta: int) -> bool:
+    async def append_progress(
+        self,
+        job_id: str,
+        entry: Dict[str, Any],
+        tokens_delta: int,
+        *,
+        resolves_current_failure: bool = False,
+    ) -> bool:
         # $push progress + $inc tokens_used 在一次原子 update 内完成。
         if (
             "candidate_pipeline_completion" in entry
@@ -3470,7 +3554,14 @@ class GenerationJobRepository:
             {
                 "$push": {"progress": entry},
                 "$inc": {"tokens_used": int(tokens_delta)},
-                "$set": {"updated_at": get_utc_now()},
+                "$set": {
+                    "updated_at": get_utc_now(),
+                    **(
+                        {"current_failure_event_id": None}
+                        if resolves_current_failure
+                        else {}
+                    ),
+                },
             },
         )
         if result.matched_count > 0:

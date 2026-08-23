@@ -86,7 +86,10 @@ from backend.services.generation.headless_generation import (
     generate_state_candidate,
     review_prose_candidate,
 )
-from backend.services.generation.failure_diagnostics import summarize_jobs
+from backend.services.generation.failure_diagnostics import (
+    build_failure_diagnostic,
+    summarize_jobs,
+)
 from backend.services.generation.job_engine import (
     JobControl,
     JobEngineDeps,
@@ -656,6 +659,7 @@ def _new_job_doc(
         "confirm_uncertain_prose_retry": False,
         "diagnostic_schema_version": 1,
         "diagnostics": [],
+        "current_failure_event_id": None,
         "outline_deviation_policy": validate_outline_deviation_policy(
             outline_deviation_policy
         ),
@@ -785,15 +789,42 @@ class GenerationJobService:
                 "occurred_at": repair.get("occurred_at") or get_utc_now(),
             }
 
-        recorded_repair_cycles = {
-            int(event.get("cycle"))
+        async def record_repair_failure(
+            failure: BaseException,
+            *,
+            cycle: int,
+        ) -> str:
+            diagnostic = build_failure_diagnostic(
+                failure,
+                step=f"reference-card-repair:{cycle}",
+                chapter_id=current_chapter_id,
+                occurred_at=get_utc_now(),
+            )
+            await generation_job_repo.append_diagnostic(job_id, diagnostic)
+            return str(diagnostic["event_id"])
+
+        recorded_repair_events = [
+            dict(event)
             for event in list(job.get("reference_card_repair_events") or [])
             if isinstance(event, Mapping)
             and type(event.get("cycle")) is int
             and str(event.get("chapter_id") or "") == current_chapter_id
             and str(event.get("authorization_digest") or "")
             == str((authorization or {}).get("authorization_digest") or "")
+        ]
+        recorded_repair_cycles = {
+            int(event.get("cycle"))
+            for event in recorded_repair_events
         }
+        latest_recorded_repair_event = max(
+            recorded_repair_events,
+            key=lambda item: int(item["cycle"]),
+            default=None,
+        )
+        last_repair: dict[str, Any] | None = None
+        last_repair_event_id = str(
+            (latest_recorded_repair_event or {}).get("event_id") or ""
+        )
         pending_repair_event = next(
             (
                 dict(event)
@@ -991,6 +1022,8 @@ class GenerationJobService:
                 )
                 current_revision = repair_next_revision
                 recorded_repair_cycles.add(cycle)
+                last_repair = dict(recovered)
+                last_repair_event_id = str(repair_event["event_id"])
                 if repair_event["resolution"] is None:
                     pending_repair_event_id = repair_event["event_id"]
                     pending_repair_candidate_ids = set(
@@ -1095,7 +1128,6 @@ class GenerationJobService:
             planning.get("reference_card_repair_plan_authorization")
         )
         latest_denials = list(result.get("denials") or [])
-        last_repair: dict[str, Any] | None = None
         for cycle in range(
             1,
             policy.max_candidate_repair_cycles_per_chapter + 1,
@@ -1144,7 +1176,8 @@ class GenerationJobService:
                     attempt_scope_factory=reserve_attempt_scope,
                     finish_attempt_reservation=finish_attempt_reservation,
                 )
-            except TokenBudgetExceeded:
+            except TokenBudgetExceeded as exc:
+                failure_event_id = await record_repair_failure(exc, cycle=cycle)
                 return {
                     **live_blockers,
                     "auto_creation": {
@@ -1153,9 +1186,11 @@ class GenerationJobService:
                         "created_count": 0,
                         "deny_reasons": list(event["deny_reasons"]),
                         "denials": latest_denials,
+                        "failure_event_id": failure_event_id,
                     },
                 }
-            except AttemptCapacityExceeded:
+            except AttemptCapacityExceeded as exc:
+                failure_event_id = await record_repair_failure(exc, cycle=cycle)
                 return {
                     **live_blockers,
                     "auto_creation": {
@@ -1164,9 +1199,11 @@ class GenerationJobService:
                         "created_count": 0,
                         "deny_reasons": list(event["deny_reasons"]),
                         "denials": latest_denials,
+                        "failure_event_id": failure_event_id,
                     },
                 }
-            except MutationConflictError:
+            except MutationConflictError as exc:
+                failure_event_id = await record_repair_failure(exc, cycle=cycle)
                 return {
                     **live_blockers,
                     "auto_creation": {
@@ -1175,6 +1212,7 @@ class GenerationJobService:
                         "created_count": 0,
                         "deny_reasons": list(event["deny_reasons"]),
                         "denials": latest_denials,
+                        "failure_event_id": failure_event_id,
                     },
                 }
             repair_status = str(repair.get("status") or "")
@@ -1197,6 +1235,7 @@ class GenerationJobService:
             current_revision = repair_next_revision
             recorded_repair_cycles.add(cycle)
             last_repair = repair
+            last_repair_event_id = str(repair_event["event_id"])
             pending_repair_event_id = (
                 repair_event["event_id"]
                 if repair_event["resolution"] is None
@@ -1221,6 +1260,7 @@ class GenerationJobService:
                         "created_count": 0,
                         "deny_reasons": list(event["deny_reasons"]),
                         "denials": latest_denials,
+                        "failure_event_id": last_repair_event_id,
                     },
                 }
             if repair_status != "applied":
@@ -1265,6 +1305,7 @@ class GenerationJobService:
                 "deny_reasons": list(event.get("deny_reasons") or []),
                 "denials": latest_denials,
                 "repair": dict(last_repair or {}),
+                "failure_event_id": last_repair_event_id,
             },
         }
 

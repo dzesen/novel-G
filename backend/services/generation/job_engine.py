@@ -211,6 +211,16 @@ async def finalize_book_job(
     ):
         raise
     except Exception as exc:  # noqa: BLE001 - publish one fail-closed fact
+        await _persist_diagnostic(
+            repo,
+            job_id,
+            build_failure_diagnostic(
+                exc,
+                step="final_audit",
+                chapter_id="",
+                occurred_at=get_utc_now(),
+            ),
+        )
         await repo.publish_book_completion_audit_failure(
             job_id,
             novel_id=novel_id,
@@ -585,7 +595,8 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
         while True:
             if control.abort_requested:
                 await repo.update_job_fields(job_id, {
-                    "status": "aborted", "current_chapter_id": None, "active_slot": None,
+                    "status": "aborted", "current_chapter_id": None,
+                    "current_failure_event_id": None, "active_slot": None,
                 })
                 return
 
@@ -685,6 +696,18 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     job.get("token_budget"),
                 )
             ):
+                await _persist_diagnostic(
+                    repo,
+                    job_id,
+                    build_failure_diagnostic(
+                        TokenBudgetExceeded(
+                            "Job token budget is exhausted before dispatch"
+                        ),
+                        step="job_budget",
+                        chapter_id="",
+                        occurred_at=get_utc_now(),
+                    ),
+                )
                 await _pause(repo, job_id, "cost_cap")
                 return
 
@@ -735,6 +758,16 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 try:
                     blockers = await reference_card_blocker_check()
                 except Exception as exc:  # noqa: BLE001 - preserve exact recovery
+                    await _persist_diagnostic(
+                        repo,
+                        job_id,
+                        build_failure_diagnostic(
+                            exc,
+                            step="reference_card_auto_creation_recovery",
+                            chapter_id=str(chapter.get("_id") or ""),
+                            occurred_at=get_utc_now(),
+                        ),
+                    )
                     await repo.update_job_fields(job_id, {
                         "status": "paused",
                         "pause_reason": (
@@ -774,6 +807,12 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     await repo.update_job_fields(job_id, {
                         "status": "paused",
                         "pause_reason": pause_reason,
+                        "current_failure_event_id": (
+                            str(auto_creation.get("failure_event_id"))
+                            if isinstance(auto_creation, Mapping)
+                            and str(auto_creation.get("failure_event_id") or "")
+                            else None
+                        ),
                         "current_chapter_id": (
                             str((blockers.get("chapter_ids") or [""])[0])
                             if pause_reason
@@ -821,7 +860,8 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     )
                     return
                 await repo.update_job_fields(job_id, {
-                    "status": "completed", "current_chapter_id": None, "active_slot": None,
+                    "status": "completed", "current_chapter_id": None,
+                    "current_failure_event_id": None, "active_slot": None,
                 })
                 return
 
@@ -1026,6 +1066,7 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     job_id,
                     progress,
                     tokens_delta=0 if outcome.attempts else outcome.tokens,
+                    resolves_current_failure=True,
                 )
 
             if outcome.requires_authorization_confirmation:

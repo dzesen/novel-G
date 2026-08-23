@@ -36,6 +36,10 @@ const ISSUE_TRANSLATION_KEYS = {
   generation_source_changed: "generationSourceChanged",
   reference_card_repair_exhausted: "referenceCardRepairExhausted",
   repair_checkpoint_unresolved: "repairCheckpointUnresolved",
+  world_baseline_not_current: "worldBaselineNotCurrent",
+  current_failure_event_missing: "currentFailureEventMissing",
+  current_failure_event_invalid: "currentFailureEventInvalid",
+  generation_failure_active: "generationFailureActive",
 } as const;
 
 export type BookCompletionResult =
@@ -46,6 +50,7 @@ export type BookCompletionResult =
 
 export type BookCompletionAction =
   | "blueprint"
+  | "world_baseline"
   | "chapter"
   | "memory"
   | "reference_cards"
@@ -54,12 +59,68 @@ export type BookCompletionAction =
   | "generation_runs"
   | null;
 
+export interface BookCompletionIssueTarget {
+  chapterId?: string;
+  jobId?: string;
+  eventId?: string;
+  candidateIds: string[];
+}
+
 export interface BookCompletionIssueGroup {
   code: string;
   category: BookCompletionIssueCategory;
   level: "blocking" | "advisory";
   count: number;
-  chapterIds: string[];
+  targets: BookCompletionIssueTarget[];
+}
+
+function normalizedTargetId(value: unknown): string | undefined {
+  if (
+    typeof value === "string"
+    && value.length > 0
+    && value === value.trim()
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function issueTarget(
+  issue: BookCompletionIssue,
+): BookCompletionIssueTarget {
+  const chapterId = normalizedTargetId(issue.chapter_id);
+  const jobId = normalizedTargetId(issue.job_id);
+  const eventId = normalizedTargetId(issue.details.event_id);
+  const candidateIds = issue.details.candidate_ids;
+  return {
+    ...(chapterId ? { chapterId } : {}),
+    ...(jobId ? { jobId } : {}),
+    ...(eventId ? { eventId } : {}),
+    candidateIds: Array.isArray(candidateIds)
+      ? [...new Set(candidateIds
+          .map(normalizedTargetId)
+          .filter((candidateId): candidateId is string => Boolean(candidateId)))]
+      : [],
+  };
+}
+
+function appendIssueTarget(
+  group: BookCompletionIssueGroup,
+  issue: BookCompletionIssue,
+): void {
+  const target = issueTarget(issue);
+  const key = JSON.stringify(target);
+  if (!group.targets.some((item) => JSON.stringify(item) === key)) {
+    group.targets.push(target);
+  }
+}
+
+export function bookCompletionChapterIds(
+  group: Pick<BookCompletionIssueGroup, "targets">,
+): string[] {
+  return [...new Set(group.targets
+    .map((target) => target.chapterId)
+    .filter((chapterId): chapterId is string => Boolean(chapterId)))];
 }
 
 export function bookCompletionAuditMatchesJob(
@@ -99,22 +160,19 @@ export function summarizeBookCompletionIssues(
     const key = `${issue.level}:${issue.category}:${issue.code}`;
     const existing = groups.get(key);
     if (!existing) {
-      groups.set(key, {
+      const group: BookCompletionIssueGroup = {
         code: issue.code,
         category: issue.category,
         level: issue.level,
         count: 1,
-        chapterIds: issue.chapter_id ? [issue.chapter_id] : [],
-      });
+        targets: [],
+      };
+      appendIssueTarget(group, issue);
+      groups.set(key, group);
       continue;
     }
     existing.count += 1;
-    if (
-      issue.chapter_id
-      && !existing.chapterIds.includes(issue.chapter_id)
-    ) {
-      existing.chapterIds.push(issue.chapter_id);
-    }
+    appendIssueTarget(existing, issue);
   }
   return [...groups.values()];
 }
@@ -128,16 +186,19 @@ export function bookCompletionIssueTranslationKey(code: string):
 }
 
 export function bookCompletionAction(
-  group: Pick<BookCompletionIssueGroup, "code" | "category" | "chapterIds">,
+  group: Pick<BookCompletionIssueGroup, "code" | "category" | "targets">,
 ): BookCompletionAction {
-  if (group.chapterIds.length > 0) return "chapter";
-  if (group.category === "structure") return "blueprint";
+  if (group.code === "world_baseline_not_current") {
+    return "world_baseline";
+  }
   if (group.code === "blocking_reference_candidates") {
     return "reference_candidates";
   }
+  if (group.category === "runtime") return "generation_runs";
+  if (bookCompletionChapterIds(group).length > 0) return "chapter";
+  if (group.category === "structure") return "blueprint";
   if (group.category === "reference") return "reference_cards";
   if (group.category === "thread") return "plot_threads";
   if (group.category === "state") return "memory";
-  if (group.category === "runtime") return "generation_runs";
   return null;
 }

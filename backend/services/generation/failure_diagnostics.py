@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from hashlib import sha256
 import json
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from backend.db.errors import InvalidIdError, NotFoundError
+from backend.db.mutation import MutationConflictError
+from backend.db.narrative_revision import NarrativeRevisionConflict
 from backend.llm.exceptions import (
     LLMAuthError,
     LLMConnectionError,
@@ -28,6 +32,9 @@ from backend.services.generation.chapter_candidate_pipeline import (
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     UncertainProseAttempt,
+)
+from backend.services.generation.reference_card_auto_creation import (
+    parse_reference_card_creation_authorization,
 )
 from backend.services.llm.context_builder import ContextBudgetError
 from backend.services.llm.pre_dispatch_boundaries import (
@@ -64,6 +71,185 @@ _CANDIDATE_REPAIR_EXHAUSTED_CODES = {
     "outline_adherence": "candidate_adherence_repair_exhausted",
     "state": "candidate_state_repair_exhausted",
 }
+
+ACTIVE_FAILURE_PAUSE_REASONS = frozenset({
+    "attempt_capacity",
+    "cost_cap",
+    "incomplete_scene",
+    "reference_card_auto_creation_recovery",
+    "reference_card_repair_exhausted",
+    "source_changed",
+    "uncertain_attempt",
+})
+
+
+class ActiveFailureEventState(str, Enum):
+    NOT_ACTIVE = "not_active"
+    MISSING = "missing"
+    INVALID = "invalid"
+    RESOLVED = "resolved"
+
+
+class ActiveFailureKind(str, Enum):
+    ACTIVE = "active"
+    SOURCE_CHANGED = "source_changed"
+    REPAIR_EXHAUSTED = "repair_exhausted"
+
+
+@dataclass(frozen=True)
+class ActiveFailureEventResolution:
+    state: ActiveFailureEventState
+    event: Mapping[str, Any] | None = None
+    event_id: str | None = None
+    kind: ActiveFailureKind | None = None
+
+
+def _authorized_repair_cycle_limit(job: Mapping[str, Any]) -> int | None:
+    readiness = job.get("readiness")
+    planning = (
+        readiness.get("planning")
+        if isinstance(readiness, Mapping)
+        else None
+    )
+    authorization = (
+        planning.get("reference_card_creation_authorization")
+        if isinstance(planning, Mapping)
+        else None
+    )
+    try:
+        parsed = parse_reference_card_creation_authorization(authorization)
+    except (TypeError, ValueError):
+        return None
+    limit = parsed.max_candidate_repair_cycles_per_chapter
+    return limit if limit > 0 else None
+
+
+def _event_matches_pause_reason(
+    event: Mapping[str, Any],
+    pause_reason: str,
+    job: Mapping[str, Any],
+) -> bool:
+    schema = event.get("schema_version")
+    category = str(event.get("category") or "")
+    code = str(event.get("code") or "")
+    step = str(event.get("step") or "")
+    outcome = str(event.get("outcome") or "")
+    is_diagnostic = schema == DIAGNOSTIC_SCHEMA_VERSION
+    is_repair = schema == "reference_card_repair_event.v1"
+
+    if not pause_reason:
+        return is_diagnostic
+    if pause_reason == "source_changed":
+        return is_diagnostic and category == "source_changed"
+    if pause_reason == "cost_cap":
+        return bool(
+            is_diagnostic
+            and category == "context_or_budget"
+            and code == "token_budget_exceeded_before_dispatch"
+        )
+    if pause_reason == "attempt_capacity":
+        return bool(
+            is_diagnostic
+            and category == "context_or_budget"
+            and code == "attempt_capacity_exhausted"
+        )
+    if pause_reason == "incomplete_scene":
+        return is_diagnostic and category == "model_output_incomplete"
+    if pause_reason == "uncertain_attempt":
+        return bool(
+            (
+                is_diagnostic
+                and category == "provider_or_transport"
+                and code == "provider_attempt_uncertain"
+            )
+            or (is_repair and outcome == "uncertain")
+        )
+    if pause_reason == "process_restart":
+        return bool(
+            is_diagnostic
+            and category == "unknown_system"
+            and code == "process_restart"
+            and step == "execution_recovery"
+        )
+    if pause_reason == "reference_card_auto_creation_recovery":
+        return is_diagnostic and step == pause_reason
+    if pause_reason == "final_audit":
+        return is_diagnostic and step == pause_reason
+    if pause_reason == "reference_card_repair_exhausted":
+        return bool(
+            is_repair
+            and (
+                outcome == "exhausted"
+                or (
+                    outcome == "applied"
+                    and type(event.get("cycle")) is int
+                    and event["cycle"] == _authorized_repair_cycle_limit(job)
+                )
+            )
+        )
+    return False
+
+
+def resolve_active_failure_event(
+    job: Mapping[str, Any],
+) -> ActiveFailureEventResolution:
+    """Resolve and validate only the active event explicitly owned by a Job."""
+    status = str(job.get("status") or "")
+    pause_reason = str(job.get("pause_reason") or "")
+    active = status in {"failed", "interrupted"} or (
+        status == "paused" and pause_reason in ACTIVE_FAILURE_PAUSE_REASONS
+    )
+    if not active:
+        return ActiveFailureEventResolution(ActiveFailureEventState.NOT_ACTIVE)
+
+    raw_pointer = job.get("current_failure_event_id")
+    if not isinstance(raw_pointer, str) or not raw_pointer.strip():
+        return ActiveFailureEventResolution(ActiveFailureEventState.MISSING)
+    pointer = raw_pointer.strip()
+    if pointer != raw_pointer or len(pointer) > 240:
+        return ActiveFailureEventResolution(
+            ActiveFailureEventState.INVALID,
+            event_id=pointer,
+        )
+
+    matches: list[Mapping[str, Any]] = []
+    for field in (
+        "diagnostics",
+        "reference_card_repair_events",
+        "reference_card_auto_creation_events",
+    ):
+        raw_events = job.get(field)
+        if not isinstance(raw_events, list):
+            continue
+        matches.extend(
+            event
+            for event in raw_events
+            if isinstance(event, Mapping)
+            and str(event.get("event_id") or "") == pointer
+        )
+    if len(matches) != 1 or not _event_matches_pause_reason(
+        matches[0],
+        pause_reason,
+        job,
+    ):
+        return ActiveFailureEventResolution(
+            ActiveFailureEventState.INVALID,
+            event_id=pointer,
+        )
+
+    kind = (
+        ActiveFailureKind.SOURCE_CHANGED
+        if pause_reason == "source_changed"
+        else ActiveFailureKind.REPAIR_EXHAUSTED
+        if pause_reason == "reference_card_repair_exhausted"
+        else ActiveFailureKind.ACTIVE
+    )
+    return ActiveFailureEventResolution(
+        ActiveFailureEventState.RESOLVED,
+        event=matches[0],
+        event_id=pointer,
+        kind=kind,
+    )
 
 
 def _exception_family(chain: Iterable[BaseException]) -> str:
@@ -376,7 +562,13 @@ def build_failure_diagnostic(
         details.update(_candidate_exception_details(failure))
     elif declared_diagnostic is not None:
         category, code, evidence = declared_diagnostic
-    elif any(isinstance(item, StaleStatePreview) for item in chain):
+    elif any(
+        isinstance(
+            item,
+            (StaleStatePreview, NarrativeRevisionConflict, MutationConflictError),
+        )
+        for item in chain
+    ):
         category = "source_changed"
         code = "chapter_or_narrative_changed"
         evidence = "confirmed"

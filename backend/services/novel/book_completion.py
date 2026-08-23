@@ -31,6 +31,11 @@ from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSE
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation.job_planner import order_book_chapters
+from backend.services.generation.failure_diagnostics import (
+    ActiveFailureEventState,
+    ActiveFailureKind,
+    resolve_active_failure_event,
+)
 from backend.services.novel.chapter_service import count_chapter_words
 from backend.services.novel.emergent_reference_card_candidates import (
     REVIEWABLE_STATUSES,
@@ -45,6 +50,13 @@ BOOK_COMPLETION_AUDIT_SCHEMA_VERSION: Literal["book_completion_audit.v1"] = (
     "book_completion_audit.v1"
 )
 _HEX_64_PATTERN = r"^[0-9a-f]{64}$"
+_WORLD_BASELINE_STATES = frozenset({
+    "required",
+    "blocked_pending_decisions",
+    "current",
+    "stale",
+    "not_required_legacy",
+})
 
 
 class _StrictModel(BaseModel):
@@ -79,6 +91,15 @@ class BookCompletionBlueprintSnapshot(_StrictModel):
         pattern=_HEX_64_PATTERN,
     )
     matches_frozen_worklist: bool | None = None
+    world_baseline_state: Literal[
+        "required",
+        "blocked_pending_decisions",
+        "current",
+        "stale",
+        "not_required_legacy",
+        "invalid",
+    ] = "invalid"
+    world_baseline_confirmed_at: str | None = None
 
 
 class BookCompletionSummary(_StrictModel):
@@ -557,6 +578,42 @@ class BookCompletionAudit:
             for volume in volumes
         ]
         issues: list[BookCompletionIssue] = []
+        # A confirmed world baseline is part of a modern book blueprint.  Old
+        # books without a baseline requirement remain explicitly compatible,
+        # but a required/stale/decision-blocked baseline cannot certify a book.
+        from backend.services.novel.world_baseline import WorldBaselineService
+
+        world_baseline = await WorldBaselineService.inspect(novel_id)
+        raw_world_baseline_state = world_baseline.get("state")
+        world_baseline_state = (
+            raw_world_baseline_state
+            if isinstance(raw_world_baseline_state, str)
+            and raw_world_baseline_state in _WORLD_BASELINE_STATES
+            else "invalid"
+        )
+        raw_stale_reasons = world_baseline.get("stale_reasons")
+        world_baseline_stale_reasons = (
+            [
+                str(reason)
+                for reason in raw_stale_reasons
+                if isinstance(reason, str) and reason
+            ]
+            if isinstance(raw_stale_reasons, list)
+            else []
+        )
+        if world_baseline_state == "invalid":
+            world_baseline_stale_reasons.append("state_missing_or_invalid")
+        if world_baseline_state not in {"current", "not_required_legacy"}:
+            issues.append(
+                BookCompletionIssue(
+                    code="world_baseline_not_current",
+                    category="reference",
+                    details={
+                        "state": world_baseline_state,
+                        "stale_reasons": world_baseline_stale_reasons,
+                    },
+                )
+            )
         if not volumes:
             issues.append(
                 BookCompletionIssue(
@@ -1164,21 +1221,74 @@ class BookCompletionAudit:
                     )
                 )
             pause_reason = str(latest_job.get("pause_reason") or "")
-            if pause_reason == "source_changed":
+            failure = resolve_active_failure_event(latest_job)
+            if failure.state in {
+                ActiveFailureEventState.MISSING,
+                ActiveFailureEventState.INVALID,
+            }:
                 issues.append(
                     BookCompletionIssue(
-                        code="generation_source_changed",
+                        code=(
+                            "current_failure_event_missing"
+                            if failure.state == ActiveFailureEventState.MISSING
+                            else "current_failure_event_invalid"
+                        ),
                         category="runtime",
                         job_id=frozen_job_id,
+                        details={
+                            "pause_reason": pause_reason,
+                            **(
+                                {"event_id": failure.event_id}
+                                if failure.event_id
+                                else {}
+                            ),
+                        },
                     )
                 )
-            exhausted = pause_reason == "reference_card_repair_exhausted"
-            if exhausted:
+            elif (
+                failure.state == ActiveFailureEventState.RESOLVED
+                and failure.event is not None
+            ):
+                issue_code = (
+                    "generation_source_changed"
+                    if failure.kind == ActiveFailureKind.SOURCE_CHANGED
+                    else "reference_card_repair_exhausted"
+                    if failure.kind == ActiveFailureKind.REPAIR_EXHAUSTED
+                    else "generation_failure_active"
+                )
+                event_chapter_id = str(
+                    failure.event.get("chapter_id") or ""
+                )
                 issues.append(
                     BookCompletionIssue(
-                        code="reference_card_repair_exhausted",
+                        code=issue_code,
+                        category="runtime",
+                        chapter_id=event_chapter_id or None,
+                        job_id=frozen_job_id,
+                        details={
+                            "event_id": failure.event_id,
+                            "pause_reason": pause_reason,
+                            **(
+                                {"event_code": failure.event.get("code")}
+                                if failure.event.get("code") is not None
+                                else {}
+                            ),
+                        },
+                    )
+                )
+            elif pause_reason in {
+                "source_changed",
+                "reference_card_repair_exhausted",
+            }:
+                # These reasons are active failures and therefore must have
+                # been resolved above. This branch is defensive against an
+                # unknown future status projection.
+                issues.append(
+                    BookCompletionIssue(
+                        code="current_failure_event_missing",
                         category="runtime",
                         job_id=frozen_job_id,
+                        details={"pause_reason": pause_reason},
                     )
                 )
             if (
@@ -1221,6 +1331,12 @@ class BookCompletionAudit:
                 frozen_job_id=frozen_job_id,
                 frozen_worklist_digest=frozen_worklist_digest,
                 matches_frozen_worklist=matches_frozen_worklist,
+                world_baseline_state=world_baseline_state,
+                world_baseline_confirmed_at=(
+                    str(world_baseline.get("confirmed_at"))
+                    if world_baseline.get("confirmed_at") is not None
+                    else None
+                ),
             ),
             summary=BookCompletionSummary(
                 volume_count=len(volumes),

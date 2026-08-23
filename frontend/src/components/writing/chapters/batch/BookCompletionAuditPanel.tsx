@@ -1,9 +1,13 @@
 "use client";
 
 import { useTranslations } from "next-intl";
-import type { BookCompletionAudit } from "./batchTypes";
+import type {
+  BookCompletionAudit,
+  GenerationRunsNavigationTarget,
+} from "./batchTypes";
 import {
   bookCompletionAction,
+  bookCompletionChapterIds,
   bookCompletionIssueTranslationKey,
   summarizeBookCompletionIssues,
   type BookCompletionAction,
@@ -14,11 +18,12 @@ interface BookCompletionAuditPanelProps {
   titleForChapter: (chapterId: string) => string;
   onJumpToChapter: (chapterId: string) => void;
   onNavigateToBlueprint: () => void;
+  onNavigateToWorldBaseline: () => void;
   onNavigateToMemory: () => void;
   onNavigateToReferenceCards: () => void;
-  onNavigateToReferenceCardCandidates: () => void;
+  onNavigateToReferenceCardCandidates: (candidateId?: string) => void;
   onNavigateToPlotThreads: () => void;
-  onOpenGenerationRuns: () => void;
+  onOpenGenerationRuns: (target?: GenerationRunsNavigationTarget) => void;
   onRefresh?: () => void;
 }
 
@@ -27,6 +32,7 @@ export default function BookCompletionAuditPanel({
   titleForChapter,
   onJumpToChapter,
   onNavigateToBlueprint,
+  onNavigateToWorldBaseline,
   onNavigateToMemory,
   onNavigateToReferenceCards,
   onNavigateToReferenceCardCandidates,
@@ -42,16 +48,31 @@ export default function BookCompletionAuditPanel({
 
   const runAction = (
     action: BookCompletionAction,
-    chapterId?: string,
+    group: ReturnType<typeof summarizeBookCompletionIssues>[number],
   ) => {
+    const target = group.targets.find((item) => (
+      action === "reference_candidates"
+        ? item.candidateIds.length > 0
+        : action === "generation_runs"
+          ? Boolean(item.jobId || item.eventId || item.chapterId)
+          : Boolean(item.chapterId)
+    )) ?? group.targets[0];
+    const chapterId = target?.chapterId;
     if (action === "blueprint") onNavigateToBlueprint();
+    else if (action === "world_baseline") onNavigateToWorldBaseline();
     else if (action === "chapter" && chapterId) onJumpToChapter(chapterId);
     else if (action === "memory") onNavigateToMemory();
     else if (action === "reference_cards") onNavigateToReferenceCards();
     else if (action === "reference_candidates") {
-      onNavigateToReferenceCardCandidates();
+      onNavigateToReferenceCardCandidates(target?.candidateIds[0]);
     } else if (action === "plot_threads") onNavigateToPlotThreads();
-    else if (action === "generation_runs") onOpenGenerationRuns();
+    else if (action === "generation_runs") {
+      onOpenGenerationRuns({
+        jobId: target?.jobId,
+        chapterId,
+        eventId: target?.eventId,
+      });
+    }
   };
 
   return (
@@ -102,8 +123,7 @@ export default function BookCompletionAuditPanel({
         <ul className="grid gap-2">
           {groups.map((group) => {
             const action = bookCompletionAction(group);
-            const chapterId = group.chapterIds[0];
-            const chapterNames = group.chapterIds
+            const chapterNames = bookCompletionChapterIds(group)
               .slice(0, 3)
               .map(titleForChapter)
               .join(t("bookAuditChapterSeparator"));
@@ -128,7 +148,7 @@ export default function BookCompletionAuditPanel({
                   <button
                     type="button"
                     className="shrink-0 font-medium text-accent hover:underline"
-                    onClick={() => runAction(action, chapterId)}
+                    onClick={() => runAction(action, group)}
                   >
                     {t(`bookAuditActions.${action}`)}
                   </button>

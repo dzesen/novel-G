@@ -15,6 +15,8 @@ import {
   isTerminal,
 } from "./batchTypes";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
+import ReferenceCardAutomationAuditPanel from "./ReferenceCardAutomationAuditPanel";
+import { buildReferenceCardAutomationAudit } from "./referenceCardAutomationAudit";
 import ResumeJobDialog, { isResumeReadinessRequired } from "./ResumeJobDialog";
 import {
   finishReasonTranslationKey,
@@ -561,12 +563,22 @@ export default function GenerationRunsWorkspace({
   const telemetryFilteredOut = !target.runId && Boolean(target.chapterId)
     && proseRuns.some((run) => run.chapter_id === target.chapterId)
     && selectedTelemetry.length === 0;
-  const selectedEvent = useMemo(() => {
+  const selectedDiagnosticEvent = useMemo(() => {
     if (!selectedJob || !target.eventId) return null;
     return (selectedJob.diagnostics ?? []).find(
       (event, index) => eventLocator(selectedJob._id, event, index) === target.eventId,
     ) ?? null;
   }, [selectedJob, target.eventId]);
+  const automationEvents = useMemo(
+    () => selectedJob ? buildReferenceCardAutomationAudit(selectedJob) : [],
+    [selectedJob],
+  );
+  const selectedAutomationEvent = target.eventId
+    ? automationEvents.find((event) => event.eventId === target.eventId) ?? null
+    : null;
+  const selectedEventLocated = Boolean(
+    selectedDiagnosticEvent || selectedAutomationEvent,
+  );
   const currentBlocker = selectedJob
     && ["failed", "interrupted", "paused"].includes(selectedJob.status)
     ? orderedDiagnostics[0]?.event ?? null
@@ -607,12 +619,12 @@ export default function GenerationRunsWorkspace({
 
   useEffect(() => {
     if (!target.eventId || loading || loadError || !selectedJob) return;
-    onTargetValidation("event", target.eventId, selectedEvent !== null);
+    onTargetValidation("event", target.eventId, selectedEventLocated);
   }, [
     loadError,
     loading,
     onTargetValidation,
-    selectedEvent,
+    selectedEventLocated,
     selectedJob,
     target.eventId,
   ]);
@@ -940,6 +952,18 @@ export default function GenerationRunsWorkspace({
                   </p>
                 )}
 
+                {automationEvents.length > 0 && (
+                  <ReferenceCardAutomationAuditPanel
+                    job={selectedJob}
+                    titleForChapter={(chapterId) => (
+                      chapters.find((chapter) => chapter._id === chapterId)?.title
+                      ?? t("unknownChapter")
+                    )}
+                    onJumpToChapter={(chapterId) => onJumpToChapter(chapterId)}
+                    highlightedEventId={target.eventId}
+                  />
+                )}
+
                 {currentBlocker && (
                   <section
                     aria-labelledby="generation-run-current-blocker-title"
@@ -1202,7 +1226,7 @@ export default function GenerationRunsWorkspace({
                       </ol>
                     )}
                   </div>
-                  {selectedEvent && (
+                  {selectedDiagnosticEvent && (
                     <p className="mt-2 text-xs leading-5 text-muted">{t("eventLocated")}</p>
                   )}
                 </section>

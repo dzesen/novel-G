@@ -2722,6 +2722,7 @@
       "bookAuditJobMismatch": "当前审计证据不属于这次整本作业，已拒绝显示为成书完成。",
       "bookAuditActions": {
         "blueprint": "打开书籍蓝图",
+        "world_baseline": "复核世界资料基线",
         "chapter": "打开章节",
         "memory": "检查连续性与状态",
         "reference_cards": "检查世界资料",
@@ -2761,6 +2762,10 @@
         "generationSourceChanged": "生成期间正式正文或叙事状态发生过未解决的并发变化。",
         "referenceCardRepairExhausted": "资料候选改稿已经耗尽授权轮次，仍需人工决定。",
         "repairCheckpointUnresolved": "仍有中断的候选修复或状态写入检查点。",
+        "worldBaselineNotCurrent": "世界资料基线尚未确认，或已因结构与资料变化失效。",
+        "currentFailureEventMissing": "当前生成故障缺少可定位的诊断事件，已按不完整处理。",
+        "currentFailureEventInvalid": "当前生成故障指向的诊断事件不属于这次作业，或无法唯一验证。",
+        "generationFailureActive": "这次作业仍有一个未解决的生成故障。",
         "unknown": "发现 {count} 个当前版本无法解释的审计阻塞项，请查看生成记录。"
       },
       "resultAborted": "作业已中止。",
