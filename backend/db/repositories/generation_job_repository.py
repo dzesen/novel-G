@@ -3560,15 +3560,22 @@ class GenerationJobRepository:
             )
         ):
             raise ValueError("Source-change diagnostic contract is invalid")
+        query: dict[str, Any] = {
+            "_id": to_object_id(job_id),
+            "is_deleted": False,
+            "status": expected_status,
+            "pause_reason": expected_pause_reason,
+            "current_failure_event_id": expected_failure_event_id,
+        }
+        if expected_execution_epoch == 0:
+            query["$or"] = [
+                {"execution_epoch": 0},
+                {"execution_epoch": {"$exists": False}},
+            ]
+        else:
+            query["execution_epoch"] = expected_execution_epoch
         result = await self._collection_update_one(
-            {
-                "_id": to_object_id(job_id),
-                "is_deleted": False,
-                "status": expected_status,
-                "pause_reason": expected_pause_reason,
-                "execution_epoch": expected_execution_epoch,
-                "current_failure_event_id": expected_failure_event_id,
-            },
+            query,
             {
                 "$push": {
                     "diagnostics": {

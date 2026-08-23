@@ -198,7 +198,7 @@ async def _pause_reference_card_review_for_source_change(
     *,
     reason_codes: list[str],
 ) -> bool:
-    execution_epoch = target.get("execution_epoch")
+    execution_epoch = target.get("execution_epoch", 0)
     failure_event_id = target.get("current_failure_event_id")
     if type(execution_epoch) is not int or execution_epoch < 0:
         raise ValueError("Generation job execution epoch is invalid")
