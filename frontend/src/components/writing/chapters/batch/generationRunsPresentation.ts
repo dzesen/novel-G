@@ -154,6 +154,22 @@ export function diagnosticHistoryState(
 
 const TERMINAL_STATUSES = new Set<JobStatus>(["completed", "aborted"]);
 
+/**
+ * Choose the only job that may occupy the current-task surface.
+ *
+ * A terminal newest job closes that surface. We deliberately do not scan
+ * farther back for an older resumable job, because doing so revives work the
+ * user already superseded or ended.
+ */
+export function selectCurrentGenerationJob(
+  jobs: GenerationJob[],
+): GenerationJob | null {
+  const latest = [...jobs].sort((left, right) => (
+    compareNewestFirst(left.created_at, right.created_at)
+  ))[0];
+  return latest && !TERMINAL_STATUSES.has(latest.status) ? latest : null;
+}
+
 /** Exact prose runs referenced by a non-terminal job, used to distinguish
  * current task drafts from genuinely historical leftovers. */
 export function currentJobStatusByProseRun(

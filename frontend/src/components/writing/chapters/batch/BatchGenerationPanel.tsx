@@ -30,6 +30,7 @@ import {
 import {
   currentJobStatusByProseRun,
   requiresResumeReadinessReview,
+  selectCurrentGenerationJob,
 } from "./generationRunsPresentation";
 
 const ABORT_DIALOG_FOCUSABLE_SELECTOR = [
@@ -154,9 +155,8 @@ export default function BatchGenerationPanel({
         }
         const jobs = await apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`);
         if (cancelled) return;
-        const latest = [...jobs]
-          .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-        if (latest && !isTerminal(latest.status)) setJob(latest);
+        const current = selectCurrentGenerationJob(jobs);
+        if (current) setJob(current);
       } catch (reason) {
         if (cancelled) return;
         if (

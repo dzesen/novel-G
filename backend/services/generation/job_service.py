@@ -70,6 +70,9 @@ from backend.services.generation.chapter_finalization import (
     chapter_finalization_service,
     parse_chapter_finalization_authorization,
 )
+from backend.services.generation.discarded_candidate_recovery import (
+    resolve_discarded_candidate_attempt_ids,
+)
 from backend.services.generation.attempt_scope import (
     JobAttemptScope,
     project_persisted_attempt_evidence,
@@ -1872,6 +1875,9 @@ class GenerationJobService:
                         generation_job_repo.append_candidate_pipeline_checkpoint
                     ),
                     list_attempts=generation_job_repo.list_attempt_slots,
+                    resolve_discarded_prose_attempt_ids=(
+                        resolve_discarded_candidate_attempt_ids
+                    ),
                     reserve_attempts=generation_job_repo.reserve_attempts,
                     attempt_scope_factory=(
                         lambda target_job_id, target_chapter_id, step, slots:

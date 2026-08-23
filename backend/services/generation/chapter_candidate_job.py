@@ -129,6 +129,10 @@ class ChapterCandidateJobRunnerDeps:
     list_checkpoints: Callable[..., Awaitable[Sequence[Any]]]
     append_checkpoint: Callable[..., Awaitable[Any]]
     list_attempts: Callable[..., Awaitable[Sequence[Mapping[str, Any]]]]
+    resolve_discarded_prose_attempt_ids: Callable[
+        ...,
+        Awaitable[Sequence[str]],
+    ]
     reserve_attempts: Callable[[str, str, int], Awaitable[Any]]
     attempt_scope_factory: Callable[[str, str, str, Sequence[Mapping[str, Any]]], Any]
     build_execution: Callable[..., CandidateJobExecution]
@@ -397,6 +401,56 @@ def _attempt_summary(slot: Mapping[str, Any]) -> CandidateAttemptSummary:
         state=state,
         usage=usage,
     )
+
+
+def _validated_discarded_attempt_ids(
+    value: Sequence[str],
+    *,
+    slots: Sequence[Mapping[str, Any]],
+    protected_attempt_ids: frozenset[str],
+) -> frozenset[str]:
+    if isinstance(value, (str, bytes)):
+        raise ChapterCandidatePipelineBlocked(
+            "候选丢弃证据无效",
+            code="candidate_result_projection_missing",
+        )
+    slot_by_id: dict[str, Mapping[str, Any]] = {}
+    for slot in slots:
+        if not isinstance(slot, Mapping):
+            continue
+        attempt_id = str(slot.get("attempt_id") or "")
+        if not attempt_id:
+            continue
+        if attempt_id in slot_by_id:
+            raise ChapterCandidatePipelineBlocked(
+                "候选调用账本包含重复 attempt id",
+                code="candidate_result_projection_missing",
+            )
+        slot_by_id[attempt_id] = slot
+    result: set[str] = set()
+    for attempt_id in value:
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt_id in result
+        ):
+            raise ChapterCandidatePipelineBlocked(
+                "候选丢弃证据无效",
+                code="candidate_result_projection_missing",
+            )
+        slot = slot_by_id.get(attempt_id)
+        if (
+            slot is None
+            or attempt_id in protected_attempt_ids
+            or str(slot.get("step_id") or "") != "candidate-prose"
+            or str(slot.get("state") or "") != "accounted"
+        ):
+            raise ChapterCandidatePipelineBlocked(
+                "候选丢弃证据与持久调用账本不一致",
+                code="candidate_result_projection_missing",
+            )
+        result.add(attempt_id)
+    return frozenset(result)
 
 
 def _adherence_result(
@@ -789,6 +843,29 @@ class ChapterCandidateJobRunner:
         if len(slots) > self._authorized_attempt_slots:
             raise ChapterCandidatePipelineBlocked("候选作业调用容量已被扩大")
         checkpoints = await self._load_checkpoints(chapter_id)
+        protected_attempt_ids = frozenset(
+            attempt_id
+            for checkpoint in checkpoints
+            for attempt_id in checkpoint.attempt_ids
+        )
+        discarded_attempt_ids = _validated_discarded_attempt_ids(
+            await self._deps.resolve_discarded_prose_attempt_ids(
+                execution_id=self._execution_id,
+                owner_id=owner_id,
+                novel_id=str(novel_id),
+                chapter_id=chapter_id,
+                attempt_slots=tuple(slots),
+                protected_attempt_ids=tuple(protected_attempt_ids),
+            ),
+            slots=slots,
+            protected_attempt_ids=protected_attempt_ids,
+        )
+        replay_slots = [
+            slot
+            for slot in slots
+            if str(slot.get("attempt_id") or "")
+            not in discarded_attempt_ids
+        ]
         max_repair_cycles = self._repair_cycle_limit(self._readiness)
         expected_revision = scope.expected_narrative_revision
         outline = current.get("outline")
@@ -835,7 +912,7 @@ class ChapterCandidateJobRunner:
                     )
                     _summaries, tokens = self._summaries_for_replay(
                         terminal,
-                        slots,
+                        replay_slots,
                     )
                     return self._terminal_outcome(
                         checkpoints=checkpoints,
@@ -848,7 +925,7 @@ class ChapterCandidateJobRunner:
 
         def fenced_scope(step: str) -> _NarrativeFencedAttemptScope:
             return _NarrativeFencedAttemptScope(
-                self._scope(chapter_id, step, slots),
+                self._scope(chapter_id, step, replay_slots),
                 lambda: self._ensure_narrative_revision(
                     scope,
                     expected_revision,
@@ -1001,7 +1078,7 @@ class ChapterCandidateJobRunner:
                 chapter=current,
                 execution=execution,
                 checkpoints=checkpoints,
-                slots=slots,
+                slots=replay_slots,
             )
             if checkpoints
             else None
@@ -1010,7 +1087,7 @@ class ChapterCandidateJobRunner:
             str(slot.get("step_id") or "").startswith("candidate-")
             and str(slot.get("state") or "")
             not in {"released_pre_dispatch", "uncertain_retry_acknowledged"}
-            for slot in slots
+            for slot in replay_slots
         ):
             raise ChapterCandidatePipelineBlocked(
                 "候选作业已有付费调用但缺少结果检查点",

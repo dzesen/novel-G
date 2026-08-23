@@ -14,6 +14,10 @@ CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION = (
 # the fixed seam window changes.
 SEAM_TAIL_MIN_CHARACTERS = 2_000
 
+# Automatic/manual continuation calls are appended after planned base-call
+# sequences without renumbering persisted base segments.
+AUTOMATIC_PROSE_SEQUENCE_FLOOR = 1_000_000
+
 
 def scene_continuation_seam_window_characters(scene_target_words: Any) -> int:
     """Return the fixed v3.3 tail window for every logical scene.

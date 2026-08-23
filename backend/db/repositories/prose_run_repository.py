@@ -215,6 +215,30 @@ class ProseRunRepository(BaseRepository):
             sort=[("updated_at", -1), ("_id", -1)],
         )
 
+    async def list_discarded_by_generation_job(
+        self,
+        *,
+        generation_job_id: str,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Return exact, durable discard evidence in creation order."""
+
+        return await self.find_many(
+            {
+                "generation_job_id": to_object_id(generation_job_id),
+                "owner_id": to_object_id(owner_id),
+                "novel_id": to_object_id(novel_id),
+                "chapter_id": to_object_id(chapter_id),
+                "status": "discarded",
+                "is_deleted": False,
+            },
+            limit=max(1, int(limit)),
+            sort=[("created_at", 1), ("_id", 1)],
+        )
+
     async def discard(
         self,
         *,

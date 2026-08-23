@@ -30,6 +30,7 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
 )
 from backend.services.generation.prose_protocol import (
+    AUTOMATIC_PROSE_SEQUENCE_FLOOR,
     scene_continuation_seam_window_characters,
 )
 from backend.services.generation.prose_token_bounds import v3_output_token_bound
@@ -49,7 +50,6 @@ from backend.services.novel.chapter_service import count_chapter_words
 
 SceneProgressCallback = Callable[[tuple[dict[str, Any], ...]], Awaitable[None] | None]
 
-_AUTOMATIC_SEQUENCE_FLOOR = 1_000_000
 # Healthy observed repeats were 10–23 characters, while pathological replays
 # were 230–2,045.  100 is deliberately in that measured gap.
 MIN_REPLAY_CHARACTERS = 100
@@ -428,8 +428,15 @@ def _next_automatic_sequence(segments: Iterable[Mapping[str, Any]]) -> int:
         if segment.get("sequence_index") is not None
     }
     candidate = max(
-        _AUTOMATIC_SEQUENCE_FLOOR,
-        max((value for value in used if value >= _AUTOMATIC_SEQUENCE_FLOOR), default=0)
+        AUTOMATIC_PROSE_SEQUENCE_FLOOR,
+        max(
+            (
+                value
+                for value in used
+                if value >= AUTOMATIC_PROSE_SEQUENCE_FLOOR
+            ),
+            default=0,
+        )
         + 1,
     )
     while candidate in used:
