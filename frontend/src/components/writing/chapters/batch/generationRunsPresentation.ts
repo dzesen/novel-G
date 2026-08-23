@@ -106,6 +106,20 @@ export function currentJobReasonCode(job: GenerationJob): string | null {
   return newestDiagnostics(job.diagnostics)[0]?.event.code ?? null;
 }
 
+export function requiresSuccessorJob(job: GenerationJob): boolean {
+  return !job.resume_original_writeback_available
+    && Boolean(job.error?.reason_codes?.includes("successor_required"));
+}
+
+export function requiresResumeReadinessReview(job: GenerationJob): boolean {
+  return job.pause_reason === "cost_cap"
+    || job.pause_reason === "authorization_scope_increased"
+    || (
+      job.pause_reason === "source_changed"
+      && !job.resume_original_writeback_available
+    );
+}
+
 export function diagnosticHistoryState(
   job: GenerationJob,
   orderedIndex: number,

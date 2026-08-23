@@ -1673,6 +1673,7 @@ class StateProposalModule:
         *,
         mutation_revision: int,
         session: Any = None,
+        persisted_finalization_intent: bool = False,
     ) -> None:
         proposal_id = to_object_id(str(claim["proposal_id"]))
         expected_revision = int(claim["expected_narrative_revision"])
@@ -1682,6 +1683,8 @@ class StateProposalModule:
         )
         current = await self.collection.find_one({"_id": proposal_id}, session=session)
         if current is None:
+            if persisted_finalization_intent:
+                return
             raise MutationConflictError("State proposal disappeared before acceptance")
         stored_job_binding = _job_mutation_binding(current)
         if stored_job_binding is not None and not _uses_current_dispatch_protocol(
@@ -1705,14 +1708,15 @@ class StateProposalModule:
             raise MutationConflictError(
                 "State proposal claim lost its Job binding"
             )
-        allow_expired = (
+        binding_allows_expired = (
             supplied_job_binding is not None
             and supplied_job_binding == stored_job_binding
         )
-        if supplied_job_binding is not None and not allow_expired:
+        if supplied_job_binding is not None and not binding_allows_expired:
             raise MutationConflictError(
                 "State proposal claim belongs to another Job authorization"
             )
+        allow_expired = binding_allows_expired or persisted_finalization_intent
         existing = current.get("claim") or {}
         if current.get("status") in {"claimed", "applied"}:
             if (
@@ -1723,7 +1727,11 @@ class StateProposalModule:
             raise MutationConflictError(
                 "State proposal is already claimed by a different mutation"
             )
-        if current.get("status") != "proposed":
+        recoverable_expired = (
+            persisted_finalization_intent
+            and current.get("status") == "expired"
+        )
+        if current.get("status") != "proposed" and not recoverable_expired:
             raise MutationConflictError("State proposal cannot be claimed")
         expires_at = current.get("expires_at") or current.get(
             "acceptance_expires_at"
@@ -1800,7 +1808,11 @@ class StateProposalModule:
             )
         claim_query: dict[str, Any] = {
             "_id": proposal_id,
-            "status": "proposed",
+            "status": (
+                {"$in": ["proposed", "expired"]}
+                if persisted_finalization_intent
+                else "proposed"
+            ),
             "narrative_revision": expected_revision,
         }
         if stored_job_binding is not None:
@@ -1849,6 +1861,7 @@ class StateProposalModule:
         result: dict[str, Any],
         *,
         session: Any = None,
+        persisted_finalization_intent: bool = False,
     ) -> None:
         proposal_id = to_object_id(str(claim["proposal_id"]))
         decision_digest = str(claim["decision_digest"])
@@ -1857,6 +1870,8 @@ class StateProposalModule:
             session=session,
         )
         if current is None:
+            if persisted_finalization_intent:
+                return
             raise MutationConflictError(
                 "State proposal disappeared before applied publication"
             )

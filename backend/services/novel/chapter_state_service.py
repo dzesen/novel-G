@@ -43,6 +43,40 @@ from backend.services.novel.narrative_timeline import narrative_timeline
 logger = logging.getLogger(__name__)
 
 
+def _has_persisted_finalization_intent(
+    mutation: Any,
+    proposal_claim: dict[str, Any],
+) -> bool:
+    """Prove that an ephemeral proposal was frozen into a finalization journal."""
+
+    journal = mutation.journal
+    command = journal.get("command") or {}
+    payload = command.get("payload") or {}
+    receipts = journal.get("receipts") or {}
+    revision_receipt = receipts.get("narrative_revision") or {}
+    expected_revision = proposal_claim.get("expected_narrative_revision")
+    finalized_prose = proposal_claim.get("finalized_prose") or {}
+    return (
+        journal.get("operation") == "finalize_chapter_generation"
+        and command.get("operation") == "accept_chapter_state"
+        and payload.get("proposal_claim") == proposal_claim
+        and type(expected_revision) is int
+        and revision_receipt.get("revision") == expected_revision + 1
+        and isinstance(proposal_claim.get("proposal_id"), str)
+        and bool(proposal_claim["proposal_id"])
+        and isinstance(proposal_claim.get("candidate_digest"), str)
+        and bool(proposal_claim["candidate_digest"])
+        and isinstance(proposal_claim.get("decision_digest"), str)
+        and bool(proposal_claim["decision_digest"])
+        and isinstance(finalized_prose, dict)
+        and isinstance(finalized_prose.get("run_id"), str)
+        and bool(finalized_prose["run_id"])
+        and type(finalized_prose.get("run_revision")) is int
+        and isinstance(finalized_prose.get("content_digest"), str)
+        and bool(finalized_prose["content_digest"])
+    )
+
+
 class ChapterStateService:
     @staticmethod
     async def _execute_accept_chapter_state(session, mutation):
@@ -56,6 +90,10 @@ class ChapterStateService:
         skipped_duplicate_facts = list(command.get("skipped_duplicate_facts") or [])
         acceptance_metadata = command.get("acceptance_metadata") or {}
         proposal_claim = command.get("proposal_claim")
+        persisted_finalization_intent = bool(
+            proposal_claim
+            and _has_persisted_finalization_intent(mutation, proposal_claim)
+        )
         states_updated = 0
         facts_appended = 0
         threads_updated = 0
@@ -72,6 +110,9 @@ class ChapterStateService:
                     proposal_claim,
                     mutation_revision=int(revision_receipt["revision"]),
                     session=session,
+                    persisted_finalization_intent=(
+                        persisted_finalization_intent
+                    ),
                 )
             await chapter_repo.update_chapter(
                 chapter_id, {"summary": data["summary"]}, session=session
@@ -175,7 +216,12 @@ class ChapterStateService:
             }
             if proposal_claim:
                 await state_proposal_module.mark_applied(
-                    proposal_claim, result, session=session
+                    proposal_claim,
+                    result,
+                    session=session,
+                    persisted_finalization_intent=(
+                        persisted_finalization_intent
+                    ),
                 )
             return result
         except Exception:

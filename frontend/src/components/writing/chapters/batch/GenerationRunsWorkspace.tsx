@@ -292,7 +292,11 @@ function JobActionButtons({
             disabled={busy}
             className="min-h-9 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white hover:bg-accent-hover disabled:cursor-wait disabled:opacity-60"
           >
-            {t("resume")}
+            {t(
+              job.resume_original_writeback_available
+                ? "resumeOriginalWriteback"
+                : "resume",
+            )}
           </button>
         )
       )}
@@ -972,6 +976,19 @@ export default function GenerationRunsWorkspace({
                           className="min-h-9 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
                         >
                           {t("resolveInspectRun")}
+                        </button>
+                      )}
+                      {(currentBlocker.action_codes?.includes("resume_generation_job")
+                        || selectedJob.resume_original_writeback_available)
+                        && isResumable(selectedJob.status)
+                        && !selectedJob.has_uncertain_attempts && (
+                        <button
+                          type="button"
+                          onClick={() => requestResume(selectedJob)}
+                          disabled={actionJobId === selectedJob._id}
+                          className="min-h-9 rounded-md bg-accent px-3 py-2 text-xs font-medium text-white hover:bg-accent-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:cursor-wait disabled:opacity-60"
+                        >
+                          {t("resolveResumeJob")}
                         </button>
                       )}
                       {currentBlocker.action_codes?.includes("restart_generation_job") && (

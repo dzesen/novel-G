@@ -9,6 +9,7 @@ import {
   isPlaceholderChapterTitle,
   outlineAdherenceForDisplay,
 } from "./batchPresentation";
+import { requiresSuccessorJob } from "./generationRunsPresentation";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
 import { jobPauseReasonTranslationKey } from "./generationReasonPresentation";
@@ -36,10 +37,6 @@ interface CheckpointReviewProps {
   onOpenGenerationRuns: () => void;
 }
 
-function requiresSuccessorJob(job: GenerationJob): boolean {
-  return job.error?.reason_codes?.includes("successor_required") ?? false;
-}
-
 function Banner({ job }: { job: GenerationJob }) {
   const t = useTranslations("writing.batch");
   const metadataT = useTranslations("writing.generationMetadata");
@@ -58,9 +55,16 @@ function Banner({ job }: { job: GenerationJob }) {
     );
   }
   if (job.status === "interrupted") {
+    const hasUncertainAttempt = job.has_uncertain_attempts
+      || job.pause_reason === "uncertain_attempt";
+    const key = hasUncertainAttempt
+      ? "reasonInterrupted"
+      : job.pause_reason
+        ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonProcessRestart"
+        : "reasonProcessRestart";
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
-        {t("reasonInterrupted")}
+        {t(key)}
       </div>
     );
   }
@@ -68,13 +72,15 @@ function Banner({ job }: { job: GenerationJob }) {
     job.pause_reason === "uncertain_attempt"
     && Boolean(job.error?.auto_creation)
   );
-  const key = requiresSuccessorJob(job)
-    ? "reasonSourceChangedSuccessor"
-    : isUncertainReferenceRepair
-    ? "reasonReferenceCardRepairUncertain"
-    : job.pause_reason
-      ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
-      : "reasonCheckpoint";
+  const key = job.resume_original_writeback_available
+    ? "reasonFinalizationWritebackRecoverable"
+    : requiresSuccessorJob(job)
+      ? "reasonSourceChangedSuccessor"
+      : isUncertainReferenceRepair
+        ? "reasonReferenceCardRepairUncertain"
+        : job.pause_reason
+          ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
+          : "reasonCheckpoint";
   const tone =
     job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
@@ -488,15 +494,17 @@ export default function CheckpointReview({
             >
               {busy
                 ? t("resuming")
-                : job.pause_reason === "outline_deviation"
-                  ? t("resumeAfterRewrite")
-                  : job.pause_reason === "source_changed"
-                    ? t("resumeAfterSourceChange")
-                    : job.pause_reason === "final_audit"
-                      ? t("rerunFinalAudit")
-                    : job.pause_reason === "reference_card_auto_creation_recovery"
-                      ? t("resumeAutoCardRecovery")
-                    : t("resume")}
+                : job.resume_original_writeback_available
+                  ? t("resumeOriginalWriteback")
+                  : job.pause_reason === "outline_deviation"
+                    ? t("resumeAfterRewrite")
+                    : job.pause_reason === "source_changed"
+                      ? t("resumeAfterSourceChange")
+                      : job.pause_reason === "final_audit"
+                        ? t("rerunFinalAudit")
+                      : job.pause_reason === "reference_card_auto_creation_recovery"
+                        ? t("resumeAutoCardRecovery")
+                      : t("resume")}
             </Button>
           )}
         </div>

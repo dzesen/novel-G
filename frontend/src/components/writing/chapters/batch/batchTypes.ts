@@ -490,6 +490,7 @@ export interface GenerationJob {
   usage_attempt_claimed: number;
   usage_attempt_summaries: AttemptSummary[];
   has_uncertain_attempts: boolean;
+  resume_original_writeback_available?: boolean;
   created_at: string;
   updated_at: string;
 }

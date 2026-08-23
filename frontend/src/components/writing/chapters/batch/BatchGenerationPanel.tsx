@@ -27,7 +27,10 @@ import {
   bookCompletionAuditMatchesJob,
   bookCompletionResult,
 } from "./bookCompletionPresentation";
-import { currentJobStatusByProseRun } from "./generationRunsPresentation";
+import {
+  currentJobStatusByProseRun,
+  requiresResumeReadinessReview,
+} from "./generationRunsPresentation";
 
 const ABORT_DIALOG_FOCUSABLE_SELECTOR = [
   "button:not([disabled])",
@@ -298,11 +301,7 @@ export default function BatchGenerationPanel({
 
   const requestResume = () => {
     if (!job) return;
-    if (
-      job.pause_reason === "cost_cap"
-      || job.pause_reason === "authorization_scope_increased"
-      || job.pause_reason === "source_changed"
-    ) {
+    if (requiresResumeReadinessReview(job)) {
       setResumeReviewOpen(true);
       return;
     }

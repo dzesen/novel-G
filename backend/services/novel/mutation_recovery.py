@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable
 
 from backend.db import collections
 from backend.db.mongo import get_database
+from backend.db.narrative_revision import narrative_revision_store
 from backend.db.mutation import (
     MutationCommand,
     MutationConflictError,
@@ -37,6 +38,32 @@ from backend.services.generation.candidate_repair_contracts import (
 from backend.services.interop.card_import_proposal_service import (
     CardImportProposalService,
 )
+
+
+_RECOVERABLE_FINALIZATION_PROPOSAL_CONFLICTS = frozenset({
+    "State proposal disappeared before acceptance",
+    "State proposal disappeared before applied publication",
+    "State proposal expired before claim",
+})
+
+
+def _is_recoverable_finalization_journal(journal: dict[str, Any]) -> bool:
+    status = str(journal.get("status") or "")
+    if status in {"intent", "running", "failed", "completed"}:
+        return True
+    if status != "conflict" or str(journal.get("phase") or "") not in {
+        "primary_writes",
+        "timeline_writes",
+        "derived_data",
+    }:
+        return False
+    recovery_error = journal.get("last_recovery_error")
+    return (
+        isinstance(recovery_error, dict)
+        and recovery_error.get("error_type") == "MutationConflictError"
+        and recovery_error.get("message")
+        in _RECOVERABLE_FINALIZATION_PROPOSAL_CONFLICTS
+    )
 
 
 MutationExecutor = Callable[[Any, Any], Awaitable[Any]]
@@ -395,7 +422,10 @@ async def recover_bound_mutation_revision(
 
     status = str(journal.get("status") or "")
     if status != "completed":
-        if status not in {"intent", "running", "failed"}:
+        recoverable_status = status in {"intent", "running", "failed"}
+        if normalized_operation == "finalize_chapter_generation":
+            recoverable_status = _is_recoverable_finalization_journal(journal)
+        if not recoverable_status:
             raise MutationConflictError(
                 f"The persisted mutation cannot be recovered from status {status or 'missing'}"
             )
@@ -429,3 +459,129 @@ async def recover_bound_mutation_revision(
             "The persisted mutation narrative revision receipt diverged"
         )
     return revision
+
+
+async def find_job_bound_finalization_recovery_binding(
+    *,
+    novel_id: str,
+    job_id: str,
+    chapter_id: str,
+    readiness_digest: str,
+    authorization_revision: int,
+    expected_narrative_revision: int,
+) -> JobMutationRecoveryBindingV1 | None:
+    """Find the one recoverable finalization journal owned by this exact Job.
+
+    Candidate finalization persists its stable idempotency key inside the journal,
+    while the GenerationJob keeps the terminal checkpoint prefix.  This lookup is
+    deliberately closed over the Job/readiness/chapter/revision authority and is
+    read-only.  The Job must first reacquire the global execution slot; its normal
+    candidate runner then resumes the frozen journal through
+    ``recover_bound_mutation_revision`` without dispatching another Provider call.
+    """
+
+    if (
+        not isinstance(novel_id, str)
+        or not novel_id
+        or not isinstance(job_id, str)
+        or not job_id
+        or not isinstance(chapter_id, str)
+        or not chapter_id
+        or not isinstance(readiness_digest, str)
+        or not readiness_digest
+        or type(authorization_revision) is not int
+        or authorization_revision < 1
+        or type(expected_narrative_revision) is not int
+        or expected_narrative_revision < 0
+    ):
+        raise MutationConflictError(
+            "The Job finalization recovery authority is invalid"
+        )
+
+    collection = get_database()[collections.MUTATION_JOURNALS]
+    matches = await collection.find(
+        {
+            "novel_id": to_object_id(novel_id),
+            "operation": "finalize_chapter_generation",
+            "is_deleted": False,
+            "command.expected_narrative_revision": expected_narrative_revision,
+            "command.payload.chapter_id": chapter_id,
+            "command.payload.authorization.job_id": job_id,
+            "command.payload.authorization.readiness_digest": readiness_digest,
+            "command.payload.authorization.authorization_revision": (
+                authorization_revision
+            ),
+            "command.payload.authorization.snapshot.authorization_revision": (
+                authorization_revision
+            ),
+        },
+        projection={
+            "idempotency_key": 1,
+            "status": 1,
+            "phase": 1,
+            "last_recovery_error": 1,
+            "receipts.narrative_revision": 1,
+        },
+    ).limit(2).to_list(length=2)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise MutationConflictError(
+            "Multiple finalization journals match the same Job authority"
+        )
+    journal = matches[0]
+    status = str(journal.get("status") or "")
+    if not _is_recoverable_finalization_journal(journal):
+        raise MutationConflictError(
+            "The persisted finalization journal is not recoverable"
+        )
+    idempotency_key = journal.get("idempotency_key")
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        raise MutationConflictError(
+            "The persisted finalization idempotency key is invalid"
+        )
+    receipts = journal.get("receipts")
+    revision_receipt = (
+        receipts.get("narrative_revision")
+        if isinstance(receipts, dict)
+        else None
+    )
+    receipt_revision = (
+        revision_receipt.get("revision")
+        if isinstance(revision_receipt, dict)
+        else None
+    )
+    if receipt_revision is not None and (
+        type(receipt_revision) is not int
+        or receipt_revision != expected_narrative_revision + 1
+    ):
+        raise MutationConflictError(
+            "The persisted finalization narrative revision receipt diverged"
+        )
+    if status == "completed" and receipt_revision is None:
+        raise MutationConflictError(
+            "The completed finalization is missing its narrative revision receipt"
+        )
+
+    current_revision = await narrative_revision_store.current(novel_id)
+    owned_revision = (
+        receipt_revision
+        if type(receipt_revision) is int
+        else expected_narrative_revision
+    )
+    if current_revision != owned_revision:
+        raise MutationConflictError(
+            "The narrative changed outside the recoverable finalization journal"
+        )
+
+    return JobMutationRecoveryBindingV1(
+        schema_version="job_mutation_recovery_binding.v1",
+        novel_id=novel_id,
+        job_id=job_id,
+        chapter_id=chapter_id,
+        readiness_digest=readiness_digest,
+        authorization_revision=authorization_revision,
+        expected_narrative_revision=expected_narrative_revision,
+        operation="finalize_chapter_generation",
+        idempotency_key=idempotency_key,
+    )

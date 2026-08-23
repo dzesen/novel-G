@@ -29,6 +29,7 @@ const DIAGNOSTIC_REASON_KEYS = {
   candidate_completion_repair_exhausted: "diagnosticsReasonCandidateCompletionExhausted",
   candidate_adherence_repair_exhausted: "diagnosticsReasonCandidateAdherenceExhausted",
   candidate_state_repair_exhausted: "diagnosticsReasonCandidateStateExhausted",
+  candidate_finalization_writeback_failed: "diagnosticsReasonFinalizationWriteback",
   historical_completion_contract_failed: "diagnosticsReasonCompletion",
   completion_contract_failed: "diagnosticsReasonCompletion",
   job_aborted: "diagnosticsReasonAborted",
@@ -43,6 +44,7 @@ const DIAGNOSTIC_IMPACT_KEYS = {
   job_stopped_by_user: "diagnosticsImpactUserStopped",
   cause_not_identified: "diagnosticsImpactUnknown",
   candidate_not_committed: "diagnosticsImpactCandidateNotCommitted",
+  formal_write_recovery_pending: "diagnosticsImpactWritebackRecovery",
 } as const;
 
 const DIAGNOSTIC_ACTION_KEYS = {
@@ -56,6 +58,7 @@ const DIAGNOSTIC_ACTION_KEYS = {
   restart_generation_job: "diagnosticsActionRestartJob",
   review_generation_authorization: "diagnosticsActionReviewAuthorization",
   open_affected_chapter: "diagnosticsActionOpenAffectedChapter",
+  resume_generation_job: "diagnosticsActionResumeJob",
 } as const;
 
 const JOB_PAUSE_REASON_KEYS = {
@@ -65,7 +68,7 @@ const JOB_PAUSE_REASON_KEYS = {
   cost_cap: "reasonCostCap",
   attempt_capacity: "reasonAttemptCapacity",
   manual: "reasonManual",
-  process_restart: "reasonInterrupted",
+  process_restart: "reasonProcessRestart",
   uncertain_attempt: "reasonInterrupted",
   source_changed: "reasonSourceChanged",
   incomplete_scene: "reasonIncompleteScene",

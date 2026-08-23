@@ -65,6 +65,9 @@ class _FinalizationDependencyError(RuntimeError):
 
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     attempts: list[dict[str, Any]] = []
+    diagnostic_category = "validation_logic"
+    diagnostic_code = "candidate_finalization_writeback_failed"
+    diagnostic_evidence = "confirmed"
 
 
 class _NarrativeFencedAttemptScope:

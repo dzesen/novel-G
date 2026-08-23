@@ -259,6 +259,79 @@ async def _recover_job_mutation_revision(
     return await recover_bound_mutation_revision(binding)
 
 
+async def _candidate_finalization_recovery_available(
+    job_id: str,
+    job: Mapping[str, Any],
+) -> bool:
+    """Read-only proof that the frozen candidate finalization can resume."""
+
+    chapter_id = job.get("current_chapter_id")
+    expected_revision = job.get("expected_narrative_revision")
+    readiness = job.get("readiness")
+    planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
+    readiness_digest = (
+        readiness.get("digest") if isinstance(readiness, Mapping) else None
+    )
+    if (
+        not isinstance(chapter_id, str)
+        or not chapter_id
+        or type(expected_revision) is not int
+        or expected_revision < 0
+        or not isinstance(readiness_digest, str)
+        or not readiness_digest
+    ):
+        return False
+    try:
+        finalization = parse_chapter_finalization_authorization(
+            planning.get("chapter_finalization_authorization")
+            if isinstance(planning, Mapping)
+            else None
+        )
+    except ValueError:
+        return False
+
+    # Discovery stays read-only until transition_job_resume atomically reacquires
+    # the global execution slot.  The candidate runner performs the actual
+    # frozen-journal recovery after that transition.
+    from backend.services.novel.mutation_recovery import (
+        find_job_bound_finalization_recovery_binding,
+    )
+
+    binding = await find_job_bound_finalization_recovery_binding(
+        novel_id=str(job.get("novel_id") or ""),
+        job_id=str(job_id),
+        chapter_id=chapter_id,
+        readiness_digest=readiness_digest,
+        authorization_revision=int(finalization["authorization_revision"]),
+        expected_narrative_revision=expected_revision,
+    )
+    return binding is not None
+
+
+async def _with_recovery_capabilities(
+    job_id: str,
+    job: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Project read-only recovery actions without mutating the stored Job."""
+
+    presented = dict(job)
+    available = False
+    if (
+        job.get("status") in {"paused", "interrupted", "failed"}
+        and job.get("pause_reason") == "source_changed"
+        and bool(job.get("candidate_pipeline_checkpoints"))
+    ):
+        try:
+            available = await _candidate_finalization_recovery_available(
+                job_id,
+                job,
+            )
+        except (MutationConflictError, ValueError):
+            available = False
+    presented["resume_original_writeback_available"] = available
+    return presented
+
+
 def _state_only_job_mutation_binding(
     *,
     job_id: str,
@@ -2574,15 +2647,20 @@ class GenerationJobService:
                 )
             )
             candidate_prefix = job.get("candidate_pipeline_checkpoints")
+            candidate_finalization_recovery_available = False
             if (
                 job.get("pause_reason") == "source_changed"
                 and isinstance(candidate_prefix, list)
                 and candidate_prefix
             ):
-                raise ValueError(
-                    "候选检查点绑定的 narrative revision 已失效；"
-                    "请终止该作业并以新 readiness 启动 successor 作业"
+                candidate_finalization_recovery_available = await (
+                    _candidate_finalization_recovery_available(job_id, job)
                 )
+                if not candidate_finalization_recovery_available:
+                    raise ValueError(
+                        "候选检查点绑定的 narrative revision 已失效；"
+                        "请终止该作业并以新 readiness 启动 successor 作业"
+                    )
             if confirm_uncertain_retry and skip_uncertain:
                 raise ValueError(
                     "confirm_uncertain_retry and skip_uncertain are mutually exclusive"
@@ -2712,9 +2790,10 @@ class GenerationJobService:
             )
             authorization_confirmation_required = bool(
                 job.get("authorization_confirmation_required")
-            )
+            ) and not candidate_finalization_recovery_available
             source_change_requires_reauthorization = (
                 job.get("pause_reason") == "source_changed"
+                and not candidate_finalization_recovery_available
             )
             authorization_settings_changed = (
                 prose_continuation_policy is not None
@@ -2921,6 +3000,11 @@ class GenerationJobService:
                 **authorization_updates,
                 **incomplete_prose_updates,
                 "status": "running", "pause_reason": None, "error": None,
+                **(
+                    {"authorization_confirmation_required": None}
+                    if candidate_finalization_recovery_available
+                    else {}
+                ),
                 "active_slot": "global",
                 "has_uncertain_attempts": False if confirm_uncertain_retry else bool(
                     job.get("has_uncertain_attempts")
@@ -3092,11 +3176,16 @@ class GenerationJobService:
 
     @staticmethod
     async def get_job(job_id: str) -> Dict[str, Any]:
-        return await generation_job_repo.get_job(job_id)
+        job = await generation_job_repo.get_job(job_id)
+        return await _with_recovery_capabilities(str(job_id), job)
 
     @staticmethod
     async def list_jobs(novel_id: str) -> List[Dict[str, Any]]:
-        return await generation_job_repo.list_jobs_by_novel(novel_id)
+        jobs = await generation_job_repo.list_jobs_by_novel(novel_id)
+        return list(await asyncio.gather(*(
+            _with_recovery_capabilities(str(job["_id"]), job)
+            for job in jobs
+        )))
 
     @staticmethod
     async def summarize_diagnostics(

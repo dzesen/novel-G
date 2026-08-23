@@ -112,6 +112,11 @@ def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
             ["retry_generation_step", "open_provider_settings"],
         )
     if category == "validation_logic":
+        if code == "candidate_finalization_writeback_failed":
+            return (
+                "formal_write_recovery_pending",
+                ["resume_generation_job"],
+            )
         if code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values():
             return (
                 "candidate_not_committed",
@@ -316,6 +321,21 @@ def build_failure_diagnostic(
         filter(None, (pre_dispatch_boundary_code(item) for item in chain)),
         None,
     )
+    declared_diagnostic = next(
+        (
+            (
+                getattr(item, "diagnostic_category", None),
+                getattr(item, "diagnostic_code", None),
+                getattr(item, "diagnostic_evidence", None),
+            )
+            for item in chain
+            if getattr(item, "diagnostic_category", None) in CATEGORY_ORDER
+            and isinstance(getattr(item, "diagnostic_code", None), str)
+            and getattr(item, "diagnostic_code", None)
+            and getattr(item, "diagnostic_evidence", None) in EVIDENCE_LEVELS
+        ),
+        None,
+    )
 
     incomplete = next(
         (item for item in chain if isinstance(item, IncompleteProseGeneration)),
@@ -354,6 +374,8 @@ def build_failure_diagnostic(
         code = failure.code
         evidence = "confirmed"
         details.update(_candidate_exception_details(failure))
+    elif declared_diagnostic is not None:
+        category, code, evidence = declared_diagnostic
     elif any(isinstance(item, StaleStatePreview) for item in chain):
         category = "source_changed"
         code = "chapter_or_narrative_changed"

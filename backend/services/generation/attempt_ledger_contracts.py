@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from bson.int64 import Int64
+
 
 PERSISTED_ATTEMPT_STATES = frozenset({
     "claimed",
@@ -83,6 +85,12 @@ class LaunchableAttemptLedgerV1:
     accounted_attempt_ids: tuple[str, ...]
 
 
+def _is_persisted_integer(value: Any) -> bool:
+    """Accept only BSON's two lossless integer representations, never bool."""
+
+    return type(value) in {int, Int64}
+
+
 def _checked_add(total: int, value: int) -> int:
     if value < 0 or total > MAX_PERSISTED_LEDGER_TOKENS - value:
         raise ValueError("persisted Provider attempt usage exceeds its bound")
@@ -107,7 +115,7 @@ def _strict_bound(value: Any, *, required: bool) -> int | None:
     if value is None and not required:
         return None
     if (
-        type(value) is not int
+        not _is_persisted_integer(value)
         or value < 1
         or value > MAX_PERSISTED_ATTEMPT_TOKENS
     ):
@@ -126,7 +134,7 @@ def _strict_usage_floor(value: Any) -> int:
     for field in ("input_tokens", "output_tokens", "total_tokens"):
         component = value.get(field)
         if (
-            type(component) is not int
+            not _is_persisted_integer(component)
             or component < 0
             or component > MAX_PERSISTED_ATTEMPT_TOKENS
         ):
@@ -156,10 +164,10 @@ def validate_launchable_attempt_ledgers(
     if (
         not isinstance(attempt_slots, list)
         or not isinstance(active_token_reservations, list)
-        or type(attempt_capacity) is not int
+        or not _is_persisted_integer(attempt_capacity)
         or attempt_capacity < 0
         or attempt_capacity > MAX_PERSISTED_LEDGER_TOKENS
-        or type(attempts_claimed) is not int
+        or not _is_persisted_integer(attempts_claimed)
         or attempts_claimed < 0
         or attempts_claimed != len(attempt_slots)
         or attempts_claimed > attempt_capacity
@@ -167,16 +175,16 @@ def validate_launchable_attempt_ledgers(
     ):
         raise ValueError("persisted Provider attempt ledger exceeds its bound")
     if (
-        type(tokens_used) is not int
+        not _is_persisted_integer(tokens_used)
         or tokens_used < 0
         or tokens_used > MAX_PERSISTED_LEDGER_TOKENS
-        or type(tokens_reserved) is not int
+        or not _is_persisted_integer(tokens_reserved)
         or tokens_reserved < 0
         or tokens_reserved > MAX_PERSISTED_LEDGER_TOKENS
         or (
             token_budget is not None
             and (
-                type(token_budget) is not int
+                not _is_persisted_integer(token_budget)
                 or token_budget < 0
                 or token_budget > MAX_PERSISTED_LEDGER_TOKENS
             )
@@ -208,7 +216,7 @@ def validate_launchable_attempt_ledgers(
             charged = item.get("charged_tokens")
             if charged is not None:
                 if (
-                    type(charged) is not int
+                    not _is_persisted_integer(charged)
                     or charged < floor
                     or charged > MAX_PERSISTED_ATTEMPT_TOKENS
                 ):

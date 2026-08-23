@@ -71,6 +71,13 @@ class CharacterStateRepository(BaseRepository):
         state_fields = {
             "current_state": str(current_state).strip(),
             "as_of_chapter_order": int(as_of_chapter_order),
+            # Timeline refresh soft-deletes projections that no longer belong to
+            # an active chapter.  A later regeneration of that chapter must
+            # reactivate the same unique (novel_id, card_id) document before a
+            # permanent fact can be appended; otherwise _get_state deliberately
+            # hides the matched document and the ordered write fails halfway.
+            "is_deleted": False,
+            "deleted_at": None,
             "updated_at": now,
         }
         if as_of_chapter_id:
@@ -85,8 +92,6 @@ class CharacterStateRepository(BaseRepository):
                     "card_id": card_obj_id,
                     "permanent_facts": [],
                     "created_at": now,
-                    "is_deleted": False,
-                    "deleted_at": None,
                 },
             },
             upsert=True,
