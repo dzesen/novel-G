@@ -3531,6 +3531,10 @@ class GenerationJobRepository:
         *,
         diagnostic: Mapping[str, Any],
         error: Mapping[str, Any],
+        expected_status: str,
+        expected_pause_reason: str | None,
+        expected_execution_epoch: int,
+        expected_failure_event_id: str | None,
     ) -> bool:
         """Atomically bind a source-change pause to its owning diagnostic."""
 
@@ -3539,10 +3543,32 @@ class GenerationJobRepository:
             diagnostic.get("schema_version") != 1
             or str(diagnostic.get("category") or "") != "source_changed"
             or str(error.get("step") or "") != "source_changed"
+            or expected_status != "paused"
+            or not isinstance(expected_pause_reason, str)
+            or not expected_pause_reason
+            or type(expected_execution_epoch) is not int
+            or expected_execution_epoch < 0
+            or (
+                expected_failure_event_id is not None
+                and (
+                    not isinstance(expected_failure_event_id, str)
+                    or not expected_failure_event_id
+                    or expected_failure_event_id
+                    != expected_failure_event_id.strip()
+                    or len(expected_failure_event_id) > 240
+                )
+            )
         ):
             raise ValueError("Source-change diagnostic contract is invalid")
         result = await self._collection_update_one(
-            {"_id": to_object_id(job_id), "is_deleted": False},
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": expected_status,
+                "pause_reason": expected_pause_reason,
+                "execution_epoch": expected_execution_epoch,
+                "current_failure_event_id": expected_failure_event_id,
+            },
             {
                 "$push": {
                     "diagnostics": {

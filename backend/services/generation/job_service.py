@@ -197,23 +197,35 @@ async def _pause_reference_card_review_for_source_change(
     target: Mapping[str, Any],
     *,
     reason_codes: list[str],
-) -> None:
+) -> bool:
+    execution_epoch = target.get("execution_epoch")
+    failure_event_id = target.get("current_failure_event_id")
+    if type(execution_epoch) is not int or execution_epoch < 0:
+        raise ValueError("Generation job execution epoch is invalid")
+    if failure_event_id is not None and not isinstance(failure_event_id, str):
+        raise ValueError("Generation job failure event pointer is invalid")
     diagnostic = build_failure_diagnostic(
         _ReferenceCardReviewSourceChanged(reason_codes[0]),
         step="source_changed",
         chapter_id=str(target.get("current_chapter_id") or ""),
         occurred_at=get_utc_now(),
     )
-    changed = await generation_job_repo.pause_for_source_change(
+    return await generation_job_repo.pause_for_source_change(
         job_id,
         diagnostic=diagnostic,
         error={
             "step": "source_changed",
             "reason_codes": list(reason_codes),
         },
+        expected_status=str(target.get("status") or ""),
+        expected_pause_reason=(
+            str(target.get("pause_reason"))
+            if target.get("pause_reason") is not None
+            else None
+        ),
+        expected_execution_epoch=execution_epoch,
+        expected_failure_event_id=failure_event_id,
     )
-    if not changed:
-        raise ConflictError("Generation Job changed during card-review recovery")
 
 
 def _validate_start_authorization(
@@ -2146,7 +2158,7 @@ class GenerationJobService:
                 or expected_revision < 0
                 or current_revision != expected_revision
             ):
-                await _pause_reference_card_review_for_source_change(
+                changed = await _pause_reference_card_review_for_source_change(
                     job_id,
                     target,
                     reason_codes=[
@@ -2154,6 +2166,12 @@ class GenerationJobService:
                         "successor_required",
                     ],
                 )
+                if not changed:
+                    return {
+                        "resumed_job_ids": [],
+                        "status": "deferred",
+                        "reason_codes": ["job_state_changed"],
+                    }
                 return {
                     "resumed_job_ids": [],
                     "status": "deferred",
@@ -2168,7 +2186,7 @@ class GenerationJobService:
                 # The human card decision was already committed by the caller.
                 # A legacy Job must not turn that successful mutation into an
                 # HTTP 500; keep it paused and require a newly authorized Job.
-                await _pause_reference_card_review_for_source_change(
+                changed = await _pause_reference_card_review_for_source_change(
                     job_id,
                     target,
                     reason_codes=[
@@ -2176,6 +2194,12 @@ class GenerationJobService:
                         "successor_required",
                     ],
                 )
+                if not changed:
+                    return {
+                        "resumed_job_ids": [],
+                        "status": "deferred",
+                        "reason_codes": ["job_state_changed"],
+                    }
                 return {
                     "resumed_job_ids": [],
                     "status": "deferred",
