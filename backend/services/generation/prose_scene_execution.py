@@ -403,6 +403,29 @@ def _is_safe_pre_dispatch_budget_refusal(segment: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_settled_reported_error(segment: Mapping[str, Any]) -> bool:
+    """Allow recovery only when text and positive Provider usage are durable."""
+    usage = segment.get("usage")
+    if not isinstance(usage, Mapping):
+        return False
+    token_counts = (
+        usage.get("input_tokens"),
+        usage.get("output_tokens"),
+        usage.get("total_tokens"),
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in token_counts
+    ):
+        return False
+    return bool(
+        str(segment.get("status") or "") == "incomplete"
+        and str(segment.get("finish_reason") or "") == "error"
+        and str(segment.get("text") or "").strip()
+        and int(usage["total_tokens"]) > 0
+    )
+
+
 def _is_scene_complete(
     *,
     scene_text: str,
@@ -823,6 +846,12 @@ async def execute_v3_prose_plan(
             if sequence not in retryable_budget_refusals
         }
 
+    # Only a terminal that was already durable before this execution may cross
+    # the reported-error recovery boundary below. A fresh ``error`` terminal
+    # must still pause this execution, so recovery is observable, bounded by the
+    # existing continuation authorization, and cannot become an opaque retry.
+    persisted_sequences = frozenset(by_sequence)
+
     uncertain = [
         segment
         for segment in by_sequence.values()
@@ -1210,7 +1239,14 @@ async def execute_v3_prose_plan(
             failure = _provider_failure_reason(
                 str(latest.get("finish_reason") or "unreported")
             )
-            if failure is not None:
+            persisted_reported_error_recovery = bool(
+                failure == "finish_reason_error"
+                and policy.permits_automatic_continuation
+                and _is_settled_reported_error(latest)
+                and int(latest.get("sequence_index") or 0)
+                in persisted_sequences
+            )
+            if failure is not None and not persisted_reported_error_recovery:
                 state["status"] = "paused"
                 state["pause_reason"] = failure
                 await publish_progress()
@@ -1229,7 +1265,11 @@ async def execute_v3_prose_plan(
             # Baseline parts come first for normal progress. An exact duplicate
             # instead gets one recovery attempt, so an old prefix cannot consume
             # the remaining planned parts as if new prose had been written.
-            if missing_base is not None and not no_progress:
+            if (
+                missing_base is not None
+                and not no_progress
+                and not persisted_reported_error_recovery
+            ):
                 await perform_call(
                     scene_index=scene_index,
                     spec=missing_base,
@@ -1280,7 +1320,11 @@ async def execute_v3_prose_plan(
 
             scene_word_count = int(state.get("word_count") or 0)
             minimum_words = _scene_minimum_words(plan, scene_index)
-            if no_progress:
+            if persisted_reported_error_recovery:
+                prompt_mode = (
+                    "final_recovery" if remaining_automatic == 1 else "recovery"
+                )
+            elif no_progress:
                 prompt_mode = (
                     "final_recovery" if remaining_automatic == 1 else "recovery"
                 )
