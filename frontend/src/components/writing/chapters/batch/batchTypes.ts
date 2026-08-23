@@ -321,6 +321,51 @@ export interface ChapterProgress {
   completed_at: string;
 }
 
+/**
+ * 新版候选流水线原子收口后写入的元数据摘要。
+ * 它证明候选链路已收口，但不包含旧检查点卡片需要的逐项冲突与步骤明细。
+ */
+export interface CandidatePipelineProgress {
+  schema_version: "candidate_pipeline_progress.v1";
+  status: "completed";
+  finalization_status: "committed";
+  chapter_id: string;
+  order_index: number;
+  tokens: number;
+  source: {
+    source_run_id: string;
+    source_run_revision: number;
+    source_content_digest: string;
+  };
+  state_proposal_id: string;
+  repair_cycles_used: number;
+  attempt_count: number;
+  truncation_count: number;
+  outline_issue_categories: string[];
+  scene_coverage_count: number;
+  consistency_issue_count: number;
+  candidate_pipeline_completion?: Record<string, unknown>;
+  completed_at: string;
+}
+
+export type GenerationJobProgress = ChapterProgress | CandidatePipelineProgress;
+
+export function isChapterProgress(
+  entry: GenerationJobProgress,
+): entry is ChapterProgress {
+  const candidate = entry as Partial<ChapterProgress>;
+  return Array.isArray(candidate.steps_done)
+    && Array.isArray(candidate.steps_skipped)
+    && Array.isArray(candidate.consistency_issues)
+    && Array.isArray(candidate.truncations);
+}
+
+export function chapterProgressEntries(
+  progress: readonly GenerationJobProgress[],
+): ChapterProgress[] {
+  return progress.filter(isChapterProgress);
+}
+
 export interface JobError {
   step: string;
   message?: string;
@@ -476,7 +521,7 @@ export interface GenerationJob {
   tokens_used: number;
   tokens_reserved?: number;
   current_chapter_id: string | null;
-  progress: ChapterProgress[];
+  progress: GenerationJobProgress[];
   last_checkpoint_index: number;
   error: JobError | null;
   diagnostics?: GenerationDiagnostic[];
@@ -528,7 +573,7 @@ export function isActive(status: JobStatus): boolean {
 
 /** 本检查点窗口 = last_checkpoint_index 之后的 progress（设计 §7.2）。 */
 export function checkpointWindow(job: GenerationJob): ChapterProgress[] {
-  return job.progress.slice(job.last_checkpoint_index);
+  return chapterProgressEntries(job.progress.slice(job.last_checkpoint_index));
 }
 
 /** 作业覆盖的章集合：整本=全书章；整卷=按 volume_id 过滤（设计 §5.1）。进度分母统一走它。 */

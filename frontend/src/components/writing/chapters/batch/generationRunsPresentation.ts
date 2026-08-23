@@ -1,9 +1,10 @@
-import type {
-  ChapterProgress,
-  GenerationDiagnostic,
-  GenerationJob,
-  JobStatus,
-} from "./batchTypes";
+import {
+  chapterProgressEntries,
+  type ChapterProgress,
+  type GenerationDiagnostic,
+  type GenerationJob,
+  type JobStatus,
+} from "./batchTypes.ts";
 
 export const JOB_CHAPTER_STEPS = ["outline", "prose", "state"] as const;
 
@@ -164,7 +165,7 @@ export function currentJobStatusByProseRun(
   ));
   for (const job of ordered) {
     if (TERMINAL_STATUSES.has(job.status)) continue;
-    const proseRunIds = unique(job.progress
+    const proseRunIds = unique(chapterProgressEntries(job.progress)
       .map((entry) => entry.incomplete_prose?.source_run_id ?? "")
       .filter(Boolean));
     for (const proseRunId of proseRunIds) {

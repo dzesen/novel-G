@@ -6,6 +6,7 @@ import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type { WritingTargetKey } from "@/lib/writingRoute";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
+  chapterProgressEntries,
   type GenerationDiagnostic,
   type GenerationJob,
   type GenerationRunsNavigationTarget,
@@ -531,7 +532,9 @@ export default function GenerationRunsWorkspace({
     ? jobs.find((job) => job._id === target.jobId) ?? null
     : null;
   const selectedChapterProgress = useMemo(
-    () => aggregateChapterProgress(selectedJob?.progress ?? []),
+    () => aggregateChapterProgress(
+      chapterProgressEntries(selectedJob?.progress ?? []),
+    ),
     [selectedJob],
   );
   const orderedDiagnostics = useMemo(

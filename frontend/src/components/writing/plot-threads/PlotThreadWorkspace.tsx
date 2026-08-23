@@ -6,7 +6,11 @@ import { useTranslations } from "next-intl";
 import { apiGet, apiPost, apiPut, apiDelete } from "@/lib/api";
 import type { PlotThread, ThreadStatus, ThreadImportance } from "../chapters/outline/outlineTypes";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
-import { isTerminal, type GenerationJob } from "../chapters/batch/batchTypes";
+import {
+  checkpointWindow,
+  isTerminal,
+  type GenerationJob,
+} from "../chapters/batch/batchTypes";
 import {
   summarizePlotThreadReferenceCleanup,
   type PlotThreadReferenceCleanupSummary,
@@ -66,7 +70,7 @@ export default function PlotThreadWorkspace({
       setUnmatchedReferenceReview(
         currentJob
           ? summarizePlotThreadReferenceCleanup(
-              currentJob.progress.slice(currentJob.last_checkpoint_index),
+              checkpointWindow(currentJob),
               res.data
                 .filter((thread) => thread.status === "planted" || thread.status === "developing")
                 .map((thread) => thread._id),
