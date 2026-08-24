@@ -77,6 +77,7 @@ ACTIVE_FAILURE_PAUSE_REASONS = frozenset({
     "attempt_capacity",
     "cost_cap",
     "incomplete_scene",
+    "outline_adherence_manual_review",
     "reference_card_auto_creation_recovery",
     "reference_card_repair_exhausted",
     "source_changed",
@@ -235,6 +236,12 @@ def _event_matches_pause_reason(
         )
     if pause_reason == "incomplete_scene":
         return is_diagnostic and category == "model_output_incomplete"
+    if pause_reason == "outline_adherence_manual_review":
+        return bool(
+            is_diagnostic
+            and category == "validation_logic"
+            and code == "candidate_adherence_manual_review"
+        )
     if pause_reason in {"uncertain_attempt", "uncertain_skipped"}:
         return bool(
             (
@@ -657,6 +664,21 @@ def build_failure_diagnostic(
         code = failure.code
         evidence = "confirmed"
         details.update(_candidate_exception_details(failure))
+    elif any(
+        isinstance(item, ChapterCandidatePipelineBlocked)
+        and item.code == "candidate_adherence_manual_review"
+        for item in chain
+    ):
+        failure = next(
+            item
+            for item in chain
+            if isinstance(item, ChapterCandidatePipelineBlocked)
+            and item.code == "candidate_adherence_manual_review"
+        )
+        category = "validation_logic"
+        code = failure.code
+        evidence = "confirmed"
+        details.update(_candidate_exception_details(failure))
     elif declared_diagnostic is not None:
         category, code, evidence = declared_diagnostic
     elif any(
@@ -909,12 +931,23 @@ def _candidate_checkpoint_projection(
             for item in coverage[:20]
         )
         categories = latest.get("issue_categories")
+        policy_result = (
+            latest.get("decision")
+            if latest.get("schema_version")
+            == "chapter_candidate_pipeline_checkpoint.v4"
+            else latest.get("verdict")
+        )
         if (
-            latest.get("verdict") != "pass"
+            policy_result != "pass"
             or bool(categories)
             or coverage_failed
         ):
             gate = "outline_adherence"
+            details[
+                "outline_decision"
+                if latest.get("decision") is not None
+                else "outline_verdict"
+            ] = _safe_text(policy_result, limit=32)
             if isinstance(categories, (list, tuple)):
                 details["outline_issue_categories"] = [
                     _safe_text(value, limit=60) for value in categories[:20]

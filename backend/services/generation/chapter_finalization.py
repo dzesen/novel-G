@@ -425,6 +425,7 @@ class ChapterFinalizationService:
                 adherence,
                 outline=outline,
                 prose=prose_text,
+                require_current_evidence=True,
             )
         except OutlineAdherenceValidationError as exc:
             raise ChapterFinalizationDenied(str(exc)) from exc

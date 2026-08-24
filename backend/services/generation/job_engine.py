@@ -542,6 +542,9 @@ async def _handle_candidate_chapter_failure(
     authorization_scope_increased = (
         candidate_code == "authorization_scope_increased"
     )
+    adherence_manual_review = (
+        candidate_code == "candidate_adherence_manual_review"
+    )
     source_changed = diagnostic["category"] == "source_changed"
     source_changed = source_changed or (
         candidate_code == "candidate_narrative_revision_changed"
@@ -551,7 +554,11 @@ async def _handle_candidate_chapter_failure(
             "interrupted"
             if has_uncertain
             else "paused"
-            if source_changed or authorization_scope_increased
+            if (
+                source_changed
+                or authorization_scope_increased
+                or adherence_manual_review
+            )
             else "failed"
         ),
         "pause_reason": (
@@ -561,11 +568,13 @@ async def _handle_candidate_chapter_failure(
             if authorization_scope_increased
             else "source_changed"
             if source_changed
+            else "outline_adherence_manual_review"
+            if adherence_manual_review
             else None
         ),
         "current_chapter_id": (
             chapter_id
-            if preserve or authorization_scope_increased
+            if preserve or authorization_scope_increased or adherence_manual_review
             else None
         ),
         "active_slot": None,

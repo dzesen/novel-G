@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.utils import get_utc_now
+from backend.scene_contract_versions import (
+    current_outline_adherence_decision,
+)
 from backend.services.generation.failure_diagnostics import infer_job_diagnostics
 from backend.services.generation.book_structure_initialization import (
     BookStructureBudgetBoundary,
@@ -156,6 +159,12 @@ def _serialize_outline_adherence(value: Any) -> Optional[Dict[str, Any]]:
     """Return only a usable historical adherence review for API consumers."""
     if not isinstance(value, dict):
         return None
+    decision = current_outline_adherence_decision(value)
+    if decision is not None:
+        review = dict(value)
+        if not isinstance(review.get("local_issues"), list):
+            review["local_issues"] = []
+        return review
     verdict = value.get("verdict")
     if not isinstance(verdict, str) or verdict not in _OUTLINE_ADHERENCE_VERDICTS:
         return None

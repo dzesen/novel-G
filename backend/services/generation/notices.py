@@ -181,32 +181,58 @@ def outline_adherence_notice(
     requires_pause: bool,
 ) -> dict[str, Any]:
     issues = []
-    for item in list(review.get("issues") or [])[:20]:
-        issues.append(
-            {
-                "severity": str(item.get("severity") or "warning")[
-                    :_MAX_VALUE_LENGTH
-                ],
-                "category": str(item.get("category") or "")[
-                    :_MAX_VALUE_LENGTH
-                ],
-                "outline_requirement": str(
-                    item.get("outline_requirement") or ""
-                )[:1000],
-                "prose_evidence": str(item.get("prose_evidence") or "")[:1000],
-                "explanation": str(item.get("explanation") or "")[:1000],
-            }
-        )
-    verdict = str(review.get("verdict") or "warn")
+    current_policy = review.get("decision") is not None
+    for item in list(
+        review.get("local_issues" if current_policy else "issues") or []
+    )[:20]:
+        projected = {
+            "severity": str(item.get("severity") or "warning")[
+                :_MAX_VALUE_LENGTH
+            ],
+            "category": str(item.get("category") or "")[:_MAX_VALUE_LENGTH],
+        }
+        if current_policy:
+            projected.update(
+                {
+                    "issue_signature": str(
+                        item.get("issue_signature") or ""
+                    )[:64],
+                    "scene_id": str(item.get("scene_id") or "")[:64],
+                    "beat_ids": _bounded_values(item.get("beat_ids") or []),
+                }
+            )
+        else:
+            projected.update(
+                {
+                    "outline_requirement": str(
+                        item.get("outline_requirement") or ""
+                    )[:1000],
+                    "prose_evidence": str(
+                        item.get("prose_evidence") or ""
+                    )[:1000],
+                    "explanation": str(item.get("explanation") or "")[:1000],
+                }
+            )
+        issues.append(projected)
+    policy_result = str(
+        review.get("decision")
+        if current_policy
+        else review.get("verdict") or "warn"
+    )
+    hard_failure = policy_result in {"repair", "manual_review", "fail"}
     return {
-        "code": "outline_adherence_failed"
-        if verdict == "fail"
-        else "outline_adherence_warning",
-        "severity": "error" if verdict == "fail" else "warning",
+        "code": (
+            "outline_adherence_manual_review"
+            if policy_result == "manual_review"
+            else "outline_adherence_failed"
+            if hard_failure
+            else "outline_adherence_warning"
+        ),
+        "severity": "error" if hard_failure else "warning",
         "category": "outline_adherence",
         "step": "outline_adherence",
         "details": {
-            "verdict": verdict,
+            "decision" if current_policy else "verdict": policy_result,
             "summary": str(review.get("summary") or "")[:1000],
             "issues": issues,
         },

@@ -30,6 +30,9 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import ACTIVE_THREAD_STATUSES
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.utils import get_utc_now, to_object_id
+from backend.scene_contract_versions import (
+    current_outline_adherence_decision,
+)
 from backend.services.generation.job_planner import order_book_chapters
 from backend.services.generation.failure_diagnostics import (
     ActiveFailureEventState,
@@ -1076,7 +1079,11 @@ class BookCompletionAudit:
                 review = entry.get("outline_adherence")
                 if (
                     isinstance(review, dict)
-                    and review.get("verdict") in {"pass", "warn", "fail"}
+                    and (
+                        review.get("verdict") in {"pass", "warn", "fail"}
+                        or current_outline_adherence_decision(review)
+                        is not None
+                    )
                 ):
                     latest_reviews[chapter_id] = (index, review)
 
@@ -1137,11 +1144,17 @@ class BookCompletionAudit:
                     index,
                     review,
                 ) in current_semantic_reviews.items()
-                if review.get("verdict") == "fail"
-                and str(
-                    latest_job.get("outline_deviation_policy") or ""
+                if (
+                    current_outline_adherence_decision(review)
+                    in {"repair", "manual_review"}
+                    or (
+                        review.get("verdict") == "fail"
+                        and str(
+                            latest_job.get("outline_deviation_policy") or ""
+                        )
+                        != "accept_and_continue"
+                    )
                 )
-                != "accept_and_continue"
             ]
             for semantic in sorted(
                 unresolved_semantics,
