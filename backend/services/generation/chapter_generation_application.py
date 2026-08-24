@@ -78,6 +78,7 @@ from backend.services.generation.outline_adherence import (
 from backend.services.llm.context_builder import (
     assemble_context,
     assemble_outline_context,
+    bind_context_lineage,
     estimate_tokens,
     fetch_context_inputs,
     outline_selection_roster,
@@ -439,6 +440,7 @@ class _PreparedProse:
     novel: dict[str, Any]
     chapter: dict[str, Any]
     context: Any
+    context_lineage: dict[str, Any] | None
     prompt: str
     gen_kwargs: dict[str, Any]
     policy: ProseContinuationPolicy
@@ -1515,6 +1517,7 @@ class ChapterGenerationApplicationService:
             novel=novel,
             chapter=chapter,
             context=context,
+            context_lineage=bind_context_lineage(inputs, context),
             prompt=prompt,
             gen_kwargs=gen_kwargs,
             policy=policy,
@@ -1590,6 +1593,7 @@ class ChapterGenerationApplicationService:
                     chapter_id=command.chapter_id,
                     outline=prepared.chapter.get("outline") or {},
                     context_text=prepared.context.to_prompt_text(),
+                    context_lineage=prepared.context_lineage,
                     plan=prepared.execution_plan,
                     provider_plan={
                         "provider_alias": (

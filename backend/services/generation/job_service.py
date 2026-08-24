@@ -3213,6 +3213,28 @@ class GenerationJobService:
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod
+    async def wait_for_worker_shutdown(job_id: str) -> None:
+        """Wait until the registered worker can no longer mutate Job state."""
+        entry = _REGISTRY.get(job_id)
+        if entry is None:
+            return
+        task = entry[0]
+        if task is None or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+        except JobExecutionLeaseLost:
+            pass
+        except Exception:  # noqa: BLE001 - completion still proves quiescence
+            logger.exception(
+                "[job %s] worker failed before reaching shutdown",
+                job_id,
+            )
+
+    @staticmethod
     async def pause_job(job_id: str) -> Dict[str, Any]:
         await generation_job_repo.get_job(job_id)
         entry = _REGISTRY.get(job_id)
@@ -3248,25 +3270,30 @@ class GenerationJobService:
             raise ValueError(
                 "Generation job state dispatch resolution action diverged"
             )
-        if (
+        resolution_is_terminal = (
             pending_resolution is not None
             and pending_resolution.phase == "terminal"
-        ):
-            return job
-        if state_dispatch_binding is not None:
-            await _advance_state_dispatch_resolution(
-                job_id=job_id,
-                binding=state_dispatch_binding,
-                action="abort",
-            )
-        else:
-            await generation_job_repo.complete_job_abort(job_id)
+        )
+        if not resolution_is_terminal:
+            if state_dispatch_binding is not None:
+                await _advance_state_dispatch_resolution(
+                    job_id=job_id,
+                    binding=state_dispatch_binding,
+                    action="abort",
+                )
+            else:
+                await generation_job_repo.complete_job_abort(job_id)
         entry = _REGISTRY.get(job_id)
         if entry is not None:
             entry[1].abort_requested = True
             task = entry[0]
-            if task is not None:
+            if (
+                task is not None
+                and task is not asyncio.current_task()
+                and not task.done()
+            ):
                 task.cancel()
+            await GenerationJobService.wait_for_worker_shutdown(job_id)
         return await generation_job_repo.get_job(job_id)
 
     @staticmethod

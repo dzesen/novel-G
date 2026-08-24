@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import unicodedata
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
@@ -62,6 +63,29 @@ _WORLD_ENTRY_INDEX_HEADER = (
 # other_threads 中 due 为空的 drop_rank：无截止期即无紧迫性，视作无限远，最先丢。
 _NO_DUE_DROP_RANK = -(10 ** 9)
 
+# These sections are the only prose-context sections assembled from the
+# canonical narrative projection. Keeping the list here lets a persisted
+# ProseRun prove that prior state material survived the real truncation pass,
+# without retaining that material in audit reports.
+STATE_PROPAGATION_CONTEXT_SECTIONS = frozenset({
+    "recent_chapters",
+    "present_states",
+    "permanent_facts",
+    "threads_to_resolve",
+    "other_threads",
+})
+
+
+def _context_evidence_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
 
 def _is_cjk(char: str) -> bool:
     """判断字符是否属于中日韩表意文字区。"""
@@ -96,6 +120,10 @@ class ContextItem(BaseModel):
     selection_id: Optional[str] = Field(
         default=None,
         description="细纲选择目录对应的正式 card_id；普通上下文条目为空",
+    )
+    source_id: Optional[str] = Field(
+        default=None,
+        description="审计绑定使用的正式来源 ID；不渲染进提示词",
     )
 
 
@@ -185,6 +213,7 @@ def _recent_chapters_section(recent: list) -> "Optional[ContextSection]":
         ContextItem(
             text=f"{c.get('display_label') or ('第 %s 章' % c['order_index'])}：{c['summary']}",
             drop_rank=int(c.get("book_ordinal") or c["order_index"]),
+            source_id=str(c.get("chapter_id") or "") or None,
         )
         for c in recent if c.get("summary")
     ]
@@ -570,6 +599,101 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
             budget,
         )
     return ChapterContext(sections=kept, truncated_sections=dropped, dropped_item_counts=partial)
+
+
+def bind_context_lineage(
+    inputs: Mapping[str, Any],
+    context: ChapterContext,
+) -> dict[str, Any] | None:
+    """Bind fetched narrative lineage to the exact post-truncation prompt.
+
+    The returned projection contains only digests and bounded section names.
+    It is safe to persist beside a ProseRun and strict enough to distinguish a
+    canonical-state change even when unrelated prompt text happens to remain
+    byte-for-byte identical.
+    """
+
+    raw = inputs.get("context_lineage")
+    if not isinstance(raw, Mapping):
+        return None
+    context_sections = list(getattr(context, "sections", []))
+    state_sections = [
+        {
+            "name": section.name,
+            "section_digest": _context_evidence_digest(section.content),
+        }
+        for section in context_sections
+        if section.name in STATE_PROPAGATION_CONTEXT_SECTIONS
+        and section.content
+    ]
+    recent_inputs = {
+        str(item.get("chapter_id") or ""): item
+        for item in list(inputs.get("recent_chapters") or [])
+        if isinstance(item, Mapping) and str(item.get("chapter_id") or "")
+    }
+    recent_context_items = {
+        str(item.source_id): item
+        for section in context_sections
+        if section.name == "recent_chapters"
+        for item in section.items
+        if item.source_id
+    }
+    model_evidence_keys = {
+        "model_context_section",
+        "model_context_summary_digest",
+        "model_context_item_digest",
+        "model_context_material_digest",
+    }
+    bound_prior_state_deltas: list[dict[str, Any]] = []
+    for raw_prior in list(raw.get("prior_state_deltas") or []):
+        if not isinstance(raw_prior, Mapping):
+            continue
+        prior = {
+            key: value
+            for key, value in dict(raw_prior).items()
+            if key not in model_evidence_keys
+        }
+        chapter_id = str(prior.get("chapter_id") or "")
+        recent_input = recent_inputs.get(chapter_id)
+        context_item = recent_context_items.get(chapter_id)
+        input_summary_digest = (
+            _context_evidence_digest(str(recent_input.get("summary") or ""))
+            if recent_input is not None
+            else ""
+        )
+        if (
+            context_item is not None
+            and input_summary_digest
+            and input_summary_digest
+            == str(prior.get("delta_summary_digest") or "")
+            and str(prior.get("delta_projection_digest") or "")
+        ):
+            item_digest = _context_evidence_digest(context_item.text)
+            material = {
+                "delta_projection_digest": str(
+                    prior["delta_projection_digest"]
+                ),
+                "delta_summary_digest": input_summary_digest,
+                "model_context_item_digest": item_digest,
+                "model_context_section": "recent_chapters",
+            }
+            prior.update({
+                "model_context_section": "recent_chapters",
+                "model_context_summary_digest": input_summary_digest,
+                "model_context_item_digest": item_digest,
+                "model_context_material_digest": _context_evidence_digest(
+                    material
+                ),
+            })
+        bound_prior_state_deltas.append(prior)
+    return {
+        **dict(raw),
+        "prior_state_deltas": bound_prior_state_deltas,
+        "prompt_context_digest": _context_evidence_digest(
+            context.to_prompt_text()
+        ),
+        "state_sections": state_sections,
+    }
 
 
 def build_roster(cards: dict, worldbook_cards: dict, threads: list, chapters=()) -> dict:
@@ -1065,6 +1189,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     chapter_by_id = {str(item["_id"]): item for item in all_chapters}
     recent = [
         {
+            "chapter_id": position.chapter_id,
             "order_index": position.chapter_order,
             "book_ordinal": position.book_ordinal,
             "display_label": (
@@ -1105,6 +1230,32 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
             }
 
     projection = await narrative_timeline.context_before(novel_id, chapter_id)
+    context_lineage = {
+        "schema_version": "narrative_context_lineage.v1",
+        "projection_digest": projection.digest,
+        "state_projection_digest": _context_evidence_digest(
+            projection.state_documents()
+        ),
+        "thread_projection_digest": _context_evidence_digest(
+            projection.active_threads
+        ),
+        "target_book_ordinal": target_position.book_ordinal,
+        "prior_state_deltas": [
+            {
+                "chapter_id": event.chapter_id,
+                "book_ordinal": event.book_ordinal,
+                "delta_revision": event.source_revision,
+                "delta_projection_digest": _context_evidence_digest(
+                    event.payload
+                ),
+                "delta_summary_digest": _context_evidence_digest(
+                    str(event.payload.get("summary") or "")
+                ),
+            }
+            for event in projection.events
+            if event.kind == "chapter_delta"
+        ],
+    }
     state_docs = (
         projection.state_documents()
         if projection.states_tracked
@@ -1232,6 +1383,10 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         "states": states,
         "threads": threads,
         "roster": roster,
+        # This metadata never enters prompt assembly. bind_context_lineage()
+        # binds it to the exact post-truncation prompt before it is persisted
+        # beside the ProseRun.
+        "context_lineage": context_lineage,
     }
 
 

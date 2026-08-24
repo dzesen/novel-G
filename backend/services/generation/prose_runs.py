@@ -4,10 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
 
 from backend.db import collections
-from backend.db.errors import NotFoundError
+from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.mongo import get_database
 from backend.db.mutation import MutationCommand, commit_mutation
 from backend.db.narrative_revision import narrative_revision_store
@@ -42,6 +42,192 @@ def prose_revision(value: Any) -> str:
         default=str,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalize_context_lineage(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Keep persisted context evidence metadata-only and structurally closed."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("正文上下文 lineage 必须是对象")
+    if value.get("schema_version") != "narrative_context_lineage.v1":
+        raise ValueError("正文上下文 lineage 版本无效")
+    projection_digest = str(value.get("projection_digest") or "")
+    if len(projection_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in projection_digest
+    ):
+        raise ValueError("正文上下文 projection 摘要无效")
+    target_book_ordinal = value.get("target_book_ordinal")
+    if (
+        type(target_book_ordinal) is not int
+        or target_book_ordinal < 1
+    ):
+        raise ValueError("正文上下文目标章节序号无效")
+    prior: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for raw in value.get("prior_state_deltas") or []:
+        if not isinstance(raw, dict):
+            raise ValueError("正文上下文前序状态 lineage 无效")
+        source_chapter_id = str(raw.get("chapter_id") or "")
+        try:
+            to_object_id(source_chapter_id)
+        except (InvalidIdError, TypeError, ValueError) as exc:
+            raise ValueError("正文上下文前序章节 ID 无效") from exc
+        book_ordinal = raw.get("book_ordinal")
+        delta_revision = raw.get("delta_revision")
+        if (
+            type(book_ordinal) is not int
+            or book_ordinal < 1
+            or book_ordinal >= target_book_ordinal
+            or type(delta_revision) is not int
+            or delta_revision < 1
+        ):
+            raise ValueError("正文上下文前序状态 revision 无效")
+        identity = (source_chapter_id, delta_revision)
+        if identity in seen:
+            raise ValueError("正文上下文前序状态 lineage 重复")
+        seen.add(identity)
+        normalized_prior: dict[str, Any] = {
+            "chapter_id": source_chapter_id,
+            "book_ordinal": book_ordinal,
+            "delta_revision": delta_revision,
+        }
+        delta_digest_keys = (
+            "delta_projection_digest",
+            "delta_summary_digest",
+        )
+        if any(key in raw for key in delta_digest_keys) and not all(
+            key in raw for key in delta_digest_keys
+        ):
+            raise ValueError("正文上下文前序状态摘要证据不完整")
+        for key in delta_digest_keys:
+            if key not in raw:
+                continue
+            digest = str(raw.get(key) or "")
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in digest
+            ):
+                raise ValueError("正文上下文前序状态摘要证据无效")
+            normalized_prior[key] = digest
+        model_evidence_keys = (
+            "model_context_section",
+            "model_context_summary_digest",
+            "model_context_item_digest",
+            "model_context_material_digest",
+        )
+        if any(key in raw for key in model_evidence_keys):
+            if not all(key in raw for key in model_evidence_keys) or not all(
+                key in normalized_prior for key in delta_digest_keys
+            ):
+                raise ValueError("正文上下文逐章模型证据不完整")
+            section = str(raw.get("model_context_section") or "")
+            model_summary_digest = str(
+                raw.get("model_context_summary_digest") or ""
+            )
+            item_digest = str(raw.get("model_context_item_digest") or "")
+            material_digest = str(
+                raw.get("model_context_material_digest") or ""
+            )
+            if (
+                section != "recent_chapters"
+                or model_summary_digest
+                != normalized_prior["delta_summary_digest"]
+                or any(
+                    len(digest) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in digest
+                    )
+                    for digest in (
+                        model_summary_digest,
+                        item_digest,
+                        material_digest,
+                    )
+                )
+                or material_digest
+                != prose_revision({
+                    "delta_projection_digest": normalized_prior[
+                        "delta_projection_digest"
+                    ],
+                    "delta_summary_digest": normalized_prior[
+                        "delta_summary_digest"
+                    ],
+                    "model_context_item_digest": item_digest,
+                    "model_context_section": section,
+                })
+            ):
+                raise ValueError("正文上下文逐章模型证据无效")
+            normalized_prior.update({
+                "model_context_section": section,
+                "model_context_summary_digest": model_summary_digest,
+                "model_context_item_digest": item_digest,
+                "model_context_material_digest": material_digest,
+            })
+        prior.append(normalized_prior)
+    if prior != sorted(
+        prior,
+        key=lambda item: (
+            item["book_ordinal"],
+            item["delta_revision"],
+            item["chapter_id"],
+        ),
+    ):
+        raise ValueError("正文上下文前序状态 lineage 顺序无效")
+    result: dict[str, Any] = {
+        "schema_version": "narrative_context_lineage.v1",
+        "projection_digest": projection_digest,
+        "target_book_ordinal": target_book_ordinal,
+        "prior_state_deltas": prior,
+    }
+    for key in (
+        "state_projection_digest",
+        "thread_projection_digest",
+        "prompt_context_digest",
+    ):
+        if key not in value:
+            continue
+        digest = str(value.get(key) or "")
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in digest
+        ):
+            raise ValueError("正文上下文 lineage 摘要无效")
+        result[key] = digest
+    if "state_sections" in value:
+        raw_sections = value.get("state_sections")
+        if not isinstance(raw_sections, list) or len(raw_sections) > 5:
+            raise ValueError("正文上下文状态段 lineage 无效")
+        sections: list[dict[str, str]] = []
+        seen_names: set[str] = set()
+        allowed_names = {
+            "recent_chapters",
+            "present_states",
+            "permanent_facts",
+            "threads_to_resolve",
+            "other_threads",
+        }
+        for raw in raw_sections:
+            if not isinstance(raw, dict):
+                raise ValueError("正文上下文状态段 lineage 无效")
+            name = str(raw.get("name") or "")
+            digest = str(raw.get("section_digest") or "")
+            if (
+                name not in allowed_names
+                or name in seen_names
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+            ):
+                raise ValueError("正文上下文状态段 lineage 无效")
+            seen_names.add(name)
+            sections.append({"name": name, "section_digest": digest})
+        result["state_sections"] = sections
+    return result
 
 
 def prose_run_draft_text(document: dict[str, Any]) -> str:
@@ -394,6 +580,7 @@ class ProseRunModule:
         context_text: str,
         plan: ProseExecutionPlan,
         provider_plan: dict[str, Any],
+        context_lineage: dict[str, Any] | None = None,
         generation_job_id: str | None = None,
         run_id: str | None = None,
         expected_revision: int | None = None,
@@ -403,10 +590,26 @@ class ProseRunModule:
     ) -> dict[str, Any]:
         outline_revision = prose_revision(outline)
         context_revision = prose_revision(context_text)
+        normalized_context_lineage = _normalize_context_lineage(
+            context_lineage
+        )
         replace_run_id: str | None = None
         replace_revision: int | None = None
         if run_id:
             existing = await prose_run_repo.get_run(run_id, owner_id)
+            try:
+                existing_context_lineage = _normalize_context_lineage(
+                    existing.get("context_lineage")
+                )
+            except ValueError as exc:
+                await prose_run_repo.mark_status(
+                    run_id=run_id,
+                    owner_id=owner_id,
+                    status="stale",
+                )
+                raise ValueError(
+                    "正文草稿缺少有效的上下文来源证据，不能继续自动拼接"
+                ) from exc
             if (
                 generation_job_id is not None
                 and str(existing.get("generation_job_id") or "")
@@ -417,13 +620,17 @@ class ProseRunModule:
                 str(existing.get("chapter_id")) != str(chapter_id)
                 or existing.get("outline_revision") != outline_revision
                 or existing.get("context_revision") != context_revision
+                or existing_context_lineage != normalized_context_lineage
             ):
                 await prose_run_repo.mark_status(
                     run_id=run_id,
                     owner_id=owner_id,
                     status="stale",
                 )
-                raise ValueError("正文草稿基于旧细纲或旧上下文，不能继续自动拼接")
+                raise ValueError(
+                    "正文草稿基于旧细纲、旧上下文或旧来源证据，"
+                    "不能静默续写；请保留旧稿参考并重新生成"
+                )
             if dict(existing.get("plan") or {}) != plan.to_dict():
                 await prose_run_repo.mark_status(
                     run_id=run_id,
@@ -531,28 +738,34 @@ class ProseRunModule:
                     owner_id=owner_id,
                     status="stale",
                 )
+        document = {
+            "owner_id": owner_id,
+            "novel_id": novel_id,
+            "chapter_id": chapter_id,
+            "generation_job_id": generation_job_id,
+            "outline_revision": outline_revision,
+            "prose_continuation_authorization": dict(authorization or {}),
+            "authorization_revision": int(
+                (authorization or {}).get("authorization_revision") or 0
+            ),
+            "token_budget": (authorization or {}).get("token_budget"),
+            "context_revision": context_revision,
+            **(
+                {"context_lineage": normalized_context_lineage}
+                if normalized_context_lineage is not None
+                else {}
+            ),
+            "plan": plan.to_dict(),
+            "provider_plan": dict(provider_plan),
+            "narrative_revision": (
+                await narrative_revision_store.current(novel_id)
+            ),
+            "completion": None,
+            "assembled_text": "",
+            "acceptance_state": None,
+        }
         created = await prose_run_repo.create_run(
-            {
-                "owner_id": owner_id,
-                "novel_id": novel_id,
-                "chapter_id": chapter_id,
-                "generation_job_id": generation_job_id,
-                "outline_revision": outline_revision,
-                "prose_continuation_authorization": dict(authorization or {}),
-                "authorization_revision": int(
-                    (authorization or {}).get("authorization_revision") or 0
-                ),
-                "token_budget": (authorization or {}).get("token_budget"),
-                "context_revision": context_revision,
-                "plan": plan.to_dict(),
-                "provider_plan": dict(provider_plan),
-                "narrative_revision": (
-                    await narrative_revision_store.current(novel_id)
-                ),
-                "completion": None,
-                "assembled_text": "",
-                "acceptance_state": None,
-            },
+            document,
             replace_run_id=replace_run_id,
             expected_revision=replace_revision,
         )
