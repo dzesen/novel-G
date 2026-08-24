@@ -16,9 +16,11 @@ from backend.llm.schemas.scene_contract_pydantic import (
     MAX_V3_LOCAL_ADHERENCE_ISSUES,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
 )
 from backend.scene_contract_versions import (
     LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
 )
 from backend.services.generation.chapter_generation_application import (
@@ -49,6 +51,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpointV1,
     AdherenceCandidateCheckpointV3,
     AdherenceCandidateCheckpointV4,
+    AdherenceCandidateCheckpointV5,
     CandidateCompletionProjectionV1,
     CandidatePipelineCheckpointConflict,
     CandidatePipelineCheckpointV1,
@@ -92,6 +95,12 @@ from backend.services.generation.state_repair_contracts import (
     StateRepairDirective,
     StateRepairReason,
 )
+
+
+_LOCAL_POLICY_EVIDENCE_VERSIONS = frozenset({
+    LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+})
 
 
 _MAX_REPAIR_SCENE_INDEXES = MAX_CANDIDATE_OUTLINE_SCENES
@@ -1323,24 +1332,30 @@ def _adherence_checkpoint_projection(
     tuple[str, ...],
     tuple[CandidateSceneCoverageV1, ...],
 ]:
-    is_current = adherence.get("evidence_schema_version") == (
-        OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    uses_local_policy = adherence.get("evidence_schema_version") in (
+        _LOCAL_POLICY_EVIDENCE_VERSIONS
     )
-    policy_result = adherence.get("decision" if is_current else "verdict")
+    policy_result = adherence.get(
+        "decision" if uses_local_policy else "verdict"
+    )
     valid_results = (
         {"pass", "repair", "manual_review"}
-        if is_current
+        if uses_local_policy
         else {"pass", "warn", "fail"}
     )
     if policy_result not in valid_results:
         raise ChapterCandidatePipelineBlocked(
-            "章纲符合度本地裁决无效" if is_current else "章纲符合度 verdict 无效"
+            "章纲符合度本地裁决无效"
+            if uses_local_policy
+            else "章纲符合度 verdict 无效"
         )
-    raw_issues = adherence.get("local_issues" if is_current else "issues")
+    raw_issues = adherence.get(
+        "local_issues" if uses_local_policy else "issues"
+    )
     raw_coverage = adherence.get("scene_coverage")
     issue_limit = (
         MAX_V3_LOCAL_ADHERENCE_ISSUES
-        if is_current
+        if uses_local_policy
         else MAX_V2_ADHERENCE_ISSUES
     )
     if (
@@ -1360,7 +1375,7 @@ def _adherence_checkpoint_projection(
                 "章纲符合度问题投影无效"
             )
         severity = item.get("severity")
-        if is_current and severity not in {"blocker", "major", "unknown"}:
+        if uses_local_policy and severity not in {"blocker", "major", "unknown"}:
             continue
         category = item.get("category")
         if category not in _OUTLINE_ISSUE_CATEGORIES:
@@ -1369,7 +1384,7 @@ def _adherence_checkpoint_projection(
             )
         if category not in categories:
             categories.append(category)
-        if is_current:
+        if uses_local_policy:
             signature = item.get("issue_signature")
             if not isinstance(signature, str):
                 raise ChapterCandidatePipelineBlocked(
@@ -1410,9 +1425,11 @@ def _adherence_checkpoint(
     evidence_version = adherence.get("evidence_schema_version")
     validated_evidence_v2 = None
     validated_evidence_v3 = None
+    validated_evidence_v4 = None
     if evidence_version is not None:
         if evidence_version not in {
             LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+            LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
             OUTLINE_ADHERENCE_EVIDENCE_VERSION,
         }:
             raise ChapterCandidatePipelineBlocked(
@@ -1420,6 +1437,15 @@ def _adherence_checkpoint(
             )
         try:
             if evidence_version == OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+                validated_evidence_v4 = (
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                        dict(adherence)
+                    )
+                )
+            elif (
+                evidence_version
+                == LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            ):
                 validated_evidence_v3 = (
                     ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
                         dict(adherence)
@@ -1442,7 +1468,20 @@ def _adherence_checkpoint(
         evidence=evidence,
     )
     try:
-        if validated_evidence_v3 is not None:
+        if validated_evidence_v4 is not None:
+            checkpoint = AdherenceCandidateCheckpointV5(
+                **{
+                    **common,
+                    "schema_version": "chapter_candidate_pipeline_checkpoint.v5",
+                },
+                cycle=cycle,
+                decision=policy_result,
+                issue_categories=categories,
+                blocking_issue_signatures=blocking_signatures,
+                scene_coverage=coverage,
+                validated_evidence=validated_evidence_v4,
+            )
+        elif validated_evidence_v3 is not None:
             checkpoint = AdherenceCandidateCheckpointV4(
                 **{
                     **common,
@@ -2077,6 +2116,7 @@ def _checkpoint_step_name(
             AdherenceCandidateCheckpointV1,
             AdherenceCandidateCheckpointV3,
             AdherenceCandidateCheckpointV4,
+            AdherenceCandidateCheckpointV5,
         ),
     ):
         return (
@@ -2104,7 +2144,22 @@ def _validate_resumed_adherence_projection(
     adherence = reviewed.value
     if not _adherence_matches_source(adherence, source):
         raise ChapterCandidatePipelineBlocked("候选管线恢复复检身份不一致")
-    if isinstance(checkpoint, AdherenceCandidateCheckpointV4):
+    if isinstance(checkpoint, AdherenceCandidateCheckpointV5):
+        try:
+            restored_evidence = (
+                ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                    dict(adherence)
+                )
+            )
+        except ValueError as exc:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复 V4 复检证据无效"
+            ) from exc
+        if restored_evidence != checkpoint.validated_evidence:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复 V4 复检证据与检查点不一致"
+            )
+    elif isinstance(checkpoint, AdherenceCandidateCheckpointV4):
         try:
             restored_evidence = (
                 ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
@@ -2144,12 +2199,18 @@ def _validate_resumed_adherence_projection(
         ) from exc
     expected_policy_result = (
         checkpoint.decision
-        if isinstance(checkpoint, AdherenceCandidateCheckpointV4)
+        if isinstance(
+            checkpoint,
+            (AdherenceCandidateCheckpointV4, AdherenceCandidateCheckpointV5),
+        )
         else checkpoint.verdict
     )
     expected_signatures = (
         checkpoint.blocking_issue_signatures
-        if isinstance(checkpoint, AdherenceCandidateCheckpointV4)
+        if isinstance(
+            checkpoint,
+            (AdherenceCandidateCheckpointV4, AdherenceCandidateCheckpointV5),
+        )
         else ()
     )
     if (
@@ -2394,6 +2455,7 @@ def _project_replayed_checkpoint_prefix(
                 AdherenceCandidateCheckpointV1,
                 AdherenceCandidateCheckpointV3,
                 AdherenceCandidateCheckpointV4,
+                AdherenceCandidateCheckpointV5,
             ),
         ):
             review_count += 1
@@ -3129,8 +3191,8 @@ _SCENE_REPAIR_CATEGORIES = frozenset({
 def _hard_repair_issues(
     adherence: Mapping[str, Any],
 ) -> tuple[RepairIssueV1, ...]:
-    if adherence.get("evidence_schema_version") != (
-        OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    if adherence.get("evidence_schema_version") not in (
+        _LOCAL_POLICY_EVIDENCE_VERSIONS
     ):
         return ()
     raw_issues = adherence.get("local_issues")
@@ -3160,7 +3222,8 @@ def _hard_repair_issues(
 
 
 def _checkpoint_hard_repair_issues(
-    checkpoint: AdherenceCandidateCheckpointV4,
+    checkpoint: AdherenceCandidateCheckpointV4
+    | AdherenceCandidateCheckpointV5,
 ) -> tuple[RepairIssueV1, ...]:
     return tuple(
         RepairIssueV1(
@@ -3177,7 +3240,10 @@ def _content_repair_component(
 ) -> RepairComponent:
     if adherence is None:
         return RepairComponent.SCENE_REGENERATION
-    if isinstance(adherence, AdherenceCandidateCheckpointV4):
+    if isinstance(
+        adherence,
+        (AdherenceCandidateCheckpointV4, AdherenceCandidateCheckpointV5),
+    ):
         categories = set(adherence.issue_categories)
         missing_scene = any(
             item.status != "covered" for item in adherence.scene_coverage
@@ -3198,7 +3264,7 @@ def _content_repair_component(
         raw_issues = adherence.get(
             "local_issues"
             if adherence.get("evidence_schema_version")
-            == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            in _LOCAL_POLICY_EVIDENCE_VERSIONS
             else "issues"
         )
         categories = {
@@ -3216,7 +3282,7 @@ def _content_repair_component(
         )
         legacy_unclassified_failure = bool(
             adherence.get("evidence_schema_version")
-            != OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            not in _LOCAL_POLICY_EVIDENCE_VERSIONS
             and adherence.get("verdict") != "pass"
             and not categories
         )
@@ -3313,7 +3379,10 @@ def _replay_repair_policy(
                         if phase == "adherence"
                         and isinstance(
                             latest_adherence,
-                            AdherenceCandidateCheckpointV4,
+                            (
+                                AdherenceCandidateCheckpointV4,
+                                AdherenceCandidateCheckpointV5,
+                            ),
                         )
                         else None
                     )
@@ -3330,6 +3399,7 @@ def _replay_repair_policy(
                     AdherenceCandidateCheckpointV1,
                     AdherenceCandidateCheckpointV3,
                     AdherenceCandidateCheckpointV4,
+                    AdherenceCandidateCheckpointV5,
                 ),
             ):
                 if checkpoint.cycle > 0:
@@ -3338,7 +3408,13 @@ def _replay_repair_policy(
                         checkpoint,
                         attempts_by_id,
                     )
-                if isinstance(checkpoint, AdherenceCandidateCheckpointV4):
+                if isinstance(
+                    checkpoint,
+                    (
+                        AdherenceCandidateCheckpointV4,
+                        AdherenceCandidateCheckpointV5,
+                    ),
+                ):
                     issues = _checkpoint_hard_repair_issues(checkpoint)
                     if policy.observation_count == 0:
                         policy.observe_adherence(

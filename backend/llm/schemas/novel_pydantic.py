@@ -11,9 +11,11 @@ from backend.llm.schemas.reference_card_pydantic import (
 from backend.llm.schemas.scene_contract_pydantic import (
     ChapterOutlineAdherenceEvidenceSchema,
     ChapterOutlineAdherenceEvidenceV3Schema,
+    ChapterOutlineAdherenceEvidenceV4Schema,
     SceneTransitionContractSchema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
 )
 from backend.llm.schemas.state_fact_pydantic import (
     ChapterStateFactEvidenceSchema,

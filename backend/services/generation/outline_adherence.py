@@ -11,18 +11,25 @@ from pydantic import ValidationError
 
 from backend.llm.schemas.scene_contract_pydantic import (
     ChapterOutlineAdherenceEvidenceSchema,
-    ChapterOutlineAdherenceEvidenceV3Schema,
+    ChapterOutlineAdherenceEvidenceV4Schema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
 )
 from backend.scene_contract_versions import (
+    LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
     SCENE_TRANSITION_CONTRACT_VERSION,
     require_known_scene_contract_version,
 )
 from backend.services.novel.state_completion import chapter_content_digest
+from backend.services.generation.narrative_quality_signals import (
+    NarrativeQualitySignalError,
+    assess_narrative_quality_signals,
+)
 
 
 class OutlineIssueCategory(StrEnum):
@@ -211,31 +218,31 @@ def assess_outline_adherence_evidence(
     source_prose_run_revision: int,
     source_content_digest: str,
 ) -> dict[str, Any]:
-    """Validate V3 Provider evidence and apply the fixed local issue policy."""
+    """Validate V4 Provider evidence and apply the fixed local issue policy."""
 
     if outline.get("scene_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
         raise OutlineAdherenceValidationError(
-            "legacy_v1 章纲不能生成 V3 符合度证据"
+            "legacy_v1 章纲不能生成 V4 符合度证据"
         )
     try:
-        parsed = ChapterOutlineAdherenceEvidenceV3Schema.model_validate(result)
+        parsed = ChapterOutlineAdherenceEvidenceV4Schema.model_validate(result)
     except ValidationError as exc:
-        raise OutlineAdherenceValidationError("V3 符合度证据结构无效") from exc
+        raise OutlineAdherenceValidationError("V4 符合度证据结构无效") from exc
     if parsed.schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
-        raise OutlineAdherenceValidationError("V3 符合度证据版本未知")
+        raise OutlineAdherenceValidationError("V4 符合度证据版本未知")
     if parsed.outline_contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
-        raise OutlineAdherenceValidationError("V3 符合度证据没有绑定当前章纲合同版本")
+        raise OutlineAdherenceValidationError("V4 符合度证据没有绑定当前章纲合同版本")
 
     run_id = str(source_prose_run_id or "").strip()
     if not run_id:
-        raise OutlineAdherenceValidationError("V3 符合度证据缺少正文运行身份")
+        raise OutlineAdherenceValidationError("V4 符合度证据缺少正文运行身份")
     if (
         type(source_prose_run_revision) is not int
         or source_prose_run_revision < 0
     ):
-        raise OutlineAdherenceValidationError("V3 符合度证据正文版本无效")
+        raise OutlineAdherenceValidationError("V4 符合度证据正文版本无效")
     if source_content_digest != chapter_content_digest(prose):
-        raise OutlineAdherenceValidationError("V3 符合度证据正文摘要不匹配")
+        raise OutlineAdherenceValidationError("V4 符合度证据正文摘要不匹配")
 
     scenes = list(outline.get("scenes") or [])
     expected = [
@@ -246,7 +253,7 @@ def assess_outline_adherence_evidence(
     actual = [(item.scene_id, item.beat_id) for item in parsed.beat_evidence]
     if not expected or actual != expected:
         raise OutlineAdherenceValidationError(
-            "V3 beat 证据身份或顺序没有精确覆盖当前章纲"
+            "V4 beat 证据身份或顺序没有精确覆盖当前章纲"
         )
 
     canonical_beats: list[dict[str, Any]] = []
@@ -385,6 +392,41 @@ def assess_outline_adherence_evidence(
             }
         )
 
+    expected_profile_scene_ids = [
+        str(scene.get("scene_id") or "") for scene in scenes
+    ]
+    actual_profile_scene_ids = [
+        profile.scene_id for profile in parsed.scene_quality_profiles
+    ]
+    if actual_profile_scene_ids != expected_profile_scene_ids:
+        raise OutlineAdherenceValidationError(
+            "V4 质量画像没有按顺序精确覆盖当前章纲场景"
+        )
+    canonical_quality_profiles = [
+        {
+            **profile.model_dump(exclude={"representative_spans"}),
+            "representative_spans": _canonical_provider_spans(
+                profile.representative_spans,
+                prose=prose,
+                subject="quality profile",
+            ),
+        }
+        for profile in parsed.scene_quality_profiles
+    ]
+    try:
+        quality_sidecar = assess_narrative_quality_signals(
+            outline=outline,
+            prose=prose,
+            scene_profiles=canonical_quality_profiles,
+            source_prose_run_id=run_id,
+            source_prose_run_revision=source_prose_run_revision,
+            source_content_digest=source_content_digest,
+        )
+    except NarrativeQualitySignalError as exc:
+        raise OutlineAdherenceValidationError(
+            "V4 叙事质量旁路证据无效"
+        ) from exc
+
     required_by_id = {
         str(beat.get("beat_id") or ""): bool(beat.get("required", True))
         for scene in scenes
@@ -511,6 +553,19 @@ def assess_outline_adherence_evidence(
             )
         )
 
+    for candidate in quality_sidecar["candidates"]:
+        local_issues.append(
+            {
+                "issue_signature": candidate["candidate_signature"],
+                "severity": "quality_debt",
+                "category": "narrative_function_repetition",
+                "source_kind": "quality_signal",
+                "scene_id": None,
+                "source_evidence_count": len(candidate["layers"]),
+                "contract_reference_ids": [],
+            }
+        )
+
     unknown_groups: dict[
         tuple[str, str | None, tuple[str, ...]],
         list[dict[str, Any]],
@@ -585,6 +640,8 @@ def assess_outline_adherence_evidence(
         "findings": canonical_findings,
         "quality_dimensions": canonical_quality,
         "unknowns": canonical_unknowns,
+        "scene_quality_profiles": canonical_quality_profiles,
+        "quality_debt_sidecar": quality_sidecar,
         "local_issues": local_issues,
         "local_issue_counts": issue_counts,
         "decision": decision,
@@ -594,12 +651,12 @@ def assess_outline_adherence_evidence(
         "source_content_digest": source_content_digest,
     }
     try:
-        return ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+        return ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
             assessed
         ).model_dump(mode="python")
     except ValidationError as exc:  # local construction must fail closed
         raise OutlineAdherenceValidationError(
-            "V3 本地问题策略投影无效"
+            "V4 本地问题策略投影无效"
         ) from exc
 
 
@@ -890,11 +947,15 @@ def validate_complete_outline_adherence(
 
     evidence_version = result.get("evidence_schema_version")
     is_current_evidence = evidence_version == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    is_legacy_local_evidence = (
+        evidence_version == LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    )
+    uses_local_policy = is_current_evidence or is_legacy_local_evidence
     if require_current_evidence and not is_current_evidence:
         raise OutlineAdherenceValidationError(
             "章纲符合度新正式写入必须使用当前本地问题策略"
         )
-    if is_current_evidence:
+    if uses_local_policy:
         decision = result.get("decision")
         if decision == "manual_review":
             raise OutlineAdherenceValidationError(
@@ -922,15 +983,24 @@ def validate_complete_outline_adherence(
                 "V2 章纲正式验证缺少精确正文"
             )
         try:
-            parsed_result = (
-                ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
-                    dict(result)
+            if is_current_evidence:
+                parsed_result = (
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                        dict(result)
+                    )
                 )
-                if is_current_evidence
-                else ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
-                    dict(result)
+            elif is_legacy_local_evidence:
+                parsed_result = (
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+                        dict(result)
+                    )
                 )
-            )
+            else:
+                parsed_result = (
+                    ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
+                        dict(result)
+                    )
+                )
         except ValidationError as exc:
             raise OutlineAdherenceValidationError(
                 "章纲符合度本地证据结构无效"
@@ -939,6 +1009,8 @@ def validate_complete_outline_adherence(
         expected_evidence_version = (
             OUTLINE_ADHERENCE_EVIDENCE_VERSION
             if is_current_evidence
+            else LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            if is_legacy_local_evidence
             else LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION
         )
         if result.get("evidence_schema_version") != expected_evidence_version:
@@ -955,16 +1027,46 @@ def validate_complete_outline_adherence(
             raise OutlineAdherenceValidationError("章纲符合度没有绑定当前章纲内容")
         if result.get("source_content_digest") != chapter_content_digest(prose):
             raise OutlineAdherenceValidationError("章纲符合度没有绑定精确正文内容")
+        if is_current_evidence:
+            try:
+                expected_quality_sidecar = assess_narrative_quality_signals(
+                    outline=outline,
+                    prose=prose,
+                    scene_profiles=list(
+                        result.get("scene_quality_profiles") or []
+                    ),
+                    source_prose_run_id=str(
+                        result.get("source_prose_run_id") or ""
+                    ),
+                    source_prose_run_revision=result.get(
+                        "source_prose_run_revision"
+                    ),
+                    source_content_digest=str(
+                        result.get("source_content_digest") or ""
+                    ),
+                )
+            except NarrativeQualitySignalError as exc:
+                raise OutlineAdherenceValidationError(
+                    "章纲符合度质量旁路没有绑定当前正文"
+                ) from exc
+            if result.get("quality_debt_sidecar") != expected_quality_sidecar:
+                raise OutlineAdherenceValidationError(
+                    "章纲符合度质量旁路没有绑定当前正文"
+                )
         evidence_collections = [
             list(result.get("beat_evidence") or []),
             list(result.get("findings") or []),
         ]
-        if is_current_evidence:
+        if uses_local_policy:
             evidence_collections.extend(
                 [
                     list(result.get("quality_dimensions") or []),
                     list(result.get("unknowns") or []),
                 ]
+            )
+        if is_current_evidence:
+            evidence_collections.append(
+                list(result.get("scene_quality_profiles") or [])
             )
         for collection in evidence_collections:
             for item in collection:
@@ -1019,7 +1121,7 @@ def validate_complete_outline_adherence(
             raise OutlineAdherenceValidationError("章纲符合度仍包含合同偏离")
         quality_debt_count = 0
         quality_observation_count = 0
-        if is_current_evidence:
+        if uses_local_policy:
             unknowns = result.get("unknowns")
             if not isinstance(unknowns, list) or unknowns:
                 raise OutlineAdherenceValidationError(
@@ -1045,6 +1147,12 @@ def validate_complete_outline_adherence(
             quality_observation_count = len(
                 list(result.get("quality_dimensions") or [])
             )
+            if is_current_evidence:
+                quality_sidecar = result.get("quality_debt_sidecar")
+                if not isinstance(quality_sidecar, Mapping):
+                    raise OutlineAdherenceValidationError(
+                        "章纲符合度缺少叙事质量旁路证据"
+                    )
         evidence_metadata = {
             "evidence_schema_version": expected_evidence_version,
             "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
@@ -1060,10 +1168,30 @@ def validate_complete_outline_adherence(
                     "quality_debt_count": quality_debt_count,
                     "quality_observation_count": quality_observation_count,
                 }
+                if uses_local_policy
+                else {}
+            ),
+            **(
+                {
+                    "quality_debt_status": "evaluated",
+                    "quality_debt_sidecar_digest": quality_sidecar.get(
+                        "sidecar_digest"
+                    ),
+                    "quality_signal_candidate_count": quality_sidecar.get(
+                        "candidate_count"
+                    ),
+                }
                 if is_current_evidence
                 else {}
             ),
         }
+        if is_legacy_local_evidence:
+            evidence_metadata["issue_policy_version"] = (
+                LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION
+            )
+            evidence_metadata.pop("quality_debt_status", None)
+            evidence_metadata.pop("quality_debt_sidecar_digest", None)
+            evidence_metadata.pop("quality_signal_candidate_count", None)
     elif result.get("evidence_schema_version") is not None:
         raise OutlineAdherenceValidationError(
             "legacy_v1 章纲不能使用版本化 beat 证据"

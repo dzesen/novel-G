@@ -29,10 +29,11 @@ from backend.llm.prompts.prompt_selector import (
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
-    ChapterOutlineAdherenceEvidenceV3Schema,
+    ChapterOutlineAdherenceEvidenceV4Schema,
     ChapterOutlineAdherenceResultSchema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
 )
 from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
@@ -272,6 +273,7 @@ class CheckOutlineAdherenceOutput(_StrictModel):
         ChapterOutlineAdherenceResultSchema
         | ValidatedChapterOutlineAdherenceEvidenceSchema
         | ValidatedChapterOutlineAdherenceEvidenceV3Schema
+        | ValidatedChapterOutlineAdherenceEvidenceV4Schema
         | None
     ) = None
 
@@ -289,7 +291,10 @@ class CheckOutlineAdherenceOutput(_StrictModel):
             self.review.decision == "pass"
             if isinstance(
                 self.review,
-                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                (
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+                ),
             )
             else self.review.verdict == "pass"
         )
@@ -1793,17 +1798,17 @@ V2 场景输出规则：
                 chapter_content=current_text,
             )
             with_schema_suffix = (
-                "outline_adherence_v3_prompt_with_schema_suffix"
+                "outline_adherence_v4_prompt_with_schema_suffix"
                 if uses_versioned_evidence
                 else "outline_adherence_prompt_with_schema_suffix"
             )
             without_schema_suffix = (
-                "outline_adherence_v3_prompt_without_schema_suffix"
+                "outline_adherence_v4_prompt_without_schema_suffix"
                 if uses_versioned_evidence
                 else "outline_adherence_prompt_without_schema_suffix"
             )
             adherence_schema = (
-                ChapterOutlineAdherenceEvidenceV3Schema
+                ChapterOutlineAdherenceEvidenceV4Schema
                 if uses_versioned_evidence
                 else RemediationAdherenceProviderOutput
             )
@@ -1872,7 +1877,7 @@ V2 场景输出规则：
         try:
             if uses_versioned_evidence:
                 provider_review = (
-                    ChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+                    ChapterOutlineAdherenceEvidenceV4Schema.model_validate(
                         generated.value
                     )
                 )
@@ -1885,7 +1890,7 @@ V2 场景输出规则：
                     source_content_digest=payload.expected_content_digest,
                 )
                 review = (
-                    ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
                         normalized
                     )
                 )
@@ -1941,7 +1946,10 @@ V2 场景输出规则：
             review.decision
             if isinstance(
                 review,
-                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                (
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+                ),
             )
             else review.verdict
         )
@@ -1961,7 +1969,10 @@ V2 场景输出规则：
             ]
             if isinstance(
                 review,
-                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                (
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+                ),
             )
             else list(review.issues)
         )
@@ -1992,7 +2003,10 @@ V2 场景输出规则：
             {"decision": policy_result}
             if isinstance(
                 review,
-                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                (
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+                    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+                ),
             )
             else {"verdict": policy_result}
         )

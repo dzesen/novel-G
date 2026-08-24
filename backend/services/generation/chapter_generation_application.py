@@ -39,7 +39,7 @@ from backend.llm.prompts.prompt_selector import (
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
-    ChapterOutlineAdherenceEvidenceV3Schema,
+    ChapterOutlineAdherenceEvidenceV4Schema,
     ChapterOutlineAdherenceResultSchema,
     ChapterOutlineResultSchema,
     ChapterStateResultSchema,
@@ -1229,7 +1229,7 @@ class ChapterGenerationApplicationService:
         if uses_versioned_evidence and prompts.get("contract_version") != (
             OUTLINE_ADHERENCE_EVIDENCE_VERSION
         ):
-            raise ValueError("V3 证据化审核提示词合同版本无效")
+            raise ValueError("V4 证据化审核提示词合同版本无效")
         prompt_base = prompts["outline_adherence_prompt_base"].format(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),
@@ -1237,12 +1237,12 @@ class ChapterGenerationApplicationService:
             chapter_content=content,
         )
         with_schema_suffix = (
-            "outline_adherence_v3_prompt_with_schema_suffix"
+            "outline_adherence_v4_prompt_with_schema_suffix"
             if uses_versioned_evidence
             else "outline_adherence_prompt_with_schema_suffix"
         )
         without_schema_suffix = (
-            "outline_adherence_v3_prompt_without_schema_suffix"
+            "outline_adherence_v4_prompt_without_schema_suffix"
             if uses_versioned_evidence
             else "outline_adherence_prompt_without_schema_suffix"
         )
@@ -1305,7 +1305,7 @@ class ChapterGenerationApplicationService:
             prose=content,
             outline=outline,
             result_schema=(
-                ChapterOutlineAdherenceEvidenceV3Schema
+                ChapterOutlineAdherenceEvidenceV4Schema
                 if uses_versioned_evidence
                 else ChapterOutlineAdherenceResultSchema
             ),
@@ -1368,9 +1368,9 @@ class ChapterGenerationApplicationService:
 
         try:
             candidate = prepared.command.prose_candidate
-            if prepared.result_schema is ChapterOutlineAdherenceEvidenceV3Schema:
+            if prepared.result_schema is ChapterOutlineAdherenceEvidenceV4Schema:
                 if candidate is None:  # guarded in prepare; fail-closed proof
-                    raise ValueError("V3 符合度证据缺少正文候选绑定")
+                    raise ValueError("V4 符合度证据缺少正文候选绑定")
                 review = assess_outline_adherence_evidence(
                     generated.value.model_dump(),
                     outline=prepared.outline,
@@ -1386,7 +1386,7 @@ class ChapterGenerationApplicationService:
             if (
                 candidate is not None
                 and prepared.result_schema
-                is not ChapterOutlineAdherenceEvidenceV3Schema
+                is not ChapterOutlineAdherenceEvidenceV4Schema
             ):
                 review = {
                     **review,

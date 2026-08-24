@@ -24,6 +24,9 @@ from backend.services.generation.chapter_candidate_authorization import (
     build_chapter_candidate_repair_authorization,
     parse_candidate_repair_authorization,
 )
+from backend.services.generation.narrative_quality_authorization import (
+    build_narrative_quality_signal_authorization,
+)
 from backend.services.generation.prose_continuation import (
     SCENE_DIVERGENCE_STOP_FACTOR,
     ProseContinuationPolicy,
@@ -729,6 +732,13 @@ class GenerationReadinessModule:
                     "providers": [],
                     "config_revision": "",
                     "capability_snapshot": "",
+                }
+            if has_chapter_work:
+                planning = {
+                    **planning,
+                    "narrative_quality_signal_authorization": (
+                        build_narrative_quality_signal_authorization(chapters)
+                    ),
                 }
             finalization_authorization = (
                 build_chapter_finalization_authorization(

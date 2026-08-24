@@ -1060,7 +1060,10 @@ def _candidate_checkpoint_projection(
         policy_result = (
             latest.get("decision")
             if latest.get("schema_version")
-            == "chapter_candidate_pipeline_checkpoint.v4"
+            in {
+                "chapter_candidate_pipeline_checkpoint.v4",
+                "chapter_candidate_pipeline_checkpoint.v5",
+            }
             else latest.get("verdict")
         )
         if (

@@ -14,10 +14,13 @@ from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
 from backend.llm.schemas.scene_contract_pydantic import (
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
 )
 from backend.llm.stream_terminal import FinishReason
 from backend.scene_contract_versions import (
     LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
 )
@@ -384,7 +387,7 @@ class _CandidatePipelineCheckpointV4(_CandidatePipelineCheckpointV1):
 
 
 class AdherenceCandidateCheckpointV4(_CandidatePipelineCheckpointV4):
-    """Current checkpoint: Provider evidence plus the local issue-policy result."""
+    """Read-only V3/V1 local-policy checkpoint."""
 
     kind: Literal["outline_adherence"] = "outline_adherence"
     decision: Literal["pass", "repair", "manual_review"]
@@ -405,9 +408,15 @@ class AdherenceCandidateCheckpointV4(_CandidatePipelineCheckpointV4):
     @model_validator(mode="after")
     def validate_evidence_projection(self) -> "AdherenceCandidateCheckpointV4":
         evidence = self.validated_evidence
-        if evidence.evidence_schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+        if (
+            evidence.evidence_schema_version
+            != LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION
+        ):
             raise ValueError("V3 adherence checkpoint evidence version is invalid")
-        if evidence.issue_policy_version != OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION:
+        if (
+            evidence.issue_policy_version
+            != LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION
+        ):
             raise ValueError("V3 adherence checkpoint issue policy is invalid")
         blocking_issues = [
             item
@@ -441,6 +450,71 @@ class AdherenceCandidateCheckpointV4(_CandidatePipelineCheckpointV4):
             or self.source.source_content_digest != evidence.source_content_digest
         ):
             raise ValueError("V3 adherence checkpoint projection diverged")
+        return self
+
+
+class _CandidatePipelineCheckpointV5(_CandidatePipelineCheckpointV1):
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v5"]
+
+
+class AdherenceCandidateCheckpointV5(_CandidatePipelineCheckpointV5):
+    """Current checkpoint: V4 evidence, local V2 policy, and quality sidecar."""
+
+    kind: Literal["outline_adherence"] = "outline_adherence"
+    decision: Literal["pass", "repair", "manual_review"]
+    issue_categories: tuple[CandidateOutlineIssueCategory, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    blocking_issue_signatures: tuple[str, ...] = Field(
+        default=(),
+        max_length=80,
+    )
+    scene_coverage: tuple[CandidateSceneCoverageV1, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    validated_evidence: ValidatedChapterOutlineAdherenceEvidenceV4Schema
+
+    @model_validator(mode="after")
+    def validate_evidence_projection(self) -> "AdherenceCandidateCheckpointV5":
+        evidence = self.validated_evidence
+        if evidence.evidence_schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+            raise ValueError("V4 adherence checkpoint evidence version is invalid")
+        if evidence.issue_policy_version != OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION:
+            raise ValueError("V4 adherence checkpoint issue policy is invalid")
+        blocking_issues = [
+            item
+            for item in evidence.local_issues
+            if item.severity in {"blocker", "major", "unknown"}
+        ]
+        categories = tuple(
+            dict.fromkeys(item.category for item in blocking_issues)
+        )
+        signatures = tuple(item.issue_signature for item in blocking_issues)
+        if any(
+            len(signature) != 64
+            or any(character not in "0123456789abcdef" for character in signature)
+            for signature in self.blocking_issue_signatures
+        ):
+            raise ValueError("V4 adherence checkpoint issue signature is invalid")
+        coverage = tuple(
+            (item.scene_index, item.status) for item in evidence.scene_coverage
+        )
+        projected_coverage = tuple(
+            (item.scene_index, item.status) for item in self.scene_coverage
+        )
+        if (
+            self.decision != evidence.decision
+            or self.issue_categories != categories
+            or self.blocking_issue_signatures != signatures
+            or projected_coverage != coverage
+            or self.source.source_run_id != evidence.source_prose_run_id
+            or self.source.source_run_revision
+            != evidence.source_prose_run_revision
+            or self.source.source_content_digest != evidence.source_content_digest
+        ):
+            raise ValueError("V4 adherence checkpoint projection diverged")
         return self
 
 
@@ -485,6 +559,7 @@ AdherenceCandidateCheckpoint = (
     AdherenceCandidateCheckpointV1
     | AdherenceCandidateCheckpointV3
     | AdherenceCandidateCheckpointV4
+    | AdherenceCandidateCheckpointV5
 )
 StateCandidateCheckpoint = StateCandidateCheckpointV1 | StateCandidateCheckpointV3
 
@@ -494,6 +569,7 @@ CandidatePipelineCheckpointV1 = (
     | AdherenceCandidateCheckpointV1
     | AdherenceCandidateCheckpointV3
     | AdherenceCandidateCheckpointV4
+    | AdherenceCandidateCheckpointV5
     | StateCandidateCheckpointV1
     | StateCandidateCheckpointV3
 )
@@ -548,7 +624,10 @@ def candidate_checkpoint_adherence_passed(
     policy_passed = (
         checkpoint.decision == "pass"
         and not checkpoint.blocking_issue_signatures
-        if isinstance(checkpoint, AdherenceCandidateCheckpointV4)
+        if isinstance(
+            checkpoint,
+            (AdherenceCandidateCheckpointV4, AdherenceCandidateCheckpointV5),
+        )
         else checkpoint.verdict == "pass"
     )
     return bool(
@@ -762,6 +841,7 @@ def replay_candidate_pipeline_checkpoints(
                 AdherenceCandidateCheckpointV1,
                 AdherenceCandidateCheckpointV3,
                 AdherenceCandidateCheckpointV4,
+                AdherenceCandidateCheckpointV5,
             ),
         ):
             if (
@@ -949,6 +1029,7 @@ def parse_candidate_pipeline_checkpoint(
         "chapter_candidate_pipeline_checkpoint.v2",
         "chapter_candidate_pipeline_checkpoint.v3",
         "chapter_candidate_pipeline_checkpoint.v4",
+        "chapter_candidate_pipeline_checkpoint.v5",
     }:
         raise ValueError("candidate checkpoint schema_version is invalid")
     if (
@@ -961,6 +1042,11 @@ def parse_candidate_pipeline_checkpoint(
         and value.get("kind") != "outline_adherence"
     ):
         raise ValueError("candidate checkpoint v4 kind is invalid")
+    if (
+        checkpoint_version == "chapter_candidate_pipeline_checkpoint.v5"
+        and value.get("kind") != "outline_adherence"
+    ):
+        raise ValueError("candidate checkpoint v5 kind is invalid")
     _require_nested_contract_version(
         value,
         field="source",

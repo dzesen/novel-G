@@ -473,7 +473,7 @@ write_chapter_by_ai:
 
 # 章节正文相对细纲的语义符合度检查（批量生成门禁）
 review_chapter_outline_adherence_by_ai:
-  contract_version: chapter_outline_adherence_evidence.v3
+  contract_version: chapter_outline_adherence_evidence.v4
   outline_adherence_prompt_base: |
     你是一位严谨但不过度机械的长篇小说责任编辑。请检查第 {chapter_order} 章
     《{chapter_title}》的正文是否在语义上落实了本章细纲，并仍然服务于当前卷大纲。
@@ -504,9 +504,9 @@ review_chapter_outline_adherence_by_ai:
     - satisfied、mentioned、contradicted 必须给至少一个正文 span；一个 beat 可以有多个 span，同一 span 也可支持多个 beat。
     - span 使用待检查正文的 0 起始 Unicode code-point 偏移，区间为 [start,end)，
       quote 必须逐字复制该区间原文。不得改写、去空格或使用字节偏移；系统会在本地复核后生成证据哈希。
-    - Provider 只返回 beat_evidence、findings、quality_dimensions 与 unknowns，
+    - Provider 只返回 beat_evidence、findings、quality_dimensions、unknowns 与 scene_quality_profiles，
       不返回 pass / warn / fail，也不决定本地 severity 或最终动作。
-    - V3 findings 用于报告场景顺序、核心冲突、结尾钩子、细纲外重大事件、卷弧线偏离、
+    - V4 findings 用于报告场景顺序、核心冲突、结尾钩子、细纲外重大事件、卷弧线偏离、
       forbidden condition 或 event repetition；observed 必须给正文 span，无法确定时用 unknown。
       forbidden_condition 必须引用同场景细纲中精确的 condition_ids；event_repetition 必须引用同场景精确的
       event_key。没有正式合同引用，或 repetition_policy 不是 forbid 时，只能作为质量观察，不得伪装成客观 finding。
@@ -514,17 +514,23 @@ review_chapter_outline_adherence_by_ai:
     - interest、pacing、character_drive、style、novelty 与 narrative_function_repetition
       只能写入 quality_dimensions，status 只可为 concern 或 strength，并提供正文 span。
       这些是尚未校准的文学质量观察，Provider 不得把它们改写成客观合同 findings。
+    - scene_quality_profiles 必须按章纲场景顺序逐场且仅返回一项。每项用 1～2 个正文 span 代表本场实际发生的动作链，
+      event_fingerprint 只抽象 actor_role、action、object_role 与 outcome；narrative_function 必须分别概括
+      goal、conflict、turn、outcome、new_information、character_change 与 stakes_delta。
+      没有明显变化时也要如实写“本场无可观察变化”，不得复制章纲计划冒充正文事实。
+    - 质量画像只供本地字面、事件指纹与叙事功能三层疑似召回。Provider 不得返回相似度阈值、候选结论、
+      severity、hard_gate 或是否修复；本地相似度也不能单独升级为客观合同 finding。
     - 旧章纲没有 V2 合同时，按提供的旧 Schema 返回 scene_coverage；旧结果只用于兼容读取。
   outline_adherence_prompt_with_schema_suffix: |
     请严格按提供的 JSON Schema 输出，不要输出额外解释。
   outline_adherence_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
     {"verdict":"pass|warn|fail","summary":"总体结论","scene_coverage":[{"scene_index":1,"status":"covered|partial|missing","evidence":"正文依据"}],"issues":[{"severity":"warning|error","category":"scene_coverage|scene_order|core_conflict|ending_hook|unplanned_major_event|volume_arc","outline_requirement":"细纲或卷纲要求","prose_evidence":"正文依据","explanation":"偏离原因"}]}
-  outline_adherence_v3_prompt_with_schema_suffix: |
-    请严格按提供的 V3 JSON Schema 输出语义证据，不要输出 verdict、severity、decision 或额外解释。
-  outline_adherence_v3_prompt_without_schema_suffix: |
+  outline_adherence_v4_prompt_with_schema_suffix: |
+    请严格按提供的 V4 JSON Schema 输出语义证据，不要输出 verdict、severity、decision、候选结论或额外解释。
+  outline_adherence_v4_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
-    {"schema_version":"chapter_outline_adherence_evidence.v3","outline_contract_version":"scene_transition_contract.v2","summary":"证据摘要","beat_evidence":[{"scene_id":"scene-1","beat_id":"scene-1-beat-1","status":"satisfied|mentioned|contradicted|missing|unknown","spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"explanation":"判定依据"}],"findings":[],"quality_dimensions":[],"unknowns":[]}
+    {"schema_version":"chapter_outline_adherence_evidence.v4","outline_contract_version":"scene_transition_contract.v2","summary":"证据摘要","beat_evidence":[{"scene_id":"scene-1","beat_id":"scene-1-beat-1","status":"satisfied|mentioned|contradicted|missing|unknown","spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"explanation":"判定依据"}],"findings":[],"quality_dimensions":[],"unknowns":[],"scene_quality_profiles":[{"profile_id":"profile-scene-1","scene_id":"scene-1","representative_spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"event_fingerprint":{"actor_role":"行动者角色","action":"核心动作","object_role":"作用对象角色","outcome":"事件结果"},"narrative_function":{"goal":"场景目标","conflict":"阻力或冲突","turn":"关键转折","outcome":"叙事结果","new_information":"新增信息或本场无可观察变化","character_change":"人物变化或本场无可观察变化","stakes_delta":"风险变化或本场无可观察变化"}}]}
 
 extract_chapter_state_by_ai:
   contract_version: chapter_state_fact_evidence.v1

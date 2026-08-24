@@ -420,15 +420,6 @@ class ChapterFinalizationService:
         outline = chapter.get("outline")
         if not isinstance(outline, Mapping):
             raise ChapterFinalizationDenied("正式提交章节缺少有效章纲")
-        try:
-            adherence_metadata = validate_complete_outline_adherence(
-                adherence,
-                outline=outline,
-                prose=prose_text,
-                require_current_evidence=True,
-            )
-        except OutlineAdherenceValidationError as exc:
-            raise ChapterFinalizationDenied(str(exc)) from exc
         if (
             str(adherence.get("source_prose_run_id") or "")
             != str(prose_command.payload["run_id"])
@@ -441,6 +432,15 @@ class ChapterFinalizationService:
             != str(prose_command.payload["text_digest"])
         ):
             raise ChapterFinalizationDenied("细纲符合度结果没有绑定当前正文候选")
+        try:
+            adherence_metadata = validate_complete_outline_adherence(
+                adherence,
+                outline=outline,
+                prose=prose_text,
+                require_current_evidence=True,
+            )
+        except OutlineAdherenceValidationError as exc:
+            raise ChapterFinalizationDenied(str(exc)) from exc
         max_repairs = _strict_int(
             authorization.get("max_repair_cycles"),
             field="正文修复次数上限",

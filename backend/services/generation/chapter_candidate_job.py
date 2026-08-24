@@ -22,6 +22,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpoint,
     AdherenceCandidateCheckpointV3,
     AdherenceCandidateCheckpointV4,
+    AdherenceCandidateCheckpointV5,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
     JobMutationRecoveryBindingV1,
@@ -623,7 +624,11 @@ def _adherence_result(
     source = checkpoint.source
     if isinstance(
         checkpoint,
-        (AdherenceCandidateCheckpointV3, AdherenceCandidateCheckpointV4),
+        (
+            AdherenceCandidateCheckpointV3,
+            AdherenceCandidateCheckpointV4,
+            AdherenceCandidateCheckpointV5,
+        ),
     ):
         value = checkpoint.validated_evidence.model_dump(mode="json")
     else:

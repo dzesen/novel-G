@@ -45,6 +45,11 @@ from backend.services.generation.provider_budget import (
     structured_call_budget,
     structured_provider_bounds,
 )
+from backend.services.generation.narrative_quality_authorization import (
+    build_narrative_quality_signal_authorization,
+    narrative_quality_signal_authorization_digest,
+    validate_readiness_narrative_quality_signal_authorization,
+)
 from backend.services.llm.generation_runtime import (
     GenerationPlan,
     STRUCTURED_REQUEST_BUDGET_PROTOCOL,
@@ -54,12 +59,12 @@ from backend.services.llm.generation_runtime import (
 
 
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_repair_authorization.v4"
+    "chapter_candidate_repair_authorization.v5"
 )
-CANDIDATE_PIPELINE_REVISION = 20
+CANDIDATE_PIPELINE_REVISION = 21
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_job_execution_authorization.v1"
+    "chapter_candidate_job_execution_authorization.v2"
 )
 CANDIDATE_JOB_GENERATION_PLAN_SCHEMA = "candidate_job_generation_plan.v1"
 PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
@@ -151,6 +156,7 @@ def readiness_chapter_uses_candidate_pipeline(
         raise ValueError(
             "existing prose without outline cannot enter the state-only pipeline"
         )
+    validate_readiness_narrative_quality_signal_authorization(readiness)
     return selected.get("has_content") is False
 
 
@@ -248,8 +254,9 @@ class CandidateJobExecutionAuthorization(_ClosedAuthorizationModel):
     """Frozen Provider plans for the initial candidate-only chapter chain."""
 
     schema_version: Literal[
-        "chapter_candidate_job_execution_authorization.v1"
+        "chapter_candidate_job_execution_authorization.v2"
     ]
+    narrative_quality_signal_authorization_digest: _Sha256
     generation_params_digest: _Sha256
     eligible_chapter_count: _NonNegativeInt
     eligible_chapter_ids_digest: _Sha256
@@ -396,7 +403,8 @@ class CandidateProviderBudgetBound(_ClosedAuthorizationModel):
 
 
 class CandidateRepairAuthorization(_ClosedAuthorizationModel):
-    schema_version: Literal["chapter_candidate_repair_authorization.v4"]
+    schema_version: Literal["chapter_candidate_repair_authorization.v5"]
+    narrative_quality_signal_authorization_digest: _Sha256
     authorization_revision: _PositiveInt
     eligible_chapter_count: _NonNegativeInt
     eligible_chapter_ids_digest: _Sha256
@@ -954,6 +962,13 @@ def candidate_job_generation_requirements(
     authorization = parse_candidate_job_execution_authorization(
         planning.get("chapter_candidate_job_execution_authorization")
     )
+    quality_authorization = (
+        validate_readiness_narrative_quality_signal_authorization(readiness)
+    )
+    if authorization.narrative_quality_signal_authorization_digest != (
+        narrative_quality_signal_authorization_digest(quality_authorization)
+    ):
+        raise ValueError("candidate Job quality-signal authority changed")
     return CandidateJobGenerationRequirements(
         active=authorization.eligible_chapter_count > 0,
         needs_outline=authorization.missing_outline_chapter_count > 0,
@@ -1013,6 +1028,9 @@ def build_candidate_job_execution_authorization(
     plans: CandidateJobGenerationPlans | None = None,
 ) -> dict[str, Any]:
     eligible_ids = _eligible_chapter_ids(chapters)
+    quality_authorization = build_narrative_quality_signal_authorization(
+        chapters
+    )
     missing_outline_count = sum(
         not bool(chapter.get("outline"))
         for chapter in chapters
@@ -1024,6 +1042,11 @@ def build_candidate_job_execution_authorization(
     )
     projection = CandidateJobExecutionAuthorization.model_validate({
         "schema_version": CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA,
+        "narrative_quality_signal_authorization_digest": (
+            narrative_quality_signal_authorization_digest(
+                quality_authorization
+            )
+        ),
         "generation_params_digest": _candidate_job_generation_params_digest(
             generation_params
         ),
@@ -1110,7 +1133,16 @@ def validate_candidate_job_execution_authorization(
             {
                 "_id": str(item.get("chapter_id") or ""),
                 "content": "" if item.get("has_content") is False else "present",
-                "outline": ({"frozen": True} if item.get("has_outline") is True else None),
+                "outline": (
+                    {
+                        "scenes": [
+                            {}
+                            for _index in range(int(item.get("scene_count") or 0))
+                        ]
+                    }
+                    if item.get("has_outline") is True
+                    else None
+                ),
             }
             for item in raw_chapters
             if isinstance(item, Mapping)
@@ -1323,8 +1355,16 @@ def build_chapter_candidate_repair_authorization(
     if cycles > MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS:
         raise ValueError("candidate repair cycle bound exceeds V1")
     eligible_ids = _eligible_chapter_ids(chapters)
+    quality_authorization = build_narrative_quality_signal_authorization(
+        chapters
+    )
     base = {
         "schema_version": CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA,
+        "narrative_quality_signal_authorization_digest": (
+            narrative_quality_signal_authorization_digest(
+                quality_authorization
+            )
+        ),
         "authorization_revision": revision,
         "eligible_chapter_count": len(eligible_ids),
         "eligible_chapter_ids_digest": _chapter_ids_digest(eligible_ids),
@@ -1572,7 +1612,6 @@ def authorized_candidate_repair_attempt_slots(
     if not isinstance(raw_authorization, Mapping):
         raise ValueError("generation readiness has no candidate repair authority")
     authorization = parse_candidate_repair_authorization(raw_authorization)
-
     from backend.services.generation.chapter_finalization import (
         build_chapter_finalization_authorization,
     )
@@ -1649,6 +1688,13 @@ def authorized_candidate_repair_attempt_slots(
         != _chapter_ids_digest(tuple(eligible_ids))
     ):
         raise ValueError("candidate repair worklist digest changed")
+    quality_authorization = (
+        validate_readiness_narrative_quality_signal_authorization(readiness)
+    )
+    if authorization.narrative_quality_signal_authorization_digest != (
+        narrative_quality_signal_authorization_digest(quality_authorization)
+    ):
+        raise ValueError("candidate repair quality-signal authority changed")
     if snapshots[normalized_chapter_id].get("has_content") is True:
         return 0
     return authorization.maximum_provider_attempts_per_chapter
@@ -1699,6 +1745,18 @@ def validate_candidate_repair_execution_authorization(
                 "already formal"
                 if snapshot.get("has_content") is True
                 else ""
+            ),
+            "outline": (
+                {
+                    "scenes": [
+                        {}
+                        for _index in range(
+                            int(snapshot.get("scene_count") or 0)
+                        )
+                    ]
+                }
+                if snapshot.get("has_outline") is True
+                else {}
             ),
         }
         for snapshot in raw_snapshots

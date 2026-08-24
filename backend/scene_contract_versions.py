@@ -10,10 +10,24 @@ CHAPTER_OUTLINE_PROMPT_REVISION = "chapter-outline-prompt-r2"
 LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION = (
     "chapter_outline_adherence_evidence.v2"
 )
-OUTLINE_ADHERENCE_EVIDENCE_VERSION = (
+LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION = (
     "chapter_outline_adherence_evidence.v3"
 )
-OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION = "chapter_outline_issue_policy.v1"
+OUTLINE_ADHERENCE_EVIDENCE_VERSION = (
+    "chapter_outline_adherence_evidence.v4"
+)
+LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION = (
+    "chapter_outline_issue_policy.v1"
+)
+OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION = "chapter_outline_issue_policy.v2"
+NARRATIVE_QUALITY_SIDECAR_SCHEMA = "chapter_narrative_quality_sidecar.v1"
+NARRATIVE_REPETITION_SIGNAL_POLICY = "narrative_repetition_signal_policy.v1"
+NARRATIVE_REPETITION_SIGNAL_LAYERS = (
+    "literal_similarity",
+    "event_fingerprint",
+    "narrative_function",
+)
+MAX_NARRATIVE_REPETITION_CANDIDATES = 20
 OUTLINE_ADHERENCE_DECISIONS = frozenset({
     "pass",
     "repair",

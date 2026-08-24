@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -384,6 +386,90 @@ class ChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
         return self
 
 
+class SceneEventFingerprintSchema(BaseModel):
+    """Provider observation used only to recall possible event repetition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actor_role: RequiredText160
+    action: RequiredText160
+    object_role: RequiredText160
+    outcome: RequiredText160
+
+
+class SceneNarrativeFunctionSchema(BaseModel):
+    """Seven bounded dimensions used to compare narrative function."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal: RequiredText160
+    conflict: RequiredText160
+    turn: RequiredText160
+    outcome: RequiredText160
+    new_information: RequiredText160
+    character_change: RequiredText160
+    stakes_delta: RequiredText160
+
+
+class SceneQualityProfileSchema(BaseModel):
+    """One scene profile; it carries observations, never a local decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: StableSceneIdentity
+    scene_id: StableSceneIdentity
+    representative_spans: list[ProseEvidenceSpanSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=2,
+    )
+    event_fingerprint: SceneEventFingerprintSchema
+    narrative_function: SceneNarrativeFunctionSchema
+
+
+class ChapterOutlineAdherenceEvidenceV4Schema(BaseModel):
+    """V3 semantic evidence plus per-scene non-blocking quality profiles."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["chapter_outline_adherence_evidence.v4"]
+    outline_contract_version: Literal["scene_transition_contract.v2"]
+    summary: RequiredText500
+    beat_evidence: list[BeatEvidenceSchema] = Field(..., min_length=1, max_length=400)
+    findings: list[OutlineContractFindingV3Schema] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    quality_dimensions: list[OutlineQualityDimensionSchema] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    unknowns: list[OutlineSemanticUnknownSchema] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    scene_quality_profiles: list[SceneQualityProfileSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+    )
+
+    @model_validator(mode="after")
+    def validate_provider_identities(
+        self,
+    ) -> "ChapterOutlineAdherenceEvidenceV4Schema":
+        identity_groups = (
+            [finding.finding_id for finding in self.findings],
+            [item.observation_id for item in self.quality_dimensions],
+            [item.unknown_id for item in self.unknowns],
+            [item.profile_id for item in self.scene_quality_profiles],
+            [item.scene_id for item in self.scene_quality_profiles],
+        )
+        if any(len(values) != len(set(values)) for values in identity_groups):
+            raise ValueError("Provider evidence identities must be unique by kind")
+        return self
+
+
 class ValidatedOutlineSceneCoverageSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -496,6 +582,227 @@ class ValidatedOutlineQualityDimensionSchema(OutlineQualityDimensionSchema):
     )
 
 
+class ValidatedSceneQualityProfileSchema(SceneQualityProfileSchema):
+    representative_spans: list[ValidatedProseEvidenceSpanSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=2,
+    )
+
+
+QualitySignalMatchedDimension = Literal[
+    "actor_role",
+    "action",
+    "object_role",
+    "outcome",
+    "goal",
+    "conflict",
+    "turn",
+    "new_information",
+    "character_change",
+    "stakes_delta",
+]
+
+
+class NarrativeQualitySignalLayerSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[
+        "literal_similarity",
+        "event_fingerprint",
+        "narrative_function",
+    ]
+    score_basis_points: StrictInt = Field(..., ge=0, le=10_000)
+    matched_dimensions: list[QualitySignalMatchedDimension] = Field(
+        default_factory=list,
+        max_length=7,
+    )
+
+    @model_validator(mode="after")
+    def validate_layer_evidence(self) -> "NarrativeQualitySignalLayerSchema":
+        if len(self.matched_dimensions) != len(set(self.matched_dimensions)):
+            raise ValueError("quality signal dimensions must be unique")
+        if self.kind == "literal_similarity":
+            if self.matched_dimensions or self.score_basis_points < 8_000:
+                raise ValueError("literal quality signal is invalid")
+        elif self.kind == "event_fingerprint":
+            if self.matched_dimensions != [
+                "actor_role",
+                "action",
+                "object_role",
+                "outcome",
+            ] or self.score_basis_points != 10_000:
+                raise ValueError("event fingerprint quality signal is invalid")
+        elif (
+            len(self.matched_dimensions) < 5
+            or self.score_basis_points < 8_500
+        ):
+            raise ValueError("narrative function quality signal is invalid")
+        return self
+
+
+class NarrativeRepetitionCandidateSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scene_ids: list[StableSceneIdentity] = Field(..., min_length=2, max_length=2)
+    layers: list[NarrativeQualitySignalLayerSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=3,
+    )
+    severity: Literal["quality_debt"]
+    hard_gate: Literal[False]
+    contract_reference_ids: list[ContractReferenceIdentity] = Field(
+        default_factory=list,
+        max_length=0,
+    )
+
+    @model_validator(mode="after")
+    def validate_candidate(self) -> "NarrativeRepetitionCandidateSchema":
+        if len(set(self.scene_ids)) != 2:
+            raise ValueError("quality candidate scenes must be distinct")
+        kinds = [layer.kind for layer in self.layers]
+        expected_order = {
+            "literal_similarity": 0,
+            "event_fingerprint": 1,
+            "narrative_function": 2,
+        }
+        if len(kinds) != len(set(kinds)) or kinds != sorted(
+            kinds,
+            key=expected_order.__getitem__,
+        ):
+            raise ValueError("quality candidate layers are invalid")
+        return self
+
+
+class NarrativeQualitySourceBindingSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_prose_run_id: str = Field(..., min_length=1, max_length=128)
+    source_prose_run_revision: StrictInt = Field(..., ge=0)
+    source_content_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    outline_contract_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
+class NarrativeQualityDetectionScopeSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["current_chapter_scene_pairs"]
+    scene_ids: list[StableSceneIdentity] = Field(..., min_length=1, max_length=20)
+    scene_count: StrictInt = Field(..., ge=1, le=20)
+    comparison_pair_count: StrictInt = Field(..., ge=0, le=190)
+    layers: list[
+        Literal[
+            "literal_similarity",
+            "event_fingerprint",
+            "narrative_function",
+        ]
+    ] = Field(..., min_length=3, max_length=3)
+    maximum_candidates: Literal[20]
+    additional_provider_calls: Literal[0]
+    additional_token_bound: Literal[0]
+    second_judge_enabled: Literal[False]
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "NarrativeQualityDetectionScopeSchema":
+        if (
+            len(self.scene_ids) != len(set(self.scene_ids))
+            or self.scene_count != len(self.scene_ids)
+            or self.comparison_pair_count
+            != self.scene_count * (self.scene_count - 1) // 2
+            or self.layers
+            != [
+                "literal_similarity",
+                "event_fingerprint",
+                "narrative_function",
+            ]
+        ):
+            raise ValueError("quality signal detection scope is invalid")
+        return self
+
+
+class NarrativeQualitySidecarSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["chapter_narrative_quality_sidecar.v1"]
+    policy_version: Literal["narrative_repetition_signal_policy.v1"]
+    status: Literal["evaluated"]
+    source_binding: NarrativeQualitySourceBindingSchema
+    detection_scope: NarrativeQualityDetectionScopeSchema
+    scene_profiles_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    candidate_count: StrictInt = Field(..., ge=0, le=20)
+    truncated_candidate_count: StrictInt = Field(..., ge=0, le=190)
+    candidates: list[NarrativeRepetitionCandidateSchema] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    sidecar_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_sidecar(self) -> "NarrativeQualitySidecarSchema":
+        signatures = [item.candidate_signature for item in self.candidates]
+        scene_order = {
+            scene_id: index
+            for index, scene_id in enumerate(self.detection_scope.scene_ids)
+        }
+        scene_pairs: list[tuple[str, str]] = []
+        for candidate in self.candidates:
+            pair = (candidate.scene_ids[0], candidate.scene_ids[1])
+            if (
+                any(scene_id not in scene_order for scene_id in pair)
+                or scene_order[pair[0]] >= scene_order[pair[1]]
+            ):
+                raise ValueError("quality candidate scene scope changed")
+            expected_signature = hashlib.sha256(
+                json.dumps(
+                    {
+                        "policy_version": self.policy_version,
+                        "scene_ids": list(pair),
+                        "layers": [layer.kind for layer in candidate.layers],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if candidate.candidate_signature != expected_signature:
+                raise ValueError("quality candidate signature changed")
+            scene_pairs.append(pair)
+        if (
+            self.candidate_count != len(self.candidates)
+            or len(signatures) != len(set(signatures))
+            or len(scene_pairs) != len(set(scene_pairs))
+            or self.candidate_count + self.truncated_candidate_count
+            > self.detection_scope.comparison_pair_count
+        ):
+            raise ValueError("quality sidecar candidate projection is invalid")
+        expected_order = sorted(
+            self.candidates,
+            key=lambda candidate: (
+                -max(
+                    layer.score_basis_points
+                    for layer in candidate.layers
+                ),
+                tuple(candidate.scene_ids),
+            ),
+        )
+        if self.candidates != expected_order:
+            raise ValueError("quality sidecar candidate order changed")
+        payload = self.model_dump(mode="json", exclude={"sidecar_digest"})
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.sidecar_digest != expected_digest:
+            raise ValueError("quality sidecar digest changed")
+        return self
+
+
 class ValidatedOutlineContractFindingV3Schema(OutlineContractFindingV3Schema):
     spans: list[ValidatedProseEvidenceSpanSchema] = Field(
         default_factory=list,
@@ -537,6 +844,7 @@ class LocalOutlineAdherenceIssueSchema(BaseModel):
         "beat_evidence",
         "finding",
         "quality_dimension",
+        "quality_signal",
         "unknown",
     ]
     scene_id: StableSceneIdentity | None = None
@@ -630,11 +938,19 @@ class ValidatedChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
                 "info",
             }:
                 raise ValueError("uncalibrated quality cannot become a hard issue")
-            if (
-                issue.source_kind == "quality_dimension"
-                and issue.category not in quality_categories
-            ):
+            if issue.source_kind in {
+                "quality_dimension",
+                "quality_signal",
+            } and issue.category not in quality_categories:
                 raise ValueError("quality issue category is invalid")
+            if (
+                issue.source_kind == "quality_signal"
+                and (
+                    issue.category != "narrative_function_repetition"
+                    or issue.severity != "quality_debt"
+                )
+            ):
+                raise ValueError("quality signal cannot change the hard gate")
             if issue.category in {"forbidden_condition", "event_repetition"}:
                 if issue.source_kind == "finding" and not issue.contract_reference_ids:
                     raise ValueError("objective issue requires contract references")
@@ -659,4 +975,70 @@ class ValidatedChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
             item.status != "covered" for item in self.scene_coverage
         ):
             raise ValueError("passing V3 review must cover every required scene")
+        return self
+
+
+class ValidatedChapterOutlineAdherenceEvidenceV4Schema(
+    ValidatedChapterOutlineAdherenceEvidenceV3Schema
+):
+    """Current local projection with a source-bound quality-debt sidecar."""
+
+    evidence_schema_version: Literal["chapter_outline_adherence_evidence.v4"]
+    issue_policy_version: Literal["chapter_outline_issue_policy.v2"]
+    scene_quality_profiles: list[ValidatedSceneQualityProfileSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+    )
+    quality_debt_sidecar: NarrativeQualitySidecarSchema
+
+    @model_validator(mode="after")
+    def validate_quality_sidecar_binding(
+        self,
+    ) -> "ValidatedChapterOutlineAdherenceEvidenceV4Schema":
+        sidecar = self.quality_debt_sidecar
+        profile_scene_ids = [item.scene_id for item in self.scene_quality_profiles]
+        if profile_scene_ids != sidecar.detection_scope.scene_ids:
+            raise ValueError("quality sidecar scene scope changed")
+        binding = sidecar.source_binding
+        if (
+            binding.source_prose_run_id != self.source_prose_run_id
+            or binding.source_prose_run_revision
+            != self.source_prose_run_revision
+            or binding.source_content_digest != self.source_content_digest
+            or binding.outline_contract_digest != self.outline_contract_digest
+        ):
+            raise ValueError("quality sidecar source binding changed")
+        profile_payload = [
+            item.model_dump(mode="json") for item in self.scene_quality_profiles
+        ]
+        expected_profiles_digest = hashlib.sha256(
+            json.dumps(
+                profile_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if sidecar.scene_profiles_digest != expected_profiles_digest:
+            raise ValueError("quality sidecar profile digest changed")
+        candidate_signatures = [
+            item.candidate_signature for item in sidecar.candidates
+        ]
+        quality_issues = [
+            item for item in self.local_issues if item.source_kind == "quality_signal"
+        ]
+        if (
+            [item.issue_signature for item in quality_issues]
+            != candidate_signatures
+            or any(
+                item.source_evidence_count != len(candidate.layers)
+                for item, candidate in zip(
+                    quality_issues,
+                    sidecar.candidates,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError("quality sidecar issues changed")
         return self
