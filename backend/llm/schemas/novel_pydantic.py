@@ -13,6 +13,9 @@ from backend.llm.schemas.scene_contract_pydantic import (
     SceneTransitionContractSchema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
 )
+from backend.llm.schemas.state_fact_pydantic import (
+    ChapterStateFactEvidenceSchema,
+)
 from backend.scene_contract_versions import (
     MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES,
     MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
@@ -775,6 +778,12 @@ class ChapterStateResultSchema(BaseModel):
     consistency_issues: List[ConsistencyIssueSchema] = Field(
         default_factory=list, max_length=20, description="一致性冲突报告；不入库"
     )
+    fact_evidence: ChapterStateFactEvidenceSchema = Field(
+        ...,
+        description=(
+            "正文正式事实的独立证据；必须明确区分完整抽取、合法无变化与抽取未知"
+        ),
+    )
 
 
 class AcceptedCharacterStateSchema(BaseModel):
@@ -782,6 +791,10 @@ class AcceptedCharacterStateSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     card_id: str = Field(..., min_length=1)
+    write_current_state: bool = Field(
+        default=True,
+        description="false 时只追加已接受永久事实，不覆盖角色当下状态",
+    )
     current_state: str = Field(default="", max_length=1000)
     accepted_permanent_facts: List[PermanentFactProposalSchema] = Field(
         default_factory=list, max_length=10

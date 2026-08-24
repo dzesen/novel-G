@@ -46,6 +46,13 @@ from backend.services.novel.state_validation import (
     state_reference_resolution,
     validate_state_ids,
 )
+from backend.services.novel.outline_validation import known_id_sets
+from backend.services.novel.state_fact_accounting import (
+    StateFactAccountingError,
+    account_state_fact_evidence,
+    automatic_state_fact_decision,
+    validate_state_fact_evidence,
+)
 
 
 PROPOSAL_TTL_SECONDS = 15 * 60
@@ -243,6 +250,28 @@ class SelectAllPolicy:
             for thread in proposal.get("thread_updates") or []
         ]
         return fact_ids, thread_ids
+
+
+@dataclass(frozen=True)
+class FactAccountingPolicy:
+    """Automatic policy that writes only supported canonical state actions."""
+
+    name: str = "fact_accounting"
+    version: str = "1"
+
+    def decide(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        evidence = proposal.get("fact_evidence")
+        if not isinstance(evidence, Mapping):
+            raise StaleStatePreview(
+                "State proposal has no current fact-accounting evidence"
+            )
+        try:
+            return automatic_state_fact_decision(
+                evidence,
+                candidate=proposal,
+            )
+        except StateFactAccountingError as exc:
+            raise StaleStatePreview(str(exc)) from exc
 
 
 def add_selection_ids(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -879,6 +908,7 @@ class StateProposalModule:
         frames: AsyncIterable[str],
         *,
         roster: dict[str, Any],
+        prose: str | None = None,
         state_step: str = "chapter_state",
     ) -> AsyncIterator[str]:
         """Own SSE candidate validation, publication, auditing, and failure state."""
@@ -920,6 +950,45 @@ class StateProposalModule:
                     roster,
                 )
                 cleaned, dropped = validate_state_ids(resolved, roster)
+                if prose is not None:
+                    known = known_id_sets(roster)
+                    cleaned["fact_evidence"] = validate_state_fact_evidence(
+                        candidate.get("fact_evidence"),
+                        candidate=cleaned,
+                        prose=prose,
+                        binding={
+                            "chapter_id": lease.snapshot.chapter_id,
+                            "source_prose_run_id": (
+                                lease.snapshot.source_prose_run_id
+                            ),
+                            "source_prose_run_revision": (
+                                lease.snapshot.source_prose_run_revision
+                            ),
+                            "source_content_digest": (
+                                lease.snapshot.source_content_digest
+                                or chapter_content_digest(prose)
+                            ),
+                        },
+                        known_character_ids=known["characters"],
+                        known_thread_ids=known["threads"],
+                    )
+                    generation_audit["state_fact_evidence"] = {
+                        "schema_version": cleaned["fact_evidence"][
+                            "evidence_schema_version"
+                        ],
+                        "evidence_digest": cleaned["fact_evidence"][
+                            "evidence_digest"
+                        ],
+                        "extraction_status": cleaned["fact_evidence"][
+                            "extraction_status"
+                        ],
+                        "invalid_internal_references": cleaned[
+                            "fact_evidence"
+                        ]["invalid_internal_references"],
+                        "dangling_references": cleaned["fact_evidence"][
+                            "dangling_references"
+                        ],
+                    }
                 generation_audit["reference_resolution"] = (
                     state_reference_resolution(
                         candidate,
@@ -1041,8 +1110,10 @@ class StateProposalModule:
         chapter_id: str,
         proposal_id: str,
         acceptance_token: str,
+        selected_character_ids: list[str] | None = None,
         selected_fact_ids: list[str],
         selected_thread_ids: list[str],
+        drop_reasons: Mapping[str, str] | None = None,
         edits: dict[str, Any] | None = None,
         policy_name: str = "human_review",
         policy_version: str = "1",
@@ -1087,6 +1158,10 @@ class StateProposalModule:
                 raise StaleStatePreview("Narrative state changed after state generation")
 
         candidate = deepcopy(proposal["candidate"])
+        characters_by_id = {
+            character["selection_id"]: character
+            for character in candidate.get("character_updates") or []
+        }
         facts_by_id = {
             fact["selection_id"]: (character, fact)
             for character in candidate.get("character_updates") or []
@@ -1096,10 +1171,50 @@ class StateProposalModule:
             thread["selection_id"]: thread
             for thread in candidate.get("thread_updates") or []
         }
+        effective_character_ids = (
+            list(characters_by_id)
+            if selected_character_ids is None
+            and not isinstance(candidate.get("fact_evidence"), Mapping)
+            else list(selected_character_ids or [])
+        )
+        if not set(effective_character_ids).issubset(characters_by_id):
+            raise StaleStatePreview("Unknown character-state selection id")
         if not set(selected_fact_ids).issubset(facts_by_id):
             raise StaleStatePreview("Unknown permanent-fact selection id")
         if not set(selected_thread_ids).issubset(threads_by_id):
             raise StaleStatePreview("Unknown plot-thread selection id")
+
+        fact_accounting: dict[str, Any] | None = None
+        validated_fact_evidence = candidate.get("fact_evidence")
+        if isinstance(validated_fact_evidence, Mapping):
+            try:
+                fact_accounting = account_state_fact_evidence(
+                    validated_fact_evidence,
+                    candidate=candidate,
+                    selected_character_ids=effective_character_ids,
+                    selected_fact_ids=selected_fact_ids,
+                    selected_thread_ids=selected_thread_ids,
+                    drop_reasons=drop_reasons,
+                )
+            except StateFactAccountingError as exc:
+                raise StaleStatePreview(str(exc)) from exc
+            source_binding = fact_accounting["source_binding"]
+            if (
+                str(source_binding.get("chapter_id") or "") != chapter_id
+                or str(source_binding.get("source_content_digest") or "")
+                != str(proposal.get("source_content_digest") or "")
+                or source_binding.get("source_prose_run_id")
+                != proposal.get("source_prose_run_id")
+                or source_binding.get("source_prose_run_revision")
+                != proposal.get("source_prose_run_revision")
+            ):
+                raise StaleStatePreview(
+                    "State fact accounting is not bound to this proposal"
+                )
+            if not fact_accounting["gate_passed"]:
+                raise StaleStatePreview(
+                    "状态候选仍有未核算正式事实或非法内部引用"
+                )
 
         allowed_edits = deepcopy(edits or {})
         unknown_edits = set(allowed_edits) - {"summary", "current_states"}
@@ -1117,18 +1232,29 @@ class StateProposalModule:
         }
         for character in candidate.get("character_updates") or []:
             card_id = str(character["card_id"])
+            character_selected = (
+                character["selection_id"] in effective_character_ids
+            )
             selected = [
                 {key: value for key, value in fact.items() if key != "selection_id"}
                 for fact in character.get("new_permanent_facts") or []
                 if fact["selection_id"] in selected_fact_ids
             ]
+            if not character_selected and not selected:
+                continue
             payload["character_updates"].append(
                 {
                     "card_id": card_id,
-                    "current_state": str(
-                        current_state_edits.get(
-                            card_id, character.get("current_state") or ""
+                    "write_current_state": character_selected,
+                    "current_state": (
+                        str(
+                            current_state_edits.get(
+                                card_id,
+                                character.get("current_state") or "",
+                            )
                         )
+                        if character_selected
+                        else ""
                     ),
                     "accepted_permanent_facts": selected,
                 }
@@ -1169,6 +1295,13 @@ class StateProposalModule:
                     0, len(threads_by_id) - len(selected_thread_ids)
                 ),
                 "edited_fields": sorted(allowed_edits),
+                "selected_character_state_count": len(
+                    effective_character_ids
+                ),
+                "rejected_character_state_count": max(
+                    0,
+                    len(characters_by_id) - len(effective_character_ids),
+                ),
             },
             "confidence": (
                 "human_reviewed" if policy_name == "human_review" else "auto_accepted"
@@ -1197,6 +1330,11 @@ class StateProposalModule:
                     )
                     or {}
                 ),
+                **(
+                    {"fact_accounting": deepcopy(fact_accounting)}
+                    if fact_accounting is not None
+                    else {}
+                ),
             },
         }
         decision_digest = _digest(
@@ -1204,6 +1342,7 @@ class StateProposalModule:
                 "payload": payload,
                 "candidate_digest": proposal.get("candidate_digest"),
                 "policy": policy,
+                "fact_accounting": fact_accounting,
             }
         )
         claim = {
@@ -1238,8 +1377,10 @@ class StateProposalModule:
         chapter_id: str,
         proposal_id: str,
         acceptance_token: str,
+        selected_character_ids: list[str] | None = None,
         selected_fact_ids: list[str],
         selected_thread_ids: list[str],
+        drop_reasons: Mapping[str, str] | None = None,
         edits: dict[str, Any] | None = None,
         policy_name: str = "human_review",
         policy_version: str = "1",
@@ -1249,8 +1390,10 @@ class StateProposalModule:
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
+            selected_character_ids=selected_character_ids,
             selected_fact_ids=selected_fact_ids,
             selected_thread_ids=selected_thread_ids,
+            drop_reasons=drop_reasons,
             edits=edits,
             policy_name=policy_name,
             policy_version=policy_version,
@@ -1303,7 +1446,7 @@ class StateProposalModule:
         *,
         chapter_id: str,
         proposal: dict[str, Any],
-        policy: SelectAllPolicy,
+        policy: SelectAllPolicy | FactAccountingPolicy,
         job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
     ) -> dict[str, Any]:
         """Apply a versioned automatic decision through the normal accept path."""
@@ -1317,15 +1460,32 @@ class StateProposalModule:
             acceptance_token=acceptance_token,
             job_mutation_binding=job_mutation_binding,
         )
-        selected_fact_ids, selected_thread_ids = policy.decide(
-            deepcopy(stored.get("candidate") or {})
-        )
+        candidate = deepcopy(stored.get("candidate") or {})
+        if isinstance(policy, FactAccountingPolicy):
+            policy_decision = policy.decide(candidate)
+            selected_character_ids = list(
+                policy_decision["selected_character_ids"]
+            )
+            selected_fact_ids = list(policy_decision["selected_fact_ids"])
+            selected_thread_ids = list(
+                policy_decision["selected_thread_ids"]
+            )
+            drop_reasons = dict(policy_decision["drop_reasons"])
+        else:
+            selected_fact_ids, selected_thread_ids = policy.decide(candidate)
+            selected_character_ids = list(
+                character["selection_id"]
+                for character in candidate.get("character_updates") or []
+            )
+            drop_reasons = {}
         return await self.accept(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
+            selected_character_ids=selected_character_ids,
             selected_fact_ids=selected_fact_ids,
             selected_thread_ids=selected_thread_ids,
+            drop_reasons=drop_reasons,
             policy_name=policy.name,
             policy_version=policy.version,
             job_mutation_binding=job_mutation_binding,
@@ -1646,7 +1806,7 @@ class StateProposalModule:
         chapter_id: str,
         proposal_id: str,
         acceptance_token: str,
-        policy: SelectAllPolicy,
+        policy: SelectAllPolicy | FactAccountingPolicy,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Prepare a policy decision from the persisted candidate, never caller data."""
         stored = await self._load_verified_proposal(
@@ -1654,15 +1814,32 @@ class StateProposalModule:
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
         )
-        selected_fact_ids, selected_thread_ids = policy.decide(
-            deepcopy(stored.get("candidate") or {})
-        )
+        candidate = deepcopy(stored.get("candidate") or {})
+        if isinstance(policy, FactAccountingPolicy):
+            policy_decision = policy.decide(candidate)
+            selected_character_ids = list(
+                policy_decision["selected_character_ids"]
+            )
+            selected_fact_ids = list(policy_decision["selected_fact_ids"])
+            selected_thread_ids = list(
+                policy_decision["selected_thread_ids"]
+            )
+            drop_reasons = dict(policy_decision["drop_reasons"])
+        else:
+            selected_fact_ids, selected_thread_ids = policy.decide(candidate)
+            selected_character_ids = list(
+                character["selection_id"]
+                for character in candidate.get("character_updates") or []
+            )
+            drop_reasons = {}
         return await self.prepare_decision(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
+            selected_character_ids=selected_character_ids,
             selected_fact_ids=selected_fact_ids,
             selected_thread_ids=selected_thread_ids,
+            drop_reasons=drop_reasons,
             policy_name=policy.name,
             policy_version=policy.version,
         )

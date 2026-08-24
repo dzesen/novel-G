@@ -337,12 +337,24 @@ class NarrativeTimeline:
                         card_id,
                         {
                             "card_id": card_id,
-                            "current_state": "",
+                            "current_state": str(
+                                update.get("prior_current_state") or ""
+                            ),
                             "permanent_facts": [],
+                            "as_of_chapter_id": update.get(
+                                "prior_as_of_chapter_id"
+                            ),
+                            "as_of_chapter_order": int(
+                                update.get("prior_as_of_chapter_order") or 0
+                            ),
                         },
                     )
-                    state["current_state"] = str(update.get("current_state") or "")
-                    state["as_of_chapter_id"] = event.chapter_id
+                    if update.get("write_current_state", True):
+                        state["current_state"] = str(
+                            update.get("current_state") or ""
+                        )
+                        state["as_of_chapter_id"] = event.chapter_id
+                        state.pop("as_of_chapter_order", None)
                     known = {
                         str(fact.get("id")): fact
                         for fact in state["permanent_facts"]
@@ -544,6 +556,9 @@ class NarrativeTimeline:
             as_of_position = (
                 timeline.position(as_of_chapter_id) if as_of_chapter_id else None
             )
+            prior_as_of_chapter_order = int(
+                state.get("as_of_chapter_order") or 0
+            )
             facts = []
             for raw_fact in state.get("permanent_facts") or []:
                 fact = deepcopy(raw_fact)
@@ -567,7 +582,9 @@ class NarrativeTimeline:
                             else None
                         ),
                         "as_of_chapter_order": (
-                            as_of_position.chapter_order if as_of_position else 0
+                            as_of_position.chapter_order
+                            if as_of_position
+                            else prior_as_of_chapter_order
                         ),
                         "history_status": "tracked",
                         "is_deleted": False,

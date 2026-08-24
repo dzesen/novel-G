@@ -9,6 +9,11 @@
  */
 
 export type FactKind = "death" | "injury" | "identity" | "relation" | "ability";
+export type StateFactDropReason =
+  | "duplicate_existing_fact"
+  | "duplicate_proposal"
+  | "legal_no_op"
+  | "unsupported_by_prose";
 
 export interface PermanentFactProposal {
   fact: string;
@@ -42,6 +47,13 @@ export interface ChapterStateResult {
   character_updates: CharacterStateUpdate[];
   thread_updates: ThreadStatusUpdate[];
   consistency_issues: ConsistencyIssue[];
+  fact_evidence: {
+    evidence_schema_version: "chapter_state_fact_evidence.v1";
+    extraction_status: "complete" | "complete_no_change" | "unknown";
+    evidence_digest: string;
+    invalid_internal_references: number;
+    dangling_references: number;
+  };
   proposal_id?: string;
   acceptance_token?: string;
   proposal_expires_at?: string;

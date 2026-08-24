@@ -10,6 +10,7 @@ from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     SCENE_TRANSITION_CONTRACT_VERSION,
 )
+from backend.state_fact_contract_versions import STATE_FACT_EVIDENCE_VERSION
 
 
 class WorkflowStepDefinition(BaseModel):
@@ -87,7 +88,13 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
     WorkflowDefinition(
         name="extract_chapter_state_by_ai",
         label_key="settings.workflow.catalog.extract_chapter_state_by_ai",
-        steps=(WorkflowStepDefinition(name="chapter_state", label_key="settings.workflow.steps.chapter_state"),),
+        steps=(
+            WorkflowStepDefinition(
+                name="chapter_state",
+                label_key="settings.workflow.steps.chapter_state",
+                contract_version=STATE_FACT_EVIDENCE_VERSION,
+            ),
+        ),
     ),
     WorkflowDefinition(
         name="remediate_chapter_prose_by_agent",

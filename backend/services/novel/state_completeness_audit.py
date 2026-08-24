@@ -20,6 +20,7 @@ _REPAIRABLE = frozenset(
         "stale_after_content_edit",
         "degraded_all_character_updates_dropped",
         "degraded_partial_reference_drop",
+        "degraded_fact_accounting",
     }
 )
 

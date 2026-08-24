@@ -26,8 +26,13 @@ from backend.services.generation.prose_completion_contract import (
 from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.state_proposal import (
-    SelectAllPolicy,
+    FactAccountingPolicy,
+    StaleStatePreview,
     state_proposal_module,
+)
+from backend.services.novel.state_fact_accounting import (
+    StateFactAccountingError,
+    validate_state_fact_accounting,
 )
 
 
@@ -273,14 +278,17 @@ class ChapterFinalizationService:
             raise ChapterFinalizationDenied(
                 "正式提交章节不属于正文候选所在小说"
             )
-        state_payload, state_metadata, proposal_claim = (
-            await self._deps.state_proposals.prepare_policy_decision(
-                chapter_id=chapter_id,
-                proposal_id=state_proposal_id,
-                acceptance_token=state_acceptance_token,
-                policy=SelectAllPolicy(),
+        try:
+            state_payload, state_metadata, proposal_claim = (
+                await self._deps.state_proposals.prepare_policy_decision(
+                    chapter_id=chapter_id,
+                    proposal_id=state_proposal_id,
+                    acceptance_token=state_acceptance_token,
+                    policy=FactAccountingPolicy(),
+                )
             )
-        )
+        except StaleStatePreview as exc:
+            raise ChapterFinalizationDenied(str(exc)) from exc
         proposal_claim = {
             **proposal_claim,
             "finalized_prose": {
@@ -471,10 +479,36 @@ class ChapterFinalizationService:
             )
         ):
             raise ChapterFinalizationDenied("状态候选仍含无效内部引用")
-        proposed_characters = counts["proposed_character_update_count"]
-        accepted_characters = counts["accepted_character_update_count"]
-        if proposed_characters > 0 and accepted_characters == 0:
-            raise ChapterFinalizationDenied("状态候选的角色更新全部丢失")
+        raw_fact_accounting = completion_evidence.get("fact_accounting")
+        if not isinstance(raw_fact_accounting, Mapping):
+            raise ChapterFinalizationDenied("状态候选缺少正式事实核算证据")
+        try:
+            fact_accounting = validate_state_fact_accounting(
+                raw_fact_accounting
+            )
+        except StateFactAccountingError as exc:
+            raise ChapterFinalizationDenied(str(exc)) from exc
+        if not fact_accounting["gate_passed"]:
+            raise ChapterFinalizationDenied(
+                "状态候选仍有未核算正式事实或非法内部引用"
+            )
+        fact_source = fact_accounting["source_binding"]
+        if (
+            str(fact_source.get("chapter_id") or "")
+            != str(chapter.get("_id") or "")
+            or str(fact_source.get("source_prose_run_id") or "")
+            != str(prose_command.payload["run_id"])
+            or _strict_int(
+                fact_source.get("source_prose_run_revision"),
+                field="正式事实核算正文版本",
+            )
+            != int(prose_command.payload["expected_revision"])
+            or str(fact_source.get("source_content_digest") or "")
+            != str(prose_command.payload["text_digest"])
+        ):
+            raise ChapterFinalizationDenied(
+                "正式事实核算没有绑定当前正文候选"
+            )
         if completion_evidence.get("source_prose_acceptance_state") != "ai_complete":
             raise ChapterFinalizationDenied("状态候选未绑定完整正文")
         if (

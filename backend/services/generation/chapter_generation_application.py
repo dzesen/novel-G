@@ -121,7 +121,7 @@ from backend.services.novel.state_completion import (
     prose_acceptance_state,
 )
 from backend.services.novel.state_proposal import (
-    SelectAllPolicy,
+    FactAccountingPolicy,
     state_proposal_module,
 )
 from backend.services.novel.outline_validation import validate_outline_ids
@@ -256,6 +256,10 @@ def _render_state_repair_guidance(guidance: StateRepairGuidance) -> str:
         f"原因：{','.join(guidance.reason_codes)}\n"
         f"冲突数量：{guidance.consistency_issue_count}\n"
         f"无效引用数量：{guidance.dropped_reference_count}\n"
+        f"未核算正式事实数量：{guidance.unaccounted_canonical_fact_count}\n"
+        f"非法内部 ID 数量：{guidance.invalid_internal_reference_count}\n"
+        f"悬空动作引用数量：{guidance.dangling_reference_count}\n"
+        f"抽取失败数量：{guidance.extraction_failure_count}\n"
         "需重点核对的已声明 card_id："
         + (",".join(guidance.affected_card_ids) or "无")
     )
@@ -913,7 +917,7 @@ class ChapterGenerationApplicationService:
                 source_content_digest=(
                     candidate.source_content_digest
                     if candidate is not None
-                    else None
+                    else chapter_content_digest(content)
                 ),
                 source_prose_run_id=(
                     candidate.source_run_id if candidate is not None else None
@@ -1065,6 +1069,7 @@ class ChapterGenerationApplicationService:
                 lease=lease,
                 params={
                     "context": context_text,
+                    "chapter_id": command.chapter_id,
                     "chapter_order": int(chapter.get("order_index") or 0),
                     "chapter_title": str(chapter.get("title") or ""),
                     "chapter_content": content,
@@ -1119,6 +1124,7 @@ class ChapterGenerationApplicationService:
             prepared.lease,
             frames,
             roster=prepared.roster,
+            prose=str(prepared.params["chapter_content"]),
             state_step=STATE_STEP,
         )
         dropped: dict[str, Any] = {}
@@ -1160,7 +1166,7 @@ class ChapterGenerationApplicationService:
                 acceptance = await self._deps.state_proposals.run_auto(
                     chapter_id=command.chapter_id,
                     proposal=proposal,
-                    policy=SelectAllPolicy(),
+                    policy=FactAccountingPolicy(),
                     job_mutation_binding=command.job_mutation_binding,
                 )
                 accepted = True

@@ -25,6 +25,7 @@ from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.llm.config import get_llm_config, get_provider_config
 from backend.llm.prompts.prompt_selector import load_prompt_config
+from backend.llm.schemas.state_fact_pydantic import StateFactManualDropReason
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
     ChapterGenerationApplicationDeps,
@@ -164,8 +165,12 @@ class AcceptChapterStateRequest(BaseModel):
     chapter_id: str = Field(..., min_length=1)
     proposal_id: str = Field(..., min_length=1)
     acceptance_token: str = Field(..., min_length=1)
+    selected_character_ids: list[str] = Field(default_factory=list)
     selected_fact_ids: list[str] = Field(default_factory=list)
     selected_thread_ids: list[str] = Field(default_factory=list)
+    drop_reasons: dict[str, StateFactManualDropReason] = Field(
+        default_factory=dict
+    )
     edits: dict = Field(default_factory=dict)
 
 
@@ -177,8 +182,10 @@ async def accept_chapter_state(req: AcceptChapterStateRequest):
             chapter_id=req.chapter_id,
             proposal_id=req.proposal_id,
             acceptance_token=req.acceptance_token,
+            selected_character_ids=req.selected_character_ids,
             selected_fact_ids=req.selected_fact_ids,
             selected_thread_ids=req.selected_thread_ids,
+            drop_reasons=req.drop_reasons,
             edits=req.edits,
         )
     except NotFoundError as exc:

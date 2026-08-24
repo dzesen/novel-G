@@ -15,7 +15,8 @@ from backend.db.repositories.agent_runtime_repository import (
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.repositories.prose_run_repository import prose_run_repo
 from backend.db.repositories.state_candidate_repair_receipt_repository import (
-    StateCandidateRepairResultProjection,
+    StateCandidateRepairResultProjectionV2,
+    parse_state_candidate_repair_result_projection,
     state_candidate_repair_receipt_repo,
 )
 from backend.services.agent_runtime.contracts import (
@@ -53,6 +54,10 @@ from backend.services.generation.prose_remediation_runtime import (
 )
 from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.novel.state_proposal import state_proposal_module
+from backend.services.novel.state_fact_accounting import (
+    StateFactAccountingError,
+    automatic_state_fact_decision,
+)
 from backend.services.llm.generation_runtime import (
     AttemptScope,
     GenerationPlan,
@@ -333,12 +338,38 @@ def _state_result_projection(
     if not isinstance(proposal_id, str) or not proposal_id:
         raise ValueError("state repair result has no proposal identity")
     truncated, dropped_items = _truncation_projection(generation.truncation)
-    return StateCandidateRepairResultProjection(
+    return StateCandidateRepairResultProjectionV2(
         proposal_id=proposal_id,
         truncated_section_count=truncated,
         dropped_item_count=dropped_items,
         dropped_reference_count=_dropped_reference_count(generation.dropped),
+        **_state_fact_result_projection(value),
     ).model_dump(mode="json")
+
+
+def _state_fact_result_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = value.get("fact_evidence")
+    if not isinstance(evidence, Mapping):
+        raise ValueError("state repair result has no fact-accounting evidence")
+    try:
+        accounting = automatic_state_fact_decision(
+            evidence,
+            candidate=value,
+        )["fact_accounting"]
+    except StateFactAccountingError as exc:
+        raise ValueError("state repair fact accounting is invalid") from exc
+    return {
+        "fact_accounting_digest": accounting["accounting_digest"],
+        "canonical_fact_count": accounting["canonical_fact_count"],
+        "unaccounted_canonical_fact_count": accounting[
+            "unaccounted_canonical_facts"
+        ],
+        "invalid_internal_reference_count": accounting[
+            "invalid_internal_references"
+        ],
+        "dangling_reference_count": accounting["dangling_references"],
+        "extraction_failure_count": accounting["extraction_failure_count"],
+    }
 
 
 class _StateRepairReceiptAttemptScope:
@@ -652,7 +683,7 @@ class ChapterCandidateRepairApplication:
     ) -> ChapterGenerationResult:
         raw_projection = receipt.get("result_projection")
         projection = (
-            StateCandidateRepairResultProjection.model_validate(raw_projection)
+            parse_state_candidate_repair_result_projection(raw_projection)
             if isinstance(raw_projection, Mapping)
             else None
         )
@@ -716,11 +747,12 @@ class ChapterCandidateRepairApplication:
                 raise ValueError(
                     "state repair proposal recovery metadata is unavailable"
                 )
-            projection = StateCandidateRepairResultProjection(
+            projection = StateCandidateRepairResultProjectionV2(
                 proposal_id=str(value["proposal_id"]),
                 truncated_section_count=recovered_context[0],
                 dropped_item_count=recovered_context[1],
                 dropped_reference_count=recovered_dropped,
+                **_state_fact_result_projection(value),
             )
         elif str(value["proposal_id"]) != projection.proposal_id:
             raise ValueError("state repair receipt proposal identity diverged")
@@ -733,6 +765,22 @@ class ChapterCandidateRepairApplication:
             or recovered_dropped != projection.dropped_reference_count
         ):
             raise ValueError("state repair receipt metadata diverged")
+        if isinstance(projection, StateCandidateRepairResultProjectionV2):
+            recovered_fact_projection = _state_fact_result_projection(value)
+            expected_fact_projection = {
+                "fact_accounting_digest": projection.fact_accounting_digest,
+                "canonical_fact_count": projection.canonical_fact_count,
+                "unaccounted_canonical_fact_count": (
+                    projection.unaccounted_canonical_fact_count
+                ),
+                "invalid_internal_reference_count": (
+                    projection.invalid_internal_reference_count
+                ),
+                "dangling_reference_count": projection.dangling_reference_count,
+                "extraction_failure_count": projection.extraction_failure_count,
+            }
+            if recovered_fact_projection != expected_fact_projection:
+                raise ValueError("state repair receipt fact accounting diverged")
         attempts = await self._state_attempts(
             chapter_id=chapter_id,
             cycle=request.cycle,
@@ -1229,6 +1277,14 @@ class ChapterCandidateRepairApplication:
                 consistency_issue_count=request.consistency_issue_count,
                 affected_card_ids=request.affected_card_ids,
                 dropped_reference_count=request.dropped_reference_count,
+                unaccounted_canonical_fact_count=(
+                    request.unaccounted_canonical_fact_count
+                ),
+                invalid_internal_reference_count=(
+                    request.invalid_internal_reference_count
+                ),
+                dangling_reference_count=request.dangling_reference_count,
+                extraction_failure_count=request.extraction_failure_count,
             ),
         )
         if (

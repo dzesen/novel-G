@@ -3968,6 +3968,15 @@
     "threadDeveloping": "推进",
     "threadResolved": "回收",
     "evidenceLabel": "正文依据",
+    "dropReasonLabel": "不写入此项的原因",
+    "dropReasonPlaceholder": "请选择明确原因",
+    "dropReasonUnsupported": "正文不支持这项提案",
+    "dropReasonExistingDuplicate": "正式状态中已存在同一事实",
+    "dropReasonProposalDuplicate": "与本次另一项提案重复",
+    "dropReasonNoOp": "核对后无需改变正式状态",
+    "dropReasonRequired": "每个未勾选的状态动作都必须选择原因，才能接受本次核算。",
+    "factAccountingBlocked": "事实提取未完成，或包含无效、悬空的内部引用；请重新生成或转人工复核。",
+    "factAccountingReady": "全部状态动作均已选择或说明，可以写入。",
     "issuesLabel": "一致性冲突（仅提示，不阻断接受）",
     "issuesEmpty": "未发现与既有永久事实的冲突。",
     "conflictLabel": "冲突内容",
@@ -4011,6 +4020,7 @@
       "stale_after_content_edit": "正文修改后状态已过期",
       "degraded_all_character_updates_dropped": "人物更新全部被清理",
       "degraded_partial_reference_drop": "部分引用被清理",
+      "degraded_fact_accounting": "正式事实核算不完整或已损坏",
       "degraded_job_reference_drop_evidence": "历史作业显示人物引用被清理",
       "unknown_legacy": "旧数据证据不足"
     }

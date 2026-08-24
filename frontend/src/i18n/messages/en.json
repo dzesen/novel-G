@@ -3968,6 +3968,15 @@
     "threadDeveloping": "Developing",
     "threadResolved": "Resolved",
     "evidenceLabel": "Evidence in prose",
+    "dropReasonLabel": "Reason for not writing this item",
+    "dropReasonPlaceholder": "Select a specific reason",
+    "dropReasonUnsupported": "The prose does not support this proposal",
+    "dropReasonExistingDuplicate": "The same fact already exists in formal state",
+    "dropReasonProposalDuplicate": "Duplicates another proposal in this result",
+    "dropReasonNoOp": "Review found no formal state change is needed",
+    "dropReasonRequired": "Choose a reason for every unchecked state action before accepting this accounting.",
+    "factAccountingBlocked": "Fact extraction is incomplete or contains invalid or dangling internal references. Regenerate it or send it for manual review.",
+    "factAccountingReady": "Every state action is selected or explained and ready to write.",
     "issuesLabel": "Consistency conflicts (advisory only; does not block accepting)",
     "issuesEmpty": "No conflicts with existing permanent facts were found.",
     "conflictLabel": "Conflict",
@@ -4011,6 +4020,7 @@
       "stale_after_content_edit": "State is stale after prose edit",
       "degraded_all_character_updates_dropped": "All character updates were dropped",
       "degraded_partial_reference_drop": "Some references were dropped",
+      "degraded_fact_accounting": "Formal fact accounting is incomplete or damaged",
       "degraded_job_reference_drop_evidence": "Historical job dropped character references",
       "unknown_legacy": "Legacy evidence is insufficient"
     }

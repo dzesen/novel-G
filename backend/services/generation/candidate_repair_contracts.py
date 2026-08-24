@@ -365,9 +365,32 @@ class StateCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
         return self
 
 
+class StateCandidateCheckpointV3(_CandidatePipelineCheckpointV3):
+    """Metadata-only projection of one locally computed fact accounting."""
+
+    kind: Literal["state_candidate"] = "state_candidate"
+    origin: Literal["initial", "repair"]
+    proposal_id: str = Field(pattern=r"^[0-9a-f]{24}$")
+    request_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    consistency_issue_count: int = Field(ge=0, le=20)
+    dropped_reference_count: int = Field(default=0, ge=0, le=1_000)
+    fact_accounting_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    unaccounted_canonical_fact_count: int = Field(ge=0, le=1_000)
+    invalid_internal_reference_count: int = Field(ge=0, le=1_000)
+    dangling_reference_count: int = Field(ge=0, le=1_000)
+    extraction_failure_count: int = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_origin_cycle(self) -> "StateCandidateCheckpointV3":
+        if (self.origin == "initial") != (self.cycle == 0):
+            raise ValueError("state checkpoint origin and cycle diverged")
+        return self
+
+
 AdherenceCandidateCheckpoint = (
     AdherenceCandidateCheckpointV1 | AdherenceCandidateCheckpointV3
 )
+StateCandidateCheckpoint = StateCandidateCheckpointV1 | StateCandidateCheckpointV3
 
 
 CandidatePipelineCheckpointV1 = (
@@ -375,6 +398,7 @@ CandidatePipelineCheckpointV1 = (
     | AdherenceCandidateCheckpointV1
     | AdherenceCandidateCheckpointV3
     | StateCandidateCheckpointV1
+    | StateCandidateCheckpointV3
 )
 
 
@@ -384,7 +408,7 @@ class CandidatePipelineCompletionEvidenceV1:
 
     prose: ProseCandidateCheckpointV1
     adherence: AdherenceCandidateCheckpoint
-    state: StateCandidateCheckpointV1
+    state: StateCandidateCheckpoint
     repair_cycles_used: int
     attempt_count: int
     truncation_count: int
@@ -398,7 +422,7 @@ class CandidatePipelineReplayV1:
     current_prose: ProseCandidateCheckpointV1
     previous_prose: ProseCandidateCheckpointV1 | None
     latest_adherence: AdherenceCandidateCheckpoint | None
-    latest_state: StateCandidateCheckpointV1 | None
+    latest_state: StateCandidateCheckpoint | None
     phase: Literal["prose", "adherence", "state"]
     repair_cycles_used: int
     review_count: int
@@ -433,6 +457,24 @@ def candidate_checkpoint_adherence_passed(
         and len(set(indexes)) == len(indexes)
         and set(indexes) == set(range(1, expected_scene_count + 1))
         and all(item.status == "covered" for item in checkpoint.scene_coverage)
+    )
+
+
+def candidate_checkpoint_state_passed(
+    checkpoint: StateCandidateCheckpoint,
+) -> bool:
+    if isinstance(checkpoint, StateCandidateCheckpointV3):
+        return bool(
+            checkpoint.consistency_issue_count == 0
+            and checkpoint.dropped_reference_count == 0
+            and checkpoint.unaccounted_canonical_fact_count == 0
+            and checkpoint.invalid_internal_reference_count == 0
+            and checkpoint.dangling_reference_count == 0
+            and checkpoint.extraction_failure_count == 0
+        )
+    return bool(
+        checkpoint.consistency_issue_count == 0
+        and checkpoint.dropped_reference_count == 0
     )
 
 
@@ -478,7 +520,7 @@ def replay_candidate_pipeline_checkpoints(
     current_prose: ProseCandidateCheckpointV1 | None = None
     previous_prose: ProseCandidateCheckpointV1 | None = None
     latest_adherence: AdherenceCandidateCheckpoint | None = None
-    latest_state: StateCandidateCheckpointV1 | None = None
+    latest_state: StateCandidateCheckpoint | None = None
     phase: Literal["start", "prose", "adherence", "state"] = "start"
     repair_cycles_used = 0
     review_count = 0
@@ -659,8 +701,7 @@ def replay_candidate_pipeline_checkpoints(
             phase != "state"
             or latest_state is None
             or (
-                latest_state.consistency_issue_count == 0
-                and latest_state.dropped_reference_count == 0
+                candidate_checkpoint_state_passed(latest_state)
             )
             or checkpoint.cycle != repair_cycles_used + 1
             or checkpoint.proposal_id == latest_state.proposal_id
@@ -712,13 +753,13 @@ def replay_candidate_pipeline_checkpoints(
         or current_prose is None
         or latest_adherence is None
         or latest_state is None
+        or not isinstance(latest_state, StateCandidateCheckpointV3)
         or not candidate_checkpoint_completion_passed(current_prose)
         or not candidate_checkpoint_adherence_passed(
             latest_adherence,
             expected_scene_count=expected_scene_count,
         )
-        or latest_state.consistency_issue_count != 0
-        or latest_state.dropped_reference_count != 0
+        or not candidate_checkpoint_state_passed(latest_state)
         or repair_cycles_used > max_repair_cycles
     ):
         raise diverged()
@@ -805,7 +846,7 @@ def parse_candidate_pipeline_checkpoint(
         raise ValueError("candidate checkpoint schema_version is invalid")
     if (
         checkpoint_version == "chapter_candidate_pipeline_checkpoint.v3"
-        and value.get("kind") != "outline_adherence"
+        and value.get("kind") not in {"outline_adherence", "state_candidate"}
     ):
         raise ValueError("candidate checkpoint v3 kind is invalid")
     _require_nested_contract_version(

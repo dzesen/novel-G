@@ -37,7 +37,9 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidateSourceIdentityV1,
     CandidateTruncationProjectionV1,
     ProseCandidateCheckpointV1,
+    StateCandidateCheckpoint,
     StateCandidateCheckpointV1,
+    StateCandidateCheckpointV3,
     candidate_pipeline_checkpoint_digest,
     is_safe_candidate_identifier,
     parse_candidate_pipeline_checkpoint,
@@ -55,6 +57,10 @@ from backend.services.generation.outline_adherence import (
 from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
+)
+from backend.services.novel.state_fact_accounting import (
+    StateFactAccountingError,
+    automatic_state_fact_decision,
 )
 from backend.services.llm.pre_dispatch_boundaries import (
     AttemptCapacityExceeded,
@@ -1397,20 +1403,38 @@ def _state_checkpoint(
     proposal_id: str,
     consistency_issue_count: int,
     dropped_reference_count: int,
-) -> StateCandidateCheckpointV1:
-    return _seal_checkpoint(StateCandidateCheckpointV1(
-        **_checkpoint_common(
-            chapter_id=chapter_id,
-            sequence=sequence,
-            source=source,
-            evidence=evidence,
-        ),
+    fact_accounting: Mapping[str, Any],
+) -> StateCandidateCheckpointV3:
+    common = _checkpoint_common(
+        chapter_id=chapter_id,
+        sequence=sequence,
+        source=source,
+        evidence=evidence,
+    )
+    return _seal_checkpoint(StateCandidateCheckpointV3(
+        **{
+            **common,
+            "schema_version": "chapter_candidate_pipeline_checkpoint.v3",
+        },
         cycle=cycle,
         origin=origin,
         request_id=request_id,
         proposal_id=proposal_id,
         consistency_issue_count=consistency_issue_count,
         dropped_reference_count=dropped_reference_count,
+        fact_accounting_digest=fact_accounting.get("accounting_digest"),
+        unaccounted_canonical_fact_count=fact_accounting.get(
+            "unaccounted_canonical_facts"
+        ),
+        invalid_internal_reference_count=fact_accounting.get(
+            "invalid_internal_references"
+        ),
+        dangling_reference_count=fact_accounting.get(
+            "dangling_references"
+        ),
+        extraction_failure_count=fact_accounting.get(
+            "extraction_failure_count"
+        ),
     ))
 
 
@@ -2051,16 +2075,32 @@ def _validate_resumed_adherence_projection(
 def _validate_resumed_state_projection(
     state_result: ChapterGenerationResult,
     *,
-    checkpoint: StateCandidateCheckpointV1,
+    checkpoint: StateCandidateCheckpoint,
+    source: ProseCandidateSource,
 ) -> None:
-    _state, proposal_id, _acceptance_token, issues = _validate_state_shape(
-        state_result
+    _state, proposal_id, _acceptance_token, issues, accounting = (
+        _validate_state_shape(
+            state_result,
+            source=source,
+            chapter_id=checkpoint.chapter_id,
+        )
     )
     if (
         proposal_id != checkpoint.proposal_id
         or len(issues) != checkpoint.consistency_issue_count
         or _dropped_reference_count(state_result.dropped)
         != checkpoint.dropped_reference_count
+        or not isinstance(checkpoint, StateCandidateCheckpointV3)
+            or accounting.get("accounting_digest")
+            != checkpoint.fact_accounting_digest
+        or accounting.get("unaccounted_canonical_facts")
+        != checkpoint.unaccounted_canonical_fact_count
+        or accounting.get("invalid_internal_references")
+        != checkpoint.invalid_internal_reference_count
+        or accounting.get("dangling_references")
+        != checkpoint.dangling_reference_count
+        or accounting.get("extraction_failure_count")
+        != checkpoint.extraction_failure_count
     ):
         raise ChapterCandidatePipelineBlocked(
             "候选管线恢复状态投影与检查点不一致"
@@ -2827,6 +2867,7 @@ def _resume_trace(
             _validate_resumed_state_projection(
                 resume.state,
                 checkpoint=latest_state,
+                source=source,
             )
             _validate_resumed_state_prerequisite(
                 resume.adherence,
@@ -3068,6 +3109,7 @@ def _state_repair_request(
     declared_card_ids: frozenset[str],
     state: Mapping[str, Any],
     dropped: Mapping[str, Any],
+    fact_accounting: Mapping[str, Any],
 ) -> StateCandidateRepairRequest:
     raw_issues = state.get("consistency_issues")
     issues = raw_issues if isinstance(raw_issues, list) else []
@@ -3076,11 +3118,25 @@ def _state_repair_request(
         declared_card_ids=declared_card_ids,
     )
     dropped_count = _dropped_reference_count(dropped)
+    unaccounted_count = int(
+        fact_accounting.get("unaccounted_canonical_facts") or 0
+    )
+    invalid_count = int(
+        fact_accounting.get("invalid_internal_references") or 0
+    )
+    dangling_count = int(fact_accounting.get("dangling_references") or 0)
+    extraction_failure_count = int(
+        fact_accounting.get("extraction_failure_count") or 0
+    )
     reason_codes: list[StateRepairReason] = []
     if issues:
         reason_codes.append("consistency_conflict")
-    if dropped_count:
+    if dropped_count or invalid_count or dangling_count:
         reason_codes.append("invalid_internal_reference")
+    if unaccounted_count:
+        reason_codes.append("unaccounted_canonical_fact")
+    if extraction_failure_count:
+        reason_codes.append("state_extraction_unknown")
     return StateCandidateRepairRequest(
         cycle=cycle,
         proposal_id=proposal_id,
@@ -3093,6 +3149,10 @@ def _state_repair_request(
         ),
         affected_card_ids=card_ids,
         dropped_reference_count=dropped_count,
+        unaccounted_canonical_fact_count=unaccounted_count,
+        invalid_internal_reference_count=invalid_count,
+        dangling_reference_count=dangling_count,
+        extraction_failure_count=extraction_failure_count,
     )
 
 
@@ -3246,7 +3306,16 @@ def _next_repair_cycle(
 
 def _validate_state_shape(
     state_result: ChapterGenerationResult,
-) -> tuple[dict[str, Any], str, str, tuple[dict[str, Any], ...]]:
+    *,
+    source: ProseCandidateSource,
+    chapter_id: str,
+) -> tuple[
+    dict[str, Any],
+    str,
+    str,
+    tuple[dict[str, Any], ...],
+    dict[str, Any],
+]:
     if (
         state_result.stage is not ChapterGenerationStage.STATE
         or state_result.accepted
@@ -3274,7 +3343,34 @@ def _validate_state_shape(
     if len(raw_issues) > MAX_STATE_REPAIR_CARD_IDS:
         raise ChapterCandidatePipelineBlocked("状态候选冲突数量超过 V1 上限")
     issues = tuple(dict(item) for item in raw_issues)
-    return state, proposal_id, acceptance_token, issues
+    raw_fact_evidence = state.get("fact_evidence")
+    if not isinstance(raw_fact_evidence, Mapping):
+        raise ChapterCandidatePipelineBlocked(
+            "状态候选缺少正式事实核算证据"
+        )
+    try:
+        policy_decision = automatic_state_fact_decision(
+            raw_fact_evidence,
+            candidate=state,
+        )
+    except StateFactAccountingError as exc:
+        raise ChapterCandidatePipelineBlocked(str(exc)) from exc
+    accounting = dict(policy_decision["fact_accounting"])
+    source_binding = accounting.get("source_binding")
+    if (
+        not isinstance(source_binding, Mapping)
+        or source_binding.get("chapter_id") != chapter_id
+        or source_binding.get("source_prose_run_id")
+        != source.source_run_id
+        or source_binding.get("source_prose_run_revision")
+        != source.source_run_revision
+        or source_binding.get("source_content_digest")
+        != source.source_content_digest
+    ):
+        raise ChapterCandidatePipelineBlocked(
+            "状态事实核算没有绑定当前正文候选"
+        )
+    return state, proposal_id, acceptance_token, issues, accounting
 
 
 class ChapterCandidatePipeline:
@@ -3593,8 +3689,18 @@ class ChapterCandidatePipeline:
                 state_request_id,
             )
         while True:
-            state, proposal_id, _acceptance_token, consistency_issues = (
-                _validate_state_shape(state_result)
+            (
+                state,
+                proposal_id,
+                _acceptance_token,
+                consistency_issues,
+                fact_accounting,
+            ) = (
+                _validate_state_shape(
+                    state_result,
+                    source=source,
+                    chapter_id=chapter_id,
+                )
             )
             if (
                 resume is not None
@@ -3626,13 +3732,29 @@ class ChapterCandidatePipeline:
                     dropped_reference_count=_dropped_reference_count(
                         dropped
                     ),
+                    fact_accounting=fact_accounting,
                 ), ledger=checkpoint_ledger)
             state_checkpoint_context = None
-            if not consistency_issues and not dropped:
+            if (
+                not consistency_issues
+                and not dropped
+                and fact_accounting.get("gate_passed") is True
+            ):
                 break
             if self._deps.repair_state_candidate is None:
+                if fact_accounting.get("unaccounted_canonical_facts"):
+                    message = "状态候选仍有未核算正式事实"
+                elif (
+                    fact_accounting.get("invalid_internal_references")
+                    or fact_accounting.get("dangling_references")
+                ):
+                    message = "状态候选仍有无效或悬空内部引用"
+                elif fact_accounting.get("extraction_failure_count"):
+                    message = "状态候选事实抽取仍不确定"
+                else:
+                    message = "状态候选仍有一致性冲突或无效引用"
                 raise ChapterCandidatePipelineBlocked(
-                    "状态候选仍有一致性冲突或无效引用"
+                    message
                 )
             cycle = _next_repair_cycle(
                 trace.repair_cycles_used,
@@ -3652,6 +3774,7 @@ class ChapterCandidatePipeline:
                 declared_card_ids=_declared_character_card_ids(chapter),
                 state=state,
                 dropped=dropped,
+                fact_accounting=fact_accounting,
             )
             trace.repair_cycles_used = cycle
             if not isinstance(owner_id, str) or not owner_id:
@@ -3671,8 +3794,18 @@ class ChapterCandidatePipeline:
                 f"state_repair_{cycle}",
                 state_result,
             )
-            _next_state, next_proposal_id, _next_token, _next_issues = (
-                _validate_state_shape(state_result)
+            (
+                _next_state,
+                next_proposal_id,
+                _next_token,
+                _next_issues,
+                next_fact_accounting,
+            ) = (
+                _validate_state_shape(
+                    state_result,
+                    source=source,
+                    chapter_id=chapter_id,
+                )
             )
             await self._persist_checkpoint(_state_checkpoint(
                 chapter_id=chapter_id,
@@ -3687,6 +3820,7 @@ class ChapterCandidatePipeline:
                 dropped_reference_count=_dropped_reference_count(
                     state_result.dropped
                 ),
+                fact_accounting=next_fact_accounting,
             ), ledger=checkpoint_ledger)
             if next_proposal_id == proposal_id:
                 raise ChapterCandidatePipelineBlocked(

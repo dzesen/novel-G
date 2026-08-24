@@ -15,6 +15,10 @@ from backend.db import collections
 from backend.db.mongo import get_database
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
+from backend.services.novel.state_fact_accounting import (
+    StateFactAccountingError,
+    validate_state_fact_accounting,
+)
 
 
 StateCompletionStatus = Literal[
@@ -23,6 +27,7 @@ StateCompletionStatus = Literal[
     "stale_after_content_edit",
     "degraded_all_character_updates_dropped",
     "degraded_partial_reference_drop",
+    "degraded_fact_accounting",
     "unknown_legacy",
 ]
 
@@ -61,6 +66,7 @@ class StateCompletion:
     current_content_digest: str | None = None
     completion_reason: str | None = None
     reference_resolution: dict[str, Any] | None = None
+    fact_accounting: dict[str, Any] | None = None
     delta_revision: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +81,7 @@ class StateCompletion:
             "current_content_digest": self.current_content_digest,
             "completion_reason": self.completion_reason,
             "reference_resolution": dict(self.reference_resolution or {}),
+            "fact_accounting": dict(self.fact_accounting or {}),
             "delta_revision": self.delta_revision,
         }
 
@@ -121,6 +128,16 @@ class StateCompletionModule:
         evidence = evaluation.get("state_completion") or {}
         source_digest = evidence.get("source_content_digest")
         resolution = dict(evidence.get("reference_resolution") or {})
+        raw_fact_accounting = evidence.get("fact_accounting")
+        fact_accounting: dict[str, Any] | None = None
+        fact_accounting_invalid = False
+        if isinstance(raw_fact_accounting, dict):
+            try:
+                fact_accounting = validate_state_fact_accounting(
+                    raw_fact_accounting
+                )
+            except StateFactAccountingError:
+                fact_accounting_invalid = True
         completion_reason = str(evidence.get("completion_reason") or "") or None
         revision = int(delta.get("revision") or 0) or None
         if not source_digest:
@@ -134,6 +151,7 @@ class StateCompletionModule:
                 current_content_digest=current_digest,
                 completion_reason=completion_reason,
                 reference_resolution=resolution,
+                fact_accounting=fact_accounting,
                 delta_revision=revision,
             )
         if source_digest != current_digest:
@@ -148,6 +166,26 @@ class StateCompletionModule:
                 current_content_digest=current_digest,
                 completion_reason=completion_reason,
                 reference_resolution=resolution,
+                fact_accounting=fact_accounting,
+                delta_revision=revision,
+            )
+
+        if fact_accounting_invalid or (
+            fact_accounting is not None
+            and fact_accounting.get("gate_passed") is not True
+        ):
+            return StateCompletion(
+                chapter_id=chapter_id,
+                status="degraded_fact_accounting",
+                needs_backfill=True,
+                requires_pause=True,
+                prose_eligible=eligible,
+                prose_acceptance_state=acceptance_state,
+                source_content_digest=str(source_digest),
+                current_content_digest=current_digest,
+                completion_reason=completion_reason,
+                reference_resolution=resolution,
+                fact_accounting=fact_accounting,
                 delta_revision=revision,
             )
 
@@ -179,6 +217,7 @@ class StateCompletionModule:
             current_content_digest=current_digest,
             completion_reason=completion_reason,
             reference_resolution=resolution,
+            fact_accounting=fact_accounting,
             delta_revision=revision,
         )
 

@@ -520,14 +520,16 @@ review_chapter_outline_adherence_by_ai:
     {"schema_version":"chapter_outline_adherence_evidence.v2","outline_contract_version":"scene_transition_contract.v2","summary":"证据摘要","beat_evidence":[{"scene_id":"scene-1","beat_id":"scene-1-beat-1","status":"satisfied|mentioned|contradicted|missing|unknown","spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"explanation":"判定依据"}],"findings":[]}
 
 extract_chapter_state_by_ai:
+  contract_version: chapter_state_fact_evidence.v1
   chapter_state_prompt_base: |
     你是一位严谨的长篇小说编辑，负责在作者写完一章后回填记忆档案。
 
-    请阅读第 {chapter_order} 章《{chapter_title}》的正文，产出四件事：
+    请阅读第 {chapter_order} 章《{chapter_title}》（内部 chapter_id：{chapter_id}）的正文，产出五件事：
     1. 本章摘要；
     2. 出场角色的当下状态更新与新确立的永久事实；
     3. 既有伏笔的状态推进；
     4. 正文与既有永久事实的冲突报告。
+    5. 一份逐字绑定正文、覆盖全部持久事实与全部状态动作的 fact_evidence。
 
     【已知上下文】
     {context}
@@ -553,8 +555,29 @@ extract_chapter_state_by_ai:
       **回忆、幻觉、诈死、托梦、他人假扮都是合法叙事**，不要把它们报成冲突；
       只报那些看起来像是作者忘了设定的地方，并在 conflict 里写明正文依据。
       没有冲突就返回空列表，不要为了凑数而编造。
+    - fact_evidence.schema_version 必须精确为 chapter_state_fact_evidence.v1。
+      fact_id 在本次输出内唯一且稳定，使用小写字母、数字、点、下划线、冒号或短横线。
+    - 逐项区分事实种类。canonical_fact 是后续叙事会依赖的客观持久事实；
+      character_cognition 只是角色知道或相信的内容；rumor 是传闻；deception 是谎言、
+      伪装或误导；temporary_fact 是位置、情绪、短期伤势等可变化状态。
+      后四类不能冒充客观世界事实写入永久事实。
+    - support 只描述正文是否支持该项。supported 必须有逐字正文 span；unsupported 表示
+      某个候选状态动作没有正文依据，也必须给能证明其不成立或仅属误判的正文 span；
+      无法可靠判断时用 unknown，绝不能把 unknown 写成 supported。
+    - 每个 character_updates[].current_state 非空动作、每条 new_permanent_facts 动作、
+      每条 thread_updates 动作都必须被且只被一条 fact_evidence.facts[].action_ref 精确引用。
+      action_ref 的 action_type、target_id、value 和 permanent_fact_kind 必须逐字等于候选动作；
+      不得用名称、别名、占位符或猜测值代替内部 ID。
+    - 章节级客观事实若已完整写入 summary，可用 action_type=chapter_summary、
+      target_id={chapter_id}、value 等于完整 summary 的 action_ref 核算。正文存在会影响后文的
+      客观持久变化时，不得用 complete_no_change 逃避，也不得漏掉对应事实。
+    - spans 使用 Python 风格字符下标的左闭右开区间，quote 必须逐字复制正文对应区间；
+      不得改写、去空格或使用字节偏移。本地会复核区间并只保存 quote 哈希。
+    - extraction_status=complete 时 facts 必须非空，no_change 与 unknown_reason 必须为空；
+      complete_no_change 只用于确实没有任何需核算持久变化时，facts 为空且 no_change 给出正文
+      span；unknown 只用于抽取确实无法完成时，并填写 unknown_reason，不能同时给 no_change。
   chapter_state_prompt_with_schema_suffix: |
-    按给定的 JSON Schema 输出。
+    按给定的 JSON Schema 输出。不得省略 fact_evidence，也不得输出额外解释。
   chapter_state_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要用代码块包裹，不要加任何解释。格式：
-    {"summary": "本章摘要", "character_updates": [{"card_id": "卡片id", "current_state": "当下状态", "new_permanent_facts": [{"fact": "事实描述", "kind": "death|injury|identity|relation|ability"}]}], "thread_updates": [{"thread_id": "伏笔id", "status": "developing|resolved", "evidence": "正文依据"}], "consistency_issues": [{"card_id": "卡片id或null", "fact": "被违反的既有事实", "conflict": "正文中冲突的内容"}]}
+    {"summary":"本章摘要","character_updates":[{"card_id":"卡片id","current_state":"当下状态","new_permanent_facts":[{"fact":"事实描述","kind":"death|injury|identity|relation|ability"}]}],"thread_updates":[{"thread_id":"伏笔id","status":"developing|resolved","evidence":"正文依据"}],"consistency_issues":[],"fact_evidence":{"schema_version":"chapter_state_fact_evidence.v1","extraction_status":"complete|complete_no_change|unknown","facts":[{"fact_id":"fact-1","kind":"canonical_fact|character_cognition|rumor|deception|temporary_fact","support":"supported|unsupported|unknown","statement":"事实陈述","target_type":"character|thread|chapter","target_id":"内部id或chapter时为null","action_ref":{"action_type":"chapter_summary|character_state|permanent_fact|thread_status","target_id":"精确内部id","value":"与候选动作逐字相同","permanent_fact_kind":null},"spans":[{"start":0,"end":4,"quote":"逐字正文"}],"explanation":"核算依据"}],"no_change":null,"unknown_reason":null}}

@@ -18,6 +18,8 @@ MAX_STATE_REPAIR_DROPPED_REFERENCES = 1_000
 StateRepairReason = Literal[
     "consistency_conflict",
     "invalid_internal_reference",
+    "unaccounted_canonical_fact",
+    "state_extraction_unknown",
 ]
 
 
@@ -29,7 +31,7 @@ class StateRepairDirective(BaseModel):
     cycle: int = Field(ge=1, le=MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES)
     reason_codes: tuple[StateRepairReason, ...] = Field(
         min_length=1,
-        max_length=2,
+        max_length=4,
     )
     consistency_issue_count: int = Field(
         ge=0,
@@ -42,6 +44,22 @@ class StateRepairDirective(BaseModel):
         ge=0,
         le=MAX_STATE_REPAIR_DROPPED_REFERENCES,
     )
+    unaccounted_canonical_fact_count: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_STATE_REPAIR_DROPPED_REFERENCES,
+    )
+    invalid_internal_reference_count: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_STATE_REPAIR_DROPPED_REFERENCES,
+    )
+    dangling_reference_count: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_STATE_REPAIR_DROPPED_REFERENCES,
+    )
+    extraction_failure_count: int = Field(default=0, ge=0, le=1)
 
     @field_validator("reason_codes", "affected_card_ids")
     @classmethod

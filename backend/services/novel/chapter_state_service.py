@@ -119,15 +119,16 @@ class ChapterStateService:
             )
 
             for character_index, update in enumerate(planned):
-                await character_state_repo.upsert_state(
-                    novel_id,
-                    update["card_id"],
-                    update["current_state"],
-                    chapter_order,
-                    session=session,
-                    as_of_chapter_id=chapter_id,
-                )
-                states_updated += 1
+                if update.get("write_current_state", True):
+                    await character_state_repo.upsert_state(
+                        novel_id,
+                        update["card_id"],
+                        update["current_state"],
+                        chapter_order,
+                        session=session,
+                        as_of_chapter_id=chapter_id,
+                    )
+                    states_updated += 1
                 for fact_index, fact in enumerate(update["accepted_permanent_facts"]):
                     child_key = f"fact_{character_index}_{fact_index}"
                     if mutation.was_received(child_key):
@@ -342,6 +343,14 @@ class ChapterStateService:
             # get_state 对不存在的角色返回 None（**不抛异常**），故这里是普通的
             # None 判断，不需要 try/except——首次出场的角色自然没有重复项。
             state = await character_state_repo.get_state(novel_id, update["card_id"])
+            if (
+                not update.get("write_current_state", True)
+                and update["accepted_permanent_facts"]
+                and state is None
+            ):
+                raise ValueError(
+                    "仅追加永久事实时角色必须已有正式状态，未做任何写入"
+                )
             existing_by_text = {
                 str(fact.get("fact", "")).strip(): fact
                 for fact in ((state or {}).get("permanent_facts") or [])
@@ -377,6 +386,23 @@ class ChapterStateService:
             planned.append(
                 {
                     **update,
+                    **(
+                        {
+                            "prior_current_state": str(
+                                (state or {}).get("current_state") or ""
+                            ),
+                            "prior_as_of_chapter_id": (
+                                str(state["as_of_chapter_id"])
+                                if (state or {}).get("as_of_chapter_id")
+                                else None
+                            ),
+                            "prior_as_of_chapter_order": int(
+                                (state or {}).get("as_of_chapter_order") or 0
+                            ),
+                        }
+                        if not update.get("write_current_state", True)
+                        else {}
+                    ),
                     "accepted_permanent_facts": fresh,
                     "retained_permanent_facts": retained,
                 }

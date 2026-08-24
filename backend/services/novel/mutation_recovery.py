@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
 
 from backend.db import collections
@@ -275,6 +276,7 @@ async def recover_bound_mutation_revision(
         if normalized_operation != "accept_chapter_state":
             return None
         from backend.services.novel.state_proposal import (
+            FactAccountingPolicy,
             SelectAllPolicy,
             state_proposal_module,
         )
@@ -285,7 +287,11 @@ async def recover_bound_mutation_revision(
         await state_proposal_module.run_auto(
             chapter_id=frozen.chapter_id,
             proposal=proposal,
-            policy=SelectAllPolicy(),
+            policy=(
+                FactAccountingPolicy()
+                if isinstance(proposal.get("fact_evidence"), Mapping)
+                else SelectAllPolicy()
+            ),
             job_mutation_binding=frozen,
         )
         journal = await collection.find_one(query)

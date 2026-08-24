@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from bson import ObjectId
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -30,8 +37,8 @@ class StateCandidateRepairReceiptConflict(ValueError):
     """A repair idempotency identity was reused with incompatible evidence."""
 
 
-class StateCandidateRepairResultProjection(BaseModel):
-    """Metadata-only pointer to a published state proposal."""
+class StateCandidateRepairResultProjectionV1(BaseModel):
+    """Legacy metadata-only pointer to a published state proposal."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -42,6 +49,47 @@ class StateCandidateRepairResultProjection(BaseModel):
     truncated_section_count: int = Field(ge=0, le=100)
     dropped_item_count: int = Field(ge=0, le=10_000)
     dropped_reference_count: int = Field(ge=0, le=1_000)
+
+
+class StateCandidateRepairResultProjectionV2(BaseModel):
+    """State repair pointer bound to its deterministic fact accounting."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["state_candidate_repair_result.v2"] = (
+        "state_candidate_repair_result.v2"
+    )
+    proposal_id: str = Field(min_length=1, max_length=128)
+    truncated_section_count: int = Field(ge=0, le=100)
+    dropped_item_count: int = Field(ge=0, le=10_000)
+    dropped_reference_count: int = Field(ge=0, le=1_000)
+    fact_accounting_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    canonical_fact_count: int = Field(ge=0, le=1_000)
+    unaccounted_canonical_fact_count: int = Field(ge=0, le=1_000)
+    invalid_internal_reference_count: int = Field(ge=0, le=1_000)
+    dangling_reference_count: int = Field(ge=0, le=1_000)
+    extraction_failure_count: int = Field(ge=0, le=1)
+
+
+StateCandidateRepairResultProjection = Annotated[
+    StateCandidateRepairResultProjectionV1
+    | StateCandidateRepairResultProjectionV2,
+    Field(discriminator="schema_version"),
+]
+_STATE_RESULT_PROJECTION_ADAPTER = TypeAdapter(
+    StateCandidateRepairResultProjection
+)
+
+
+def parse_state_candidate_repair_result_projection(
+    value: Any,
+) -> (
+    StateCandidateRepairResultProjectionV1
+    | StateCandidateRepairResultProjectionV2
+):
+    """Read legacy V1 receipts while keeping every new completion on V2."""
+
+    return _STATE_RESULT_PROJECTION_ADAPTER.validate_python(value)
 
 
 class StateCandidateRepairReceiptEnvelope(BaseModel):
@@ -620,7 +668,7 @@ class StateCandidateRepairReceiptRepository:
         receipt_id = self._command_identity(receipt_id, field="id")
         claim_token = self._command_identity(claim_token, field="claim token")
         claim_epoch = self._claim_epoch(claim_epoch)
-        projection = StateCandidateRepairResultProjection.model_validate(
+        projection = StateCandidateRepairResultProjectionV2.model_validate(
             result_projection
         ).model_dump(mode="json")
         await self._load_transition_receipt(
@@ -661,7 +709,7 @@ class StateCandidateRepairReceiptRepository:
             raise StateCandidateRepairReceiptConflict(
                 "state repair completed receipt is invalid"
             ) from exc
-        stored = StateCandidateRepairResultProjection.model_validate(
+        stored = StateCandidateRepairResultProjectionV2.model_validate(
             receipt.get("result_projection")
         ).model_dump(mode="json")
         if stored != projection:

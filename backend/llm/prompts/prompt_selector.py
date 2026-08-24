@@ -22,6 +22,7 @@ from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     SCENE_TRANSITION_CONTRACT_VERSION,
 )
+from backend.state_fact_contract_versions import STATE_FACT_EVIDENCE_VERSION
 
 PROMPT_DIR = Path(__file__).resolve().parent
 CUSTOM_PROMPT_FILENAME = "prompt.yaml"
@@ -95,6 +96,7 @@ REQUIRED_REFERENCE_CARDS_PROMPT_KEYS: tuple[str, ...] = (
 )
 
 REQUIRED_CHAPTER_STATE_PROMPT_KEYS: tuple[str, ...] = (
+    "contract_version",
     "chapter_state_prompt_base",
     "chapter_state_prompt_with_schema_suffix",
     "chapter_state_prompt_without_schema_suffix",
@@ -197,6 +199,7 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
     },
     "chapter_state_prompt_base": {
         "context",
+        "chapter_id",
         "chapter_order",
         "chapter_title",
         "chapter_content",
@@ -206,6 +209,7 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
 PROMPT_CONTRACT_VERSIONS: dict[str, str] = {
     CHAPTER_OUTLINE_PROMPT_NAME: SCENE_TRANSITION_CONTRACT_VERSION,
     OUTLINE_ADHERENCE_PROMPT_NAME: OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    CHAPTER_STATE_PROMPT_NAME: STATE_FACT_EVIDENCE_VERSION,
 }
 
 PROMPT_REVISIONS: dict[str, str] = {

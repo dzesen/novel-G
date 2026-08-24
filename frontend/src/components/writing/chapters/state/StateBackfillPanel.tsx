@@ -17,6 +17,7 @@ import type {
   ChapterStateAcceptResponse,
   ChapterStateResult,
   PermanentFactProposal,
+  StateFactDropReason,
 } from "./stateTypes";
 
 interface StateBackfillPanelProps {
@@ -28,7 +29,7 @@ interface StateBackfillPanelProps {
   onAccepted: () => void;
 }
 
-/** 事实的稳定标识：同一角色下用「下标 + 文本」，文本被编辑时勾选状态自然失效。 */
+/** 事实的渲染键；正式选择与丢弃原因始终使用服务端 selection_id。 */
 const factKey = (cardId: string, index: number, fact: PermanentFactProposal) =>
   `${cardId}::${index}::${fact.fact}`;
 
@@ -64,7 +65,9 @@ export function StateBackfillPanel({
   });
 
   const [checkedFacts, setCheckedFacts] = useState<Set<string>>(new Set());
+  const [checkedCharacters, setCheckedCharacters] = useState<Set<string>>(new Set());
   const [checkedThreads, setCheckedThreads] = useState<Set<string>>(new Set());
+  const [dropReasons, setDropReasons] = useState<Record<string, StateFactDropReason>>({});
   const [accepting, setAccepting] = useState(false);
   const [acceptError, setAcceptError] = useState("");
   const [acceptResult, setAcceptResult] = useState<ChapterStateAcceptResponse | null>(null);
@@ -75,7 +78,17 @@ export function StateBackfillPanel({
   useEffect(() => {
     if (!stream.result) return;
     setCheckedFacts(new Set());
-    setCheckedThreads(new Set(stream.result.thread_updates.map((item) => item.thread_id)));
+    setCheckedCharacters(new Set(
+      stream.result.character_updates
+        .map((item) => item.selection_id)
+        .filter((id): id is string => Boolean(id))
+    ));
+    setCheckedThreads(new Set(
+      stream.result.thread_updates
+        .map((item) => item.selection_id)
+        .filter((id): id is string => Boolean(id))
+    ));
+    setDropReasons({});
     setAcceptResult(null);
     setAcceptError("");
     // 只在**流**送来新结果时重置勾选（由 resultVersion 追踪）；刻意不把 stream.result
@@ -106,23 +119,69 @@ export function StateBackfillPanel({
     patchResult({ character_updates: next });
   };
 
-  const toggleFact = (key: string) => {
-    setCheckedFacts((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+  const clearDropReason = (selectionId: string) => {
+    setDropReasons((current) => {
+      const next = { ...current };
+      delete next[selectionId];
       return next;
     });
   };
 
-  const toggleThread = (threadId: string) => {
-    setCheckedThreads((current) => {
+  const toggleFact = (selectionId: string) => {
+    clearDropReason(selectionId);
+    setCheckedFacts((current) => {
       const next = new Set(current);
-      if (next.has(threadId)) next.delete(threadId);
-      else next.add(threadId);
+      if (next.has(selectionId)) next.delete(selectionId);
+      else next.add(selectionId);
       return next;
     });
   };
+
+  const toggleCharacter = (selectionId: string) => {
+    clearDropReason(selectionId);
+    setCheckedCharacters((current) => {
+      const next = new Set(current);
+      if (next.has(selectionId)) next.delete(selectionId);
+      else next.add(selectionId);
+      return next;
+    });
+  };
+
+  const toggleThread = (selectionId: string) => {
+    clearDropReason(selectionId);
+    setCheckedThreads((current) => {
+      const next = new Set(current);
+      if (next.has(selectionId)) next.delete(selectionId);
+      else next.add(selectionId);
+      return next;
+    });
+  };
+
+  const setDropReason = (selectionId: string, value: string) => {
+    setDropReasons((current) => {
+      const next = { ...current };
+      if (value) next[selectionId] = value as StateFactDropReason;
+      else delete next[selectionId];
+      return next;
+    });
+  };
+
+  const dropReasonField = (selectionId: string) => (
+    <label className="mt-2 block min-w-0 text-xs text-muted">
+      <span className="mb-1 block font-medium text-foreground">{t("dropReasonLabel")}</span>
+      <select
+        value={dropReasons[selectionId] ?? ""}
+        onChange={(event) => setDropReason(selectionId, event.target.value)}
+        className="w-full min-w-0 rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
+      >
+        <option value="">{t("dropReasonPlaceholder")}</option>
+        <option value="unsupported_by_prose">{t("dropReasonUnsupported")}</option>
+        <option value="duplicate_existing_fact">{t("dropReasonExistingDuplicate")}</option>
+        <option value="duplicate_proposal">{t("dropReasonProposalDuplicate")}</option>
+        <option value="legal_no_op">{t("dropReasonNoOp")}</option>
+      </select>
+    </label>
+  );
 
   const factKindLabel = (kind: PermanentFactProposal["kind"]) => {
     switch (kind) {
@@ -151,6 +210,51 @@ export function StateBackfillPanel({
   const threadName = (threadId: string) =>
     roster.nameById[threadId] ?? t("unknownThread");
 
+  const result = stream.result;
+  const selectionIds = result
+    ? [
+        ...result.character_updates.map((item) => item.selection_id),
+        ...result.character_updates.flatMap((item) =>
+          item.new_permanent_facts.map((fact) => fact.selection_id)
+        ),
+        ...result.thread_updates.map((item) => item.selection_id),
+      ]
+    : [];
+  const hasMissingSelectionIds = selectionIds.some((id) => !id);
+  const hasFactEvidenceBlocker = Boolean(
+    result
+      && (
+        result.fact_evidence.extraction_status === "unknown"
+        || result.fact_evidence.invalid_internal_references > 0
+        || result.fact_evidence.dangling_references > 0
+      )
+  );
+  const unselectedIds = result
+    ? [
+        ...result.character_updates
+          .map((item) => item.selection_id)
+          .filter(
+            (id): id is string =>
+              typeof id === "string" && id.length > 0 && !checkedCharacters.has(id)
+          ),
+        ...result.character_updates.flatMap((item) =>
+          item.new_permanent_facts
+            .map((fact) => fact.selection_id)
+            .filter(
+              (id): id is string =>
+                typeof id === "string" && id.length > 0 && !checkedFacts.has(id)
+            )
+        ),
+        ...result.thread_updates
+          .map((item) => item.selection_id)
+          .filter(
+            (id): id is string =>
+              typeof id === "string" && id.length > 0 && !checkedThreads.has(id)
+          ),
+      ]
+    : [];
+  const hasUnexplainedDrops = unselectedIds.some((id) => !dropReasons[id]);
+
   const accept = async () => {
     if (!stream.result) return;
     if (!stream.result.proposal_id || !stream.result.acceptance_token) {
@@ -166,16 +270,21 @@ export function StateBackfillPanel({
           chapter_id: chapterId,
           proposal_id: stream.result.proposal_id,
           acceptance_token: stream.result.acceptance_token,
+          selected_character_ids: stream.result.character_updates
+            .filter((item) => item.selection_id && checkedCharacters.has(item.selection_id))
+            .map((item) => item.selection_id)
+            .filter((id): id is string => Boolean(id)),
           selected_fact_ids: stream.result.character_updates.flatMap((update) =>
             update.new_permanent_facts
-              .filter((fact, index) => checkedFacts.has(factKey(update.card_id, index, fact)))
+              .filter((fact) => fact.selection_id && checkedFacts.has(fact.selection_id))
               .map((fact) => fact.selection_id)
               .filter((id): id is string => Boolean(id))
           ),
           selected_thread_ids: stream.result.thread_updates
-            .filter((item) => checkedThreads.has(item.thread_id))
+            .filter((item) => item.selection_id && checkedThreads.has(item.selection_id))
             .map((item) => item.selection_id)
             .filter((id): id is string => Boolean(id)),
+          drop_reasons: dropReasons,
           edits: {
             summary: stream.result.summary,
             current_states: Object.fromEntries(
@@ -195,7 +304,6 @@ export function StateBackfillPanel({
     }
   };
 
-  const result = stream.result;
   const noStateChanges = result
     ? result.character_updates.length === 0 && result.thread_updates.length === 0
     : false;
@@ -297,7 +405,7 @@ export function StateBackfillPanel({
                     value={result.summary}
                     rows={3}
                     onChange={(e) => patchResult({ summary: e.target.value })}
-                    className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-sm leading-5 text-foreground outline-none focus:border-accent"
+                    className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-base leading-6 text-foreground outline-none focus:border-accent sm:text-sm sm:leading-5"
                   />
                 </Field>
               </div>
@@ -320,16 +428,39 @@ export function StateBackfillPanel({
                         <p className="mb-2 text-sm font-medium text-foreground">
                           {characterName(update.card_id)}
                         </p>
-                        <Field label={t("currentStateLabel")}>
+                        <div className="grid gap-1">
+                          <label className="flex min-w-0 items-start gap-2 text-xs font-medium text-muted">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(
+                                update.selection_id
+                                && checkedCharacters.has(update.selection_id)
+                              )}
+                              disabled={!update.selection_id}
+                              onChange={() => {
+                                if (update.selection_id) toggleCharacter(update.selection_id);
+                              }}
+                              className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+                            />
+                            <span className="min-w-0">{t("currentStateLabel")}</span>
+                          </label>
                           <textarea
                             value={update.current_state}
                             rows={2}
+                            disabled={Boolean(
+                              update.selection_id
+                              && !checkedCharacters.has(update.selection_id)
+                            )}
+                            aria-label={t("currentStateLabel")}
                             onChange={(e) =>
                               updateCharacter(index, { current_state: e.target.value })
                             }
-                            className="w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-sm leading-5 text-foreground outline-none focus:border-accent"
+                            className="w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-base leading-6 text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60 sm:text-sm sm:leading-5"
                           />
-                        </Field>
+                          {update.selection_id
+                            && !checkedCharacters.has(update.selection_id)
+                            && dropReasonField(update.selection_id)}
+                        </div>
                         {update.new_permanent_facts.length > 0 && (
                           <div className="mt-2 grid gap-1.5">
                             <span className="text-xs font-medium text-muted">
@@ -337,24 +468,34 @@ export function StateBackfillPanel({
                             </span>
                             {update.new_permanent_facts.map((fact, factIndex) => {
                               const key = factKey(update.card_id, factIndex, fact);
+                              const selectionId = fact.selection_id ?? "";
+                              const selected = Boolean(
+                                selectionId && checkedFacts.has(selectionId)
+                              );
                               return (
-                                <label
+                                <div
                                   key={key}
-                                  className="flex items-start gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground"
+                                  className="rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground"
                                 >
-                                  <input
-                                    type="checkbox"
-                                    checked={checkedFacts.has(key)}
-                                    onChange={() => toggleFact(key)}
-                                    className="mt-0.5 h-4 w-4 accent-[var(--color-accent)]"
-                                  />
-                                  <span>
-                                    <span className="mr-1.5 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted">
-                                      {factKindLabel(fact.kind)}
+                                  <label className="flex min-w-0 items-start gap-2">
+                                    <input
+                                      type="checkbox"
+                                      checked={selected}
+                                      disabled={!selectionId}
+                                      onChange={() => {
+                                        if (selectionId) toggleFact(selectionId);
+                                      }}
+                                      className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+                                    />
+                                    <span className="min-w-0 break-words">
+                                      <span className="mr-1.5 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted">
+                                        {factKindLabel(fact.kind)}
+                                      </span>
+                                      {fact.fact}
                                     </span>
-                                    {fact.fact}
-                                  </span>
-                                </label>
+                                  </label>
+                                  {selectionId && !selected && dropReasonField(selectionId)}
+                                </div>
                               );
                             })}
                           </div>
@@ -369,33 +510,45 @@ export function StateBackfillPanel({
                 <section className="grid gap-3 rounded-md border border-border bg-background p-4">
                   <h4 className="text-sm font-semibold text-foreground">{t("threadsLabel")}</h4>
                   <div className="grid gap-2">
-                    {result.thread_updates.map((item) => (
-                      <label
-                        key={item.thread_id}
-                        className="flex items-start gap-2 rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checkedThreads.has(item.thread_id)}
-                          onChange={() => toggleThread(item.thread_id)}
-                          className="mt-0.5 h-4 w-4 accent-[var(--color-accent)]"
-                        />
-                        <span className="flex-1">
-                          <span className="mr-1.5 font-medium">{threadName(item.thread_id)}</span>
-                          <span className="mr-1.5 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted">
-                            {item.status === "resolved"
-                              ? t("threadResolved")
-                              : t("threadDeveloping")}
-                          </span>
-                          {item.evidence && (
-                            <span className="mt-1 block text-xs text-muted">
-                              <span className="font-medium">{t("evidenceLabel")}: </span>
-                              {item.evidence}
+                    {result.thread_updates.map((item) => {
+                      const selectionId = item.selection_id ?? "";
+                      const selected = Boolean(
+                        selectionId && checkedThreads.has(selectionId)
+                      );
+                      return (
+                        <div
+                          key={item.thread_id}
+                          className="rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground"
+                        >
+                          <label className="flex min-w-0 items-start gap-2">
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              disabled={!selectionId}
+                              onChange={() => {
+                                if (selectionId) toggleThread(selectionId);
+                              }}
+                              className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+                            />
+                            <span className="min-w-0 flex-1 break-words">
+                              <span className="mr-1.5 font-medium">{threadName(item.thread_id)}</span>
+                              <span className="mr-1.5 rounded-md border border-border px-1.5 py-0.5 text-xs text-muted">
+                                {item.status === "resolved"
+                                  ? t("threadResolved")
+                                  : t("threadDeveloping")}
+                              </span>
+                              {item.evidence && (
+                                <span className="mt-1 block text-xs text-muted">
+                                  <span className="font-medium">{t("evidenceLabel")}: </span>
+                                  {item.evidence}
+                                </span>
+                              )}
                             </span>
-                          )}
-                        </span>
-                      </label>
-                    ))}
+                          </label>
+                          {selectionId && !selected && dropReasonField(selectionId)}
+                        </div>
+                      );
+                    })}
                   </div>
                 </section>
               )}
@@ -422,13 +575,37 @@ export function StateBackfillPanel({
           )}
         </div>
 
-        <footer className="flex justify-end gap-2 border-t border-border bg-surface px-4 py-3 sm:px-6">
+        <footer className="flex flex-col gap-2 border-t border-border bg-surface px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+          <p
+            role={
+              hasMissingSelectionIds || hasFactEvidenceBlocker || hasUnexplainedDrops
+                ? "alert"
+                : undefined
+            }
+            className="min-w-0 text-xs leading-5 text-muted"
+          >
+            {hasMissingSelectionIds
+              ? t("stalePreview")
+              : hasFactEvidenceBlocker
+                ? t("factAccountingBlocked")
+                : hasUnexplainedDrops
+                  ? t("dropReasonRequired")
+                  : result
+                    ? t("factAccountingReady")
+                    : ""}
+          </p>
           <Button
             variant="primary"
             size="sm"
             className="bg-accent text-white hover:bg-accent-hover"
             onPress={() => void accept()}
-            isDisabled={!result || busy}
+            isDisabled={
+              !result
+              || busy
+              || hasMissingSelectionIds
+              || hasFactEvidenceBlocker
+              || hasUnexplainedDrops
+            }
           >
             {accepting ? t("accepting") : t("accept")}
           </Button>
