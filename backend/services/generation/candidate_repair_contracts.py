@@ -27,10 +27,22 @@ from backend.services.generation.outline_adherence import (
 from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
+from backend.services.generation.chapter_repair_policy import (
+    RepairComponent,
+    RepairComponentUsageV1,
+    RepairConvergenceEvidenceV1,
+)
 
 
-MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = 8
-MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 32
+MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS = 8
+MAX_CHAPTER_CANDIDATE_REPAIR_EVENTS = (
+    MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS * 3
+)
+# Historical name retained for persisted checkpoint validators. A "cycle" in
+# that ledger is now one charged repair event, while each component remains
+# independently capped by MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS.
+MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES = MAX_CHAPTER_CANDIDATE_REPAIR_EVENTS
+MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS = 64
 MAX_CANDIDATE_CHECKPOINT_ATTEMPTS = 512
 MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES = 10_000
 MAX_CANDIDATE_OUTLINE_SCENES = MAX_CHAPTER_OUTLINE_SCENES
@@ -235,6 +247,14 @@ class CandidatePipelineProgressV1(_CandidateCheckpointContract):
         le=MAX_CANDIDATE_OUTLINE_SCENES,
     )
     consistency_issue_count: int = Field(ge=0, le=20)
+    repair_component_usage: tuple[RepairComponentUsageV1, ...] = Field(
+        default=(),
+        max_length=6,
+    )
+    repair_convergence: tuple[RepairConvergenceEvidenceV1, ...] = Field(
+        default=(),
+        max_length=MAX_CHAPTER_CANDIDATE_REPAIR_EVENTS,
+    )
 
 
 class CandidateCompletionProjectionV1(_CandidateCheckpointContract):
@@ -1054,6 +1074,64 @@ def parse_candidate_pipeline_progress(value: Any) -> CandidatePipelineProgressV1
         value["outline_issue_categories"] = tuple(
             value["outline_issue_categories"]
         )
+    raw_usage = value.get("repair_component_usage")
+    if raw_usage is not None:
+        if not isinstance(raw_usage, (list, tuple)) or len(raw_usage) > 6:
+            raise ValueError("candidate repair component usage is invalid")
+        normalized_usage: list[RepairComponentUsageV1] = []
+        for raw_item in raw_usage:
+            if isinstance(raw_item, BaseModel):
+                raw_item = raw_item.model_dump(mode="python")
+            if not isinstance(raw_item, Mapping):
+                raise ValueError(
+                    "candidate repair component usage item is invalid"
+                )
+            item = dict(raw_item)
+            item["component"] = RepairComponent(item.get("component"))
+            normalized_usage.append(
+                RepairComponentUsageV1.model_validate(item)
+            )
+        value["repair_component_usage"] = tuple(normalized_usage)
+    raw_convergence = value.get("repair_convergence")
+    if raw_convergence is not None:
+        if (
+            not isinstance(raw_convergence, (list, tuple))
+            or len(raw_convergence) > MAX_CHAPTER_CANDIDATE_REPAIR_EVENTS
+        ):
+            raise ValueError("candidate repair convergence is invalid")
+        normalized_convergence: list[RepairConvergenceEvidenceV1] = []
+        tuple_fields = (
+            "target_issue_signatures",
+            "remaining_target_issue_signatures",
+            "resolved_issue_signatures",
+            "introduced_issue_signatures",
+            "regressed_issue_signatures",
+            "introduced_blocker_signatures",
+            "reason_codes",
+            "prose_run_revision_sequence",
+            "content_digest_sequence",
+        )
+        for raw_item in raw_convergence:
+            if isinstance(raw_item, BaseModel):
+                raw_item = raw_item.model_dump(mode="python")
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("candidate repair convergence item is invalid")
+            item = dict(raw_item)
+            raw_charge = item.get("charge")
+            if isinstance(raw_charge, Mapping):
+                charge = dict(raw_charge)
+                charge["component"] = RepairComponent(
+                    charge.get("component")
+                )
+                item["charge"] = charge
+            for field in tuple_fields:
+                field_value = item.get(field)
+                if isinstance(field_value, list):
+                    item[field] = tuple(field_value)
+            normalized_convergence.append(
+                RepairConvergenceEvidenceV1.model_validate(item)
+            )
+        value["repair_convergence"] = tuple(normalized_convergence)
     return CandidatePipelineProgressV1.model_validate(value)
 
 

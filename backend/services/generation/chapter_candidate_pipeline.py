@@ -29,8 +29,21 @@ from backend.services.generation.chapter_generation_application import (
 from backend.services.generation.chapter_finalization import (
     MAX_FINALIZATION_REPAIR_CYCLES,
 )
+from backend.services.generation.chapter_repair_policy import (
+    ChapterRepairPolicy,
+    RepairBudgetExhausted,
+    RepairBudgetLimitsV1,
+    RepairChargeV1,
+    RepairComponent,
+    RepairComponentUsageV1,
+    RepairConvergenceEvidenceV1,
+    RepairIssueV1,
+    default_repair_budget_limits,
+    repair_next_step,
+)
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_OUTLINE_SCENES,
+    MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS,
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     AdherenceCandidateCheckpoint,
     AdherenceCandidateCheckpointV1,
@@ -159,6 +172,11 @@ _CHARGED_ATTEMPT_STATES = frozenset({
     CandidateAttemptState.RESOLVED_RETRY,
     CandidateAttemptState.RESOLVED_SKIP,
     CandidateAttemptState.RESOLVED_ABORT,
+})
+_JUDGE_OR_SCHEMA_RETRY_PHASES = frozenset({
+    CandidateAttemptPhase.SCHEMA_FALLBACK,
+    CandidateAttemptPhase.REPAIR,
+    CandidateAttemptPhase.REVIEWER,
 })
 
 
@@ -1015,6 +1033,8 @@ class ChapterCandidatePipelineProgress:
     truncations: tuple[CandidateTruncationSummary, ...] = ()
     completed_steps: tuple[str, ...] = ()
     repair_cycles_used: int = 0
+    repair_component_usage: tuple[RepairComponentUsageV1, ...] = ()
+    repair_convergence: tuple[RepairConvergenceEvidenceV1, ...] = ()
     prose_run_id: str | None = None
     prose_run_revision: int | None = None
     prose_content_digest: str | None = None
@@ -1067,6 +1087,10 @@ class ChapterCandidatePipelineBlocked(ValueError):
         progress: ChapterCandidatePipelineProgress | None = None,
         gate: Literal["completion", "outline_adherence", "state"] | None = None,
         repair_limit: int | None = None,
+        repair_component: RepairComponent | None = None,
+        component_used: int | None = None,
+        component_limit: int | None = None,
+        next_step: str | None = None,
         consistency_issue_count: int | None = None,
         dropped_reference_count: int | None = None,
         affected_card_ids: tuple[str, ...] = (),
@@ -1077,6 +1101,10 @@ class ChapterCandidatePipelineBlocked(ValueError):
         self._progress_attached = progress is not None
         self.gate = gate
         self.repair_limit = repair_limit
+        self.repair_component = repair_component
+        self.component_used = component_used
+        self.component_limit = component_limit
+        self.next_step = next_step
         self.consistency_issue_count = consistency_issue_count
         self.dropped_reference_count = dropped_reference_count
         self.affected_card_ids = affected_card_ids
@@ -1184,6 +1212,8 @@ class ChapterCandidatePipelineResult:
     prose_content_digest: str
     state_proposal_id: str
     repair_cycles_used: int
+    repair_component_usage: tuple[RepairComponentUsageV1, ...]
+    repair_convergence: tuple[RepairConvergenceEvidenceV1, ...]
     finalization: dict[str, Any]
 
 
@@ -1528,6 +1558,8 @@ class _PipelineTrace:
     truncations: list[CandidateTruncationSummary] = field(default_factory=list)
     completed_steps: list[str] = field(default_factory=list)
     repair_cycles_used: int = 0
+    repair_component_usage: tuple[RepairComponentUsageV1, ...] = ()
+    repair_convergence: tuple[RepairConvergenceEvidenceV1, ...] = ()
     source: ProseCandidateSource | None = None
     state_proposal_id: str | None = None
 
@@ -1962,6 +1994,8 @@ class _PipelineTrace:
             truncations=tuple(self.truncations),
             completed_steps=tuple(self.completed_steps),
             repair_cycles_used=self.repair_cycles_used,
+            repair_component_usage=self.repair_component_usage,
+            repair_convergence=self.repair_convergence,
             prose_run_id=source.source_run_id if source is not None else None,
             prose_run_revision=(
                 source.source_run_revision if source is not None else None
@@ -1981,6 +2015,7 @@ class _RestoredPipeline:
     state: ChapterGenerationResult | None
     review_count: int
     last_repair_kept_digest: bool
+    repair_policy_replay: _RepairPolicyReplay
 
 
 def _blocked_resume(
@@ -2431,6 +2466,9 @@ def _resume_trace(
     resume: ChapterCandidatePipelineResume,
     *,
     repair_limit: int,
+    repair_budget_limits: RepairBudgetLimitsV1,
+    tail_judge_retry_usage: int,
+    tail_repair_attempt_ids: tuple[str, ...],
     chapter_id: str,
     chapter: Mapping[str, Any],
 ) -> _RestoredPipeline:
@@ -2817,22 +2855,77 @@ def _resume_trace(
     phase = replay.phase
     repair_cycles_used = replay.repair_cycles_used
     review_count = replay.review_count
+    repair_gate: Literal["outline_adherence", "state"] = (
+        "state" if phase is _ResumePhase.STATE else "outline_adherence"
+    )
+    try:
+        repair_policy_replay = _replay_repair_policy(
+            tuple(checkpoints),
+            limits=repair_budget_limits,
+            attempts=tuple(restored.attempts),
+            tail_judge_retry_usage=tail_judge_retry_usage,
+        )
+    except _RepairPolicyReplayBudgetExhausted as replay_exhausted:
+        raise _repair_budget_blocked(
+            replay_exhausted.exhausted,
+            trace=restored,
+            policy=replay_exhausted.policy,
+            gate=repair_gate,
+        ) from replay_exhausted
+    _sync_repair_policy(restored, repair_policy_replay.policy)
     if replay.completed_steps != progress.completed_steps:
         raise _blocked_resume(restored, "候选管线恢复步骤与检查点不一致")
     restored_attempt_ids = tuple(
         item.attempt_id for item in restored.attempts
     )
     trailing_attempts = restored.attempts[len(replay.attempt_ids):]
-    if (
-        restored_attempt_ids[:len(replay.attempt_ids)]
-        != replay.attempt_ids
-        or len(trailing_attempts) > 1
-    ):
+    trailing_attempt_ids = tuple(
+        item.attempt_id for item in trailing_attempts
+    )
+    if restored_attempt_ids[:len(replay.attempt_ids)] != replay.attempt_ids:
+        raise _blocked_resume(restored, "候选管线恢复调用与检查点不一致")
+    if tail_repair_attempt_ids:
+        if trailing_attempt_ids != tail_repair_attempt_ids:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复修复调用组与持久账本不一致",
+            )
+        observed_tail_judge_retries = sum(
+            1
+            for attempt in trailing_attempts
+            if (
+                attempt.phase in _JUDGE_OR_SCHEMA_RETRY_PHASES
+                and attempt.state in _CHARGED_ATTEMPT_STATES
+            )
+        )
+        if observed_tail_judge_retries != tail_judge_retry_usage:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复修复调用组重试用量不一致",
+            )
+    elif tail_judge_retry_usage or len(trailing_attempts) > 1:
         raise _blocked_resume(restored, "候选管线恢复调用与检查点不一致")
     if (
         trailing_attempts
-        and trailing_attempts[0].state is not CandidateAttemptState.UNCERTAIN
+        and any(
+            attempt.state is not CandidateAttemptState.UNCERTAIN
+            for attempt in trailing_attempts
+        )
     ):
+        judge_component = RepairComponent.ADHERENCE_JUDGE_RETRY
+        judge_used = repair_policy_replay.policy.used(judge_component)
+        judge_limit = repair_budget_limits.limit_for(judge_component)
+        if tail_judge_retry_usage and judge_used >= judge_limit:
+            raise _repair_budget_blocked(
+                RepairBudgetExhausted(
+                    component=judge_component,
+                    used=judge_used,
+                    limit=judge_limit,
+                ),
+                trace=restored,
+                policy=repair_policy_replay.policy,
+                gate=repair_gate,
+            )
         raise _blocked_resume(
             restored,
             "已结算候选调用缺少可恢复结果投影",
@@ -2955,6 +3048,7 @@ def _resume_trace(
         state=resume.state,
         review_count=review_count,
         last_repair_kept_digest=last_repair_kept_digest,
+        repair_policy_replay=repair_policy_replay,
     )
 
 
@@ -3026,17 +3120,426 @@ def _validate_resumed_state_prerequisite(
         ) from exc
 
 
-def _strict_repair_limit(value: Any) -> int:
+_SCENE_REPAIR_CATEGORIES = frozenset({
+    OutlineIssueCategory.SCENE_COVERAGE.value,
+    OutlineIssueCategory.SCENE_ORDER.value,
+})
+
+
+def _hard_repair_issues(
+    adherence: Mapping[str, Any],
+) -> tuple[RepairIssueV1, ...]:
+    if adherence.get("evidence_schema_version") != (
+        OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    ):
+        return ()
+    raw_issues = adherence.get("local_issues")
+    if not isinstance(raw_issues, list):
+        raise ChapterCandidatePipelineBlocked(
+            "章纲符合度稳定问题集合无效"
+        )
+    issues: list[RepairIssueV1] = []
+    for item in raw_issues:
+        if not isinstance(item, Mapping):
+            raise ChapterCandidatePipelineBlocked(
+                "章纲符合度稳定问题集合无效"
+            )
+        severity = item.get("severity")
+        if severity not in {"blocker", "major"}:
+            continue
+        try:
+            issues.append(RepairIssueV1(
+                issue_signature=item.get("issue_signature"),
+                severity=severity,
+            ))
+        except ValueError as exc:
+            raise ChapterCandidatePipelineBlocked(
+                "章纲符合度稳定问题身份无效"
+            ) from exc
+    return tuple(issues)
+
+
+def _checkpoint_hard_repair_issues(
+    checkpoint: AdherenceCandidateCheckpointV4,
+) -> tuple[RepairIssueV1, ...]:
+    return tuple(
+        RepairIssueV1(
+            issue_signature=item.issue_signature,
+            severity=item.severity,
+        )
+        for item in checkpoint.validated_evidence.local_issues
+        if item.severity in {"blocker", "major"}
+    )
+
+
+def _content_repair_component(
+    adherence: Mapping[str, Any] | AdherenceCandidateCheckpoint | None,
+) -> RepairComponent:
+    if adherence is None:
+        return RepairComponent.SCENE_REGENERATION
+    if isinstance(adherence, AdherenceCandidateCheckpointV4):
+        categories = set(adherence.issue_categories)
+        missing_scene = any(
+            item.status != "covered" for item in adherence.scene_coverage
+        )
+        legacy_unclassified_failure = False
+    elif isinstance(
+        adherence,
+        (AdherenceCandidateCheckpointV1, AdherenceCandidateCheckpointV3),
+    ):
+        categories = set(adherence.issue_categories)
+        missing_scene = any(
+            item.status != "covered" for item in adherence.scene_coverage
+        )
+        legacy_unclassified_failure = bool(
+            adherence.verdict != "pass" and not categories
+        )
+    else:
+        raw_issues = adherence.get(
+            "local_issues"
+            if adherence.get("evidence_schema_version")
+            == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            else "issues"
+        )
+        categories = {
+            str(item.get("category") or "")
+            for item in (raw_issues if isinstance(raw_issues, list) else [])
+            if isinstance(item, Mapping)
+            and item.get("severity") not in {"quality_debt", "info", "unknown"}
+        }
+        raw_coverage = adherence.get("scene_coverage")
+        missing_scene = any(
+            isinstance(item, Mapping) and item.get("status") != "covered"
+            for item in (
+                raw_coverage if isinstance(raw_coverage, list) else []
+            )
+        )
+        legacy_unclassified_failure = bool(
+            adherence.get("evidence_schema_version")
+            != OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            and adherence.get("verdict") != "pass"
+            and not categories
+        )
+    if (
+        missing_scene
+        or legacy_unclassified_failure
+        or categories.intersection(_SCENE_REPAIR_CATEGORIES)
+    ):
+        return RepairComponent.SCENE_REGENERATION
+    return RepairComponent.LOCAL_PROSE_REPAIR
+
+
+@dataclass(frozen=True)
+class _RepairPolicyReplay:
+    policy: ChapterRepairPolicy
+    pending_convergence_charge: RepairChargeV1 | None
+
+
+@dataclass(frozen=True)
+class ChapterRepairEvidenceReplay:
+    """Durable metadata projection reconstructed from checkpoints and attempts."""
+
+    component_usage: tuple[RepairComponentUsageV1, ...]
+    convergence: tuple[RepairConvergenceEvidenceV1, ...]
+
+
+class _RepairPolicyReplayBudgetExhausted(ValueError):
+    def __init__(
+        self,
+        exhausted: RepairBudgetExhausted,
+        policy: ChapterRepairPolicy,
+    ) -> None:
+        super().__init__(str(exhausted))
+        self.exhausted = exhausted
+        self.policy = policy
+
+
+def _judge_or_schema_retry_count(
+    attempt_ids: tuple[str, ...],
+    attempts_by_id: Mapping[str, CandidateAttemptSummary],
+) -> int:
+    return sum(
+        1
+        for attempt_id in attempt_ids
+        if (
+            (attempt := attempts_by_id.get(attempt_id)) is not None
+            and attempt.phase in _JUDGE_OR_SCHEMA_RETRY_PHASES
+            and attempt.state in _CHARGED_ATTEMPT_STATES
+        )
+    )
+
+
+def _replay_judge_or_schema_retries(
+    policy: ChapterRepairPolicy,
+    checkpoint: CandidatePipelineCheckpointV1,
+    attempts_by_id: Mapping[str, CandidateAttemptSummary],
+) -> None:
+    for _index in range(_judge_or_schema_retry_count(
+        checkpoint.attempt_ids,
+        attempts_by_id,
+    )):
+        policy.authorize(RepairComponent.ADHERENCE_JUDGE_RETRY)
+
+
+def _replay_repair_policy(
+    checkpoints: list[CandidatePipelineCheckpointV1]
+    | tuple[CandidatePipelineCheckpointV1, ...],
+    *,
+    limits: RepairBudgetLimitsV1,
+    attempts: tuple[CandidateAttemptSummary, ...] = (),
+    tail_judge_retry_usage: int = 0,
+) -> _RepairPolicyReplay:
+    if (
+        type(tail_judge_retry_usage) is not int
+        or tail_judge_retry_usage < 0
+        or tail_judge_retry_usage > _MAX_PIPELINE_ATTEMPTS
+    ):
+        raise ValueError("tail Judge/schema retry usage is invalid")
+    policy = ChapterRepairPolicy(limits)
+    attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
+    phase: Literal["start", "prose", "adherence", "state"] = "start"
+    latest_adherence: AdherenceCandidateCheckpoint | None = None
+    pending: RepairChargeV1 | None = None
+    try:
+        for checkpoint in checkpoints:
+            if isinstance(checkpoint, ProseCandidateCheckpointV1):
+                if checkpoint.origin == "repair":
+                    component = _content_repair_component(
+                        latest_adherence if phase == "adherence" else None
+                    )
+                    charge = policy.authorize(component)
+                    pending = (
+                        charge
+                        if phase == "adherence"
+                        and isinstance(
+                            latest_adherence,
+                            AdherenceCandidateCheckpointV4,
+                        )
+                        else None
+                    )
+                    _replay_judge_or_schema_retries(
+                        policy,
+                        checkpoint,
+                        attempts_by_id,
+                    )
+                phase = "prose"
+                continue
+            if isinstance(
+                checkpoint,
+                (
+                    AdherenceCandidateCheckpointV1,
+                    AdherenceCandidateCheckpointV3,
+                    AdherenceCandidateCheckpointV4,
+                ),
+            ):
+                if checkpoint.cycle > 0:
+                    _replay_judge_or_schema_retries(
+                        policy,
+                        checkpoint,
+                        attempts_by_id,
+                    )
+                if isinstance(checkpoint, AdherenceCandidateCheckpointV4):
+                    issues = _checkpoint_hard_repair_issues(checkpoint)
+                    if policy.observation_count == 0:
+                        policy.observe_adherence(
+                            issues,
+                            prose_run_revision=(
+                                checkpoint.source.source_run_revision
+                            ),
+                            content_digest=(
+                                checkpoint.source.source_content_digest
+                            ),
+                        )
+                    elif pending is not None:
+                        policy.observe_adherence(
+                            issues,
+                            prose_run_revision=(
+                                checkpoint.source.source_run_revision
+                            ),
+                            content_digest=(
+                                checkpoint.source.source_content_digest
+                            ),
+                            charge=pending,
+                        )
+                    pending = None
+                latest_adherence = checkpoint
+                phase = "adherence"
+                continue
+            if checkpoint.origin == "repair":
+                policy.authorize(RepairComponent.STATE_REEXTRACTION)
+                _replay_judge_or_schema_retries(
+                    policy,
+                    checkpoint,
+                    attempts_by_id,
+                )
+            phase = "state"
+        for _index in range(tail_judge_retry_usage):
+            policy.authorize(RepairComponent.ADHERENCE_JUDGE_RETRY)
+    except RepairBudgetExhausted as exc:
+        raise _RepairPolicyReplayBudgetExhausted(exc, policy) from exc
+    return _RepairPolicyReplay(
+        policy=policy,
+        pending_convergence_charge=pending,
+    )
+
+
+def replay_chapter_repair_evidence(
+    checkpoints: list[CandidatePipelineCheckpointV1]
+    | tuple[CandidatePipelineCheckpointV1, ...],
+    *,
+    limits: RepairBudgetLimitsV1,
+    attempts: tuple[CandidateAttemptSummary, ...] = (),
+    tail_judge_retry_usage: int = 0,
+) -> ChapterRepairEvidenceReplay:
+    """Rebuild persisted component usage and convergence without prose content."""
+
+    try:
+        replay = _replay_repair_policy(
+            checkpoints,
+            limits=limits,
+            attempts=attempts,
+            tail_judge_retry_usage=tail_judge_retry_usage,
+        )
+    except _RepairPolicyReplayBudgetExhausted as exc:
+        raise exc.exhausted from exc
+    return ChapterRepairEvidenceReplay(
+        component_usage=replay.policy.component_usage,
+        convergence=replay.policy.transitions,
+    )
+
+
+def _sync_repair_policy(
+    trace: _PipelineTrace,
+    policy: ChapterRepairPolicy,
+) -> None:
+    trace.repair_component_usage = policy.component_usage
+    trace.repair_convergence = policy.transitions
+
+
+def _repair_budget_blocked(
+    exhausted: RepairBudgetExhausted,
+    *,
+    trace: _PipelineTrace,
+    policy: ChapterRepairPolicy,
+    gate: Literal["completion", "outline_adherence", "state"],
+    consistency_issue_count: int | None = None,
+    dropped_reference_count: int | None = None,
+    affected_card_ids: tuple[str, ...] = (),
+) -> ChapterCandidatePipelineBlocked:
+    _sync_repair_policy(trace, policy)
+    return ChapterCandidatePipelineBlocked(
+        "候选仍未通过闸门，对应组件的授权修复额度已耗尽",
+        code="repair_budget_exhausted",
+        progress=trace.snapshot(),
+        gate=gate,
+        repair_component=exhausted.component,
+        component_used=exhausted.used,
+        component_limit=exhausted.limit,
+        next_step=exhausted.next_step,
+        consistency_issue_count=consistency_issue_count,
+        dropped_reference_count=dropped_reference_count,
+        affected_card_ids=affected_card_ids,
+    )
+
+
+def _authorize_repair_component(
+    policy: ChapterRepairPolicy,
+    component: RepairComponent,
+    *,
+    trace: _PipelineTrace,
+    gate: Literal["completion", "outline_adherence", "state"],
+    consistency_issue_count: int | None = None,
+    dropped_reference_count: int | None = None,
+    affected_card_ids: tuple[str, ...] = (),
+) -> RepairChargeV1:
+    try:
+        return policy.authorize(component)
+    except RepairBudgetExhausted as exc:
+        raise _repair_budget_blocked(
+            exc,
+            trace=trace,
+            policy=policy,
+            gate=gate,
+            consistency_issue_count=consistency_issue_count,
+            dropped_reference_count=dropped_reference_count,
+            affected_card_ids=affected_card_ids,
+        ) from exc
+
+
+def _charge_judge_or_schema_retries(
+    policy: ChapterRepairPolicy,
+    evidence: _RecordedStepEvidence,
+    *,
+    trace: _PipelineTrace,
+    gate: Literal["completion", "outline_adherence", "state"],
+    consistency_issue_count: int | None = None,
+    dropped_reference_count: int | None = None,
+    affected_card_ids: tuple[str, ...] = (),
+) -> None:
+    attempts_by_id = {
+        attempt.attempt_id: attempt
+        for attempt in trace.attempts
+    }
+    for _index in range(_judge_or_schema_retry_count(
+        evidence.attempt_ids,
+        attempts_by_id,
+    )):
+        _authorize_repair_component(
+            policy,
+            RepairComponent.ADHERENCE_JUDGE_RETRY,
+            trace=trace,
+            gate=gate,
+            consistency_issue_count=consistency_issue_count,
+            dropped_reference_count=dropped_reference_count,
+            affected_card_ids=affected_card_ids,
+        )
+    _sync_repair_policy(trace, policy)
+
+
+def _strict_repair_limits(
+    value: Any,
+    supplied: RepairBudgetLimitsV1 | Mapping[str, Any] | None,
+) -> tuple[RepairBudgetLimitsV1, int]:
     if (
         type(value) is not int
         or value < 0
-        or value > MAX_FINALIZATION_REPAIR_CYCLES
+        or value > MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS
     ):
         raise ValueError(
             "max_repair_cycles must be an integer between 0 and "
-            f"{MAX_FINALIZATION_REPAIR_CYCLES}"
+            f"{MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS}"
         )
-    return value
+    limits = (
+        default_repair_budget_limits(value)
+        if supplied is None
+        else RepairBudgetLimitsV1.model_validate(
+            supplied.model_dump(mode="python")
+            if isinstance(supplied, RepairBudgetLimitsV1)
+            else supplied
+        )
+    )
+    for component in (
+        RepairComponent.STATE_REEXTRACTION,
+        RepairComponent.LOCAL_PROSE_REPAIR,
+        RepairComponent.SCENE_REGENERATION,
+        RepairComponent.OUTLINE_ROLLBACK,
+    ):
+        if limits.limit_for(component) > value:
+            raise ValueError(
+                "repair component limit exceeds max_repair_cycles"
+            )
+    event_limit = sum(
+        limits.limit_for(component)
+        for component in (
+            RepairComponent.STATE_REEXTRACTION,
+            RepairComponent.LOCAL_PROSE_REPAIR,
+            RepairComponent.SCENE_REGENERATION,
+            RepairComponent.OUTLINE_ROLLBACK,
+        )
+    )
+    if event_limit > MAX_FINALIZATION_REPAIR_CYCLES:
+        raise ValueError("repair event limit exceeds finalization authority")
+    return limits, event_limit
 
 
 def _outline_scene_indexes(chapter: Mapping[str, Any]) -> tuple[int, ...]:
@@ -3481,12 +3984,12 @@ class ChapterCandidatePipeline:
         source: ProseCandidateSource,
         request: ProseCandidateRepairRequest,
         trace: _PipelineTrace,
+        repair_policy: ChapterRepairPolicy,
         checkpoint_ledger: list[CandidatePipelineCheckpointV1],
     ) -> tuple[ProseCandidateSource, bool]:
         repair = self._deps.repair_prose_candidate
         if repair is None:
             raise ChapterCandidatePipelineBlocked("正文候选没有授权修复入口")
-        trace.repair_cycles_used = request.cycle
         if not isinstance(owner_id, str) or not owner_id:
             raise ChapterCandidatePipelineBlocked(
                 "自动修复缺少 owner-scoped 身份"
@@ -3513,6 +4016,13 @@ class ChapterCandidatePipeline:
             cycle=request.cycle,
             origin="repair",
         ), ledger=checkpoint_ledger)
+        trace.repair_cycles_used = request.cycle
+        _charge_judge_or_schema_retries(
+            repair_policy,
+            evidence,
+            trace=trace,
+            gate=request.trigger,
+        )
         if not _prose_repair_advanced_revision(source, repaired_source):
             raise ChapterCandidatePipelineBlocked(
                 "正文修复没有产生新候选",
@@ -3531,9 +4041,32 @@ class ChapterCandidatePipeline:
         novel_id: str,
         chapter: dict[str, Any],
         max_repair_cycles: int = 0,
+        repair_budget_limits: (
+            RepairBudgetLimitsV1 | Mapping[str, Any] | None
+        ) = None,
+        tail_judge_retry_usage: int = 0,
+        tail_repair_attempt_ids: tuple[str, ...] = (),
         resume: ChapterCandidatePipelineResume | None = None,
     ) -> ChapterCandidatePipelineResult:
-        repair_limit = _strict_repair_limit(max_repair_cycles)
+        component_limits, repair_limit = _strict_repair_limits(
+            max_repair_cycles,
+            repair_budget_limits,
+        )
+        if (
+            not isinstance(tail_repair_attempt_ids, tuple)
+            or len(tail_repair_attempt_ids) > _MAX_PIPELINE_ATTEMPTS
+            or len(tail_repair_attempt_ids)
+            != len(set(tail_repair_attempt_ids))
+            or any(
+                not isinstance(attempt_id, str) or not attempt_id
+                for attempt_id in tail_repair_attempt_ids
+            )
+            or (
+                resume is None
+                and (tail_judge_retry_usage or tail_repair_attempt_ids)
+            )
+        ):
+            raise ValueError("tail repair attempt group is invalid")
         trace = _PipelineTrace()
         restored: _RestoredPipeline | None = None
         checkpoint_ledger: list[CandidatePipelineCheckpointV1] = []
@@ -3542,6 +4075,9 @@ class ChapterCandidatePipeline:
                 restored = _resume_trace(
                     resume,
                     repair_limit=repair_limit,
+                    repair_budget_limits=component_limits,
+                    tail_judge_retry_usage=tail_judge_retry_usage,
+                    tail_repair_attempt_ids=tail_repair_attempt_ids,
                     chapter_id=str(chapter.get("_id") or ""),
                     chapter=chapter,
                 )
@@ -3550,11 +4086,49 @@ class ChapterCandidatePipeline:
                     parse_candidate_pipeline_checkpoint(checkpoint)
                     for checkpoint in resume.checkpoints
                 ]
+            if restored is not None:
+                policy_replay = restored.repair_policy_replay
+            else:
+                try:
+                    policy_replay = _replay_repair_policy(
+                        checkpoint_ledger,
+                        limits=component_limits,
+                        attempts=tuple(trace.attempts),
+                        tail_judge_retry_usage=tail_judge_retry_usage,
+                    )
+                except _RepairPolicyReplayBudgetExhausted as replay_exhausted:
+                    raise _repair_budget_blocked(
+                        replay_exhausted.exhausted,
+                        trace=trace,
+                        policy=replay_exhausted.policy,
+                        gate="outline_adherence",
+                    ) from replay_exhausted
+            repair_policy = policy_replay.policy
+            _sync_repair_policy(trace, repair_policy)
+            if (
+                repair_policy.transitions
+                and repair_policy.transitions[-1].decision == "not_converged"
+            ):
+                latest = repair_policy.transitions[-1]
+                raise ChapterCandidatePipelineBlocked(
+                    "修复后的稳定问题集合没有收敛",
+                    code="repair_not_converged",
+                    progress=trace.snapshot(),
+                    gate="outline_adherence",
+                    repair_component=latest.component,
+                    component_used=latest.component_attempt,
+                    component_limit=latest.charge.authorized_limit,
+                    next_step=repair_next_step(latest.component),
+                )
             return await self._run(
                 novel_id=novel_id,
                 owner_id=owner_id,
                 chapter=chapter,
                 repair_limit=repair_limit,
+                repair_policy=repair_policy,
+                pending_convergence_charge=(
+                    policy_replay.pending_convergence_charge
+                ),
                 trace=trace,
                 resume=restored,
                 checkpoint_ledger=checkpoint_ledger,
@@ -3582,6 +4156,8 @@ class ChapterCandidatePipeline:
         novel_id: str,
         chapter: dict[str, Any],
         repair_limit: int,
+        repair_policy: ChapterRepairPolicy,
+        pending_convergence_charge: RepairChargeV1 | None,
         trace: _PipelineTrace,
         resume: _RestoredPipeline | None,
         checkpoint_ledger: list[CandidatePipelineCheckpointV1],
@@ -3635,6 +4211,12 @@ class ChapterCandidatePipeline:
                     raise ChapterCandidatePipelineBlocked(
                         "正文候选未通过完成闸门"
                     )
+                _authorize_repair_component(
+                    repair_policy,
+                    RepairComponent.SCENE_REGENERATION,
+                    trace=trace,
+                    gate="completion",
+                )
                 cycle = _next_repair_cycle(
                     trace.repair_cycles_used,
                     repair_limit,
@@ -3652,9 +4234,11 @@ class ChapterCandidatePipeline:
                             chapter=chapter,
                         ),
                         trace=trace,
+                        repair_policy=repair_policy,
                         checkpoint_ledger=checkpoint_ledger,
                     )
                 )
+                _sync_repair_policy(trace, repair_policy)
                 continue
 
             if pending_review is None:
@@ -3698,6 +4282,54 @@ class ChapterCandidatePipeline:
                     cycle=trace.repair_cycles_used,
                     adherence=adherence,
                 ), ledger=checkpoint_ledger)
+                if trace.repair_cycles_used > 0:
+                    _charge_judge_or_schema_retries(
+                        repair_policy,
+                        review_evidence,
+                        trace=trace,
+                        gate="outline_adherence",
+                    )
+                if adherence.get("evidence_schema_version") == (
+                    OUTLINE_ADHERENCE_EVIDENCE_VERSION
+                ):
+                    repair_issues = _hard_repair_issues(adherence)
+                    if repair_policy.observation_count == 0:
+                        convergence = repair_policy.observe_adherence(
+                            repair_issues,
+                            prose_run_revision=source.source_run_revision,
+                            content_digest=source.source_content_digest,
+                        )
+                    elif pending_convergence_charge is not None:
+                        convergence = repair_policy.observe_adherence(
+                            repair_issues,
+                            prose_run_revision=source.source_run_revision,
+                            content_digest=source.source_content_digest,
+                            charge=pending_convergence_charge,
+                        )
+                    else:
+                        raise ChapterCandidatePipelineBlocked(
+                            "章纲符合度复检缺少对应的内容修复授权"
+                        )
+                    pending_convergence_charge = None
+                    _sync_repair_policy(trace, repair_policy)
+                    if (
+                        convergence is not None
+                        and convergence.decision == "not_converged"
+                    ):
+                        raise ChapterCandidatePipelineBlocked(
+                            "修复后的稳定问题集合没有收敛",
+                            code="repair_not_converged",
+                            progress=trace.snapshot(),
+                            gate="outline_adherence",
+                            repair_component=convergence.component,
+                            component_used=convergence.component_attempt,
+                            component_limit=(
+                                convergence.charge.authorized_limit
+                            ),
+                            next_step=repair_next_step(
+                                convergence.component
+                            ),
+                        )
             if adherence.get("decision") == "manual_review":
                 raise ChapterCandidatePipelineBlocked(
                     "章纲符合度存在无法自动裁决的语义 unknown，必须转人工",
@@ -3711,13 +4343,23 @@ class ChapterCandidatePipeline:
                     prose=source.text,
                 )
             except ChapterCandidatePipelineBlocked as gate_error:
-                if last_repair_kept_digest:
+                uses_stable_issue_policy = adherence.get(
+                    "evidence_schema_version"
+                ) == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+                if last_repair_kept_digest and not uses_stable_issue_policy:
                     raise ChapterCandidatePipelineBlocked(
                         "正文摘要未变化且章纲复检仍未通过",
                         code="repair_no_progress",
                     ) from gate_error
                 if self._deps.repair_prose_candidate is None:
                     raise
+                component = _content_repair_component(adherence)
+                charge = _authorize_repair_component(
+                    repair_policy,
+                    component,
+                    trace=trace,
+                    gate="outline_adherence",
+                )
                 cycle = _next_repair_cycle(
                     trace.repair_cycles_used,
                     repair_limit,
@@ -3736,9 +4378,14 @@ class ChapterCandidatePipeline:
                             chapter=chapter,
                         ),
                         trace=trace,
+                        repair_policy=repair_policy,
                         checkpoint_ledger=checkpoint_ledger,
                     )
                 )
+                pending_convergence_charge = (
+                    charge if uses_stable_issue_policy else None
+                )
+                _sync_repair_policy(trace, repair_policy)
                 continue
             break
 
@@ -3831,16 +4478,27 @@ class ChapterCandidatePipeline:
                 raise ChapterCandidatePipelineBlocked(
                     message
                 )
+            state_issue_card_ids = _state_issue_card_ids(
+                consistency_issues,
+                declared_card_ids=_declared_character_card_ids(chapter),
+            )
+            state_dropped_count = _dropped_reference_count(dropped)
+            _authorize_repair_component(
+                repair_policy,
+                RepairComponent.STATE_REEXTRACTION,
+                trace=trace,
+                gate="state",
+                consistency_issue_count=len(consistency_issues),
+                dropped_reference_count=state_dropped_count,
+                affected_card_ids=state_issue_card_ids,
+            )
             cycle = _next_repair_cycle(
                 trace.repair_cycles_used,
                 repair_limit,
                 gate="state",
                 consistency_issue_count=len(consistency_issues),
-                dropped_reference_count=_dropped_reference_count(dropped),
-                affected_card_ids=_state_issue_card_ids(
-                    consistency_issues,
-                    declared_card_ids=_declared_character_card_ids(chapter),
-                ),
+                dropped_reference_count=state_dropped_count,
+                affected_card_ids=state_issue_card_ids,
             )
             request = _state_repair_request(
                 cycle=cycle,
@@ -3851,7 +4509,6 @@ class ChapterCandidatePipeline:
                 dropped=dropped,
                 fact_accounting=fact_accounting,
             )
-            trace.repair_cycles_used = cycle
             if not isinstance(owner_id, str) or not owner_id:
                 raise ChapterCandidatePipelineBlocked(
                     "自动修复缺少 owner-scoped 身份"
@@ -3897,10 +4554,35 @@ class ChapterCandidatePipeline:
                 ),
                 fact_accounting=next_fact_accounting,
             ), ledger=checkpoint_ledger)
+            trace.repair_cycles_used = cycle
+            _charge_judge_or_schema_retries(
+                repair_policy,
+                state_evidence,
+                trace=trace,
+                gate="state",
+                consistency_issue_count=len(_next_issues),
+                dropped_reference_count=_dropped_reference_count(
+                    state_result.dropped
+                ),
+                affected_card_ids=state_issue_card_ids,
+            )
+            _sync_repair_policy(trace, repair_policy)
             if next_proposal_id == proposal_id:
                 raise ChapterCandidatePipelineBlocked(
                     "状态修复没有产生新候选",
-                    code="repair_no_progress",
+                    code="repair_not_converged",
+                    progress=trace.snapshot(),
+                    gate="state",
+                    repair_component=RepairComponent.STATE_REEXTRACTION,
+                    component_used=repair_policy.used(
+                        RepairComponent.STATE_REEXTRACTION
+                    ),
+                    component_limit=repair_policy.limits.limit_for(
+                        RepairComponent.STATE_REEXTRACTION
+                    ),
+                    next_step=repair_next_step(
+                        RepairComponent.STATE_REEXTRACTION
+                    ),
                 )
             trace.state_proposal_id = next_proposal_id
 
@@ -3944,5 +4626,7 @@ class ChapterCandidatePipeline:
             prose_content_digest=source.source_content_digest,
             state_proposal_id=proposal_id,
             repair_cycles_used=trace.repair_cycles_used,
+            repair_component_usage=progress.repair_component_usage,
+            repair_convergence=progress.repair_convergence,
             finalization=finalization,
         )
