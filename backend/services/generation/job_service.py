@@ -1809,9 +1809,10 @@ class GenerationJobService:
                     generation_params=generation_params,
                     attempt_scope_factory=attempt_scope_factory,
                 )
-                cycles, adherence_plan, state_plan = (
+                repair_authorization, adherence_plan, state_plan = (
                     repairs.execution_snapshot(chapter_id=chapter_id)
                 )
+                cycles = repair_authorization.max_repair_cycles_per_chapter
                 work = readiness.get("work")
                 raw_chapters = (
                     work.get("chapters")
@@ -1853,7 +1854,7 @@ class GenerationJobService:
                         "candidate repair and initial Provider plans diverged"
                     )
                 return CandidateJobExecution(
-                    max_repair_cycles=cycles,
+                    repair_authorization=repair_authorization,
                     outline_plan=(
                         generation_plan_from_candidate_snapshot(
                             execution_authorization.outline

@@ -31,6 +31,12 @@ from backend.services.agent_runtime.contracts import (
 from backend.services.generation.chapter_finalization import (
     MAX_FINALIZATION_REPAIR_CYCLES,
 )
+from backend.services.generation.candidate_repair_contracts import (
+    MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS,
+)
+from backend.services.generation.chapter_repair_policy import (
+    RepairBudgetLimitsV1,
+)
 from backend.services.generation.provider_budget import (
     ProviderBudgetBound,
     max_provider_bounds,
@@ -48,9 +54,9 @@ from backend.services.llm.generation_runtime import (
 
 
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_repair_authorization.v3"
+    "chapter_candidate_repair_authorization.v4"
 )
-CANDIDATE_PIPELINE_REVISION = 19
+CANDIDATE_PIPELINE_REVISION = 20
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v1"
@@ -390,17 +396,24 @@ class CandidateProviderBudgetBound(_ClosedAuthorizationModel):
 
 
 class CandidateRepairAuthorization(_ClosedAuthorizationModel):
-    schema_version: Literal["chapter_candidate_repair_authorization.v3"]
+    schema_version: Literal["chapter_candidate_repair_authorization.v4"]
     authorization_revision: _PositiveInt
     eligible_chapter_count: _NonNegativeInt
     eligible_chapter_ids_digest: _Sha256
     max_repair_cycles_per_chapter: Annotated[
         StrictInt,
+        Field(ge=0, le=MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS),
+    ]
+    maximum_repair_events_per_chapter: Annotated[
+        StrictInt,
         Field(ge=0, le=MAX_FINALIZATION_REPAIR_CYCLES),
     ]
+    component_limits: RepairBudgetLimitsV1
     maximum_provider_attempts_per_cycle: _NonNegativeInt
+    maximum_provider_attempts_per_chapter: _NonNegativeInt
     maximum_provider_attempts_total: _NonNegativeInt
     maximum_tokens_per_cycle: _NonNegativeInt
+    maximum_tokens_per_chapter: _NonNegativeInt
     maximum_tokens_total: _NonNegativeInt
     provider_bounds: tuple[CandidateProviderBudgetBound, ...]
     prose_remediation: ProseRemediationAuthorization | None
@@ -419,11 +432,16 @@ class CandidateRepairAuthorization(_ClosedAuthorizationModel):
             self.state_repair,
         )
         if inactive:
+            if self.component_limits != _zero_component_limits():
+                raise ValueError("inactive candidate component limits are not empty")
             if any(item is not None for item in adapters) or any(
                 (
+                    self.maximum_repair_events_per_chapter,
                     self.maximum_provider_attempts_per_cycle,
+                    self.maximum_provider_attempts_per_chapter,
                     self.maximum_provider_attempts_total,
                     self.maximum_tokens_per_cycle,
+                    self.maximum_tokens_per_chapter,
                     self.maximum_tokens_total,
                 )
             ) or self.provider_bounds:
@@ -434,30 +452,53 @@ class CandidateRepairAuthorization(_ClosedAuthorizationModel):
         assert self.prose_remediation is not None
         assert self.adherence_review is not None
         assert self.state_repair is not None
-        cycle_bounds = _candidate_cycle_bounds(
+        component_limits = _candidate_component_limits(
+            self.max_repair_cycles_per_chapter,
             self.prose_remediation,
             self.adherence_review,
             self.state_repair,
         )
-        multiplier = (
-            self.eligible_chapter_count * self.max_repair_cycles_per_chapter
+        if self.component_limits != component_limits:
+            raise ValueError("candidate repair component limits changed")
+        expected_events = _candidate_repair_event_count(component_limits)
+        if self.maximum_repair_events_per_chapter != expected_events:
+            raise ValueError("candidate repair event bound changed")
+        cycle_bounds, chapter_bounds = _candidate_authorized_bounds(
+            self.prose_remediation,
+            self.adherence_review,
+            self.state_repair,
+            component_limits,
         )
         if (
             self.maximum_provider_attempts_per_cycle
             != cycle_bounds.paid_attempts
+            or self.maximum_provider_attempts_per_chapter
+            != chapter_bounds.paid_attempts
             or self.maximum_provider_attempts_total
-            != multiplier * cycle_bounds.paid_attempts
+            != self.eligible_chapter_count * chapter_bounds.paid_attempts
             or self.maximum_tokens_per_cycle != cycle_bounds.tokens
-            or self.maximum_tokens_total != multiplier * cycle_bounds.tokens
+            or self.maximum_tokens_per_chapter != chapter_bounds.tokens
+            or self.maximum_tokens_total
+            != self.eligible_chapter_count * chapter_bounds.tokens
         ):
             raise ValueError("candidate repair aggregate bounds changed")
+        chapter_provider_bounds = {
+            bound.provider_alias: bound
+            for bound in chapter_bounds.provider_bounds
+        }
         expected_provider_bounds = tuple(
             CandidateProviderBudgetBound(
                 provider_alias=bound.provider_alias,
                 maximum_paid_attempts_per_cycle=bound.paid_attempts,
-                maximum_paid_attempts_total=bound.paid_attempts * multiplier,
+                maximum_paid_attempts_total=(
+                    chapter_provider_bounds[bound.provider_alias].paid_attempts
+                    * self.eligible_chapter_count
+                ),
                 maximum_tokens_per_cycle=bound.tokens,
-                maximum_tokens_total=bound.tokens * multiplier,
+                maximum_tokens_total=(
+                    chapter_provider_bounds[bound.provider_alias].tokens
+                    * self.eligible_chapter_count
+                ),
             )
             for bound in cycle_bounds.provider_bounds
         )
@@ -531,11 +572,11 @@ def _prose_descriptor_totals(
     )
 
 
-def _candidate_cycle_bounds(
+def _candidate_branch_bounds(
     prose_remediation: ProseRemediationAuthorization,
     adherence_review: CandidateStructuredGenerationPlan,
     state_repair: CandidateStructuredGenerationPlan,
-) -> _BudgetBounds:
+) -> tuple[_BudgetBounds, _BudgetBounds]:
     prose = _prose_remediation_bounds(prose_remediation)
     adherence_provider = _projection_provider_bounds(adherence_review)
     state_provider = _projection_provider_bounds(state_repair)
@@ -557,6 +598,19 @@ def _candidate_cycle_bounds(
         tokens=state_repair.max_tokens_per_call,
         provider_bounds=state_provider,
     )
+    return prose_branch, state_branch
+
+
+def _candidate_cycle_bounds(
+    prose_remediation: ProseRemediationAuthorization,
+    adherence_review: CandidateStructuredGenerationPlan,
+    state_repair: CandidateStructuredGenerationPlan,
+) -> _BudgetBounds:
+    prose_branch, state_branch = _candidate_branch_bounds(
+        prose_remediation,
+        adherence_review,
+        state_repair,
+    )
     return _BudgetBounds(
         paid_attempts=max(
             prose_branch.paid_attempts,
@@ -568,6 +622,94 @@ def _candidate_cycle_bounds(
             state_branch.provider_bounds,
         ),
     )
+
+
+def _zero_component_limits() -> RepairBudgetLimitsV1:
+    return RepairBudgetLimitsV1(
+        provider_technical_retry=0,
+        adherence_judge_retry=0,
+        state_reextraction=0,
+        local_prose_repair=0,
+        scene_regeneration=0,
+        outline_rollback=0,
+    )
+
+
+def _candidate_component_limits(
+    max_component_repairs: int,
+    prose_remediation: ProseRemediationAuthorization,
+    adherence_review: CandidateStructuredGenerationPlan,
+    state_repair: CandidateStructuredGenerationPlan,
+) -> RepairBudgetLimitsV1:
+    prose = _prose_remediation_bounds(prose_remediation)
+    prose_logical_calls = (
+        PROSE_REMEDIATION_MAX_PLANNER_CALLS
+        + PROSE_REMEDIATION_MAX_TOOL_CALLS
+    )
+    prose_schema_retries = prose.paid_attempts - prose_logical_calls
+    adherence_schema_retries = adherence_review.max_paid_attempts_per_call - 1
+    state_schema_retries = state_repair.max_paid_attempts_per_call - 1
+    content_events = max_component_repairs * 2
+    return RepairBudgetLimitsV1(
+        # Candidate runtimes are constructed with max_provider_retries=0.
+        provider_technical_retry=0,
+        adherence_judge_retry=(
+            content_events
+            * (prose_schema_retries + adherence_schema_retries)
+            + max_component_repairs * state_schema_retries
+        ),
+        state_reextraction=max_component_repairs,
+        local_prose_repair=max_component_repairs,
+        scene_regeneration=max_component_repairs,
+        outline_rollback=0,
+    )
+
+
+def _candidate_repair_event_count(limits: RepairBudgetLimitsV1) -> int:
+    return (
+        limits.state_reextraction
+        + limits.local_prose_repair
+        + limits.scene_regeneration
+        + limits.outline_rollback
+    )
+
+
+def _candidate_authorized_bounds(
+    prose_remediation: ProseRemediationAuthorization,
+    adherence_review: CandidateStructuredGenerationPlan,
+    state_repair: CandidateStructuredGenerationPlan,
+    limits: RepairBudgetLimitsV1,
+) -> tuple[_BudgetBounds, _BudgetBounds]:
+    prose_branch, state_branch = _candidate_branch_bounds(
+        prose_remediation,
+        adherence_review,
+        state_repair,
+    )
+    cycle_bounds = _candidate_cycle_bounds(
+        prose_remediation,
+        adherence_review,
+        state_repair,
+    )
+    content_events = limits.local_prose_repair + limits.scene_regeneration
+    chapter_provider_bounds = merge_provider_bounds(
+        scale_provider_bounds(prose_branch.provider_bounds, content_events),
+        scale_provider_bounds(
+            state_branch.provider_bounds,
+            limits.state_reextraction,
+        ),
+    )
+    chapter_bounds = _BudgetBounds(
+        paid_attempts=(
+            prose_branch.paid_attempts * content_events
+            + state_branch.paid_attempts * limits.state_reextraction
+        ),
+        tokens=(
+            prose_branch.tokens * content_events
+            + state_branch.tokens * limits.state_reextraction
+        ),
+        provider_bounds=chapter_provider_bounds,
+    )
+    return cycle_bounds, chapter_bounds
 
 
 def _validate_remediation_generation_plans(
@@ -1178,7 +1320,7 @@ def build_chapter_candidate_repair_authorization(
         max_repair_cycles,
         field="candidate repair cycle bound",
     )
-    if cycles > MAX_FINALIZATION_REPAIR_CYCLES:
+    if cycles > MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS:
         raise ValueError("candidate repair cycle bound exceeds V1")
     eligible_ids = _eligible_chapter_ids(chapters)
     base = {
@@ -1191,9 +1333,13 @@ def build_chapter_candidate_repair_authorization(
     if not eligible_ids or cycles == 0:
         return CandidateRepairAuthorization.model_validate({
             **base,
+            "maximum_repair_events_per_chapter": 0,
+            "component_limits": _zero_component_limits(),
             "maximum_provider_attempts_per_cycle": 0,
+            "maximum_provider_attempts_per_chapter": 0,
             "maximum_provider_attempts_total": 0,
             "maximum_tokens_per_cycle": 0,
+            "maximum_tokens_per_chapter": 0,
             "maximum_tokens_total": 0,
             "provider_bounds": [],
             "prose_remediation": None,
@@ -1335,29 +1481,53 @@ def build_chapter_candidate_repair_authorization(
     # A prose repair is not trusted on the Agent's own review alone. The
     # deterministic candidate pipeline always performs one fresh, exact-source
     # adherence review before it may advance to state extraction.
-    cycle_bounds = _candidate_cycle_bounds(
+    component_limits = _candidate_component_limits(
+        cycles,
         prose_authorization,
         adherence_projection,
         state_projection,
     )
-    multiplier = len(eligible_ids) * cycles
+    cycle_bounds, chapter_bounds = _candidate_authorized_bounds(
+        prose_authorization,
+        adherence_projection,
+        state_projection,
+        component_limits,
+    )
+    chapter_provider_bounds = {
+        bound.provider_alias: bound
+        for bound in chapter_bounds.provider_bounds
+    }
     return CandidateRepairAuthorization.model_validate({
         **base,
+        "maximum_repair_events_per_chapter": (
+            _candidate_repair_event_count(component_limits)
+        ),
+        "component_limits": component_limits,
         "maximum_provider_attempts_per_cycle": cycle_bounds.paid_attempts,
+        "maximum_provider_attempts_per_chapter": (
+            chapter_bounds.paid_attempts
+        ),
         "maximum_provider_attempts_total": (
-            multiplier * cycle_bounds.paid_attempts
+            len(eligible_ids) * chapter_bounds.paid_attempts
         ),
         "maximum_tokens_per_cycle": cycle_bounds.tokens,
-        "maximum_tokens_total": multiplier * cycle_bounds.tokens,
+        "maximum_tokens_per_chapter": chapter_bounds.tokens,
+        "maximum_tokens_total": len(eligible_ids) * chapter_bounds.tokens,
         "provider_bounds": [
             {
                 "provider_alias": bound.provider_alias,
                 "maximum_paid_attempts_per_cycle": bound.paid_attempts,
                 "maximum_paid_attempts_total": (
-                    multiplier * bound.paid_attempts
+                    len(eligible_ids)
+                    * chapter_provider_bounds[
+                        bound.provider_alias
+                    ].paid_attempts
                 ),
                 "maximum_tokens_per_cycle": bound.tokens,
-                "maximum_tokens_total": multiplier * bound.tokens,
+                "maximum_tokens_total": (
+                    len(eligible_ids)
+                    * chapter_provider_bounds[bound.provider_alias].tokens
+                ),
             }
             for bound in cycle_bounds.provider_bounds
         ],
@@ -1415,7 +1585,9 @@ def authorized_candidate_repair_attempt_slots(
 
     expected_finalization = build_chapter_finalization_authorization(
         authorization_revision=authorization.authorization_revision,
-        max_repair_cycles=authorization.max_repair_cycles_per_chapter,
+        max_repair_cycles=(
+            authorization.maximum_repair_events_per_chapter
+        ),
     )
     raw_finalization = planning.get("chapter_finalization_authorization")
     finalization_matches = False
@@ -1477,11 +1649,9 @@ def authorized_candidate_repair_attempt_slots(
         != _chapter_ids_digest(tuple(eligible_ids))
     ):
         raise ValueError("candidate repair worklist digest changed")
-    cycles = authorization.max_repair_cycles_per_chapter
-    per_cycle = authorization.maximum_provider_attempts_per_cycle
     if snapshots[normalized_chapter_id].get("has_content") is True:
         return 0
-    return cycles * per_cycle
+    return authorization.maximum_provider_attempts_per_chapter
 
 
 def validate_candidate_repair_execution_authorization(

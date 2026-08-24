@@ -1091,8 +1091,21 @@ class GenerationReadinessModule:
             token_budget=token_budget,
             authorization_revision=authorization_revision,
         )
+        raw_candidate_repair_authorization = planning.get(
+            "chapter_candidate_repair_authorization"
+        )
+        finalization_repair_events = None
+        if isinstance(raw_candidate_repair_authorization, Mapping):
+            finalization_repair_events = parse_candidate_repair_authorization(
+                raw_candidate_repair_authorization
+            ).maximum_repair_events_per_chapter
         finalization_authorization = build_chapter_finalization_authorization(
             authorization_revision=authorization_revision,
+            **(
+                {"max_repair_cycles": finalization_repair_events}
+                if finalization_repair_events is not None
+                else {}
+            ),
         )
         planning = {
             **planning,

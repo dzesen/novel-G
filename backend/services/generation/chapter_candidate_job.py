@@ -14,7 +14,11 @@ from typing import Any
 
 from bson import ObjectId
 
+from backend.services.generation.attempt_ledger_contracts import (
+    EVIDENCE_ATTEMPT_STATES,
+)
 from backend.services.generation.candidate_repair_contracts import (
+    MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
     AdherenceCandidateCheckpoint,
     AdherenceCandidateCheckpointV3,
     AdherenceCandidateCheckpointV4,
@@ -27,6 +31,7 @@ from backend.services.generation.candidate_repair_contracts import (
     replay_candidate_pipeline_checkpoints,
 )
 from backend.services.generation.chapter_candidate_authorization import (
+    CandidateRepairAuthorization,
     parse_candidate_repair_authorization,
     readiness_chapter_uses_candidate_pipeline,
 )
@@ -45,11 +50,16 @@ from backend.services.generation.chapter_candidate_pipeline import (
     ProseCandidateRepairRequest,
     StateCandidateRepairReceipt,
     StateCandidateRepairRequest,
+    replay_chapter_repair_evidence,
 )
 from backend.services.generation.chapter_generation_application import (
     ChapterGenerationResult,
     ChapterGenerationStage,
     ProseCandidateSource,
+)
+from backend.services.generation.chapter_repair_policy import (
+    RepairBudgetExhausted,
+    RepairComponent,
 )
 from backend.services.generation.headless_generation import GeneratedProseCandidate
 from backend.services.generation.chapter_finalization import (
@@ -60,6 +70,12 @@ from backend.services.generation.job_engine import CandidateChapterOutcome
 
 
 _MAX_TOKEN_COUNT = 1_000_000_000
+_JUDGE_RETRY_PHASES = frozenset({"schema_fallback", "repair", "reviewer"})
+_REPAIR_ATTEMPT_STEP_PREFIXES = (
+    "candidate-prose-repair:",
+    "candidate-outline-adherence-repair:",
+    "candidate-state-repair:",
+)
 
 
 class _FinalizationDependencyError(RuntimeError):
@@ -103,11 +119,157 @@ class _NarrativeFencedAttemptScope:
         return await self._delegate.claim(provider_alias, phase)
 
 
+@dataclass
+class _JudgeRetryBudget:
+    limit: int
+    used: int = 0
+
+    def reserve(self, phase: str) -> None:
+        if phase not in _JUDGE_RETRY_PHASES:
+            return
+        if self.used >= self.limit:
+            raise RepairBudgetExhausted(
+                component=RepairComponent.ADHERENCE_JUDGE_RETRY,
+                used=self.used,
+                limit=self.limit,
+            )
+        self.used += 1
+
+
+def _judge_retry_budget_blocked(
+    exhausted: RepairBudgetExhausted,
+) -> ChapterCandidatePipelineBlocked:
+    return ChapterCandidatePipelineBlocked(
+        "候选 Judge/schema 重试额度已在派发前耗尽",
+        code="repair_budget_exhausted",
+        gate="outline_adherence",
+        repair_component=exhausted.component,
+        component_used=exhausted.used,
+        component_limit=exhausted.limit,
+        next_step=exhausted.next_step,
+    )
+
+
+class _JudgeRetryBudgetedAttemptScope:
+    """Release a claimed slot before dispatch when the component is exhausted."""
+
+    def __init__(self, delegate: Any, budget: _JudgeRetryBudget) -> None:
+        self._delegate = delegate
+        self._budget = budget
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def _authorize(self, attempt_id: str, phase: str) -> str:
+        try:
+            self._budget.reserve(phase)
+        except RepairBudgetExhausted as exc:
+            release = getattr(self._delegate, "release_pre_dispatch", None)
+            if not callable(release):
+                raise ChapterCandidatePipelineBlocked(
+                    "Judge/schema 重试预算耗尽但缺少预派发释放入口"
+                ) from exc
+            await release(
+                attempt_id,
+                "candidate judge/schema retry budget exhausted",
+            )
+            raise _judge_retry_budget_blocked(exc) from exc
+        return attempt_id
+
+    async def claim(self, provider_alias: str, phase: str) -> str:
+        attempt_id = await self._delegate.claim(provider_alias, phase)
+        return await self._authorize(attempt_id, phase)
+
+    async def claim_with_budget(
+        self,
+        provider_alias: str,
+        phase: str,
+        conservative_tokens: int | None,
+    ) -> str:
+        claim = getattr(self._delegate, "claim_with_budget", None)
+        attempt_id = (
+            await claim(provider_alias, phase, conservative_tokens)
+            if callable(claim)
+            else await self._delegate.claim(provider_alias, phase)
+        )
+        return await self._authorize(attempt_id, phase)
+
+
+@dataclass(frozen=True)
+class _PersistedJudgeRetryUsage:
+    checkpointed: int
+    tail: int
+    tail_attempt_ids: tuple[str, ...]
+
+    @property
+    def total(self) -> int:
+        return self.checkpointed + self.tail
+
+
+def _repair_attempt_step_identity(value: object) -> str | None:
+    step_id = str(value or "")
+    for prefix in _REPAIR_ATTEMPT_STEP_PREFIXES:
+        if not step_id.startswith(prefix):
+            continue
+        raw_cycle = step_id[len(prefix):]
+        if (
+            raw_cycle
+            and len(raw_cycle)
+            <= len(str(MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES))
+            and all(character in "0123456789" for character in raw_cycle)
+            and 1 <= int(raw_cycle) <= MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
+        ):
+            return step_id
+    return None
+
+
+def _persisted_judge_retry_usage(
+    checkpoints: tuple[CandidatePipelineCheckpointV1, ...],
+    slots: Sequence[Mapping[str, Any]],
+) -> _PersistedJudgeRetryUsage:
+    repair_checkpoint_attempt_ids = {
+        attempt_id
+        for checkpoint in checkpoints
+        if checkpoint.cycle > 0
+        for attempt_id in checkpoint.attempt_ids
+    }
+    checkpointed = 0
+    tail = 0
+    tail_attempt_ids: list[str] = []
+    tail_step_ids: set[str] = set()
+    for slot in slots:
+        if str(slot.get("state") or "") not in EVIDENCE_ATTEMPT_STATES:
+            continue
+        attempt_id = str(slot.get("attempt_id") or "")
+        phase = str(slot.get("phase") or "")
+        if attempt_id in repair_checkpoint_attempt_ids:
+            if phase in _JUDGE_RETRY_PHASES:
+                checkpointed += 1
+            continue
+        repair_step_id = _repair_attempt_step_identity(slot.get("step_id"))
+        if repair_step_id is None:
+            continue
+        tail_attempt_ids.append(attempt_id)
+        tail_step_ids.add(repair_step_id)
+        if phase in _JUDGE_RETRY_PHASES:
+            tail += 1
+    if len(tail_step_ids) > 1:
+        raise ChapterCandidatePipelineBlocked(
+            "候选作业未投影调用跨越多个修复 step/cycle",
+            code="candidate_result_projection_missing",
+        )
+    return _PersistedJudgeRetryUsage(
+        checkpointed=checkpointed,
+        tail=tail,
+        tail_attempt_ids=tuple(tail_attempt_ids),
+    )
+
+
 @dataclass(frozen=True)
 class CandidateJobExecution:
     """Frozen live adapters that have already matched the Job readiness."""
 
-    max_repair_cycles: int
+    repair_authorization: CandidateRepairAuthorization
     outline_plan: Any | None
     prose_plan: Any
     adherence_plan: Any
@@ -608,7 +770,9 @@ class ChapterCandidateJobRunner:
             )
 
     @staticmethod
-    def _repair_cycle_limit(readiness: Mapping[str, Any]) -> int:
+    def _repair_authorization(
+        readiness: Mapping[str, Any],
+    ) -> CandidateRepairAuthorization:
         planning = readiness.get("planning")
         raw = (
             planning.get("chapter_candidate_repair_authorization")
@@ -620,9 +784,7 @@ class ChapterCandidateJobRunner:
                 "候选作业修复授权无效"
             )
         try:
-            return parse_candidate_repair_authorization(
-                raw
-            ).max_repair_cycles_per_chapter
+            return parse_candidate_repair_authorization(raw)
         except ValueError as exc:
             raise ChapterCandidatePipelineBlocked(
                 "候选作业修复授权无效"
@@ -686,7 +848,10 @@ class ChapterCandidateJobRunner:
             if attempt_id in checkpoint_ids:
                 continue
             state = str(slot.get("state") or "")
-            if state in {"released_pre_dispatch", "uncertain_retry_acknowledged"}:
+            if state == "released_pre_dispatch" or (
+                state == "uncertain_retry_acknowledged"
+                and _repair_attempt_step_identity(slot.get("step_id")) is None
+            ):
                 continue
             if str(slot.get("step_id") or "").startswith("candidate-"):
                 summaries.append(_attempt_summary(slot))
@@ -720,7 +885,10 @@ class ChapterCandidateJobRunner:
             checkpoints,
             chapter_id=chapter_id,
             expected_scene_count=len(scenes),
-            max_repair_cycles=execution.max_repair_cycles,
+            max_repair_cycles=(
+                execution.repair_authorization.
+                maximum_repair_events_per_chapter
+            ),
         )
         source_identity = replay.current_prose.source
         source = await execution.recover_source(
@@ -789,6 +957,8 @@ class ChapterCandidateJobRunner:
         terminal: Any,
         order_index: int,
         tokens: int,
+        repair_component_usage: tuple[Any, ...],
+        repair_convergence: tuple[Any, ...],
         expected_narrative_revision: int,
         next_narrative_revision: int,
     ) -> CandidateChapterOutcome:
@@ -820,6 +990,8 @@ class ChapterCandidateJobRunner:
                 consistency_issue_count=(
                     state_checkpoint.consistency_issue_count
                 ),
+                repair_component_usage=repair_component_usage,
+                repair_convergence=repair_convergence,
             ),
             checkpoints=checkpoints,
             expected_narrative_revision=expected_narrative_revision,
@@ -875,7 +1047,14 @@ class ChapterCandidateJobRunner:
             if str(slot.get("attempt_id") or "")
             not in discarded_attempt_ids
         ]
-        max_repair_cycles = self._repair_cycle_limit(self._readiness)
+        repair_authorization = self._repair_authorization(self._readiness)
+        max_repair_events = (
+            repair_authorization.maximum_repair_events_per_chapter
+        )
+        persisted_judge_retry_usage = _persisted_judge_retry_usage(
+            checkpoints,
+            replay_slots,
+        )
         expected_revision = scope.expected_narrative_revision
         outline = current.get("outline")
         scenes = outline.get("scenes") if isinstance(outline, Mapping) else None
@@ -885,7 +1064,7 @@ class ChapterCandidateJobRunner:
                 checkpoints,
                 chapter_id=chapter_id,
                 expected_scene_count=len(scenes),
-                max_repair_cycles=max_repair_cycles,
+                max_repair_cycles=max_repair_events,
             )
             state_checkpoint = prefix.latest_state
             if (
@@ -916,30 +1095,72 @@ class ChapterCandidateJobRunner:
                         checkpoints,
                         chapter_id=chapter_id,
                         expected_scene_count=len(scenes),
-                        max_repair_cycles=max_repair_cycles,
+                        max_repair_cycles=max_repair_events,
                         require_terminal=True,
                     )
-                    _summaries, tokens = self._summaries_for_replay(
+                    summaries, tokens = self._summaries_for_replay(
                         terminal,
                         replay_slots,
+                    )
+                    repair_evidence = replay_chapter_repair_evidence(
+                        checkpoints,
+                        limits=repair_authorization.component_limits,
+                        attempts=summaries,
+                        tail_judge_retry_usage=(
+                            persisted_judge_retry_usage.tail
+                        ),
                     )
                     return self._terminal_outcome(
                         checkpoints=checkpoints,
                         terminal=terminal,
                         order_index=scope.order_index,
                         tokens=tokens,
+                        repair_component_usage=(
+                            repair_evidence.component_usage
+                        ),
+                        repair_convergence=repair_evidence.convergence,
                         expected_narrative_revision=expected_revision,
                         next_narrative_revision=finalization_revision,
                     )
 
-        def fenced_scope(step: str) -> _NarrativeFencedAttemptScope:
-            return _NarrativeFencedAttemptScope(
+        judge_retry_limit = (
+            repair_authorization.component_limits.adherence_judge_retry
+        )
+        judge_retry_used = persisted_judge_retry_usage.total
+        if judge_retry_used > judge_retry_limit:
+            raise _judge_retry_budget_blocked(RepairBudgetExhausted(
+                component=RepairComponent.ADHERENCE_JUDGE_RETRY,
+                used=judge_retry_used,
+                limit=judge_retry_limit,
+            ))
+        judge_retry_budget = _JudgeRetryBudget(
+            limit=judge_retry_limit,
+            used=judge_retry_used,
+        )
+        active_content_repair_cycle = max(
+            (
+                checkpoint.cycle
+                for checkpoint in checkpoints
+                if isinstance(checkpoint, ProseCandidateCheckpointV1)
+                and checkpoint.origin == "repair"
+            ),
+            default=0,
+        )
+
+        def fenced_scope(step: str) -> Any:
+            scope_adapter: Any = _NarrativeFencedAttemptScope(
                 self._scope(chapter_id, step, replay_slots),
                 lambda: self._ensure_narrative_revision(
                     scope,
                     expected_revision,
                 ),
             )
+            if step.startswith(_REPAIR_ATTEMPT_STEP_PREFIXES):
+                return _JudgeRetryBudgetedAttemptScope(
+                    scope_adapter,
+                    judge_retry_budget,
+                )
+            return scope_adapter
 
         execution = self._deps.build_execution(
             chapter_id=chapter_id,
@@ -947,7 +1168,7 @@ class ChapterCandidateJobRunner:
         )
         if (
             not isinstance(execution, CandidateJobExecution)
-            or execution.max_repair_cycles != max_repair_cycles
+            or execution.repair_authorization != repair_authorization
         ):
             raise ChapterCandidatePipelineBlocked("候选作业冻结执行计划无效")
 
@@ -1125,13 +1346,19 @@ class ChapterCandidateJobRunner:
             source: ProseCandidateSource,
         ) -> ChapterGenerationResult:
             await self._ensure_narrative_revision(scope, expected_revision)
+            attempt_step = (
+                "candidate-outline-adherence"
+                if active_content_repair_cycle == 0
+                else (
+                    "candidate-outline-adherence-repair:"
+                    f"{active_content_repair_cycle}"
+                )
+            )
             return await self._deps.review_prose_candidate(
                 target_novel,
                 target_chapter,
                 source,
-                attempt_scope=fenced_scope(
-                    "candidate-outline-adherence"
-                ),
+                attempt_scope=fenced_scope(attempt_step),
                 generation_params=self._generation_params,
                 generation_plan=execution.adherence_plan,
             )
@@ -1156,7 +1383,21 @@ class ChapterCandidateJobRunner:
         repair_prose = execution.repair_prose_candidate
         if repair_prose is not None:
             async def guarded_repair_prose(*args: Any, **kwargs: Any) -> Any:
+                nonlocal active_content_repair_cycle
                 await self._ensure_narrative_revision(scope, expected_revision)
+                request = next(
+                    (
+                        value
+                        for value in (*args, *kwargs.values())
+                        if isinstance(value, ProseCandidateRepairRequest)
+                    ),
+                    None,
+                )
+                if request is None:
+                    raise ChapterCandidatePipelineBlocked(
+                        "正文修复缺少类型化轮次身份"
+                    )
+                active_content_repair_cycle = request.cycle
                 return await repair_prose(*args, **kwargs)
         else:
             guarded_repair_prose = None
@@ -1211,7 +1452,17 @@ class ChapterCandidateJobRunner:
             owner_id=owner_id,
             novel_id=novel_id,
             chapter=current,
-            max_repair_cycles=execution.max_repair_cycles,
+            max_repair_cycles=(
+                execution.repair_authorization.
+                max_repair_cycles_per_chapter
+            ),
+            repair_budget_limits=(
+                execution.repair_authorization.component_limits
+            ),
+            tail_judge_retry_usage=persisted_judge_retry_usage.tail,
+            tail_repair_attempt_ids=(
+                persisted_judge_retry_usage.tail_attempt_ids
+            ),
             resume=resume,
         )
         final_checkpoints = await self._load_checkpoints(chapter_id)
@@ -1222,7 +1473,10 @@ class ChapterCandidateJobRunner:
             final_checkpoints,
             chapter_id=chapter_id,
             expected_scene_count=len(scenes),
-            max_repair_cycles=execution.max_repair_cycles,
+            max_repair_cycles=(
+                execution.repair_authorization.
+                maximum_repair_events_per_chapter
+            ),
             require_terminal=True,
         )
         state_checkpoint = terminal.latest_state
@@ -1248,6 +1502,8 @@ class ChapterCandidateJobRunner:
             terminal=terminal,
             order_index=scope.order_index,
             tokens=result.tokens,
+            repair_component_usage=result.repair_component_usage,
+            repair_convergence=result.repair_convergence,
             expected_narrative_revision=expected_revision,
             next_narrative_revision=finalization_revision,
         )

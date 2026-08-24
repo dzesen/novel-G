@@ -29,6 +29,7 @@ from backend.services.generation.chapter_pipeline import IncompleteProseGenerati
 from backend.services.generation.chapter_candidate_pipeline import (
     ChapterCandidatePipelineBlocked,
 )
+from backend.services.generation.chapter_repair_policy import RepairComponent
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     UncertainProseAttempt,
@@ -72,6 +73,14 @@ _CANDIDATE_REPAIR_EXHAUSTED_CODES = {
     "outline_adherence": "candidate_adherence_repair_exhausted",
     "state": "candidate_state_repair_exhausted",
 }
+_COMPONENT_REPAIR_FAILURE_CODES = frozenset({
+    "repair_budget_exhausted",
+    "repair_not_converged",
+})
+_COMPONENT_REPAIR_PAUSE_REASONS = frozenset(
+    f"repair_budget_exhausted_{component.value}"
+    for component in RepairComponent
+)
 
 ACTIVE_FAILURE_PAUSE_REASONS = frozenset({
     "attempt_capacity",
@@ -80,9 +89,76 @@ ACTIVE_FAILURE_PAUSE_REASONS = frozenset({
     "outline_adherence_manual_review",
     "reference_card_auto_creation_recovery",
     "reference_card_repair_exhausted",
+    "repair_not_converged",
     "source_changed",
     "uncertain_attempt",
-})
+}) | _COMPONENT_REPAIR_PAUSE_REASONS
+
+
+def candidate_repair_budget_pause_reason(component: object) -> str | None:
+    """Return the closed pause reason for one exhausted component."""
+
+    try:
+        parsed = RepairComponent(component)
+    except (TypeError, ValueError):
+        return None
+    return f"repair_budget_exhausted_{parsed.value}"
+
+
+@dataclass(frozen=True)
+class CandidateRepairStopProjection:
+    """Closed content-free projection shared by diagnostics and Job pausing."""
+
+    pause_reason: str
+    reason_codes: tuple[str, ...]
+    repair_component: RepairComponent | None
+    component_used: int | None
+    component_limit: int | None
+    next_step: str | None
+
+
+def candidate_repair_stop_projection(
+    failure: object,
+) -> CandidateRepairStopProjection | None:
+    """Project one typed repair stop without duplicating reason switches."""
+
+    code = _safe_text(getattr(failure, "code", None), limit=100)
+    repair_component: RepairComponent | None = None
+    if code == "repair_budget_exhausted":
+        try:
+            repair_component = RepairComponent(
+                getattr(failure, "repair_component", None)
+            )
+        except (TypeError, ValueError):
+            return None
+        pause_reason = candidate_repair_budget_pause_reason(repair_component)
+        if pause_reason is None:
+            return None
+        reason_codes = (code, repair_component.value)
+    elif code == "repair_not_converged":
+        pause_reason = code
+        reason_codes = (code,)
+        try:
+            repair_component = RepairComponent(
+                getattr(failure, "repair_component", None)
+            )
+        except (TypeError, ValueError):
+            repair_component = None
+    else:
+        return None
+    next_step = _safe_text(getattr(failure, "next_step", None), limit=100)
+    return CandidateRepairStopProjection(
+        pause_reason=pause_reason,
+        reason_codes=reason_codes,
+        repair_component=repair_component,
+        component_used=_safe_non_negative_int(
+            getattr(failure, "component_used", None)
+        ),
+        component_limit=_safe_non_negative_int(
+            getattr(failure, "component_limit", None)
+        ),
+        next_step=next_step or None,
+    )
 
 
 class ActiveFailureEventState(str, Enum):
@@ -242,6 +318,25 @@ def _event_matches_pause_reason(
             and category == "validation_logic"
             and code == "candidate_adherence_manual_review"
         )
+    if pause_reason in _COMPONENT_REPAIR_PAUSE_REASONS:
+        component = pause_reason.removeprefix(
+            "repair_budget_exhausted_"
+        )
+        event_details = event.get("details")
+        return bool(
+            is_diagnostic
+            and category == "validation_logic"
+            and code == "repair_budget_exhausted"
+            and isinstance(event_details, Mapping)
+            and str(event_details.get("repair_component") or "")
+            == component
+        )
+    if pause_reason == "repair_not_converged":
+        return bool(
+            is_diagnostic
+            and category == "validation_logic"
+            and code == "repair_not_converged"
+        )
     if pause_reason in {"uncertain_attempt", "uncertain_skipped"}:
         return bool(
             (
@@ -334,7 +429,10 @@ def resolve_active_failure_event(
         ActiveFailureKind.SOURCE_CHANGED
         if pause_reason == "source_changed"
         else ActiveFailureKind.REPAIR_EXHAUSTED
-        if pause_reason == "reference_card_repair_exhausted"
+        if (
+            pause_reason == "reference_card_repair_exhausted"
+            or pause_reason in _COMPONENT_REPAIR_PAUSE_REASONS
+        )
         else ActiveFailureKind.ACTIVE
     )
     return ActiveFailureEventResolution(
@@ -396,7 +494,10 @@ def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
                 "formal_write_recovery_pending",
                 ["resume_generation_job"],
             )
-        if code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values():
+        if (
+            code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values()
+            or code in _COMPONENT_REPAIR_FAILURE_CODES
+        ):
             return (
                 "candidate_not_committed",
                 [
@@ -558,6 +659,16 @@ def _candidate_exception_details(
         details["repair_cycles_used"] = repair_cycles_used
     if repair_limit is not None:
         details["repair_cycles_limit"] = repair_limit
+    repair_stop = candidate_repair_stop_projection(failure)
+    if repair_stop is not None:
+        if repair_stop.repair_component is not None:
+            details["repair_component"] = repair_stop.repair_component.value
+        if repair_stop.component_used is not None:
+            details["component_used"] = repair_stop.component_used
+        if repair_stop.component_limit is not None:
+            details["component_limit"] = repair_stop.component_limit
+        if repair_stop.next_step is not None:
+            details["next_step"] = repair_stop.next_step
     for field in ("consistency_issue_count", "dropped_reference_count"):
         value = _safe_non_negative_int(getattr(failure, field, None))
         if value is not None:
@@ -649,6 +760,21 @@ def build_failure_diagnostic(
         )
         evidence = "confirmed"
         details.update(_safe_completion(completion))
+    elif any(
+        isinstance(item, ChapterCandidatePipelineBlocked)
+        and item.code in _COMPONENT_REPAIR_FAILURE_CODES
+        for item in chain
+    ):
+        failure = next(
+            item
+            for item in chain
+            if isinstance(item, ChapterCandidatePipelineBlocked)
+            and item.code in _COMPONENT_REPAIR_FAILURE_CODES
+        )
+        category = "validation_logic"
+        code = failure.code
+        evidence = "confirmed"
+        details.update(_candidate_exception_details(failure))
     elif any(
         isinstance(item, ChapterCandidatePipelineBlocked)
         and item.code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values()

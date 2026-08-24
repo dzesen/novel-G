@@ -37,6 +37,7 @@ from backend.services.generation.chapter_candidate_authorization import (
 )
 from backend.services.generation.failure_diagnostics import (
     build_failure_diagnostic,
+    candidate_repair_stop_projection,
     incomplete_prose_pre_dispatch_boundary_code,
 )
 from backend.services.generation.job_execution import JobExecutionLeaseLost
@@ -539,6 +540,10 @@ async def _handle_candidate_chapter_failure(
     preserve = isinstance(checkpoints, list) and bool(checkpoints)
     has_uncertain = bool(latest.get("has_uncertain_attempts"))
     candidate_code = str(getattr(exc, "code", "") or "")
+    repair_stop = candidate_repair_stop_projection(exc)
+    repair_pause_reason = (
+        repair_stop.pause_reason if repair_stop is not None else None
+    )
     authorization_scope_increased = (
         candidate_code == "authorization_scope_increased"
     )
@@ -558,6 +563,7 @@ async def _handle_candidate_chapter_failure(
                 source_changed
                 or authorization_scope_increased
                 or adherence_manual_review
+                or repair_pause_reason is not None
             )
             else "failed"
         ),
@@ -570,11 +576,18 @@ async def _handle_candidate_chapter_failure(
             if source_changed
             else "outline_adherence_manual_review"
             if adherence_manual_review
+            else repair_pause_reason
+            if repair_pause_reason is not None
             else None
         ),
         "current_chapter_id": (
             chapter_id
-            if preserve or authorization_scope_increased or adherence_manual_review
+            if (
+                preserve
+                or authorization_scope_increased
+                or adherence_manual_review
+                or repair_pause_reason is not None
+            )
             else None
         ),
         "active_slot": None,
@@ -585,6 +598,14 @@ async def _handle_candidate_chapter_failure(
             "attempts": attempts,
         },
     }
+    if repair_stop is not None:
+        fields["error"]["reason_codes"] = list(repair_stop.reason_codes)
+        if repair_stop.next_step is not None:
+            fields["error"]["next_step"] = repair_stop.next_step
+        if repair_stop.component_used is not None:
+            fields["error"]["component_used"] = repair_stop.component_used
+        if repair_stop.component_limit is not None:
+            fields["error"]["component_limit"] = repair_stop.component_limit
     if source_changed:
         fields["error"]["reason_codes"] = [
             "narrative_revision_changed",

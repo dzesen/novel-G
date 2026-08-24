@@ -493,7 +493,11 @@ class ChapterCandidateRepairApplication:
         self,
         *,
         chapter_id: str,
-    ) -> tuple[int, GenerationPlan, GenerationPlan]:
+    ) -> tuple[
+        CandidateRepairAuthorization,
+        GenerationPlan,
+        GenerationPlan,
+    ]:
         """Validate and expose the frozen plans used by the outer candidate tail."""
 
         planning = self._readiness.get("planning")
@@ -510,7 +514,7 @@ class ChapterCandidateRepairApplication:
         cycles = authorization.max_repair_cycles_per_chapter
         adherence_plan, state_plan = self._deps.plan_candidate_workflows()
         if cycles:
-            _authorization, _bundle, adherence_plan, state_plan = (
+            authorization, _bundle, adherence_plan, state_plan = (
                 self._authorized_snapshot(
                     chapter_id=chapter_id,
                     cycle=1,
@@ -522,7 +526,7 @@ class ChapterCandidateRepairApplication:
                 chapter_id=chapter_id,
                 generation_params=self._generation_params,
             )
-        return cycles, adherence_plan, state_plan
+        return authorization, adherence_plan, state_plan
 
     def _state_receipt_identity(
         self,
