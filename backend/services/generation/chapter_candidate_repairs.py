@@ -877,12 +877,34 @@ class ChapterCandidateRepairApplication:
                     limits=prose.limits,
                 ),
             )
-            view = await bundle.runtime.start(
-                owner_id=owner_id,
-                readiness_id=inspected.readiness_id,
-                digest=inspected.digest,
-                start_request_id=start_request_id,
-            )
+            try:
+                view = await bundle.runtime.start(
+                    owner_id=owner_id,
+                    readiness_id=inspected.readiness_id,
+                    digest=inspected.digest,
+                    start_request_id=start_request_id,
+                )
+            except Exception:
+                # A completed AgentRun can outlive a crash in its idempotent
+                # post-terminal candidate materializer.  Replaying that exact
+                # terminal run performs no new Provider dispatch.
+                recovered = await self._deps.find_agent_run(
+                    owner_id=owner_id,
+                    start_request_id=start_request_id,
+                )
+                recovered_run_id = str(
+                    (recovered or {}).get("_id") or ""
+                )
+                if (
+                    not recovered_run_id
+                    or str((recovered or {}).get("status") or "")
+                    != "completed"
+                ):
+                    raise
+                view = await bundle.runtime.resume(
+                    owner_id=owner_id,
+                    run_id=recovered_run_id,
+                )
         else:
             view = await bundle.runtime.resume(
                 owner_id=owner_id,
