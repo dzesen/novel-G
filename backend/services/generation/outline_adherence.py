@@ -11,10 +11,14 @@ from pydantic import ValidationError
 
 from backend.llm.schemas.scene_contract_pydantic import (
     ChapterOutlineAdherenceEvidenceSchema,
+    ChapterOutlineAdherenceEvidenceV3Schema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
+    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
 )
 from backend.scene_contract_versions import (
+    LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
     SCENE_TRANSITION_CONTRACT_VERSION,
     require_known_scene_contract_version,
 )
@@ -119,6 +123,486 @@ def _span_references(spans: list[Mapping[str, Any]]) -> str:
     return ",".join(f"{span['start']}:{span['end']}" for span in spans)
 
 
+def _issue_signature(
+    *,
+    source_kind: str,
+    category: str,
+    scene_id: str | None,
+    beat_ids: list[str],
+    variant: str = "",
+) -> str:
+    """Hash only stable semantic targets, never Provider wording or IDs."""
+
+    payload = {
+        "issue_policy_version": OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
+        "source_kind": source_kind,
+        "category": category,
+        "scene_id": scene_id,
+        "beat_ids": beat_ids,
+        "variant": variant,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _local_issue(
+    *,
+    severity: str,
+    category: str,
+    source_kind: str,
+    scene_id: str | None,
+    beat_ids: list[str],
+    source_evidence_ids: list[str],
+    contract_reference_ids: list[str] | None = None,
+    signature_beat_ids: list[str] | None = None,
+    variant: str = "",
+) -> dict[str, Any]:
+    return {
+        "issue_signature": _issue_signature(
+            source_kind=source_kind,
+            category=category,
+            scene_id=scene_id,
+            beat_ids=(
+                beat_ids if signature_beat_ids is None else signature_beat_ids
+            ),
+            variant=variant,
+        ),
+        "severity": severity,
+        "category": category,
+        "source_kind": source_kind,
+        "scene_id": scene_id,
+        "source_evidence_count": len(source_evidence_ids),
+        "contract_reference_ids": contract_reference_ids or [],
+    }
+
+
+def _canonical_provider_spans(
+    spans: list[Any],
+    *,
+    prose: str,
+    subject: str,
+) -> list[dict[str, Any]]:
+    canonical = [
+        _canonicalize_provider_span(span.model_dump(), prose=prose)
+        for span in spans
+    ]
+    if canonical != sorted(
+        canonical,
+        key=lambda value: (value["start"], value["end"]),
+    ):
+        raise OutlineAdherenceValidationError(
+            f"{subject} 正文证据 span 顺序无效"
+        )
+    return canonical
+
+
+def assess_outline_adherence_evidence(
+    result: Mapping[str, Any],
+    *,
+    outline: Mapping[str, Any],
+    prose: str,
+    source_prose_run_id: str,
+    source_prose_run_revision: int,
+    source_content_digest: str,
+) -> dict[str, Any]:
+    """Validate V3 Provider evidence and apply the fixed local issue policy."""
+
+    if outline.get("scene_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
+        raise OutlineAdherenceValidationError(
+            "legacy_v1 章纲不能生成 V3 符合度证据"
+        )
+    try:
+        parsed = ChapterOutlineAdherenceEvidenceV3Schema.model_validate(result)
+    except ValidationError as exc:
+        raise OutlineAdherenceValidationError("V3 符合度证据结构无效") from exc
+    if parsed.schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+        raise OutlineAdherenceValidationError("V3 符合度证据版本未知")
+    if parsed.outline_contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
+        raise OutlineAdherenceValidationError("V3 符合度证据没有绑定当前章纲合同版本")
+
+    run_id = str(source_prose_run_id or "").strip()
+    if not run_id:
+        raise OutlineAdherenceValidationError("V3 符合度证据缺少正文运行身份")
+    if (
+        type(source_prose_run_revision) is not int
+        or source_prose_run_revision < 0
+    ):
+        raise OutlineAdherenceValidationError("V3 符合度证据正文版本无效")
+    if source_content_digest != chapter_content_digest(prose):
+        raise OutlineAdherenceValidationError("V3 符合度证据正文摘要不匹配")
+
+    scenes = list(outline.get("scenes") or [])
+    expected = [
+        (str(scene.get("scene_id") or ""), str(beat.get("beat_id") or ""))
+        for scene in scenes
+        for beat in list(scene.get("beats") or [])
+    ]
+    actual = [(item.scene_id, item.beat_id) for item in parsed.beat_evidence]
+    if not expected or actual != expected:
+        raise OutlineAdherenceValidationError(
+            "V3 beat 证据身份或顺序没有精确覆盖当前章纲"
+        )
+
+    canonical_beats: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    for item in parsed.beat_evidence:
+        spans = _canonical_provider_spans(
+            item.spans,
+            prose=prose,
+            subject="beat",
+        )
+        status_counts[item.status] = status_counts.get(item.status, 0) + 1
+        canonical_beats.append(
+            {
+                "scene_id": item.scene_id,
+                "beat_id": item.beat_id,
+                "status": item.status,
+                "spans": spans,
+                "explanation": item.explanation,
+            }
+        )
+
+    known_scene_ids = {str(scene.get("scene_id") or "") for scene in scenes}
+    scene_by_id = {
+        str(scene.get("scene_id") or ""): scene for scene in scenes
+    }
+    known_beat_ids = {beat_id for _scene_id, beat_id in expected}
+    beat_scene_by_id = {beat_id: scene_id for scene_id, beat_id in expected}
+    beat_order = {
+        beat_id: index for index, (_scene_id, beat_id) in enumerate(expected)
+    }
+
+    def validate_targets(
+        *,
+        scene_id: str | None,
+        beat_ids: list[str],
+        subject: str,
+    ) -> None:
+        if scene_id is not None and scene_id not in known_scene_ids:
+            raise OutlineAdherenceValidationError(
+                f"{subject} 引用了未知 scene_id"
+            )
+        if any(beat_id not in known_beat_ids for beat_id in beat_ids):
+            raise OutlineAdherenceValidationError(
+                f"{subject} 引用了未知 beat_id"
+            )
+        if len(beat_ids) != len(set(beat_ids)):
+            raise OutlineAdherenceValidationError(
+                f"{subject} beat 引用不得重复"
+            )
+        if scene_id is not None and any(
+            beat_scene_by_id[beat_id] != scene_id for beat_id in beat_ids
+        ):
+            raise OutlineAdherenceValidationError(
+                f"{subject} beat 引用与 scene_id 不匹配"
+            )
+        if beat_ids != sorted(beat_ids, key=beat_order.__getitem__):
+            raise OutlineAdherenceValidationError(
+                f"{subject} beat 引用顺序无效"
+            )
+
+    canonical_findings: list[dict[str, Any]] = []
+    for finding in parsed.findings:
+        validate_targets(
+            scene_id=finding.scene_id,
+            beat_ids=list(finding.beat_ids),
+            subject="finding",
+        )
+        if finding.category == OutlineIssueCategory.FORBIDDEN_CONDITION.value:
+            scene = scene_by_id[finding.scene_id or ""]
+            known_condition_ids = {
+                str(item.get("condition_id") or "")
+                for item in list(scene.get("forbidden_conditions") or [])
+            }
+            if any(
+                condition_id not in known_condition_ids
+                for condition_id in finding.condition_ids
+            ):
+                raise OutlineAdherenceValidationError(
+                    "forbidden finding 没有引用当前场景的客观禁止条件"
+                )
+        if finding.category == OutlineIssueCategory.EVENT_REPETITION.value:
+            scene = scene_by_id[finding.scene_id or ""]
+            if (
+                finding.event_key != scene.get("event_key")
+                or scene.get("repetition_policy") != "forbid"
+            ):
+                raise OutlineAdherenceValidationError(
+                    "repetition finding 没有引用当前场景的客观重复合同"
+                )
+        canonical_findings.append(
+            {
+                **finding.model_dump(exclude={"spans"}),
+                "spans": _canonical_provider_spans(
+                    finding.spans,
+                    prose=prose,
+                    subject="finding",
+                ),
+            }
+        )
+
+    canonical_quality: list[dict[str, Any]] = []
+    for observation in parsed.quality_dimensions:
+        if (
+            observation.scene_id is not None
+            and observation.scene_id not in known_scene_ids
+        ):
+            raise OutlineAdherenceValidationError(
+                "quality dimension 引用了未知 scene_id"
+            )
+        canonical_quality.append(
+            {
+                **observation.model_dump(exclude={"spans"}),
+                "spans": _canonical_provider_spans(
+                    observation.spans,
+                    prose=prose,
+                    subject="quality dimension",
+                ),
+            }
+        )
+
+    canonical_unknowns: list[dict[str, Any]] = []
+    for unknown in parsed.unknowns:
+        validate_targets(
+            scene_id=unknown.scene_id,
+            beat_ids=list(unknown.beat_ids),
+            subject="unknown",
+        )
+        canonical_unknowns.append(
+            {
+                **unknown.model_dump(exclude={"spans"}),
+                "spans": _canonical_provider_spans(
+                    unknown.spans,
+                    prose=prose,
+                    subject="unknown",
+                ),
+            }
+        )
+
+    required_by_id = {
+        str(beat.get("beat_id") or ""): bool(beat.get("required", True))
+        for scene in scenes
+        for beat in list(scene.get("beats") or [])
+    }
+    local_issues: list[dict[str, Any]] = []
+    for scene in scenes:
+        scene_id = str(scene.get("scene_id") or "")
+        unknown_beats = [
+            item
+            for item in canonical_beats
+            if item["scene_id"] == scene_id
+            and item["status"] == "unknown"
+        ]
+        if unknown_beats:
+            local_issues.append(
+                _local_issue(
+                    severity="unknown",
+                    category=OutlineIssueCategory.SCENE_COVERAGE.value,
+                    source_kind="beat_evidence",
+                    scene_id=scene_id,
+                    beat_ids=[item["beat_id"] for item in unknown_beats],
+                    source_evidence_ids=[
+                        item["beat_id"] for item in unknown_beats
+                    ],
+                    signature_beat_ids=[],
+                    variant="semantic_unknown",
+                )
+            )
+        decidable_failures = [
+            item
+            for item in canonical_beats
+            if item["scene_id"] == scene_id
+            and item["status"] not in {"satisfied", "unknown"}
+        ]
+        if decidable_failures:
+            has_required_failure = any(
+                required_by_id[item["beat_id"]]
+                for item in decidable_failures
+            )
+            local_issues.append(
+                _local_issue(
+                    severity="major" if has_required_failure else "info",
+                    category=OutlineIssueCategory.SCENE_COVERAGE.value,
+                    source_kind="beat_evidence",
+                    scene_id=scene_id,
+                    beat_ids=[item["beat_id"] for item in decidable_failures],
+                    source_evidence_ids=[
+                        item["beat_id"] for item in decidable_failures
+                    ],
+                    signature_beat_ids=[],
+                    variant="required" if has_required_failure else "optional",
+                )
+            )
+
+    finding_groups: dict[
+        tuple[str, str | None, tuple[str, ...], tuple[str, ...]],
+        list[dict[str, Any]],
+    ] = {}
+    for finding in canonical_findings:
+        key = (
+            finding["category"],
+            finding["scene_id"],
+            tuple(finding["beat_ids"]),
+            tuple(
+                [*finding.get("condition_ids", [])]
+                + ([finding["event_key"]] if finding.get("event_key") else [])
+            ),
+        )
+        finding_groups.setdefault(key, []).append(finding)
+    for key in sorted(
+        finding_groups,
+        key=lambda item: (item[0], item[1] or "", item[2], item[3]),
+    ):
+        category, scene_id, grouped_beat_ids, contract_references = key
+        grouped = finding_groups[key]
+        severity = (
+            "unknown"
+            if any(item["status"] == "unknown" for item in grouped)
+            else "blocker"
+            if category
+            in {
+                OutlineIssueCategory.FORBIDDEN_CONDITION.value,
+                OutlineIssueCategory.EVENT_REPETITION.value,
+            }
+            else "major"
+        )
+        local_issues.append(
+            _local_issue(
+                severity=severity,
+                category=category,
+                source_kind="finding",
+                scene_id=scene_id,
+                beat_ids=list(grouped_beat_ids),
+                source_evidence_ids=sorted(
+                    item["finding_id"] for item in grouped
+                ),
+                contract_reference_ids=list(contract_references),
+                variant="|".join(contract_references),
+            )
+        )
+
+    quality_groups: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
+    for observation in canonical_quality:
+        key = (observation["dimension"], observation["scene_id"])
+        quality_groups.setdefault(key, []).append(observation)
+    for key in sorted(quality_groups, key=lambda item: (item[0], item[1] or "")):
+        dimension, scene_id = key
+        grouped = quality_groups[key]
+        local_issues.append(
+            _local_issue(
+                severity=(
+                    "quality_debt"
+                    if any(item["status"] == "concern" for item in grouped)
+                    else "info"
+                ),
+                category=dimension,
+                source_kind="quality_dimension",
+                scene_id=scene_id,
+                beat_ids=[],
+                source_evidence_ids=sorted(
+                    item["observation_id"] for item in grouped
+                ),
+            )
+        )
+
+    unknown_groups: dict[
+        tuple[str, str | None, tuple[str, ...]],
+        list[dict[str, Any]],
+    ] = {}
+    for unknown in canonical_unknowns:
+        key = (
+            unknown["category"],
+            unknown["scene_id"],
+            tuple(unknown["beat_ids"]),
+        )
+        unknown_groups.setdefault(key, []).append(unknown)
+    for key in sorted(
+        unknown_groups,
+        key=lambda item: (item[0], item[1] or "", item[2]),
+    ):
+        category, scene_id, grouped_beat_ids = key
+        grouped = unknown_groups[key]
+        local_issues.append(
+            _local_issue(
+                severity="unknown",
+                category=category,
+                source_kind="unknown",
+                scene_id=scene_id,
+                beat_ids=list(grouped_beat_ids),
+                source_evidence_ids=sorted(
+                    item["unknown_id"] for item in grouped
+                ),
+            )
+        )
+
+    issue_counts: dict[str, int] = {}
+    for issue in local_issues:
+        severity = issue["severity"]
+        issue_counts[severity] = issue_counts.get(severity, 0) + 1
+    decision = (
+        "manual_review"
+        if issue_counts.get("unknown", 0)
+        else "repair"
+        if issue_counts.get("blocker", 0) or issue_counts.get("major", 0)
+        else "pass"
+    )
+
+    coverage: list[dict[str, Any]] = []
+    for index, scene in enumerate(scenes, start=1):
+        scene_id = str(scene.get("scene_id") or "")
+        required_beats = [
+            item
+            for item in canonical_beats
+            if item["scene_id"] == scene_id
+            and required_by_id[item["beat_id"]]
+        ]
+        satisfied = sum(
+            item["status"] == "satisfied" for item in required_beats
+        )
+        status = (
+            "covered"
+            if not required_beats or satisfied == len(required_beats)
+            else "partial"
+            if satisfied
+            else "missing"
+        )
+        coverage.append({"scene_index": index, "status": status, "evidence": ""})
+
+    assessed = {
+        "evidence_schema_version": OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+        "issue_policy_version": OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
+        "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
+        "outline_contract_digest": _outline_contract_digest(outline),
+        "summary": parsed.summary,
+        "beat_evidence": canonical_beats,
+        "beat_status_counts": status_counts,
+        "findings": canonical_findings,
+        "quality_dimensions": canonical_quality,
+        "unknowns": canonical_unknowns,
+        "local_issues": local_issues,
+        "local_issue_counts": issue_counts,
+        "decision": decision,
+        "scene_coverage": coverage,
+        "source_prose_run_id": run_id,
+        "source_prose_run_revision": source_prose_run_revision,
+        "source_content_digest": source_content_digest,
+    }
+    try:
+        return ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+            assessed
+        ).model_dump(mode="python")
+    except ValidationError as exc:  # local construction must fail closed
+        raise OutlineAdherenceValidationError(
+            "V3 本地问题策略投影无效"
+        ) from exc
+
+
 def validate_beat_evidence(
     result: Mapping[str, Any],
     *,
@@ -138,7 +622,7 @@ def validate_beat_evidence(
         parsed = ChapterOutlineAdherenceEvidenceSchema.model_validate(result)
     except ValidationError as exc:
         raise OutlineAdherenceValidationError("beat 证据结构无效") from exc
-    if parsed.schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+    if parsed.schema_version != LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION:
         raise OutlineAdherenceValidationError("beat 证据版本未知")
     if parsed.outline_contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
         raise OutlineAdherenceValidationError("beat 证据没有绑定当前章纲合同版本")
@@ -332,7 +816,7 @@ def validate_beat_evidence(
         coverage.append({"scene_index": index, "status": status, "evidence": ""})
 
     return {
-        "evidence_schema_version": OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+        "evidence_schema_version": LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
         "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
         "outline_contract_digest": _outline_contract_digest(outline),
         "summary": parsed.summary,
@@ -382,6 +866,9 @@ def normalize_outline_adherence(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def is_material_deviation(result: dict[str, Any]) -> bool:
+    decision = result.get("decision")
+    if decision is not None:
+        return decision in {"repair", "manual_review"}
     return str(result.get("verdict") or "") == "fail"
 
 
@@ -390,8 +877,9 @@ def validate_complete_outline_adherence(
     *,
     outline: Mapping[str, Any],
     prose: str | None = None,
+    require_current_evidence: bool = False,
 ) -> dict[str, Any]:
-    """验证 exact-pass 闸门，并仅返回可持久化的元数据投影。"""
+    """Validate current local decisions and read legacy exact-pass reviews."""
 
     try:
         contract_version = require_known_scene_contract_version(outline)
@@ -400,16 +888,34 @@ def validate_complete_outline_adherence(
             "章纲场景合同版本未知"
         ) from exc
 
-    if result.get("verdict") != "pass":
+    evidence_version = result.get("evidence_schema_version")
+    is_current_evidence = evidence_version == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    if require_current_evidence and not is_current_evidence:
         raise OutlineAdherenceValidationError(
-            "正文候选未精确通过章纲符合度"
+            "章纲符合度新正式写入必须使用当前本地问题策略"
         )
-    issues = result.get("issues")
-    if not isinstance(issues, list) or issues:
-        raise OutlineAdherenceValidationError("章纲符合度仍包含偏离问题")
+    if is_current_evidence:
+        decision = result.get("decision")
+        if decision == "manual_review":
+            raise OutlineAdherenceValidationError(
+                "章纲符合度存在语义 unknown，必须转人工"
+            )
+        if decision != "pass":
+            raise OutlineAdherenceValidationError(
+                "正文候选需要修复后才能通过章纲符合度"
+            )
+    else:
+        if result.get("verdict") != "pass":
+            raise OutlineAdherenceValidationError(
+                "正文候选未精确通过章纲符合度"
+            )
+        issues = result.get("issues")
+        if not isinstance(issues, list) or issues:
+            raise OutlineAdherenceValidationError("章纲符合度仍包含偏离问题")
+
     scenes = outline.get("scenes")
     is_v2_outline = contract_version == SCENE_TRANSITION_CONTRACT_VERSION
-    v2_metadata: dict[str, Any] = {}
+    evidence_metadata: dict[str, Any] = {}
     if is_v2_outline:
         if prose is None:
             raise OutlineAdherenceValidationError(
@@ -417,33 +923,53 @@ def validate_complete_outline_adherence(
             )
         try:
             parsed_result = (
-                ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
+                ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+                    dict(result)
+                )
+                if is_current_evidence
+                else ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
                     dict(result)
                 )
             )
         except ValidationError as exc:
             raise OutlineAdherenceValidationError(
-                "章纲符合度 V2 本地证据结构无效"
+                "章纲符合度本地证据结构无效"
             ) from exc
         result = parsed_result.model_dump(mode="python")
-        if result.get("evidence_schema_version") != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+        expected_evidence_version = (
+            OUTLINE_ADHERENCE_EVIDENCE_VERSION
+            if is_current_evidence
+            else LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION
+        )
+        if result.get("evidence_schema_version") != expected_evidence_version:
             raise OutlineAdherenceValidationError("章纲符合度证据版本不匹配")
-        if result.get("outline_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
-            raise OutlineAdherenceValidationError("章纲符合度没有绑定当前章纲合同版本")
+        if (
+            result.get("outline_contract_version")
+            != SCENE_TRANSITION_CONTRACT_VERSION
+        ):
+            raise OutlineAdherenceValidationError(
+                "章纲符合度没有绑定当前章纲合同版本"
+            )
         outline_digest = _outline_contract_digest(outline)
         if result.get("outline_contract_digest") != outline_digest:
             raise OutlineAdherenceValidationError("章纲符合度没有绑定当前章纲内容")
         if result.get("source_content_digest") != chapter_content_digest(prose):
             raise OutlineAdherenceValidationError("章纲符合度没有绑定精确正文内容")
-        try:
-            for item in list(result.get("beat_evidence") or []):
+        evidence_collections = [
+            list(result.get("beat_evidence") or []),
+            list(result.get("findings") or []),
+        ]
+        if is_current_evidence:
+            evidence_collections.extend(
+                [
+                    list(result.get("quality_dimensions") or []),
+                    list(result.get("unknowns") or []),
+                ]
+            )
+        for collection in evidence_collections:
+            for item in collection:
                 for span in list(item.get("spans") or []):
                     _validate_span(span, prose=prose)
-            for finding in list(result.get("findings") or []):
-                for span in list(finding.get("spans") or []):
-                    _validate_span(span, prose=prose)
-        except OutlineAdherenceValidationError:
-            raise
 
         expected_beats = [
             (
@@ -491,15 +1017,57 @@ def validate_complete_outline_adherence(
         findings = result.get("findings")
         if not isinstance(findings, list) or findings:
             raise OutlineAdherenceValidationError("章纲符合度仍包含合同偏离")
-        v2_metadata = {
-            "evidence_schema_version": OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+        quality_debt_count = 0
+        quality_observation_count = 0
+        if is_current_evidence:
+            unknowns = result.get("unknowns")
+            if not isinstance(unknowns, list) or unknowns:
+                raise OutlineAdherenceValidationError(
+                    "章纲符合度存在语义 unknown，必须转人工"
+                )
+            local_issues = result.get("local_issues")
+            if not isinstance(local_issues, list) or any(
+                item.get("severity") in {"blocker", "major", "unknown"}
+                for item in local_issues
+                if isinstance(item, Mapping)
+            ):
+                raise OutlineAdherenceValidationError(
+                    "章纲符合度仍包含本地硬问题"
+                )
+            if any(not isinstance(item, Mapping) for item in local_issues):
+                raise OutlineAdherenceValidationError(
+                    "章纲符合度本地问题格式无效"
+                )
+            quality_debt_count = sum(
+                item.get("severity") == "quality_debt"
+                for item in local_issues
+            )
+            quality_observation_count = len(
+                list(result.get("quality_dimensions") or [])
+            )
+        evidence_metadata = {
+            "evidence_schema_version": expected_evidence_version,
             "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
             "outline_contract_digest": outline_digest,
             "beat_count": len(expected_beats),
             "finding_count": 0,
+            **(
+                {
+                    "decision": "pass",
+                    "issue_policy_version": (
+                        OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION
+                    ),
+                    "quality_debt_count": quality_debt_count,
+                    "quality_observation_count": quality_observation_count,
+                }
+                if is_current_evidence
+                else {}
+            ),
         }
     elif result.get("evidence_schema_version") is not None:
-        raise OutlineAdherenceValidationError("legacy_v1 章纲不能使用 V2 beat 证据")
+        raise OutlineAdherenceValidationError(
+            "legacy_v1 章纲不能使用版本化 beat 证据"
+        )
 
     coverage = result.get("scene_coverage")
     if (
@@ -518,12 +1086,9 @@ def validate_complete_outline_adherence(
         if type(scene_index) is not int or item.get("status") != "covered":
             raise OutlineAdherenceValidationError("章纲场景尚未全部落实")
         scene_indexes.append(scene_index)
-    if (
-        len(set(scene_indexes)) != len(scene_indexes)
-        or set(scene_indexes) != set(range(1, len(scenes) + 1))
-    ):
+    if scene_indexes != list(range(1, len(scenes) + 1)):
         raise OutlineAdherenceValidationError(
-            "章纲场景覆盖不是完整唯一集合"
+            "章纲场景覆盖顺序或身份无效"
         )
 
     run_id = result.get("source_prose_run_id")
@@ -541,12 +1106,12 @@ def validate_complete_outline_adherence(
         raise OutlineAdherenceValidationError("章纲符合度正文摘要无效")
 
     return {
-        "verdict": "pass",
+        **({"decision": "pass"} if is_current_evidence else {"verdict": "pass"}),
         "scene_count": len(coverage),
         "issue_count": 0,
         "issue_categories": [],
         "source_prose_run_id": run_id,
         "source_prose_run_revision": revision,
         "source_content_digest": digest,
-        **v2_metadata,
+        **evidence_metadata,
     }

@@ -85,8 +85,8 @@ REQUIRED_OUTLINE_ADHERENCE_PROMPT_KEYS: tuple[str, ...] = (
     "outline_adherence_prompt_base",
     "outline_adherence_prompt_with_schema_suffix",
     "outline_adherence_prompt_without_schema_suffix",
-    "outline_adherence_v2_prompt_with_schema_suffix",
-    "outline_adherence_v2_prompt_without_schema_suffix",
+    "outline_adherence_v3_prompt_with_schema_suffix",
+    "outline_adherence_v3_prompt_without_schema_suffix",
 )
 
 REQUIRED_REFERENCE_CARDS_PROMPT_KEYS: tuple[str, ...] = (

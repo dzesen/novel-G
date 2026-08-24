@@ -294,16 +294,23 @@ async def run_chapter(
             "outline_adherence",
             truncation,
         )
-        verdict = str(review.get("verdict") or "warn")
+        decision = review.get("decision")
+        policy_result = str(
+            decision if decision is not None else review.get("verdict") or "warn"
+        )
+        passed = policy_result == "pass"
         _record_completed_step(
             outcome,
             "outline_adherence",
-            degraded=degraded or verdict != "pass",
+            degraded=degraded or not passed,
         )
-        if verdict in {"warn", "fail"}:
+        if not passed:
             requires_pause = (
-                is_material_deviation(review)
-                and deviation_policy != ACCEPT_AND_CONTINUE
+                decision is not None
+                or (
+                    is_material_deviation(review)
+                    and deviation_policy != ACCEPT_AND_CONTINUE
+                )
             )
             outcome.notices.append(
                 outline_adherence_notice(

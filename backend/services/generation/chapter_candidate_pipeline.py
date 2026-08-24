@@ -13,9 +13,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.llm.schemas.scene_contract_pydantic import (
     MAX_V2_ADHERENCE_ISSUES,
+    MAX_V3_LOCAL_ADHERENCE_ISSUES,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
+    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
 )
-from backend.scene_contract_versions import OUTLINE_ADHERENCE_EVIDENCE_VERSION
+from backend.scene_contract_versions import (
+    LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+)
 from backend.services.generation.chapter_generation_application import (
     ChapterGenerationResult,
     ChapterGenerationStage,
@@ -30,6 +35,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpoint,
     AdherenceCandidateCheckpointV1,
     AdherenceCandidateCheckpointV3,
+    AdherenceCandidateCheckpointV4,
     CandidateCompletionProjectionV1,
     CandidatePipelineCheckpointConflict,
     CandidatePipelineCheckpointV1,
@@ -80,7 +86,6 @@ _MAX_PIPELINE_ATTEMPTS = 512
 _MAX_PIPELINE_TRUNCATIONS = 32
 _MAX_PIPELINE_UNATTRIBUTED_USAGE = 32
 _MAX_TOKEN_COUNT = 1_000_000_000
-_MAX_RESUMED_ADHERENCE_ISSUES = MAX_V2_ADHERENCE_ISSUES
 _MAX_RESUMED_ADHERENCE_COVERAGE = MAX_CANDIDATE_OUTLINE_SCENES
 _MAX_DROPPED_PROJECTION_DEPTH = 8
 _MAX_DROPPED_PROJECTION_NODES = 1_000
@@ -1283,32 +1288,50 @@ def _prose_checkpoint(
 def _adherence_checkpoint_projection(
     adherence: Mapping[str, Any],
 ) -> tuple[
-    Literal["pass", "warn", "fail"],
+    str,
     tuple[OutlineIssueCategory, ...],
+    tuple[str, ...],
     tuple[CandidateSceneCoverageV1, ...],
 ]:
-    verdict = adherence.get("verdict")
-    if verdict not in {"pass", "warn", "fail"}:
+    is_current = adherence.get("evidence_schema_version") == (
+        OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    )
+    policy_result = adherence.get("decision" if is_current else "verdict")
+    valid_results = (
+        {"pass", "repair", "manual_review"}
+        if is_current
+        else {"pass", "warn", "fail"}
+    )
+    if policy_result not in valid_results:
         raise ChapterCandidatePipelineBlocked(
-            "章纲符合度 verdict 无效"
+            "章纲符合度本地裁决无效" if is_current else "章纲符合度 verdict 无效"
         )
-    raw_issues = adherence.get("issues")
+    raw_issues = adherence.get("local_issues" if is_current else "issues")
     raw_coverage = adherence.get("scene_coverage")
+    issue_limit = (
+        MAX_V3_LOCAL_ADHERENCE_ISSUES
+        if is_current
+        else MAX_V2_ADHERENCE_ISSUES
+    )
     if (
         not isinstance(raw_issues, list)
         or not isinstance(raw_coverage, list)
-        or len(raw_issues) > _MAX_RESUMED_ADHERENCE_ISSUES
+        or len(raw_issues) > issue_limit
         or len(raw_coverage) > _MAX_RESUMED_ADHERENCE_COVERAGE
     ):
         raise ChapterCandidatePipelineBlocked(
             "章纲符合度持久投影无效"
         )
     categories: list[OutlineIssueCategory] = []
+    blocking_signatures: list[str] = []
     for item in raw_issues:
         if not isinstance(item, Mapping):
             raise ChapterCandidatePipelineBlocked(
                 "章纲符合度问题投影无效"
             )
+        severity = item.get("severity")
+        if is_current and severity not in {"blocker", "major", "unknown"}:
+            continue
         category = item.get("category")
         if category not in _OUTLINE_ISSUE_CATEGORIES:
             raise ChapterCandidatePipelineBlocked(
@@ -1316,6 +1339,13 @@ def _adherence_checkpoint_projection(
             )
         if category not in categories:
             categories.append(category)
+        if is_current:
+            signature = item.get("issue_signature")
+            if not isinstance(signature, str):
+                raise ChapterCandidatePipelineBlocked(
+                    "章纲符合度问题签名无效"
+                )
+            blocking_signatures.append(signature)
     coverage: list[CandidateSceneCoverageV1] = []
     for item in raw_coverage:
         if not isinstance(item, Mapping):
@@ -1327,7 +1357,12 @@ def _adherence_checkpoint_projection(
             scene_index=item.get("scene_index"),
             status=item.get("status"),
         ))
-    return verdict, tuple(categories), tuple(coverage)
+    return (
+        str(policy_result),
+        tuple(categories),
+        tuple(blocking_signatures),
+        tuple(coverage),
+    )
 
 
 def _adherence_checkpoint(
@@ -1339,23 +1374,33 @@ def _adherence_checkpoint(
     cycle: int,
     adherence: Mapping[str, Any],
 ) -> AdherenceCandidateCheckpoint:
-    verdict, categories, coverage = _adherence_checkpoint_projection(
-        adherence
+    policy_result, categories, blocking_signatures, coverage = (
+        _adherence_checkpoint_projection(adherence)
     )
-    validated_evidence = None
-    if adherence.get("evidence_schema_version") is not None:
-        if adherence.get("evidence_schema_version") != (
-            OUTLINE_ADHERENCE_EVIDENCE_VERSION
-        ):
+    evidence_version = adherence.get("evidence_schema_version")
+    validated_evidence_v2 = None
+    validated_evidence_v3 = None
+    if evidence_version is not None:
+        if evidence_version not in {
+            LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+            OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+        }:
             raise ChapterCandidatePipelineBlocked(
                 "章纲符合度检查点证据版本无效"
             )
         try:
-            validated_evidence = (
-                ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
-                    dict(adherence)
+            if evidence_version == OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+                validated_evidence_v3 = (
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+                        dict(adherence)
+                    )
                 )
-            )
+            else:
+                validated_evidence_v2 = (
+                    ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
+                        dict(adherence)
+                    )
+                )
         except ValueError as exc:
             raise ChapterCandidatePipelineBlocked(
                 "章纲符合度检查点证据无效"
@@ -1367,22 +1412,38 @@ def _adherence_checkpoint(
         evidence=evidence,
     )
     try:
-        if validated_evidence is None:
+        if validated_evidence_v3 is not None:
+            checkpoint = AdherenceCandidateCheckpointV4(
+                **{
+                    **common,
+                    "schema_version": "chapter_candidate_pipeline_checkpoint.v4",
+                },
+                cycle=cycle,
+                decision=policy_result,
+                issue_categories=categories,
+                blocking_issue_signatures=blocking_signatures,
+                scene_coverage=coverage,
+                validated_evidence=validated_evidence_v3,
+            )
+        elif validated_evidence_v2 is not None:
+            checkpoint = AdherenceCandidateCheckpointV3(
+                **{
+                    **common,
+                    "schema_version": "chapter_candidate_pipeline_checkpoint.v3",
+                },
+                cycle=cycle,
+                verdict=policy_result,
+                issue_categories=categories,
+                scene_coverage=coverage,
+                validated_evidence=validated_evidence_v2,
+            )
+        else:
             checkpoint = AdherenceCandidateCheckpointV1(
                 **common,
                 cycle=cycle,
-                verdict=verdict,
+                verdict=policy_result,
                 issue_categories=categories,
                 scene_coverage=coverage,
-            )
-        else:
-            checkpoint = AdherenceCandidateCheckpointV3(
-                **{**common, "schema_version": "chapter_candidate_pipeline_checkpoint.v3"},
-                cycle=cycle,
-                verdict=verdict,
-                issue_categories=categories,
-                scene_coverage=coverage,
-                validated_evidence=validated_evidence,
             )
     except ValueError as exc:
         raise ChapterCandidatePipelineBlocked(
@@ -1977,7 +2038,11 @@ def _checkpoint_step_name(
         )
     if isinstance(
         checkpoint,
-        (AdherenceCandidateCheckpointV1, AdherenceCandidateCheckpointV3),
+        (
+            AdherenceCandidateCheckpointV1,
+            AdherenceCandidateCheckpointV3,
+            AdherenceCandidateCheckpointV4,
+        ),
     ):
         return (
             "outline_adherence"
@@ -2004,7 +2069,22 @@ def _validate_resumed_adherence_projection(
     adherence = reviewed.value
     if not _adherence_matches_source(adherence, source):
         raise ChapterCandidatePipelineBlocked("候选管线恢复复检身份不一致")
-    if isinstance(checkpoint, AdherenceCandidateCheckpointV3):
+    if isinstance(checkpoint, AdherenceCandidateCheckpointV4):
+        try:
+            restored_evidence = (
+                ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
+                    dict(adherence)
+                )
+            )
+        except ValueError as exc:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复 V3 复检证据无效"
+            ) from exc
+        if restored_evidence != checkpoint.validated_evidence:
+            raise ChapterCandidatePipelineBlocked(
+                "候选管线恢复 V3 复检证据与检查点不一致"
+            )
+    elif isinstance(checkpoint, AdherenceCandidateCheckpointV3):
         try:
             restored_evidence = (
                 ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
@@ -2019,53 +2099,30 @@ def _validate_resumed_adherence_projection(
             raise ChapterCandidatePipelineBlocked(
                 "候选管线恢复 V2 复检证据与检查点不一致"
             )
-    issues = adherence.get("issues")
-    coverage = adherence.get("scene_coverage")
-    if (
-        not isinstance(issues, list)
-        or not isinstance(coverage, list)
-        or len(issues) > _MAX_RESUMED_ADHERENCE_ISSUES
-        or len(coverage) > _MAX_RESUMED_ADHERENCE_COVERAGE
-    ):
-        raise ChapterCandidatePipelineBlocked("候选管线恢复复检结果无效")
-    issue_categories: list[str] = []
-    for item in issues:
-        if not isinstance(item, Mapping):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复复检结果无效"
-            )
-        category = item.get("category")
-        if category not in _OUTLINE_ISSUE_CATEGORIES:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复复检结果无效"
-            )
-        if category not in issue_categories:
-            issue_categories.append(category)
-    projected_coverage: list[tuple[int, str]] = []
-    for item in coverage:
-        if not isinstance(item, Mapping):
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复复检结果无效"
-            )
-        index = item.get("scene_index")
-        status = item.get("status")
-        if type(index) is not int or status not in {
-            "covered",
-            "partial",
-            "missing",
-        }:
-            raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复复检结果无效"
-            )
-        projected_coverage.append((index, status))
-    if (
-        adherence.get("verdict") != checkpoint.verdict
-        or tuple(issue_categories) != tuple(checkpoint.issue_categories)
-        or tuple(projected_coverage)
-        != tuple(
-            (item.scene_index, item.status)
-            for item in checkpoint.scene_coverage
+    try:
+        policy_result, categories, signatures, coverage = (
+            _adherence_checkpoint_projection(adherence)
         )
+    except ChapterCandidatePipelineBlocked as exc:
+        raise ChapterCandidatePipelineBlocked(
+            "候选管线恢复复检结果无效"
+        ) from exc
+    expected_policy_result = (
+        checkpoint.decision
+        if isinstance(checkpoint, AdherenceCandidateCheckpointV4)
+        else checkpoint.verdict
+    )
+    expected_signatures = (
+        checkpoint.blocking_issue_signatures
+        if isinstance(checkpoint, AdherenceCandidateCheckpointV4)
+        else ()
+    )
+    if (
+        policy_result != expected_policy_result
+        or categories != checkpoint.issue_categories
+        or signatures != expected_signatures
+        or tuple((item.scene_index, item.status) for item in coverage)
+        != tuple((item.scene_index, item.status) for item in checkpoint.scene_coverage)
     ):
         raise ChapterCandidatePipelineBlocked(
             "候选管线恢复复检投影与检查点不一致"
@@ -2298,7 +2355,11 @@ def _project_replayed_checkpoint_prefix(
     for checkpoint in checkpoints:
         if isinstance(
             checkpoint,
-            (AdherenceCandidateCheckpointV1, AdherenceCandidateCheckpointV3),
+            (
+                AdherenceCandidateCheckpointV1,
+                AdherenceCandidateCheckpointV3,
+                AdherenceCandidateCheckpointV4,
+            ),
         ):
             review_count += 1
         step = _checkpoint_step_name(
@@ -3016,10 +3077,18 @@ def _adherence_repair_request(
     chapter: Mapping[str, Any],
 ) -> ProseCandidateRepairRequest:
     categories: list[OutlineIssueCategory] = []
-    issues = adherence.get("issues")
+    current_policy = adherence.get("evidence_schema_version") == (
+        OUTLINE_ADHERENCE_EVIDENCE_VERSION
+    )
+    issues = adherence.get("local_issues" if current_policy else "issues")
     if isinstance(issues, list):
         for item in issues:
             if not isinstance(item, Mapping):
+                continue
+            if current_policy and item.get("severity") not in {
+                "blocker",
+                "major",
+            }:
                 continue
             try:
                 category = OutlineIssueCategory(str(item.get("category") or ""))
@@ -3629,6 +3698,12 @@ class ChapterCandidatePipeline:
                     cycle=trace.repair_cycles_used,
                     adherence=adherence,
                 ), ledger=checkpoint_ledger)
+            if adherence.get("decision") == "manual_review":
+                raise ChapterCandidatePipelineBlocked(
+                    "章纲符合度存在无法自动裁决的语义 unknown，必须转人工",
+                    code="candidate_adherence_manual_review",
+                    gate="outline_adherence",
+                )
             try:
                 adherence_metadata = _validate_adherence_gate(
                     adherence,

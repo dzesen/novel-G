@@ -16,6 +16,7 @@ from pydantic import (
 
 
 MAX_V2_ADHERENCE_ISSUES = 20
+MAX_V3_LOCAL_ADHERENCE_ISSUES = 80
 
 
 StableSceneIdentity = Annotated[
@@ -32,6 +33,14 @@ CanonicalEventKey = Annotated[
         min_length=1,
         max_length=100,
         pattern=r"^[a-z0-9][a-z0-9._:-]{0,99}$",
+    ),
+]
+ContractReferenceIdentity = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$",
     ),
 ]
 RequiredText500 = Annotated[
@@ -263,6 +272,118 @@ class ChapterOutlineAdherenceEvidenceSchema(BaseModel):
         return self
 
 
+class OutlineQualityDimensionSchema(BaseModel):
+    """One uncalibrated literary observation; never a hard gate by itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: StableSceneIdentity
+    dimension: Literal[
+        "interest",
+        "pacing",
+        "character_drive",
+        "style",
+        "novelty",
+        "narrative_function_repetition",
+    ]
+    status: Literal["concern", "strength"]
+    scene_id: StableSceneIdentity | None = None
+    spans: list[ProseEvidenceSpanSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=2,
+    )
+    explanation: RequiredText160
+
+
+class OutlineSemanticUnknownSchema(BaseModel):
+    """A semantic contract question the Provider could not resolve."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    unknown_id: StableSceneIdentity
+    category: Literal[
+        "scene_coverage",
+        "scene_order",
+        "core_conflict",
+        "ending_hook",
+        "unplanned_major_event",
+        "volume_arc",
+        "forbidden_condition",
+        "event_repetition",
+    ]
+    scene_id: StableSceneIdentity | None = None
+    beat_ids: list[StableSceneIdentity] = Field(default_factory=list, max_length=10)
+    spans: list[ProseEvidenceSpanSchema] = Field(default_factory=list, max_length=2)
+    explanation: RequiredText160
+
+
+class OutlineContractFindingV3Schema(OutlineContractFindingSchema):
+    """A finding with machine-verifiable references for objective blockers."""
+
+    condition_ids: list[StableSceneIdentity] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    event_key: CanonicalEventKey | None = None
+
+    @model_validator(mode="after")
+    def validate_objective_references(self) -> "OutlineContractFindingV3Schema":
+        if self.category == "forbidden_condition":
+            if self.scene_id is None or not self.condition_ids or self.event_key:
+                raise ValueError(
+                    "forbidden_condition requires scene_id and condition_ids"
+                )
+        elif self.category == "event_repetition":
+            if self.scene_id is None or self.event_key is None or self.condition_ids:
+                raise ValueError(
+                    "event_repetition requires scene_id and event_key"
+                )
+        elif self.condition_ids or self.event_key is not None:
+            raise ValueError(
+                "objective contract references are only valid for objective findings"
+            )
+        if len(self.condition_ids) != len(set(self.condition_ids)):
+            raise ValueError("condition_ids must be unique")
+        return self
+
+
+class ChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
+    """Provider evidence only; verdict and severity are intentionally absent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["chapter_outline_adherence_evidence.v3"]
+    outline_contract_version: Literal["scene_transition_contract.v2"]
+    summary: RequiredText500
+    beat_evidence: list[BeatEvidenceSchema] = Field(..., min_length=1, max_length=400)
+    findings: list[OutlineContractFindingV3Schema] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    quality_dimensions: list[OutlineQualityDimensionSchema] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    unknowns: list[OutlineSemanticUnknownSchema] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+
+    @model_validator(mode="after")
+    def validate_provider_identities(
+        self,
+    ) -> "ChapterOutlineAdherenceEvidenceV3Schema":
+        identity_groups = (
+            [finding.finding_id for finding in self.findings],
+            [item.observation_id for item in self.quality_dimensions],
+            [item.unknown_id for item in self.unknowns],
+        )
+        if any(len(values) != len(set(values)) for values in identity_groups):
+            raise ValueError("Provider evidence identities must be unique by kind")
+        return self
+
+
 class ValidatedOutlineSceneCoverageSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -364,4 +485,178 @@ class ValidatedChapterOutlineAdherenceEvidenceSchema(BaseModel):
             raise ValueError("passing V2 review must cover every scene")
         if self.verdict == "fail" and not (self.issues or self.findings):
             raise ValueError("failed V2 review requires a local deviation")
+        return self
+
+
+class ValidatedOutlineQualityDimensionSchema(OutlineQualityDimensionSchema):
+    spans: list[ValidatedProseEvidenceSpanSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=2,
+    )
+
+
+class ValidatedOutlineContractFindingV3Schema(OutlineContractFindingV3Schema):
+    spans: list[ValidatedProseEvidenceSpanSchema] = Field(
+        default_factory=list,
+        max_length=2,
+    )
+
+
+class ValidatedOutlineSemanticUnknownSchema(OutlineSemanticUnknownSchema):
+    spans: list[ValidatedProseEvidenceSpanSchema] = Field(
+        default_factory=list,
+        max_length=2,
+    )
+
+
+class LocalOutlineAdherenceIssueSchema(BaseModel):
+    """Compact deterministic issue projection derived from Provider evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    issue_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+    severity: Literal["blocker", "major", "quality_debt", "unknown", "info"]
+    category: Literal[
+        "scene_coverage",
+        "scene_order",
+        "core_conflict",
+        "ending_hook",
+        "unplanned_major_event",
+        "volume_arc",
+        "forbidden_condition",
+        "event_repetition",
+        "interest",
+        "pacing",
+        "character_drive",
+        "style",
+        "novelty",
+        "narrative_function_repetition",
+    ]
+    source_kind: Literal[
+        "beat_evidence",
+        "finding",
+        "quality_dimension",
+        "unknown",
+    ]
+    scene_id: StableSceneIdentity | None = None
+    source_evidence_count: StrictInt = Field(..., ge=1, le=20)
+    contract_reference_ids: list[ContractReferenceIdentity] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+
+
+class ValidatedChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
+    """Locally verified V3 evidence plus the fixed V1 issue policy result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_schema_version: Literal["chapter_outline_adherence_evidence.v3"]
+    issue_policy_version: Literal["chapter_outline_issue_policy.v1"]
+    outline_contract_version: Literal["scene_transition_contract.v2"]
+    outline_contract_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    summary: RequiredText500
+    beat_evidence: list[ValidatedBeatEvidenceSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=400,
+    )
+    beat_status_counts: dict[
+        Literal[
+            "satisfied",
+            "mentioned",
+            "contradicted",
+            "missing",
+            "unknown",
+        ],
+        StrictInt,
+    ]
+    findings: list[ValidatedOutlineContractFindingV3Schema] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    quality_dimensions: list[ValidatedOutlineQualityDimensionSchema] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    unknowns: list[ValidatedOutlineSemanticUnknownSchema] = Field(
+        default_factory=list,
+        max_length=10,
+    )
+    local_issues: list[LocalOutlineAdherenceIssueSchema] = Field(
+        default_factory=list,
+        max_length=MAX_V3_LOCAL_ADHERENCE_ISSUES,
+    )
+    local_issue_counts: dict[
+        Literal["blocker", "major", "quality_debt", "unknown", "info"],
+        StrictInt,
+    ]
+    decision: Literal["pass", "repair", "manual_review"]
+    scene_coverage: list[ValidatedOutlineSceneCoverageSchema] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
+    source_prose_run_id: str = Field(..., min_length=1, max_length=128)
+    source_prose_run_revision: StrictInt = Field(..., ge=0)
+    source_content_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_local_issue_policy(
+        self,
+    ) -> "ValidatedChapterOutlineAdherenceEvidenceV3Schema":
+        beat_counts: dict[str, int] = {}
+        for evidence in self.beat_evidence:
+            beat_counts[evidence.status] = beat_counts.get(evidence.status, 0) + 1
+        if self.beat_status_counts != beat_counts:
+            raise ValueError("beat_status_counts does not match beat_evidence")
+
+        issue_counts: dict[str, int] = {}
+        signatures: list[str] = []
+        quality_categories = {
+            "interest",
+            "pacing",
+            "character_drive",
+            "style",
+            "novelty",
+            "narrative_function_repetition",
+        }
+        for issue in self.local_issues:
+            issue_counts[issue.severity] = issue_counts.get(issue.severity, 0) + 1
+            signatures.append(issue.issue_signature)
+            if issue.category in quality_categories and issue.severity not in {
+                "quality_debt",
+                "info",
+            }:
+                raise ValueError("uncalibrated quality cannot become a hard issue")
+            if (
+                issue.source_kind == "quality_dimension"
+                and issue.category not in quality_categories
+            ):
+                raise ValueError("quality issue category is invalid")
+            if issue.category in {"forbidden_condition", "event_repetition"}:
+                if issue.source_kind == "finding" and not issue.contract_reference_ids:
+                    raise ValueError("objective issue requires contract references")
+            elif issue.contract_reference_ids:
+                raise ValueError("non-objective issue cannot claim contract references")
+        if self.local_issue_counts != issue_counts:
+            raise ValueError("local_issue_counts does not match local_issues")
+        if len(signatures) != len(set(signatures)):
+            raise ValueError("local issue signatures must be unique")
+
+        severities = set(issue_counts)
+        expected_decision = (
+            "manual_review"
+            if "unknown" in severities
+            else "repair"
+            if severities & {"blocker", "major"}
+            else "pass"
+        )
+        if self.decision != expected_decision:
+            raise ValueError("decision diverges from local issue policy")
+        if self.decision == "pass" and any(
+            item.status != "covered" for item in self.scene_coverage
+        ):
+            raise ValueError("passing V3 review must cover every required scene")
         return self

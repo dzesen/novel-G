@@ -473,7 +473,7 @@ write_chapter_by_ai:
 
 # 章节正文相对细纲的语义符合度检查（批量生成门禁）
 review_chapter_outline_adherence_by_ai:
-  contract_version: chapter_outline_adherence_evidence.v2
+  contract_version: chapter_outline_adherence_evidence.v3
   outline_adherence_prompt_base: |
     你是一位严谨但不过度机械的长篇小说责任编辑。请检查第 {chapter_order} 章
     《{chapter_title}》的正文是否在语义上落实了本章细纲，并仍然服务于当前卷大纲。
@@ -504,20 +504,27 @@ review_chapter_outline_adherence_by_ai:
     - satisfied、mentioned、contradicted 必须给至少一个正文 span；一个 beat 可以有多个 span，同一 span 也可支持多个 beat。
     - span 使用待检查正文的 0 起始 Unicode code-point 偏移，区间为 [start,end)，
       quote 必须逐字复制该区间原文。不得改写、去空格或使用字节偏移；系统会在本地复核后生成证据哈希。
-    - Provider 只返回 beat_evidence 与 findings，不返回 pass / warn / fail，也不决定本地 severity。
-    - V2 findings 用于报告场景顺序、核心冲突、结尾钩子、细纲外重大事件、卷弧线偏离、
+    - Provider 只返回 beat_evidence、findings、quality_dimensions 与 unknowns，
+      不返回 pass / warn / fail，也不决定本地 severity 或最终动作。
+    - V3 findings 用于报告场景顺序、核心冲突、结尾钩子、细纲外重大事件、卷弧线偏离、
       forbidden condition 或 event repetition；observed 必须给正文 span，无法确定时用 unknown。
+      forbidden_condition 必须引用同场景细纲中精确的 condition_ids；event_repetition 必须引用同场景精确的
+      event_key。没有正式合同引用，或 repetition_policy 不是 forbid 时，只能作为质量观察，不得伪装成客观 finding。
+    - 无法判断一项客观合同且不能由 beat/finding 的 unknown 表达时，写入 unknowns；不得猜测通过。
+    - interest、pacing、character_drive、style、novelty 与 narrative_function_repetition
+      只能写入 quality_dimensions，status 只可为 concern 或 strength，并提供正文 span。
+      这些是尚未校准的文学质量观察，Provider 不得把它们改写成客观合同 findings。
     - 旧章纲没有 V2 合同时，按提供的旧 Schema 返回 scene_coverage；旧结果只用于兼容读取。
   outline_adherence_prompt_with_schema_suffix: |
     请严格按提供的 JSON Schema 输出，不要输出额外解释。
   outline_adherence_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
     {"verdict":"pass|warn|fail","summary":"总体结论","scene_coverage":[{"scene_index":1,"status":"covered|partial|missing","evidence":"正文依据"}],"issues":[{"severity":"warning|error","category":"scene_coverage|scene_order|core_conflict|ending_hook|unplanned_major_event|volume_arc","outline_requirement":"细纲或卷纲要求","prose_evidence":"正文依据","explanation":"偏离原因"}]}
-  outline_adherence_v2_prompt_with_schema_suffix: |
-    请严格按提供的 V2 JSON Schema 输出 beat_evidence 与 findings，不要输出 verdict 或额外解释。
-  outline_adherence_v2_prompt_without_schema_suffix: |
+  outline_adherence_v3_prompt_with_schema_suffix: |
+    请严格按提供的 V3 JSON Schema 输出语义证据，不要输出 verdict、severity、decision 或额外解释。
+  outline_adherence_v3_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
-    {"schema_version":"chapter_outline_adherence_evidence.v2","outline_contract_version":"scene_transition_contract.v2","summary":"证据摘要","beat_evidence":[{"scene_id":"scene-1","beat_id":"scene-1-beat-1","status":"satisfied|mentioned|contradicted|missing|unknown","spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"explanation":"判定依据"}],"findings":[]}
+    {"schema_version":"chapter_outline_adherence_evidence.v3","outline_contract_version":"scene_transition_contract.v2","summary":"证据摘要","beat_evidence":[{"scene_id":"scene-1","beat_id":"scene-1-beat-1","status":"satisfied|mentioned|contradicted|missing|unknown","spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"explanation":"判定依据"}],"findings":[],"quality_dimensions":[],"unknowns":[]}
 
 extract_chapter_state_by_ai:
   contract_version: chapter_state_fact_evidence.v1

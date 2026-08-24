@@ -39,7 +39,7 @@ from backend.llm.prompts.prompt_selector import (
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
-    ChapterOutlineAdherenceEvidenceSchema,
+    ChapterOutlineAdherenceEvidenceV3Schema,
     ChapterOutlineAdherenceResultSchema,
     ChapterOutlineResultSchema,
     ChapterStateResultSchema,
@@ -75,8 +75,8 @@ from backend.services.generation.protected_generation_params import (
 )
 from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
+    assess_outline_adherence_evidence,
     normalize_outline_adherence,
-    validate_beat_evidence,
 )
 from backend.scene_contract_versions import (
     MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
@@ -1211,11 +1211,11 @@ class ChapterGenerationApplicationService:
         if not chapter.get("outline"):
             raise ValueError("本章尚无可供细纲符合度检查的章节细纲")
         outline = dict(chapter["outline"])
-        uses_v2_evidence = require_known_scene_contract_version(outline) == (
+        uses_versioned_evidence = require_known_scene_contract_version(outline) == (
             SCENE_TRANSITION_CONTRACT_VERSION
         )
-        if uses_v2_evidence and candidate is None:
-            raise ValueError("V2 beat 证据必须绑定精确正文候选")
+        if uses_versioned_evidence and candidate is None:
+            raise ValueError("版本化 beat 证据必须绑定精确正文候选")
 
         inputs = await self._deps.fetch_context_inputs(
             command.novel_id,
@@ -1226,10 +1226,10 @@ class ChapterGenerationApplicationService:
             OUTLINE_ADHERENCE_PROMPT_NAME,
             {},
         )
-        if uses_v2_evidence and prompts.get("contract_version") != (
+        if uses_versioned_evidence and prompts.get("contract_version") != (
             OUTLINE_ADHERENCE_EVIDENCE_VERSION
         ):
-            raise ValueError("V2 beat 审核提示词合同版本无效")
+            raise ValueError("V3 证据化审核提示词合同版本无效")
         prompt_base = prompts["outline_adherence_prompt_base"].format(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),
@@ -1237,13 +1237,13 @@ class ChapterGenerationApplicationService:
             chapter_content=content,
         )
         with_schema_suffix = (
-            "outline_adherence_v2_prompt_with_schema_suffix"
-            if uses_v2_evidence
+            "outline_adherence_v3_prompt_with_schema_suffix"
+            if uses_versioned_evidence
             else "outline_adherence_prompt_with_schema_suffix"
         )
         without_schema_suffix = (
-            "outline_adherence_v2_prompt_without_schema_suffix"
-            if uses_v2_evidence
+            "outline_adherence_v3_prompt_without_schema_suffix"
+            if uses_versioned_evidence
             else "outline_adherence_prompt_without_schema_suffix"
         )
         prompt_plan = PromptPlan(
@@ -1305,8 +1305,8 @@ class ChapterGenerationApplicationService:
             prose=content,
             outline=outline,
             result_schema=(
-                ChapterOutlineAdherenceEvidenceSchema
-                if uses_v2_evidence
+                ChapterOutlineAdherenceEvidenceV3Schema
+                if uses_versioned_evidence
                 else ChapterOutlineAdherenceResultSchema
             ),
         )
@@ -1368,10 +1368,10 @@ class ChapterGenerationApplicationService:
 
         try:
             candidate = prepared.command.prose_candidate
-            if prepared.result_schema is ChapterOutlineAdherenceEvidenceSchema:
+            if prepared.result_schema is ChapterOutlineAdherenceEvidenceV3Schema:
                 if candidate is None:  # guarded in prepare; fail-closed proof
-                    raise ValueError("V2 beat 证据缺少正文候选绑定")
-                review = validate_beat_evidence(
+                    raise ValueError("V3 符合度证据缺少正文候选绑定")
+                review = assess_outline_adherence_evidence(
                     generated.value.model_dump(),
                     outline=prepared.outline,
                     prose=prepared.prose,
@@ -1386,7 +1386,7 @@ class ChapterGenerationApplicationService:
             if (
                 candidate is not None
                 and prepared.result_schema
-                is not ChapterOutlineAdherenceEvidenceSchema
+                is not ChapterOutlineAdherenceEvidenceV3Schema
             ):
                 review = {
                     **review,

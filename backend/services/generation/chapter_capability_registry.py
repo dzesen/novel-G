@@ -358,7 +358,7 @@ def build_chapter_capability_registry(
             ),
             CapabilityDefinition(
                 capability="chapter_outline_adherence",
-                version=2,
+                version=3,
                 label="章节细纲符合度",
                 description="检查正文候选是否兑现已接受的章节细纲。",
                 customizable=False,

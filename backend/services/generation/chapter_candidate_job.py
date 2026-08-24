@@ -17,6 +17,7 @@ from bson import ObjectId
 from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpoint,
     AdherenceCandidateCheckpointV3,
+    AdherenceCandidateCheckpointV4,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
     JobMutationRecoveryBindingV1,
@@ -458,7 +459,10 @@ def _adherence_result(
     checkpoint: AdherenceCandidateCheckpoint,
 ) -> ChapterGenerationResult:
     source = checkpoint.source
-    if isinstance(checkpoint, AdherenceCandidateCheckpointV3):
+    if isinstance(
+        checkpoint,
+        (AdherenceCandidateCheckpointV3, AdherenceCandidateCheckpointV4),
+    ):
         value = checkpoint.validated_evidence.model_dump(mode="json")
     else:
         value = {

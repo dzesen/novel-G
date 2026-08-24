@@ -29,9 +29,10 @@ from backend.llm.prompts.prompt_selector import (
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
-    ChapterOutlineAdherenceEvidenceSchema,
+    ChapterOutlineAdherenceEvidenceV3Schema,
     ChapterOutlineAdherenceResultSchema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
+    ValidatedChapterOutlineAdherenceEvidenceV3Schema,
 )
 from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
@@ -60,8 +61,8 @@ from backend.services.generation.chapter_generation_application import (
 from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
     OutlineIssueCategoryValue,
+    assess_outline_adherence_evidence,
     normalize_outline_adherence,
-    validate_beat_evidence,
 )
 from backend.services.generation.prose_completion import (
     ProseExecutionPlan,
@@ -270,6 +271,7 @@ class CheckOutlineAdherenceOutput(_StrictModel):
     review: (
         ChapterOutlineAdherenceResultSchema
         | ValidatedChapterOutlineAdherenceEvidenceSchema
+        | ValidatedChapterOutlineAdherenceEvidenceV3Schema
         | None
     ) = None
 
@@ -283,8 +285,16 @@ class CheckOutlineAdherenceOutput(_StrictModel):
             raise ValueError("checked adherence output requires a review")
         if self.outcome == "no_progress" and self.passed:
             raise ValueError("no-progress adherence output cannot pass")
-        if self.passed != (self.review.verdict == "pass"):
-            raise ValueError("passed must match the normalized adherence verdict")
+        local_passed = (
+            self.review.decision == "pass"
+            if isinstance(
+                self.review,
+                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+            )
+            else self.review.verdict == "pass"
+        )
+        if self.passed != local_passed:
+            raise ValueError("passed must match the local adherence policy")
         return self
 
 
@@ -836,6 +846,7 @@ def _planner_observations(
         "observation_kind": 160,
         "content_digest": 64,
         "verdict": 32,
+        "decision": 32,
         "summary": 1_000,
         "latest_kind": 160,
     }
@@ -1768,13 +1779,13 @@ V2 场景输出规则：
                 {},
             )
             outline = dict(chapter.get("outline") or {})
-            uses_v2_evidence = require_known_scene_contract_version(outline) == (
+            uses_versioned_evidence = require_known_scene_contract_version(outline) == (
                 SCENE_TRANSITION_CONTRACT_VERSION
             )
-            if uses_v2_evidence and prompts.get("contract_version") != (
+            if uses_versioned_evidence and prompts.get("contract_version") != (
                 OUTLINE_ADHERENCE_EVIDENCE_VERSION
             ):
-                raise ValueError("V2 beat 审核提示词合同版本无效")
+                raise ValueError("V3 证据化审核提示词合同版本无效")
             prompt_base = prompts["outline_adherence_prompt_base"].format(
                 context=assembled.to_prompt_text(),
                 chapter_order=int(chapter.get("order_index") or 0),
@@ -1782,18 +1793,18 @@ V2 场景输出规则：
                 chapter_content=current_text,
             )
             with_schema_suffix = (
-                "outline_adherence_v2_prompt_with_schema_suffix"
-                if uses_v2_evidence
+                "outline_adherence_v3_prompt_with_schema_suffix"
+                if uses_versioned_evidence
                 else "outline_adherence_prompt_with_schema_suffix"
             )
             without_schema_suffix = (
-                "outline_adherence_v2_prompt_without_schema_suffix"
-                if uses_v2_evidence
+                "outline_adherence_v3_prompt_without_schema_suffix"
+                if uses_versioned_evidence
                 else "outline_adherence_prompt_without_schema_suffix"
             )
             adherence_schema = (
-                ChapterOutlineAdherenceEvidenceSchema
-                if uses_v2_evidence
+                ChapterOutlineAdherenceEvidenceV3Schema
+                if uses_versioned_evidence
                 else RemediationAdherenceProviderOutput
             )
             adherence_native_prompt = apply_agent_profile(
@@ -1859,13 +1870,13 @@ V2 场景输出规则：
             ),
         )
         try:
-            if uses_v2_evidence:
+            if uses_versioned_evidence:
                 provider_review = (
-                    ChapterOutlineAdherenceEvidenceSchema.model_validate(
+                    ChapterOutlineAdherenceEvidenceV3Schema.model_validate(
                         generated.value
                     )
                 )
-                normalized = validate_beat_evidence(
+                normalized = assess_outline_adherence_evidence(
                     provider_review.model_dump(),
                     outline=outline,
                     prose=current_text,
@@ -1874,7 +1885,7 @@ V2 场景输出规则：
                     source_content_digest=payload.expected_content_digest,
                 )
                 review = (
-                    ValidatedChapterOutlineAdherenceEvidenceSchema.model_validate(
+                    ValidatedChapterOutlineAdherenceEvidenceV3Schema.model_validate(
                         normalized
                     )
                 )
@@ -1926,17 +1937,37 @@ V2 场景输出规则：
                 provider_dispatched=True,
                 error=exc,
             )
+        policy_result = (
+            review.decision
+            if isinstance(
+                review,
+                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+            )
+            else review.verdict
+        )
         data = CheckOutlineAdherenceOutput(
             outcome="checked",
             prose_run_id=str(run["_id"]),
             candidate_revision=payload.expected_revision,
             content_digest=payload.expected_content_digest,
-            passed=review.verdict == "pass",
+            passed=policy_result == "pass",
             review=review,
         )
-        issue_categories = list(dict.fromkeys(
-            issue.category for issue in review.issues
-        ))
+        blocking_issues = (
+            [
+                issue
+                for issue in review.local_issues
+                if issue.severity in {"blocker", "major", "unknown"}
+            ]
+            if isinstance(
+                review,
+                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+            )
+            else list(review.issues)
+        )
+        issue_categories = list(
+            dict.fromkeys(issue.category for issue in blocking_issues)
+        )
         missing_scenes = [
             item.scene_index
             for item in review.scene_coverage
@@ -1953,10 +1984,49 @@ V2 场景输出规则：
         remaining_categories = target_categories.intersection(issue_categories)
         remaining_scenes = target_scenes.intersection(missing_scenes)
         no_progress = bool(
-            review.verdict != "pass"
+            policy_result in {"repair", "fail"}
             and str(remediation.get("source_content_digest") or "")
             == str(remediation.get("latest_content_digest") or "")
         )
+        policy_projection = (
+            {"decision": policy_result}
+            if isinstance(
+                review,
+                ValidatedChapterOutlineAdherenceEvidenceV3Schema,
+            )
+            else {"verdict": policy_result}
+        )
+        if policy_result == "manual_review":
+            return RuntimeToolResult(
+                status="permanent_error",
+                code="outline_adherence_manual_review",
+                data=data.model_dump(mode="json"),
+                planner_view={
+                    "observation_kind": "outline_adherence_checked",
+                    "candidate_revision": payload.expected_revision,
+                    "content_digest": payload.expected_content_digest,
+                    "passed": False,
+                    **policy_projection,
+                    "summary": review.summary,
+                    "issue_categories": issue_categories,
+                    "scene_indexes": missing_scenes,
+                    "reason_codes": ["semantic_unknown"],
+                },
+                audit_view={
+                    "prose_run_id": str(run["_id"]),
+                    "candidate_revision": payload.expected_revision,
+                    "content_digest": payload.expected_content_digest,
+                    "decision": "manual_review",
+                    "issue_count": len(blocking_issues),
+                },
+                evidence_refs=(
+                    f"prose-run:{run['_id']}:{payload.expected_revision}",
+                ),
+                resource_revision=str(payload.expected_revision),
+                resource_digest=payload.expected_content_digest,
+                usage=usage,
+                error_summary="章纲符合度存在语义 unknown，必须转人工",
+            )
         if no_progress:
             no_progress_data = CheckOutlineAdherenceOutput(
                 outcome="no_progress",
@@ -1975,7 +2045,7 @@ V2 场景输出规则：
                     "candidate_revision": payload.expected_revision,
                     "content_digest": payload.expected_content_digest,
                     "passed": False,
-                    "verdict": review.verdict,
+                    **policy_projection,
                     "summary": review.summary,
                     "issue_categories": issue_categories,
                     "scene_indexes": missing_scenes,
@@ -2009,7 +2079,7 @@ V2 场景输出规则：
                 "candidate_revision": data.candidate_revision,
                 "content_digest": data.content_digest,
                 "passed": data.passed,
-                "verdict": review.verdict,
+                **policy_projection,
                 "summary": review.summary,
                 "issue_categories": issue_categories,
                 "scene_indexes": missing_scenes,
@@ -2018,8 +2088,8 @@ V2 场景输出规则：
                 "prose_run_id": data.prose_run_id,
                 "candidate_revision": data.candidate_revision,
                 "content_digest": data.content_digest,
-                "verdict": review.verdict,
-                "issue_count": len(review.issues),
+                **policy_projection,
+                "issue_count": len(blocking_issues),
             },
             evidence_refs=(
                 f"prose-run:{data.prose_run_id}:{data.candidate_revision}",
@@ -2082,7 +2152,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r9-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r10-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
