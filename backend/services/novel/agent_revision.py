@@ -20,8 +20,21 @@ from backend.db.narrative_revision import narrative_revision_store
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.utils import get_utc_now, to_object_id
+from backend.llm.schemas.novel_pydantic import (
+    ChapterOutlineEditSchema,
+    LegacySceneSchema,
+    chapter_outline_context_prompt_utf8_bytes,
+)
+from backend.scene_contract_versions import (
+    MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES,
+    SCENE_TRANSITION_CONTRACT_VERSION,
+    require_known_scene_contract_version,
+)
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
-from backend.services.novel.chapter_service import count_chapter_words
+from backend.services.novel.chapter_service import (
+    count_chapter_words,
+    v2_outline_structure,
+)
 from backend.services.novel.derived_stats import derived_stats
 
 
@@ -69,10 +82,10 @@ class RevisionPatch(BaseModel):
 
     summary: str | None = Field(default=None, max_length=20_000)
     arc: str | None = Field(default=None, max_length=20_000)
-    core_conflict: str | None = Field(default=None, max_length=4_000)
-    ending_hook: str | None = Field(default=None, max_length=4_000)
-    scene_summary: str | None = Field(default=None, max_length=4_000)
-    scene_purpose: str | None = Field(default=None, max_length=2_000)
+    core_conflict: str | None = Field(default=None, min_length=1, max_length=500)
+    ending_hook: str | None = Field(default=None, min_length=1, max_length=500)
+    scene_summary: str | None = Field(default=None, min_length=1, max_length=500)
+    scene_purpose: str | None = Field(default=None, min_length=1, max_length=200)
     content: str | None = Field(default=None, max_length=1_000_000)
 
 
@@ -163,6 +176,89 @@ class AgentRevisionProposalService:
         }.intersection(values):
             raise ValueError("Scene proposal must change summary or purpose")
         return values
+
+    @staticmethod
+    def _outline_edit_projection(outline: dict[str, Any]) -> dict[str, Any]:
+        """Convert one stored V2 outline into the author-edit Schema shape."""
+
+        return {
+            "scene_contract_version": outline.get("scene_contract_version"),
+            "pov_character_card_id": (
+                str(outline["pov_character_card_id"])
+                if outline.get("pov_character_card_id") is not None
+                else None
+            ),
+            "present_character_card_ids": [
+                str(item)
+                for item in outline.get("present_character_card_ids") or []
+            ],
+            "mentioned_character_card_ids": [
+                str(item)
+                for item in outline.get("mentioned_character_card_ids") or []
+            ],
+            "referenced_worldbook_card_ids": [
+                str(item)
+                for item in outline.get("referenced_worldbook_card_ids") or []
+            ],
+            "scenes": deepcopy(outline.get("scenes") or []),
+            "core_conflict": outline.get("core_conflict"),
+            "ending_hook": outline.get("ending_hook"),
+            "target_word_count": outline.get("target_word_count"),
+            "threads_resolved": [
+                str(item) for item in outline.get("threads_resolved") or []
+            ],
+        }
+
+    @staticmethod
+    def _outline_with_patch(
+        target_document: dict[str, Any],
+        target: RevisionTarget,
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge and fully revalidate any outline patch before formal write."""
+
+        outline = deepcopy(target_document.get("outline") or {})
+        scene: dict[str, Any] | None = None
+        if target.kind == "chapter_outline":
+            for field in ("core_conflict", "ending_hook"):
+                if field in patch:
+                    outline[field] = patch[field]
+        elif target.kind == "scene":
+            scenes = list(deepcopy(outline.get("scenes") or []))
+            scene_index = target.scene_index
+            if scene_index is None or scene_index >= len(scenes):
+                raise ValueError("Scene revision target no longer exists")
+            scene = dict(scenes[scene_index])
+            if "scene_summary" in patch:
+                scene["summary"] = patch["scene_summary"]
+            if "scene_purpose" in patch:
+                scene["purpose"] = patch["scene_purpose"]
+            scenes[scene_index] = scene
+            outline["scenes"] = scenes
+        else:
+            raise ValueError("Outline validation requires an outline target")
+
+        version = require_known_scene_contract_version(outline)
+        if version == SCENE_TRANSITION_CONTRACT_VERSION:
+            exact_projection = AgentRevisionProposalService._outline_edit_projection(
+                outline
+            )
+            parsed = ChapterOutlineEditSchema.model_validate(
+                exact_projection
+            )
+            if v2_outline_structure(outline) != v2_outline_structure(
+                parsed.model_dump(mode="python")
+            ):
+                raise ValueError("Outline revision cannot change V2 contract structure")
+            if chapter_outline_context_prompt_utf8_bytes(exact_projection) > (
+                MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES
+            ):
+                raise ValueError(
+                    "V2 chapter outline exceeds the downstream context budget"
+                )
+        elif scene is not None:
+            LegacySceneSchema.model_validate(scene)
+        return outline
 
     @staticmethod
     def _source_from_run(
@@ -337,6 +433,12 @@ class AgentRevisionProposalService:
         prepared_patch = self._validate_patch(target, patch)
         target_document = await self._load_target(novel_id, target)
         self._ensure_target_within_run_scope(run, target, target_document)
+        if target.kind in {"chapter_outline", "scene"}:
+            self._outline_with_patch(
+                target_document,
+                target,
+                prepared_patch,
+            )
         target_revision = _digest(self._target_view(target, target_document))
         now = get_utc_now()
         proposal_id = ObjectId()
@@ -438,7 +540,7 @@ class AgentRevisionProposalService:
         proposal_id = str(command["proposal_id"])
         novel_id = str(mutation.journal["novel_id"])
         target = RevisionTarget.model_validate(command["target"])
-        patch = dict(command["patch"])
+        raw_patch = dict(command["patch"])
         proposals = get_database()[collections.AGENT_REVISION_PROPOSALS]
         proposal = await proposals.find_one(
             {"_id": to_object_id(proposal_id)},
@@ -458,6 +560,16 @@ class AgentRevisionProposalService:
             raise RevisionProposalConflict(
                 f"Proposal cannot be applied from status {proposal.get('status')}"
             )
+
+        try:
+            patch = AgentRevisionProposalService._validate_patch(
+                target,
+                RevisionPatch.model_validate(raw_patch),
+            )
+        except ValueError as exc:
+            raise StaleRevisionProposal(
+                "修订提案不再满足当前字段合同"
+            ) from exc
 
         expected_narrative_revision = int(command["narrative_revision"])
         if not mutation.was_received("target"):
@@ -506,23 +618,32 @@ class AgentRevisionProposalService:
                 else:
                     chapter_id = str(target.chapter_id)
                     if target.kind == "chapter_outline":
-                        outline = deepcopy(target_document.get("outline") or {})
-                        outline.update(patch)
+                        try:
+                            outline = AgentRevisionProposalService._outline_with_patch(
+                                target_document,
+                                target,
+                                patch,
+                            )
+                        except ValueError as exc:
+                            raise StaleRevisionProposal(
+                                "章纲修订不再满足当前章纲合同"
+                            ) from exc
                         await chapter_repo.update_chapter(
                             chapter_id,
                             {"outline": outline},
                             session=session,
                         )
                     elif target.kind == "scene":
-                        outline = deepcopy(target_document.get("outline") or {})
-                        scenes = list(deepcopy(outline.get("scenes") or []))
-                        scene = dict(scenes[int(target.scene_index)])
-                        if "scene_summary" in patch:
-                            scene["summary"] = patch["scene_summary"]
-                        if "scene_purpose" in patch:
-                            scene["purpose"] = patch["scene_purpose"]
-                        scenes[int(target.scene_index)] = scene
-                        outline["scenes"] = scenes
+                        try:
+                            outline = AgentRevisionProposalService._outline_with_patch(
+                                target_document,
+                                target,
+                                patch,
+                            )
+                        except ValueError as exc:
+                            raise StaleRevisionProposal(
+                                "场景修订不再满足当前章纲合同"
+                            ) from exc
                         await chapter_repo.update_chapter(
                             chapter_id,
                             {"outline": outline},
@@ -638,6 +759,22 @@ class AgentRevisionProposalService:
                 await self._mark_stale(proposal_id, reason)
                 raise StaleRevisionProposal(reason)
 
+            try:
+                proposed_patch = self._validate_patch(
+                    target,
+                    RevisionPatch.model_validate(proposal["patch"]),
+                )
+                if target.kind in {"chapter_outline", "scene"}:
+                    self._outline_with_patch(
+                        current_target,
+                        target,
+                        proposed_patch,
+                    )
+            except ValueError as exc:
+                reason = "章纲修订不再满足当前章纲合同"
+                await self._mark_stale(proposal_id, reason)
+                raise StaleRevisionProposal(reason) from exc
+
             claimed = await self.collection.find_one_and_update(
                 {
                     "_id": proposal["_id"],
@@ -670,6 +807,23 @@ class AgentRevisionProposalService:
                 f"修订提案当前状态不能接受: {proposal.get('status')}"
             )
 
+        target = RevisionTarget.model_validate(proposal["target"])
+        try:
+            prepared_command_patch = self._validate_patch(
+                target,
+                RevisionPatch.model_validate(proposal["patch"]),
+            )
+            if target.kind in {"chapter_outline", "scene"}:
+                self._outline_with_patch(
+                    await self._load_target(str(proposal["novel_id"]), target),
+                    target,
+                    prepared_command_patch,
+                )
+        except ValueError as exc:
+            reason = "章纲修订不再满足当前章纲合同"
+            await self._mark_stale(proposal_id, reason)
+            raise StaleRevisionProposal(reason) from exc
+
         command = MutationCommand(
             novel_id=str(proposal["novel_id"]),
             idempotency_key=f"apply-agent-revision:{proposal_id}",
@@ -679,7 +833,7 @@ class AgentRevisionProposalService:
                 "proposal_id": proposal_id,
                 "actor_id": actor_id,
                 "target": deepcopy(proposal["target"]),
-                "patch": deepcopy(proposal["patch"]),
+                "patch": deepcopy(prepared_command_patch),
                 "target_revision": proposal["target_revision"],
                 "narrative_revision": int(
                     (proposal.get("context_snapshot") or {}).get(

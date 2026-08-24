@@ -29,6 +29,8 @@ const PROSE_REASON_KEYS = {
   prose_no_progress: "proseNoProgress",
   prose_no_progress_without_quota: "proseNoProgressWithoutQuota",
   prose_scene_divergence_stopped: "proseSceneDivergenceStopped",
+  scene_word_budget_exceeded: "sceneWordBudgetExceeded",
+  scene_word_budget_below_minimum: "sceneWordBudgetBelowMinimum",
   uncertain_provider_attempt: "uncertainProviderAttempt",
   completion_contract_failed: "completionContractFailed",
 } as const;

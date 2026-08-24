@@ -12,7 +12,9 @@ import type {
   ContextReport,
   DroppedIds,
   RemappedReference,
+  Scene,
 } from "./outlineTypes";
+import { isSceneTransitionContract } from "./outlineTypes";
 
 export function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -37,6 +39,104 @@ export function Notice({
       ? "mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
       : "mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300";
   return <div className={className}>{children}</div>;
+}
+
+export function SceneContractDetails({ scene }: { scene: Scene }) {
+  const t = useTranslations("writing.outline");
+  if (!isSceneTransitionContract(scene)) return null;
+
+  const conditionList = (
+    title: string,
+    conditions: typeof scene.preconditions,
+  ) => (
+    <div className="grid min-w-0 gap-1">
+      <h6 className="text-xs font-semibold text-foreground">{title}</h6>
+      {conditions.length > 0 ? (
+        <ul className="grid gap-1">
+          {conditions.map((condition) => (
+            <li key={condition.condition_id} className="min-w-0 break-words text-xs leading-5 text-muted">
+              <code className="mr-1 break-all text-[11px] text-foreground">
+                {condition.condition_id}
+              </code>
+              {condition.description}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-xs text-muted">{t("sceneContractNone")}</p>
+      )}
+    </div>
+  );
+
+  return (
+    <details open className="min-w-0 rounded-md border border-border bg-background px-3 py-2">
+      <summary className="cursor-pointer break-words text-xs font-semibold text-foreground">
+        {t("sceneContractSummary", {
+          sceneId: scene.scene_id,
+          min: scene.word_budget.min,
+          target: scene.word_budget.target,
+          max: scene.word_budget.max,
+        })}
+      </summary>
+      <div className="mt-3 grid min-w-0 gap-3">
+        <dl className="grid min-w-0 gap-2 text-xs sm:grid-cols-2">
+          <div className="min-w-0">
+            <dt className="font-medium text-muted">{t("sceneContractEventKey")}</dt>
+            <dd className="break-all text-foreground">{scene.event_key}</dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="font-medium text-muted">{t("sceneContractRepetition")}</dt>
+            <dd className="break-words text-foreground">
+              {t(`sceneContractRepetitionPolicies.${scene.repetition_policy}`)}
+            </dd>
+          </div>
+        </dl>
+
+        {conditionList(t("sceneContractPreconditions"), scene.preconditions)}
+
+        <div className="grid min-w-0 gap-1">
+          <h6 className="text-xs font-semibold text-foreground">{t("sceneContractBeats")}</h6>
+          <ol className="grid gap-2">
+            {scene.beats.map((beat) => (
+              <li key={beat.beat_id} className="min-w-0 rounded-md bg-surface px-2 py-1.5 text-xs leading-5">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <code className="break-all text-[11px] text-foreground">{beat.beat_id}</code>
+                  <span className="rounded border border-border px-1 text-[10px] text-muted">
+                    {beat.required ? t("sceneContractRequired") : t("sceneContractOptional")}
+                  </span>
+                </div>
+                <p className="break-words text-foreground">{beat.description}</p>
+                <p className="break-words text-muted">
+                  {t("sceneContractExpectedTransition", {
+                    transition: beat.expected_transition,
+                  })}
+                </p>
+              </li>
+            ))}
+          </ol>
+        </div>
+
+        {conditionList(t("sceneContractPostconditions"), scene.postconditions)}
+        {conditionList(t("sceneContractForbidden"), scene.forbidden_conditions)}
+
+        <div className="grid min-w-0 gap-1">
+          <h6 className="text-xs font-semibold text-foreground">{t("sceneContractDeltas")}</h6>
+          <ul className="grid gap-1">
+            {scene.narrative_delta.map((delta) => (
+              <li key={delta.delta_id} className="min-w-0 break-words text-xs leading-5 text-muted">
+                <code className="mr-1 break-all text-[11px] text-foreground">{delta.delta_id}</code>
+                {t("sceneContractDelta", {
+                  dimension: t(`sceneContractDimensions.${delta.dimension}`),
+                  before: delta.before,
+                  after: delta.after,
+                })}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </details>
+  );
 }
 
 /**
@@ -165,6 +265,7 @@ export function RowEditor<T>({
   addLabel,
   removeLabel,
   blank,
+  structureLocked = false,
   onChange,
   render,
 }: {
@@ -173,6 +274,7 @@ export function RowEditor<T>({
   addLabel: string;
   removeLabel: string;
   blank: T;
+  structureLocked?: boolean;
   onChange: (rows: T[]) => void;
   render: (row: T, update: (patch: Partial<T>) => void, index: number) => ReactNode;
 }) {
@@ -183,7 +285,8 @@ export function RowEditor<T>({
         <button
           type="button"
           onClick={() => onChange([...rows, blank])}
-          className="rounded-md border border-border px-2 py-1 text-xs text-muted hover:bg-surface-secondary hover:text-foreground"
+          disabled={structureLocked}
+          className="rounded-md border border-border px-2 py-1 text-xs text-muted hover:bg-surface-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
           {addLabel}
         </button>
@@ -204,7 +307,8 @@ export function RowEditor<T>({
               <button
                 type="button"
                 onClick={() => onChange(rows.filter((_, i) => i !== index))}
-                className="text-xs text-red-600 hover:underline dark:text-red-400"
+                disabled={structureLocked}
+                className="text-xs text-red-600 hover:underline disabled:cursor-not-allowed disabled:opacity-50 dark:text-red-400"
               >
                 {removeLabel}
               </button>

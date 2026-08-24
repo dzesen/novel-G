@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -26,6 +27,7 @@ from backend.services.generation.prose_protocol import (
     is_scene_continuation_v3_family,
 )
 from backend.services.generation.prose_generation import UncertainProseAttempt
+from backend.scene_contract_versions import require_known_scene_contract_version
 from backend.services.generation.job_relations import related_prose_run_ids
 from backend.services.llm.context_builder import normalize_outline_references
 from backend.services.novel.chapter_service import count_chapter_words
@@ -315,6 +317,31 @@ def _run_has_uncertain_attempt(document: dict[str, Any]) -> bool:
         segment.get("status") == "uncertain"
         for segment in document.get("segments") or []
     )
+
+
+def _stored_plan_identity_for_resume(
+    stored_plan: dict[str, Any],
+    *,
+    outline: dict[str, Any],
+) -> dict[str, Any]:
+    """Backfill only derivable fields absent from pre-V2 legacy-outline runs."""
+
+    normalized = dict(stored_plan)
+    if require_known_scene_contract_version(outline) != "legacy_v1":
+        return normalized
+    budgets = normalized.get("segment_budgets")
+    ratio = normalized.get("minimum_completion_ratio")
+    if "segment_minimums" not in normalized:
+        try:
+            normalized["segment_minimums"] = [
+                math.ceil(int(budget) * float(ratio))
+                for budget in list(budgets)
+            ]
+        except (TypeError, ValueError, OverflowError):
+            return normalized
+    if "segment_maximums" not in normalized:
+        normalized["segment_maximums"] = []
+    return normalized
 
 
 def _leftover_reason_codes(document: dict[str, Any]) -> list[str]:
@@ -631,7 +658,10 @@ class ProseRunModule:
                     "正文草稿基于旧细纲、旧上下文或旧来源证据，"
                     "不能静默续写；请保留旧稿参考并重新生成"
                 )
-            if dict(existing.get("plan") or {}) != plan.to_dict():
+            if _stored_plan_identity_for_resume(
+                dict(existing.get("plan") or {}),
+                outline=outline,
+            ) != plan.to_dict():
                 await prose_run_repo.mark_status(
                     run_id=run_id,
                     owner_id=owner_id,
@@ -913,6 +943,28 @@ class ProseRunModule:
         """Return one owned run's metadata without exposing prose or prompts."""
         run = await prose_run_repo.get_run(run_id, owner_id)
         return serialize_prose_run_telemetry(run)
+
+    async def load_candidate_text_for_validation(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        chapter_id: str,
+        expected_revision: int,
+        expected_digest: str,
+    ) -> str:
+        """Read the exact draft used to revalidate evidence before mutation."""
+
+        run = await prose_run_repo.get_run(run_id, owner_id)
+        if (
+            str(run.get("chapter_id") or "") != str(chapter_id)
+            or int(run.get("revision") or 0) != int(expected_revision)
+        ):
+            raise ValueError("正文候选验证快照已经变化")
+        text = prose_run_draft_text(run)
+        if chapter_content_digest(text) != str(expected_digest):
+            raise ValueError("正文候选验证快照摘要已经变化")
+        return text
 
     async def prepare_accept_mutation(
         self,

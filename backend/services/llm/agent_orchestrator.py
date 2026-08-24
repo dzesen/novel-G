@@ -209,8 +209,8 @@ _AGENT_BY_ID = {profile.agent_id: profile for profile in _AGENT_PROFILES}
 class SceneRewriteResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    summary: str = Field(min_length=5, max_length=1200)
-    purpose: str = Field(min_length=5, max_length=600)
+    summary: str = Field(min_length=5, max_length=500)
+    purpose: str = Field(min_length=5, max_length=200)
 
 
 class CreativeDirection(BaseModel):

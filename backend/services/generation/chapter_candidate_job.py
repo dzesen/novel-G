@@ -15,7 +15,8 @@ from typing import Any
 from bson import ObjectId
 
 from backend.services.generation.candidate_repair_contracts import (
-    AdherenceCandidateCheckpointV1,
+    AdherenceCandidateCheckpoint,
+    AdherenceCandidateCheckpointV3,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
     JobMutationRecoveryBindingV1,
@@ -454,12 +455,13 @@ def _validated_discarded_attempt_ids(
 
 
 def _adherence_result(
-    checkpoint: AdherenceCandidateCheckpointV1,
+    checkpoint: AdherenceCandidateCheckpoint,
 ) -> ChapterGenerationResult:
     source = checkpoint.source
-    return ChapterGenerationResult(
-        stage=ChapterGenerationStage.OUTLINE_ADHERENCE,
-        value={
+    if isinstance(checkpoint, AdherenceCandidateCheckpointV3):
+        value = checkpoint.validated_evidence.model_dump(mode="json")
+    else:
+        value = {
             "verdict": checkpoint.verdict,
             "issues": [
                 {"category": category}
@@ -475,7 +477,10 @@ def _adherence_result(
             "source_prose_run_id": source.source_run_id,
             "source_prose_run_revision": source.source_run_revision,
             "source_content_digest": source.source_content_digest,
-        },
+        }
+    return ChapterGenerationResult(
+        stage=ChapterGenerationStage.OUTLINE_ADHERENCE,
+        value=value,
         usage={},
         attempts=[],
         truncation={},

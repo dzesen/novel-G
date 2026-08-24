@@ -10,7 +10,11 @@ from dataclasses import dataclass, replace
 from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 
 from backend.llm.prompts.prompt_selector import PROSE_PROMPT_NAME, load_prompt_config
-from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
+from backend.llm.schemas.novel_pydantic import (
+    MAX_CHAPTER_OUTLINE_SCENES,
+    chapter_outline_response_utf8_bytes,
+)
+from backend.scene_contract_versions import MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
 from backend.services.llm.context_builder import (
     DEFAULT_CONTEXT_TOKEN_BUDGET,
     assemble_context,
@@ -81,6 +85,16 @@ _GENERATION_OVERRIDE_KEYS = frozenset({
     "presence_penalty",
     "frequency_penalty",
 })
+
+# ``_build_prompts`` serializes the source outline with the default JSON
+# separators, which add one ASCII space after every comma and colon.  Every
+# such separator already occupies at least one byte in the compact Provider
+# response, so an additional full response-cap worth of bytes is a proven
+# upper bound for *all* legal scene/array-count combinations.  This avoids
+# mistaking a handful of structural endpoint samples for the true maximum.
+UNKNOWN_V2_OUTLINE_JSON_SEPARATOR_MARGIN = (
+    MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+)
 
 
 @dataclass(frozen=True)
@@ -162,29 +176,281 @@ def build_prose_base_prompt(
 
 
 def _unknown_outline_prompt_envelope() -> dict[str, Any]:
-    """Return the schema-sized, content-free upper envelope for one outline.
+    """Return a valid V2 outline that saturates its Provider response bound.
 
     An outline is not available until its own accepted write has occurred.
-    Until then the initial authorization must cover the bounded schema shape;
-    after acceptance the job recalculates from the real scene list and can only
-    narrow its existing authority without a new confirmation.
+    This one-scene shape maximizes the part repeated as ``current_scene`` while
+    also filling every bounded nested array.  The 16KB response Gate and 20KB
+    stored-context Gate jointly bound any later accepted outline; call-count
+    planning separately retains the 20-scene ceiling.
     """
     widest = "\U0001f600"
+    semantic = widest * 16
     scene = {
-        "summary": widest * 500,
-        "purpose": widest * 200,
+        "contract_version": "scene_transition_contract.v2",
+        "scene_id": "scene-authorization-maximum",
+        "summary": (widest * 209) + "xx",
+        "purpose": semantic,
+        "preconditions": [
+            {
+                "condition_id": f"pre-{index}",
+                "description": semantic,
+            }
+            for index in range(20)
+        ],
+        "beats": [
+            {
+                "beat_id": f"beat-{index}",
+                "description": semantic,
+                "expected_transition": semantic,
+                "required": True,
+            }
+            for index in range(20)
+        ],
+        "postconditions": [
+            {
+                "condition_id": f"post-{index}",
+                "description": semantic,
+            }
+            for index in range(20)
+        ],
+        "forbidden_conditions": [
+            {
+                "condition_id": f"forbid-{index}",
+                "description": semantic,
+            }
+            for index in range(20)
+        ],
+        "narrative_delta": [
+            {
+                "delta_id": f"delta-{index}",
+                "dimension": "risk",
+                "before": semantic,
+                "after": f"{semantic[:-1]}x",
+            }
+            for index in range(20)
+        ],
+        "event_key": "authorization.maximum-scene",
+        "repetition_policy": "allow",
+        "word_budget": {"min": 1, "target": 50_000, "max": 50_000},
     }
     return {
+        "scene_contract_version": "scene_transition_contract.v2",
         "pov_character_card_id": None,
         "present_character_card_ids": [],
         "mentioned_character_card_ids": [],
         "referenced_worldbook_card_ids": [],
-        "scenes": [dict(scene) for _ in range(MAX_CHAPTER_OUTLINE_SCENES)],
-        "core_conflict": widest * 500,
-        "ending_hook": widest * 500,
+        "scenes": [scene],
+        "core_conflict": "x",
+        "ending_hook": "x",
         "target_word_count": 50_000,
         "threads_resolved": [],
+        "new_threads": [],
+        "new_reference_card_candidates": [],
     }
+
+
+def _unknown_dense_outline_prompt_envelope() -> dict[str, Any]:
+    """Saturate the response cap with the densest legal scene structure.
+
+    Pretty/sorted JSON used by downstream repair prompts adds separators and
+    repeated keys that compact response bytes do not contain.  A one-scene
+    semantic maximum and this twenty-scene structural maximum therefore form
+    distinct conservative authorization cases.
+    """
+
+    scene_target = 50_000 // MAX_CHAPTER_OUTLINE_SCENES
+    scenes = []
+    for index in range(1, MAX_CHAPTER_OUTLINE_SCENES + 1):
+        scenes.append({
+            "contract_version": "scene_transition_contract.v2",
+            "scene_id": f"s{index}",
+            "summary": "x",
+            "purpose": "x",
+            "preconditions": [
+                {"condition_id": f"p{index}", "description": "x"}
+            ],
+            "beats": [{
+                "beat_id": f"b{index}",
+                "description": "x",
+                "expected_transition": "x",
+                "required": True,
+            }],
+            "postconditions": [
+                {"condition_id": f"o{index}", "description": "x"}
+            ],
+            "forbidden_conditions": [],
+            "narrative_delta": [{
+                "delta_id": f"d{index}",
+                "dimension": "risk",
+                "before": "a",
+                "after": "b",
+            }],
+            "event_key": f"e.{index}",
+            "repetition_policy": "allow",
+            "word_budget": {
+                "min": 1,
+                "target": scene_target,
+                "max": scene_target,
+            },
+        })
+    outline = {
+        "scene_contract_version": "scene_transition_contract.v2",
+        "pov_character_card_id": None,
+        "present_character_card_ids": [],
+        "mentioned_character_card_ids": [],
+        "referenced_worldbook_card_ids": [],
+        "scenes": scenes,
+        "core_conflict": "x",
+        "ending_hook": "x",
+        "target_word_count": 50_000,
+        "threads_resolved": [],
+        "new_threads": [],
+        "new_reference_card_candidates": [],
+    }
+    remaining = (
+        MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+        - chapter_outline_response_utf8_bytes(outline)
+    )
+    for scene in scenes:
+        if remaining <= 0:
+            break
+        addition = min(500 - len(scene["summary"]), remaining)
+        scene["summary"] += "x" * addition
+        remaining -= addition
+    if (
+        remaining != 0
+        or chapter_outline_response_utf8_bytes(outline)
+        != MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+    ):
+        raise AssertionError("dense V2 outline envelope no longer saturates its cap")
+    return outline
+
+
+def _unknown_mixed_outline_prompt_envelope() -> dict[str, Any]:
+    """Return the legal three-scene/eighteen-entry mixed-structure case.
+
+    The maximum default-JSON whitespace overhead is not necessarily at the
+    one- or twenty-scene endpoints.  This regression envelope captures the
+    counterexample that exposed that gap; authorization additionally applies
+    ``UNKNOWN_V2_OUTLINE_JSON_SEPARATOR_MARGIN`` as the proof for the entire
+    legal structure space.
+    """
+
+    scene_count = 3
+    nested_count = 18
+    targets = [16_667, 16_667, 16_666]
+    scenes: list[dict[str, Any]] = []
+    expandable_fields: list[tuple[dict[str, Any], str, int]] = []
+    for scene_index in range(1, scene_count + 1):
+        scene = {
+            "contract_version": "scene_transition_contract.v2",
+            "scene_id": f"s{scene_index}",
+            "summary": "x",
+            "purpose": "x",
+            "preconditions": [
+                {
+                    "condition_id": f"p{scene_index}-{item_index}",
+                    "description": "x",
+                }
+                for item_index in range(1, nested_count + 1)
+            ],
+            "beats": [
+                {
+                    "beat_id": f"b{scene_index}-{item_index}",
+                    "description": "x",
+                    "expected_transition": "x",
+                    "required": True,
+                }
+                for item_index in range(1, nested_count + 1)
+            ],
+            "postconditions": [
+                {
+                    "condition_id": f"o{scene_index}-{item_index}",
+                    "description": "x",
+                }
+                for item_index in range(1, nested_count + 1)
+            ],
+            "forbidden_conditions": [
+                {
+                    "condition_id": f"f{scene_index}-{item_index}",
+                    "description": "x",
+                }
+                for item_index in range(1, nested_count + 1)
+            ],
+            "narrative_delta": [
+                {
+                    "delta_id": f"d{scene_index}-{item_index}",
+                    "dimension": "risk",
+                    "before": "a",
+                    "after": "b",
+                }
+                for item_index in range(1, nested_count + 1)
+            ],
+            "event_key": f"e.{scene_index}",
+            "repetition_policy": "allow",
+            "word_budget": {
+                "min": 1,
+                "target": targets[scene_index - 1],
+                "max": targets[scene_index - 1],
+            },
+        }
+        scenes.append(scene)
+        expandable_fields.extend([
+            (scene, "summary", 500),
+            (scene, "purpose", 200),
+        ])
+        for condition_group in (
+            scene["preconditions"],
+            scene["postconditions"],
+            scene["forbidden_conditions"],
+        ):
+            expandable_fields.extend(
+                (condition, "description", 500)
+                for condition in condition_group
+            )
+        for beat in scene["beats"]:
+            expandable_fields.extend([
+                (beat, "description", 500),
+                (beat, "expected_transition", 500),
+            ])
+        for delta in scene["narrative_delta"]:
+            expandable_fields.extend([
+                (delta, "before", 500),
+                (delta, "after", 500),
+            ])
+
+    outline = {
+        "scene_contract_version": "scene_transition_contract.v2",
+        "pov_character_card_id": None,
+        "present_character_card_ids": [],
+        "mentioned_character_card_ids": [],
+        "referenced_worldbook_card_ids": [],
+        "scenes": scenes,
+        "core_conflict": "x",
+        "ending_hook": "x",
+        "target_word_count": 50_000,
+        "threads_resolved": [],
+        "new_threads": [],
+        "new_reference_card_candidates": [],
+    }
+    remaining = (
+        MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+        - chapter_outline_response_utf8_bytes(outline)
+    )
+    for owner, field, maximum_length in expandable_fields:
+        if remaining <= 0:
+            break
+        addition = min(maximum_length - len(owner[field]), remaining)
+        owner[field] += "x" * addition
+        remaining -= addition
+    if (
+        remaining != 0
+        or chapter_outline_response_utf8_bytes(outline)
+        != MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+    ):
+        raise AssertionError("mixed V2 outline envelope no longer saturates its cap")
+    return outline
 
 def _unknown_outline_context_prompt_envelope() -> str:
     """Reserve the complete prose-context budget at worst-case UTF-8 width."""

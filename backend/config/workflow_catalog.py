@@ -6,11 +6,17 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from backend.scene_contract_versions import (
+    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    SCENE_TRANSITION_CONTRACT_VERSION,
+)
+
 
 class WorkflowStepDefinition(BaseModel):
     name: str
     label_key: str
     thinking_mode: Literal["enabled", "disabled"] | None = None
+    contract_version: str | None = None
 
 
 class WorkflowDefinition(BaseModel):
@@ -59,7 +65,13 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
     WorkflowDefinition(
         name="create_chapter_outline_by_ai",
         label_key="settings.workflow.catalog.create_chapter_outline_by_ai",
-        steps=(WorkflowStepDefinition(name="chapter_outline", label_key="settings.workflow.steps.chapter_outline"),),
+        steps=(
+            WorkflowStepDefinition(
+                name="chapter_outline",
+                label_key="settings.workflow.steps.chapter_outline",
+                contract_version=SCENE_TRANSITION_CONTRACT_VERSION,
+            ),
+        ),
     ),
     WorkflowDefinition(
         name="write_chapter_by_ai",
@@ -93,6 +105,7 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
             WorkflowStepDefinition(
                 name="outline_adherence",
                 label_key="settings.workflow.steps.outline_adherence",
+                contract_version=OUTLINE_ADHERENCE_EVIDENCE_VERSION,
             ),
         ),
     ),

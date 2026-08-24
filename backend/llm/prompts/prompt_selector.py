@@ -17,6 +17,12 @@ from typing import Any
 
 import yaml
 
+from backend.scene_contract_versions import (
+    CHAPTER_OUTLINE_PROMPT_REVISION,
+    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    SCENE_TRANSITION_CONTRACT_VERSION,
+)
+
 PROMPT_DIR = Path(__file__).resolve().parent
 CUSTOM_PROMPT_FILENAME = "prompt.yaml"
 DEFAULT_PROMPT_FILENAME = "prompt_default.yaml"
@@ -61,6 +67,8 @@ REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS: tuple[str, ...] = (
 )
 
 REQUIRED_CHAPTER_OUTLINE_PROMPT_KEYS: tuple[str, ...] = (
+    "contract_version",
+    "prompt_revision",
     "chapter_outline_prompt_base",
     "chapter_outline_prompt_with_schema_suffix",
     "chapter_outline_prompt_without_schema_suffix",
@@ -72,9 +80,12 @@ REQUIRED_PROSE_PROMPT_KEYS: tuple[str, ...] = (
 )
 
 REQUIRED_OUTLINE_ADHERENCE_PROMPT_KEYS: tuple[str, ...] = (
+    "contract_version",
     "outline_adherence_prompt_base",
     "outline_adherence_prompt_with_schema_suffix",
     "outline_adherence_prompt_without_schema_suffix",
+    "outline_adherence_v2_prompt_with_schema_suffix",
+    "outline_adherence_v2_prompt_without_schema_suffix",
 )
 
 REQUIRED_REFERENCE_CARDS_PROMPT_KEYS: tuple[str, ...] = (
@@ -190,6 +201,15 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
         "chapter_title",
         "chapter_content",
     },
+}
+
+PROMPT_CONTRACT_VERSIONS: dict[str, str] = {
+    CHAPTER_OUTLINE_PROMPT_NAME: SCENE_TRANSITION_CONTRACT_VERSION,
+    OUTLINE_ADHERENCE_PROMPT_NAME: OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+}
+
+PROMPT_REVISIONS: dict[str, str] = {
+    CHAPTER_OUTLINE_PROMPT_NAME: CHAPTER_OUTLINE_PROMPT_REVISION,
 }
 
 logger = logging.getLogger(__name__)
@@ -313,6 +333,24 @@ def _validate_prompt_section(
             errors.append(f"{section_name}.{key} 缺少占位符: {', '.join(sorted(missing_fields))}")
         if unknown_fields:
             errors.append(f"{section_name}.{key} 包含未支持的占位符: {', '.join(sorted(unknown_fields))}")
+
+    expected_contract_version = PROMPT_CONTRACT_VERSIONS.get(section_name)
+    if expected_contract_version is not None and section_prompts.get(
+        "contract_version"
+    ) != expected_contract_version:
+        errors.append(
+            f"{section_name}.contract_version 必须精确为 "
+            f"{expected_contract_version}"
+        )
+
+    expected_prompt_revision = PROMPT_REVISIONS.get(section_name)
+    if expected_prompt_revision is not None and section_prompts.get(
+        "prompt_revision"
+    ) != expected_prompt_revision:
+        errors.append(
+            f"{section_name}.prompt_revision 必须精确为 "
+            f"{expected_prompt_revision}"
+        )
 
     return errors
 

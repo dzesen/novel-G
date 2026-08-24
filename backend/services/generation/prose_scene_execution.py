@@ -93,9 +93,25 @@ def _scene_target_words(plan: ProseExecutionPlan, scene_index: int) -> int:
 
 
 def _scene_minimum_words(plan: ProseExecutionPlan, scene_index: int) -> int:
+    if plan.segment_minimums:
+        budget = plan.segment_minimums[
+            min(max(0, scene_index), len(plan.segment_minimums) - 1)
+        ]
+        return max(1, int(budget))
     return math.ceil(
         _scene_target_words(plan, scene_index) * plan.minimum_completion_ratio
     )
+
+
+def _scene_maximum_words(
+    plan: ProseExecutionPlan, scene_index: int
+) -> int | None:
+    if not plan.segment_maximums:
+        return None
+    budget = plan.segment_maximums[
+        min(max(0, scene_index), len(plan.segment_maximums) - 1)
+    ]
+    return max(1, int(budget))
 
 
 def effective_scene_divergence_stop_factor(
@@ -429,6 +445,7 @@ def _is_settled_reported_error(segment: Mapping[str, Any]) -> bool:
 def _is_scene_complete(
     *,
     scene_text: str,
+    raw_word_count: int,
     effective_word_count: int,
     finish_reason: str,
     plan: ProseExecutionPlan,
@@ -436,11 +453,15 @@ def _is_scene_complete(
 ) -> bool:
     # A length terminal is deliberately never accepted as a scene boundary, even
     # when it happened to reach the target length.
+    maximum_words = _scene_maximum_words(plan, scene_index)
+    normalized_effective_word_count = max(0, int(effective_word_count))
+    normalized_raw_word_count = max(0, int(raw_word_count))
     return bool(
         finish_reason == "stop"
         and scene_text.strip()
-        and max(0, int(effective_word_count))
+        and normalized_effective_word_count
         >= _scene_minimum_words(plan, scene_index)
+        and (maximum_words is None or normalized_raw_word_count <= maximum_words)
     )
 
 
@@ -521,6 +542,8 @@ def _scene_progress_snapshot(
         replay_measurement.replayed_characters_total
     )
     state["scene_target_words"] = _scene_target_words(plan, scene_index)
+    state["scene_minimum_words"] = _scene_minimum_words(plan, scene_index)
+    state["scene_maximum_words"] = _scene_maximum_words(plan, scene_index)
     converge_segments = [
         segment
         for segment in scene_segments
@@ -570,8 +593,16 @@ def _scene_progress_snapshot(
         state.setdefault("last_finish_reason", "unreported")
         state.setdefault("last_raw_finish_reason", "unreported")
 
-    if _is_scene_complete(
+    maximum_words = _scene_maximum_words(plan, scene_index)
+    if (
+        maximum_words is not None
+        and replay_measurement.raw_word_count > maximum_words
+    ):
+        state["status"] = "paused"
+        state["pause_reason"] = "scene_word_budget_exceeded"
+    elif _is_scene_complete(
         scene_text=scene_text,
+        raw_word_count=replay_measurement.raw_word_count,
         effective_word_count=replay_measurement.effective_word_count,
         finish_reason=str(state.get("last_finish_reason") or "unreported"),
         plan=plan,
@@ -643,6 +674,17 @@ def _scene_prompt(
     if frozenset(mode_instructions) != CONTINUATION_PROMPT_MODES:
         raise RuntimeError("Continuation prompt mode registry drifted")
     instruction = mode_instructions.get(prompt_mode, mode_instructions["base"])
+    contract_budget = current_scene.get("word_budget")
+    contract_budget_instruction = ""
+    if isinstance(contract_budget, Mapping):
+        minimum = contract_budget.get("min")
+        target = contract_budget.get("target")
+        maximum = contract_budget.get("max")
+        if all(type(value) is int for value in (minimum, target, maximum)):
+            contract_budget_instruction = (
+                f"本场合同字数范围为 {minimum} / {target} / {maximum} 字"
+                "（最低 / 目标 / 最高）；不得用重复内容填充，也不要超过最高值。\n"
+            )
     if (
         continues_truncated_output
         and prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
@@ -657,6 +699,7 @@ def _scene_prompt(
             f"SCENE_INDEX={scene_index}\n"
             f"CONTINUATION_MODE={prompt_mode}\n"
             f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
+            f"{contract_budget_instruction}"
             "本次只写当前场景，以本段目标为准。\n"
             f"{instruction}\n"
             f"当前场景：{current_scene}\n"
@@ -677,6 +720,7 @@ def _scene_prompt(
         f"SCENE_INDEX={scene_index}\n"
         f"CONTINUATION_MODE={prompt_mode}\n"
         f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
+        f"{contract_budget_instruction}"
         "本次只写当前场景，以本段目标为准。\n"
         f"{instruction}\n"
         "【本场已完成正文】\n"
@@ -1114,6 +1158,7 @@ async def execute_v3_prose_plan(
         )
         scene_complete = _is_scene_complete(
             scene_text=candidate_text,
+            raw_word_count=candidate_replay_measurement.raw_word_count,
             effective_word_count=(
                 candidate_replay_measurement.effective_word_count
             ),
@@ -1149,9 +1194,6 @@ async def execute_v3_prose_plan(
     for scene_index in range(plan.scene_count):
         while True:
             state = refresh_scene(scene_index)
-            if state.get("status") == "complete":
-                break
-
             scene_segments = _ordered_scene_segments(
                 by_sequence.values(), scene_index=scene_index
             )
@@ -1162,6 +1204,30 @@ async def execute_v3_prose_plan(
                 (spec for spec in scene_specs if spec.sequence_index not in by_sequence),
                 None,
             )
+            # Scene ``min`` and the chapter-wide 80% floor are independent.
+            # A low-minimum stop proves a scene boundary, but may skip frozen
+            # base parts only after supplying its proportional 80% share (the
+            # historical independent-completion seam), or after reaching the
+            # hard scene maximum where another call could only risk overrun.
+            if state.get("status") == "complete":
+                maximum_words = _scene_maximum_words(plan, scene_index)
+                may_end_before_remaining_base = bool(
+                    int(state.get("effective_word_count") or 0)
+                    >= math.ceil(
+                        _scene_target_words(plan, scene_index)
+                        * plan.minimum_completion_ratio
+                    )
+                    or (
+                        maximum_words is not None
+                        and int(state.get("raw_word_count") or 0)
+                        >= maximum_words
+                    )
+                )
+                if missing_base is None or may_end_before_remaining_base:
+                    break
+            if state.get("pause_reason") == "scene_word_budget_exceeded":
+                pause_reason = "scene_word_budget_exceeded"
+                break
 
             # A manual click is deliberately one provider call only. It never
             # silently spills into another base part, scene, or automatic quota.

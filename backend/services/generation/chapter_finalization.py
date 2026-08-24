@@ -251,6 +251,18 @@ class ChapterFinalizationService:
             accept_partial=False,
             partial_acknowledgement=False,
         )
+        try:
+            candidate_text = (
+                await self._deps.prose_runs.load_candidate_text_for_validation(
+                    owner_id=owner_id,
+                    run_id=prose_run_id,
+                    chapter_id=chapter_id,
+                    expected_revision=prose_run_revision,
+                    expected_digest=str(prose_command.payload["text_digest"]),
+                )
+            )
+        except ValueError as exc:
+            raise ChapterFinalizationDenied(str(exc)) from exc
         stored_authorization = await self._verify_authorization(
             authorization,
             novel_id=prose_command.novel_id,
@@ -294,6 +306,7 @@ class ChapterFinalizationService:
             evidence=evidence,
             authorization=stored_authorization,
             chapter=chapter,
+            prose_text=candidate_text,
         )
         expected_revision = int(
             prose_command.payload["captured_narrative_revision"]
@@ -386,6 +399,7 @@ class ChapterFinalizationService:
         evidence: ChapterFinalizationEvidence,
         authorization: Mapping[str, Any],
         chapter: Mapping[str, Any],
+        prose_text: str,
     ) -> dict[str, Any]:
         completion = dict(prose_command.payload.get("completion") or {})
         if not completion_allows_formal_write(
@@ -402,6 +416,7 @@ class ChapterFinalizationService:
             adherence_metadata = validate_complete_outline_adherence(
                 adherence,
                 outline=outline,
+                prose=prose_text,
             )
         except OutlineAdherenceValidationError as exc:
             raise ChapterFinalizationDenied(str(exc)) from exc

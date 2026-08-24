@@ -74,6 +74,7 @@ interface StartJobDialogProps {
   onNavigateToReferenceCards: () => void;
   onNavigateToWorldBaseline: () => void;
   onNavigateToBookStructure: () => void;
+  onNavigateToChapterOutline: (chapterId: string) => void;
 }
 
 export default function StartJobDialog({
@@ -92,6 +93,7 @@ export default function StartJobDialog({
   onNavigateToReferenceCards,
   onNavigateToWorldBaseline,
   onNavigateToBookStructure,
+  onNavigateToChapterOutline,
 }: StartJobDialogProps) {
   const t = useTranslations("writing.batch");
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -914,6 +916,11 @@ export default function StartJobDialog({
                   );
                   const requiresAck = issue.level === "warning_requires_ack";
                   const blocked = issue.level === "blocked";
+                  const chapterIds = issue.details.chapter_ids;
+                  const firstChapterId = Array.isArray(chapterIds)
+                    && typeof chapterIds[0] === "string"
+                    ? chapterIds[0]
+                    : null;
                   return (
                     <div
                       key={issue.code}
@@ -1010,6 +1017,21 @@ export default function StartJobDialog({
                           className="mt-2 text-xs font-medium text-accent hover:underline"
                         >
                           {t("readinessOpenBookStructure")}
+                        </button>
+                      )}
+                      {issue.action_codes.some((code) =>
+                        code === "regenerate_chapter_outline"
+                        || code === "review_chapter_outline"
+                      ) && firstChapterId && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onNavigateToChapterOutline(firstChapterId);
+                          }}
+                          className="mt-2 text-xs font-medium text-accent hover:underline"
+                        >
+                          {t("readinessOpenChapterOutline")}
                         </button>
                       )}
                     </div>

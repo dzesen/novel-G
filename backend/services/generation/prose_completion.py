@@ -18,6 +18,10 @@ from backend.services.generation.prose_completion_contract import (
 )
 from backend.services.generation.prose_protocol import CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 from backend.services.novel.chapter_service import count_chapter_words
+from backend.scene_contract_versions import (
+    SCENE_TRANSITION_CONTRACT_VERSION,
+    require_known_scene_contract_version,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,8 @@ class ProseExecutionPlan:
     minimum_completion_ratio: float
     segment_budgets: tuple[int, ...]
     reason_codes: tuple[str, ...]
+    segment_minimums: tuple[int, ...] = ()
+    segment_maximums: tuple[int, ...] = ()
     protocol_revision: str = CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
     # Kept as a non-serialized compatibility attribute while v2 runs remain
     # readable. New plans never use it as a continuation authorization.
@@ -69,6 +75,8 @@ class ProseExecutionPlan:
             "safe_output_budget": self.safe_output_budget,
             "minimum_completion_ratio": self.minimum_completion_ratio,
             "segment_budgets": list(self.segment_budgets),
+            "segment_minimums": list(self.segment_minimums),
+            "segment_maximums": list(self.segment_maximums),
             "reason_codes": list(self.reason_codes),
             "protocol_revision": self.protocol_revision,
             "scheduled_base_call_count": self.scheduled_base_call_count,
@@ -212,7 +220,52 @@ class ProseCompletionModule:
                 reason_codes.append("requested_words_exceed_safe_output")
             if scene_count_requires_segmentation:
                 reason_codes.append("scene_count_requires_segmentation")
-        budgets = _allocate_budgets(requested, scene_count)
+        scene_contract_version = require_known_scene_contract_version(outline)
+        if scene_contract_version == SCENE_TRANSITION_CONTRACT_VERSION:
+            minimums: list[int] = []
+            targets: list[int] = []
+            maximums: list[int] = []
+            for scene in scenes:
+                word_budget = (
+                    scene.get("word_budget")
+                    if isinstance(scene, dict)
+                    else None
+                )
+                if not isinstance(word_budget, dict):
+                    raise ValueError("V2 scene contract is missing word_budget")
+                values = (
+                    word_budget.get("min"),
+                    word_budget.get("target"),
+                    word_budget.get("max"),
+                )
+                if any(
+                    type(value) is not int or value < 1
+                    for value in values
+                ):
+                    raise ValueError("V2 scene word budget must use positive integers")
+                minimum, target, maximum = values
+                if not minimum <= target <= maximum:
+                    raise ValueError(
+                        "V2 scene word budget must satisfy min <= target <= max"
+                    )
+                minimums.append(minimum)
+                targets.append(target)
+                maximums.append(maximum)
+            if sum(targets) != requested:
+                raise ValueError(
+                    "V2 scene target budgets must equal requested_word_count"
+                )
+            budgets = tuple(targets)
+            segment_minimums = tuple(minimums)
+            segment_maximums = tuple(maximums)
+            reason_codes.append("scene_contract_word_budgets")
+        else:
+            budgets = _allocate_budgets(requested, scene_count)
+            segment_minimums = tuple(
+                math.ceil(budget * self._minimum_completion_ratio)
+                for budget in budgets
+            )
+            segment_maximums = ()
 
         return ProseExecutionPlan(
             requested_word_count=requested,
@@ -223,6 +276,8 @@ class ProseCompletionModule:
             minimum_completion_ratio=self._minimum_completion_ratio,
             segment_budgets=budgets,
             reason_codes=tuple(reason_codes),
+            segment_minimums=segment_minimums,
+            segment_maximums=segment_maximums,
         )
 
     def inspect(

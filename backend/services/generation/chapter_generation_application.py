@@ -39,6 +39,7 @@ from backend.llm.prompts.prompt_selector import (
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
+    ChapterOutlineAdherenceEvidenceSchema,
     ChapterOutlineAdherenceResultSchema,
     ChapterOutlineResultSchema,
     ChapterStateResultSchema,
@@ -73,7 +74,15 @@ from backend.services.generation.protected_generation_params import (
     validate_protected_generation_params,
 )
 from backend.services.generation.outline_adherence import (
+    OUTLINE_ADHERENCE_SYSTEM_PROMPT,
     normalize_outline_adherence,
+    validate_beat_evidence,
+)
+from backend.scene_contract_versions import (
+    MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    SCENE_TRANSITION_CONTRACT_VERSION,
+    require_known_scene_contract_version,
 )
 from backend.services.llm.context_builder import (
     assemble_context,
@@ -139,6 +148,9 @@ CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
         key=CHAPTER_OUTLINE_STEP,
         schema=ChapterOutlineResultSchema,
         agent_id="chapter_planner",
+        max_structured_raw_output_bytes=(
+            MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+        ),
         prompt_args=lambda ctx: {
             "context": ctx.params["context"],
             "chapter_order": ctx.params["chapter_order"],
@@ -465,6 +477,9 @@ class _PreparedOutlineAdherence:
     runtime: Any
     plan: Any
     truncation: dict[str, Any]
+    prose: str
+    outline: dict[str, Any]
+    result_schema: type[BaseModel]
 
 
 @dataclass(frozen=True)
@@ -1181,13 +1196,19 @@ class ChapterGenerationApplicationService:
             candidate.text
             if candidate is not None
             else str(chapter.get("content") or "")
-        ).strip()
+        )
         if candidate is not None:
             self._validate_prose_candidate(candidate)
-        if not content:
+        if not content.strip():
             raise ValueError("本章尚无可供细纲符合度检查的正文")
         if not chapter.get("outline"):
             raise ValueError("本章尚无可供细纲符合度检查的章节细纲")
+        outline = dict(chapter["outline"])
+        uses_v2_evidence = require_known_scene_contract_version(outline) == (
+            SCENE_TRANSITION_CONTRACT_VERSION
+        )
+        if uses_v2_evidence and candidate is None:
+            raise ValueError("V2 beat 证据必须绑定精确正文候选")
 
         inputs = await self._deps.fetch_context_inputs(
             command.novel_id,
@@ -1198,24 +1219,38 @@ class ChapterGenerationApplicationService:
             OUTLINE_ADHERENCE_PROMPT_NAME,
             {},
         )
+        if uses_v2_evidence and prompts.get("contract_version") != (
+            OUTLINE_ADHERENCE_EVIDENCE_VERSION
+        ):
+            raise ValueError("V2 beat 审核提示词合同版本无效")
         prompt_base = prompts["outline_adherence_prompt_base"].format(
             context=context.to_prompt_text(),
             chapter_order=int(chapter.get("order_index") or 0),
             chapter_title=str(chapter.get("title") or ""),
             chapter_content=content,
         )
+        with_schema_suffix = (
+            "outline_adherence_v2_prompt_with_schema_suffix"
+            if uses_v2_evidence
+            else "outline_adherence_prompt_with_schema_suffix"
+        )
+        without_schema_suffix = (
+            "outline_adherence_v2_prompt_without_schema_suffix"
+            if uses_v2_evidence
+            else "outline_adherence_prompt_without_schema_suffix"
+        )
         prompt_plan = PromptPlan(
             native_schema_prompt=apply_agent_profile(
                 "continuity_editor",
                 prompt_base
                 + "\n"
-                + prompts["outline_adherence_prompt_with_schema_suffix"],
+                + prompts[with_schema_suffix],
             ),
             prompt_json_prompt=apply_agent_profile(
                 "continuity_editor",
                 prompt_base
                 + "\n"
-                + prompts["outline_adherence_prompt_without_schema_suffix"],
+                + prompts[without_schema_suffix],
             ),
         )
         generation_values = dict(command.generation_params or {})
@@ -1224,6 +1259,7 @@ class ChapterGenerationApplicationService:
             for key, value in generation_values.items()
             if key in _GENERATION_OVERRIDE_KEYS and value is not None
         }
+        gen_kwargs["system_prompt"] = OUTLINE_ADHERENCE_SYSTEM_PROMPT
         runtime_kwargs = (
             {}
             if generation_values.get("allow_failure_retry", True)
@@ -1259,6 +1295,13 @@ class ChapterGenerationApplicationService:
                 "truncated_sections": list(context.truncated_sections),
                 "dropped_item_counts": dict(context.dropped_item_counts),
             },
+            prose=content,
+            outline=outline,
+            result_schema=(
+                ChapterOutlineAdherenceEvidenceSchema
+                if uses_v2_evidence
+                else ChapterOutlineAdherenceResultSchema
+            ),
         )
 
     @staticmethod
@@ -1296,7 +1339,7 @@ class ChapterGenerationApplicationService:
         try:
             generated = await prepared.runtime.generate_structured(
                 prepared.plan,
-                ChapterOutlineAdherenceResultSchema,
+                prepared.result_schema,
                 prepared.prompt_plan,
                 **prepared.gen_kwargs,
             )
@@ -1316,15 +1359,49 @@ class ChapterGenerationApplicationService:
             )
             return
 
-        review = normalize_outline_adherence(generated.value.model_dump())
-        candidate = prepared.command.prose_candidate
-        if candidate is not None:
-            review = {
-                **review,
-                "source_prose_run_id": candidate.source_run_id,
-                "source_prose_run_revision": candidate.source_run_revision,
-                "source_content_digest": candidate.source_content_digest,
-            }
+        try:
+            candidate = prepared.command.prose_candidate
+            if prepared.result_schema is ChapterOutlineAdherenceEvidenceSchema:
+                if candidate is None:  # guarded in prepare; fail-closed proof
+                    raise ValueError("V2 beat 证据缺少正文候选绑定")
+                review = validate_beat_evidence(
+                    generated.value.model_dump(),
+                    outline=prepared.outline,
+                    prose=prepared.prose,
+                    source_prose_run_id=candidate.source_run_id,
+                    source_prose_run_revision=candidate.source_run_revision,
+                    source_content_digest=candidate.source_content_digest,
+                )
+            else:
+                review = normalize_outline_adherence(
+                    generated.value.model_dump()
+                )
+            if (
+                candidate is not None
+                and prepared.result_schema
+                is not ChapterOutlineAdherenceEvidenceSchema
+            ):
+                review = {
+                    **review,
+                    "source_prose_run_id": candidate.source_run_id,
+                    "source_prose_run_revision": candidate.source_run_revision,
+                    "source_content_digest": candidate.source_content_digest,
+                }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            usage = generated.usage.model_dump()
+            yield ChapterGenerationEvent(
+                name="done",
+                data={
+                    "success": False,
+                    "failed_step": "outline_adherence",
+                    "error": str(exc),
+                    "usage": usage,
+                    "attempts": _serialize_attempts(prepared.runtime),
+                },
+            )
+            return
         usage = generated.usage.model_dump()
         attempts = _serialize_attempts(prepared.runtime)
         yield ChapterGenerationEvent(
@@ -1366,6 +1443,19 @@ class ChapterGenerationApplicationService:
         outline = dict(chapter.get("outline") or {})
         if not outline:
             raise ValueError("本章还没有已接受的细纲，请先生成并接受章节细纲")
+        scene_contract_version = require_known_scene_contract_version(outline)
+        resumes_frozen_legacy_run = bool(
+            command.resume_run_id
+            and type(command.expected_run_revision) is int
+            and command.expected_run_revision >= 0
+        )
+        if (
+            scene_contract_version != SCENE_TRANSITION_CONTRACT_VERSION
+            and not resumes_frozen_legacy_run
+        ):
+            raise ValueError(
+                "旧版章纲不能启动新的 AI 正文；请重新生成并接受 V2 场景合同章纲"
+            )
 
         inputs = await self._deps.fetch_context_inputs(
             command.novel_id,

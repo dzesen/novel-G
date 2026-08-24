@@ -53,6 +53,24 @@ STRUCTURED_REPAIR_PROMPT_REVISION = hashlib.sha256(
 ).hexdigest()
 
 
+def render_structured_repair_prompt(
+    *,
+    original_prompt: str,
+    schema: type[BaseModel],
+    produced: Any,
+) -> str:
+    """Render the exact local JSON-repair prompt used after validation fails."""
+
+    return _STRUCTURED_REPAIR_PROMPT_TEMPLATE.format(
+        original_prompt=original_prompt,
+        schema_json=json.dumps(
+            schema.model_json_schema(),
+            ensure_ascii=False,
+        ),
+        produced=produced,
+    )
+
+
 def _redacted_config_revision(
     config: dict[str, Any],
     *,
@@ -736,6 +754,7 @@ class GenerationRuntime:
         *,
         max_conservative_input_tokens: int | None = None,
         max_conservative_total_tokens: int | None = None,
+        max_structured_raw_output_bytes: int | None = None,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         attempt_offset = len(self.attempts)
@@ -767,8 +786,30 @@ class GenerationRuntime:
                 int(max_conservative_input_tokens)
                 + int(effective_output_tokens)
             )
+        if max_structured_raw_output_bytes is not None and (
+            isinstance(max_structured_raw_output_bytes, bool)
+            or not isinstance(max_structured_raw_output_bytes, int)
+            or max_structured_raw_output_bytes < 1
+        ):
+            raise ValueError("structured raw-output byte cap is invalid")
 
         schema_request_payload = structured_schema_request_payload(schema)
+
+        def enforce_structured_output_byte_cap(output: Any) -> None:
+            if max_structured_raw_output_bytes is None:
+                return
+            if isinstance(output, BaseModel):
+                rendered = json.dumps(
+                    output.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            else:
+                rendered = str(output)
+            if len(rendered.encode("utf-8")) > max_structured_raw_output_bytes:
+                raise ConservativeGenerationBoundExceeded(
+                    "structured output exceeds the frozen local-repair byte cap"
+                )
 
         def bounded_reservation(
             prompt: str,
@@ -866,15 +907,13 @@ class GenerationRuntime:
                 fallback_call,
                 bounded_reservation(prompts.prompt_json_prompt),
             )
+        enforce_structured_output_byte_cap(produced)
         try:
             value = produced if isinstance(produced, BaseModel) else _parse_structured_text(str(produced), schema)
         except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
-            repair_prompt = _STRUCTURED_REPAIR_PROMPT_TEMPLATE.format(
+            repair_prompt = render_structured_repair_prompt(
                 original_prompt=primary_prompt,
-                schema_json=json.dumps(
-                    schema.model_json_schema(),
-                    ensure_ascii=False,
-                ),
+                schema=schema,
                 produced=produced,
             )
 
@@ -888,6 +927,7 @@ class GenerationRuntime:
                 plan, plan.provider_alias, "repair", adapter, repair_call,
                 bounded_reservation(repair_prompt),
             )
+            enforce_structured_output_byte_cap(repaired)
             try:
                 value = _parse_structured_text(str(repaired), schema)
             except (ValidationError, ValueError, json.JSONDecodeError):
@@ -916,6 +956,8 @@ class GenerationRuntime:
                         includes_native_schema=True,
                     ),
                 )
+
+        enforce_structured_output_byte_cap(value)
 
         attempts = self.attempts[attempt_offset:]
         self._last_finish_reason = normalize_finish_reason(

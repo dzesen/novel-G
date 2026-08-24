@@ -24,6 +24,10 @@ from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineEditSchema,
     ChapterOutlineResultSchema,
 )
+from backend.scene_contract_versions import (
+    SCENE_TRANSITION_CONTRACT_VERSION,
+    require_known_scene_contract_version,
+)
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.emergent_reference_card_candidates import (
@@ -57,6 +61,34 @@ def _optional_object_id(value):
 def count_chapter_words(content: str) -> int:
     """按中文单字、英文单词和数字词组统计正文有效字数。"""
     return len(_WORD_TOKEN_RE.findall(content or ""))
+
+
+_V2_SCENE_STRUCTURE_FIELDS = (
+    "contract_version",
+    "scene_id",
+    "preconditions",
+    "beats",
+    "postconditions",
+    "forbidden_conditions",
+    "narrative_delta",
+    "event_key",
+    "repetition_policy",
+    "word_budget",
+)
+
+
+def v2_outline_structure(outline: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "scene_contract_version": outline.get("scene_contract_version"),
+        "target_word_count": outline.get("target_word_count"),
+        "scenes": [
+            {
+                field: scene.get(field)
+                for field in _V2_SCENE_STRUCTURE_FIELDS
+            }
+            for scene in list(outline.get("scenes") or [])
+        ],
+    }
 
 
 class ChapterService:
@@ -203,6 +235,10 @@ class ChapterService:
 
     @staticmethod
     async def update_chapter(chapter_id: str, update_data: Dict[str, Any]) -> bool:
+        if "outline" in update_data:
+            raise ValueError(
+                "Chapter outline updates must use the versioned outline service"
+            )
         if "status" in update_data and update_data["status"] not in VALID_CHAPTER_STATUSES:
             raise ValueError(f"Invalid chapter status: {update_data['status']}")
         allowed = {
@@ -212,7 +248,6 @@ class ChapterService:
             "status",
             "order_index",
             "word_count",
-            "outline",
             "prose_acceptance",
         }
         prepared = {key: value for key, value in update_data.items() if key in allowed}
@@ -404,6 +439,11 @@ class ChapterService:
                 "referenced_worldbook_card_ids": [
                     to_object_id(cid) for cid in payload["referenced_worldbook_card_ids"]
                 ],
+                **(
+                    {"scene_contract_version": payload["scene_contract_version"]}
+                    if payload.get("scene_contract_version")
+                    else {}
+                ),
                 "scenes": payload["scenes"],
                 "core_conflict": payload["core_conflict"],
                 "ending_hook": payload["ending_hook"],
@@ -635,6 +675,38 @@ class ChapterService:
         existing = chapter.get("outline")
         if not existing:
             raise ValueError("本章尚无细纲，请先生成细纲后再编辑，未做任何写入")
+        try:
+            existing_contract_version = require_known_scene_contract_version(
+                existing
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "现有章纲的场景合同版本未知，必须人工复核，未做任何写入"
+            ) from exc
+        if (
+            existing_contract_version == SCENE_TRANSITION_CONTRACT_VERSION
+            and payload.get("scene_contract_version")
+            != SCENE_TRANSITION_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "已接受的 V2 场景合同不能降级为 legacy_v1，未做任何写入"
+            )
+        if (
+            existing_contract_version == "legacy_v1"
+            and payload.get("scene_contract_version")
+            == SCENE_TRANSITION_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "legacy_v1 章纲不能通过普通编辑升级为 V2；请等待显式迁移流程"
+            )
+        if (
+            existing_contract_version == SCENE_TRANSITION_CONTRACT_VERSION
+            and v2_outline_structure(existing)
+            != v2_outline_structure(payload)
+        ):
+            raise ValueError(
+                "已接受的 V2 场景合同结构字段不能直接修改；请重新生成整份细纲"
+            )
 
         novel_id = str(chapter["novel_id"])
 
@@ -658,6 +730,11 @@ class ChapterService:
             "referenced_worldbook_card_ids": [
                 to_object_id(cid) for cid in payload["referenced_worldbook_card_ids"]
             ],
+            **(
+                {"scene_contract_version": payload["scene_contract_version"]}
+                if payload.get("scene_contract_version")
+                else {}
+            ),
             "scenes": payload["scenes"],
             "core_conflict": payload["core_conflict"],
             "ending_hook": payload["ending_hook"],

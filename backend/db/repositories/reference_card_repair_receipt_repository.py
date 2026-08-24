@@ -15,7 +15,7 @@ from pymongo.errors import DuplicateKeyError
 from backend.db import collections
 from backend.db.mongo import get_database
 from backend.db.utils import get_utc_now, to_object_id
-from backend.llm.schemas.novel_pydantic import ChapterOutlineResultSchema
+from backend.llm.schemas.novel_pydantic import ChapterOutlineProposalSchema
 from backend.services.generation.reference_card_auto_creation import (
     MAX_CANDIDATE_REPAIR_CYCLES_PER_CHAPTER,
 )
@@ -55,7 +55,7 @@ class ReferenceCardRepairReceiptEnvelope(BaseModel):
     claim_epoch: int = Field(ge=1, le=_MAX_CLAIM_EPOCH)
     claim_expires_at: datetime | None = None
     provider_attempt_ids: list[str] = Field(max_length=16)
-    result: ChapterOutlineResultSchema | None = None
+    result: ChapterOutlineProposalSchema | None = None
     result_digest: str | None = Field(default=None, pattern=_HEX_64_PATTERN)
     finish_reason: str | None = Field(default=None, min_length=1, max_length=80)
     created_at: datetime
@@ -407,7 +407,7 @@ class ReferenceCardRepairReceiptRepository:
         result_digest: str,
         finish_reason: str,
     ) -> dict[str, Any]:
-        parsed_result = ChapterOutlineResultSchema.model_validate(
+        parsed_result = ChapterOutlineProposalSchema.model_validate(
             dict(result)
         ).model_dump(mode="json")
         expected_result_digest = hashlib.sha256(

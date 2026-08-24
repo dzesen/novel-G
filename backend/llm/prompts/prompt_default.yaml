@@ -390,6 +390,8 @@ create_volume_outline_by_ai:
 
 # 章节细纲 Prompt 配置
 create_chapter_outline_by_ai:
+  contract_version: scene_transition_contract.v2
+  prompt_revision: chapter-outline-prompt-r2
   chapter_outline_prompt_base: |
     你是一位资深长篇小说编辑。请为第 {chapter_order} 章《{chapter_title}》撰写章节细纲。
     本章目标字数约 {words_per_chapter} 字。
@@ -400,7 +402,19 @@ create_chapter_outline_by_ai:
     {style_controls}
 
     要求：
-    - scenes：拆成 2-6 个场景，每场给出 summary（这一场发生了什么）与 purpose（这一场在全局的作用）。
+    - scene_contract_version 必须精确为 scene_transition_contract.v2。
+    - 整个章纲必须精炼。系统保存后形成的【本章细纲】上下文投影必须不超过
+      20,000 UTF-8 bytes；请把最终 JSON 响应控制在 16,000 UTF-8 bytes 以内，
+      避免同义复述，并优先保留可执行的条件、叙事拍与状态变化。
+    - scenes：拆成 2-6 个场景，每场都必须是可审计的状态转移合同：
+      - contract_version 精确为 scene_transition_contract.v2；scene_id 在本章唯一且按叙事顺序稳定编号。
+      - summary 和 purpose 保留给作者阅读。
+      - preconditions / postconditions / forbidden_conditions 中每项都有本章唯一 condition_id 和可核对描述。
+      - beats 把本场拆成原子叙事拍；每项给本章唯一 beat_id、description、expected_transition 和 required。
+        expected_transition 必须写明这一拍使知识、关系、目标、风险、选择或情绪发生了什么变化，不能只写“提到某事”。
+      - narrative_delta 每项给本章唯一 delta_id、dimension、before、after；before 与 after 不得同义复述。
+      - event_key 使用稳定的小写事件键；repetition_policy 只能为 forbid、allow_if_escalated 或 allow。
+      - word_budget 给出 min / target / max，满足 min <= target <= max；所有场景 target 之和必须精确等于 target_word_count。
     - core_conflict：本章的核心冲突，一句话。
     - ending_hook：章末钩子，让读者想读下一章。
     - target_word_count：本章目标字数，接近 {words_per_chapter}。
@@ -428,11 +442,12 @@ create_chapter_outline_by_ai:
       that will not matter again should not become candidates. Existing roster entries
       must continue to use their formal ids instead of being declared again.
   chapter_outline_prompt_with_schema_suffix: |
-    请严格按提供的 JSON Schema 输出。
+    请严格按提供的 JSON Schema 输出。最终 JSON 响应不得超过 16,000 UTF-8 bytes，
+    且保存后的【本章细纲】上下文投影不得超过 20,000 UTF-8 bytes。
   chapter_outline_prompt_without_schema_suffix: |
     请只输出 JSON，形如：
-    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"summary":"...","purpose":"..."}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[{"name":"...","description":"...","due_target":{"kind":"planned_ordinal","ordinal":120},"importance":"sub"}],"new_reference_card_candidates":[{"card_type":"character","name":"...","evidence_summary":"...","requires_review_before_next_chapter":false}]}
-    不要输出 JSON 以外的任何内容。
+    {"scene_contract_version":"scene_transition_contract.v2","pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"contract_version":"scene_transition_contract.v2","scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-1-delta-1","dimension":"goal","before":"尚未接受目标","after":"主动接受目标"}],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":1200,"target":1500,"max":1800}},{"contract_version":"scene_transition_contract.v2","scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-2-delta-1","dimension":"risk","before":"风险尚未暴露","after":"风险公开升级"}],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1200,"target":1500,"max":1800}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
+    整个 JSON 响应不得超过 16,000 UTF-8 bytes；不要输出 JSON 以外的任何内容。
 
 # 章节正文 Prompt 配置
 write_chapter_by_ai:
@@ -458,6 +473,7 @@ write_chapter_by_ai:
 
 # 章节正文相对细纲的语义符合度检查（批量生成门禁）
 review_chapter_outline_adherence_by_ai:
+  contract_version: chapter_outline_adherence_evidence.v2
   outline_adherence_prompt_base: |
     你是一位严谨但不过度机械的长篇小说责任编辑。请检查第 {chapter_order} 章
     《{chapter_title}》的正文是否在语义上落实了本章细纲，并仍然服务于当前卷大纲。
@@ -476,19 +492,32 @@ review_chapter_outline_adherence_by_ai:
     5. 是否偏离当前卷弧线，或提前完成后续阶段才应完成的目标。
 
     判定规则：
-    - pass：关键场景、核心冲突和结尾钩子均已落实；措辞、对话和过渡差异不算偏离。
-    - warn：存在轻微压缩、顺序微调或局部落实不充分，但不会改变本章及本卷走向。
-    - fail：遗漏或替换关键场景、核心冲突没有发生、结尾钩子被不兼容情节取代、
-      新增细纲外重大事件，或明显违反卷弧线。
+    - 仅当细纲是 legacy_v1 时返回 pass / warn / fail：关键场景、核心冲突和结尾钩子均落实才是 pass；
+      轻微压缩或顺序微调是 warn；遗漏关键场景、核心冲突、结尾钩子，新增重大事件或偏离卷弧线是 fail。
     - 不做关键词匹配，不因正文比细纲更具体而判错，也不要为了凑问题而报告。
-    - 每个问题必须同时给出细纲要求和正文依据；没有可引用依据就不要报告。
-    - verdict 必须与 issues 一致：存在 error 即 fail；只有 warning 即 warn；无问题即 pass。
-    - scene_coverage 按细纲 scenes 的 1 起始顺序逐项返回。
+    - legacy_v1 的每个问题必须同时给出细纲要求和正文依据；没有可引用依据就不要报告。
+    - legacy_v1 的 verdict 必须与 issues 一致：存在 error 即 fail；只有 warning 即 warn；无问题即 pass。
+    - 如果细纲声明 scene_transition_contract.v2，逐个 scene_id / beat_id 返回证据，不得把整场 covered 当作 beat 已兑现。
+    - beat 状态只能为 satisfied、mentioned、contradicted、missing 或 unknown。
+      只出现名词、道具或一句结果，但 expected_transition 没有发生时必须用 mentioned；正文与要求相反时用 contradicted；
+      完全没有证据时用 missing；无法可靠判断时用 unknown，不得猜成 satisfied。
+    - satisfied、mentioned、contradicted 必须给至少一个正文 span；一个 beat 可以有多个 span，同一 span 也可支持多个 beat。
+    - span 使用待检查正文的 0 起始 Unicode code-point 偏移，区间为 [start,end)，
+      quote 必须逐字复制该区间原文。不得改写、去空格或使用字节偏移；系统会在本地复核后生成证据哈希。
+    - Provider 只返回 beat_evidence 与 findings，不返回 pass / warn / fail，也不决定本地 severity。
+    - V2 findings 用于报告场景顺序、核心冲突、结尾钩子、细纲外重大事件、卷弧线偏离、
+      forbidden condition 或 event repetition；observed 必须给正文 span，无法确定时用 unknown。
+    - 旧章纲没有 V2 合同时，按提供的旧 Schema 返回 scene_coverage；旧结果只用于兼容读取。
   outline_adherence_prompt_with_schema_suffix: |
     请严格按提供的 JSON Schema 输出，不要输出额外解释。
   outline_adherence_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
     {"verdict":"pass|warn|fail","summary":"总体结论","scene_coverage":[{"scene_index":1,"status":"covered|partial|missing","evidence":"正文依据"}],"issues":[{"severity":"warning|error","category":"scene_coverage|scene_order|core_conflict|ending_hook|unplanned_major_event|volume_arc","outline_requirement":"细纲或卷纲要求","prose_evidence":"正文依据","explanation":"偏离原因"}]}
+  outline_adherence_v2_prompt_with_schema_suffix: |
+    请严格按提供的 V2 JSON Schema 输出 beat_evidence 与 findings，不要输出 verdict 或额外解释。
+  outline_adherence_v2_prompt_without_schema_suffix: |
+    只输出一个 JSON 对象，不要使用代码块，不要输出额外解释。格式：
+    {"schema_version":"chapter_outline_adherence_evidence.v2","outline_contract_version":"scene_transition_contract.v2","summary":"证据摘要","beat_evidence":[{"scene_id":"scene-1","beat_id":"scene-1-beat-1","status":"satisfied|mentioned|contradicted|missing|unknown","spans":[{"start":0,"end":4,"quote":"逐字复制的正文原文"}],"explanation":"判定依据"}],"findings":[]}
 
 extract_chapter_state_by_ai:
   chapter_state_prompt_base: |

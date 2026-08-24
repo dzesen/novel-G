@@ -24,9 +24,52 @@ export interface VolumeOutlineResult {
   volumes: VolumeOutlineItem[];
 }
 
-export interface Scene {
+export interface LegacyScene {
   summary: string;
   purpose: string;
+}
+
+export interface SceneCondition {
+  condition_id: string;
+  description: string;
+}
+
+export interface SceneBeat {
+  beat_id: string;
+  description: string;
+  expected_transition: string;
+  required: boolean;
+}
+
+export interface NarrativeDelta {
+  delta_id: string;
+  dimension: "knowledge" | "relationship" | "goal" | "risk" | "choice" | "emotion";
+  before: string;
+  after: string;
+}
+
+export interface SceneTransitionContract extends LegacyScene {
+  contract_version: "scene_transition_contract.v2";
+  scene_id: string;
+  preconditions: SceneCondition[];
+  beats: SceneBeat[];
+  postconditions: SceneCondition[];
+  forbidden_conditions: SceneCondition[];
+  narrative_delta: NarrativeDelta[];
+  event_key: string;
+  repetition_policy: "forbid" | "allow_if_escalated" | "allow";
+  word_budget: { min: number; target: number; max: number };
+}
+
+export type Scene = LegacyScene | SceneTransitionContract;
+
+export function isSceneTransitionContract(
+  scene: Scene,
+): scene is SceneTransitionContract {
+  return (
+    "contract_version" in scene &&
+    scene.contract_version === "scene_transition_contract.v2"
+  );
 }
 
 export type ThreadImportance = "main" | "sub";
@@ -46,6 +89,7 @@ export interface NewThread {
 
 /** AI 输出 / accept 入参的细纲形状。 */
 export interface ChapterOutlineResult {
+  scene_contract_version?: "scene_transition_contract.v2" | null;
   pov_character_card_id: string | null;
   present_character_card_ids: string[];
   mentioned_character_card_ids: string[];
@@ -60,6 +104,7 @@ export interface ChapterOutlineResult {
 
 /** 库里存的细纲形状；**不可**直接贴回 accept（见文件头注释）。 */
 export interface StoredChapterOutline {
+  scene_contract_version?: "scene_transition_contract.v2" | null;
   pov_character_card_id: string | null;
   present_character_card_ids: string[];
   mentioned_character_card_ids: string[];

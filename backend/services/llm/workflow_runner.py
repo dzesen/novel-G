@@ -68,6 +68,7 @@ class WorkflowStep:
     prompt_args: Callable[[StepContext], dict[str, Any]]
     config_key: str | None = None
     agent_id: str | None = None
+    max_structured_raw_output_bytes: int | None = None
 
     @property
     def resolved_config_key(self) -> str:
@@ -306,6 +307,11 @@ async def run_workflow(
                 native_prompt = apply_agent_profile(step.agent_id, native_prompt)
                 prompt_json = apply_agent_profile(step.agent_id, prompt_json)
 
+            structured_kwargs = dict(gen_kwargs)
+            if step.max_structured_raw_output_bytes is not None:
+                structured_kwargs["max_structured_raw_output_bytes"] = (
+                    step.max_structured_raw_output_bytes
+                )
             coro = deps.runtime.generate_structured(
                 generation_plan,
                 step.schema,
@@ -313,7 +319,7 @@ async def run_workflow(
                     native_schema_prompt=native_prompt,
                     prompt_json_prompt=prompt_json,
                 ),
-                **gen_kwargs,
+                **structured_kwargs,
             )
 
             task = asyncio.ensure_future(coro)

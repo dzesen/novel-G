@@ -82,6 +82,20 @@ export function readinessIssueCopy(
         title: t("readinessIssueContextTooLargeTitle"),
         body: t("readinessIssueContextTooLargeBody"),
       };
+    case "legacy_outline_requires_v2_regeneration":
+      return {
+        title: t("readinessIssueLegacyOutlineTitle"),
+        body: t("readinessIssueLegacyOutlineBody", {
+          count: Number(issue.details.chapter_count ?? 0),
+        }),
+      };
+    case "unknown_outline_contract_requires_manual_review":
+      return {
+        title: t("readinessIssueUnknownOutlineContractTitle"),
+        body: t("readinessIssueUnknownOutlineContractBody", {
+          count: Number(issue.details.chapter_count ?? 0),
+        }),
+      };
     case "no_generation_work":
       return {
         title: t("readinessIssueNoWorkTitle"),

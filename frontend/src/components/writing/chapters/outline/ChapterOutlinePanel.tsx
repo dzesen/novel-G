@@ -20,6 +20,7 @@ import {
   ReferenceCleanupNotice,
   ReferenceRemapNotice,
   RowEditor,
+  SceneContractDetails,
 } from "./outlineUi";
 import type {
   AcceptChapterOutlineResponse,
@@ -145,6 +146,9 @@ export default function ChapterOutlinePanel({
     setEditError("");
     try {
       const payload: ChapterOutlineEditPayload = {
+        ...(editBuffer.scene_contract_version
+          ? { scene_contract_version: editBuffer.scene_contract_version }
+          : {}),
         pov_character_card_id: editBuffer.pov_character_card_id,
         present_character_card_ids: editBuffer.present_character_card_ids,
         mentioned_character_card_ids: editBuffer.mentioned_character_card_ids,
@@ -267,6 +271,9 @@ export default function ChapterOutlinePanel({
                   <div key={index} className="rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-foreground">
                     <p>{scene.summary}</p>
                     <p className="mt-1 text-muted">{scene.purpose}</p>
+                    <div className="mt-2">
+                      <SceneContractDetails scene={scene} />
+                    </div>
                   </div>
                 ))}
               </div>

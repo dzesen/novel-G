@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { apiGet, apiPost } from "@/lib/api";
 import RosterPicker from "./RosterPicker";
-import { Field, RowEditor } from "./outlineUi";
+import { Field, RowEditor, SceneContractDetails } from "./outlineUi";
 import type { ChapterOutlineAuthoredFields, Scene } from "./outlineTypes";
 import type { useRoster } from "./useRoster";
 
@@ -51,6 +51,8 @@ export default function OutlineFieldsEditor({
   const [agentErrors, setAgentErrors] = useState<Record<number, string>>({});
   const sceneAgentMode = Boolean(novelId && chapterId && baseScenes);
   const sceneStructureMatches = baseScenes?.length === value.scenes.length;
+  const sceneContractLocked =
+    value.scene_contract_version === "scene_transition_contract.v2";
 
   useEffect(() => {
     if (!sceneAgentMode) return;
@@ -84,8 +86,11 @@ export default function OutlineFieldsEditor({
           novel_id: novelId,
           chapter_id: chapterId,
           scene_index: index,
-          base_scene: baseScenes[index],
-          scene,
+          base_scene: {
+            summary: baseScenes[index].summary,
+            purpose: baseScenes[index].purpose,
+          },
+          scene: { summary: scene.summary, purpose: scene.purpose },
           agent_id: agentId,
           instruction: agentInstructions[index] || "",
         },
@@ -171,10 +176,16 @@ export default function OutlineFieldsEditor({
           <input
             type="number"
             value={value.target_word_count}
+            readOnly={sceneContractLocked}
             onChange={(e) => onChange({ target_word_count: Number(e.target.value) })}
             className="min-h-9 w-40 rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent"
           />
         </Field>
+        {sceneContractLocked && (
+          <p className="rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-muted">
+            {t("sceneContractStructureLocked")}
+          </p>
+        )}
       </div>
 
       <RowEditor<Scene>
@@ -184,6 +195,7 @@ export default function OutlineFieldsEditor({
         removeLabel={t("removeRow")}
         onChange={(scenes) => onChange({ scenes })}
         blank={{ summary: "", purpose: "" }}
+        structureLocked={sceneContractLocked}
         render={(scene, update, index) => (
           <div className="grid gap-3">
             <div className="grid gap-3 md:grid-cols-2">
@@ -204,6 +216,7 @@ export default function OutlineFieldsEditor({
                 />
               </Field>
             </div>
+            <SceneContractDetails scene={scene} />
 
             {sceneAgentMode && (
               <div className="grid gap-2 rounded-md border border-border bg-background p-3">

@@ -47,6 +47,10 @@ from backend.services.generation.provider_budget import (
     scale_provider_bounds,
     structured_call_budget,
 )
+from backend.scene_contract_versions import (
+    SCENE_TRANSITION_CONTRACT_VERSION,
+    require_known_scene_contract_version,
+)
 from backend.services.llm.context_builder import ContextBudgetError
 
 
@@ -624,6 +628,47 @@ class GenerationReadinessModule:
                     details={
                         "chapter_count": len(prose_without_outline),
                         "chapter_ids": prose_without_outline[:50],
+                    },
+                    action_codes=["review_chapter_outline"],
+                )
+            )
+
+        legacy_outline_prose = []
+        unknown_outline_contracts = []
+        for chapter in chapters:
+            if str(chapter.get("content") or "").strip():
+                continue
+            outline = chapter.get("outline")
+            if not isinstance(outline, Mapping) or not outline:
+                continue
+            chapter_id = str(chapter.get("_id") or "")
+            try:
+                contract_version = require_known_scene_contract_version(outline)
+            except ValueError:
+                unknown_outline_contracts.append(chapter_id)
+                continue
+            if contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
+                legacy_outline_prose.append(chapter_id)
+        if legacy_outline_prose:
+            issues.append(
+                _issue(
+                    "legacy_outline_requires_v2_regeneration",
+                    "blocked",
+                    details={
+                        "chapter_count": len(legacy_outline_prose),
+                        "chapter_ids": legacy_outline_prose[:50],
+                    },
+                    action_codes=["regenerate_chapter_outline"],
+                )
+            )
+        if unknown_outline_contracts:
+            issues.append(
+                _issue(
+                    "unknown_outline_contract_requires_manual_review",
+                    "blocked",
+                    details={
+                        "chapter_count": len(unknown_outline_contracts),
+                        "chapter_ids": unknown_outline_contracts[:50],
                     },
                     action_codes=["review_chapter_outline"],
                 )

@@ -204,7 +204,11 @@ class AgentCapabilityApplication:
             if request.scene_index >= len(scenes):
                 raise ValueError("场景序号超出当前细纲范围")
             current = scenes[request.scene_index]
-            if current != request.base_scene.model_dump():
+            current_rewrite_projection = {
+                "summary": current.get("summary"),
+                "purpose": current.get("purpose"),
+            }
+            if current_rewrite_projection != request.base_scene.model_dump():
                 raise StaleAgentContext("场景已被其他操作修改，请刷新细纲后重试")
             inputs = await fetch_context_inputs(
                 request.novel_id,
@@ -285,7 +289,10 @@ class AgentCapabilityApplication:
     ) -> SceneRewriteResponse:
         evidence: SceneRewriteContext = prepared.evidence
         prompt_scenes = [dict(item) for item in evidence.scenes]
-        prompt_scenes[request.scene_index] = request.scene.model_dump()
+        prompt_scenes[request.scene_index] = {
+            **prompt_scenes[request.scene_index],
+            **request.scene.model_dump(),
+        }
         native_prompt = _scene_prompt(
             context=evidence.assembled.to_prompt_text(),
             chapter=evidence.chapter,

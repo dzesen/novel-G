@@ -347,6 +347,7 @@ export default function BatchGenerationPanel({
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onNavigateToWorldBaseline={onNavigateToWorldBaseline}
         onNavigateToBookStructure={onNavigateToBlueprint}
+        onNavigateToChapterOutline={onJumpToChapter}
         onSubmitted={(started) => {
           setDismissed(null);
           setJob(started);
@@ -371,6 +372,7 @@ export default function BatchGenerationPanel({
         onNavigateToReferenceCards={() => onNavigateToReferenceCards()}
         onNavigateToWorldBaseline={onNavigateToWorldBaseline}
         onNavigateToBookStructure={onNavigateToBlueprint}
+        onNavigateToChapterOutline={onJumpToChapter}
         onStructureInitialized={async () => {
           await onQuietRefresh();
         }}

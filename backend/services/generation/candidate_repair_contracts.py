@@ -6,12 +6,16 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, get_args
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
+from backend.llm.schemas.scene_contract_pydantic import (
+    ValidatedChapterOutlineAdherenceEvidenceSchema,
+)
 from backend.llm.stream_terminal import FinishReason
+from backend.scene_contract_versions import OUTLINE_ADHERENCE_EVIDENCE_VERSION
 from backend.services.generation.outline_adherence import (
     OutlineIssueCategoryValue,
 )
@@ -304,6 +308,48 @@ class AdherenceCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
     )
 
 
+class _CandidatePipelineCheckpointV3(_CandidatePipelineCheckpointV1):
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v3"]
+
+
+class AdherenceCandidateCheckpointV3(_CandidatePipelineCheckpointV3):
+    kind: Literal["outline_adherence"] = "outline_adherence"
+    verdict: Literal["pass", "warn", "fail"]
+    issue_categories: tuple[CandidateOutlineIssueCategory, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    scene_coverage: tuple[CandidateSceneCoverageV1, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    validated_evidence: ValidatedChapterOutlineAdherenceEvidenceSchema
+
+    @model_validator(mode="after")
+    def validate_evidence_projection(self) -> "AdherenceCandidateCheckpointV3":
+        evidence = self.validated_evidence
+        if evidence.evidence_schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
+            raise ValueError("V2 adherence checkpoint evidence version is invalid")
+        categories = tuple(dict.fromkeys(item.category for item in evidence.issues))
+        coverage = tuple(
+            (item.scene_index, item.status) for item in evidence.scene_coverage
+        )
+        projected_coverage = tuple(
+            (item.scene_index, item.status) for item in self.scene_coverage
+        )
+        if (
+            self.verdict != evidence.verdict
+            or self.issue_categories != categories
+            or projected_coverage != coverage
+            or self.source.source_run_id != evidence.source_prose_run_id
+            or self.source.source_run_revision
+            != evidence.source_prose_run_revision
+            or self.source.source_content_digest != evidence.source_content_digest
+        ):
+            raise ValueError("V2 adherence checkpoint projection diverged")
+        return self
+
+
 class StateCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
     kind: Literal["state_candidate"] = "state_candidate"
     origin: Literal["initial", "repair"]
@@ -319,12 +365,17 @@ class StateCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
         return self
 
 
-CandidatePipelineCheckpointV1 = Annotated[
+AdherenceCandidateCheckpoint = (
+    AdherenceCandidateCheckpointV1 | AdherenceCandidateCheckpointV3
+)
+
+
+CandidatePipelineCheckpointV1 = (
     ProseCandidateCheckpointV1
     | AdherenceCandidateCheckpointV1
-    | StateCandidateCheckpointV1,
-    Field(discriminator="kind"),
-]
+    | AdherenceCandidateCheckpointV3
+    | StateCandidateCheckpointV1
+)
 
 
 @dataclass(frozen=True)
@@ -332,7 +383,7 @@ class CandidatePipelineCompletionEvidenceV1:
     """Canonical terminal projection derived from one checkpoint ledger."""
 
     prose: ProseCandidateCheckpointV1
-    adherence: AdherenceCandidateCheckpointV1
+    adherence: AdherenceCandidateCheckpoint
     state: StateCandidateCheckpointV1
     repair_cycles_used: int
     attempt_count: int
@@ -346,7 +397,7 @@ class CandidatePipelineReplayV1:
     checkpoints: tuple[CandidatePipelineCheckpointV1, ...]
     current_prose: ProseCandidateCheckpointV1
     previous_prose: ProseCandidateCheckpointV1 | None
-    latest_adherence: AdherenceCandidateCheckpointV1 | None
+    latest_adherence: AdherenceCandidateCheckpoint | None
     latest_state: StateCandidateCheckpointV1 | None
     phase: Literal["prose", "adherence", "state"]
     repair_cycles_used: int
@@ -368,7 +419,7 @@ def candidate_checkpoint_completion_passed(
 
 
 def candidate_checkpoint_adherence_passed(
-    checkpoint: AdherenceCandidateCheckpointV1,
+    checkpoint: AdherenceCandidateCheckpoint,
     *,
     expected_scene_count: int,
 ) -> bool:
@@ -426,7 +477,7 @@ def replay_candidate_pipeline_checkpoints(
 
     current_prose: ProseCandidateCheckpointV1 | None = None
     previous_prose: ProseCandidateCheckpointV1 | None = None
-    latest_adherence: AdherenceCandidateCheckpointV1 | None = None
+    latest_adherence: AdherenceCandidateCheckpoint | None = None
     latest_state: StateCandidateCheckpointV1 | None = None
     phase: Literal["start", "prose", "adherence", "state"] = "start"
     repair_cycles_used = 0
@@ -561,7 +612,10 @@ def replay_candidate_pipeline_checkpoints(
             accepted_checkpoints = sequence
             continue
 
-        if isinstance(checkpoint, AdherenceCandidateCheckpointV1):
+        if isinstance(
+            checkpoint,
+            (AdherenceCandidateCheckpointV1, AdherenceCandidateCheckpointV3),
+        ):
             if (
                 phase != "prose"
                 or current_prose is None
@@ -743,11 +797,17 @@ def parse_candidate_pipeline_checkpoint(
         return _CANDIDATE_PIPELINE_CHECKPOINT_ADAPTER.validate_python(value)
 
     value = dict(value)
-    _require_contract_version(
-        value,
-        expected="chapter_candidate_pipeline_checkpoint.v2",
-        subject="candidate checkpoint",
-    )
+    checkpoint_version = value.get("schema_version")
+    if checkpoint_version not in {
+        "chapter_candidate_pipeline_checkpoint.v2",
+        "chapter_candidate_pipeline_checkpoint.v3",
+    }:
+        raise ValueError("candidate checkpoint schema_version is invalid")
+    if (
+        checkpoint_version == "chapter_candidate_pipeline_checkpoint.v3"
+        and value.get("kind") != "outline_adherence"
+    ):
+        raise ValueError("candidate checkpoint v3 kind is invalid")
     _require_nested_contract_version(
         value,
         field="source",

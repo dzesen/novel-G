@@ -280,7 +280,7 @@ def build_chapter_capability_registry(
         (
             CapabilityDefinition(
                 capability="chapter_outline",
-                version=1,
+                version=2,
                 label="章节策划",
                 description="生成受卷纲与故事状态约束的章节细纲。",
                 customizable=False,
@@ -358,7 +358,7 @@ def build_chapter_capability_registry(
             ),
             CapabilityDefinition(
                 capability="chapter_outline_adherence",
-                version=1,
+                version=2,
                 label="章节细纲符合度",
                 description="检查正文候选是否兑现已接受的章节细纲。",
                 customizable=False,
