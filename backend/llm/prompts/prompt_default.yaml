@@ -568,6 +568,13 @@ extract_chapter_state_by_ai:
       每条 thread_updates 动作都必须被且只被一条 fact_evidence.facts[].action_ref 精确引用。
       action_ref 的 action_type、target_id、value 和 permanent_fact_kind 必须逐字等于候选动作；
       不得用名称、别名、占位符或猜测值代替内部 ID。
+    - 本章摘要也会进入后续叙事上下文。extraction_status=complete 时，必须有且只有一条
+      fact_evidence 通过 action_type=chapter_summary、target_id={chapter_id}、value 等于完整
+      summary 的 action_ref 核算它；正文支持时使用 supported canonical_fact，正文不支持时
+      如实标为 unsupported。本地仅在既有摘要仍绑定同一正文时保留它；若本次会替换正文则
+      失败关闭并要求重新生成受支持摘要。不得让摘要绕过逐动作核算。
+      complete_no_change 表示候选摘要也不应写入，本地会用 no_change spans 记录 legal_no_op
+      并保留既有正式摘要。
     - 章节级客观事实若已完整写入 summary，可用 action_type=chapter_summary、
       target_id={chapter_id}、value 等于完整 summary 的 action_ref 核算。正文存在会影响后文的
       客观持久变化时，不得用 complete_no_change 逃避，也不得漏掉对应事实。

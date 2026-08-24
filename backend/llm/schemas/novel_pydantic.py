@@ -817,10 +817,22 @@ class ChapterStateAcceptSchema(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
 
-    summary: str = Field(..., min_length=1, max_length=2000)
+    write_summary: bool = Field(
+        default=True,
+        description="false 时保留现有正式摘要，不接受候选摘要",
+    )
+    summary: str = Field(default="", max_length=2000)
     character_updates: List[AcceptedCharacterStateSchema] = Field(
         default_factory=list, max_length=30
     )
     accepted_thread_updates: List[AcceptedThreadUpdateSchema] = Field(
         default_factory=list, max_length=20
     )
+
+    @model_validator(mode="after")
+    def validate_summary_write(self) -> "ChapterStateAcceptSchema":
+        if self.write_summary and not self.summary:
+            raise ValueError("summary is required when write_summary is true")
+        if not self.write_summary and self.summary:
+            raise ValueError("summary must be empty when write_summary is false")
+        return self

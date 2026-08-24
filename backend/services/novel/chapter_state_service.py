@@ -1,9 +1,10 @@
 """状态回填的落库层：把 AI 提议 + 人的勾选映射成记忆层的写入（设计 §5）。
 
-分治的依据是**可逆性**：
-- summary / current_state 覆盖式，全盘接受，改错了重跑即可；
+分治的依据是**可逆性与事实证据**：
+- summary / current_state 是覆盖式写入，但只有经策略选中或正式事实核算接受的字段才写；
 - permanent_facts 只增不改、无删除入口，故逐条勾选 + 服务层去重；
-- 伏笔 status 可改，但当前没有伏笔管理 UI 能纠正，故逐条勾选。
+- 伏笔 status 可改，但当前没有伏笔管理 UI 能纠正，故逐条勾选；
+- write_summary=false / write_current_state=false 时保留上游已证明仍适用的正式值，不以空值覆盖。
 
 非原子（单机 mongod 无事务，run_mongo_write_unit 降级为顺序写）：
 ①写前全校验（形状 + id 存在性，第一次写之前）②run_mongo_write_unit(auto)
@@ -114,9 +115,10 @@ class ChapterStateService:
                         persisted_finalization_intent
                     ),
                 )
-            await chapter_repo.update_chapter(
-                chapter_id, {"summary": data["summary"]}, session=session
-            )
+            if data.get("write_summary", True):
+                await chapter_repo.update_chapter(
+                    chapter_id, {"summary": data["summary"]}, session=session
+                )
 
             for character_index, update in enumerate(planned):
                 if update.get("write_current_state", True):

@@ -233,23 +233,41 @@ class RecoveredStateProposal:
 
 
 @dataclass(frozen=True)
+class StatePolicyDecision:
+    """One typed selection projection shared by every acceptance policy."""
+
+    selected_character_ids: tuple[str, ...] = ()
+    selected_fact_ids: tuple[str, ...] = ()
+    selected_thread_ids: tuple[str, ...] = ()
+    drop_reasons: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class SelectAllPolicy:
     """Deterministic headless policy that accepts every selectable candidate."""
 
     name: str = "select_all"
     version: str = "1"
 
-    def decide(self, proposal: dict[str, Any]) -> tuple[list[str], list[str]]:
-        fact_ids = [
+    def decide(self, proposal: dict[str, Any]) -> StatePolicyDecision:
+        character_ids = tuple(
+            str(character["selection_id"])
+            for character in proposal.get("character_updates") or []
+        )
+        fact_ids = tuple(
             str(fact["selection_id"])
             for character in proposal.get("character_updates") or []
             for fact in character.get("new_permanent_facts") or []
-        ]
-        thread_ids = [
+        )
+        thread_ids = tuple(
             str(thread["selection_id"])
             for thread in proposal.get("thread_updates") or []
-        ]
-        return fact_ids, thread_ids
+        )
+        return StatePolicyDecision(
+            selected_character_ids=character_ids,
+            selected_fact_ids=fact_ids,
+            selected_thread_ids=thread_ids,
+        )
 
 
 @dataclass(frozen=True)
@@ -259,19 +277,25 @@ class FactAccountingPolicy:
     name: str = "fact_accounting"
     version: str = "1"
 
-    def decide(self, proposal: dict[str, Any]) -> dict[str, Any]:
+    def decide(self, proposal: dict[str, Any]) -> StatePolicyDecision:
         evidence = proposal.get("fact_evidence")
         if not isinstance(evidence, Mapping):
             raise StaleStatePreview(
                 "State proposal has no current fact-accounting evidence"
             )
         try:
-            return automatic_state_fact_decision(
+            raw = automatic_state_fact_decision(
                 evidence,
                 candidate=proposal,
             )
         except StateFactAccountingError as exc:
             raise StaleStatePreview(str(exc)) from exc
+        return StatePolicyDecision(
+            selected_character_ids=tuple(raw["selected_character_ids"]),
+            selected_fact_ids=tuple(raw["selected_fact_ids"]),
+            selected_thread_ids=tuple(raw["selected_thread_ids"]),
+            drop_reasons=tuple(sorted(dict(raw["drop_reasons"]).items())),
+        )
 
 
 def add_selection_ids(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -1184,9 +1208,82 @@ class StateProposalModule:
         if not set(selected_thread_ids).issubset(threads_by_id):
             raise StaleStatePreview("Unknown plot-thread selection id")
 
+        allowed_edits = deepcopy(edits or {})
+        unknown_edits = set(allowed_edits) - {"summary", "current_states"}
+        if unknown_edits:
+            raise StaleStatePreview(
+                f"Unsupported proposal edits: {sorted(unknown_edits)}"
+            )
+        current_state_edits = allowed_edits.get("current_states") or {}
+        if not isinstance(current_state_edits, Mapping):
+            raise StaleStatePreview("Current-state edits must be an object")
+
         fact_accounting: dict[str, Any] | None = None
         validated_fact_evidence = candidate.get("fact_evidence")
+        fact_summary_accepted = True
         if isinstance(validated_fact_evidence, Mapping):
+            reference_resolution = (
+                (proposal.get("generation_audit") or {}).get(
+                    "reference_resolution"
+                )
+                or {}
+            )
+            dropped_references = (
+                reference_resolution.get("dropped")
+                if isinstance(reference_resolution, Mapping)
+                else {}
+            )
+            has_dropped_references = bool(
+                isinstance(dropped_references, Mapping)
+                and any(dropped_references.values())
+            ) or bool(
+                isinstance(reference_resolution, Mapping)
+                and (
+                    int(
+                        reference_resolution.get(
+                            "dropped_character_update_count"
+                        )
+                        or 0
+                    )
+                    > 0
+                    or int(
+                        reference_resolution.get(
+                            "dropped_thread_update_count"
+                        )
+                        or 0
+                    )
+                    > 0
+                )
+            )
+            if has_dropped_references:
+                raise StaleStatePreview(
+                    "状态候选包含已清洗的无效内部引用，必须重新生成"
+                )
+
+            candidate_states = {
+                str(character.get("card_id") or ""): str(
+                    character.get("current_state") or ""
+                )
+                for character in candidate.get("character_updates") or []
+            }
+            summary_changed = (
+                "summary" in allowed_edits
+                and str(allowed_edits["summary"])
+                != str(candidate.get("summary") or "")
+            )
+            states_changed = any(
+                card_id not in candidate_states
+                or str(value) != candidate_states[card_id]
+                for card_id, value in current_state_edits.items()
+            )
+            if summary_changed or states_changed:
+                raise StaleStatePreview(
+                    "人工编辑已脱离当前事实证据，请重新生成状态候选"
+                )
+            # Exact no-op echoes from older clients are harmless, but must not
+            # be recorded as edits or alter the digest-sealed candidate.
+            allowed_edits = {}
+            current_state_edits = {}
             try:
                 fact_accounting = account_state_fact_evidence(
                     validated_fact_evidence,
@@ -1215,18 +1312,32 @@ class StateProposalModule:
                 raise StaleStatePreview(
                     "状态候选仍有未核算正式事实或非法内部引用"
                 )
-
-        allowed_edits = deepcopy(edits or {})
-        unknown_edits = set(allowed_edits) - {"summary", "current_states"}
-        if unknown_edits:
-            raise StaleStatePreview(
-                f"Unsupported proposal edits: {sorted(unknown_edits)}"
+            fact_summary_accepted = any(
+                action.get("action_type") == "chapter_summary"
+                and action.get("decision") == "accepted"
+                for action in fact_accounting.get("action_accounts") or []
             )
-        current_state_edits = allowed_edits.get("current_states") or {}
+            if (
+                not fact_summary_accepted
+                and str(chapter.get("summary") or "").strip()
+                and chapter_content_digest(chapter.get("content") or "")
+                != str(proposal.get("source_content_digest") or "")
+            ):
+                raise StaleStatePreview(
+                    "旧摘要没有绑定当前正文候选，必须重新生成受支持的摘要"
+                )
+
         payload: dict[str, Any] = {
             "summary": str(
-                allowed_edits.get("summary", candidate.get("summary") or "")
+                (
+                    allowed_edits.get(
+                        "summary", candidate.get("summary") or ""
+                    )
+                    if fact_summary_accepted
+                    else ""
+                )
             ),
+            **({"write_summary": False} if not fact_summary_accepted else {}),
             "character_updates": [],
             "accepted_thread_updates": [],
         }
@@ -1461,31 +1572,17 @@ class StateProposalModule:
             job_mutation_binding=job_mutation_binding,
         )
         candidate = deepcopy(stored.get("candidate") or {})
-        if isinstance(policy, FactAccountingPolicy):
-            policy_decision = policy.decide(candidate)
-            selected_character_ids = list(
-                policy_decision["selected_character_ids"]
-            )
-            selected_fact_ids = list(policy_decision["selected_fact_ids"])
-            selected_thread_ids = list(
-                policy_decision["selected_thread_ids"]
-            )
-            drop_reasons = dict(policy_decision["drop_reasons"])
-        else:
-            selected_fact_ids, selected_thread_ids = policy.decide(candidate)
-            selected_character_ids = list(
-                character["selection_id"]
-                for character in candidate.get("character_updates") or []
-            )
-            drop_reasons = {}
+        policy_decision = policy.decide(candidate)
         return await self.accept(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
-            selected_character_ids=selected_character_ids,
-            selected_fact_ids=selected_fact_ids,
-            selected_thread_ids=selected_thread_ids,
-            drop_reasons=drop_reasons,
+            selected_character_ids=list(
+                policy_decision.selected_character_ids
+            ),
+            selected_fact_ids=list(policy_decision.selected_fact_ids),
+            selected_thread_ids=list(policy_decision.selected_thread_ids),
+            drop_reasons=dict(policy_decision.drop_reasons),
             policy_name=policy.name,
             policy_version=policy.version,
             job_mutation_binding=job_mutation_binding,
@@ -1815,31 +1912,17 @@ class StateProposalModule:
             acceptance_token=acceptance_token,
         )
         candidate = deepcopy(stored.get("candidate") or {})
-        if isinstance(policy, FactAccountingPolicy):
-            policy_decision = policy.decide(candidate)
-            selected_character_ids = list(
-                policy_decision["selected_character_ids"]
-            )
-            selected_fact_ids = list(policy_decision["selected_fact_ids"])
-            selected_thread_ids = list(
-                policy_decision["selected_thread_ids"]
-            )
-            drop_reasons = dict(policy_decision["drop_reasons"])
-        else:
-            selected_fact_ids, selected_thread_ids = policy.decide(candidate)
-            selected_character_ids = list(
-                character["selection_id"]
-                for character in candidate.get("character_updates") or []
-            )
-            drop_reasons = {}
+        policy_decision = policy.decide(candidate)
         return await self.prepare_decision(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
-            selected_character_ids=selected_character_ids,
-            selected_fact_ids=selected_fact_ids,
-            selected_thread_ids=selected_thread_ids,
-            drop_reasons=drop_reasons,
+            selected_character_ids=list(
+                policy_decision.selected_character_ids
+            ),
+            selected_fact_ids=list(policy_decision.selected_fact_ids),
+            selected_thread_ids=list(policy_decision.selected_thread_ids),
+            drop_reasons=dict(policy_decision.drop_reasons),
             policy_name=policy.name,
             policy_version=policy.version,
         )

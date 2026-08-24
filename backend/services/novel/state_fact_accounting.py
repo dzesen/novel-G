@@ -85,7 +85,6 @@ def _candidate_actions(
         permanent_fact_kind: Any = None,
         selection_id: Any = None,
         path: str,
-        required_evidence: bool = True,
     ) -> None:
         target = str(target_id or "")
         text = str(value or "").strip()
@@ -109,7 +108,6 @@ def _candidate_actions(
                     str(selection_id) if isinstance(selection_id, str) else None
                 ),
                 "path": path,
-                "required_evidence": required_evidence,
                 "semantic_key": _action_semantic_key(
                     action_type=action_type,
                     target_id=target,
@@ -124,7 +122,6 @@ def _candidate_actions(
         target_id=chapter_id,
         value=candidate.get("summary"),
         path="summary",
-        required_evidence=False,
     )
     for character_index, character in enumerate(
         candidate.get("character_updates") or []
@@ -281,25 +278,28 @@ def validate_state_fact_evidence(
             }
         )
 
-    # A Provider proposal without any fact evidence is an unexplained action,
-    # not a legal empty result. Empty current_state values are containers only.
-    dangling += len(
-        {
-            str(action["action_id"])
-            for action in actions
-            if action["required_evidence"]
-        }
-        - matched_action_ids
-    )
     no_change = None
     if parsed.no_change is not None:
+        no_change_action_ids = tuple(
+            str(action["action_id"])
+            for action in actions
+            if action["action_type"] == "chapter_summary"
+        )
+        matched_action_ids.update(no_change_action_ids)
         no_change = {
+            "action_ids": no_change_action_ids,
             "spans": tuple(
                 _canonical_span(span.model_dump(mode="python"), prose=prose)
                 for span in parsed.no_change.spans
             ),
             "explanation": parsed.no_change.explanation,
         }
+    # A Provider proposal without any fact/no-op evidence is an unexplained
+    # action, not a legal empty result. Empty values never become actions.
+    dangling += len(
+        {str(action["action_id"]) for action in actions}
+        - matched_action_ids
+    )
     raw = {
         "evidence_schema_version": STATE_FACT_EVIDENCE_VERSION,
         "extraction_status": parsed.extraction_status,
@@ -332,6 +332,42 @@ _ACCEPT_REASONS = {
 }
 
 
+def _validated_fact_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    error_message: str,
+) -> ValidatedChapterStateFactEvidenceSchema:
+    """Normalize persisted JSON containers at the single validation seam."""
+
+    normalized = dict(evidence)
+    raw_facts = normalized.get("facts")
+    if isinstance(raw_facts, list):
+        normalized_facts = []
+        for raw_fact in raw_facts:
+            fact = dict(raw_fact) if isinstance(raw_fact, Mapping) else raw_fact
+            if isinstance(fact, dict):
+                if isinstance(fact.get("action_ids"), list):
+                    fact["action_ids"] = tuple(fact["action_ids"])
+                if isinstance(fact.get("spans"), list):
+                    fact["spans"] = tuple(fact["spans"])
+            normalized_facts.append(fact)
+        normalized["facts"] = tuple(normalized_facts)
+    raw_no_change = normalized.get("no_change")
+    if isinstance(raw_no_change, Mapping):
+        no_change = dict(raw_no_change)
+        if isinstance(no_change.get("action_ids"), list):
+            no_change["action_ids"] = tuple(no_change["action_ids"])
+        if isinstance(no_change.get("spans"), list):
+            no_change["spans"] = tuple(no_change["spans"])
+        normalized["no_change"] = no_change
+    try:
+        return ValidatedChapterStateFactEvidenceSchema.model_validate(
+            normalized
+        )
+    except ValidationError as exc:
+        raise StateFactAccountingError(error_message) from exc
+
+
 def account_state_fact_evidence(
     evidence: Mapping[str, Any],
     *,
@@ -343,36 +379,29 @@ def account_state_fact_evidence(
 ) -> dict[str, Any]:
     """Apply one exact selection decision to already validated evidence."""
 
-    normalized_evidence = dict(evidence)
-    raw_facts = normalized_evidence.get("facts")
-    if isinstance(raw_facts, list):
-        normalized_facts = []
-        for raw_fact in raw_facts:
-            fact = dict(raw_fact) if isinstance(raw_fact, Mapping) else raw_fact
-            if isinstance(fact, dict):
-                if isinstance(fact.get("action_ids"), list):
-                    fact["action_ids"] = tuple(fact["action_ids"])
-                if isinstance(fact.get("spans"), list):
-                    fact["spans"] = tuple(fact["spans"])
-            normalized_facts.append(fact)
-        normalized_evidence["facts"] = tuple(normalized_facts)
-    raw_no_change = normalized_evidence.get("no_change")
-    if isinstance(raw_no_change, Mapping):
-        no_change = dict(raw_no_change)
-        if isinstance(no_change.get("spans"), list):
-            no_change["spans"] = tuple(no_change["spans"])
-        normalized_evidence["no_change"] = no_change
-    try:
-        validated = ValidatedChapterStateFactEvidenceSchema.model_validate(
-            normalized_evidence
-        )
-    except ValidationError as exc:
-        raise StateFactAccountingError("状态事实核算输入证据无效") from exc
+    validated = _validated_fact_evidence(
+        evidence,
+        error_message="状态事实核算输入证据无效",
+    )
     actions = _candidate_actions(
         candidate,
         chapter_id=validated.source_binding.chapter_id,
     )
     actions_by_id = {str(action["action_id"]): action for action in actions}
+    claimed_action_ids = {
+        str(action_id)
+        for fact in validated.facts
+        for action_id in fact.action_ids
+    }
+    if validated.no_change is not None:
+        claimed_action_ids.update(validated.no_change.action_ids)
+    recomputed_dangling = len(
+        set(actions_by_id) - claimed_action_ids
+    ) + len(claimed_action_ids - set(actions_by_id))
+    dangling_references = max(
+        validated.dangling_references,
+        recomputed_dangling,
+    )
     selected_by_type = {
         "character_state": {str(value) for value in selected_character_ids},
         "permanent_fact": {str(value) for value in selected_fact_ids},
@@ -387,8 +416,11 @@ def account_state_fact_evidence(
     }
     selected_action_ids.update(
         action_id
-        for action_id, action in actions_by_id.items()
-        if action["action_type"] == "chapter_summary"
+        for fact in validated.facts
+        if fact.kind == "canonical_fact" and fact.support == "supported"
+        for action_id in fact.action_ids
+        if action_id in actions_by_id
+        and actions_by_id[action_id]["action_type"] == "chapter_summary"
     )
     raw_drop_reasons = {
         str(key): str(value) for key, value in dict(drop_reasons or {}).items()
@@ -513,10 +545,39 @@ def account_state_fact_evidence(
             }
         )
 
+    if validated.no_change is not None:
+        no_change_spans = tuple(
+            span.model_dump(mode="json")
+            for span in validated.no_change.spans
+        )
+        for action_id in validated.no_change.action_ids:
+            action = actions_by_id.get(action_id)
+            if action is None or action["action_type"] != "chapter_summary":
+                raise StateFactAccountingError(
+                    "合法 no-op 引用了未知状态动作"
+                )
+            signature = _digest({
+                "schema_version": "state_no_change_signature.v1",
+                "evidence_digest": validated.evidence_digest,
+                "action_id": action_id,
+            })
+            action_accounts.append({
+                "action_id": action_id,
+                "fact_id": "no-change",
+                "fact_signature": signature,
+                "action_type": "chapter_summary",
+                "target_id": action["target_id"],
+                "decision": "dropped",
+                "reason_code": "legal_no_op",
+                "spans": no_change_spans,
+            })
+            dropped_actions.add(action_id)
+
     extraction_failure_count = int(validated.extraction_status == "unknown")
     no_change_account = (
         {
             "reason_code": "legal_no_op",
+            "action_ids": validated.no_change.action_ids,
             "spans": tuple(
                 span.model_dump(mode="json")
                 for span in validated.no_change.spans
@@ -531,7 +592,7 @@ def account_state_fact_evidence(
     gate_passed = (
         unaccounted == 0
         and validated.invalid_internal_references == 0
-        and validated.dangling_references == 0
+        and dangling_references == 0
     )
     raw = {
         "schema_version": STATE_FACT_ACCOUNTING_VERSION,
@@ -545,7 +606,7 @@ def account_state_fact_evidence(
         "accounted_canonical_fact_count": accounted_canonical,
         "unaccounted_canonical_facts": unaccounted,
         "invalid_internal_references": validated.invalid_internal_references,
-        "dangling_references": validated.dangling_references,
+        "dangling_references": dangling_references,
         "extraction_failure_count": extraction_failure_count,
         "accepted_action_count": len(accepted_actions),
         "dropped_action_count": len(dropped_actions),
@@ -584,31 +645,10 @@ def automatic_state_fact_decision(
 ) -> dict[str, Any]:
     """Select only prose-supported canonical actions and type every legal drop."""
 
-    normalized = dict(evidence)
-    raw_facts = normalized.get("facts")
-    if isinstance(raw_facts, list):
-        if any(not isinstance(item, Mapping) for item in raw_facts):
-            raise StateFactAccountingError("自动状态事实决策证据无效")
-        normalized["facts"] = tuple(
-            {
-                **dict(item),
-                "action_ids": tuple(item.get("action_ids") or ()),
-                "spans": tuple(item.get("spans") or ()),
-            }
-            for item in raw_facts
-        )
-    raw_no_change = normalized.get("no_change")
-    if isinstance(raw_no_change, Mapping):
-        normalized["no_change"] = {
-            **dict(raw_no_change),
-            "spans": tuple(raw_no_change.get("spans") or ()),
-        }
-    try:
-        validated = ValidatedChapterStateFactEvidenceSchema.model_validate(
-            normalized
-        )
-    except ValidationError as exc:
-        raise StateFactAccountingError("自动状态事实决策证据无效") from exc
+    validated = _validated_fact_evidence(
+        evidence,
+        error_message="自动状态事实决策证据无效",
+    )
 
     actions = _candidate_actions(
         candidate,

@@ -3956,6 +3956,7 @@
     "emptyTitle": "No state proposal has been generated",
     "emptyDescription": "Opening this page does not call a model. “Start backfill” reads this chapter and creates a preview; formal state changes are written only after you accept the selected items.",
     "summaryLabel": "Chapter summary",
+    "evidenceLockedHint": "The summary and current states are bound to this prose evidence and cannot be edited here. Choose state actions to write; evidence accounting decides the summary. Regenerate the proposal to change its text.",
     "charactersLabel": "Character states",
     "currentStateLabel": "Current state",
     "factsLabel": "New permanent facts (written when checked; cannot be deleted afterwards)",

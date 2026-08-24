@@ -33,6 +33,13 @@ interface StateBackfillPanelProps {
 const factKey = (cardId: string, index: number, fact: PermanentFactProposal) =>
   `${cardId}::${index}::${fact.fact}`;
 
+const toggleSetValue = (current: Set<string>, value: string) => {
+  const next = new Set(current);
+  if (next.has(value)) next.delete(value);
+  else next.add(value);
+  return next;
+};
+
 /**
  * 后端在正文为空时返回的原始 400 错误文案（见 state_router.py 的
  * `extract_chapter_state_by_ai`）。该文案不经 i18n，是后端固定吐出的中文串；
@@ -92,8 +99,7 @@ export function StateBackfillPanel({
     setAcceptResult(null);
     setAcceptError("");
     // 只在**流**送来新结果时重置勾选（由 resultVersion 追踪）；刻意不把 stream.result
-    // 放进依赖——本地编辑（摘要/current_state 文本框）会经 setResult 换新对象引用但**不**
-    // 推进 resultVersion，若把 result 列入依赖，每次击键都会清空用户的勾选与跳过横幅。
+    // 放进依赖，避免同一候选的其他本地状态变化清空勾选与跳过原因。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stream.resultVersion]);
 
@@ -103,20 +109,6 @@ export function StateBackfillPanel({
 
   const startGeneration = () => {
     void stream.start({ novel_id: novelId, chapter_id: chapterId });
-  };
-
-  const patchResult = (next: Partial<ChapterStateResult>) => {
-    stream.setResult((current) => (current ? { ...current, ...next } : current));
-  };
-
-  const updateCharacter = (
-    index: number,
-    patch: Partial<ChapterStateResult["character_updates"][number]>
-  ) => {
-    if (!stream.result) return;
-    const next = [...stream.result.character_updates];
-    next[index] = { ...next[index], ...patch };
-    patchResult({ character_updates: next });
   };
 
   const clearDropReason = (selectionId: string) => {
@@ -129,32 +121,17 @@ export function StateBackfillPanel({
 
   const toggleFact = (selectionId: string) => {
     clearDropReason(selectionId);
-    setCheckedFacts((current) => {
-      const next = new Set(current);
-      if (next.has(selectionId)) next.delete(selectionId);
-      else next.add(selectionId);
-      return next;
-    });
+    setCheckedFacts((current) => toggleSetValue(current, selectionId));
   };
 
   const toggleCharacter = (selectionId: string) => {
     clearDropReason(selectionId);
-    setCheckedCharacters((current) => {
-      const next = new Set(current);
-      if (next.has(selectionId)) next.delete(selectionId);
-      else next.add(selectionId);
-      return next;
-    });
+    setCheckedCharacters((current) => toggleSetValue(current, selectionId));
   };
 
   const toggleThread = (selectionId: string) => {
     clearDropReason(selectionId);
-    setCheckedThreads((current) => {
-      const next = new Set(current);
-      if (next.has(selectionId)) next.delete(selectionId);
-      else next.add(selectionId);
-      return next;
-    });
+    setCheckedThreads((current) => toggleSetValue(current, selectionId));
   };
 
   const setDropReason = (selectionId: string, value: string) => {
@@ -221,10 +198,14 @@ export function StateBackfillPanel({
       ]
     : [];
   const hasMissingSelectionIds = selectionIds.some((id) => !id);
+  const hasDroppedIds = Object.values(stream.droppedIds ?? {}).some(
+    (ids) => ids.length > 0
+  );
   const hasFactEvidenceBlocker = Boolean(
     result
       && (
-        result.fact_evidence.extraction_status === "unknown"
+        hasDroppedIds
+        || result.fact_evidence.extraction_status === "unknown"
         || result.fact_evidence.invalid_internal_references > 0
         || result.fact_evidence.dangling_references > 0
       )
@@ -285,12 +266,6 @@ export function StateBackfillPanel({
             .map((item) => item.selection_id)
             .filter((id): id is string => Boolean(id)),
           drop_reasons: dropReasons,
-          edits: {
-            summary: stream.result.summary,
-            current_states: Object.fromEntries(
-              stream.result.character_updates.map((update) => [update.card_id, update.current_state])
-            ),
-          },
         }
       );
       setAcceptResult(response);
@@ -399,13 +374,16 @@ export function StateBackfillPanel({
 
           {result && (
             <div className="grid gap-4">
+              <p className="rounded-md border border-border bg-surface px-3 py-2 text-xs leading-5 text-muted">
+                {t("evidenceLockedHint")}
+              </p>
               <div className="rounded-md border border-border bg-background p-4">
                 <Field label={t("summaryLabel")}>
                   <textarea
                     value={result.summary}
                     rows={3}
-                    onChange={(e) => patchResult({ summary: e.target.value })}
-                    className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-base leading-6 text-foreground outline-none focus:border-accent sm:text-sm sm:leading-5"
+                    readOnly
+                    className="w-full resize-y rounded-md border border-border bg-surface px-3 py-2 text-base leading-6 text-foreground sm:text-sm sm:leading-5"
                   />
                 </Field>
               </div>
@@ -420,7 +398,7 @@ export function StateBackfillPanel({
                 <section className="grid gap-3 rounded-md border border-border bg-background p-4">
                   <h4 className="text-sm font-semibold text-foreground">{t("charactersLabel")}</h4>
                   <div className="grid gap-3">
-                    {result.character_updates.map((update, index) => (
+                    {result.character_updates.map((update) => (
                       <div
                         key={update.card_id}
                         className="rounded-md border border-border bg-surface p-3"
@@ -447,15 +425,13 @@ export function StateBackfillPanel({
                           <textarea
                             value={update.current_state}
                             rows={2}
+                            readOnly
                             disabled={Boolean(
                               update.selection_id
                               && !checkedCharacters.has(update.selection_id)
                             )}
                             aria-label={t("currentStateLabel")}
-                            onChange={(e) =>
-                              updateCharacter(index, { current_state: e.target.value })
-                            }
-                            className="w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-base leading-6 text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60 sm:text-sm sm:leading-5"
+                            className="w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-base leading-6 text-foreground disabled:cursor-not-allowed disabled:opacity-60 sm:text-sm sm:leading-5"
                           />
                           {update.selection_id
                             && !checkedCharacters.has(update.selection_id)

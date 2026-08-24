@@ -24,6 +24,17 @@ from backend.state_fact_contract_versions import (
 )
 
 
+def _canonical_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 StableFactIdentity = Annotated[
     str,
     Field(min_length=1, max_length=96, pattern=r"^[a-z0-9][a-z0-9._:-]*$"),
@@ -218,6 +229,7 @@ class ValidatedStateFactEvidenceItemSchema(BaseModel):
 class ValidatedStateNoChangeEvidenceSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    action_ids: tuple[str, ...] = Field(default=(), max_length=10)
     spans: tuple[ValidatedProseEvidenceSpanSchema, ...] = Field(
         ...,
         min_length=1,
@@ -241,6 +253,15 @@ class ValidatedChapterStateFactEvidenceSchema(BaseModel):
     invalid_internal_references: StrictInt = Field(ge=0, le=1000)
     dangling_references: StrictInt = Field(ge=0, le=1000)
     evidence_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> "ValidatedChapterStateFactEvidenceSchema":
+        expected_digest = _canonical_digest(
+            self.model_dump(mode="json", exclude={"evidence_digest"})
+        )
+        if self.evidence_digest != expected_digest:
+            raise ValueError("state fact evidence digest diverged")
+        return self
 
 
 class StateFactAccountSchema(BaseModel):
@@ -295,6 +316,7 @@ class StateNoChangeAccountSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     reason_code: Literal["legal_no_op"]
+    action_ids: tuple[str, ...] = Field(default=(), max_length=10)
     spans: tuple[ValidatedProseEvidenceSpanSchema, ...] = Field(
         ...,
         min_length=1,
@@ -327,7 +349,7 @@ class StateFactAccountingSchema(BaseModel):
     accounting_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
-    def validate_summary(self) -> "StateFactAccountingSchema":
+    def validate_projection(self) -> "StateFactAccountingSchema":
         if self.accounted_canonical_fact_count > self.canonical_fact_count:
             raise ValueError("accounted canonical fact count exceeds total")
         expected_unaccounted = (
@@ -363,14 +385,7 @@ class StateFactAccountingSchema(BaseModel):
             mode="json",
             exclude={"accounting_digest"},
         )
-        expected_digest = hashlib.sha256(
-            json.dumps(
-                digest_payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        expected_digest = _canonical_digest(digest_payload)
         if self.accounting_digest != expected_digest:
             raise ValueError("state fact accounting digest diverged")
         return self

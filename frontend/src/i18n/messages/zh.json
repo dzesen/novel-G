@@ -3956,6 +3956,7 @@
     "emptyTitle": "状态提案尚未生成",
     "emptyDescription": "打开本页不会调用模型。点击“开始回填”后才会读取本章正文并生成预览；只有接受所选内容后才写入正式状态。",
     "summaryLabel": "本章摘要",
+    "evidenceLockedHint": "摘要和当下状态已绑定本次正文证据，文本不可直接改写。状态动作可选择是否写入，摘要由证据核算决定；如需改写，请重新生成候选。",
     "charactersLabel": "角色状态",
     "currentStateLabel": "当下状态",
     "factsLabel": "新增永久事实（勾选后写入，写入后无法删除）",
