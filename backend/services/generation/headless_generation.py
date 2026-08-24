@@ -432,7 +432,7 @@ async def generate_outline(
     expected_narrative_revision: int | None = None,
     mutation_idempotency_key: str | None = None,
     job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
-) -> tuple[dict, dict, int, dict, list[dict[str, Any]]]:
+) -> tuple[dict, dict, int, dict, list[dict[str, Any]], list[dict[str, Any]]]:
     execution = await _chapter_capability_registry().execute(
         "chapter_outline",
         OutlineGenerationCommand(
@@ -449,6 +449,41 @@ async def generate_outline(
         call=CapabilityCall(source="job_engine"),
     )
     result = execution.value
+    return (
+        result.value,
+        result.dropped,
+        result.total_tokens,
+        result.truncation,
+        result.attempts,
+        result.remapped,
+    )
+
+
+async def generate_outline_preview(
+    novel_id: str,
+    chapter: Dict[str, Any],
+    attempt_scope: AttemptScope | None = None,
+    generation_params: Mapping[str, Any] | None = None,
+    *,
+    generation_plan: GenerationPlan | None = None,
+) -> tuple[dict, dict, int, dict, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Generate an outline candidate without writing the formal outline."""
+
+    execution = await _chapter_capability_registry().execute(
+        "chapter_outline",
+        OutlineGenerationCommand(
+            novel_id=novel_id,
+            chapter_id=str(chapter["_id"]),
+            authority=AcceptanceAuthority.PREVIEW,
+            generation_params=dict(generation_params or {}),
+            attempt_scope=attempt_scope,
+            generation_plan=generation_plan,
+        ),
+        call=CapabilityCall(source="job_engine"),
+    )
+    result = execution.value
+    if result.accepted:
+        raise RuntimeError("outline preview unexpectedly entered formal storage")
     return (
         result.value,
         result.dropped,
