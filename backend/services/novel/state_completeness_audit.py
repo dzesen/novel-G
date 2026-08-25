@@ -83,7 +83,10 @@ class StateCompletenessAudit:
                 include_content=True,
             )
         chapters = order_book_chapters(chapters, volume_order)
-        completions = await state_completion_module.inspect_many(chapters)
+        completions = await state_completion_module.inspect_many(
+            chapters,
+            allow_unverified_legacy=True,
+        )
         jobs = await get_database()[collections.GENERATION_JOBS].find(
             {"novel_id": to_object_id(novel_id), "is_deleted": False},
             projection={"progress": 1},

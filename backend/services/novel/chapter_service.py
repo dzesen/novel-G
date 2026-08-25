@@ -280,15 +280,18 @@ class ChapterService:
         acceptance_state = str(acceptance.get("state") or "")
         explicitly_completed = prepared.get("status") == "completed"
         if next_content.strip() and (
-            (acceptance_state == "partial_manual_required" and explicitly_completed)
+            (
+                explicitly_completed
+                and acceptance_state not in {"ai_complete", "manual_complete"}
+            )
             or (
                 acceptance_state in {"ai_complete", "manual_complete"}
                 and content_changed
             )
         ):
             prepared["prose_acceptance"] = {
-                **acceptance,
                 "state": "manual_complete",
+                "content_origin": "manual",
                 "content_digest": chapter_content_digest(next_content),
                 "manually_completed_at": get_utc_now(),
             }

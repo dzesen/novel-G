@@ -34,12 +34,20 @@ from backend.scene_contract_versions import (
     current_outline_adherence_decision,
 )
 from backend.services.generation.job_planner import order_book_chapters
+from backend.services.generation.chapter_completion_certificate import (
+    ChapterCompletionCertificate,
+    ChapterCompletionPolicyError,
+    verify_persisted_chapter_completion_certificate,
+)
 from backend.services.generation.failure_diagnostics import (
     ActiveFailureEventState,
     ActiveFailureKind,
     resolve_active_failure_event,
 )
 from backend.services.novel.chapter_service import count_chapter_words
+from backend.services.novel.legacy_chapter_completion import (
+    legacy_semantic_override,
+)
 from backend.services.novel.emergent_reference_card_candidates import (
     REVIEWABLE_STATUSES,
 )
@@ -260,11 +268,15 @@ def _frozen_worklist(job: dict[str, Any]) -> list[dict[str, Any]] | None:
 def _prose_status(
     chapter: dict[str, Any],
     *,
+    owner_id: str,
     content_digest: str,
     actual_word_count: int,
     target_word_count: int | None,
     expected_scene_count: int | None,
     source_run: Mapping[str, Any] | None,
+    finalization_journals: list[Mapping[str, Any]],
+    legacy_job_reviews: list[Mapping[str, Any]],
+    state_status: str,
 ) -> tuple[str, list[BookCompletionIssue]]:
     chapter_id = str(chapter.get("_id") or "")
     volume_id = str(chapter.get("volume_id") or "")
@@ -303,7 +315,14 @@ def _prose_status(
         return state or "unknown_legacy", issues
 
     assert isinstance(acceptance, dict)
-    if str(acceptance.get("content_digest") or "") != content_digest:
+    acceptance_digest_current = (
+        str(acceptance.get("content_digest") or "") == content_digest
+    )
+    word_gate_passed = bool(
+        target_word_count is None
+        or actual_word_count >= math.ceil(target_word_count * 0.8)
+    )
+    if not acceptance_digest_current:
         issues.append(
             BookCompletionIssue(
                 code="chapter_prose_acceptance_stale",
@@ -312,6 +331,7 @@ def _prose_status(
                 chapter_id=chapter_id,
             )
         )
+    audited_state = state
     if state == "ai_complete":
         completion_status = str(acceptance.get("completion_status") or "")
         finish_reason = str(acceptance.get("finish_reason") or "")
@@ -382,20 +402,162 @@ def _prose_status(
                     },
                 )
             )
-    elif str(chapter.get("status") or "") != "completed":
+        raw_certificate = acceptance.get("chapter_completion_certificate")
+        if raw_certificate is not None:
+            certificate_verified = False
+            try:
+                verification = verify_persisted_chapter_completion_certificate(
+                    chapter
+                )
+                certificate = ChapterCompletionCertificate.model_validate(
+                    raw_certificate
+                )
+            except (ChapterCompletionPolicyError, ValueError) as exc:
+                issues.append(
+                    BookCompletionIssue(
+                        code="chapter_completion_certificate_invalid",
+                        category="prose",
+                        volume_id=volume_id,
+                        chapter_id=chapter_id,
+                        details={"reason": str(exc)},
+                    )
+                )
+            else:
+                owner_is_bound = (
+                    certificate.chapter_binding.owner_id == owner_id
+                )
+                if not owner_is_bound:
+                    issues.append(
+                        BookCompletionIssue(
+                            code="chapter_completion_certificate_invalid",
+                            category="prose",
+                            volume_id=volume_id,
+                            chapter_id=chapter_id,
+                            details={"reason": "certificate owner binding is stale"},
+                        )
+                    )
+                source_revision = (
+                    source_run.get("revision")
+                    if isinstance(source_run, Mapping)
+                    else None
+                )
+                source_revision_current = bool(
+                    source_is_bound
+                    and source_revision
+                    == certificate.source_binding.prose_run_revision + 1
+                )
+                if not source_revision_current:
+                    issues.append(
+                        BookCompletionIssue(
+                            code="chapter_completion_source_stale",
+                            category="prose",
+                            volume_id=volume_id,
+                            chapter_id=chapter_id,
+                            details={
+                                "source_run_revision": source_revision,
+                                "certificate_source_revision": (
+                                    certificate.source_binding.prose_run_revision
+                                ),
+                            },
+                        )
+                    )
+                expected_certificate = certificate.model_dump(mode="json")
+                expected_receipt = acceptance.get("completion_receipt")
+                journal_matches = [
+                    journal
+                    for journal in finalization_journals
+                    if journal.get("status") == "completed"
+                    and (journal.get("command") or {}).get("version") == 2
+                    and (
+                        (journal.get("command") or {}).get("payload") or {}
+                    ).get("chapter_completion_certificate")
+                    == expected_certificate
+                    and (journal.get("receipts") or {}).get(
+                        "chapter_completion"
+                    )
+                    == expected_receipt
+                ]
+                if len(journal_matches) != 1:
+                    issues.append(
+                        BookCompletionIssue(
+                            code="chapter_completion_receipt_unproven",
+                            category="runtime",
+                            volume_id=volume_id,
+                            chapter_id=chapter_id,
+                            details={
+                                "certificate_id": verification.certificate_id,
+                                "matching_journal_count": len(journal_matches),
+                            },
+                        )
+                    )
+                certificate_verified = bool(
+                    owner_is_bound
+                    and acceptance_digest_current
+                    and word_gate_passed
+                    and completion_status == "complete"
+                    and finish_reason == "stop"
+                    and scene_gate_passed
+                    and source_revision_current
+                    and len(journal_matches) == 1
+                )
+                audited_state = (
+                    "certificate_verified_v2"
+                    if certificate_verified
+                    else "certificate_unproven_v2"
+                )
+        else:
+            legacy_override = legacy_semantic_override(
+                source_prose_run_id=source_run_id,
+                source_content_digest=content_digest,
+                finalization_journals=finalization_journals,
+                job_reviews=legacy_job_reviews,
+            )
+            legacy_verified = bool(
+                source_is_bound
+                and scene_gate_passed
+                and completion_status == "complete"
+                and finish_reason == "stop"
+                and acceptance_digest_current
+                and word_gate_passed
+                and state_status == "current"
+                and not legacy_override
+            )
+            if legacy_verified:
+                audited_state = "legacy_verified_v1"
+            else:
+                audited_state = "legacy_completion_unproven"
+                issues.append(
+                    BookCompletionIssue(
+                        code="legacy_completion_unproven",
+                        category="prose",
+                        volume_id=volume_id,
+                        chapter_id=chapter_id,
+                        details={
+                            "source_is_bound": source_is_bound,
+                            "scene_gate_passed": scene_gate_passed,
+                            "state_status": state_status,
+                            "legacy_override": legacy_override,
+                        },
+                    )
+                )
+    elif (
+        str(chapter.get("status") or "") != "completed"
+        or acceptance.get("content_origin") not in {None, "manual"}
+        or not acceptance_digest_current
+    ):
         issues.append(
             BookCompletionIssue(
                 code="manual_prose_completion_gate_unproven",
                 category="prose",
                 volume_id=volume_id,
                 chapter_id=chapter_id,
-                details={"chapter_status": chapter.get("status")},
+                details={
+                    "chapter_status": chapter.get("status"),
+                    "content_origin": acceptance.get("content_origin"),
+                },
             )
         )
-    if (
-        target_word_count is not None
-        and actual_word_count < math.ceil(target_word_count * 0.8)
-    ):
+    if not word_gate_passed:
         issues.append(
             BookCompletionIssue(
                 code="chapter_prose_below_word_gate",
@@ -408,7 +570,7 @@ def _prose_status(
                 },
             )
         )
-    return state, issues
+    return audited_state, issues
 
 
 def _finish_report(
@@ -502,7 +664,8 @@ class BookCompletionAudit:
         expected_narrative_revision: int | None = None,
         publication_fence_token: str | None = None,
     ) -> BookCompletionReport:
-        await novel_repo.get_novel_by_id(novel_id)
+        novel = await novel_repo.get_novel_by_id(novel_id)
+        owner_id = str(novel.get("owner_id") or "")
         narrative_revision = await narrative_revision_store.current_for_audit(
             novel_id,
             allowed_book_completion_token=publication_fence_token,
@@ -526,7 +689,10 @@ class BookCompletionAudit:
             include_content=True,
         )
         chapters = order_book_chapters(chapters, volume_order)
-        completions = await state_completion_module.inspect_many(chapters)
+        completions = await state_completion_module.inspect_many(
+            chapters,
+            allow_unverified_legacy=True,
+        )
         database = get_database()
         novel_object_id = to_object_id(novel_id)
         active_character_ids = {
@@ -704,6 +870,7 @@ class BookCompletionAudit:
                     "acceptance_state": 1,
                     "accepted_text_digest": 1,
                     "completion": 1,
+                    "revision": 1,
                 },
             ).to_list(length=None)
             if source_run_object_ids
@@ -712,6 +879,62 @@ class BookCompletionAudit:
         source_runs_by_id = {
             str(source_run["_id"]): source_run for source_run in source_runs
         }
+        active_chapter_ids = {
+            str(chapter.get("_id") or "") for chapter in chapters
+        }
+        finalization_journals = await database[
+            collections.MUTATION_JOURNALS
+        ].find(
+            {
+                "novel_id": novel_object_id,
+                "operation": "finalize_chapter_generation",
+                "command.payload.chapter_id": {"$in": list(active_chapter_ids)},
+                "is_deleted": False,
+            },
+            projection={
+                "status": 1,
+                "command": 1,
+                "receipts.chapter_completion": 1,
+            },
+        ).to_list(length=None)
+        finalization_journals_by_chapter: dict[
+            str, list[Mapping[str, Any]]
+        ] = {}
+        for journal in finalization_journals:
+            command = journal.get("command") or {}
+            payload = command.get("payload") or {}
+            journal_chapter_id = str(payload.get("chapter_id") or "")
+            finalization_journals_by_chapter.setdefault(
+                journal_chapter_id,
+                [],
+            ).append(journal)
+        legacy_jobs = await database[collections.GENERATION_JOBS].find(
+            {
+                "novel_id": novel_object_id,
+                "is_deleted": False,
+                "progress.outline_adherence": {"$exists": True},
+            },
+            projection={"progress": 1, "outline_deviation_policy": 1},
+        ).to_list(length=None)
+        legacy_job_reviews_by_chapter: dict[
+            str, list[Mapping[str, Any]]
+        ] = {}
+        for legacy_job in legacy_jobs:
+            policy = legacy_job.get("outline_deviation_policy")
+            for progress_entry in legacy_job.get("progress") or []:
+                if not isinstance(progress_entry, Mapping):
+                    continue
+                review = progress_entry.get("outline_adherence")
+                chapter_id = str(progress_entry.get("chapter_id") or "")
+                if not chapter_id or not isinstance(review, Mapping):
+                    continue
+                legacy_job_reviews_by_chapter.setdefault(
+                    chapter_id,
+                    [],
+                ).append({
+                    "outline_adherence": review,
+                    "outline_deviation_policy": policy,
+                })
         chapter_audits: list[BookCompletionChapterAudit] = []
         formal_prose_evidence: dict[str, dict[str, str]] = {}
         current_state_count = 0
@@ -737,6 +960,7 @@ class BookCompletionAudit:
                 ),
             }
             actual_word_count = count_chapter_words(content)
+            state_status = completions[chapter_id].status
             if not outline_complete:
                 issues.append(
                     BookCompletionIssue(
@@ -748,6 +972,7 @@ class BookCompletionAudit:
                 )
             prose_status, prose_issues = _prose_status(
                 chapter,
+                owner_id=owner_id,
                 content_digest=content_digest,
                 actual_word_count=actual_word_count,
                 target_word_count=target_word_count,
@@ -765,6 +990,15 @@ class BookCompletionAudit:
                         or ""
                     )
                 ),
+                finalization_journals=finalization_journals_by_chapter.get(
+                    chapter_id,
+                    [],
+                ),
+                legacy_job_reviews=legacy_job_reviews_by_chapter.get(
+                    chapter_id,
+                    [],
+                ),
+                state_status=state_status,
             )
             issues.extend(prose_issues)
             stored_word_count = chapter.get("word_count")
@@ -785,7 +1019,6 @@ class BookCompletionAudit:
                         },
                     )
                 )
-            state_status = completions[chapter_id].status
             if state_status != "current":
                 issues.append(
                     BookCompletionIssue(
@@ -1147,13 +1380,7 @@ class BookCompletionAudit:
                 if (
                     current_outline_adherence_decision(review)
                     in {"repair", "manual_review"}
-                    or (
-                        review.get("verdict") == "fail"
-                        and str(
-                            latest_job.get("outline_deviation_policy") or ""
-                        )
-                        != "accept_and_continue"
-                    )
+                    or review.get("verdict") in {"warn", "fail"}
                 )
             ]
             for semantic in sorted(
@@ -1315,6 +1542,69 @@ class BookCompletionAudit:
                         job_id=frozen_job_id,
                     )
                 )
+        active_interactive_jobs = await database[
+            collections.GENERATION_JOBS
+        ].find(
+            {
+                "novel_id": novel_object_id,
+                "job_kind": "interactive_chapter_completion",
+                "is_deleted": False,
+                "$or": [
+                    {
+                        "status": {
+                            "$in": [
+                                "completion_running",
+                                "completion_uncertain",
+                                "completion_resolving_uncertain",
+                            ]
+                        }
+                    },
+                    {"has_uncertain_attempts": True},
+                    {
+                        "attempt_slots": {
+                            "$elemMatch": {
+                                "state": {"$in": ["claimed", "uncertain"]}
+                            }
+                        }
+                    },
+                ],
+            },
+            projection={
+                "_id": 1,
+                "current_chapter_id": 1,
+                "status": 1,
+                "has_uncertain_attempts": 1,
+                "attempt_slots.state": 1,
+            },
+        ).to_list(length=None)
+        for interactive_job in active_interactive_jobs:
+            has_live_attempt = bool(
+                interactive_job.get("has_uncertain_attempts")
+            ) or any(
+                isinstance(slot, Mapping)
+                and slot.get("state") in {"claimed", "uncertain"}
+                for slot in interactive_job.get("attempt_slots") or []
+            )
+            issues.append(
+                BookCompletionIssue(
+                    code=(
+                        "uncertain_provider_attempt"
+                        if has_live_attempt
+                        else "interactive_completion_unresolved"
+                    ),
+                    category="runtime",
+                    chapter_id=(
+                        str(interactive_job.get("current_chapter_id") or "")
+                        or None
+                    ),
+                    job_id=str(interactive_job.get("_id") or ""),
+                    details=(
+                        {}
+                        if has_live_attempt
+                        else {"status": str(interactive_job.get("status") or "")}
+                    ),
+                )
+            )
         blocking_chapter_ids = {
             issue.chapter_id
             for issue in issues

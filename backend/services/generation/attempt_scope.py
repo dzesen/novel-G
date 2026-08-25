@@ -129,12 +129,14 @@ class JobAttemptScope:
         repo: GenerationJobRepository = generation_job_repo,
         confirm_uncertain_retry: bool = False,
         existing_attempt_slots: Sequence[Mapping[str, object]] = (),
+        interactive_execution_token: str | None = None,
     ) -> None:
         self.job_id = str(job_id)
         self.chapter_id = str(chapter_id)
         self.step_id = str(step_id)
         self.repo = repo
         self.confirm_uncertain_retry = bool(confirm_uncertain_retry)
+        self.interactive_execution_token = interactive_execution_token
         self._claims: dict[str, tuple[str, str]] = {}
         self._conservative_tokens: dict[str, int | None] = {}
         self._attempts: dict[str, AttemptUsage] = {}
@@ -255,15 +257,27 @@ class JobAttemptScope:
         phase: str,
         conservative_tokens: int | None,
     ) -> str:
-        attempt_id = await self.repo.claim_attempt_with_budget(
-            self.job_id,
-            self.chapter_id,
-            self.step_id,
-            phase,
-            provider_alias,
-            conservative_tokens,
-            pre_dispatch_fence=self._pre_dispatch_fence,
-        )
+        if self.interactive_execution_token is None:
+            attempt_id = await self.repo.claim_attempt_with_budget(
+                self.job_id,
+                self.chapter_id,
+                self.step_id,
+                phase,
+                provider_alias,
+                conservative_tokens,
+                pre_dispatch_fence=self._pre_dispatch_fence,
+            )
+        else:
+            attempt_id = await self.repo.claim_attempt_with_budget(
+                self.job_id,
+                self.chapter_id,
+                self.step_id,
+                phase,
+                provider_alias,
+                conservative_tokens,
+                pre_dispatch_fence=self._pre_dispatch_fence,
+                interactive_execution_token=self.interactive_execution_token,
+            )
         self._claims[attempt_id] = (provider_alias, phase)
         self._conservative_tokens[attempt_id] = conservative_tokens
         self._persisted_states[attempt_id] = "claimed"

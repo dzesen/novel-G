@@ -1422,6 +1422,8 @@ class ChapterCandidateJobRunner:
             adherence: Mapping[str, Any],
             state: Mapping[str, Any],
             cycles: int,
+            *,
+            repair_trace: Mapping[str, Any] | None,
         ) -> Mapping[str, Any]:
             try:
                 await self._ensure_narrative_revision(
@@ -1436,6 +1438,7 @@ class ChapterCandidateJobRunner:
                     adherence=adherence,
                     state=state,
                     repair_cycles_used=cycles,
+                    repair_trace=repair_trace,
                 )
             except ChapterCandidatePipelineBlocked:
                 raise

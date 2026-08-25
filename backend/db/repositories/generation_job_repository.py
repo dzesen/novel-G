@@ -69,6 +69,7 @@ BOOK_COMPLETION_PUBLICATION_LEASE_SECONDS = 30
 BOOK_COMPLETION_PUBLICATION_SCHEMA = "book_completion_audit_publication.v1"
 _ATOMIC_JOB_FIELDS = frozenset({
     "candidate_pipeline_checkpoints",
+    "chapter_completion_decisions",
     "completion_audit",
     "completion_audit_publication",
     "expected_narrative_revision",
@@ -162,6 +163,9 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         )
     if document.get("job_mutation_recovery") is not None:
         raise ValueError("Job mutation recovery binding must start empty")
+    decisions = document.get("chapter_completion_decisions", [])
+    if not isinstance(decisions, list) or decisions:
+        raise ValueError("Chapter completion decision ledger must start empty")
     if document.get("state_dispatch_resolution") is not None:
         raise ValueError("State dispatch resolution must start empty")
     if document.get("execution_lease") is not None:
@@ -3513,6 +3517,88 @@ class GenerationJobRepository:
         )
         return result.matched_count > 0
 
+    async def append_chapter_completion_decision(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        prose_run_id: str,
+        prose_run_revision: int,
+        decision: Mapping[str, Any],
+    ) -> bool:
+        """Append one bounded, canonical completion decision exactly once."""
+
+        from backend.services.generation.chapter_completion_certificate import (
+            ChapterCompletionDecision,
+        )
+
+        if (
+            not ObjectId.is_valid(str(chapter_id))
+            or not ObjectId.is_valid(str(prose_run_id))
+            or type(prose_run_revision) is not int
+            or prose_run_revision < 1
+        ):
+            raise ValueError("Chapter completion decision binding is invalid")
+        parsed = ChapterCompletionDecision.model_validate(decision)
+        canonical = parsed.model_dump(mode="json")
+        entry = {
+            "chapter_id": str(chapter_id),
+            "prose_run_id": str(prose_run_id),
+            "prose_run_revision": prose_run_revision,
+            "decision": canonical,
+            "recorded_at": get_utc_now(),
+        }
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "chapter_completion_decisions.decision.decision_id": {
+                    "$ne": parsed.decision_id
+                },
+                "$expr": {
+                    "$lt": [
+                        {
+                            "$size": {
+                                "$ifNull": [
+                                    "$chapter_completion_decisions",
+                                    [],
+                                ]
+                            }
+                        },
+                        200,
+                    ]
+                },
+            },
+            {
+                "$push": {"chapter_completion_decisions": entry},
+                "$set": {"updated_at": get_utc_now()},
+            },
+        )
+        if result.matched_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        matches = [
+            item
+            for item in current.get("chapter_completion_decisions") or []
+            if isinstance(item, Mapping)
+            and isinstance(item.get("decision"), Mapping)
+            and item["decision"].get("decision_id") == parsed.decision_id
+        ]
+        if len(matches) == 1 and all(
+            (
+                str(matches[0].get("chapter_id") or "") == str(chapter_id),
+                str(matches[0].get("prose_run_id") or "")
+                == str(prose_run_id),
+                matches[0].get("prose_run_revision")
+                == prose_run_revision,
+                dict(matches[0]["decision"]) == canonical,
+            )
+        ):
+            return False
+        if len(current.get("chapter_completion_decisions") or []) >= 200:
+            raise ValueError("Chapter completion decision ledger is full")
+        raise ValueError("Chapter completion decision append lost its fence")
+
     @staticmethod
     def _validated_diagnostic_event_id(event: Mapping[str, Any]) -> str:
         event_id = event.get("event_id")
@@ -3872,6 +3958,7 @@ class GenerationJobRepository:
         conservative_tokens: int | None,
         *,
         pre_dispatch_fence: PreDispatchFenceV1 | None = None,
+        interactive_execution_token: str | None = None,
     ) -> str:
         """Atomically claim an attempt slot and reserve its worst-case tokens."""
         if (
@@ -3883,6 +3970,15 @@ class GenerationJobRepository:
                 "Every Provider attempt requires a conservative token bound"
             )
         reserved = conservative_tokens
+        if interactive_execution_token is not None and (
+            not isinstance(interactive_execution_token, str)
+            or len(interactive_execution_token) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in interactive_execution_token
+            )
+        ):
+            raise ValueError("Interactive execution token is invalid")
         attempt_id = uuid4().hex
         now = get_utc_now()
         slot = {
@@ -3910,6 +4006,13 @@ class GenerationJobRepository:
             "state_dispatch_resolution": None,
             "attempt_reservation.chapter_id": str(chapter_id),
         }
+        if interactive_execution_token is not None:
+            query.update({
+                "status": "completion_running",
+                "interactive_execution_claim.token": (
+                    interactive_execution_token
+                ),
+            })
         if fence is not None:
             query["attempt_reservation.pre_dispatch_fence"] = fence
         query["$expr"] = {
@@ -3975,6 +4078,20 @@ class GenerationJobRepository:
             return attempt_id
 
         job = await self.get_job(job_id)
+        if interactive_execution_token is not None:
+            execution_claim = job.get("interactive_execution_claim")
+            active_token = (
+                str(execution_claim.get("token") or "")
+                if isinstance(execution_claim, Mapping)
+                else ""
+            )
+            if (
+                active_token != interactive_execution_token
+                or str(job.get("status") or "") != "completion_running"
+            ):
+                raise AttemptFenceExpired(
+                    "Interactive completion execution authority was replaced"
+                )
         if fence is not None:
             active_fence = (job.get("attempt_reservation") or {}).get(
                 "pre_dispatch_fence"

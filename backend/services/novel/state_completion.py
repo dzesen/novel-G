@@ -19,6 +19,10 @@ from backend.services.novel.state_fact_accounting import (
     StateFactAccountingError,
     validate_state_fact_accounting,
 )
+from backend.services.generation.chapter_completion_certificate import (
+    ChapterCompletionPolicyError,
+    verify_persisted_chapter_completion_certificate,
+)
 
 
 StateCompletionStatus = Literal[
@@ -32,7 +36,7 @@ StateCompletionStatus = Literal[
 ]
 
 PROSE_ACCEPTANCE_ELIGIBLE_STATES = frozenset(
-    {"ai_complete", "manual_complete", "unknown_legacy"}
+    {"ai_complete", "manual_complete"}
 )
 
 
@@ -48,10 +52,42 @@ def prose_acceptance_state(chapter: dict[str, Any]) -> str:
     return "unknown_legacy"
 
 
-def prose_is_eligible_for_state(chapter: dict[str, Any]) -> bool:
-    return bool(str(chapter.get("content") or "").strip()) and (
-        prose_acceptance_state(chapter) in PROSE_ACCEPTANCE_ELIGIBLE_STATES
-    )
+def prose_is_eligible_for_state(
+    chapter: dict[str, Any],
+    *,
+    allow_unverified_legacy: bool = False,
+) -> bool:
+    content = str(chapter.get("content") or "")
+    if not content.strip():
+        return False
+    acceptance = chapter.get("prose_acceptance")
+    if not isinstance(acceptance, dict):
+        return allow_unverified_legacy
+    state = prose_acceptance_state(chapter)
+    current_digest = chapter_content_digest(content)
+    if state == "manual_complete":
+        return bool(
+            acceptance.get("content_origin") in {None, "manual"}
+            and acceptance.get("content_digest") == current_digest
+        )
+    if state != "ai_complete":
+        return False
+    try:
+        verify_persisted_chapter_completion_certificate(chapter)
+        return True
+    except ChapterCompletionPolicyError:
+        # ``legacy_verified_v1`` is a read-only audit classification derived
+        # from the source run, outline, word gate, current state, and legacy
+        # journals. A label copied into chapter acceptance is not that proof
+        # and must never unlock a new state Provider call.
+        return bool(
+            allow_unverified_legacy
+            and acceptance.get("chapter_completion_certificate") is None
+            and acceptance.get("content_digest") == current_digest
+            and acceptance.get("completion_status") == "complete"
+            and acceptance.get("finish_reason") == "stop"
+            and str(acceptance.get("source_run_id") or "")
+        )
 
 
 @dataclass(frozen=True)
@@ -91,16 +127,42 @@ class StateCompletionModule:
     def classify(
         chapter: dict[str, Any],
         delta: dict[str, Any] | None,
+        *,
+        allow_unverified_legacy: bool = False,
     ) -> StateCompletion:
         chapter_id = str(chapter.get("_id") or "")
         acceptance_state = prose_acceptance_state(chapter)
-        eligible = prose_is_eligible_for_state(chapter)
+        eligible = prose_is_eligible_for_state(
+            chapter,
+            allow_unverified_legacy=allow_unverified_legacy,
+        )
         current_digest = (
             chapter_content_digest(chapter.get("content"))
             if str(chapter.get("content") or "").strip()
             else None
         )
         if not eligible:
+            acceptance = chapter.get("prose_acceptance")
+            acceptance_digest = (
+                acceptance.get("content_digest")
+                if isinstance(acceptance, dict)
+                else None
+            )
+            if (
+                acceptance_state in PROSE_ACCEPTANCE_ELIGIBLE_STATES
+                and acceptance_digest
+                and acceptance_digest != current_digest
+            ):
+                return StateCompletion(
+                    chapter_id=chapter_id,
+                    status="stale_after_content_edit",
+                    needs_backfill=True,
+                    requires_pause=False,
+                    prose_eligible=False,
+                    prose_acceptance_state=acceptance_state,
+                    source_content_digest=str(acceptance_digest),
+                    current_content_digest=current_digest,
+                )
             # A matching old delta is still not reusable after prose is explicitly
             # marked partial/manual-required. Eligibility is the outer gate; the
             # digest only proves which bytes the old delta described.
@@ -235,6 +297,8 @@ class StateCompletionModule:
     async def inspect_many(
         self,
         chapters: list[dict[str, Any]],
+        *,
+        allow_unverified_legacy: bool = False,
     ) -> dict[str, StateCompletion]:
         if not chapters:
             return {}
@@ -254,6 +318,7 @@ class StateCompletionModule:
             str(chapter["_id"]): self.classify(
                 chapter,
                 by_chapter.get(str(chapter["_id"])),
+                allow_unverified_legacy=allow_unverified_legacy,
             )
             for chapter in chapters
         }

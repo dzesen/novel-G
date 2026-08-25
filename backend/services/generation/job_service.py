@@ -698,6 +698,7 @@ def _new_job_doc(
         "attempt_slots": [],
         "attempt_reservation": None,
         "candidate_pipeline_checkpoints": [],
+        "chapter_completion_decisions": [],
         "reference_card_auto_creation_events": [],
         "reference_card_repair_events": [],
         "state_dispatch_resolution": None,
@@ -1889,6 +1890,7 @@ class GenerationJobService:
                 adherence: Mapping[str, Any],
                 state: Mapping[str, Any],
                 repair_cycles_used: int,
+                repair_trace: Mapping[str, Any] | None,
             ) -> Mapping[str, Any]:
                 del novel_id
                 planning = readiness.get("planning")
@@ -1923,6 +1925,11 @@ class GenerationJobService:
                     evidence=ChapterFinalizationEvidence(
                         outline_adherence=dict(adherence),
                         repair_cycles_used=repair_cycles_used,
+                        repair_trace=(
+                            dict(repair_trace)
+                            if repair_trace is not None
+                            else None
+                        ),
                     ),
                 )
 

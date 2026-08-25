@@ -23,6 +23,9 @@ from backend.db.repositories.prose_run_repository import (
 )
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation.prose_completion import ProseExecutionPlan
+from backend.services.generation.chapter_completion_certificate import (
+    ChapterCompletionCertificate,
+)
 from backend.services.generation.prose_protocol import (
     is_scene_continuation_v3_family,
 )
@@ -33,6 +36,9 @@ from backend.services.llm.context_builder import normalize_outline_references
 from backend.services.novel.chapter_service import count_chapter_words
 from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.state_completion import chapter_content_digest
+
+
+ACCEPT_PROSE_RUN_COMMAND_VERSION = 2
 
 
 def prose_revision(value: Any) -> str:
@@ -966,16 +972,14 @@ class ProseRunModule:
             raise ValueError("正文候选验证快照摘要已经变化")
         return text
 
-    async def prepare_accept_mutation(
+    async def _load_accept_context(
         self,
         *,
         owner_id: str,
         run_id: str,
         chapter_id: str,
         expected_revision: int,
-        accept_partial: bool,
-        partial_acknowledgement: bool,
-    ) -> MutationCommand:
+    ) -> dict[str, Any]:
         run = await prose_run_repo.get_run(run_id, owner_id)
         fence = dict(run.get("remediation_write_fence") or {})
         if fence:
@@ -1039,7 +1043,6 @@ class ProseRunModule:
         ):
             raise ValueError("章节细纲已经变化，旧正文草稿不能写入")
         completion = dict(run.get("completion") or {})
-        can_write = bool(completion.get("can_write_formal_prose"))
         remediation = dict(run.get("remediation") or {})
         if remediation:
             if remediation.get("schema_version") != "prose_run_remediation.v1":
@@ -1067,18 +1070,100 @@ class ProseRunModule:
                 raise ValueError(
                     "正文修复 Agent 尚未完成，不能正式接受"
                 ) from exc
+        text = prose_run_draft_text(run)
+        if not text.strip():
+            raise ValueError("正文草稿为空，不能接受")
+        return {
+            "run": run,
+            "chapter": chapter,
+            "completion": completion,
+            "text": text,
+            "text_digest": chapter_content_digest(text),
+            "captured_narrative_revision": int(captured_narrative_revision),
+        }
+
+    async def inspect_ai_completion_candidate(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        chapter_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Return the exact current candidate without creating a mutation intent."""
+
+        context = await self._load_accept_context(
+            owner_id=owner_id,
+            run_id=run_id,
+            chapter_id=chapter_id,
+            expected_revision=expected_revision,
+        )
+        if not bool(context["completion"].get("can_write_formal_prose")):
+            raise ValueError("正文尚未完成；不能进入 AI 完成评估")
+        return context
+
+    async def prepare_accept_mutation(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        chapter_id: str,
+        expected_revision: int,
+        accept_partial: bool,
+        partial_acknowledgement: bool,
+        chapter_completion_certificate: Mapping[str, Any] | None = None,
+    ) -> MutationCommand:
+        context = await self._load_accept_context(
+            owner_id=owner_id,
+            run_id=run_id,
+            chapter_id=chapter_id,
+            expected_revision=expected_revision,
+        )
+        run = context["run"]
+        chapter = context["chapter"]
+        completion = context["completion"]
+        text_digest = str(context["text_digest"])
+        captured_narrative_revision = int(
+            context["captured_narrative_revision"]
+        )
+        can_write = bool(completion.get("can_write_formal_prose"))
         if not can_write and not accept_partial:
             raise ValueError("正文尚未完成；只能继续生成或明确接受部分正文")
         if accept_partial and not partial_acknowledgement:
             raise ValueError("接受部分正文前必须确认仍需人工补写")
-        text = prose_run_draft_text(run)
-        if not text.strip():
-            raise ValueError("正文草稿为空，不能接受")
+
+        serialized_certificate: dict[str, Any] | None = None
+        if accept_partial:
+            if chapter_completion_certificate is not None:
+                raise ValueError("部分正文不能绑定章节完成证书")
+        else:
+            if chapter_completion_certificate is None:
+                raise ValueError("AI 完整正文必须先取得当前章节完成证书")
+            try:
+                certificate = ChapterCompletionCertificate.model_validate(
+                    chapter_completion_certificate
+                )
+            except ValueError as exc:
+                raise ValueError("章节完成证书格式或摘要无效") from exc
+            source = certificate.source_binding
+            binding = certificate.chapter_binding
+            if (
+                source.prose_run_id != str(run_id)
+                or source.prose_run_revision != int(expected_revision)
+                or source.content_digest != text_digest
+                or source.expected_narrative_revision_before_commit
+                != captured_narrative_revision
+                or binding.owner_id != str(owner_id)
+                or binding.novel_id != str(run["novel_id"])
+                or binding.chapter_id != str(chapter_id)
+                or binding.volume_id != str(chapter.get("volume_id") or "")
+            ):
+                raise ValueError("章节完成证书没有绑定当前正文候选")
+            serialized_certificate = certificate.model_dump(mode="json")
 
         acceptance_state = (
             "partial_manual_required" if accept_partial else "ai_complete"
         )
-        text_digest = chapter_content_digest(text)
         command = MutationCommand(
             novel_id=str(run["novel_id"]),
             idempotency_key=(
@@ -1086,7 +1171,7 @@ class ProseRunModule:
                 f"{acceptance_state}:{text_digest[:16]}"
             ),
             operation="accept_prose_run",
-            version=1,
+            version=ACCEPT_PROSE_RUN_COMMAND_VERSION,
             payload={
                 "run_id": run_id,
                 "owner_id": owner_id,
@@ -1095,8 +1180,10 @@ class ProseRunModule:
                 "text_digest": text_digest,
                 "acceptance_state": acceptance_state,
                 "accepted_partial": bool(accept_partial),
+                "content_origin": "ai",
                 "completion": completion,
                 "captured_narrative_revision": int(captured_narrative_revision),
+                "chapter_completion_certificate": serialized_certificate,
             },
             before_image={
                 "chapter": {"status": chapter.get("status")},
@@ -1152,7 +1239,11 @@ class ProseRunModule:
 
     @staticmethod
     async def _execute_accept(session, mutation) -> dict[str, Any]:
-        command = mutation.journal["command"]["payload"]
+        command_envelope = mutation.journal["command"]
+        command_version = int(command_envelope.get("version") or 0)
+        if command_version not in {1, 2}:
+            raise ValueError("正文接受命令版本未知")
+        command = command_envelope["payload"]
         run_id = str(command["run_id"])
         chapter_id = str(command["chapter_id"])
         owner_id = str(command["owner_id"])
@@ -1178,9 +1269,38 @@ class ProseRunModule:
         if chapter_content_digest(text) != command["text_digest"]:
             raise ValueError("正文草稿内容摘要已经变化")
 
+        serialized_certificate: dict[str, Any] | None = None
+        if command_version == 2:
+            raw_certificate = command.get("chapter_completion_certificate")
+            if command["acceptance_state"] == "ai_complete":
+                if not isinstance(raw_certificate, Mapping):
+                    raise ValueError("AI 完整正文缺少章节完成证书")
+                try:
+                    certificate = ChapterCompletionCertificate.model_validate(
+                        raw_certificate
+                    )
+                except ValueError as exc:
+                    raise ValueError("章节完成证书格式或摘要无效") from exc
+                if (
+                    certificate.source_binding.prose_run_id != run_id
+                    or certificate.source_binding.prose_run_revision
+                    != expected_revision
+                    or certificate.source_binding.content_digest
+                    != command["text_digest"]
+                    or certificate.chapter_binding.chapter_id != chapter_id
+                    or certificate.chapter_binding.owner_id != owner_id
+                    or certificate.chapter_binding.novel_id
+                    != str(run["novel_id"])
+                ):
+                    raise ValueError("章节完成证书没有绑定当前正文候选")
+                serialized_certificate = certificate.model_dump(mode="json")
+            elif raw_certificate is not None:
+                raise ValueError("部分正文不能绑定章节完成证书")
+
         accepted_at = get_utc_now()
         acceptance = {
             "state": command["acceptance_state"],
+            "content_origin": str(command.get("content_origin") or "ai"),
             "accepted_partial": bool(command.get("accepted_partial")),
             "source_run_id": run_id,
             "content_digest": command["text_digest"],
@@ -1188,6 +1308,10 @@ class ProseRunModule:
             "finish_reason": (run.get("completion") or {}).get("finish_reason"),
             "accepted_at": accepted_at,
         }
+        if serialized_certificate is not None:
+            acceptance["chapter_completion_certificate"] = (
+                serialized_certificate
+            )
         await mutation.advance_phase("primary_writes")
         if not mutation.was_received("chapter"):
             await chapter_repo.update_chapter(

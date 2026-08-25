@@ -727,6 +727,21 @@ async def init_generation_job_indexes():
             ]),
             pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
             pymongo.IndexModel(
+                [
+                    ("owner_id", pymongo.ASCENDING),
+                    ("novel_id", pymongo.ASCENDING),
+                    ("job_kind", pymongo.ASCENDING),
+                    ("interactive_source_key", pymongo.ASCENDING),
+                    ("authorization_revision", pymongo.DESCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                ],
+                partialFilterExpression={
+                    "job_kind": "interactive_chapter_completion",
+                    "is_deleted": False,
+                },
+                name="interactive_completion_source_history",
+            ),
+            pymongo.IndexModel(
                 [("active_slot", pymongo.ASCENDING)],
                 unique=True,
                 partialFilterExpression={"active_slot": "global", "is_deleted": False},

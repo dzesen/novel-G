@@ -4680,6 +4680,25 @@ class ChapterCandidatePipeline:
                 code=exc.code,
             ) from exc
 
+        progress = trace.snapshot()
+        repair_trace = (
+            None
+            if progress.repair_cycles_used == 0
+            else {
+                "schema_version": "chapter_repair_trace.v2",
+                "repair_cycles_used": progress.repair_cycles_used,
+                "component_usage": [
+                    item.model_dump(mode="json")
+                    for item in progress.repair_component_usage
+                ],
+                "convergence": [
+                    item.model_dump(mode="json")
+                    for item in progress.repair_convergence
+                ],
+                "final_issue_signatures": [],
+                "converged": True,
+            }
+        )
         finalization = dict(
             await self._deps.finalize(
                 novel_id,
@@ -4688,9 +4707,9 @@ class ChapterCandidatePipeline:
                 adherence,
                 state,
                 trace.repair_cycles_used,
+                repair_trace=repair_trace,
             )
         )
-        progress = trace.snapshot()
         return ChapterCandidatePipelineResult(
             tokens=progress.tokens,
             attempts=progress.attempts,

@@ -32,6 +32,7 @@ from backend.services.generation.chapter_generation_application import (
     ChapterGenerationApplicationService,
     CHAPTER_STATE_STEPS,
     PartialProseRequiresCompletion,
+    ProseCompletionProofRequired,
     StateGenerationCommand,
     STATE_STEP,
     STATE_WORKFLOW,
@@ -135,8 +136,18 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except PartialProseRequiresCompletion as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (PartialProseRequiresCompletion, ProseCompletionProofRequired) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": (
+                    "partial_prose_requires_completion"
+                    if isinstance(exc, PartialProseRequiresCompletion)
+                    else "prose_completion_proof_required"
+                ),
+                "message": str(exc),
+            },
+        ) from exc
     except (InvalidIdError, ContextBudgetError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

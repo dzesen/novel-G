@@ -116,8 +116,13 @@ from backend.services.llm.workflow_runner import (
     run_workflow,
 )
 from backend.services.novel.chapter_service import ChapterService
+from backend.services.novel.legacy_chapter_completion import (
+    LegacyChapterCompletionProof,
+    verify_legacy_chapter_completion_for_state,
+)
 from backend.services.novel.state_completion import (
     chapter_content_digest,
+    prose_is_eligible_for_state,
     prose_acceptance_state,
 )
 from backend.services.novel.state_proposal import (
@@ -277,6 +282,10 @@ class PartialProseRequiresCompletion(ValueError):
     """正文只接受了部分 AI 结果，状态回填必须硬暂停。"""
 
 
+class ProseCompletionProofRequired(ValueError):
+    """正式正文缺少 manual、V2 certificate 或冻结 legacy 证明。"""
+
+
 class _ChapterGenerationCommand(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -410,6 +419,9 @@ class ChapterGenerationApplicationDeps:
     resolve_provider: Callable[[str, str], str] = resolve_provider_for_step
     get_provider_config: Callable[[str], Any] = get_provider_config
     estimate_tokens: Callable[[str], int] = estimate_tokens
+    verify_legacy_completion: Callable[..., Awaitable[Any]] = (
+        verify_legacy_chapter_completion_for_state
+    )
 
     @classmethod
     def production(cls) -> "ChapterGenerationApplicationDeps":
@@ -437,6 +449,9 @@ class ChapterGenerationApplicationDeps:
             resolve_provider=resolve_provider_for_step,
             get_provider_config=get_provider_config,
             estimate_tokens=estimate_tokens,
+            verify_legacy_completion=(
+                verify_legacy_chapter_completion_for_state
+            ),
         )
 
 
@@ -910,6 +925,32 @@ class ChapterGenerationApplicationService:
                     "本章正文只接受了部分 AI 结果；请先补写并将章节状态设为完成，"
                     "再执行状态回填"
                 )
+            legacy_proof: LegacyChapterCompletionProof | bool | None = None
+            if candidate is None and not prose_is_eligible_for_state(chapter):
+                if prose_acceptance_state(chapter) == "ai_complete":
+                    legacy_proof = await self._deps.verify_legacy_completion(
+                        novel_id=command.novel_id,
+                        chapter_id=command.chapter_id,
+                        chapter=chapter,
+                    )
+                if not legacy_proof:
+                    raise ProseCompletionProofRequired(
+                        "本章正文没有可验证的人工完成、V2 完成证书或冻结的旧版"
+                        "完成证明，不能生成新的正式状态候选"
+                    )
+
+            acceptance = chapter.get("prose_acceptance")
+            acceptance = acceptance if isinstance(acceptance, Mapping) else {}
+            legacy_source_run_id = (
+                legacy_proof.source_prose_run_id
+                if isinstance(legacy_proof, LegacyChapterCompletionProof)
+                else str(acceptance.get("source_run_id") or "") or None
+            )
+            legacy_source_run_revision = (
+                legacy_proof.source_prose_run_revision
+                if isinstance(legacy_proof, LegacyChapterCompletionProof)
+                else None
+            )
 
             snapshot = await self._deps.state_proposals.capture(
                 command.novel_id,
@@ -921,15 +962,19 @@ class ChapterGenerationApplicationService:
                     else chapter_content_digest(content)
                 ),
                 source_prose_run_id=(
-                    candidate.source_run_id if candidate is not None else None
+                    candidate.source_run_id
+                    if candidate is not None
+                    else legacy_source_run_id
                 ),
                 source_prose_run_revision=(
                     candidate.source_run_revision
                     if candidate is not None
-                    else None
+                    else legacy_source_run_revision
                 ),
                 source_prose_acceptance_state=(
-                    "ai_complete" if candidate is not None else None
+                    "ai_complete"
+                    if candidate is not None
+                    else prose_acceptance_state(chapter)
                 ),
             )
             binding = command.job_mutation_binding
@@ -1909,23 +1954,11 @@ class ChapterGenerationApplicationService:
                         assembled_text=generated.text,
                     )
 
+                # SYSTEM authority may persist a complete ProseRun candidate, but
+                # it no longer owns formal prose acceptance.  Every AI complete
+                # write is issued later by the certificate finalizer together
+                # with its semantic and state evidence.
                 accepted = False
-                if (
-                    command.authority is AcceptanceAuthority.SYSTEM
-                    and command.acceptance_timing is AcceptanceTiming.IMMEDIATE
-                    and generated.completion.can_write_formal_prose
-                ):
-                    if latest_run is None or owner_id is None:
-                        raise ValueError("系统接受正文前缺少可审计的 ProseRun")
-                    await self._deps.prose_runs.accept(
-                        owner_id=owner_id,
-                        run_id=str(latest_run["_id"]),
-                        chapter_id=command.chapter_id,
-                        expected_revision=int(latest_run.get("revision") or 0),
-                        accept_partial=False,
-                        partial_acknowledgement=False,
-                    )
-                    accepted = True
 
                 completion = {
                     **generated.completion.to_dict(),

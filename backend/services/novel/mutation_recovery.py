@@ -30,6 +30,7 @@ from backend.services.novel.emergent_reference_card_candidates import (
 from backend.services.novel.volume_service import VolumeService
 from backend.services.generation.prose_runs import ProseRunModule
 from backend.services.generation.chapter_finalization import (
+    ChapterFinalizationAuthorization,
     ChapterFinalizationService,
     parse_chapter_finalization_authorization,
 )
@@ -92,7 +93,11 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
         ("accept_prose_run", 1): ProseRunModule._execute_accept,
+        ("accept_prose_run", 2): ProseRunModule._execute_accept,
         ("finalize_chapter_generation", 1): (
+            ChapterFinalizationService._execute_finalize
+        ),
+        ("finalize_chapter_generation", 2): (
             ChapterFinalizationService._execute_finalize
         ),
         ("create_chapter", 1): ChapterService._execute_create_chapter,
@@ -366,14 +371,30 @@ async def recover_bound_mutation_revision(
             )
     elif normalized_operation == "finalize_chapter_generation":
         raw_authorization = payload.get("authorization")
-        if not isinstance(raw_authorization, dict) or set(
-            raw_authorization
-        ) != {
+        legacy_keys = {
             "job_id",
             "readiness_digest",
             "authorization_revision",
             "snapshot",
-        }:
+        }
+        interactive_v2_keys = legacy_keys | {
+            "kind",
+            "authorization_id",
+            "execution_claim_token",
+        }
+        if (
+            not isinstance(raw_authorization, dict)
+            or (
+                command.version == 1
+                and set(raw_authorization) != legacy_keys
+            )
+            or (
+                command.version == 2
+                and frozenset(raw_authorization)
+                not in {frozenset(legacy_keys), frozenset(interactive_v2_keys)}
+            )
+            or command.version not in {1, 2}
+        ):
             raise MutationConflictError(
                 "The persisted finalization authorization is invalid"
             )
@@ -381,28 +402,33 @@ async def recover_bound_mutation_revision(
             snapshot = parse_chapter_finalization_authorization(
                 raw_authorization.get("snapshot")
             )
+            parsed_authorization = ChapterFinalizationAuthorization.model_validate({
+                key: value
+                for key, value in raw_authorization.items()
+                if key != "snapshot"
+            })
         except ValueError as exc:
             raise MutationConflictError(
                 "The persisted finalization authorization is invalid"
             ) from exc
-        authorization_revision = raw_authorization.get(
-            "authorization_revision"
-        )
         if (
-            not isinstance(raw_authorization.get("job_id"), str)
-            or not isinstance(raw_authorization.get("readiness_digest"), str)
-            or type(authorization_revision) is not int
-            or authorization_revision
+            parsed_authorization.authorization_revision
             != snapshot["authorization_revision"]
+            or (
+                parsed_authorization.kind
+                == "interactive_completion_readiness"
+                and parsed_authorization.authorization_id
+                != parsed_authorization.job_id
+            )
         ):
             raise MutationConflictError(
                 "The persisted finalization authorization is invalid"
             )
         supplied = {
-            "job_id": raw_authorization.get("job_id"),
-            "readiness_digest": raw_authorization.get("readiness_digest"),
-            "authorization_revision": raw_authorization.get(
-                "authorization_revision"
+            "job_id": parsed_authorization.job_id,
+            "readiness_digest": parsed_authorization.readiness_digest,
+            "authorization_revision": (
+                parsed_authorization.authorization_revision
             ),
         }
         expected = {
