@@ -61,6 +61,8 @@ from backend.services.generation.prose_runs import (
 )
 from backend.services.generation.interactive_chapter_completion import (
     InteractiveCompletionBlocked,
+    InteractiveCompletionRequestBinding,
+    build_interactive_completion_request_binding,
     interactive_chapter_completion_service,
 )
 from backend.services.generation.chapter_generation_application import (
@@ -186,6 +188,24 @@ class ResolveInteractiveCompletionRequest(
     InteractiveCompletionAuthorityRequest
 ):
     action: Literal["retry", "abort"]
+
+
+def _interactive_completion_request_binding(
+    *,
+    owner_id: str,
+    run_id: str,
+    request: InteractiveCompletionAuthorityRequest,
+) -> InteractiveCompletionRequestBinding:
+    return build_interactive_completion_request_binding(
+        owner_id=owner_id,
+        novel_id=request.novel_id,
+        chapter_id=request.chapter_id,
+        run_id=run_id,
+        run_revision=request.expected_run_revision,
+        authorization_id=request.authorization_id,
+        authorization_revision=request.authorization_revision,
+        readiness_digest=request.completion_readiness_digest,
+    )
 
 
 def _interactive_completion_conflict(
@@ -503,14 +523,11 @@ async def complete_interactive_prose_run(
         raise HTTPException(status_code=401, detail="需要登录")
     try:
         return await interactive_chapter_completion_service.complete(
-            owner_id=str(actor.id),
-            novel_id=req.novel_id,
-            chapter_id=req.chapter_id,
-            run_id=run_id,
-            run_revision=req.expected_run_revision,
-            authorization_id=req.authorization_id,
-            authorization_revision=req.authorization_revision,
-            readiness_digest=req.completion_readiness_digest,
+            request=_interactive_completion_request_binding(
+                owner_id=str(actor.id),
+                run_id=run_id,
+                request=req,
+            ),
             confirmed=req.completion_readiness_confirmed,
         )
     except NotFoundError as exc:
@@ -534,14 +551,11 @@ async def resolve_interactive_completion_uncertainty(
         raise HTTPException(status_code=401, detail="需要登录")
     try:
         return await interactive_chapter_completion_service.resolve_uncertain(
-            owner_id=str(actor.id),
-            novel_id=req.novel_id,
-            chapter_id=req.chapter_id,
-            run_id=run_id,
-            run_revision=req.expected_run_revision,
-            authorization_id=req.authorization_id,
-            authorization_revision=req.authorization_revision,
-            readiness_digest=req.completion_readiness_digest,
+            request=_interactive_completion_request_binding(
+                owner_id=str(actor.id),
+                run_id=run_id,
+                request=req,
+            ),
             action=req.action,
         )
     except NotFoundError as exc:

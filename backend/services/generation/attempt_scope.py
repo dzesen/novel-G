@@ -257,27 +257,22 @@ class JobAttemptScope:
         phase: str,
         conservative_tokens: int | None,
     ) -> str:
-        if self.interactive_execution_token is None:
-            attempt_id = await self.repo.claim_attempt_with_budget(
-                self.job_id,
-                self.chapter_id,
-                self.step_id,
-                phase,
-                provider_alias,
-                conservative_tokens,
-                pre_dispatch_fence=self._pre_dispatch_fence,
+        claim_options = {
+            "pre_dispatch_fence": self._pre_dispatch_fence,
+        }
+        if self.interactive_execution_token is not None:
+            claim_options["interactive_execution_token"] = (
+                self.interactive_execution_token
             )
-        else:
-            attempt_id = await self.repo.claim_attempt_with_budget(
-                self.job_id,
-                self.chapter_id,
-                self.step_id,
-                phase,
-                provider_alias,
-                conservative_tokens,
-                pre_dispatch_fence=self._pre_dispatch_fence,
-                interactive_execution_token=self.interactive_execution_token,
-            )
+        attempt_id = await self.repo.claim_attempt_with_budget(
+            self.job_id,
+            self.chapter_id,
+            self.step_id,
+            phase,
+            provider_alias,
+            conservative_tokens,
+            **claim_options,
+        )
         self._claims[attempt_id] = (provider_alias, phase)
         self._conservative_tokens[attempt_id] = conservative_tokens
         self._persisted_states[attempt_id] = "claimed"

@@ -511,7 +511,7 @@ def _candidate_source(candidate: Mapping[str, Any]) -> ProseCandidateSource:
     )
 
 
-def _request_binding(
+def build_interactive_completion_request_binding(
     *,
     owner_id: str,
     novel_id: str,
@@ -1386,14 +1386,7 @@ class InteractiveChapterCompletionService:
     async def resolve_uncertain(
         self,
         *,
-        owner_id: str,
-        novel_id: str,
-        chapter_id: str,
-        run_id: str,
-        run_revision: int,
-        authorization_id: str,
-        authorization_revision: int,
-        readiness_digest: str,
+        request: InteractiveCompletionRequestBinding,
         action: Literal["retry", "abort"],
     ) -> dict[str, Any]:
         """Explicitly dispose one frozen uncertain paid attempt.
@@ -1409,16 +1402,7 @@ class InteractiveChapterCompletionService:
                 "interactive uncertainty resolution is invalid",
                 code="interactive_uncertain_resolution_invalid",
             )
-        request = _request_binding(
-            owner_id=owner_id,
-            novel_id=novel_id,
-            chapter_id=chapter_id,
-            run_id=run_id,
-            run_revision=run_revision,
-            authorization_id=authorization_id,
-            authorization_revision=authorization_revision,
-            readiness_digest=readiness_digest,
-        )
+        authorization_id = request.authorization_id
         try:
             job = await self._deps.job_repo.get_job(authorization_id)
         except KeyError as exc:
@@ -1506,14 +1490,7 @@ class InteractiveChapterCompletionService:
     async def complete(
         self,
         *,
-        owner_id: str,
-        novel_id: str,
-        chapter_id: str,
-        run_id: str,
-        run_revision: int,
-        authorization_id: str,
-        authorization_revision: int,
-        readiness_digest: str,
+        request: InteractiveCompletionRequestBinding,
         confirmed: bool,
     ) -> dict[str, Any]:
         if confirmed is not True:
@@ -1521,43 +1498,33 @@ class InteractiveChapterCompletionService:
                 "interactive completion readiness requires explicit confirmation",
                 code="interactive_confirmation_required",
             )
-        request = _request_binding(
-            owner_id=owner_id,
-            novel_id=novel_id,
-            chapter_id=chapter_id,
-            run_id=run_id,
-            run_revision=run_revision,
-            authorization_id=authorization_id,
-            authorization_revision=authorization_revision,
-            readiness_digest=readiness_digest,
-        )
         recovered = await self._recover_committed_finalization(
             request=request,
         )
         if recovered is not None:
             return recovered
         readiness = await self.inspect(
-            owner_id=owner_id,
-            novel_id=novel_id,
-            chapter_id=chapter_id,
-            run_id=run_id,
-            run_revision=run_revision,
+            owner_id=request.owner_id,
+            novel_id=request.novel_id,
+            chapter_id=request.chapter_id,
+            run_id=request.run_id,
+            run_revision=request.run_revision,
         )
         if (
-            authorization_id != readiness.authorization_id
-            or authorization_revision != readiness.authorization_revision
-            or readiness_digest != readiness.digest
+            request.authorization_id != readiness.authorization_id
+            or request.authorization_revision != readiness.authorization_revision
+            or request.readiness_digest != readiness.digest
         ):
             raise InteractiveCompletionBlocked(
                 "interactive completion readiness is stale",
                 code="interactive_readiness_stale",
             )
         candidate, chapter, source = await self._snapshot(
-            owner_id=owner_id,
-            novel_id=novel_id,
-            chapter_id=chapter_id,
-            run_id=run_id,
-            run_revision=run_revision,
+            owner_id=request.owner_id,
+            novel_id=request.novel_id,
+            chapter_id=request.chapter_id,
+            run_id=request.run_id,
+            run_revision=request.run_revision,
         )
         if source != readiness.source_binding:
             raise InteractiveCompletionBlocked(
