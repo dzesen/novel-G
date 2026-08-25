@@ -38,6 +38,36 @@ export function validateConfig(config: AppConfig, t: TFunc): string | null {
     if (p.timeout_seconds < 0 || p.max_retries < 0 || p.max_concurrency < 0) {
       return t("database.nonNegative") + `: ${alias}`;
     }
+    const pricingValues = [
+      p.billing_currency,
+      p.input_cost_per_million_tokens,
+      p.output_cost_per_million_tokens,
+      p.pricing_basis,
+    ];
+    const hasPricing = pricingValues.some((value) => value != null);
+    if (hasPricing && pricingValues.some((value) => value == null || value === "")) {
+      return t("provider.pricing.complete") + `: ${alias}`;
+    }
+    if (
+      p.billing_currency != null
+      && !/^[A-Z][A-Z0-9]{2,11}$/.test(p.billing_currency)
+    ) {
+      return t("provider.pricing.currencyInvalid") + `: ${alias}`;
+    }
+    if (
+      p.input_cost_per_million_tokens != null
+      && (!Number.isFinite(p.input_cost_per_million_tokens)
+        || p.input_cost_per_million_tokens < 0)
+    ) {
+      return t("provider.pricing.priceInvalid") + `: ${alias}`;
+    }
+    if (
+      p.output_cost_per_million_tokens != null
+      && (!Number.isFinite(p.output_cost_per_million_tokens)
+        || p.output_cost_per_million_tokens < 0)
+    ) {
+      return t("provider.pricing.priceInvalid") + `: ${alias}`;
+    }
   }
 
   // Workflow validation

@@ -22,10 +22,15 @@ import OutlineGenerationParams, {
 import { ContextNotices, Notice } from "../outline/outlineUi";
 import { countChapterWords } from "../chapterUtils";
 import {
+  buildInteractiveCompletionPayload,
+  buildInteractiveCompletionReadinessPayload,
+  buildInteractiveCompletionResolutionPayload,
   buildProseAcceptPayload,
   finishReasonTranslationKey,
   proseReasonTranslationKey,
   proseRequiresPartialAcknowledgement,
+  interactiveCompletionErrorCode,
+  type InteractiveCompletionResolutionAction,
 } from "./prosePresentation";
 import {
   buildProseDiscardPayload,
@@ -41,6 +46,28 @@ import {
   type ProseContinuationPolicy,
   type ProseReadiness,
 } from "./proseContinuation";
+
+interface InteractiveCompletionReadiness {
+  schema_version: "interactive_chapter_completion_readiness.v1";
+  digest: string;
+  authorization_id: string;
+  authorization_revision: number;
+  logical_call_count: 2;
+  recovery_replay_limit: 1;
+  maximum_paid_attempts: number;
+  conservative_token_bound: number;
+  externalized_prose_utf8_bytes: number;
+  provider_bounds: Array<{
+    provider_alias: string;
+    maximum_paid_attempts: number;
+    conservative_token_bound: number;
+    currency: string;
+    maximum_cost: string;
+    price_upper_bound_per_million_tokens: string;
+    pricing_basis: string;
+    pricing_snapshot_digest: string;
+  }>;
+}
 
 interface ProsePanelProps {
   novelId: string;
@@ -78,6 +105,15 @@ export default function ProsePanel({
   const [continuationReadinessLoading, setContinuationReadinessLoading] = useState(false);
   const [continuationReadinessError, setContinuationReadinessError] = useState("");
   const [automaticContinuationsConfirmed, setAutomaticContinuationsConfirmed] = useState(false);
+  const [completionReadiness, setCompletionReadiness] =
+    useState<InteractiveCompletionReadiness | null>(null);
+  const [completionReadinessLoading, setCompletionReadinessLoading] =
+    useState(false);
+  const [completionReadinessConfirmed, setCompletionReadinessConfirmed] =
+    useState(false);
+  const [completionUncertain, setCompletionUncertain] = useState(false);
+  const [completionResolutionLoading, setCompletionResolutionLoading] =
+    useState(false);
 
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const [partialArmed, setPartialArmed] = useState(false);
@@ -93,7 +129,10 @@ export default function ProsePanel({
   const dialogRef = useRef<HTMLDivElement>(null);
 
   const running = stream.status === "running";
-  const mutationPending = accepting || discarding;
+  const mutationPending = accepting
+    || discarding
+    || completionReadinessLoading
+    || completionResolutionLoading;
   const runActionsBlocked = proseRunActionsBlocked({
     restoreLoading,
     streamStatus: stream.status,
@@ -114,6 +153,11 @@ export default function ProsePanel({
     stream.completion
       ? proseRequiresPartialAcknowledgement(stream.completion)
       : incomplete,
+  );
+  const completionReadinessKey = (
+    stream.runId && stream.runRevision != null
+      ? `${stream.runId}:${stream.runRevision}`
+      : null
   );
   const selectedInitialRun = initialRunResolved ? null : initialRun;
   const resumableDraft = Boolean(
@@ -154,6 +198,12 @@ export default function ProsePanel({
     setContinuationReadinessError("");
     setAutomaticContinuationsConfirmed(false);
   }, [continuationConfigurationKey]);
+
+  useEffect(() => {
+    setCompletionReadiness(null);
+    setCompletionReadinessConfirmed(false);
+    setCompletionUncertain(false);
+  }, [completionReadinessKey]);
 
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement
@@ -229,6 +279,36 @@ export default function ProsePanel({
     setUncertainRetryArmed(false);
   };
 
+  const finishInteractiveCompletion = async (
+    runId: string,
+    runRevision: number,
+    readiness: InteractiveCompletionReadiness,
+  ) => {
+    await apiPost(
+      `/api/llm/prose-runs/${runId}/complete`,
+      buildInteractiveCompletionPayload({
+        novelId,
+        chapterId,
+        runRevision,
+        authorizationId: readiness.authorization_id,
+        authorizationRevision: readiness.authorization_revision,
+        readinessDigest: readiness.digest,
+      }),
+    );
+    onAccepted(stream.text, "ai_complete");
+    onRunStateChanged?.();
+    onClose();
+  };
+
+  const recordCompletionFailure = (error: unknown): boolean => {
+    if (interactiveCompletionErrorCode(error) !== "interactive_uncertain_attempt") {
+      return false;
+    }
+    setCompletionUncertain(true);
+    setActionError("");
+    return true;
+  };
+
   const accept = async () => {
     if (!hasText || running || runActionsBlocked) return;
     const runId = stream.runId;
@@ -251,8 +331,44 @@ export default function ProsePanel({
       setActionError(t("runMissing"));
       return;
     }
+    if (!partialAcceptance && !completionReadiness) {
+      setCompletionReadinessLoading(true);
+      try {
+        const readiness = await apiPost<InteractiveCompletionReadiness>(
+          `/api/llm/prose-runs/${runId}/completion-readiness`,
+          buildInteractiveCompletionReadinessPayload({
+            novelId,
+            chapterId,
+            runRevision,
+          }),
+        );
+        setCompletionReadiness(readiness);
+        setCompletionReadinessConfirmed(false);
+      } catch (error) {
+        setActionError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setCompletionReadinessLoading(false);
+      }
+      return;
+    }
+    if (
+      !partialAcceptance
+      && completionReadiness
+      && !completionReadinessConfirmed
+    ) {
+      setActionError(t("completionConfirmationRequired"));
+      return;
+    }
     setAccepting(true);
     try {
+      if (!partialAcceptance && completionReadiness) {
+        await finishInteractiveCompletion(
+          runId,
+          runRevision,
+          completionReadiness,
+        );
+        return;
+      }
       const outcome = await submitProseRunMutation({
         mutate: () => apiPost(
           `/api/llm/prose-runs/${runId}/accept`,
@@ -261,7 +377,7 @@ export default function ProsePanel({
             chapterId,
             runId,
             runRevision,
-            partial: partialAcceptance,
+            partial: true,
           }),
         ),
         refresh: () => restoreActive({ clearWhenMissing: true }),
@@ -279,16 +395,55 @@ export default function ProsePanel({
         }
         return;
       }
-      onAccepted(
-        stream.text,
-        partialAcceptance ? "partial_manual_required" : "ai_complete",
-      );
+      onAccepted(stream.text, "partial_manual_required");
       onRunStateChanged?.();
       onClose();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : String(error));
+      if (!recordCompletionFailure(error)) {
+        setActionError(error instanceof Error ? error.message : String(error));
+      }
     } finally {
       setAccepting(false);
+    }
+  };
+
+  const resolveCompletionUncertainty = async (
+    action: InteractiveCompletionResolutionAction,
+  ) => {
+    const runId = stream.runId;
+    const runRevision = stream.runRevision;
+    const readiness = completionReadiness;
+    if (!runId || runRevision == null || !readiness) return;
+    setCompletionResolutionLoading(true);
+    setActionError("");
+    setSyncNotice("");
+    try {
+      await apiPost(
+        `/api/llm/prose-runs/${runId}/complete/uncertain-resolution`,
+        buildInteractiveCompletionResolutionPayload({
+          novelId,
+          chapterId,
+          runRevision,
+          authorizationId: readiness.authorization_id,
+          authorizationRevision: readiness.authorization_revision,
+          readinessDigest: readiness.digest,
+          action,
+        }),
+      );
+      setCompletionUncertain(false);
+      if (action === "retry") {
+        await finishInteractiveCompletion(runId, runRevision, readiness);
+        return;
+      }
+      setCompletionReadiness(null);
+      setCompletionReadinessConfirmed(false);
+      setSyncNotice(t("completionUncertainAborted"));
+    } catch (error) {
+      if (!recordCompletionFailure(error)) {
+        setActionError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      setCompletionResolutionLoading(false);
     }
   };
 
@@ -719,8 +874,126 @@ export default function ProsePanel({
           </div>
 
           <ContextNotices report={stream.contextReport} />
+          {hasText && !partialAcceptance && (
+            <Notice tone="info">
+              <section
+                data-testid="interactive-completion-readiness"
+                className="grid min-w-0 gap-2"
+              >
+                <div>
+                  <p className="font-medium text-foreground">
+                    {t("completionReadinessTitle")}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-muted">
+                    {t("completionReadinessDescription")}
+                  </p>
+                </div>
+                {completionReadinessLoading && (
+                  <p role="status" className="text-xs text-muted">
+                    {t("completionInspecting")}
+                  </p>
+                )}
+                {completionReadiness && (
+                  <>
+                    <div className="grid gap-1 rounded-md border border-border bg-surface p-3 text-xs leading-5 text-muted sm:grid-cols-2">
+                      <p>
+                        {t("completionReadinessCalls", {
+                          logical: completionReadiness.logical_call_count,
+                          maximum: completionReadiness.maximum_paid_attempts,
+                        })}
+                      </p>
+                      <p>
+                        {t("completionReadinessTokens", {
+                          count: completionReadiness.conservative_token_bound,
+                        })}
+                      </p>
+                      <p>
+                        {t("completionReadinessExternalization", {
+                          bytes: completionReadiness.externalized_prose_utf8_bytes,
+                        })}
+                      </p>
+                      <p className="min-w-0 break-words">
+                        {t("completionReadinessProviders", {
+                          providers: completionReadiness.provider_bounds
+                            .map((item) => item.provider_alias)
+                            .join(", "),
+                        })}
+                      </p>
+                      <p className="min-w-0 break-words sm:col-span-2">
+                        {t("completionReadinessCost", {
+                          costs: completionReadiness.provider_bounds
+                            .map((item) => (
+                              `${item.provider_alias} ${item.currency} ${item.maximum_cost}`
+                            ))
+                            .join("；"),
+                        })}
+                      </p>
+                      <p className="min-w-0 break-words sm:col-span-2">
+                        {t("completionReadinessPricingBasis", {
+                          basis: completionReadiness.provider_bounds
+                            .map((item) => (
+                              `${item.provider_alias}: ${item.pricing_basis}`
+                            ))
+                            .join("；"),
+                        })}
+                      </p>
+                    </div>
+                    <label className="flex cursor-pointer items-start gap-2">
+                      <input
+                        type="checkbox"
+                        checked={completionReadinessConfirmed}
+                        disabled={accepting || runActionsBlocked}
+                        onChange={(event) => {
+                          setCompletionReadinessConfirmed(event.target.checked);
+                          setActionError("");
+                        }}
+                        className="mt-0.5 size-4 shrink-0"
+                      />
+                      <span className="text-xs leading-5 text-muted">
+                        {t("completionReadinessConfirmation")}
+                      </span>
+                    </label>
+                  </>
+                )}
+              </section>
+            </Notice>
+          )}
           {stream.error && <Notice tone="error">{stream.error}</Notice>}
           {actionError && <Notice tone="error">{actionError}</Notice>}
+          {completionUncertain && completionReadiness && (
+            <Notice tone="warning">
+              <section className="grid min-w-0 gap-3">
+                <div>
+                  <p className="font-medium text-foreground">
+                    {t("completionUncertainTitle")}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-muted">
+                    {t("completionUncertainDescription")}
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onPress={() => void resolveCompletionUncertainty("retry")}
+                    isDisabled={completionResolutionLoading}
+                  >
+                    {completionResolutionLoading
+                      ? t("completionUncertainResolving")
+                      : t("completionUncertainRetry")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onPress={() => void resolveCompletionUncertainty("abort")}
+                    isDisabled={completionResolutionLoading}
+                  >
+                    {t("completionUncertainAbort")}
+                  </Button>
+                </div>
+              </section>
+            </Notice>
+          )}
           {continuationReadinessError && (
             <Notice tone="error">{continuationReadinessError}</Notice>
           )}
@@ -846,16 +1119,28 @@ export default function ProsePanel({
               !hasText
               || running
               || runActionsBlocked
+              || completionUncertain
               || selectedInitialRun?.can_accept_partial === false
+              || (
+                !partialAcceptance
+                && Boolean(completionReadiness)
+                && !completionReadinessConfirmed
+              )
             }
           >
             {accepting
-              ? t("accepting")
+              ? t(partialAcceptance ? "accepting" : "completionFinalizing")
+              : completionReadinessLoading
+                ? t("completionInspecting")
               : partialAcceptance && !partialArmed
                 ? t("acceptPartial")
-                : overwriteArmed
+                : overwriteArmed && !completionReadiness
                   ? t("overwriteConfirm")
-                  : t("accept")}
+                  : !partialAcceptance && !completionReadiness
+                    ? t("completionInspect")
+                    : !partialAcceptance
+                      ? t("completionFinalize")
+                      : t("accept")}
           </Button>
         </footer>
       </div>

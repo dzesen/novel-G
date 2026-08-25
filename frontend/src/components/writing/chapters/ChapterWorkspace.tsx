@@ -1135,8 +1135,8 @@ export default function ChapterWorkspace({
           }}
           onRunStateChanged={() => onRunTargetChange(undefined)}
           onAccepted={(text, acceptanceState) => {
-            // ProseRun accept 已以 mutation 原子写入正式正文；这里同步当前编辑器
-            // 草稿，后续自动保存只会幂等写回同一份内容。不能立刻用 loadChapter
+            // ProseRun accept 已通过可恢复的 mutation journal 写入正式正文；
+            // 这里同步当前编辑器草稿，后续自动保存只会幂等写回同一份内容。不能立刻用 loadChapter
             // 回读：它会把 updated_at 顶新，并可能把未保存的其他编辑器字段误判
             // 为过期本地草稿后删除。
             changeDraft({
@@ -1145,7 +1145,11 @@ export default function ChapterWorkspace({
                 ? { status: "writing" as const }
                 : {}),
             });
-            setStructureNotice(tProse("acceptedNotice"));
+            setStructureNotice(tProse(
+              acceptanceState === "partial_manual_required"
+                ? "acceptedPartialNotice"
+                : "acceptedCompleteNotice",
+            ));
           }}
         />
       )}

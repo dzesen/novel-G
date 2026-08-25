@@ -602,6 +602,17 @@ function ProviderDetail({
   onRunTest: () => void;
   t: ReturnType<typeof useTranslations>;
 }) {
+  const pricingFields = [
+    provider.billing_currency,
+    provider.input_cost_per_million_tokens,
+    provider.output_cost_per_million_tokens,
+    provider.pricing_basis,
+  ];
+  const pricingEnabled = pricingFields.some((value) => value != null);
+  const pricingComplete = pricingEnabled && pricingFields.every(
+    (value) => value != null && value !== "",
+  );
+
   return (
     <div className="space-y-3">
       <div className="rounded-lg border border-border bg-surface-secondary/30 p-3">
@@ -822,6 +833,113 @@ function ProviderDetail({
           )}
         </section>
       </div>
+
+      <section className="rounded-lg border border-border bg-surface-secondary/20 p-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <SectionTitle
+            title={t("pricing.title")}
+            description={t("pricing.description")}
+          />
+          <Switch
+            isSelected={pricingEnabled}
+            onChange={(enabled) => onChange(enabled
+              ? {
+                  billing_currency: provider.billing_currency || "USD",
+                  input_cost_per_million_tokens:
+                    provider.input_cost_per_million_tokens ?? 0,
+                  output_cost_per_million_tokens:
+                    provider.output_cost_per_million_tokens ?? 0,
+                  pricing_basis: provider.pricing_basis ?? "",
+                }
+              : {
+                  billing_currency: null,
+                  input_cost_per_million_tokens: null,
+                  output_cost_per_million_tokens: null,
+                  pricing_basis: null,
+                })}
+          >
+            <Switch.Control>
+              <Switch.Thumb />
+            </Switch.Control>
+            <Switch.Content className="text-sm">
+              {t("pricing.enabled")}
+            </Switch.Content>
+          </Switch>
+        </div>
+        {pricingEnabled && (
+          <div className="mt-3 grid min-w-0 gap-3 border-t border-border pt-3 md:grid-cols-2">
+            <TextField
+              value={provider.billing_currency || ""}
+              onChange={(value) => onChange({
+                billing_currency: value.toUpperCase(),
+              })}
+            >
+              <Label className="text-sm text-muted">
+                {t("pricing.currency")}
+              </Label>
+              <Input maxLength={12} className="border-border uppercase" />
+            </TextField>
+            <TextField
+              value={provider.pricing_basis || ""}
+              onChange={(value) => onChange({ pricing_basis: value })}
+            >
+              <Label className="text-sm text-muted">
+                {t("pricing.basis")}
+              </Label>
+              <Input
+                maxLength={240}
+                placeholder={t("pricing.basisPlaceholder")}
+                className="border-border"
+              />
+            </TextField>
+            <NumberField
+              value={provider.input_cost_per_million_tokens ?? 0}
+              onChange={(value) => onChange({
+                input_cost_per_million_tokens: Math.max(0, value),
+              })}
+              minValue={0}
+              step={0.01}
+            >
+              <Label className="text-sm text-muted">
+                {t("pricing.inputPrice")}
+              </Label>
+              <NumberField.Group>
+                <NumberField.DecrementButton />
+                <NumberField.Input className="border-border tabular-nums" />
+                <NumberField.IncrementButton />
+              </NumberField.Group>
+            </NumberField>
+            <NumberField
+              value={provider.output_cost_per_million_tokens ?? 0}
+              onChange={(value) => onChange({
+                output_cost_per_million_tokens: Math.max(0, value),
+              })}
+              minValue={0}
+              step={0.01}
+            >
+              <Label className="text-sm text-muted">
+                {t("pricing.outputPrice")}
+              </Label>
+              <NumberField.Group>
+                <NumberField.DecrementButton />
+                <NumberField.Input className="border-border tabular-nums" />
+                <NumberField.IncrementButton />
+              </NumberField.Group>
+            </NumberField>
+            <p className="text-xs leading-5 text-muted md:col-span-2">
+              {t("pricing.hint")}
+            </p>
+            {!pricingComplete && (
+              <p
+                role="alert"
+                className="text-xs leading-5 text-red-700 dark:text-red-300 md:col-span-2"
+              >
+                {t("pricing.complete")}
+              </p>
+            )}
+          </div>
+        )}
+      </section>
 
       <section className="rounded-lg border border-border bg-surface-secondary/20 p-3">
         <SectionTitle title={t("capabilities.title")} description={t("capabilities.description")} />

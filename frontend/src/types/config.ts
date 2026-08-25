@@ -20,6 +20,10 @@ export interface ProviderConfig {
   temperature?: number | null;
   top_p?: number | null;
   max_tokens?: number | null;
+  billing_currency?: string | null;
+  input_cost_per_million_tokens?: number | null;
+  output_cost_per_million_tokens?: number | null;
+  pricing_basis?: string | null;
   system_prompt?: string | null;
   presence_penalty?: number | null;
   frequency_penalty?: number | null;
@@ -352,6 +356,8 @@ export function newProviderConfig(): ProviderConfig {
     supports_stream_usage: false, has_api_key: false, api_key: "", api_key_mode: "keep",
     structured_output: "prompt_json",
     temperature: null, top_p: null, max_tokens: null, system_prompt: null,
+    billing_currency: null, input_cost_per_million_tokens: null,
+    output_cost_per_million_tokens: null, pricing_basis: null,
     presence_penalty: null, frequency_penalty: null,
   };
 }
@@ -729,10 +735,23 @@ export function setImagePipelineKind(
 
 export function normalizeAppConfig(config: AppConfig, catalog: WorkflowDefinition[] = []): AppConfig {
   const providers: Record<string, ProviderConfig> = Object.fromEntries(
-    Object.entries(config.llm?.providers || {}).map(([alias, provider]) => [
-      alias,
-      { ...newProviderConfig(), ...provider, api_key: "", api_key_mode: "keep" as const },
-    ]),
+    Object.entries(config.llm?.providers || {}).map(([alias, provider]) => {
+      const normalized = {
+        ...newProviderConfig(),
+        ...provider,
+        api_key: "",
+        api_key_mode: "keep" as const,
+      };
+      for (const field of [
+        "input_cost_per_million_tokens",
+        "output_cost_per_million_tokens",
+      ] as const) {
+        if (normalized[field] != null) {
+          normalized[field] = Number(normalized[field]);
+        }
+      }
+      return [alias, normalized];
+    }),
   );
   const definitions = new Map(catalog.map((definition) => [definition.name, definition]));
   const workflowNames = new Set([

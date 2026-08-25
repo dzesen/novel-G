@@ -114,6 +114,11 @@ export function buildProseAcceptPayload({
   partial,
 }: AcceptPayloadInput) {
   if (!runId.trim()) throw new Error("runId is required");
+  if (!partial) {
+    throw new Error(
+      "A complete AI draft requires the chapter completion certificate endpoint",
+    );
+  }
   return {
     novel_id: novelId,
     chapter_id: chapterId,
@@ -121,4 +126,86 @@ export function buildProseAcceptPayload({
     accept_partial: partial,
     partial_acknowledgement: partial,
   };
+}
+
+interface InteractiveCompletionReadinessPayloadInput {
+  novelId: string;
+  chapterId: string;
+  runRevision: number;
+}
+
+export function buildInteractiveCompletionReadinessPayload({
+  novelId,
+  chapterId,
+  runRevision,
+}: InteractiveCompletionReadinessPayloadInput) {
+  return {
+    novel_id: novelId,
+    chapter_id: chapterId,
+    expected_run_revision: runRevision,
+  };
+}
+
+interface InteractiveCompletionPayloadInput
+  extends InteractiveCompletionReadinessPayloadInput {
+  authorizationId: string;
+  authorizationRevision: number;
+  readinessDigest: string;
+}
+
+export type InteractiveCompletionResolutionAction = "retry" | "abort";
+
+export function buildInteractiveCompletionPayload({
+  novelId,
+  chapterId,
+  runRevision,
+  authorizationId,
+  authorizationRevision,
+  readinessDigest,
+}: InteractiveCompletionPayloadInput) {
+  if (!/^[0-9a-f]{24}$/.test(authorizationId)) {
+    throw new Error("completion authorization id is invalid");
+  }
+  if (!/^[0-9a-f]{64}$/.test(readinessDigest)) {
+    throw new Error("completion readiness digest is invalid");
+  }
+  return {
+    novel_id: novelId,
+    chapter_id: chapterId,
+    expected_run_revision: runRevision,
+    authorization_id: authorizationId,
+    authorization_revision: authorizationRevision,
+    completion_readiness_digest: readinessDigest,
+    completion_readiness_confirmed: true,
+  };
+}
+
+export function buildInteractiveCompletionResolutionPayload({
+  novelId,
+  chapterId,
+  runRevision,
+  authorizationId,
+  authorizationRevision,
+  readinessDigest,
+  action,
+}: InteractiveCompletionPayloadInput & {
+  action: InteractiveCompletionResolutionAction;
+}) {
+  return {
+    novel_id: novelId,
+    chapter_id: chapterId,
+    expected_run_revision: runRevision,
+    authorization_id: authorizationId,
+    authorization_revision: authorizationRevision,
+    completion_readiness_digest: readinessDigest,
+    action,
+  };
+}
+
+export function interactiveCompletionErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const detail = (error as { detail?: unknown }).detail;
+  if (!detail || typeof detail !== "object") return null;
+  const code = (detail as { code?: unknown }).code;
+  return typeof code === "string" && code ? code : null;
 }
