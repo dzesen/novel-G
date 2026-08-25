@@ -120,6 +120,12 @@ llm:
       # stream_options={"include_usage": true}，官方 API 支持；若把 base_url
       # 改指到不认该参数的第三方兼容端点，需改回 false。
       supports_stream_usage: true
+      # 交互式正文完成验收会在付费确认前展示费用上界。使用该 Provider 时，
+      # 以下四项必须成组配置；价格不会由系统联网猜测或自动刷新。
+      # billing_currency: USD
+      # input_cost_per_million_tokens: 0.15
+      # output_cost_per_million_tokens: 0.60
+      # pricing_basis: "2026-08-25 官方价目表，按无缓存输入计费"
       # 生成参数默认值（可选，不设置则由模型自行决定）
       # temperature: 0.7
       # top_p: 0.9

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -58,6 +58,10 @@ from backend.services.generation.prose_run_attempt_scope import ProseRunAttemptS
 from backend.services.generation.prose_runs import (
     prose_run_module,
     serialize_prose_run,
+)
+from backend.services.generation.interactive_chapter_completion import (
+    InteractiveCompletionBlocked,
+    interactive_chapter_completion_service,
 )
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
@@ -148,6 +152,49 @@ class AcceptProseRunRequest(ProseRequest):
 
 class DiscardProseRunRequest(ProseRequest):
     expected_run_revision: int = Field(ge=1)
+
+
+class InteractiveCompletionReadinessRequest(GenerationParamsMixin):
+    novel_id: str = Field(..., min_length=1)
+    chapter_id: str = Field(..., min_length=1)
+    expected_run_revision: int = Field(ge=1)
+
+
+class InteractiveCompletionAuthorityRequest(
+    InteractiveCompletionReadinessRequest
+):
+    authorization_id: str = Field(
+        min_length=24,
+        max_length=24,
+        pattern=r"^[0-9a-f]{24}$",
+    )
+    authorization_revision: int = Field(ge=1)
+    completion_readiness_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
+class CompleteInteractiveProseRunRequest(
+    InteractiveCompletionAuthorityRequest
+):
+    completion_readiness_confirmed: bool = False
+
+
+class ResolveInteractiveCompletionRequest(
+    InteractiveCompletionAuthorityRequest
+):
+    action: Literal["retry", "abort"]
+
+
+def _interactive_completion_conflict(
+    exc: InteractiveCompletionBlocked,
+) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"code": exc.code, "message": str(exc)},
+    )
 
 
 @dataclass(frozen=True)
@@ -411,6 +458,96 @@ async def accept_prose_run(
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/prose-runs/{run_id}/completion-readiness")
+async def inspect_interactive_completion_readiness(
+    run_id: str,
+    req: InteractiveCompletionReadinessRequest,
+    request: Request,
+):
+    """Show the additional semantic/state cost before any paid call."""
+
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        readiness = await interactive_chapter_completion_service.inspect(
+            owner_id=str(actor.id),
+            novel_id=req.novel_id,
+            chapter_id=req.chapter_id,
+            run_id=run_id,
+            run_revision=req.expected_run_revision,
+        )
+        return readiness.model_dump(mode="json")
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InteractiveCompletionBlocked as exc:
+        raise _interactive_completion_conflict(exc) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/prose-runs/{run_id}/complete")
+async def complete_interactive_prose_run(
+    run_id: str,
+    req: CompleteInteractiveProseRunRequest,
+    request: Request,
+):
+    """Consume one explicitly confirmed completion readiness and V2-finalize."""
+
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await interactive_chapter_completion_service.complete(
+            owner_id=str(actor.id),
+            novel_id=req.novel_id,
+            chapter_id=req.chapter_id,
+            run_id=run_id,
+            run_revision=req.expected_run_revision,
+            authorization_id=req.authorization_id,
+            authorization_revision=req.authorization_revision,
+            readiness_digest=req.completion_readiness_digest,
+            confirmed=req.completion_readiness_confirmed,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InteractiveCompletionBlocked as exc:
+        raise _interactive_completion_conflict(exc) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/prose-runs/{run_id}/complete/uncertain-resolution")
+async def resolve_interactive_completion_uncertainty(
+    run_id: str,
+    req: ResolveInteractiveCompletionRequest,
+    request: Request,
+):
+    """Explicitly retry or abort one frozen uncertain completion attempt."""
+
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await interactive_chapter_completion_service.resolve_uncertain(
+            owner_id=str(actor.id),
+            novel_id=req.novel_id,
+            chapter_id=req.chapter_id,
+            run_id=run_id,
+            run_revision=req.expected_run_revision,
+            authorization_id=req.authorization_id,
+            authorization_revision=req.authorization_revision,
+            readiness_digest=req.completion_readiness_digest,
+            action=req.action,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InteractiveCompletionBlocked as exc:
+        raise _interactive_completion_conflict(exc) from exc
     except (InvalidIdError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from backend.config import get_config_value
 
@@ -52,9 +53,44 @@ class LLMProviderConfig(BaseModel):
         ge=4096,
         description="模型上下文窗口；用于付费调用前的本地预算诊断",
     )
+    billing_currency: str | None = Field(
+        default=None,
+        pattern=r"^[A-Z][A-Z0-9]{2,11}$",
+        description="费用上界展示使用的货币代码",
+    )
+    input_cost_per_million_tokens: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description="每百万输入 token 的保守 cache-miss 单价",
+    )
+    output_cost_per_million_tokens: Decimal | None = Field(
+        default=None,
+        ge=0,
+        description="每百万输出 token 的保守单价",
+    )
+    pricing_basis: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=240,
+        description="价格快照来源或生效日期说明",
+    )
     system_prompt: str | None = Field(default=None, description="默认系统提示词")
     presence_penalty: float | None = Field(default=None, ge=-2, le=2, description="默认存在惩罚")
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2, description="默认频率惩罚")
+
+    @model_validator(mode="after")
+    def validate_pricing_snapshot(self) -> "LLMProviderConfig":
+        pricing = (
+            self.billing_currency,
+            self.input_cost_per_million_tokens,
+            self.output_cost_per_million_tokens,
+            self.pricing_basis,
+        )
+        if any(item is not None for item in pricing) and not all(
+            item is not None for item in pricing
+        ):
+            raise ValueError("Provider pricing snapshot must be complete")
+        return self
 
 
 class FormatReviewPolicy(BaseModel):
