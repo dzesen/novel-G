@@ -18,6 +18,7 @@ from backend.llm.exceptions import (
     LLMSchemaUnsupportedError,
     LLMStructuredValidationError,
 )
+from backend.llm.config import resolve_effective_system_prompt
 from backend.llm.models import TokenUsage
 from backend.llm.stream_terminal import FinishReason, normalize_finish_reason
 from backend.config.workflow_catalog import get_workflow_step_definition
@@ -92,6 +93,29 @@ def _redacted_config_revision(
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def effective_provider_system_prompt(
+    config: Mapping[str, Any],
+    provider_alias: str,
+    generation_kwargs: Mapping[str, Any] | None = None,
+) -> str:
+    """Resolve one Provider's configured prompt through the shared client rule."""
+
+    requested = dict(generation_kwargs or {}).get("system_prompt")
+    llm = config.get("llm")
+    providers = llm.get("providers") if isinstance(llm, Mapping) else None
+    provider = (
+        providers.get(provider_alias)
+        if isinstance(providers, Mapping)
+        else None
+    )
+    if not isinstance(provider, Mapping):
+        return resolve_effective_system_prompt(requested, None)
+    return resolve_effective_system_prompt(
+        requested,
+        provider.get("system_prompt"),
+    )
 
 
 @dataclass(frozen=True)
@@ -815,14 +839,24 @@ class GenerationRuntime:
             prompt: str,
             *,
             includes_native_schema: bool = False,
+            provider_alias: str | None = None,
         ) -> int | None:
             nonlocal reserved_conservative_tokens
             additional_request_payload = (
                 schema_request_payload if includes_native_schema else ""
             )
+            effective_provider_alias = provider_alias or plan.provider_alias
+            reservation_kwargs = dict(request_kwargs)
+            reservation_kwargs["system_prompt"] = (
+                effective_provider_system_prompt(
+                    self._config_supplier(),
+                    effective_provider_alias,
+                    request_kwargs,
+                )
+            )
             input_tokens = conservative_prompt_input_bound(
                 prompt=prompt,
-                system_prompt=str(request_kwargs.get("system_prompt") or ""),
+                system_prompt=str(reservation_kwargs["system_prompt"]),
                 additional_request_payload=additional_request_payload,
             )
             if (
@@ -835,7 +869,7 @@ class GenerationRuntime:
             bound = self._conservative_token_bound(
                 plan,
                 prompt,
-                request_kwargs,
+                reservation_kwargs,
                 additional_request_payload=additional_request_payload,
             )
             if bound is None and max_conservative_total_tokens is not None:
@@ -954,6 +988,7 @@ class GenerationRuntime:
                     bounded_reservation(
                         repair_prompt,
                         includes_native_schema=True,
+                        provider_alias=plan.reviewer_alias,
                     ),
                 )
 
@@ -986,12 +1021,18 @@ class GenerationRuntime:
         self._validate_plan(plan)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
         request_kwargs = self._request_kwargs_for_plan(plan, gen_kwargs)
+        reservation_kwargs = dict(request_kwargs)
+        reservation_kwargs["system_prompt"] = effective_provider_system_prompt(
+            self._config_supplier(),
+            plan.provider_alias,
+            request_kwargs,
+        )
         self._last_finish_reason = "unreported"
         self._last_raw_finish_reason = "unreported"
         attempt_id = await self._claim_paid_attempt(
             plan.provider_alias,
             "text",
-            self._conservative_token_bound(plan, prompt, request_kwargs),
+            self._conservative_token_bound(plan, prompt, reservation_kwargs),
         )
         try:
             async for chunk in adapter.stream_text(prompt, **request_kwargs):

@@ -8,7 +8,10 @@ from typing import Any, AsyncGenerator, Callable
 
 from pydantic import BaseModel
 
-from backend.llm.config import LLMProviderConfig
+from backend.llm.config import (
+    LLMProviderConfig,
+    resolve_effective_system_prompt,
+)
 from backend.llm.models import LLMFunctionCallProbe, LLMRequest, LLMResponse, TokenUsage
 from backend.llm.stream_terminal import FinishReason
 
@@ -139,8 +142,12 @@ class BaseLLMClient(ABC):
             overrides["presence_penalty"] = cfg.presence_penalty
         if request.frequency_penalty is None and cfg.frequency_penalty is not None:
             overrides["frequency_penalty"] = cfg.frequency_penalty
-        if not request.system_prompt and cfg.system_prompt:
-            overrides["system_prompt"] = cfg.system_prompt
+        effective_system_prompt = resolve_effective_system_prompt(
+            request.system_prompt,
+            cfg.system_prompt,
+        )
+        if effective_system_prompt != request.system_prompt:
+            overrides["system_prompt"] = effective_system_prompt
         if not overrides:
             return request
         return request.model_copy(update=overrides)

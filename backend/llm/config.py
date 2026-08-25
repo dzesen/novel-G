@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -11,6 +11,15 @@ from backend.config import get_config_value
 
 # 支持的客户端类别
 LLMProviderType = Literal["openai", "gemini", "claude"]
+
+
+def resolve_effective_system_prompt(
+    request_system_prompt: Any,
+    configured_system_prompt: Any,
+) -> str:
+    """Apply the shared request-first Provider system-prompt default rule."""
+
+    return str(request_system_prompt or configured_system_prompt or "")
 
 
 class LLMProviderConfig(BaseModel):
