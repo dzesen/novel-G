@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 
 MAX_COMPONENT_REPAIR_BUDGET = 512
@@ -137,6 +137,32 @@ class RepairComponentUsageV1(_RepairPolicyModel):
         ge=0,
         le=MAX_COMPONENT_REPAIR_BUDGET,
     )
+
+
+class RepairFailureEvidenceV1(_RepairPolicyModel):
+    """Closed, content-free repair context attached to one terminal stop."""
+
+    schema_version: Literal["chapter_repair_failure_evidence.v1"] = (
+        "chapter_repair_failure_evidence.v1"
+    )
+    component: RepairComponent
+    component_used: StrictInt = Field(
+        ge=0,
+        le=MAX_COMPONENT_REPAIR_BUDGET,
+    )
+    component_limit: StrictInt = Field(
+        ge=0,
+        le=MAX_COMPONENT_REPAIR_BUDGET,
+    )
+    next_step: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_closed_route(self) -> "RepairFailureEvidenceV1":
+        if self.component_used > self.component_limit:
+            raise ValueError("repair failure usage exceeds its authority")
+        if self.next_step != repair_next_step(self.component):
+            raise ValueError("repair failure next step is not canonical")
+        return self
 
 
 class RepairConvergenceEvidenceV1(_RepairPolicyModel):

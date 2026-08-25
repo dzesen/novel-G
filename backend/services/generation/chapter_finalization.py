@@ -8,32 +8,62 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 
-from backend.db.mutation import MutationCommand, MutationRecorder, commit_mutation
+from backend.db.mutation import (
+    MutationCommand,
+    MutationConflictError,
+    MutationRecorder,
+    commit_mutation,
+)
+from backend.db.narrative_revision import NarrativeRevisionConflict
 from backend.db.repositories.chapter_repository import chapter_repo
-from backend.db.repositories.generation_job_repository import generation_job_repo
+from backend.db.repositories.generation_job_repository import (
+    ChapterCompletionDecisionFence,
+    generation_job_repo,
+)
+from backend.llm.schemas.scene_contract_pydantic import (
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+)
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
+    AdherenceCandidateCheckpointV5,
+    parse_candidate_pipeline_checkpoint,
 )
 from backend.services.generation.chapter_completion_certificate import (
     CHAPTER_COMPLETION_POLICY_REVISION,
+    CHAPTER_COMPLETION_FAILURE_EVIDENCE_SCHEMA,
     ChapterBinding,
     ChapterCompletionCandidateSnapshot,
     ChapterCompletionCertificate,
     ChapterCompletionCurrentSnapshot,
     ChapterCompletionDecision,
     ChapterCompletionEvidenceBundle,
+    ChapterCompletionFailureFact,
+    ChapterCompletionFailureEvidenceBundle,
     ChapterCompletionPolicy,
     ChapterCompletionPolicyError,
     ChapterSourceBinding,
     FailureClass,
+    FailureAssessmentStage,
+    FailureFactReason,
     build_chapter_authorization_binding,
     canonical_completion_digest,
+    classify_chapter_completion_failure,
+    failure_fact_from_outline_adherence_decision,
     verify_persisted_chapter_completion_certificate,
+)
+from backend.services.generation.chapter_repair_policy import (
+    RepairFailureEvidenceV1,
 )
 from backend.services.generation.outline_adherence import (
     OutlineAdherenceValidationError,
+    revalidate_current_outline_adherence_evidence,
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import ProseRunModule, prose_run_module
@@ -44,6 +74,8 @@ from backend.services.novel.chapter_state_service import ChapterStateService
 from backend.services.novel.derived_stats import derived_stats
 from backend.services.novel.state_proposal import (
     FactAccountingPolicy,
+    StateProposalCompletionFailure,
+    StateProposalCompletionFailureReason,
     StaleStatePreview,
     state_proposal_module,
 )
@@ -65,9 +97,107 @@ class ChapterFinalizationDenied(ValueError):
 
 
 class _CompletionGateDenied(ChapterFinalizationDenied):
-    def __init__(self, message: str, failure_class: FailureClass) -> None:
+    def __init__(
+        self,
+        message: str,
+        failure_fact: ChapterCompletionFailureFact,
+    ) -> None:
         super().__init__(message)
-        self.failure_class = failure_class
+        if not isinstance(failure_fact, ChapterCompletionFailureFact):
+            raise TypeError("chapter completion failure fact is required")
+        self.failure_fact = failure_fact
+
+
+def _failure_fact(
+    reason: FailureFactReason,
+    observed_at: FailureAssessmentStage,
+    *,
+    repair_failure: RepairFailureEvidenceV1 | None = None,
+) -> ChapterCompletionFailureFact:
+    return ChapterCompletionFailureFact(
+        reason=reason,
+        observed_at=observed_at,
+        repair_failure=repair_failure,
+    )
+
+
+def _retarget_failure_fact(
+    fact: ChapterCompletionFailureFact,
+    observed_at: FailureAssessmentStage,
+) -> ChapterCompletionFailureFact:
+    return _failure_fact(
+        fact.reason,
+        observed_at,
+        repair_failure=fact.repair_failure,
+    )
+
+
+_STATE_PROPOSAL_FAILURE_REASONS: dict[
+    StateProposalCompletionFailureReason,
+    FailureFactReason,
+] = {
+    "canonical_fact_unaccounted": "canonical_fact_unaccounted",
+    "evidence_invalid": "evidence_invalid",
+    "internal_reference_invalid": "internal_reference_invalid",
+    "semantic_unknown": "semantic_unknown",
+    "source_binding_stale": "source_binding_stale",
+}
+
+
+def _state_proposal_failure_fact(
+    failure: StateProposalCompletionFailure,
+) -> ChapterCompletionFailureFact:
+    return _failure_fact(
+        _STATE_PROPOSAL_FAILURE_REASONS[
+            failure.completion_failure_reason
+        ],
+        "state_proposal",
+    )
+
+
+def _trusted_outline_adherence_evidence(
+    *,
+    job: Mapping[str, Any],
+    chapter_id: str,
+) -> ValidatedChapterOutlineAdherenceEvidenceV4Schema:
+    """Load the exact server-persisted V4 evidence for this finalization."""
+
+    raw_trusted: Any = None
+    interactive = job.get("interactive_completion_evidence")
+    if isinstance(interactive, Mapping) and "outline_adherence" in interactive:
+        raw_trusted = interactive.get("outline_adherence")
+    if raw_trusted is None:
+        raw_checkpoints = job.get("candidate_pipeline_checkpoints")
+        if isinstance(raw_checkpoints, list):
+            latest: AdherenceCandidateCheckpointV5 | None = None
+            try:
+                for raw_checkpoint in raw_checkpoints:
+                    checkpoint = parse_candidate_pipeline_checkpoint(
+                        raw_checkpoint
+                    )
+                    if (
+                        isinstance(checkpoint, AdherenceCandidateCheckpointV5)
+                        and checkpoint.chapter_id == chapter_id
+                    ):
+                        latest = checkpoint
+            except ValueError as exc:
+                raise _CompletionGateDenied(
+                    "作业中的章纲符合度检查点无效",
+                    _failure_fact("evidence_invalid", "outline_adherence"),
+                ) from exc
+            if latest is not None:
+                raw_trusted = latest.validated_evidence.model_dump(
+                    mode="python"
+                )
+    try:
+        return ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+            raw_trusted
+        )
+    except ValueError as exc:
+        raise _CompletionGateDenied(
+            "作业缺少当前章纲符合度的持久证据",
+            _failure_fact("evidence_invalid", "outline_adherence"),
+        ) from exc
 
 
 class ChapterFinalizationAuthorization(BaseModel):
@@ -227,6 +357,22 @@ class ChapterFinalizationDeps:
     state_service: Any = ChapterStateService
 
 
+@dataclass(frozen=True)
+class _CompletionDecisionContext:
+    owner_id: str
+    novel_id: str
+    chapter_id: str
+    prose_run_id: str
+    prose_run_revision: int
+    candidate_digest: str
+    expected_narrative_revision: int
+    candidate_text: str
+    completion: Mapping[str, Any]
+    run: Mapping[str, Any]
+    chapter: Mapping[str, Any]
+    authorization: ChapterFinalizationAuthorization
+
+
 def _serialize_subcommand(command: MutationCommand) -> dict[str, Any]:
     return {
         "operation": command.operation,
@@ -241,6 +387,200 @@ def _aware_snapshot_time(value: Any) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ChapterFinalizationDenied("正文候选缺少有效的冻结审计时间")
     return value.astimezone(UTC)
+
+
+def _is_completion_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _bounded_failure_code(value: Any, *, maximum: int = 128) -> str | None:
+    return (
+        value
+        if isinstance(value, str) and 0 < len(value) <= maximum
+        else None
+    )
+
+
+def _validated_failure_adherence(
+    adherence: Mapping[str, Any] | None,
+    *,
+    context: _CompletionDecisionContext,
+) -> dict[str, Any] | None:
+    if not isinstance(adherence, Mapping):
+        return None
+    outline = context.chapter.get("outline")
+    if not isinstance(outline, Mapping):
+        return None
+    try:
+        return revalidate_current_outline_adherence_evidence(
+            adherence,
+            outline=outline,
+            prose=context.candidate_text,
+            source_prose_run_id=context.prose_run_id,
+            source_prose_run_revision=context.prose_run_revision,
+            source_content_digest=context.candidate_digest,
+        )
+    except OutlineAdherenceValidationError:
+        return None
+
+
+def _reconcile_outline_failure_fact(
+    failure_fact: ChapterCompletionFailureFact,
+    adherence: Mapping[str, Any] | None,
+) -> ChapterCompletionFailureFact:
+    if (
+        failure_fact.observed_at != "outline_adherence"
+        or failure_fact.reason
+        not in {
+            "evidence_invalid",
+            "semantic_unknown",
+            "scene_contract_unsatisfied",
+        }
+    ):
+        return failure_fact
+    reason: FailureFactReason = "evidence_invalid"
+    if isinstance(adherence, Mapping):
+        decision = adherence.get("decision")
+        if decision == "manual_review":
+            reason = "semantic_unknown"
+        elif decision == "repair":
+            reason = "scene_contract_unsatisfied"
+    return _failure_fact(reason, "outline_adherence")
+
+
+def _failure_quality_binding(
+    adherence: Mapping[str, Any] | None,
+    *,
+    assessment_stage: FailureAssessmentStage,
+) -> tuple[Literal["evaluated", "not_run", "not_applicable"], str]:
+    if isinstance(adherence, Mapping):
+        sidecar = adherence.get("quality_debt_sidecar")
+        digest = (
+            sidecar.get("sidecar_digest")
+            if isinstance(sidecar, Mapping)
+            else None
+        )
+        if _is_completion_digest(digest):
+            return "evaluated", str(digest)
+    return "not_run", canonical_completion_digest({
+        "schema_version": "chapter_quality_debt_not_run.v1",
+        "assessment_stage": assessment_stage,
+    })
+
+
+def _failure_adherence_projection(
+    adherence: Mapping[str, Any] | None,
+    *,
+    quality_debt_status: str,
+    quality_debt_sidecar_digest: str,
+) -> dict[str, Any] | None:
+    if not isinstance(adherence, Mapping):
+        return None
+    source = adherence
+    local_issues: Any = _local_issue_projection(source)
+    return {
+        "evidence_schema_version": _bounded_failure_code(
+            source.get("evidence_schema_version")
+        ),
+        "issue_policy_version": _bounded_failure_code(
+            source.get("issue_policy_version")
+        ),
+        "decision": (
+            source.get("decision")
+            if source.get("decision") in {"pass", "repair", "manual_review"}
+            else None
+        ),
+        "source_prose_run_id": _bounded_failure_code(
+            source.get("source_prose_run_id")
+        ),
+        "source_prose_run_revision": (
+            source.get("source_prose_run_revision")
+            if type(source.get("source_prose_run_revision")) is int
+            else None
+        ),
+        "source_content_digest": (
+            source.get("source_content_digest")
+            if _is_completion_digest(source.get("source_content_digest"))
+            else None
+        ),
+        "outline_contract_digest": (
+            source.get("outline_contract_digest")
+            if _is_completion_digest(source.get("outline_contract_digest"))
+            else None
+        ),
+        "beat_evidence_count": (
+            len(source["beat_evidence"])
+            if isinstance(source.get("beat_evidence"), list)
+            else None
+        ),
+        "finding_count": (
+            len(source["findings"])
+            if isinstance(source.get("findings"), list)
+            else None
+        ),
+        "unknown_count": (
+            len(source["unknowns"])
+            if isinstance(source.get("unknowns"), list)
+            else None
+        ),
+        "local_issues": local_issues,
+        "quality_debt_status": quality_debt_status,
+        "quality_debt_sidecar_digest": quality_debt_sidecar_digest,
+    }
+
+
+def _failure_state_projection(
+    *,
+    state_proposal_id: str | None,
+    state_command: MutationCommand | None,
+    proposal_claim: Mapping[str, Any] | None,
+    state_fact_accounting: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if (
+        state_proposal_id is None
+        and state_command is None
+        and proposal_claim is None
+        and state_fact_accounting is None
+    ):
+        return None
+    state_completion: Mapping[str, Any] = {}
+    if state_command is not None:
+        acceptance = state_command.payload.get("acceptance_metadata")
+        if isinstance(acceptance, Mapping):
+            raw_completion = acceptance.get("state_completion")
+            if isinstance(raw_completion, Mapping):
+                state_completion = raw_completion
+    command_accounting = state_completion.get("fact_accounting")
+    accounting = (
+        command_accounting
+        if isinstance(command_accounting, Mapping)
+        else (
+            state_fact_accounting
+            if isinstance(state_fact_accounting, Mapping)
+            else {}
+        )
+    )
+    claim = proposal_claim if isinstance(proposal_claim, Mapping) else {}
+    return {
+        "state_proposal_id": state_proposal_id,
+        "state_proposal_digest": claim.get("candidate_digest"),
+        "expected_narrative_revision": claim.get(
+            "expected_narrative_revision"
+        ),
+        "fact_accounting_digest": accounting.get("accounting_digest"),
+        "unaccounted_canonical_facts": accounting.get(
+            "unaccounted_canonical_facts"
+        ),
+        "invalid_internal_references": accounting.get(
+            "invalid_internal_references"
+        ),
+        "dangling_references": accounting.get("dangling_references"),
+        "extraction_failure_count": accounting.get("extraction_failure_count"),
+    }
 
 
 def _provider_attempt_ledger_projection(
@@ -288,24 +628,100 @@ def _provider_attempt_ledger_projection(
 
 
 def _local_issue_projection(adherence: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_issues = adherence.get("local_issues") or []
+    if not isinstance(raw_issues, list) or len(raw_issues) > 200:
+        raise ChapterFinalizationDenied("本地问题集合格式无效")
     projected: list[dict[str, Any]] = []
-    for raw in list(adherence.get("local_issues") or []):
+    for raw in raw_issues:
         if not isinstance(raw, Mapping):
             raise ChapterFinalizationDenied("本地问题集合格式无效")
         signature = str(raw.get("issue_signature") or "")
-        if len(signature) != 64:
+        if not _is_completion_digest(signature):
             raise ChapterFinalizationDenied("本地问题集合身份无效")
+        severity = _bounded_failure_code(raw.get("severity"), maximum=32)
+        category = _bounded_failure_code(raw.get("category"), maximum=64)
+        source_kind = _bounded_failure_code(
+            raw.get("source_kind"),
+            maximum=64,
+        )
+        scene_id = raw.get("scene_id")
+        if scene_id is not None:
+            scene_id = _bounded_failure_code(scene_id, maximum=128)
+            if scene_id is None:
+                raise ChapterFinalizationDenied("本地问题场景身份无效")
+        raw_references = raw.get("contract_reference_ids") or []
+        references = (
+            list(raw_references)
+            if isinstance(raw_references, (list, tuple))
+            else None
+        )
+        if (
+            references is None
+            or len(references) > 100
+            or any(
+                _bounded_failure_code(value, maximum=128) is None
+                for value in references
+            )
+        ):
+            raise ChapterFinalizationDenied("本地问题合同引用无效")
         projected.append({
             "issue_signature": signature,
-            "severity": str(raw.get("severity") or ""),
-            "category": str(raw.get("category") or ""),
-            "source_kind": str(raw.get("source_kind") or ""),
-            "scene_id": raw.get("scene_id"),
-            "contract_reference_ids": list(
-                raw.get("contract_reference_ids") or []
-            ),
+            "severity": severity,
+            "category": category,
+            "source_kind": source_kind,
+            "scene_id": scene_id,
+            "contract_reference_ids": references,
         })
     return sorted(projected, key=lambda item: item["issue_signature"])
+
+
+def _failure_issue_signatures(
+    *,
+    failure_fact: ChapterCompletionFailureFact,
+    failure_class: FailureClass,
+    adherence: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    signatures: list[str] = []
+    if isinstance(adherence, Mapping):
+        signatures.extend(
+            item["issue_signature"]
+            for item in _local_issue_projection(adherence)
+            if item["severity"] in {"blocker", "major", "unknown"}
+        )
+    repair = failure_fact.repair_failure
+    if repair is not None:
+        signatures.append(canonical_completion_digest({
+            "schema_version": "chapter_completion_repair_failure_issue.v1",
+            "failure_class": failure_class,
+            "repair_failure": repair.model_dump(mode="json"),
+        }))
+    if not signatures:
+        signatures.append(canonical_completion_digest({
+            "schema_version": "chapter_completion_failure_issue.v2",
+            "assessment_stage": failure_fact.observed_at,
+            "failure_class": failure_class,
+        }))
+    return tuple(sorted(set(signatures)))
+
+
+def _failure_provider_attempt_ledger_digest(
+    job: Mapping[str, Any],
+    *,
+    chapter_id: str,
+) -> str:
+    try:
+        projection: Any = _provider_attempt_ledger_projection(
+            job,
+            chapter_id=chapter_id,
+        )
+    except ChapterFinalizationDenied:
+        raw = job.get("attempt_slots")
+        projection = {
+            "schema_version": "chapter_attempt_ledger_invalid.v1",
+            "status": "invalid",
+            "slot_count": len(raw) if isinstance(raw, list) else None,
+        }
+    return canonical_completion_digest(projection)
 
 
 def _repair_trace_binding(
@@ -411,6 +827,65 @@ class ChapterFinalizationService:
         self._deps = deps or ChapterFinalizationDeps()
 
     @staticmethod
+    def _assert_completion_decision_scope(
+        *,
+        job: Mapping[str, Any],
+        authorization: ChapterFinalizationAuthorization,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        prose_run_id: str,
+        prose_run_revision: int,
+        content_digest: str,
+        prose_run: Mapping[str, Any],
+    ) -> None:
+        if str(job.get("novel_id") or "") != str(novel_id):
+            raise ChapterFinalizationDenied(
+                "章节完成决定不能写入其他小说的作业"
+            )
+        scope = str(job.get("scope") or "")
+        job_kind = str(job.get("job_kind") or "")
+        if authorization.kind == "job_readiness":
+            if (
+                scope not in {"book", "volume"}
+                or job_kind == "interactive_chapter_completion"
+                or str(prose_run.get("generation_job_id") or "")
+                != authorization.job_id
+            ):
+                raise ChapterFinalizationDenied(
+                    "章节完成决定不能跨作业类型写入"
+                )
+            return
+        readiness = job.get("readiness")
+        source = (
+            readiness.get("source_binding")
+            if isinstance(readiness, Mapping)
+            else None
+        )
+        if (
+            scope != "interactive_completion"
+            or job_kind != "interactive_chapter_completion"
+            or str(job.get("owner_id") or "") != str(owner_id)
+            or str(job.get("current_chapter_id") or "") != str(chapter_id)
+            or not isinstance(readiness, Mapping)
+            or readiness.get("schema_version")
+            != "interactive_chapter_completion_readiness.v1"
+            or readiness.get("authorization_id")
+            != authorization.authorization_id
+            or not isinstance(source, Mapping)
+            or str(source.get("owner_id") or "") != str(owner_id)
+            or str(source.get("novel_id") or "") != str(novel_id)
+            or str(source.get("chapter_id") or "") != str(chapter_id)
+            or str(source.get("prose_run_id") or "") != str(prose_run_id)
+            or source.get("prose_run_revision") != prose_run_revision
+            or str(source.get("content_digest") or "")
+            != str(content_digest)
+        ):
+            raise ChapterFinalizationDenied(
+                "交互式章节完成决定不能跨来源作用域写入"
+            )
+
+    @staticmethod
     def _candidate_snapshot(
         *,
         owner_id: str,
@@ -467,6 +942,7 @@ class ChapterFinalizationService:
         self,
         *,
         authorization: ChapterFinalizationAuthorization,
+        job: Mapping[str, Any],
         chapter_id: str,
         prose_run_id: str,
         prose_run_revision: int,
@@ -478,129 +954,202 @@ class ChapterFinalizationService:
             prose_run_id=prose_run_id,
             prose_run_revision=prose_run_revision,
             decision=decision.model_dump(mode="json"),
+            fence=ChapterCompletionDecisionFence.capture(job),
         )
 
-    async def _persist_gate_failure(
+    @staticmethod
+    def _decision_authorization(
+        supplied: ChapterFinalizationAuthorization,
+        job: Mapping[str, Any],
+    ) -> ChapterFinalizationAuthorization:
+        readiness = job.get("readiness")
+        current = readiness if isinstance(readiness, Mapping) else {}
+        current_digest = current.get("digest")
+        readiness_digest = (
+            current_digest
+            if _is_completion_digest(current_digest)
+            else supplied.readiness_digest
+        )
+        planning = current.get("planning")
+        frozen = (
+            planning.get("chapter_finalization_authorization")
+            if isinstance(planning, Mapping)
+            else None
+        )
+        frozen_revision = (
+            frozen.get("authorization_revision")
+            if isinstance(frozen, Mapping)
+            else None
+        )
+        authorization_revision = (
+            frozen_revision
+            if type(frozen_revision) is int and frozen_revision >= 1
+            else supplied.authorization_revision
+        )
+        authorization_id = supplied.authorization_id
+        if supplied.kind == "interactive_completion_readiness":
+            current_id = current.get("authorization_id")
+            if isinstance(current_id, str) and current_id:
+                authorization_id = current_id
+        return ChapterFinalizationAuthorization(
+            kind=supplied.kind,
+            authorization_id=authorization_id,
+            job_id=supplied.job_id,
+            readiness_digest=readiness_digest,
+            authorization_revision=authorization_revision,
+            execution_claim_token=supplied.execution_claim_token,
+        )
+
+    def _decision_context(
         self,
         *,
-        failure: _CompletionGateDenied,
         owner_id: str,
         novel_id: str,
         chapter_id: str,
         prose_run_id: str,
         prose_run_revision: int,
-        state_proposal_id: str,
         candidate_digest: str,
-        expected_revision: int,
+        candidate: Mapping[str, Any],
         run: Mapping[str, Any],
         chapter: Mapping[str, Any],
         job: Mapping[str, Any],
         authorization: ChapterFinalizationAuthorization,
-        evidence: ChapterFinalizationEvidence,
-        prose_payload: Mapping[str, Any],
-        state_command: MutationCommand,
-        proposal_claim: Mapping[str, Any],
-    ) -> None:
-        adherence = dict(evidence.outline_adherence or {})
-        raw_contract_digest = str(
-            adherence.get("outline_contract_digest") or ""
-        )
-        if (
-            len(raw_contract_digest) != 64
-            or any(char not in "0123456789abcdef" for char in raw_contract_digest)
-        ):
-            raw_contract_digest = canonical_completion_digest(
-                chapter.get("outline") or {}
-            )
-        candidate_snapshot = self._candidate_snapshot(
+    ) -> _CompletionDecisionContext:
+        return _CompletionDecisionContext(
             owner_id=owner_id,
             novel_id=novel_id,
             chapter_id=chapter_id,
             prose_run_id=prose_run_id,
             prose_run_revision=prose_run_revision,
-            content_digest=candidate_digest,
-            expected_narrative_revision=expected_revision,
-            outline_contract_digest=raw_contract_digest,
+            candidate_digest=candidate_digest,
+            expected_narrative_revision=int(
+                candidate["captured_narrative_revision"]
+            ),
+            candidate_text=str(candidate["text"]),
+            completion=dict(candidate.get("completion") or {}),
             run=run,
             chapter=chapter,
-            authorization=authorization,
+            authorization=self._decision_authorization(authorization, job),
         )
-        try:
-            local_issue_set = _local_issue_projection(adherence)
-        except ChapterFinalizationDenied:
-            local_issue_set = []
-        state_completion = dict(
-            (
-                state_command.payload.get("acceptance_metadata") or {}
-            ).get("state_completion")
-            or {}
+
+    async def _persist_failure_decision(
+        self,
+        *,
+        context: _CompletionDecisionContext,
+        job: Mapping[str, Any],
+        failure_fact: ChapterCompletionFailureFact,
+        adherence: Mapping[str, Any] | None = None,
+        state_proposal_id: str | None = None,
+        state_command: MutationCommand | None = None,
+        proposal_claim: Mapping[str, Any] | None = None,
+        state_fact_accounting: Mapping[str, Any] | None = None,
+    ) -> ChapterCompletionDecision:
+        self._assert_completion_decision_scope(
+            job=job,
+            authorization=context.authorization,
+            owner_id=context.owner_id,
+            novel_id=context.novel_id,
+            chapter_id=context.chapter_id,
+            prose_run_id=context.prose_run_id,
+            prose_run_revision=context.prose_run_revision,
+            content_digest=context.candidate_digest,
+            prose_run=context.run,
         )
-        raw_accounting = state_completion.get("fact_accounting")
-        accounting_digest = (
-            str(raw_accounting.get("accounting_digest") or "")
-            if isinstance(raw_accounting, Mapping)
-            else ""
+        validated_adherence = _validated_failure_adherence(
+            adherence,
+            context=context,
         )
-        if (
-            len(accounting_digest) != 64
-            or any(char not in "0123456789abcdef" for char in accounting_digest)
-        ):
-            accounting_digest = canonical_completion_digest(
-                raw_accounting or {}
+        terminal_fact = _reconcile_outline_failure_fact(
+            failure_fact,
+            validated_adherence,
+        )
+        failure_class, assessment_stage = (
+            classify_chapter_completion_failure(terminal_fact)
+        )
+        raw_contract_digest = (
+            validated_adherence.get("outline_contract_digest")
+            if isinstance(validated_adherence, Mapping)
+            else None
+        )
+        outline_contract_digest = (
+            str(raw_contract_digest)
+            if _is_completion_digest(raw_contract_digest)
+            else canonical_completion_digest(
+                context.chapter.get("outline") or {}
             )
-        proposal_digest = str(proposal_claim.get("candidate_digest") or "")
-        if (
-            len(proposal_digest) != 64
-            or any(char not in "0123456789abcdef" for char in proposal_digest)
-        ):
-            proposal_digest = canonical_completion_digest(proposal_claim)
-        issue_signature = canonical_completion_digest({
-            "failure_class": failure.failure_class,
-            "message": str(failure),
-        })
-        evidence_bundle = ChapterCompletionEvidenceBundle(
-            provider_attempt_ledger_digest=canonical_completion_digest(
-                _provider_attempt_ledger_projection(job, chapter_id=chapter_id)
+        )
+        candidate_snapshot = self._candidate_snapshot(
+            owner_id=context.owner_id,
+            novel_id=context.novel_id,
+            chapter_id=context.chapter_id,
+            prose_run_id=context.prose_run_id,
+            prose_run_revision=context.prose_run_revision,
+            content_digest=context.candidate_digest,
+            expected_narrative_revision=(
+                context.expected_narrative_revision
             ),
-            prose_integrity_digest=canonical_completion_digest({
-                "source": prose_payload,
-                "scene_progress": list(run.get("scene_progress") or []),
-            }),
-            scene_contract_digest=raw_contract_digest,
-            beat_evidence_digest=canonical_completion_digest({
-                "schema_version": adherence.get("evidence_schema_version"),
-                "source_prose_run_id": prose_run_id,
-                "source_prose_run_revision": prose_run_revision,
-                "source_content_digest": candidate_digest,
-                "beat_evidence": list(adherence.get("beat_evidence") or []),
-                "findings": list(adherence.get("findings") or []),
-                "unknowns": list(adherence.get("unknowns") or []),
-            }),
-            local_issue_set_digest=canonical_completion_digest(
-                local_issue_set
+            outline_contract_digest=outline_contract_digest,
+            run=context.run,
+            chapter=context.chapter,
+            authorization=context.authorization,
+        )
+        quality_debt_status, quality_debt_sidecar_digest = (
+            _failure_quality_binding(
+                validated_adherence,
+                assessment_stage=assessment_stage,
+            )
+        )
+        blocking_issue_signatures = _failure_issue_signatures(
+            failure_fact=terminal_fact,
+            failure_class=failure_class,
+            adherence=validated_adherence,
+        )
+        available_evidence = {
+            "schema_version": "chapter_completion_available_evidence.v1",
+            "assessment_stage": assessment_stage,
+            "completion": {
+                key: context.completion.get(key)
+                for key in (
+                    "status",
+                    "can_write_formal_prose",
+                    "finish_reason",
+                    "scene_count",
+                    "completed_scene_count",
+                )
+            },
+            "outline_adherence": _failure_adherence_projection(
+                validated_adherence,
+                quality_debt_status=quality_debt_status,
+                quality_debt_sidecar_digest=quality_debt_sidecar_digest,
             ),
-            state_proposal_id=state_proposal_id,
-            state_proposal_digest=proposal_digest,
-            state_fact_accounting_digest=accounting_digest,
-            repair_trace_digest=None,
-            quality_debt_status="not_run",
-            quality_debt_sidecar_digest=canonical_completion_digest({
-                "status": "not_run",
-                "blocking_failure": failure.failure_class,
-            }),
-            prose_integrity_passed=(
-                failure.failure_class != "incomplete_prose"
+            "state": _failure_state_projection(
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+                state_fact_accounting=state_fact_accounting,
             ),
-            scene_contract_passed=(
-                failure.failure_class != "scene_contract_violation"
+            "repair_failure": (
+                terminal_fact.repair_failure.model_dump(mode="json")
+                if terminal_fact.repair_failure is not None
+                else None
             ),
-            state_fact_accounting_passed=(
-                failure.failure_class != "unaccounted_canonical_fact"
+        }
+        evidence_bundle = ChapterCompletionFailureEvidenceBundle(
+            schema_version=CHAPTER_COMPLETION_FAILURE_EVIDENCE_SCHEMA,
+            assessment_stage=assessment_stage,
+            provider_attempt_ledger_digest=(
+                _failure_provider_attempt_ledger_digest(
+                    job,
+                    chapter_id=context.chapter_id,
+                )
             ),
-            repair_convergence="not_required",
-            blocking_issue_signatures=(issue_signature,),
-            failure_classes=(failure.failure_class,),
-            quality_debt_count=0,
+            available_evidence_digest=canonical_completion_digest(
+                available_evidence
+            ),
+            blocking_issue_signatures=blocking_issue_signatures,
+            failure_classes=(failure_class,),
+            quality_debt_status=quality_debt_status,
+            quality_debt_sidecar_digest=quality_debt_sidecar_digest,
         )
         decision = ChapterCompletionPolicy().assess(
             candidate_snapshot,
@@ -608,11 +1157,98 @@ class ChapterFinalizationService:
             CHAPTER_COMPLETION_POLICY_REVISION,
         )
         await self._persist_completion_decision(
+            authorization=context.authorization,
+            job=job,
+            chapter_id=context.chapter_id,
+            prose_run_id=context.prose_run_id,
+            prose_run_revision=context.prose_run_revision,
+            decision=decision,
+        )
+        return decision
+
+    async def record_failure(
+        self,
+        *,
+        owner_id: str,
+        chapter_id: str,
+        prose_run_id: str,
+        prose_run_revision: int,
+        authorization: ChapterFinalizationAuthorization,
+        adherence: Mapping[str, Any] | None,
+        failure_fact: ChapterCompletionFailureFact,
+        state_proposal_id: str | None = None,
+        state_fact_accounting: Mapping[str, Any] | None = None,
+    ) -> ChapterCompletionDecision:
+        """Persist one terminal evaluation that stops before finalization."""
+
+        try:
+            candidate = await self._deps.prose_runs.inspect_ai_completion_candidate(
+                owner_id=owner_id,
+                run_id=prose_run_id,
+                chapter_id=chapter_id,
+                expected_revision=prose_run_revision,
+            )
+        except ValueError as exc:
+            raise ChapterFinalizationDenied(str(exc)) from exc
+        run = dict(candidate["run"])
+        candidate_digest = str(candidate["text_digest"])
+        novel_id = str(run.get("novel_id") or "")
+        chapter = await self._deps.chapter_repo.get_chapter_by_id(chapter_id)
+        job = await self._deps.job_repo.get_job(authorization.job_id)
+        self._assert_completion_decision_scope(
+            job=job,
             authorization=authorization,
+            owner_id=owner_id,
+            novel_id=novel_id,
             chapter_id=chapter_id,
             prose_run_id=prose_run_id,
             prose_run_revision=prose_run_revision,
-            decision=decision,
+            content_digest=candidate_digest,
+            prose_run=run,
+        )
+        context = self._decision_context(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            prose_run_id=prose_run_id,
+            prose_run_revision=prose_run_revision,
+            candidate_digest=candidate_digest,
+            candidate=candidate,
+            run=run,
+            chapter=chapter,
+            job=job,
+            authorization=authorization,
+        )
+        if not isinstance(failure_fact, ChapterCompletionFailureFact):
+            raise ChapterFinalizationDenied(
+                "章节完成失败事实不是闭集合同"
+            )
+        terminal_fact = failure_fact
+        try:
+            await self._verify_authorization(
+                authorization,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                prose_run_id=prose_run_id,
+                prose_run_revision=prose_run_revision,
+                content_digest=candidate_digest,
+                job=job,
+            )
+        except _CompletionGateDenied as exc:
+            terminal_fact = exc.failure_fact
+        if str(chapter.get("novel_id") or "") != novel_id:
+            terminal_fact = _failure_fact(
+                "source_binding_stale",
+                "chapter_binding",
+            )
+        return await self._persist_failure_decision(
+            context=context,
+            job=job,
+            failure_fact=terminal_fact,
+            adherence=adherence,
+            state_proposal_id=state_proposal_id,
+            state_fact_accounting=state_fact_accounting,
         )
 
     async def commit(
@@ -640,20 +1276,66 @@ class ChapterFinalizationService:
         candidate_text = str(candidate["text"])
         candidate_digest = str(candidate["text_digest"])
         novel_id = str(run.get("novel_id") or "")
-        stored_authorization, job = await self._verify_authorization(
-            authorization,
+        chapter = await self._deps.chapter_repo.get_chapter_by_id(chapter_id)
+        job = await self._deps.job_repo.get_job(authorization.job_id)
+        self._assert_completion_decision_scope(
+            job=job,
+            authorization=authorization,
             owner_id=owner_id,
             novel_id=novel_id,
             chapter_id=chapter_id,
             prose_run_id=prose_run_id,
             prose_run_revision=prose_run_revision,
             content_digest=candidate_digest,
+            prose_run=run,
         )
-        chapter = await self._deps.chapter_repo.get_chapter_by_id(chapter_id)
-        if str(chapter.get("novel_id") or "") != novel_id:
-            raise ChapterFinalizationDenied(
-                "正式提交章节不属于正文候选所在小说"
+        decision_context = self._decision_context(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            prose_run_id=prose_run_id,
+            prose_run_revision=prose_run_revision,
+            candidate_digest=candidate_digest,
+            candidate=candidate,
+            run=run,
+            chapter=chapter,
+            job=job,
+            authorization=authorization,
+        )
+        try:
+            stored_authorization, job = await self._verify_authorization(
+                authorization,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                prose_run_id=prose_run_id,
+                prose_run_revision=prose_run_revision,
+                content_digest=candidate_digest,
+                job=job,
             )
+        except _CompletionGateDenied as exc:
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=exc.failure_fact,
+                adherence=evidence.outline_adherence,
+            )
+            raise ChapterFinalizationDenied(str(exc)) from exc
+        if str(chapter.get("novel_id") or "") != novel_id:
+            failure = _CompletionGateDenied(
+                "正式提交章节不属于正文候选所在小说",
+                _failure_fact(
+                    "source_binding_stale",
+                    "chapter_binding",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+            )
+            raise ChapterFinalizationDenied(str(failure)) from failure
         try:
             state_payload, state_metadata, proposal_claim = (
                 await self._deps.state_proposals.prepare_policy_decision(
@@ -663,7 +1345,50 @@ class ChapterFinalizationService:
                     policy=FactAccountingPolicy(),
                 )
             )
+        except StateProposalCompletionFailure as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _state_proposal_failure_fact(exc),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+            )
+            raise ChapterFinalizationDenied(str(exc)) from exc
         except StaleStatePreview as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "source_binding_stale",
+                    "state_proposal",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+            )
+            raise ChapterFinalizationDenied(str(exc)) from exc
+        except ValueError as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "evidence_invalid",
+                    "state_proposal",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+            )
             raise ChapterFinalizationDenied(str(exc)) from exc
         proposal_claim = {
             **proposal_claim,
@@ -673,16 +1398,50 @@ class ChapterFinalizationService:
                 "content_digest": candidate_digest,
             },
         }
-        state_command = await self._deps.state_service.prepare_chapter_state_mutation(
-            chapter_id,
-            state_payload,
-            acceptance_metadata=state_metadata,
-            proposal_claim=proposal_claim,
-        )
-        if state_command.novel_id != novel_id:
-            raise ChapterFinalizationDenied(
-                "正文候选与状态候选不属于同一小说"
+        try:
+            state_command = (
+                await self._deps.state_service.prepare_chapter_state_mutation(
+                    chapter_id,
+                    state_payload,
+                    acceptance_metadata=state_metadata,
+                    proposal_claim=proposal_claim,
+                )
             )
+        except ValueError as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "evidence_invalid",
+                    "state_mutation",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                proposal_claim=proposal_claim,
+            )
+            raise ChapterFinalizationDenied(str(exc)) from exc
+        if state_command.novel_id != novel_id:
+            failure = _CompletionGateDenied(
+                "正文候选与状态候选不属于同一小说",
+                _failure_fact(
+                    "source_binding_stale",
+                    "state_mutation",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+            )
+            raise ChapterFinalizationDenied(str(failure)) from failure
 
         prose_payload = {
             "run_id": prose_run_id,
@@ -701,6 +1460,7 @@ class ChapterFinalizationService:
                 evidence=evidence,
                 authorization=stored_authorization,
                 chapter=chapter,
+                job=job,
                 prose_text=candidate_text,
             )
             if (
@@ -709,7 +1469,10 @@ class ChapterFinalizationService:
             ):
                 raise _CompletionGateDenied(
                     "正文候选与状态候选基于不同的小说版本",
-                    "stale_source",
+                    _failure_fact(
+                        "source_binding_stale",
+                        "completion_gates",
+                    ),
                 )
         except ChapterFinalizationDenied as exc:
             failure = (
@@ -717,25 +1480,18 @@ class ChapterFinalizationService:
                 if isinstance(exc, _CompletionGateDenied)
                 else _CompletionGateDenied(
                     str(exc),
-                    "invalid_or_unknown_evidence",
+                    _failure_fact(
+                        "evidence_invalid",
+                        "completion_gates",
+                    ),
                 )
             )
-            await self._persist_gate_failure(
-                failure=failure,
-                owner_id=owner_id,
-                novel_id=novel_id,
-                chapter_id=chapter_id,
-                prose_run_id=prose_run_id,
-                prose_run_revision=prose_run_revision,
-                state_proposal_id=state_proposal_id,
-                candidate_digest=candidate_digest,
-                expected_revision=expected_revision,
-                run=run,
-                chapter=chapter,
+            await self._persist_failure_decision(
+                context=decision_context,
                 job=job,
-                authorization=authorization,
-                evidence=evidence,
-                prose_payload=prose_payload,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
                 state_command=state_command,
                 proposal_claim=proposal_claim,
             )
@@ -833,6 +1589,7 @@ class ChapterFinalizationService:
             )
             await self._persist_completion_decision(
                 authorization=authorization,
+                job=job,
                 chapter_id=chapter_id,
                 prose_run_id=prose_run_id,
                 prose_run_revision=prose_run_revision,
@@ -847,6 +1604,22 @@ class ChapterFinalizationService:
                 ),
             )
         except (ChapterCompletionPolicyError, ValueError) as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "evidence_invalid",
+                    "policy_assessment",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+            )
             raise ChapterFinalizationDenied(str(exc)) from exc
 
         try:
@@ -862,15 +1635,63 @@ class ChapterFinalizationService:
                 ),
             )
         except ValueError as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "publication_conflict",
+                    "publication_prepare",
+                ),
+            )
+            await self._persist_failure_decision(
+                context=decision_context,
+                job=job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+            )
             raise ChapterFinalizationDenied(str(exc)) from exc
-        latest_authorization, latest_job = await self._verify_authorization(
-            authorization,
-            owner_id=owner_id,
-            novel_id=novel_id,
-            chapter_id=chapter_id,
-            prose_run_id=prose_run_id,
-            prose_run_revision=prose_run_revision,
-            content_digest=candidate_digest,
+        try:
+            latest_authorization, latest_job = await self._verify_authorization(
+                authorization,
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                prose_run_id=prose_run_id,
+                prose_run_revision=prose_run_revision,
+                content_digest=candidate_digest,
+            )
+        except _CompletionGateDenied as exc:
+            latest_job = await self._deps.job_repo.get_job(
+                authorization.job_id
+            )
+            latest_decision_context = replace(
+                decision_context,
+                authorization=self._decision_authorization(
+                    authorization,
+                    latest_job,
+                ),
+            )
+            await self._persist_failure_decision(
+                context=latest_decision_context,
+                job=latest_job,
+                failure_fact=_retarget_failure_fact(
+                    exc.failure_fact,
+                    "publication_revalidation",
+                ),
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+            )
+            raise ChapterFinalizationDenied(str(exc)) from exc
+        latest_decision_context = replace(
+            decision_context,
+            authorization=self._decision_authorization(
+                authorization,
+                latest_job,
+            ),
         )
         latest_attempt_digest = canonical_completion_digest(
             _provider_attempt_ledger_projection(
@@ -883,9 +1704,23 @@ class ChapterFinalizationService:
             or latest_attempt_digest
             != certificate.evidence_binding.provider_attempt_ledger_digest
         ):
-            raise ChapterFinalizationDenied(
-                "正式提交授权或付费调用账本在证书签发后发生变化"
+            failure = _CompletionGateDenied(
+                "正式提交授权或付费调用账本在证书签发后发生变化",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "publication_revalidation",
+                ),
             )
+            await self._persist_failure_decision(
+                context=latest_decision_context,
+                job=latest_job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+            )
+            raise ChapterFinalizationDenied(str(failure)) from failure
 
         idempotency_key = chapter_finalization_idempotency_key(
             prose_run_id=prose_run_id,
@@ -928,11 +1763,40 @@ class ChapterFinalizationService:
                 "state_command": _serialize_subcommand(state_command),
             },
         )
-        return await commit_mutation(
-            command,
-            self._execute_finalize,
-            advances_narrative_revision=True,
-        )
+        try:
+            return await commit_mutation(
+                command,
+                self._execute_finalize,
+                advances_narrative_revision=True,
+            )
+        except (MutationConflictError, NarrativeRevisionConflict) as exc:
+            failure = _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "publication_conflict",
+                    "publication_commit",
+                ),
+            )
+            latest_job = await self._deps.job_repo.get_job(
+                authorization.job_id
+            )
+            conflict_decision_context = replace(
+                decision_context,
+                authorization=self._decision_authorization(
+                    authorization,
+                    latest_job,
+                ),
+            )
+            await self._persist_failure_decision(
+                context=conflict_decision_context,
+                job=latest_job,
+                failure_fact=failure.failure_fact,
+                adherence=evidence.outline_adherence,
+                state_proposal_id=state_proposal_id,
+                state_command=state_command,
+                proposal_claim=proposal_claim,
+            )
+            raise ChapterFinalizationDenied(str(exc)) from exc
 
     async def recover_completed(
         self,
@@ -1085,18 +1949,44 @@ class ChapterFinalizationService:
         prose_run_id: str,
         prose_run_revision: int,
         content_digest: str,
+        job: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        job = await self._deps.job_repo.get_job(supplied.job_id)
-        if str(job.get("novel_id") or "") != str(novel_id):
-            raise ChapterFinalizationDenied("批量作业不属于正文候选所在小说")
+        current_job = (
+            dict(job)
+            if isinstance(job, Mapping)
+            else await self._deps.job_repo.get_job(supplied.job_id)
+        )
+        if str(current_job.get("novel_id") or "") != str(novel_id):
+            raise _CompletionGateDenied(
+                "批量作业不属于正文候选所在小说",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "authorization",
+                ),
+            )
+        attempt_slots = current_job.get("attempt_slots")
+        has_live_attempt = isinstance(attempt_slots, list) and any(
+            isinstance(slot, Mapping)
+            and slot.get("state") in {"claimed", "uncertain"}
+            for slot in attempt_slots
+        )
+        if current_job.get("has_uncertain_attempts") or has_live_attempt:
+            raise _CompletionGateDenied(
+                "尚有未处置的付费调用，不能正式提交",
+                _failure_fact(
+                    "paid_attempt_unresolved",
+                    "authorization",
+                ),
+            )
         if supplied.kind == "interactive_completion_readiness":
-            readiness = dict(job.get("readiness") or {})
+            readiness = dict(current_job.get("readiness") or {})
             source = readiness.get("source_binding")
             if (
-                str(job.get("job_kind") or "")
+                str(current_job.get("job_kind") or "")
                 != "interactive_chapter_completion"
-                or str(job.get("status") or "") != "completion_running"
-                or str(job.get("owner_id") or "") != str(owner_id)
+                or str(current_job.get("status") or "")
+                != "completion_running"
+                or str(current_job.get("owner_id") or "") != str(owner_id)
                 or readiness.get("schema_version")
                 != "interactive_chapter_completion_readiness.v1"
                 or readiness.get("authorization_id")
@@ -1114,9 +2004,9 @@ class ChapterFinalizationService:
                 != str(content_digest)
                 or str(
                     (
-                        job.get("interactive_execution_claim")
+                        current_job.get("interactive_execution_claim")
                         if isinstance(
-                            job.get("interactive_execution_claim"),
+                            current_job.get("interactive_execution_claim"),
                             Mapping,
                         )
                         else {}
@@ -1125,35 +2015,70 @@ class ChapterFinalizationService:
                 )
                 != supplied.execution_claim_token
             ):
-                raise ChapterFinalizationDenied(
-                    "交互式完成授权没有绑定当前正文候选"
+                raise _CompletionGateDenied(
+                    "交互式完成授权没有绑定当前正文候选",
+                    _failure_fact(
+                        "authorization_binding_stale",
+                        "authorization",
+                    ),
                 )
         else:
-            if str(job.get("status") or "") != "running":
-                raise ChapterFinalizationDenied("批量作业当前不允许正式提交")
-            readiness = dict(job.get("readiness") or {})
-        if str(job.get("current_chapter_id") or "") != str(chapter_id):
-            raise ChapterFinalizationDenied("批量作业未授权当前章节")
-        attempt_slots = job.get("attempt_slots")
-        has_live_attempt = isinstance(attempt_slots, list) and any(
-            isinstance(slot, Mapping)
-            and slot.get("state") in {"claimed", "uncertain"}
-            for slot in attempt_slots
-        )
-        if job.get("has_uncertain_attempts") or has_live_attempt:
-            raise ChapterFinalizationDenied("尚有未处置的付费调用，不能正式提交")
+            if str(current_job.get("status") or "") != "running":
+                raise _CompletionGateDenied(
+                    "批量作业当前不允许正式提交",
+                    _failure_fact(
+                        "authorization_binding_stale",
+                        "authorization",
+                    ),
+                )
+            readiness = dict(current_job.get("readiness") or {})
+        if str(current_job.get("current_chapter_id") or "") != str(chapter_id):
+            raise _CompletionGateDenied(
+                "批量作业未授权当前章节",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "authorization",
+                ),
+            )
         if str(readiness.get("digest") or "") != supplied.readiness_digest:
-            raise ChapterFinalizationDenied("批量 readiness 摘要已经变化")
+            raise _CompletionGateDenied(
+                "批量 readiness 摘要已经变化",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "authorization",
+                ),
+            )
         planning = readiness.get("planning")
         if not isinstance(planning, Mapping):
-            raise ChapterFinalizationDenied("批量 readiness 规划无效")
-        frozen = parse_chapter_finalization_authorization(
-            planning.get("chapter_finalization_authorization")
-        )
+            raise _CompletionGateDenied(
+                "批量 readiness 规划无效",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "authorization",
+                ),
+            )
+        try:
+            frozen = parse_chapter_finalization_authorization(
+                planning.get("chapter_finalization_authorization")
+            )
+        except ChapterFinalizationDenied as exc:
+            raise _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "authorization",
+                ),
+            ) from exc
         frozen_revision = frozen["authorization_revision"]
         if frozen_revision != supplied.authorization_revision:
-            raise ChapterFinalizationDenied("正式提交授权版本已经变化")
-        return frozen, dict(job)
+            raise _CompletionGateDenied(
+                "正式提交授权版本已经变化",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "authorization",
+                ),
+            )
+        return frozen, current_job
 
     @staticmethod
     def _validate_gates(
@@ -1163,6 +2088,7 @@ class ChapterFinalizationService:
         evidence: ChapterFinalizationEvidence,
         authorization: Mapping[str, Any],
         chapter: Mapping[str, Any],
+        job: Mapping[str, Any],
         prose_text: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         completion = dict(prose_payload.get("completion") or {})
@@ -1173,14 +2099,20 @@ class ChapterFinalizationService:
         ):
             raise _CompletionGateDenied(
                 "正文候选未通过完整性闸门",
-                "incomplete_prose",
+                _failure_fact(
+                    "prose_incomplete",
+                    "completion_gates",
+                ),
             )
         adherence = dict(evidence.outline_adherence or {})
         outline = chapter.get("outline")
         if not isinstance(outline, Mapping):
             raise _CompletionGateDenied(
                 "正式提交章节缺少有效章纲",
-                "invalid_or_unknown_evidence",
+                _failure_fact(
+                    "evidence_invalid",
+                    "completion_gates",
+                ),
             )
         scenes = outline.get("scenes")
         if (
@@ -1191,7 +2123,10 @@ class ChapterFinalizationService:
         ):
             raise _CompletionGateDenied(
                 "正文候选场景完整性证据无效",
-                "scene_contract_violation",
+                _failure_fact(
+                    "scene_contract_unsatisfied",
+                    "completion_gates",
+                ),
             )
         if (
             str(adherence.get("source_prose_run_id") or "")
@@ -1206,11 +2141,56 @@ class ChapterFinalizationService:
         ):
             raise _CompletionGateDenied(
                 "细纲符合度结果没有绑定当前正文候选",
-                "stale_source",
+                _failure_fact(
+                    "source_binding_stale",
+                    "completion_gates",
+                ),
+            )
+        try:
+            submitted_adherence = (
+                ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                    adherence
+                )
+            )
+        except ValueError as exc:
+            raise _CompletionGateDenied(
+                "章纲符合度当前本地问题策略证据无效",
+                _failure_fact(
+                    "evidence_invalid",
+                    "outline_adherence",
+                ),
+            ) from exc
+        try:
+            rebuilt_adherence = revalidate_current_outline_adherence_evidence(
+                adherence,
+                outline=outline,
+                prose=prose_text,
+                source_prose_run_id=str(prose_payload["run_id"]),
+                source_prose_run_revision=int(
+                    prose_payload["expected_revision"]
+                ),
+                source_content_digest=str(prose_payload["text_digest"]),
+            )
+        except OutlineAdherenceValidationError as exc:
+            raise _CompletionGateDenied(
+                str(exc),
+                _failure_fact(
+                    "evidence_invalid",
+                    "outline_adherence",
+                ),
+            ) from exc
+        trusted_adherence = _trusted_outline_adherence_evidence(
+            job=job,
+            chapter_id=str(chapter.get("_id") or ""),
+        )
+        if submitted_adherence != trusted_adherence:
+            raise _CompletionGateDenied(
+                "章纲符合度证据与作业持久证据不一致",
+                _failure_fact("evidence_invalid", "outline_adherence"),
             )
         try:
             adherence_metadata = validate_complete_outline_adherence(
-                adherence,
+                rebuilt_adherence,
                 outline=outline,
                 prose=prose_text,
                 require_current_evidence=True,
@@ -1218,7 +2198,9 @@ class ChapterFinalizationService:
         except OutlineAdherenceValidationError as exc:
             raise _CompletionGateDenied(
                 str(exc),
-                "semantic_unknown",
+                failure_fact_from_outline_adherence_decision(
+                    rebuilt_adherence.get("decision")
+                ),
             ) from exc
         max_repairs = _strict_int(
             authorization.get("max_repair_cycles"),
@@ -1228,7 +2210,10 @@ class ChapterFinalizationService:
         if evidence.repair_cycles_used > max_repairs:
             raise _CompletionGateDenied(
                 "正文修复次数超过已授权上限",
-                "repair_budget_exhausted",
+                _failure_fact(
+                    "authorization_binding_stale",
+                    "completion_gates",
+                ),
             )
 
         state_payload = state_command.payload
@@ -1236,7 +2221,10 @@ class ChapterFinalizationService:
         if list(metadata.get("consistency_issues") or []):
             raise _CompletionGateDenied(
                 "状态候选仍有一致性冲突",
-                "unaccounted_canonical_fact",
+                _failure_fact(
+                    "canonical_fact_unaccounted",
+                    "completion_gates",
+                ),
             )
         completion_evidence = dict(metadata.get("state_completion") or {})
         resolution = dict(completion_evidence.get("reference_resolution") or {})
@@ -1251,7 +2239,10 @@ class ChapterFinalizationService:
         if any(field not in resolution for field in resolution_fields):
             raise _CompletionGateDenied(
                 "状态候选缺少完整的引用校验证据",
-                "invalid_or_unknown_evidence",
+                _failure_fact(
+                    "evidence_invalid",
+                    "completion_gates",
+                ),
             )
         counts = {
             field: _strict_int(
@@ -1269,13 +2260,19 @@ class ChapterFinalizationService:
         ):
             raise _CompletionGateDenied(
                 "状态候选仍含无效内部引用",
-                "invalid_internal_reference",
+                _failure_fact(
+                    "internal_reference_invalid",
+                    "completion_gates",
+                ),
             )
         raw_fact_accounting = completion_evidence.get("fact_accounting")
         if not isinstance(raw_fact_accounting, Mapping):
             raise _CompletionGateDenied(
                 "状态候选缺少正式事实核算证据",
-                "invalid_or_unknown_evidence",
+                _failure_fact(
+                    "evidence_invalid",
+                    "completion_gates",
+                ),
             )
         try:
             fact_accounting = validate_state_fact_accounting(
@@ -1284,12 +2281,18 @@ class ChapterFinalizationService:
         except StateFactAccountingError as exc:
             raise _CompletionGateDenied(
                 str(exc),
-                "invalid_or_unknown_evidence",
+                _failure_fact(
+                    "evidence_invalid",
+                    "completion_gates",
+                ),
             ) from exc
         if not fact_accounting["gate_passed"]:
             raise _CompletionGateDenied(
                 "状态候选仍有未核算正式事实或非法内部引用",
-                "unaccounted_canonical_fact",
+                _failure_fact(
+                    "canonical_fact_unaccounted",
+                    "completion_gates",
+                ),
             )
         fact_source = fact_accounting["source_binding"]
         if (
@@ -1307,12 +2310,18 @@ class ChapterFinalizationService:
         ):
             raise _CompletionGateDenied(
                 "正式事实核算没有绑定当前正文候选",
-                "stale_source",
+                _failure_fact(
+                    "source_binding_stale",
+                    "completion_gates",
+                ),
             )
         if completion_evidence.get("source_prose_acceptance_state") != "ai_complete":
             raise _CompletionGateDenied(
                 "状态候选未绑定完整正文",
-                "incomplete_prose",
+                _failure_fact(
+                    "prose_incomplete",
+                    "completion_gates",
+                ),
             )
         if (
             str(completion_evidence.get("source_prose_run_id") or "")
@@ -1327,7 +2336,10 @@ class ChapterFinalizationService:
         ):
             raise _CompletionGateDenied(
                 "状态候选没有绑定当前正文候选",
-                "stale_source",
+                _failure_fact(
+                    "source_binding_stale",
+                    "completion_gates",
+                ),
             )
         return adherence_metadata, fact_accounting
 

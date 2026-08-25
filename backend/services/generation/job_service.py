@@ -38,6 +38,7 @@ from backend.services.generation.chapter_candidate_authorization import (
 )
 from backend.services.generation.chapter_candidate_job import (
     CandidateJobExecution,
+    ChapterCandidateCompletionFailureRequest,
     ChapterCandidateJobRunner,
     ChapterCandidateJobRunnerDeps,
 )
@@ -1881,33 +1882,43 @@ class GenerationJobService:
                     recover_source=repairs.recover_source,
                 )
 
-            async def finalize_candidate(
-                *,
-                owner_id: str,
-                novel_id: str,
-                chapter: Mapping[str, Any],
-                source,
-                adherence: Mapping[str, Any],
-                state: Mapping[str, Any],
-                repair_cycles_used: int,
-                repair_trace: Mapping[str, Any] | None,
-            ) -> Mapping[str, Any]:
-                del novel_id
+            def candidate_finalization_authorization(
+            ) -> ChapterFinalizationAuthorization:
                 planning = readiness.get("planning")
                 if not isinstance(planning, Mapping):
                     raise ValueError("candidate finalization planning is invalid")
                 frozen = parse_chapter_finalization_authorization(
                     planning.get("chapter_finalization_authorization")
                 )
+                readiness_digest = readiness.get("digest")
+                if not isinstance(readiness_digest, str) or not readiness_digest:
+                    raise ValueError("candidate readiness digest is invalid")
+                return ChapterFinalizationAuthorization(
+                    job_id=job_id,
+                    readiness_digest=readiness_digest,
+                    authorization_revision=frozen[
+                        "authorization_revision"
+                    ],
+                )
+
+            async def finalize_candidate(
+                *,
+                owner_id: str,
+                novel_id: str,
+                chapter: Mapping[str, Any],
+                source,
+                adherence: Mapping[str, Any] | None,
+                state: Mapping[str, Any],
+                repair_cycles_used: int,
+                repair_trace: Mapping[str, Any] | None,
+            ) -> Mapping[str, Any]:
+                del novel_id
                 proposal_id = state.get("proposal_id")
                 acceptance_token = state.get("acceptance_token")
                 if not isinstance(proposal_id, str) or not isinstance(
                     acceptance_token, str
                 ):
                     raise ValueError("candidate state receipt is invalid")
-                readiness_digest = readiness.get("digest")
-                if not isinstance(readiness_digest, str) or not readiness_digest:
-                    raise ValueError("candidate readiness digest is invalid")
                 return await chapter_finalization_service.commit(
                     owner_id=owner_id,
                     chapter_id=str(chapter.get("_id") or ""),
@@ -1915,13 +1926,7 @@ class GenerationJobService:
                     prose_run_revision=source.source_run_revision,
                     state_proposal_id=proposal_id,
                     state_acceptance_token=acceptance_token,
-                    authorization=ChapterFinalizationAuthorization(
-                        job_id=job_id,
-                        readiness_digest=readiness_digest,
-                        authorization_revision=frozen[
-                            "authorization_revision"
-                        ],
-                    ),
+                    authorization=candidate_finalization_authorization(),
                     evidence=ChapterFinalizationEvidence(
                         outline_adherence=dict(adherence),
                         repair_cycles_used=repair_cycles_used,
@@ -1932,6 +1937,31 @@ class GenerationJobService:
                         ),
                     ),
                 )
+
+            async def record_completion_failure(
+                *,
+                owner_id: str,
+                novel_id: str,
+                chapter: Mapping[str, Any],
+                failure: ChapterCandidateCompletionFailureRequest,
+            ) -> Mapping[str, Any]:
+                del novel_id
+                decision = await chapter_finalization_service.record_failure(
+                    owner_id=owner_id,
+                    chapter_id=str(chapter.get("_id") or ""),
+                    prose_run_id=failure.source.source_run_id,
+                    prose_run_revision=failure.source.source_run_revision,
+                    authorization=candidate_finalization_authorization(),
+                    adherence=(
+                        dict(failure.adherence)
+                        if isinstance(failure.adherence, Mapping)
+                        else None
+                    ),
+                    failure_fact=failure.failure_fact,
+                    state_proposal_id=failure.state_proposal_id,
+                    state_fact_accounting=failure.state_fact_accounting,
+                )
+                return decision.model_dump(mode="json")
 
             async def generate_job_prose_candidate(
                 target_novel_id,
@@ -2004,6 +2034,7 @@ class GenerationJobService:
                     recover_state_candidate=(
                         state_proposal_module.recover_owned_repair_result
                     ),
+                    record_completion_failure=record_completion_failure,
                     finalize=finalize_candidate,
                 ),
             )

@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from bson import ObjectId
@@ -61,6 +61,41 @@ STATE_PROPOSAL_DISPATCH_PROTOCOL_REVISION = 1
 
 class StaleStatePreview(ValueError):
     """A proposal is missing, expired, reused, or bound to stale narrative data."""
+
+
+StateProposalCompletionFailureReason = Literal[
+    "canonical_fact_unaccounted",
+    "evidence_invalid",
+    "internal_reference_invalid",
+    "semantic_unknown",
+    "source_binding_stale",
+]
+
+
+_STATE_PROPOSAL_COMPLETION_FAILURE_REASONS: frozenset[
+    StateProposalCompletionFailureReason
+] = frozenset({
+    "canonical_fact_unaccounted",
+    "evidence_invalid",
+    "internal_reference_invalid",
+    "semantic_unknown",
+    "source_binding_stale",
+})
+
+
+class StateProposalCompletionFailure(StaleStatePreview):
+    """A closed state-policy fact that the chapter finalizer can classify."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: StateProposalCompletionFailureReason,
+    ) -> None:
+        if reason not in _STATE_PROPOSAL_COMPLETION_FAILURE_REASONS:
+            raise ValueError("state proposal completion failure reason is invalid")
+        super().__init__(message)
+        self.completion_failure_reason = reason
 
 
 def _uses_current_dispatch_protocol(proposal: dict[str, Any]) -> bool:
@@ -1080,15 +1115,19 @@ class StateProposalModule:
     ) -> dict[str, Any]:
         proposal = await self.collection.find_one({"_id": to_object_id(proposal_id)})
         if not proposal:
-            raise StaleStatePreview("State proposal is missing")
+            raise StateProposalCompletionFailure(
+                "State proposal is missing",
+                reason="evidence_invalid",
+            )
         if proposal.get("status") not in {"proposed", "claimed", "applied"}:
             raise StaleStatePreview("State proposal is not available for acceptance")
         stored_job_binding = _job_mutation_binding(proposal)
         if stored_job_binding is not None and not _uses_current_dispatch_protocol(
             proposal
         ):
-            raise StaleStatePreview(
-                "State proposal Provider dispatch evidence is unknown"
+            raise StateProposalCompletionFailure(
+                "State proposal Provider dispatch evidence is unknown",
+                reason="evidence_invalid",
             )
         allow_expired = False
         if job_mutation_binding is not None:
@@ -1125,7 +1164,10 @@ class StateProposalModule:
         if not hmac.compare_digest(
             expected_token, str(proposal.get("token_digest") or "")
         ):
-            raise StaleStatePreview("State proposal token is invalid")
+            raise StateProposalCompletionFailure(
+                "State proposal token is invalid",
+                reason="evidence_invalid",
+            )
         return proposal
 
     async def prepare_decision(
@@ -1256,8 +1298,9 @@ class StateProposalModule:
                 )
             )
             if has_dropped_references:
-                raise StaleStatePreview(
-                    "状态候选包含已清洗的无效内部引用，必须重新生成"
+                raise StateProposalCompletionFailure(
+                    "状态候选包含已清洗的无效内部引用，必须重新生成",
+                    reason="internal_reference_invalid",
                 )
 
             candidate_states = {
@@ -1294,7 +1337,10 @@ class StateProposalModule:
                     drop_reasons=drop_reasons,
                 )
             except StateFactAccountingError as exc:
-                raise StaleStatePreview(str(exc)) from exc
+                raise StateProposalCompletionFailure(
+                    str(exc),
+                    reason="evidence_invalid",
+                ) from exc
             source_binding = fact_accounting["source_binding"]
             if (
                 str(source_binding.get("chapter_id") or "") != chapter_id
@@ -1305,12 +1351,25 @@ class StateProposalModule:
                 or source_binding.get("source_prose_run_revision")
                 != proposal.get("source_prose_run_revision")
             ):
-                raise StaleStatePreview(
-                    "State fact accounting is not bound to this proposal"
+                raise StateProposalCompletionFailure(
+                    "State fact accounting is not bound to this proposal",
+                    reason="source_binding_stale",
                 )
             if not fact_accounting["gate_passed"]:
-                raise StaleStatePreview(
-                    "状态候选仍有未核算正式事实或非法内部引用"
+                if fact_accounting.get("extraction_failure_count"):
+                    failure_reason = "semantic_unknown"
+                elif (
+                    fact_accounting.get("invalid_internal_references")
+                    or fact_accounting.get("dangling_references")
+                ):
+                    failure_reason = "internal_reference_invalid"
+                elif fact_accounting.get("unaccounted_canonical_facts"):
+                    failure_reason = "canonical_fact_unaccounted"
+                else:
+                    failure_reason = "evidence_invalid"
+                raise StateProposalCompletionFailure(
+                    "状态候选仍有未核算正式事实或非法内部引用",
+                    reason=failure_reason,
                 )
             fact_summary_accepted = any(
                 action.get("action_type") == "chapter_summary"

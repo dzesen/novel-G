@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from itertools import islice
-from typing import Any, Awaitable, Callable, Literal, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -31,6 +31,10 @@ from backend.services.generation.chapter_generation_application import (
 from backend.services.generation.chapter_finalization import (
     MAX_FINALIZATION_REPAIR_CYCLES,
 )
+from backend.services.generation.chapter_completion_certificate import (
+    ChapterCompletionFailureFact,
+    failure_fact_from_outline_adherence_decision,
+)
 from backend.services.generation.chapter_repair_policy import (
     ChapterRepairPolicy,
     RepairBudgetExhausted,
@@ -39,6 +43,7 @@ from backend.services.generation.chapter_repair_policy import (
     RepairComponent,
     RepairComponentUsageV1,
     RepairConvergenceEvidenceV1,
+    RepairFailureEvidenceV1,
     RepairIssueV1,
     default_repair_budget_limits,
     repair_next_step,
@@ -74,6 +79,7 @@ from backend.services.generation.outline_adherence import (
     OUTLINE_ISSUE_CATEGORIES,
     OutlineIssueCategory,
     OutlineAdherenceValidationError,
+    revalidate_current_outline_adherence_evidence,
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
@@ -1139,6 +1145,117 @@ class ChapterCandidatePipelineBlocked(ValueError):
         return _exception_unattributed_usage_projection(self.progress)
 
 
+def _repair_failure_evidence(
+    blocked: ChapterCandidatePipelineBlocked,
+) -> RepairFailureEvidenceV1 | None:
+    if (
+        not isinstance(blocked.repair_component, RepairComponent)
+        or type(blocked.component_used) is not int
+        or type(blocked.component_limit) is not int
+        or not isinstance(blocked.next_step, str)
+    ):
+        return None
+    try:
+        return RepairFailureEvidenceV1(
+            component=blocked.repair_component,
+            component_used=blocked.component_used,
+            component_limit=blocked.component_limit,
+            next_step=blocked.next_step,
+        )
+    except ValueError:
+        return None
+
+
+def _completion_failure_fact(
+    blocked: ChapterCandidatePipelineBlocked,
+) -> ChapterCompletionFailureFact | None:
+    if blocked.code == "candidate_adherence_manual_review":
+        return None
+    repair_failure = _repair_failure_evidence(blocked)
+    if blocked.code in {
+        "repair_budget_exhausted",
+        "candidate_completion_repair_exhausted",
+        "candidate_adherence_repair_exhausted",
+        "candidate_state_repair_exhausted",
+    }:
+        reason = (
+            "repair_authority_exhausted"
+            if repair_failure is not None
+            else "evidence_invalid"
+        )
+    elif blocked.code in {"repair_not_converged", "repair_no_progress"}:
+        reason = (
+            "repair_not_converged"
+            if repair_failure is not None
+            else "evidence_invalid"
+        )
+    elif blocked.code == "repair_authorization_invalid":
+        reason = "authorization_binding_stale"
+    elif blocked.code == "repair_evidence_invalid":
+        reason = "evidence_invalid"
+    elif blocked.code == "candidate_completion_failed":
+        reason = "prose_incomplete"
+    elif blocked.code in {
+        "candidate_adherence_stale",
+        "candidate_state_stale",
+    }:
+        reason = "source_binding_stale"
+    elif blocked.code == "candidate_adherence_failed":
+        reason = "scene_contract_unsatisfied"
+    elif blocked.code == "candidate_state_unaccounted_fact":
+        reason = "canonical_fact_unaccounted"
+    elif blocked.code == "candidate_state_invalid_reference":
+        reason = "internal_reference_invalid"
+    elif blocked.code == "candidate_state_evidence_unknown":
+        reason = "semantic_unknown"
+    elif blocked.code == "candidate_narrative_revision_changed":
+        reason = "authorization_binding_stale"
+    else:
+        reason = "evidence_invalid"
+    observed_at = (
+        "outline_adherence"
+        if blocked.gate == "outline_adherence"
+        else "state_proposal"
+        if blocked.gate == "state"
+        else "completion_gates"
+    )
+    return ChapterCompletionFailureFact(
+        reason=reason,
+        observed_at=observed_at,
+        repair_failure=(
+            repair_failure
+            if reason in {
+                "repair_not_converged",
+                "repair_authority_exhausted",
+                "authorization_binding_stale",
+                "evidence_invalid",
+            }
+            else None
+        ),
+    )
+
+
+def _repair_operation_blocked(
+    message: str,
+    *,
+    gate: Literal["completion", "outline_adherence", "state"],
+    repair_failure: RepairFailureEvidenceV1,
+    code: Literal[
+        "repair_authorization_invalid",
+        "repair_evidence_invalid",
+    ],
+) -> ChapterCandidatePipelineBlocked:
+    return ChapterCandidatePipelineBlocked(
+        message,
+        code=code,
+        gate=gate,
+        repair_component=repair_failure.component,
+        component_used=repair_failure.component_used,
+        component_limit=repair_failure.component_limit,
+        next_step=repair_failure.next_step,
+    )
+
+
 class ChapterCandidatePipelineDependencyFailed(RuntimeError):
     """A non-retryable dependency stop with all prior bounded evidence attached."""
 
@@ -1161,6 +1278,26 @@ class ChapterCandidatePipelineDependencyFailed(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ChapterCandidateCompletionFailureRequest:
+    """One in-process, source-bound request to persist a terminal decision."""
+
+    source: ProseCandidateSource
+    adherence: Mapping[str, Any] | None
+    failure_fact: ChapterCompletionFailureFact
+    state_proposal_id: str | None = None
+    state_fact_accounting: Mapping[str, Any] | None = None
+
+
+class ChapterCompletionFailureRecorder(Protocol):
+    async def __call__(
+        self,
+        novel_id: str,
+        chapter: dict[str, Any],
+        failure: ChapterCandidateCompletionFailureRequest,
+    ) -> Any: ...
+
+
+@dataclass(frozen=True)
 class ChapterCandidatePipelineDeps:
     generate_prose_candidate: Callable[
         [str, dict[str, Any]],
@@ -1174,6 +1311,7 @@ class ChapterCandidatePipelineDeps:
         ...,
         Awaitable[ChapterGenerationResult],
     ]
+    record_completion_failure: ChapterCompletionFailureRecorder
     finalize: Callable[
         [
             str,
@@ -1600,7 +1738,9 @@ class _PipelineTrace:
     repair_component_usage: tuple[RepairComponentUsageV1, ...] = ()
     repair_convergence: tuple[RepairConvergenceEvidenceV1, ...] = ()
     source: ProseCandidateSource | None = None
+    adherence: dict[str, Any] | None = None
     state_proposal_id: str | None = None
+    state_fact_accounting: dict[str, Any] | None = None
 
     def record(
         self,
@@ -2062,11 +2202,13 @@ def _blocked_resume(
     message: str,
     *,
     code: str = "candidate_gate_blocked",
+    gate: Literal["completion", "outline_adherence", "state"] | None = None,
 ) -> ChapterCandidatePipelineBlocked:
     return ChapterCandidatePipelineBlocked(
         message,
         code=code,
         progress=trace.snapshot(),
+        gate=gate,
     )
 
 
@@ -2256,7 +2398,8 @@ def _validate_resumed_state_projection(
         != checkpoint.extraction_failure_count
     ):
         raise ChapterCandidatePipelineBlocked(
-            "候选管线恢复状态投影与检查点不一致"
+            "候选管线恢复状态投影与检查点不一致",
+            gate="state",
         )
 
 
@@ -2527,6 +2670,7 @@ def _replay_candidate_checkpoints(
 def _resume_trace(
     resume: ChapterCandidatePipelineResume,
     *,
+    trace: _PipelineTrace,
     repair_limit: int,
     repair_budget_limits: RepairBudgetLimitsV1,
     tail_judge_retry_usage: int,
@@ -2540,7 +2684,7 @@ def _resume_trace(
     if not isinstance(progress, ChapterCandidatePipelineProgress):
         raise ChapterCandidatePipelineBlocked("候选管线恢复进度无效")
 
-    restored = _PipelineTrace()
+    restored = trace
     trusted_progress_tokens = (
         progress.tokens
         if (
@@ -2901,7 +3045,7 @@ def _resume_trace(
             "恢复检查点与正文候选身份不一致",
         )
     restored.source = source
-    restored.state_proposal_id = progress.state_proposal_id
+    restored.state_proposal_id = None
 
     replay = _replay_candidate_checkpoints(
         tuple(checkpoints),
@@ -2919,6 +3063,13 @@ def _resume_trace(
     review_count = replay.review_count
     repair_gate: Literal["outline_adherence", "state"] = (
         "state" if phase is _ResumePhase.STATE else "outline_adherence"
+    )
+    projection_gate: Literal["outline_adherence", "state"] = (
+        repair_gate
+        if tail_repair_attempt_ids
+        else "outline_adherence"
+        if phase is _ResumePhase.PROSE
+        else "state"
     )
     try:
         repair_policy_replay = _replay_repair_policy(
@@ -2992,6 +3143,7 @@ def _resume_trace(
             restored,
             "已结算候选调用缺少可恢复结果投影",
             code="candidate_result_projection_missing",
+            gate=projection_gate,
         )
     if replay.truncations != tuple(restored.truncations):
         raise _blocked_resume(restored, "候选管线恢复截断与检查点不一致")
@@ -3037,29 +3189,53 @@ def _resume_trace(
         resume.adherence is not None
         and not isinstance(resume.adherence, ChapterGenerationResult)
     ):
-        raise _blocked_resume(restored, "候选管线恢复复检结果无效")
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复复检结果无效",
+            gate="outline_adherence",
+        )
     if resume.state is not None and not isinstance(
         resume.state,
         ChapterGenerationResult,
     ):
-        raise _blocked_resume(restored, "候选管线恢复状态结果无效")
+        raise _blocked_resume(
+            restored,
+            "候选管线恢复状态结果无效",
+            gate="state",
+        )
 
     if phase is _ResumePhase.PROSE:
-        if (
-            resume.adherence is not None
-            or resume.state is not None
-            or progress.state_proposal_id is not None
-        ):
-            raise _blocked_resume(restored, "候选管线恢复候选阶段无效")
+        if resume.state is not None or progress.state_proposal_id is not None:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复候选阶段无效",
+                gate="state",
+            )
+        if resume.adherence is not None:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复候选阶段无效",
+                gate="outline_adherence",
+            )
     elif phase is _ResumePhase.ADHERENCE:
         if resume.adherence is None:
-            raise _blocked_resume(restored, "候选管线恢复复检候选缺失")
-        if (
-            resume.state is not None
-            or progress.state_proposal_id is not None
-            or latest_adherence is None
-        ):
-            raise _blocked_resume(restored, "候选管线恢复候选阶段无效")
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复复检候选缺失",
+                gate="outline_adherence",
+            )
+        if latest_adherence is None:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复复检检查点缺失",
+                gate="outline_adherence",
+            )
+        if resume.state is not None or progress.state_proposal_id is not None:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复候选阶段无效",
+                gate="state",
+            )
         try:
             _validate_resumed_adherence_projection(
                 resume.adherence,
@@ -3067,37 +3243,77 @@ def _resume_trace(
                 source=source,
             )
         except ChapterCandidatePipelineBlocked as exc:
-            exc.attach_progress(restored.snapshot())
-            raise
+            raise _blocked_resume(
+                restored,
+                str(exc),
+                code=exc.code,
+                gate="outline_adherence",
+            ) from exc
     else:
         if resume.state is None:
-            raise _blocked_resume(restored, "候选管线恢复状态候选缺失")
-        if resume.adherence is None or latest_adherence is None or latest_state is None:
-            raise _blocked_resume(restored, "候选管线恢复状态缺少前置复检")
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复状态候选缺失",
+                gate="state",
+            )
+        if resume.adherence is None or latest_adherence is None:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复状态缺少前置复检",
+                gate="outline_adherence",
+            )
+        if latest_state is None:
+            raise _blocked_resume(
+                restored,
+                "候选管线恢复状态检查点缺失",
+                gate="state",
+            )
         try:
             _validate_resumed_adherence_projection(
                 resume.adherence,
                 checkpoint=latest_adherence,
                 source=source,
             )
+        except ChapterCandidatePipelineBlocked as exc:
+            raise _blocked_resume(
+                restored,
+                str(exc),
+                code=exc.code,
+                gate="outline_adherence",
+            ) from exc
+        try:
             _validate_resumed_state_projection(
                 resume.state,
                 checkpoint=latest_state,
                 source=source,
             )
+        except ChapterCandidatePipelineBlocked as exc:
+            raise _blocked_resume(
+                restored,
+                str(exc),
+                code=exc.code,
+                gate="state",
+            ) from exc
+        try:
             _validate_resumed_state_prerequisite(
                 resume.adherence,
                 source=source,
                 chapter=chapter,
             )
         except ChapterCandidatePipelineBlocked as exc:
-            exc.attach_progress(restored.snapshot())
-            raise
+            raise _blocked_resume(
+                restored,
+                str(exc),
+                code=exc.code,
+                gate="outline_adherence",
+            ) from exc
         if progress.state_proposal_id != latest_state.proposal_id:
             raise _blocked_resume(
                 restored,
                 "恢复检查点与状态候选身份不一致",
+                gate="state",
             )
+        restored.state_proposal_id = latest_state.proposal_id
 
     last_repair_kept_digest = _prose_checkpoint_kept_digest(
         current_prose,
@@ -3169,7 +3385,9 @@ def _validate_resumed_state_prerequisite(
         adherence = reviewed.value
         if not _adherence_matches_source(adherence, source):
             raise ChapterCandidatePipelineBlocked(
-                "章纲符合度没有绑定正文候选"
+                "章纲符合度没有绑定正文候选",
+                code="candidate_adherence_stale",
+                gate="outline_adherence",
             )
         _validate_adherence_gate(
             adherence,
@@ -3178,7 +3396,13 @@ def _validate_resumed_state_prerequisite(
         )
     except ChapterCandidatePipelineBlocked as exc:
         raise ChapterCandidatePipelineBlocked(
-            "候选管线恢复状态的前置复检未通过"
+            "候选管线恢复状态的前置复检未通过",
+            code=(
+                "candidate_adherence_stale"
+                if exc.code == "candidate_adherence_stale"
+                else "candidate_adherence_evidence_invalid"
+            ),
+            gate="outline_adherence",
         ) from exc
 
 
@@ -3540,6 +3764,29 @@ def _authorize_repair_component(
             dropped_reference_count=dropped_reference_count,
             affected_card_ids=affected_card_ids,
         ) from exc
+
+
+def _repair_failure_for_charge(
+    charge: RepairChargeV1,
+) -> RepairFailureEvidenceV1:
+    return RepairFailureEvidenceV1(
+        component=charge.component,
+        component_used=charge.component_attempt,
+        component_limit=charge.authorized_limit,
+        next_step=repair_next_step(charge.component),
+    )
+
+
+def _repair_failure_for_component(
+    policy: ChapterRepairPolicy,
+    component: RepairComponent,
+) -> RepairFailureEvidenceV1:
+    return RepairFailureEvidenceV1(
+        component=component,
+        component_used=policy.used(component),
+        component_limit=policy.limits.limit_for(component),
+        next_step=repair_next_step(component),
+    )
 
 
 def _charge_judge_or_schema_retries(
@@ -3931,6 +4178,7 @@ def _next_repair_cycle(
     limit: int,
     *,
     gate: Literal["completion", "outline_adherence", "state"],
+    repair_failure: RepairFailureEvidenceV1,
     consistency_issue_count: int | None = None,
     dropped_reference_count: int | None = None,
     affected_card_ids: tuple[str, ...] = (),
@@ -3945,6 +4193,10 @@ def _next_repair_cycle(
             }[gate],
             gate=gate,
             repair_limit=limit,
+            repair_component=repair_failure.component,
+            component_used=repair_failure.component_used,
+            component_limit=repair_failure.component_limit,
+            next_step=repair_failure.next_step,
             consistency_issue_count=consistency_issue_count,
             dropped_reference_count=dropped_reference_count,
             affected_card_ids=affected_card_ids,
@@ -3969,10 +4221,16 @@ def _validate_state_shape(
         or state_result.accepted
     ):
         raise ChapterCandidatePipelineBlocked(
-            "状态候选不是未接受的延迟生成结果"
+            "状态候选不是未接受的延迟生成结果",
+            code="candidate_state_evidence_invalid",
+            gate="state",
         )
     if not isinstance(state_result.value, Mapping):
-        raise ChapterCandidatePipelineBlocked("状态候选不是有效映射")
+        raise ChapterCandidatePipelineBlocked(
+            "状态候选不是有效映射",
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        )
     state = dict(state_result.value)
     proposal_id = state.get("proposal_id")
     acceptance_token = state.get("acceptance_token")
@@ -3982,19 +4240,54 @@ def _validate_state_shape(
         or not isinstance(acceptance_token, str)
         or not acceptance_token
     ):
-        raise ChapterCandidatePipelineBlocked("状态候选缺少接受回执")
+        raise ChapterCandidatePipelineBlocked(
+            "状态候选缺少接受回执",
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        )
     raw_issues = state.get("consistency_issues")
     if not isinstance(raw_issues, list) or any(
         not isinstance(item, Mapping) for item in raw_issues
     ):
-        raise ChapterCandidatePipelineBlocked("状态候选冲突证据格式无效")
+        raise ChapterCandidatePipelineBlocked(
+            "状态候选冲突证据格式无效",
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        )
     if len(raw_issues) > MAX_STATE_REPAIR_CARD_IDS:
-        raise ChapterCandidatePipelineBlocked("状态候选冲突数量超过 V1 上限")
+        raise ChapterCandidatePipelineBlocked(
+            "状态候选冲突数量超过 V1 上限",
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        )
     issues = tuple(dict(item) for item in raw_issues)
     raw_fact_evidence = state.get("fact_evidence")
     if not isinstance(raw_fact_evidence, Mapping):
         raise ChapterCandidatePipelineBlocked(
-            "状态候选缺少正式事实核算证据"
+            "状态候选缺少正式事实核算证据",
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        )
+    raw_source_binding = raw_fact_evidence.get("source_binding")
+    if not isinstance(raw_source_binding, Mapping):
+        raise ChapterCandidatePipelineBlocked(
+            "状态事实证据缺少正文来源绑定",
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        )
+    if (
+        raw_source_binding.get("chapter_id") != chapter_id
+        or raw_source_binding.get("source_prose_run_id")
+        != source.source_run_id
+        or raw_source_binding.get("source_prose_run_revision")
+        != source.source_run_revision
+        or raw_source_binding.get("source_content_digest")
+        != source.source_content_digest
+    ):
+        raise ChapterCandidatePipelineBlocked(
+            "状态事实证据没有绑定当前正文候选",
+            code="candidate_state_stale",
+            gate="state",
         )
     try:
         policy_decision = automatic_state_fact_decision(
@@ -4002,7 +4295,11 @@ def _validate_state_shape(
             candidate=state,
         )
     except StateFactAccountingError as exc:
-        raise ChapterCandidatePipelineBlocked(str(exc)) from exc
+        raise ChapterCandidatePipelineBlocked(
+            str(exc),
+            code="candidate_state_evidence_invalid",
+            gate="state",
+        ) from exc
     accounting = dict(policy_decision["fact_accounting"])
     source_binding = accounting.get("source_binding")
     if (
@@ -4016,7 +4313,9 @@ def _validate_state_shape(
         != source.source_content_digest
     ):
         raise ChapterCandidatePipelineBlocked(
-            "状态事实核算没有绑定当前正文候选"
+            "状态事实核算没有绑定当前正文候选",
+            code="candidate_state_stale",
+            gate="state",
         )
     return state, proposal_id, acceptance_token, issues, accounting
 
@@ -4028,6 +4327,10 @@ class ChapterCandidatePipeline:
         if not callable(deps.persist_checkpoint):
             raise ValueError(
                 "candidate checkpoint persistence is required"
+            )
+        if not callable(deps.record_completion_failure):
+            raise ValueError(
+                "candidate completion failure persistence is required"
             )
         self._deps = deps
 
@@ -4059,16 +4362,25 @@ class ChapterCandidatePipeline:
         chapter_id: str,
         source: ProseCandidateSource,
         request: ProseCandidateRepairRequest,
+        repair_failure: RepairFailureEvidenceV1,
         trace: _PipelineTrace,
         repair_policy: ChapterRepairPolicy,
         checkpoint_ledger: list[CandidatePipelineCheckpointV1],
     ) -> tuple[ProseCandidateSource, bool]:
         repair = self._deps.repair_prose_candidate
         if repair is None:
-            raise ChapterCandidatePipelineBlocked("正文候选没有授权修复入口")
+            raise _repair_operation_blocked(
+                "正文候选没有授权修复入口",
+                gate=request.trigger,
+                repair_failure=repair_failure,
+                code="repair_authorization_invalid",
+            )
         if not isinstance(owner_id, str) or not owner_id:
-            raise ChapterCandidatePipelineBlocked(
-                "自动修复缺少 owner-scoped 身份"
+            raise _repair_operation_blocked(
+                "自动修复缺少 owner-scoped 身份",
+                gate=request.trigger,
+                repair_failure=repair_failure,
+                code="repair_authorization_invalid",
             )
         receipt = await repair(
             owner_id,
@@ -4077,7 +4389,12 @@ class ChapterCandidatePipeline:
             request,
         )
         if not isinstance(receipt, ProseCandidateRepairReceipt):
-            raise ChapterCandidatePipelineBlocked("正文修复回执版本无效")
+            raise _repair_operation_blocked(
+                "正文修复回执版本无效",
+                gate=request.trigger,
+                repair_failure=repair_failure,
+                code="repair_evidence_invalid",
+            )
         evidence = trace.record(
             f"prose_repair_{request.cycle}",
             receipt.generation,
@@ -4103,6 +4420,11 @@ class ChapterCandidatePipeline:
             raise ChapterCandidatePipelineBlocked(
                 "正文修复没有产生新候选",
                 code="repair_no_progress",
+                gate=request.trigger,
+                repair_component=repair_failure.component,
+                component_used=repair_failure.component_used,
+                component_limit=repair_failure.component_limit,
+                next_step=repair_failure.next_step,
             )
         same_digest = (
             repaired_source.source_content_digest
@@ -4150,6 +4472,7 @@ class ChapterCandidatePipeline:
             if resume is not None:
                 restored = _resume_trace(
                     resume,
+                    trace=trace,
                     repair_limit=repair_limit,
                     repair_budget_limits=component_limits,
                     tail_judge_retry_usage=tail_judge_retry_usage,
@@ -4210,6 +4533,19 @@ class ChapterCandidatePipeline:
                 checkpoint_ledger=checkpoint_ledger,
             )
         except ChapterCandidatePipelineBlocked as exc:
+            failure_fact = _completion_failure_fact(exc)
+            if failure_fact is not None and trace.source is not None:
+                await self._deps.record_completion_failure(
+                    novel_id,
+                    chapter,
+                    ChapterCandidateCompletionFailureRequest(
+                        source=trace.source,
+                        adherence=trace.adherence,
+                        failure_fact=failure_fact,
+                        state_proposal_id=trace.state_proposal_id,
+                        state_fact_accounting=trace.state_fact_accounting,
+                    ),
+                )
             if not exc.has_progress:
                 exc.attach_progress(trace.snapshot())
             raise
@@ -4279,15 +4615,40 @@ class ChapterCandidatePipeline:
         while True:
             if not _completion_passed(source):
                 if last_repair_kept_digest:
+                    repair_failure = _repair_failure_for_component(
+                        repair_policy,
+                        RepairComponent.SCENE_REGENERATION,
+                    )
                     raise ChapterCandidatePipelineBlocked(
                         "正文摘要未变化且完成闸门复检仍未通过",
                         code="repair_no_progress",
+                        gate="completion",
+                        repair_component=repair_failure.component,
+                        component_used=repair_failure.component_used,
+                        component_limit=repair_failure.component_limit,
+                        next_step=repair_failure.next_step,
                     )
                 if self._deps.repair_prose_candidate is None:
-                    raise ChapterCandidatePipelineBlocked(
-                        "正文候选未通过完成闸门"
+                    repair_failure = _repair_failure_for_component(
+                        repair_policy,
+                        RepairComponent.SCENE_REGENERATION,
                     )
-                _authorize_repair_component(
+                    if (
+                        repair_failure.component_used
+                        < repair_failure.component_limit
+                    ):
+                        raise _repair_operation_blocked(
+                            "正文候选缺少已授权的修复入口",
+                            gate="completion",
+                            repair_failure=repair_failure,
+                            code="repair_authorization_invalid",
+                        )
+                    raise ChapterCandidatePipelineBlocked(
+                        "正文候选未通过完成闸门",
+                        code="candidate_completion_failed",
+                        gate="completion",
+                    )
+                charge = _authorize_repair_component(
                     repair_policy,
                     RepairComponent.SCENE_REGENERATION,
                     trace=trace,
@@ -4297,6 +4658,7 @@ class ChapterCandidatePipeline:
                     trace.repair_cycles_used,
                     repair_limit,
                     gate="completion",
+                    repair_failure=_repair_failure_for_charge(charge),
                 )
                 source, last_repair_kept_digest = (
                     await self._apply_prose_repair(
@@ -4309,6 +4671,7 @@ class ChapterCandidatePipeline:
                             source=source,
                             chapter=chapter,
                         ),
+                        repair_failure=_repair_failure_for_charge(charge),
                         trace=trace,
                         repair_policy=repair_policy,
                         checkpoint_ledger=checkpoint_ledger,
@@ -4338,16 +4701,23 @@ class ChapterCandidatePipeline:
                 review_evidence = None
             if reviewed.stage is not ChapterGenerationStage.OUTLINE_ADHERENCE:
                 raise ChapterCandidatePipelineBlocked(
-                    "章纲符合度返回了错误阶段"
+                    "章纲符合度返回了错误阶段",
+                    code="candidate_adherence_evidence_invalid",
+                    gate="outline_adherence",
                 )
             if not isinstance(reviewed.value, Mapping):
                 raise ChapterCandidatePipelineBlocked(
-                    "章纲符合度不是有效映射"
+                    "章纲符合度不是有效映射",
+                    code="candidate_adherence_evidence_invalid",
+                    gate="outline_adherence",
                 )
             adherence = dict(reviewed.value)
+            trace.adherence = adherence
             if not _adherence_matches_source(adherence, source):
                 raise ChapterCandidatePipelineBlocked(
-                    "章纲符合度没有绑定正文候选"
+                    "章纲符合度没有绑定正文候选",
+                    code="candidate_adherence_stale",
+                    gate="outline_adherence",
                 )
             if review_evidence is not None:
                 await self._persist_checkpoint(_adherence_checkpoint(
@@ -4407,6 +4777,42 @@ class ChapterCandidatePipeline:
                             ),
                         )
             if adherence.get("decision") == "manual_review":
+                outline = chapter.get("outline")
+                if not isinstance(outline, Mapping):
+                    raise ChapterCandidatePipelineBlocked(
+                        "章节缺少有效章纲",
+                        code="candidate_adherence_evidence_invalid",
+                        gate="outline_adherence",
+                    )
+                try:
+                    adherence = revalidate_current_outline_adherence_evidence(
+                        adherence,
+                        outline=outline,
+                        prose=source.text,
+                        source_prose_run_id=source.source_run_id,
+                        source_prose_run_revision=source.source_run_revision,
+                        source_content_digest=source.source_content_digest,
+                    )
+                except OutlineAdherenceValidationError as evidence_error:
+                    raise ChapterCandidatePipelineBlocked(
+                        "章纲符合度语义 unknown 证据无效",
+                        code="candidate_adherence_evidence_invalid",
+                        gate="outline_adherence",
+                    ) from evidence_error
+                trace.adherence = adherence
+                await self._deps.record_completion_failure(
+                    novel_id,
+                    chapter,
+                    ChapterCandidateCompletionFailureRequest(
+                        source=source,
+                        adherence=adherence,
+                        failure_fact=(
+                            failure_fact_from_outline_adherence_decision(
+                                adherence.get("decision")
+                            )
+                        ),
+                    ),
+                )
                 raise ChapterCandidatePipelineBlocked(
                     "章纲符合度存在无法自动裁决的语义 unknown，必须转人工",
                     code="candidate_adherence_manual_review",
@@ -4422,14 +4828,41 @@ class ChapterCandidatePipeline:
                 uses_stable_issue_policy = adherence.get(
                     "evidence_schema_version"
                 ) == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+                component = _content_repair_component(adherence)
                 if last_repair_kept_digest and not uses_stable_issue_policy:
+                    repair_failure = _repair_failure_for_component(
+                        repair_policy,
+                        component,
+                    )
                     raise ChapterCandidatePipelineBlocked(
                         "正文摘要未变化且章纲复检仍未通过",
                         code="repair_no_progress",
+                        gate="outline_adherence",
+                        repair_component=repair_failure.component,
+                        component_used=repair_failure.component_used,
+                        component_limit=repair_failure.component_limit,
+                        next_step=repair_failure.next_step,
                     ) from gate_error
                 if self._deps.repair_prose_candidate is None:
-                    raise
-                component = _content_repair_component(adherence)
+                    repair_failure = _repair_failure_for_component(
+                        repair_policy,
+                        component,
+                    )
+                    if (
+                        repair_failure.component_used
+                        < repair_failure.component_limit
+                    ):
+                        raise _repair_operation_blocked(
+                            "章纲复检缺少已授权的正文修复入口",
+                            gate="outline_adherence",
+                            repair_failure=repair_failure,
+                            code="repair_authorization_invalid",
+                        ) from gate_error
+                    raise ChapterCandidatePipelineBlocked(
+                        str(gate_error),
+                        code="candidate_adherence_failed",
+                        gate="outline_adherence",
+                    ) from gate_error
                 charge = _authorize_repair_component(
                     repair_policy,
                     component,
@@ -4440,6 +4873,7 @@ class ChapterCandidatePipeline:
                     trace.repair_cycles_used,
                     repair_limit,
                     gate="outline_adherence",
+                    repair_failure=_repair_failure_for_charge(charge),
                 )
                 source, last_repair_kept_digest = (
                     await self._apply_prose_repair(
@@ -4453,6 +4887,7 @@ class ChapterCandidatePipeline:
                             adherence=adherence,
                             chapter=chapter,
                         ),
+                        repair_failure=_repair_failure_for_charge(charge),
                         trace=trace,
                         repair_policy=repair_policy,
                         checkpoint_ledger=checkpoint_ledger,
@@ -4506,9 +4941,11 @@ class ChapterCandidatePipeline:
                 and trace.state_proposal_id != proposal_id
             ):
                 raise ChapterCandidatePipelineBlocked(
-                    "恢复检查点与状态候选身份不一致"
+                    "恢复检查点与状态候选身份不一致",
+                    gate="state",
                 )
             trace.state_proposal_id = proposal_id
+            trace.state_fact_accounting = dict(fact_accounting)
             dropped = dict(state_result.dropped or {})
             if state_checkpoint_context is not None:
                 (
@@ -4540,26 +4977,47 @@ class ChapterCandidatePipeline:
             ):
                 break
             if self._deps.repair_state_candidate is None:
-                if fact_accounting.get("unaccounted_canonical_facts"):
+                repair_failure = _repair_failure_for_component(
+                    repair_policy,
+                    RepairComponent.STATE_REEXTRACTION,
+                )
+                if (
+                    repair_failure.component_used
+                    < repair_failure.component_limit
+                ):
+                    raise _repair_operation_blocked(
+                        "状态候选缺少已授权的修复入口",
+                        gate="state",
+                        repair_failure=repair_failure,
+                        code="repair_authorization_invalid",
+                    )
+                if fact_accounting.get("extraction_failure_count"):
+                    message = "状态候选事实抽取仍不确定"
+                    code = "candidate_state_evidence_unknown"
+                elif fact_accounting.get("unaccounted_canonical_facts"):
                     message = "状态候选仍有未核算正式事实"
+                    code = "candidate_state_unaccounted_fact"
                 elif (
                     fact_accounting.get("invalid_internal_references")
                     or fact_accounting.get("dangling_references")
+                    or dropped
                 ):
                     message = "状态候选仍有无效或悬空内部引用"
-                elif fact_accounting.get("extraction_failure_count"):
-                    message = "状态候选事实抽取仍不确定"
+                    code = "candidate_state_invalid_reference"
                 else:
                     message = "状态候选仍有一致性冲突或无效引用"
+                    code = "candidate_state_evidence_unknown"
                 raise ChapterCandidatePipelineBlocked(
-                    message
+                    message,
+                    code=code,
+                    gate="state",
                 )
             state_issue_card_ids = _state_issue_card_ids(
                 consistency_issues,
                 declared_card_ids=_declared_character_card_ids(chapter),
             )
             state_dropped_count = _dropped_reference_count(dropped)
-            _authorize_repair_component(
+            state_charge = _authorize_repair_component(
                 repair_policy,
                 RepairComponent.STATE_REEXTRACTION,
                 trace=trace,
@@ -4568,10 +5026,12 @@ class ChapterCandidatePipeline:
                 dropped_reference_count=state_dropped_count,
                 affected_card_ids=state_issue_card_ids,
             )
+            state_repair_failure = _repair_failure_for_charge(state_charge)
             cycle = _next_repair_cycle(
                 trace.repair_cycles_used,
                 repair_limit,
                 gate="state",
+                repair_failure=state_repair_failure,
                 consistency_issue_count=len(consistency_issues),
                 dropped_reference_count=state_dropped_count,
                 affected_card_ids=state_issue_card_ids,
@@ -4586,8 +5046,11 @@ class ChapterCandidatePipeline:
                 fact_accounting=fact_accounting,
             )
             if not isinstance(owner_id, str) or not owner_id:
-                raise ChapterCandidatePipelineBlocked(
-                    "自动修复缺少 owner-scoped 身份"
+                raise _repair_operation_blocked(
+                    "自动修复缺少 owner-scoped 身份",
+                    gate="state",
+                    repair_failure=state_repair_failure,
+                    code="repair_authorization_invalid",
                 )
             receipt = await self._deps.repair_state_candidate(
                 owner_id,
@@ -4596,7 +5059,12 @@ class ChapterCandidatePipeline:
                 request,
             )
             if not isinstance(receipt, StateCandidateRepairReceipt):
-                raise ChapterCandidatePipelineBlocked("状态修复回执版本无效")
+                raise _repair_operation_blocked(
+                    "状态修复回执版本无效",
+                    gate="state",
+                    repair_failure=state_repair_failure,
+                    code="repair_evidence_invalid",
+                )
             state_result = receipt.generation
             state_evidence = trace.record(
                 f"state_repair_{cycle}",

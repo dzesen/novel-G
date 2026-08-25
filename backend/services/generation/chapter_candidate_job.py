@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from bson import ObjectId
 
@@ -42,6 +42,7 @@ from backend.services.generation.chapter_candidate_pipeline import (
     CandidateAttemptSummary,
     CandidateTruncationSummary,
     CandidateUsageSummary,
+    ChapterCandidateCompletionFailureRequest,
     ChapterCandidatePipeline,
     ChapterCandidatePipelineBlocked,
     ChapterCandidatePipelineDeps,
@@ -52,6 +53,9 @@ from backend.services.generation.chapter_candidate_pipeline import (
     StateCandidateRepairReceipt,
     StateCandidateRepairRequest,
     replay_chapter_repair_evidence,
+)
+from backend.services.generation.chapter_completion_certificate import (
+    ChapterCompletionFailureFact,
 )
 from backend.services.generation.chapter_generation_application import (
     ChapterGenerationResult,
@@ -286,6 +290,17 @@ class CandidateJobExecution:
     recover_source: Callable[..., Awaitable[ProseCandidateSource]]
 
 
+class CandidateCompletionFailurePersistence(Protocol):
+    async def __call__(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter: Mapping[str, Any],
+        failure: ChapterCandidateCompletionFailureRequest,
+    ) -> Any: ...
+
+
 @dataclass(frozen=True)
 class ChapterCandidateJobRunnerDeps:
     get_novel: Callable[[str], Awaitable[Mapping[str, Any]]]
@@ -309,6 +324,7 @@ class ChapterCandidateJobRunnerDeps:
     review_prose_candidate: Callable[..., Awaitable[ChapterGenerationResult]]
     generate_state_candidate: Callable[..., Awaitable[ChapterGenerationResult]]
     recover_state_candidate: Callable[..., Awaitable[Any]]
+    record_completion_failure: CandidateCompletionFailurePersistence
     finalize: Callable[..., Awaitable[Mapping[str, Any]]]
 
 
@@ -916,17 +932,49 @@ class ChapterCandidateJobRunner:
         state_proposal_id = None
         if replay.latest_state is not None:
             state_checkpoint = replay.latest_state
-            recovered = await self._deps.recover_state_candidate(
-                owner_id=owner_id,
-                novel_id=novel_id,
-                chapter_id=chapter_id,
-                proposal_id=state_checkpoint.proposal_id,
-                request_id=state_checkpoint.request_id,
-                source_run_id=source.source_run_id,
-                source_run_revision=source.source_run_revision,
-                source_content_digest=source.source_content_digest,
-            )
-            state = _state_result(recovered)
+            try:
+                recovered = await self._deps.recover_state_candidate(
+                    owner_id=owner_id,
+                    novel_id=novel_id,
+                    chapter_id=chapter_id,
+                    proposal_id=state_checkpoint.proposal_id,
+                    request_id=state_checkpoint.request_id,
+                    source_run_id=source.source_run_id,
+                    source_run_revision=source.source_run_revision,
+                    source_content_digest=source.source_content_digest,
+                )
+                state = _state_result(recovered)
+            except ValueError as exc:
+                try:
+                    await self._deps.record_completion_failure(
+                        owner_id=owner_id,
+                        novel_id=novel_id,
+                        chapter=dict(chapter),
+                        failure=ChapterCandidateCompletionFailureRequest(
+                            source=source,
+                            adherence=(
+                                dict(adherence.value)
+                                if adherence is not None
+                                and isinstance(adherence.value, Mapping)
+                                else None
+                            ),
+                            failure_fact=ChapterCompletionFailureFact(
+                                reason="evidence_invalid",
+                                observed_at="state_proposal",
+                            ),
+                        ),
+                    )
+                except ChapterCandidatePipelineBlocked:
+                    raise
+                except Exception as persistence_error:
+                    raise _FinalizationDependencyError(
+                        "candidate state recovery failure persistence failed"
+                    ) from persistence_error
+                raise ChapterCandidatePipelineBlocked(
+                    "候选作业无法恢复已持久化状态候选",
+                    code="candidate_state_evidence_invalid",
+                    gate="state",
+                ) from exc
             state_proposal_id = state_checkpoint.proposal_id
 
         progress = ChapterCandidatePipelineProgress(
@@ -1419,7 +1467,7 @@ class ChapterCandidateJobRunner:
             target_novel: str,
             target_chapter: dict[str, Any],
             source: ProseCandidateSource,
-            adherence: Mapping[str, Any],
+            adherence: Mapping[str, Any] | None,
             state: Mapping[str, Any],
             cycles: int,
             *,
@@ -1447,10 +1495,30 @@ class ChapterCandidateJobRunner:
                     "candidate finalization dependency failed"
                 ) from exc
 
+        async def record_completion_failure(
+            target_novel: str,
+            target_chapter: dict[str, Any],
+            failure: ChapterCandidateCompletionFailureRequest,
+        ) -> Any:
+            try:
+                return await self._deps.record_completion_failure(
+                    owner_id=owner_id,
+                    novel_id=target_novel,
+                    chapter=target_chapter,
+                    failure=failure,
+                )
+            except ChapterCandidatePipelineBlocked:
+                raise
+            except Exception as exc:
+                raise _FinalizationDependencyError(
+                    "candidate completion failure persistence failed"
+                ) from exc
+
         pipeline = ChapterCandidatePipeline(ChapterCandidatePipelineDeps(
             generate_prose_candidate=generate_prose_step,
             review_prose_candidate=review_prose_step,
             generate_state_candidate=generate_state_step,
+            record_completion_failure=record_completion_failure,
             finalize=finalize,
             persist_checkpoint=persist,
             repair_prose_candidate=guarded_repair_prose,

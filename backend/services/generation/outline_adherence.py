@@ -660,6 +660,94 @@ def assess_outline_adherence_evidence(
         ) from exc
 
 
+def revalidate_current_outline_adherence_evidence(
+    result: Mapping[str, Any],
+    *,
+    outline: Mapping[str, Any],
+    prose: str,
+    source_prose_run_id: str,
+    source_prose_run_revision: int,
+    source_content_digest: str,
+) -> dict[str, Any]:
+    """Rebuild one stored V4 projection from current prose and outline.
+
+    Failure diagnostics may preserve local issue identities and quality debt,
+    but only after reproducing the local projection from the current source.
+    Provider wording is not returned to completion-decision storage.
+    """
+
+    try:
+        parsed = ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+            result
+        )
+    except ValidationError as exc:
+        raise OutlineAdherenceValidationError(
+            "V4 本地符合度证据结构无效"
+        ) from exc
+    validated = parsed.model_dump(mode="python")
+
+    def provider_span(value: Mapping[str, Any]) -> dict[str, Any]:
+        _validate_span(value, prose=prose)
+        start = value["start"]
+        end = value["end"]
+        return {
+            "start": start,
+            "end": end,
+            "quote": prose[start:end],
+        }
+
+    def provider_item(
+        value: Mapping[str, Any],
+        *,
+        span_field: str,
+    ) -> dict[str, Any]:
+        projected = dict(value)
+        projected[span_field] = [
+            provider_span(span)
+            for span in list(projected.get(span_field) or [])
+        ]
+        return projected
+
+    provider_evidence = {
+        "schema_version": validated["evidence_schema_version"],
+        "outline_contract_version": validated["outline_contract_version"],
+        "summary": validated["summary"],
+        "beat_evidence": [
+            provider_item(item, span_field="spans")
+            for item in validated["beat_evidence"]
+        ],
+        "findings": [
+            provider_item(item, span_field="spans")
+            for item in validated["findings"]
+        ],
+        "quality_dimensions": [
+            provider_item(item, span_field="spans")
+            for item in validated["quality_dimensions"]
+        ],
+        "unknowns": [
+            provider_item(item, span_field="spans")
+            for item in validated["unknowns"]
+        ],
+        "scene_quality_profiles": [
+            provider_item(item, span_field="representative_spans")
+            for item in validated["scene_quality_profiles"]
+        ],
+    }
+    rebuilt = assess_outline_adherence_evidence(
+        provider_evidence,
+        outline=outline,
+        prose=prose,
+        source_prose_run_id=source_prose_run_id,
+        source_prose_run_revision=source_prose_run_revision,
+        source_content_digest=source_content_digest,
+    )
+    if rebuilt != validated:
+        raise OutlineAdherenceValidationError(
+            "V4 本地符合度证据没有绑定当前正文与章纲"
+        )
+    return rebuilt
+
+
 def validate_beat_evidence(
     result: Mapping[str, Any],
     *,

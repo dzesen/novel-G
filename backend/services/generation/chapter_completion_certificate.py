@@ -21,8 +21,18 @@ from pydantic import (
     model_validator,
 )
 
+from backend.services.generation.chapter_repair_policy import (
+    RepairFailureEvidenceV1,
+)
+
 
 CHAPTER_COMPLETION_DECISION_SCHEMA = "chapter_completion_decision.v2"
+CHAPTER_COMPLETION_FAILURE_FACT_SCHEMA = (
+    "chapter_completion_failure_fact.v1"
+)
+CHAPTER_COMPLETION_FAILURE_EVIDENCE_SCHEMA = (
+    "chapter_completion_failure_evidence.v1"
+)
 CHAPTER_COMPLETION_CERTIFICATE_SCHEMA = "chapter_completion_certificate.v2"
 CHAPTER_COMPLETION_VERIFICATION_SCHEMA = (
     "chapter_completion_certificate_verification.v2"
@@ -49,6 +59,33 @@ FailureClass = Literal[
     "repair_budget_exhausted",
     "authorization_stale",
     "uncertain_paid_attempt",
+    "publication_conflict",
+    "legacy_completion_unproven",
+]
+FailureAssessmentStage = Literal[
+    "authorization",
+    "chapter_binding",
+    "outline_adherence",
+    "state_proposal",
+    "state_mutation",
+    "completion_gates",
+    "policy_assessment",
+    "publication_prepare",
+    "publication_revalidation",
+    "publication_commit",
+]
+FailureFactReason = Literal[
+    "prose_incomplete",
+    "source_binding_stale",
+    "evidence_invalid",
+    "semantic_unknown",
+    "scene_contract_unsatisfied",
+    "canonical_fact_unaccounted",
+    "internal_reference_invalid",
+    "repair_not_converged",
+    "repair_authority_exhausted",
+    "authorization_binding_stale",
+    "paid_attempt_unresolved",
     "publication_conflict",
     "legacy_completion_unproven",
 ]
@@ -128,6 +165,83 @@ def _ensure_aware(value: datetime, *, field: str) -> datetime:
 
 class _ClosedCompletionModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+_FAILURE_FACT_CLASS: dict[FailureFactReason, FailureClass] = {
+    "prose_incomplete": "incomplete_prose",
+    "source_binding_stale": "stale_source",
+    "evidence_invalid": "invalid_or_unknown_evidence",
+    "semantic_unknown": "semantic_unknown",
+    "scene_contract_unsatisfied": "scene_contract_violation",
+    "canonical_fact_unaccounted": "unaccounted_canonical_fact",
+    "internal_reference_invalid": "invalid_internal_reference",
+    "repair_not_converged": "repair_not_converged",
+    "repair_authority_exhausted": "repair_budget_exhausted",
+    "authorization_binding_stale": "authorization_stale",
+    "paid_attempt_unresolved": "uncertain_paid_attempt",
+    "publication_conflict": "publication_conflict",
+    "legacy_completion_unproven": "legacy_completion_unproven",
+}
+_REPAIR_FAILURE_REASONS = frozenset({
+    "repair_not_converged",
+    "repair_authority_exhausted",
+})
+_OPTIONAL_REPAIR_CONTEXT_REASONS = frozenset({
+    "evidence_invalid",
+    "authorization_binding_stale",
+})
+
+
+class ChapterCompletionFailureFact(_ClosedCompletionModel):
+    """One closed local fact; policy, not the caller, classifies its result."""
+
+    schema_version: Literal["chapter_completion_failure_fact.v1"] = (
+        "chapter_completion_failure_fact.v1"
+    )
+    reason: FailureFactReason
+    observed_at: FailureAssessmentStage
+    repair_failure: RepairFailureEvidenceV1 | None = None
+
+    @model_validator(mode="after")
+    def validate_repair_binding(self) -> "ChapterCompletionFailureFact":
+        requires_repair = self.reason in _REPAIR_FAILURE_REASONS
+        has_repair = self.repair_failure is not None
+        if requires_repair and not has_repair:
+            raise ValueError("repair failure fact binding is incomplete")
+        if (
+            has_repair
+            and not requires_repair
+            and self.reason not in _OPTIONAL_REPAIR_CONTEXT_REASONS
+        ):
+            raise ValueError("repair failure fact binding is incomplete")
+        return self
+
+
+def classify_chapter_completion_failure(
+    fact: ChapterCompletionFailureFact | Mapping[str, Any],
+) -> tuple[FailureClass, FailureAssessmentStage]:
+    parsed = (
+        fact
+        if isinstance(fact, ChapterCompletionFailureFact)
+        else ChapterCompletionFailureFact.model_validate(fact)
+    )
+    return _FAILURE_FACT_CLASS[parsed.reason], parsed.observed_at
+
+
+def failure_fact_from_outline_adherence_decision(
+    decision: Any,
+) -> ChapterCompletionFailureFact:
+    reason: FailureFactReason = (
+        "semantic_unknown"
+        if decision == "manual_review"
+        else "scene_contract_unsatisfied"
+        if decision == "repair"
+        else "evidence_invalid"
+    )
+    return ChapterCompletionFailureFact(
+        reason=reason,
+        observed_at="outline_adherence",
+    )
 
 
 class ChapterBinding(_ClosedCompletionModel):
@@ -253,6 +367,54 @@ class ChapterCompletionEvidenceBundle(_ClosedCompletionModel):
             raise ValueError("repair convergence requires a repair trace")
         if self.quality_debt_status != "evaluated" and self.quality_debt_count:
             raise ValueError("unevaluated quality debt count must be zero")
+        return self
+
+
+class ChapterCompletionFailureEvidenceBundle(_ClosedCompletionModel):
+    """Closed evidence available when evaluation stops before certification.
+
+    A state proposal is deliberately absent here.  Preflight and publication
+    failures must still produce a canonical decision without inventing an
+    internal ObjectId or pretending that later evidence was collected.
+    """
+
+    schema_version: Literal["chapter_completion_failure_evidence.v1"]
+    assessment_stage: FailureAssessmentStage
+    provider_attempt_ledger_digest: Digest
+    available_evidence_digest: Digest
+    blocking_issue_signatures: tuple[str, ...] = Field(
+        min_length=1,
+        max_length=200,
+    )
+    failure_classes: tuple[FailureClass, ...] = Field(
+        min_length=1,
+        max_length=13,
+    )
+    quality_debt_status: QualityDebtStatus
+    quality_debt_sidecar_digest: Digest
+
+    @field_validator(
+        "blocking_issue_signatures",
+        "failure_classes",
+        mode="before",
+    )
+    @classmethod
+    def tupleize_arrays(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_closed_failure(self) -> "ChapterCompletionFailureEvidenceBundle":
+        if any(
+            not item or len(item) > 256
+            for item in self.blocking_issue_signatures
+        ):
+            raise ValueError("blocking issue signature is invalid")
+        if len(set(self.blocking_issue_signatures)) != len(
+            self.blocking_issue_signatures
+        ):
+            raise ValueError("blocking issue signatures must be unique")
+        if len(set(self.failure_classes)) != len(self.failure_classes):
+            raise ValueError("failure classes must be unique")
         return self
 
 
@@ -518,14 +680,23 @@ class ChapterCompletionPolicy:
 
     @staticmethod
     def _parse_evidence(
-        value: ChapterCompletionEvidenceBundle | Mapping[str, Any],
-    ) -> ChapterCompletionEvidenceBundle:
+        value: (
+            ChapterCompletionEvidenceBundle
+            | ChapterCompletionFailureEvidenceBundle
+            | Mapping[str, Any]
+        ),
+    ) -> ChapterCompletionEvidenceBundle | ChapterCompletionFailureEvidenceBundle:
         try:
-            return (
-                value
-                if isinstance(value, ChapterCompletionEvidenceBundle)
-                else ChapterCompletionEvidenceBundle.model_validate(value)
-            )
+            if isinstance(
+                value,
+                (ChapterCompletionEvidenceBundle, ChapterCompletionFailureEvidenceBundle),
+            ):
+                return value
+            if value.get("schema_version") == (
+                CHAPTER_COMPLETION_FAILURE_EVIDENCE_SCHEMA
+            ):
+                return ChapterCompletionFailureEvidenceBundle.model_validate(value)
+            return ChapterCompletionEvidenceBundle.model_validate(value)
         except ValidationError as exc:
             raise ChapterCompletionPolicyError(
                 "chapter completion evidence schema is invalid"
@@ -534,7 +705,11 @@ class ChapterCompletionPolicy:
     def assess(
         self,
         candidate_snapshot: ChapterCompletionCandidateSnapshot | Mapping[str, Any],
-        evidence_bundle: ChapterCompletionEvidenceBundle | Mapping[str, Any],
+        evidence_bundle: (
+            ChapterCompletionEvidenceBundle
+            | ChapterCompletionFailureEvidenceBundle
+            | Mapping[str, Any]
+        ),
         policy_revision: str,
     ) -> ChapterCompletionDecision:
         if policy_revision != CHAPTER_COMPLETION_POLICY_REVISION:
@@ -544,14 +719,15 @@ class ChapterCompletionPolicy:
         candidate = self._parse_candidate(candidate_snapshot)
         evidence = self._parse_evidence(evidence_bundle)
         failures = set(evidence.failure_classes)
-        if not evidence.prose_integrity_passed:
-            failures.add("incomplete_prose")
-        if not evidence.scene_contract_passed:
-            failures.add("scene_contract_violation")
-        if not evidence.state_fact_accounting_passed:
-            failures.add("unaccounted_canonical_fact")
-        if evidence.repair_convergence == "failed":
-            failures.add("repair_not_converged")
+        if isinstance(evidence, ChapterCompletionEvidenceBundle):
+            if not evidence.prose_integrity_passed:
+                failures.add("incomplete_prose")
+            if not evidence.scene_contract_passed:
+                failures.add("scene_contract_violation")
+            if not evidence.state_fact_accounting_passed:
+                failures.add("unaccounted_canonical_fact")
+            if evidence.repair_convergence == "failed":
+                failures.add("repair_not_converged")
         ordered_failures = tuple(
             failure for failure in _FAILURE_CLASS_ORDER if failure in failures
         )
@@ -588,11 +764,12 @@ class ChapterCompletionPolicy:
             decision_digest=decision_digest,
             evaluated_at=candidate.evaluated_at,
         )
-        self._issuance_context[decision.decision_id] = (
-            candidate,
-            evidence,
-            decision,
-        )
+        if isinstance(evidence, ChapterCompletionEvidenceBundle):
+            self._issuance_context[decision.decision_id] = (
+                candidate,
+                evidence,
+                decision,
+            )
         return decision
 
     def issue(

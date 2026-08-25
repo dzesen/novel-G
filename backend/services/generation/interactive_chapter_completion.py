@@ -40,7 +40,9 @@ from backend.services.generation.chapter_candidate_authorization import (
     generation_plan_from_candidate_snapshot,
 )
 from backend.services.generation.chapter_completion_certificate import (
+    ChapterCompletionFailureFact,
     canonical_completion_digest,
+    failure_fact_from_outline_adherence_decision,
 )
 from backend.services.generation.chapter_finalization import (
     ChapterFinalizationAuthorization,
@@ -64,6 +66,8 @@ from backend.services.generation.chapter_generation_application import (
     StateGenerationCommand,
 )
 from backend.services.generation.outline_adherence import (
+    OutlineAdherenceValidationError,
+    revalidate_current_outline_adherence_evidence,
     validate_complete_outline_adherence,
 )
 from backend.services.generation.prose_runs import prose_revision, prose_run_module
@@ -848,11 +852,20 @@ class InteractiveChapterCompletionService:
                     code="interactive_authorization_conflict",
                 )
             if job.get("status") != INTERACTIVE_COMPLETION_UNCERTAIN:
-                await self._update_job(readiness.authorization_id, {
-                    "status": INTERACTIVE_COMPLETION_UNCERTAIN,
-                    "pause_reason": "uncertain_provider_attempt",
-                    "updated_at": get_utc_now(),
-                })
+                await self._update_job(
+                    readiness.authorization_id,
+                    {
+                        "status": INTERACTIVE_COMPLETION_UNCERTAIN,
+                        "pause_reason": "uncertain_provider_attempt",
+                        "updated_at": get_utc_now(),
+                    },
+                    expected={
+                        "status": job.get("status"),
+                        "interactive_execution_claim": deepcopy(
+                            job.get("interactive_execution_claim")
+                        ),
+                    },
+                )
             raise InteractiveCompletionBlocked(
                 "interactive completion has an uncertain paid attempt",
                 code="interactive_uncertain_attempt",
@@ -922,6 +935,55 @@ class InteractiveChapterCompletionService:
             "status": INTERACTIVE_COMPLETION_RUNNING,
             "interactive_execution_claim.token": token,
         }
+
+    @staticmethod
+    def _finalization_authorization(
+        readiness: InteractiveChapterCompletionReadiness,
+        execution: InteractiveCompletionExecutionClaim,
+    ) -> ChapterFinalizationAuthorization:
+        return ChapterFinalizationAuthorization(
+            kind="interactive_completion_readiness",
+            authorization_id=readiness.authorization_id,
+            job_id=readiness.authorization_id,
+            readiness_digest=readiness.digest,
+            authorization_revision=readiness.authorization_revision,
+            execution_claim_token=execution.token,
+        )
+
+    async def _record_failure_and_pause(
+        self,
+        *,
+        readiness: InteractiveChapterCompletionReadiness,
+        execution: InteractiveCompletionExecutionClaim,
+        source: InteractiveCompletionSourceBinding,
+        adherence: Mapping[str, Any] | None,
+        failure_fact: ChapterCompletionFailureFact,
+        pause_reason: str,
+        state_proposal_id: str | None = None,
+    ) -> None:
+        await self._deps.finalizer.record_failure(
+            owner_id=source.owner_id,
+            chapter_id=source.chapter_id,
+            prose_run_id=source.prose_run_id,
+            prose_run_revision=source.prose_run_revision,
+            authorization=self._finalization_authorization(
+                readiness,
+                execution,
+            ),
+            adherence=(dict(adherence) if isinstance(adherence, Mapping) else None),
+            failure_fact=failure_fact,
+            state_proposal_id=state_proposal_id,
+        )
+        await self._update_job(
+            readiness.authorization_id,
+            {
+                "status": INTERACTIVE_COMPLETION_MANUAL_REVIEW,
+                "pause_reason": pause_reason,
+                "interactive_execution_claim": None,
+                "updated_at": get_utc_now(),
+            },
+            expected=self._execution_expected(execution.token),
+        )
 
     async def _claim_execution(
         self,
@@ -1128,15 +1190,34 @@ class InteractiveChapterCompletionService:
                 prose=str(candidate["text"]),
             )
         except ValueError as exc:
-            await self._update_job(
-                readiness.authorization_id,
-                {
-                    "status": INTERACTIVE_COMPLETION_MANUAL_REVIEW,
-                    "pause_reason": "outline_adherence_manual_review",
-                    "interactive_execution_claim": None,
-                    "updated_at": get_utc_now(),
-                },
-                expected=self._execution_expected(execution.token),
+            try:
+                validated_failure_adherence = (
+                    revalidate_current_outline_adherence_evidence(
+                        adherence,
+                        outline=dict(chapter["outline"]),
+                        prose=str(candidate["text"]),
+                        source_prose_run_id=run_id,
+                        source_prose_run_revision=run_revision,
+                        source_content_digest=source.content_digest,
+                    )
+                )
+            except OutlineAdherenceValidationError:
+                validated_failure_adherence = None
+                failure_fact = ChapterCompletionFailureFact(
+                    reason="evidence_invalid",
+                    observed_at="outline_adherence",
+                )
+            else:
+                failure_fact = failure_fact_from_outline_adherence_decision(
+                    validated_failure_adherence.get("decision")
+                )
+            await self._record_failure_and_pause(
+                readiness=readiness,
+                execution=execution,
+                source=source,
+                adherence=validated_failure_adherence,
+                failure_fact=failure_fact,
+                pause_reason="outline_adherence_manual_review",
             )
             raise InteractiveCompletionBlocked(
                 str(exc),
@@ -1145,20 +1226,52 @@ class InteractiveChapterCompletionService:
 
         state_checkpoint = evidence.get("state_proposal")
         state: Mapping[str, Any] | None = None
-        if isinstance(state_checkpoint, Mapping):
-            recovered = await self._deps.recover_state_candidate(
-                owner_id=source.owner_id,
-                novel_id=novel_id,
-                chapter_id=chapter_id,
-                proposal_id=str(state_checkpoint.get("proposal_id") or ""),
-                request_id=str(state_checkpoint.get("request_id") or ""),
-                source_run_id=run_id,
-                source_run_revision=run_revision,
-                source_content_digest=source.content_digest,
+        recovery_error: TypeError | ValueError | None = None
+        if state_checkpoint is not None:
+            if not isinstance(state_checkpoint, Mapping):
+                recovery_error = ValueError(
+                    "interactive state checkpoint is invalid"
+                )
+            else:
+                try:
+                    recovered = await self._deps.recover_state_candidate(
+                        owner_id=source.owner_id,
+                        novel_id=novel_id,
+                        chapter_id=chapter_id,
+                        proposal_id=str(
+                            state_checkpoint.get("proposal_id") or ""
+                        ),
+                        request_id=str(
+                            state_checkpoint.get("request_id") or ""
+                        ),
+                        source_run_id=run_id,
+                        source_run_revision=run_revision,
+                        source_content_digest=source.content_digest,
+                    )
+                    raw_value = getattr(recovered, "value", recovered)
+                    if not isinstance(raw_value, Mapping):
+                        raise ValueError(
+                            "interactive recovered state candidate is invalid"
+                        )
+                    state = dict(raw_value)
+                except (TypeError, ValueError) as exc:
+                    recovery_error = exc
+        if recovery_error is not None:
+            await self._record_failure_and_pause(
+                readiness=readiness,
+                execution=execution,
+                source=source,
+                adherence=adherence,
+                failure_fact=ChapterCompletionFailureFact(
+                    reason="evidence_invalid",
+                    observed_at="state_proposal",
+                ),
+                pause_reason="state_proposal_recovery_invalid",
             )
-            raw_value = getattr(recovered, "value", recovered)
-            if isinstance(raw_value, Mapping):
-                state = dict(raw_value)
+            raise InteractiveCompletionBlocked(
+                "interactive state proposal recovery is invalid",
+                code="interactive_state_invalid",
+            ) from recovery_error
         if state is None:
             request_id = (
                 f"interactive-{readiness.authorization_id[:16]}-"
@@ -1198,6 +1311,17 @@ class InteractiveChapterCompletionService:
             if not isinstance(proposal_id, str) or not ObjectId.is_valid(
                 proposal_id
             ):
+                await self._record_failure_and_pause(
+                    readiness=readiness,
+                    execution=execution,
+                    source=source,
+                    adherence=adherence,
+                    failure_fact=ChapterCompletionFailureFact(
+                        reason="evidence_invalid",
+                        observed_at="state_proposal",
+                    ),
+                    pause_reason="state_proposal_invalid",
+                )
                 raise InteractiveCompletionBlocked(
                     "interactive state proposal identity is invalid",
                     code="interactive_state_invalid",
@@ -1223,6 +1347,23 @@ class InteractiveChapterCompletionService:
         if not isinstance(proposal_id, str) or not isinstance(
             acceptance_token, str
         ):
+            safe_proposal_id = (
+                proposal_id
+                if isinstance(proposal_id, str) and ObjectId.is_valid(proposal_id)
+                else None
+            )
+            await self._record_failure_and_pause(
+                readiness=readiness,
+                execution=execution,
+                source=source,
+                adherence=adherence,
+                failure_fact=ChapterCompletionFailureFact(
+                    reason="evidence_invalid",
+                    observed_at="state_proposal",
+                ),
+                pause_reason="state_proposal_receipt_invalid",
+                state_proposal_id=safe_proposal_id,
+            )
             raise InteractiveCompletionBlocked(
                 "interactive state proposal receipt is invalid",
                 code="interactive_state_invalid",
@@ -1235,13 +1376,9 @@ class InteractiveChapterCompletionService:
                 prose_run_revision=run_revision,
                 state_proposal_id=proposal_id,
                 state_acceptance_token=acceptance_token,
-                authorization=ChapterFinalizationAuthorization(
-                    kind="interactive_completion_readiness",
-                    authorization_id=readiness.authorization_id,
-                    job_id=readiness.authorization_id,
-                    readiness_digest=readiness.digest,
-                    authorization_revision=readiness.authorization_revision,
-                    execution_claim_token=execution.token,
+                authorization=self._finalization_authorization(
+                    readiness,
+                    execution,
                 ),
                 evidence=ChapterFinalizationEvidence(
                     outline_adherence=dict(adherence),

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 from uuid import uuid4
@@ -89,6 +91,89 @@ _LEASED_RUNTIME_PATCH_FIELDS = frozenset({
     "status",
 })
 _MAX_NARRATIVE_REVISION = 2**63 - 1
+
+
+@dataclass(frozen=True)
+class ChapterCompletionDecisionFence:
+    """Exact authority/ledger snapshot for one completion-decision append."""
+
+    novel_id: Any
+    owner_id: Any
+    scope: Any
+    job_kind: Any
+    status: Any
+    current_chapter_id: Any
+    readiness_digest: Any
+    finalization_authorization: Any
+    authorization_revision: Any
+    execution_epoch: Any
+    has_uncertain_attempts: Any
+    attempt_slots: Any
+    interactive_execution_claim: Any
+
+    @classmethod
+    def capture(
+        cls,
+        job: Mapping[str, Any],
+    ) -> "ChapterCompletionDecisionFence":
+        readiness = job.get("readiness")
+        planning = (
+            readiness.get("planning")
+            if isinstance(readiness, Mapping)
+            else None
+        )
+        return cls(
+            novel_id=deepcopy(job.get("novel_id")),
+            owner_id=deepcopy(job.get("owner_id")),
+            scope=deepcopy(job.get("scope")),
+            job_kind=deepcopy(job.get("job_kind")),
+            status=deepcopy(job.get("status")),
+            current_chapter_id=deepcopy(job.get("current_chapter_id")),
+            readiness_digest=deepcopy(
+                readiness.get("digest")
+                if isinstance(readiness, Mapping)
+                else None
+            ),
+            finalization_authorization=deepcopy(
+                planning.get("chapter_finalization_authorization")
+                if isinstance(planning, Mapping)
+                else None
+            ),
+            authorization_revision=deepcopy(
+                job.get("authorization_revision")
+            ),
+            execution_epoch=deepcopy(job.get("execution_epoch")),
+            has_uncertain_attempts=deepcopy(
+                job.get("has_uncertain_attempts")
+            ),
+            attempt_slots=deepcopy(job.get("attempt_slots")),
+            interactive_execution_claim=deepcopy(
+                job.get("interactive_execution_claim")
+            ),
+        )
+
+    def query(self) -> dict[str, Any]:
+        return {
+            "novel_id": deepcopy(self.novel_id),
+            "owner_id": deepcopy(self.owner_id),
+            "scope": deepcopy(self.scope),
+            "job_kind": deepcopy(self.job_kind),
+            "status": deepcopy(self.status),
+            "current_chapter_id": deepcopy(self.current_chapter_id),
+            "readiness.digest": deepcopy(self.readiness_digest),
+            "readiness.planning.chapter_finalization_authorization": (
+                deepcopy(self.finalization_authorization)
+            ),
+            "authorization_revision": deepcopy(self.authorization_revision),
+            "execution_epoch": deepcopy(self.execution_epoch),
+            "has_uncertain_attempts": deepcopy(
+                self.has_uncertain_attempts
+            ),
+            "attempt_slots": deepcopy(self.attempt_slots),
+            "interactive_execution_claim": deepcopy(
+                self.interactive_execution_claim
+            ),
+        }
 
 
 def _reject_atomic_field_updates(fields: Dict[str, Any]) -> None:
@@ -3525,6 +3610,7 @@ class GenerationJobRepository:
         prose_run_id: str,
         prose_run_revision: int,
         decision: Mapping[str, Any],
+        fence: ChapterCompletionDecisionFence,
     ) -> bool:
         """Append one bounded, canonical completion decision exactly once."""
 
@@ -3533,7 +3619,8 @@ class GenerationJobRepository:
         )
 
         if (
-            not ObjectId.is_valid(str(chapter_id))
+            not isinstance(fence, ChapterCompletionDecisionFence)
+            or not ObjectId.is_valid(str(chapter_id))
             or not ObjectId.is_valid(str(prose_run_id))
             or type(prose_run_revision) is not int
             or prose_run_revision < 1
@@ -3552,6 +3639,7 @@ class GenerationJobRepository:
             {
                 "_id": to_object_id(job_id),
                 "is_deleted": False,
+                **fence.query(),
                 "chapter_completion_decisions.decision.decision_id": {
                     "$ne": parsed.decision_id
                 },
