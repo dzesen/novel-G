@@ -31,6 +31,7 @@ from backend.services.generation.prose_continuation import (
 )
 from backend.services.generation.prose_protocol import (
     AUTOMATIC_PROSE_SEQUENCE_FLOOR,
+    CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
     scene_continuation_seam_window_characters,
 )
 from backend.services.generation.prose_token_bounds import v3_output_token_bound
@@ -84,6 +85,108 @@ class _SceneReplayMeasurement:
     raw_word_count: int
     effective_word_count: int
     replayed_characters_total: int
+
+
+@dataclass(frozen=True)
+class _SceneWordBudgetTrim:
+    text: str
+    original_word_count: int
+    discarded_word_count: int = 0
+    boundary: str | None = None
+
+    @property
+    def trimmed(self) -> bool:
+        return self.discarded_word_count > 0
+
+
+_SCENE_SENTENCE_END_CHARACTERS = frozenset("。！？!?…")
+_SCENE_SENTENCE_CLOSING_CHARACTERS = frozenset(
+    "”’」』】）》)]} \t\r\n"
+)
+_SCENE_WORD_BUDGET_TERMINALS = frozenset({
+    "scene_word_budget_exceeded",
+    "scene_word_budget_exhausted",
+    "scene_word_budget_trimmed_without_sentence_boundary",
+})
+
+
+def _longest_prefix_with_word_limit(text: str, maximum_words: int) -> str:
+    """Return the longest source prefix whose Novel-G word count fits."""
+
+    source = str(text or "")
+    limit = max(0, int(maximum_words))
+    low = 0
+    high = len(source)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_chapter_words(source[:middle]) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return source[:low].rstrip()
+
+
+def _trim_scene_contribution_to_word_budget(
+    *,
+    current_text: str,
+    contribution: str,
+    maximum_words: int | None,
+    enabled: bool,
+) -> _SceneWordBudgetTrim:
+    """Converge one Provider contribution without inventing prose."""
+
+    source = str(contribution or "").strip()
+    original_word_count = count_chapter_words(source)
+    if not enabled or maximum_words is None:
+        return _SceneWordBudgetTrim(
+            text=source,
+            original_word_count=original_word_count,
+        )
+    current_word_count = count_chapter_words(current_text)
+    remaining_words = max(0, int(maximum_words) - current_word_count)
+    if original_word_count <= remaining_words:
+        return _SceneWordBudgetTrim(
+            text=source,
+            original_word_count=original_word_count,
+        )
+
+    hard_prefix = _longest_prefix_with_word_limit(source, remaining_words)
+    sentence_end = max(
+        (
+            hard_prefix.rfind(character) + 1
+            for character in _SCENE_SENTENCE_END_CHARACTERS
+        ),
+        default=0,
+    )
+    if sentence_end > 0:
+        while (
+            sentence_end < len(hard_prefix)
+            and hard_prefix[sentence_end] in _SCENE_SENTENCE_CLOSING_CHARACTERS
+        ):
+            sentence_end += 1
+        retained = hard_prefix[:sentence_end].rstrip()
+        boundary = "sentence"
+    else:
+        retained = hard_prefix
+        boundary = "word"
+    retained_word_count = count_chapter_words(retained)
+    return _SceneWordBudgetTrim(
+        text=retained,
+        original_word_count=original_word_count,
+        discarded_word_count=max(0, original_word_count - retained_word_count),
+        boundary=boundary,
+    )
+
+
+def _word_budget_trim_fields(trim: _SceneWordBudgetTrim) -> dict[str, Any]:
+    if not trim.trimmed:
+        return {}
+    return {
+        "word_budget_trimmed": True,
+        "word_budget_original_words": trim.original_word_count,
+        "word_budget_discarded_words": trim.discarded_word_count,
+        "word_budget_trim_boundary": trim.boundary,
+    }
 
 
 def _scene_target_words(plan: ProseExecutionPlan, scene_index: int) -> int:
@@ -566,6 +669,17 @@ def _scene_progress_snapshot(
         ),
         default=0,
     )
+    state["word_budget_trimmed_segments"] = sum(
+        bool(segment.get("word_budget_trimmed")) for segment in scene_segments
+    )
+    state["word_budget_discarded_words"] = sum(
+        max(0, int(segment.get("word_budget_discarded_words") or 0))
+        for segment in scene_segments
+    )
+    state["word_budget_word_boundary_fallbacks"] = sum(
+        str(segment.get("word_budget_trim_boundary") or "") == "word"
+        for segment in scene_segments
+    )
     if scene_segments:
         latest = scene_segments[-1]
         state["last_prompt_mode"] = str(latest.get("prompt_mode") or "base")
@@ -594,7 +708,13 @@ def _scene_progress_snapshot(
         state.setdefault("last_raw_finish_reason", "unreported")
 
     maximum_words = _scene_maximum_words(plan, scene_index)
-    if (
+    latest_error_code = str(
+        (scene_segments[-1] if scene_segments else {}).get("error_code") or ""
+    )
+    if latest_error_code == "scene_word_budget_trimmed_without_sentence_boundary":
+        state["status"] = "paused"
+        state["pause_reason"] = latest_error_code
+    elif (
         maximum_words is not None
         and replay_measurement.raw_word_count > maximum_words
     ):
@@ -610,6 +730,14 @@ def _scene_progress_snapshot(
     ):
         state["status"] = "complete"
         state["pause_reason"] = None
+    elif (
+        plan.protocol_revision == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+        and maximum_words is not None
+        and scene_segments
+        and replay_measurement.raw_word_count >= maximum_words
+    ):
+        state["status"] = "paused"
+        state["pause_reason"] = "scene_word_budget_exhausted"
     elif state.get("status") != "paused":
         state["status"] = "incomplete" if scene_segments else "pending"
         state.setdefault("pause_reason", None)
@@ -1033,6 +1161,16 @@ async def execute_v3_prose_plan(
         except asyncio.CancelledError:
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
+            trim = _trim_scene_contribution_to_word_budget(
+                current_text=current_text,
+                contribution=contribution,
+                maximum_words=_scene_maximum_words(plan, scene_index),
+                enabled=(
+                    plan.protocol_revision
+                    == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+                ),
+            )
+            contribution = trim.text
             cross_call_repeat_characters = (
                 _longest_exact_common_substring_characters(current_text, contribution)
             )
@@ -1053,6 +1191,7 @@ async def execute_v3_prose_plan(
                 "usage": observed_usage.model_dump(),
                 "empty_output": not bool(generated),
                 "no_progress": bool(generated) and not bool(contribution),
+                **_word_budget_trim_fields(trim),
             }
             by_sequence[sequence] = terminal
             refresh_scene(scene_index)
@@ -1070,6 +1209,16 @@ async def execute_v3_prose_plan(
             assert boundary_code is not None
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
+            trim = _trim_scene_contribution_to_word_budget(
+                current_text=current_text,
+                contribution=contribution,
+                maximum_words=_scene_maximum_words(plan, scene_index),
+                enabled=(
+                    plan.protocol_revision
+                    == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+                ),
+            )
+            contribution = trim.text
             cross_call_repeat_characters = (
                 _longest_exact_common_substring_characters(current_text, contribution)
             )
@@ -1087,6 +1236,7 @@ async def execute_v3_prose_plan(
                 "usage": TokenUsage().model_dump(),
                 "empty_output": not bool(generated),
                 "no_progress": bool(generated) and not bool(contribution),
+                **_word_budget_trim_fields(trim),
             }
             by_sequence[sequence] = terminal
             state = refresh_scene(scene_index)
@@ -1098,6 +1248,16 @@ async def execute_v3_prose_plan(
         except Exception:
             generated = "".join(chunks).strip()
             contribution = _deduplicate_exact_seam(current_text, generated).strip()
+            trim = _trim_scene_contribution_to_word_budget(
+                current_text=current_text,
+                contribution=contribution,
+                maximum_words=_scene_maximum_words(plan, scene_index),
+                enabled=(
+                    plan.protocol_revision
+                    == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+                ),
+            )
+            contribution = trim.text
             cross_call_repeat_characters = (
                 _longest_exact_common_substring_characters(current_text, contribution)
             )
@@ -1118,6 +1278,7 @@ async def execute_v3_prose_plan(
                 "usage": observed_usage.model_dump(),
                 "empty_output": not bool(generated),
                 "no_progress": bool(generated) and not bool(contribution),
+                **_word_budget_trim_fields(trim),
             }
             by_sequence[sequence] = terminal
             refresh_scene(scene_index)
@@ -1127,6 +1288,16 @@ async def execute_v3_prose_plan(
 
         generated = "".join(chunks).strip()
         contribution = _deduplicate_exact_seam(current_text, generated).strip()
+        trim = _trim_scene_contribution_to_word_budget(
+            current_text=current_text,
+            contribution=contribution,
+            maximum_words=_scene_maximum_words(plan, scene_index),
+            enabled=(
+                plan.protocol_revision
+                == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+            ),
+        )
+        contribution = trim.text
         cross_call_repeat_characters = (
             _longest_exact_common_substring_characters(current_text, contribution)
         )
@@ -1156,15 +1327,18 @@ async def execute_v3_prose_plan(
                 },
             ]
         )
-        scene_complete = _is_scene_complete(
-            scene_text=candidate_text,
-            raw_word_count=candidate_replay_measurement.raw_word_count,
-            effective_word_count=(
-                candidate_replay_measurement.effective_word_count
-            ),
-            finish_reason=finish_reason,
-            plan=plan,
-            scene_index=scene_index,
+        scene_complete = (
+            trim.boundary != "word"
+            and _is_scene_complete(
+                scene_text=candidate_text,
+                raw_word_count=candidate_replay_measurement.raw_word_count,
+                effective_word_count=(
+                    candidate_replay_measurement.effective_word_count
+                ),
+                finish_reason=finish_reason,
+                plan=plan,
+                scene_index=scene_index,
+            )
         )
         terminal = {
             **checkpoint,
@@ -1179,6 +1353,16 @@ async def execute_v3_prose_plan(
             "usage": usage.model_dump(),
             "empty_output": not bool(generated),
             "no_progress": bool(generated) and not bool(contribution),
+            **(
+                {
+                    "error_code": (
+                        "scene_word_budget_trimmed_without_sentence_boundary"
+                    )
+                }
+                if trim.boundary == "word"
+                else {}
+            ),
+            **_word_budget_trim_fields(trim),
         }
         by_sequence[sequence] = terminal
         state = refresh_scene(scene_index)
@@ -1225,8 +1409,8 @@ async def execute_v3_prose_plan(
                 )
                 if missing_base is None or may_end_before_remaining_base:
                     break
-            if state.get("pause_reason") == "scene_word_budget_exceeded":
-                pause_reason = "scene_word_budget_exceeded"
+            if state.get("pause_reason") in _SCENE_WORD_BUDGET_TERMINALS:
+                pause_reason = str(state["pause_reason"])
                 break
 
             # A manual click is deliberately one provider call only. It never

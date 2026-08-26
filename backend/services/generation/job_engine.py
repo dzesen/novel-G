@@ -598,6 +598,14 @@ async def _handle_candidate_chapter_failure(
             "attempts": attempts,
         },
     }
+    diagnostic_details = diagnostic.get("details")
+    diagnostic_reason_codes = (
+        list(diagnostic_details.get("reason_codes") or [])
+        if isinstance(diagnostic_details, Mapping)
+        else []
+    )
+    if diagnostic_reason_codes:
+        fields["error"]["reason_codes"] = diagnostic_reason_codes
     if repair_stop is not None:
         fields["error"]["reason_codes"] = list(repair_stop.reason_codes)
         if repair_stop.next_step is not None:

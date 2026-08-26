@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -67,6 +68,8 @@ from backend.services.llm.generation_runtime import (
 
 
 _MAX_REPAIR_ATTEMPT_EVIDENCE = 64
+_STABLE_REPAIR_REASON_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
+_MAX_REPAIR_REASON_CODES = 20
 
 
 class FencedAttemptScope(AttemptScope, Protocol):
@@ -87,10 +90,61 @@ class CandidateRepairRunStopped(RuntimeError):
         *,
         usage: Mapping[str, Any],
         attempts: Sequence[Mapping[str, Any]],
+        termination_reason_code: str | None = None,
+        reason_codes: Sequence[str] = (),
     ) -> None:
         super().__init__(message)
         self.usage = dict(usage)
         self.attempts = [dict(item) for item in attempts]
+        normalized_termination = str(termination_reason_code or "").strip()
+        self.termination_reason_code = (
+            normalized_termination
+            if _STABLE_REPAIR_REASON_CODE.fullmatch(normalized_termination)
+            else None
+        )
+        normalized_codes: list[str] = []
+        for raw_code in reason_codes:
+            code = str(raw_code or "").strip()
+            if (
+                not _STABLE_REPAIR_REASON_CODE.fullmatch(code)
+                or code in normalized_codes
+            ):
+                continue
+            normalized_codes.append(code)
+            if len(normalized_codes) >= _MAX_REPAIR_REASON_CODES:
+                break
+        self.reason_codes = tuple(normalized_codes)
+        if self.reason_codes:
+            self.diagnostic_category = "model_output_incomplete"
+            self.diagnostic_code = "candidate_repair_stopped"
+            self.diagnostic_evidence = "confirmed"
+
+
+def _stopped_agent_reason_codes(view: Any) -> tuple[str, ...]:
+    """Project only bounded stable codes from durable Tool observations."""
+
+    result: list[str] = []
+    for step in tuple(getattr(view, "steps", ()) or ()):
+        observation = getattr(step, "observation", None)
+        if not isinstance(observation, Mapping):
+            continue
+        planner_view = observation.get("planner_view")
+        if not isinstance(planner_view, Mapping):
+            continue
+        raw_codes = planner_view.get("reason_codes")
+        if not isinstance(raw_codes, (list, tuple)):
+            continue
+        for raw_code in raw_codes:
+            code = str(raw_code or "").strip()
+            if (
+                not _STABLE_REPAIR_REASON_CODE.fullmatch(code)
+                or code in result
+            ):
+                continue
+            result.append(code)
+            if len(result) >= _MAX_REPAIR_REASON_CODES:
+                return tuple(result)
+    return tuple(result)
 
 
 class _StateRepairProposalUnavailable(ValueError):
@@ -980,6 +1034,12 @@ class ChapterCandidateRepairApplication:
                 f"candidate prose repair stopped with status {view.status}",
                 usage=usage,
                 attempts=attempts,
+                termination_reason_code=(
+                    getattr(view.termination, "reason_code", None)
+                    if view.termination is not None
+                    else None
+                ),
+                reason_codes=_stopped_agent_reason_codes(view),
             )
         if (
             int(view.usage.paid_attempts) != len(attempts)

@@ -472,6 +472,15 @@ def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
                 "max_cross_call_repeat_characters": _safe_non_negative_int(
                     item.get("max_cross_call_repeat_characters")
                 ),
+                "word_budget_trimmed_segments": _safe_non_negative_int(
+                    item.get("word_budget_trimmed_segments")
+                ),
+                "word_budget_discarded_words": _safe_non_negative_int(
+                    item.get("word_budget_discarded_words")
+                ),
+                "word_budget_word_boundary_fallbacks": _safe_non_negative_int(
+                    item.get("word_budget_word_boundary_fallbacks")
+                ),
                 "pause_reason": (
                     str(item.get("pause_reason"))
                     if item.get("pause_reason") is not None

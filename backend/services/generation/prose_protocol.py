@@ -12,7 +12,7 @@ from backend.llm.schemas.novel_pydantic import (
 
 SCENE_CONTINUATION_V3_PROTOCOL_REVISION = "scene-continuation-v3"
 CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION = (
-    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.4"
+    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.5"
 )
 
 # V2 scene contracts carry an explicit hard maximum for the whole scene, but a
@@ -77,10 +77,10 @@ def maximum_v2_chapter_base_calls(
 
 
 def scene_continuation_seam_window_characters(scene_target_words: Any) -> int:
-    """Return the fixed v3.4 tail window for every logical scene.
+    """Return the fixed v3.5 tail window for every logical scene.
 
     ``scene_target_words`` remains part of this stable call boundary because
-    readiness and the executor share it, but v3.4 intentionally does not
+    readiness and the executor share it, but v3.5 intentionally does not
     derive model-visible context from the target.  The prior v3.2 expansion
     added cost without an observed benefit in the four-cell retest.
     """

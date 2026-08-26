@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 import json
+import re
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
@@ -56,6 +57,7 @@ CATEGORY_ORDER = (
     "unknown_system",
 )
 EVIDENCE_LEVELS = ("confirmed", "strong_inference", "insufficient")
+_SAFE_REASON_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
 _SAFE_COMPLETION_KEYS = (
     "status",
     "requested_word_count",
@@ -590,6 +592,20 @@ def _safe_text(value: Any, *, limit: int = 100) -> str:
     return str(value or "")[:limit]
 
 
+def _safe_reason_codes(values: Any, *, limit: int = 20) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    result: list[str] = []
+    for value in values:
+        code = str(value or "").strip()
+        if not _SAFE_REASON_CODE_PATTERN.fullmatch(code) or code in result:
+            continue
+        result.append(code)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _safe_completion(completion: Mapping[str, Any]) -> dict[str, Any]:
     details: dict[str, Any] = {}
     for key in _SAFE_COMPLETION_KEYS:
@@ -711,13 +727,9 @@ def build_failure_diagnostic(
         filter(None, (pre_dispatch_boundary_code(item) for item in chain)),
         None,
     )
-    declared_diagnostic = next(
+    declared_failure = next(
         (
-            (
-                getattr(item, "diagnostic_category", None),
-                getattr(item, "diagnostic_code", None),
-                getattr(item, "diagnostic_evidence", None),
-            )
+            item
             for item in chain
             if getattr(item, "diagnostic_category", None) in CATEGORY_ORDER
             and isinstance(getattr(item, "diagnostic_code", None), str)
@@ -725,6 +737,15 @@ def build_failure_diagnostic(
             and getattr(item, "diagnostic_evidence", None) in EVIDENCE_LEVELS
         ),
         None,
+    )
+    declared_diagnostic = (
+        (
+            getattr(declared_failure, "diagnostic_category"),
+            getattr(declared_failure, "diagnostic_code"),
+            getattr(declared_failure, "diagnostic_evidence"),
+        )
+        if declared_failure is not None
+        else None
     )
 
     incomplete = next(
@@ -807,6 +828,16 @@ def build_failure_diagnostic(
         details.update(_candidate_exception_details(failure))
     elif declared_diagnostic is not None:
         category, code, evidence = declared_diagnostic
+        declared_reason_codes = _safe_reason_codes(
+            getattr(declared_failure, "reason_codes", ())
+        )
+        if declared_reason_codes:
+            details["reason_codes"] = declared_reason_codes
+        termination_reason_code = str(
+            getattr(declared_failure, "termination_reason_code", None) or ""
+        ).strip()
+        if _SAFE_REASON_CODE_PATTERN.fullmatch(termination_reason_code):
+            details["termination_reason_code"] = termination_reason_code
     elif any(
         isinstance(
             item,
