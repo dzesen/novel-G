@@ -64,6 +64,7 @@ from backend.services.llm.generation_runtime import (
     PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
+    maximum_structured_validation_issues_projection,
     render_structured_repair_prompt,
 )
 from backend.services.llm.outline_generation import (
@@ -663,6 +664,9 @@ def _reference_repair_input_bound(
                 original_prompt=original_prompt,
                 schema=schema,
                 produced=produced_envelope,
+                validation_issues=(
+                    maximum_structured_validation_issues_projection()
+                ),
             )
             for original_prompt in (
                 prompts.native_schema_prompt,

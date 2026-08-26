@@ -391,7 +391,7 @@ create_volume_outline_by_ai:
 # 章节细纲 Prompt 配置
 create_chapter_outline_by_ai:
   contract_version: scene_transition_contract.v2
-  prompt_revision: chapter-outline-prompt-r2
+  prompt_revision: chapter-outline-prompt-r3
   chapter_outline_prompt_base: |
     你是一位资深长篇小说编辑。请为第 {chapter_order} 章《{chapter_title}》撰写章节细纲。
     本章目标字数约 {words_per_chapter} 字。
@@ -412,7 +412,7 @@ create_chapter_outline_by_ai:
       - preconditions / postconditions / forbidden_conditions 中每项都有本章唯一 condition_id 和可核对描述。
       - beats 把本场拆成原子叙事拍；每项给本章唯一 beat_id、description、expected_transition 和 required。
         expected_transition 必须写明这一拍使知识、关系、目标、风险、选择或情绪发生了什么变化，不能只写“提到某事”。
-      - narrative_delta 每项给本章唯一 delta_id、dimension、before、after；before 与 after 不得同义复述。
+      - narrative_delta 每项给本章唯一 delta_id、dimension、before、after；dimension 只能为 knowledge、relationship、goal、risk、choice、emotion；before 与 after 不得同义复述。
       - event_key 使用稳定的小写事件键；repetition_policy 只能为 forbid、allow_if_escalated 或 allow。
       - word_budget 给出 min / target / max，满足 min <= target <= max；所有场景 target 之和必须精确等于 target_word_count。
     - core_conflict：本章的核心冲突，一句话。

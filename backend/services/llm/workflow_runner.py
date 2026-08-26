@@ -25,6 +25,7 @@ from backend.services.llm.generation_runtime import (
     PromptPlan,
     StructuredOutputMode,
     WorkflowStepTarget,
+    safe_structured_repair_failure_diagnostics,
 )
 
 logger = logging.getLogger(__name__)
@@ -363,25 +364,33 @@ async def run_workflow(
                 }
                 for attempt in failed_attempts
             ]
+            diagnostics = safe_structured_repair_failure_diagnostics(
+                getattr(exc, "diagnostics", None)
+            )
+            step_failure = {
+                "step": step.key,
+                "status": "error",
+                "error": str(exc),
+                "usage": failed_usage.model_dump(),
+                "attempts": attempt_payload,
+            }
+            done_failure = {
+                "success": False,
+                "failed_step": step.key,
+                "partial_result": _partial(),
+                "usage": total_usage.model_dump(),
+                "attempts": attempt_payload,
+            }
+            if diagnostics is not None:
+                step_failure["diagnostics"] = diagnostics
+                done_failure["diagnostics"] = diagnostics
             yield sse_event(
                 "step",
-                {
-                    "step": step.key,
-                    "status": "error",
-                    "error": str(exc),
-                    "usage": failed_usage.model_dump(),
-                    "attempts": attempt_payload,
-                },
+                step_failure,
             )
             yield sse_event(
                 "done",
-                {
-                    "success": False,
-                    "failed_step": step.key,
-                    "partial_result": _partial(),
-                    "usage": total_usage.model_dump(),
-                    "attempts": attempt_payload,
-                },
+                done_failure,
             )
             return
 
@@ -424,10 +433,18 @@ class WorkflowFailed(Exception):
         *,
         usage: dict[str, Any] | None = None,
         attempts: list[dict[str, Any]] | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.usage = usage or {}
         self.attempts = attempts or []
+        self.diagnostics = (
+            safe_structured_repair_failure_diagnostics(diagnostics) or {}
+        )
+        if self.diagnostics:
+            self.diagnostic_category = "validation_logic"
+            self.diagnostic_code = "structured_output_invalid"
+            self.diagnostic_evidence = "confirmed"
 
 
 async def run_workflow_to_result(step_key: str, frames: AsyncGenerator[str, None]) -> "tuple[dict, int]":
@@ -447,6 +464,7 @@ async def run_workflow_to_result(step_key: str, frames: AsyncGenerator[str, None
                     data.get("error") or f"workflow failed at {data.get('failed_step')}",
                     usage=data.get("usage"),
                     attempts=data.get("attempts"),
+                    diagnostics=data.get("diagnostics"),
                 )
             result = data.get("result") or {}
             usage = data.get("usage") or {}

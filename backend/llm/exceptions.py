@@ -1,5 +1,8 @@
 """LLM 模块自定义异常体系。"""
 
+from copy import deepcopy
+from typing import Any, Mapping
+
 
 class LLMError(Exception):
     """LLM 调用基础异常。"""
@@ -66,6 +69,30 @@ class LLMStructuredValidationError(LLMSchemaError):
     ) -> None:
         self.raw_output = raw_output
         super().__init__(message, provider=provider, model=model)
+
+
+class LLMStructuredRepairError(LLMSchemaError):
+    """同 Provider 的唯一结构化修复仍未通过本地校验。"""
+
+    diagnostic_category = "validation_logic"
+    diagnostic_code = "structured_output_invalid"
+    diagnostic_evidence = "confirmed"
+
+    def __init__(
+        self,
+        *,
+        diagnostics: Mapping[str, Any],
+        provider: str = "",
+        model: str = "",
+    ) -> None:
+        # diagnostics 只能由 generation_runtime 的封闭投影构造；复制后避免
+        # 上游在异常传播期间把脱敏证据替换为原始值。
+        self.diagnostics = deepcopy(dict(diagnostics))
+        super().__init__(
+            "Structured output validation failed after one same-Provider repair.",
+            provider=provider,
+            model=model,
+        )
 
 
 def is_schema_protocol_unsupported(exc: BaseException) -> bool:
