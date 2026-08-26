@@ -92,6 +92,7 @@ class CandidateRepairRunStopped(RuntimeError):
         attempts: Sequence[Mapping[str, Any]],
         termination_reason_code: str | None = None,
         reason_codes: Sequence[str] = (),
+        reason_evidence_expected: bool = False,
     ) -> None:
         super().__init__(message)
         self.usage = dict(usage)
@@ -118,7 +119,7 @@ class CandidateRepairRunStopped(RuntimeError):
             self.diagnostic_category = "model_output_incomplete"
             self.diagnostic_code = "candidate_repair_stopped"
             self.diagnostic_evidence = "confirmed"
-        elif self.termination_reason_code is not None:
+        elif reason_evidence_expected or self.termination_reason_code is not None:
             self.diagnostic_category = "unknown_system"
             self.diagnostic_code = "candidate_repair_reason_unavailable"
             self.diagnostic_evidence = "insufficient"
@@ -1044,6 +1045,7 @@ class ChapterCandidateRepairApplication:
                     else None
                 ),
                 reason_codes=_stopped_agent_reason_codes(view),
+                reason_evidence_expected=True,
             )
         if (
             int(view.usage.paid_attempts) != len(attempts)
