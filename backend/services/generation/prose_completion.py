@@ -16,7 +16,10 @@ from backend.services.generation.prose_continuation import ProseContinuationPoli
 from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
-from backend.services.generation.prose_protocol import CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+from backend.services.generation.prose_protocol import (
+    CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
+    v2_scene_base_call_safe_output_budget,
+)
 from backend.services.novel.chapter_service import count_chapter_words
 from backend.scene_contract_versions import (
     SCENE_TRANSITION_CONTRACT_VERSION,
@@ -207,6 +210,15 @@ class ProseCompletionModule:
         else:
             safe_budget = max(1, math.floor(output_limit * self._safety_ratio))
 
+        scene_contract_version = require_known_scene_contract_version(outline)
+        if scene_contract_version == SCENE_TRANSITION_CONTRACT_VERSION:
+            bounded_safe_budget = v2_scene_base_call_safe_output_budget(
+                safe_budget
+            )
+            if bounded_safe_budget != safe_budget:
+                reason_codes.append("scene_contract_base_call_bound")
+            safe_budget = bounded_safe_budget
+
         # Every multi-scene chapter is executed scene-by-scene in v3. A long
         # one-scene chapter may still be split into base parts by output capacity.
         scene_count_requires_segmentation = scene_count >= 2
@@ -220,7 +232,6 @@ class ProseCompletionModule:
                 reason_codes.append("requested_words_exceed_safe_output")
             if scene_count_requires_segmentation:
                 reason_codes.append("scene_count_requires_segmentation")
-        scene_contract_version = require_known_scene_contract_version(outline)
         if scene_contract_version == SCENE_TRANSITION_CONTRACT_VERSION:
             minimums: list[int] = []
             targets: list[int] = []

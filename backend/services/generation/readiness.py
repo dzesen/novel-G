@@ -36,6 +36,13 @@ from backend.services.generation.prose_token_bounds import (
     positive_token_limit,
     v3_output_token_bound,
 )
+from backend.services.generation.prose_protocol import (
+    maximum_v2_chapter_base_calls,
+    v2_scene_base_call_safe_output_budget,
+)
+from backend.services.generation.prose_generation import (
+    planned_base_call_target_words,
+)
 from backend.services.generation.reference_card_auto_creation import (
     ReferenceCardAutoCreationPolicy,
     build_reference_card_creation_authorization,
@@ -1674,7 +1681,9 @@ def _plan_work(
             if not outline:
                 target_words = int(chapter.get("words_per_chapter") or 3_000)
                 unknown_outline_chapters += 1
-                maximum_prose_calls += 32
+                maximum_prose_calls += maximum_v2_chapter_base_calls(
+                    safe_output_budget=capability_plan.safe_output_budget,
+                )
                 maximum_target_words = max(maximum_target_words, target_words)
                 high_risk_chapter_ids.append(chapter_id)
                 continue
@@ -1834,12 +1843,18 @@ def _plan_work_with_prose_continuation(
     maximum_base_calls = 0
     estimated_scene_count = 0
     unknown_outline_chapters = 0
-    maximum_base_call_target_words = capability_plan.safe_output_budget
+    maximum_base_call_target_words = (
+        v2_scene_base_call_safe_output_budget(
+            capability_plan.safe_output_budget
+        )
+    )
     for chapter in chapters_needing_prose:
         outline = chapter.get("outline") or {}
         if not outline:
             unknown_outline_chapters += 1
-            maximum_base_calls += 32
+            maximum_base_calls += maximum_v2_chapter_base_calls(
+                safe_output_budget=capability_plan.safe_output_budget,
+            )
             estimated_scene_count += MAX_CHAPTER_OUTLINE_SCENES
             continue
         target_words = int(
@@ -1860,7 +1875,7 @@ def _plan_work_with_prose_continuation(
         estimated_scene_count += chapter_plan.scene_count
         maximum_base_call_target_words = max(
             maximum_base_call_target_words,
-            *chapter_plan.segment_budgets,
+            *planned_base_call_target_words(chapter_plan),
         )
 
     inherited_max_tokens = values.get("max_tokens")

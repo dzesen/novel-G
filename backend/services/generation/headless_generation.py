@@ -12,6 +12,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, Tuple
 from backend.llm.prompts.prompt_selector import PROSE_PROMPT_NAME, load_prompt_config
 from backend.llm.schemas.novel_pydantic import (
     MAX_CHAPTER_OUTLINE_SCENES,
+    MAX_CHAPTER_OUTLINE_TARGET_WORDS,
     chapter_outline_response_utf8_bytes,
 )
 from backend.scene_contract_versions import MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
@@ -71,6 +72,9 @@ from backend.services.generation.job_planner import (
 from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
+)
+from backend.services.generation.prose_protocol import (
+    maximum_v2_chapter_base_calls,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.generation.protected_generation_params import (
@@ -232,7 +236,11 @@ def _unknown_outline_prompt_envelope() -> dict[str, Any]:
         ],
         "event_key": "authorization.maximum-scene",
         "repetition_policy": "allow",
-        "word_budget": {"min": 1, "target": 50_000, "max": 50_000},
+        "word_budget": {
+            "min": 1,
+            "target": MAX_CHAPTER_OUTLINE_TARGET_WORDS,
+            "max": MAX_CHAPTER_OUTLINE_TARGET_WORDS,
+        },
     }
     return {
         "scene_contract_version": "scene_transition_contract.v2",
@@ -243,7 +251,7 @@ def _unknown_outline_prompt_envelope() -> dict[str, Any]:
         "scenes": [scene],
         "core_conflict": "x",
         "ending_hook": "x",
-        "target_word_count": 50_000,
+        "target_word_count": MAX_CHAPTER_OUTLINE_TARGET_WORDS,
         "threads_resolved": [],
         "new_threads": [],
         "new_reference_card_candidates": [],
@@ -259,7 +267,9 @@ def _unknown_dense_outline_prompt_envelope() -> dict[str, Any]:
     distinct conservative authorization cases.
     """
 
-    scene_target = 50_000 // MAX_CHAPTER_OUTLINE_SCENES
+    scene_target = (
+        MAX_CHAPTER_OUTLINE_TARGET_WORDS // MAX_CHAPTER_OUTLINE_SCENES
+    )
     scenes = []
     for index in range(1, MAX_CHAPTER_OUTLINE_SCENES + 1):
         scenes.append({
@@ -303,7 +313,7 @@ def _unknown_dense_outline_prompt_envelope() -> dict[str, Any]:
         "scenes": scenes,
         "core_conflict": "x",
         "ending_hook": "x",
-        "target_word_count": 50_000,
+        "target_word_count": MAX_CHAPTER_OUTLINE_TARGET_WORDS,
         "threads_resolved": [],
         "new_threads": [],
         "new_reference_card_candidates": [],
@@ -429,7 +439,7 @@ def _unknown_mixed_outline_prompt_envelope() -> dict[str, Any]:
         "scenes": scenes,
         "core_conflict": "x",
         "ending_hook": "x",
-        "target_word_count": 50_000,
+        "target_word_count": MAX_CHAPTER_OUTLINE_TARGET_WORDS,
         "threads_resolved": [],
         "new_threads": [],
         "new_reference_card_candidates": [],
@@ -613,9 +623,18 @@ def estimate_chapter_attempt_slots(
         else:
             # 细纲尚未生成，场景数和逐场景预算未知。预留有界的保守容量，
             # 生成出细纲后实际调用仍受每章 reservation 约束，不可无限扩张。
-            from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
-
-            slots += 32 + (
+            capability_plan = prose_completion_module.plan(
+                outline={"scenes": [{}]},
+                target_word_count=MAX_CHAPTER_OUTLINE_TARGET_WORDS,
+                provider_capability={
+                    "max_output_tokens": text_plan.max_output_tokens,
+                    "model": text_plan.provider_model,
+                },
+                request_overrides=overrides,
+            )
+            slots += maximum_v2_chapter_base_calls(
+                safe_output_budget=capability_plan.safe_output_budget,
+            ) + (
                 MAX_CHAPTER_OUTLINE_SCENES
                 * continuation_policy.automatic_continuations_per_scene
             )

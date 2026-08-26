@@ -291,6 +291,7 @@ class VolumeOutlineResultSchema(BaseModel):
 
 
 MAX_CHAPTER_OUTLINE_SCENES = 20
+MAX_CHAPTER_OUTLINE_TARGET_WORDS = 50_000
 _CONTEXT_OBJECT_ID = ObjectId("f" * 24)
 
 
@@ -467,7 +468,12 @@ class ChapterOutlineAuthoredSchema(BaseModel):
     )
     core_conflict: str = Field(..., min_length=1, max_length=500, description="本章核心冲突")
     ending_hook: str = Field(..., min_length=1, max_length=500, description="章末钩子")
-    target_word_count: int = Field(..., ge=100, le=50000, description="本章目标字数")
+    target_word_count: int = Field(
+        ...,
+        ge=100,
+        le=MAX_CHAPTER_OUTLINE_TARGET_WORDS,
+        description="本章目标字数",
+    )
     threads_resolved: List[str] = Field(default_factory=list, description="本章回收的伏笔 id")
 
     @model_validator(mode="after")

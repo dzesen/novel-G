@@ -23,10 +23,17 @@ from backend.services.generation.chapter_generation_application import (
     STATE_WORKFLOW,
     StateGenerationCommand,
 )
-from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
+from backend.llm.schemas.novel_pydantic import (
+    MAX_CHAPTER_OUTLINE_SCENES,
+    MAX_CHAPTER_OUTLINE_TARGET_WORDS,
+)
 from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
 )
+from backend.services.generation.prose_protocol import (
+    maximum_v2_chapter_base_calls,
+)
+from backend.services.generation.prose_completion import prose_completion_module
 from backend.services.llm.outline_generation import (
     CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS,
 )
@@ -154,10 +161,6 @@ def _prose_budget(command: ProseGenerationCommand) -> CapabilityBudget:
     policy = ProseContinuationPolicy.from_mapping(
         dict(command.generation_params).get("prose_continuation_policy")
     )
-    maximum_calls = 32 + (
-        MAX_CHAPTER_OUTLINE_SCENES
-        * policy.automatic_continuations_per_scene
-    )
     per_call_output = int(
         _positive_int(command.generation_params.get("max_tokens"))
         or (
@@ -166,6 +169,21 @@ def _prose_budget(command: ProseGenerationCommand) -> CapabilityBudget:
             else None
         )
         or _FALLBACK_OUTPUT_TOKENS
+    )
+    capability_plan = prose_completion_module.plan(
+        outline={"scenes": [{}]},
+        target_word_count=MAX_CHAPTER_OUTLINE_TARGET_WORDS,
+        provider_capability={
+            "max_output_tokens": per_call_output,
+            "model": getattr(plan, "provider_model", None),
+        },
+        request_overrides={},
+    )
+    maximum_calls = maximum_v2_chapter_base_calls(
+        safe_output_budget=capability_plan.safe_output_budget,
+    ) + (
+        MAX_CHAPTER_OUTLINE_SCENES
+        * policy.automatic_continuations_per_scene
     )
     return CapabilityBudget(
         max_paid_attempts=maximum_calls,
