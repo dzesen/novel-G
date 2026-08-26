@@ -397,6 +397,28 @@ def _longest_exact_common_substring_characters(
     )
 
 
+def _prepare_bounded_scene_contribution(
+    *,
+    current_text: str,
+    generated: str,
+    maximum_words: int | None,
+    trim_enabled: bool,
+) -> tuple[_SceneWordBudgetTrim, int]:
+    """Apply seam deduplication, the word bound, and repeat measurement once."""
+
+    contribution = _deduplicate_exact_seam(current_text, generated).strip()
+    trim = _trim_scene_contribution_to_word_budget(
+        current_text=current_text,
+        contribution=contribution,
+        maximum_words=maximum_words,
+        enabled=trim_enabled,
+    )
+    return (
+        trim,
+        _longest_exact_common_substring_characters(current_text, trim.text),
+    )
+
+
 def _merged_character_ranges(
     ranges: Iterable[tuple[int, int]],
 ) -> tuple[tuple[int, int], ...]:
@@ -1160,20 +1182,16 @@ async def execute_v3_prose_plan(
                 await _notify(on_delta, chunk)
         except asyncio.CancelledError:
             generated = "".join(chunks).strip()
-            contribution = _deduplicate_exact_seam(current_text, generated).strip()
-            trim = _trim_scene_contribution_to_word_budget(
+            trim, cross_call_repeat_characters = _prepare_bounded_scene_contribution(
                 current_text=current_text,
-                contribution=contribution,
+                generated=generated,
                 maximum_words=_scene_maximum_words(plan, scene_index),
-                enabled=(
+                trim_enabled=(
                     plan.protocol_revision
                     == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
                 ),
             )
             contribution = trim.text
-            cross_call_repeat_characters = (
-                _longest_exact_common_substring_characters(current_text, contribution)
-            )
             try:
                 observed_usage = usage_reader()
             except Exception:
@@ -1208,20 +1226,16 @@ async def execute_v3_prose_plan(
             boundary_code = pre_dispatch_boundary_code(exc)
             assert boundary_code is not None
             generated = "".join(chunks).strip()
-            contribution = _deduplicate_exact_seam(current_text, generated).strip()
-            trim = _trim_scene_contribution_to_word_budget(
+            trim, cross_call_repeat_characters = _prepare_bounded_scene_contribution(
                 current_text=current_text,
-                contribution=contribution,
+                generated=generated,
                 maximum_words=_scene_maximum_words(plan, scene_index),
-                enabled=(
+                trim_enabled=(
                     plan.protocol_revision
                     == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
                 ),
             )
             contribution = trim.text
-            cross_call_repeat_characters = (
-                _longest_exact_common_substring_characters(current_text, contribution)
-            )
             terminal = {
                 **checkpoint,
                 "status": "incomplete",
@@ -1247,20 +1261,16 @@ async def execute_v3_prose_plan(
             return terminal
         except Exception:
             generated = "".join(chunks).strip()
-            contribution = _deduplicate_exact_seam(current_text, generated).strip()
-            trim = _trim_scene_contribution_to_word_budget(
+            trim, cross_call_repeat_characters = _prepare_bounded_scene_contribution(
                 current_text=current_text,
-                contribution=contribution,
+                generated=generated,
                 maximum_words=_scene_maximum_words(plan, scene_index),
-                enabled=(
+                trim_enabled=(
                     plan.protocol_revision
                     == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
                 ),
             )
             contribution = trim.text
-            cross_call_repeat_characters = (
-                _longest_exact_common_substring_characters(current_text, contribution)
-            )
             try:
                 observed_usage = usage_reader()
             except Exception:
@@ -1287,20 +1297,16 @@ async def execute_v3_prose_plan(
             raise
 
         generated = "".join(chunks).strip()
-        contribution = _deduplicate_exact_seam(current_text, generated).strip()
-        trim = _trim_scene_contribution_to_word_budget(
+        trim, cross_call_repeat_characters = _prepare_bounded_scene_contribution(
             current_text=current_text,
-            contribution=contribution,
+            generated=generated,
             maximum_words=_scene_maximum_words(plan, scene_index),
-            enabled=(
+            trim_enabled=(
                 plan.protocol_revision
                 == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
             ),
         )
         contribution = trim.text
-        cross_call_repeat_characters = (
-            _longest_exact_common_substring_characters(current_text, contribution)
-        )
         observed_finish = finish_reason_reader()
         raw_finish = (
             raw_finish_reason_reader()

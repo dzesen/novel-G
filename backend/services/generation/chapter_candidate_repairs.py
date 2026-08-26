@@ -118,6 +118,10 @@ class CandidateRepairRunStopped(RuntimeError):
             self.diagnostic_category = "model_output_incomplete"
             self.diagnostic_code = "candidate_repair_stopped"
             self.diagnostic_evidence = "confirmed"
+        elif self.termination_reason_code is not None:
+            self.diagnostic_category = "unknown_system"
+            self.diagnostic_code = "candidate_repair_reason_unavailable"
+            self.diagnostic_evidence = "insufficient"
 
 
 def _stopped_agent_reason_codes(view: Any) -> tuple[str, ...]:
