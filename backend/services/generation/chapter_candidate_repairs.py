@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import uuid4
@@ -54,6 +53,10 @@ from backend.services.generation.prose_remediation_runtime import (
     build_prose_remediation_runtime,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
+from backend.services.generation.stable_reason_codes import (
+    normalize_stable_reason_code,
+    project_stable_reason_codes,
+)
 from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.novel.state_fact_accounting import (
     StateFactAccountingError,
@@ -68,8 +71,6 @@ from backend.services.llm.generation_runtime import (
 
 
 _MAX_REPAIR_ATTEMPT_EVIDENCE = 64
-_STABLE_REPAIR_REASON_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
-_MAX_REPAIR_REASON_CODES = 20
 
 
 class FencedAttemptScope(AttemptScope, Protocol):
@@ -97,24 +98,10 @@ class CandidateRepairRunStopped(RuntimeError):
         super().__init__(message)
         self.usage = dict(usage)
         self.attempts = [dict(item) for item in attempts]
-        normalized_termination = str(termination_reason_code or "").strip()
-        self.termination_reason_code = (
-            normalized_termination
-            if _STABLE_REPAIR_REASON_CODE.fullmatch(normalized_termination)
-            else None
+        self.termination_reason_code = normalize_stable_reason_code(
+            termination_reason_code
         )
-        normalized_codes: list[str] = []
-        for raw_code in reason_codes:
-            code = str(raw_code or "").strip()
-            if (
-                not _STABLE_REPAIR_REASON_CODE.fullmatch(code)
-                or code in normalized_codes
-            ):
-                continue
-            normalized_codes.append(code)
-            if len(normalized_codes) >= _MAX_REPAIR_REASON_CODES:
-                break
-        self.reason_codes = tuple(normalized_codes)
+        self.reason_codes = project_stable_reason_codes(reason_codes)
         if self.reason_codes:
             self.diagnostic_category = "model_output_incomplete"
             self.diagnostic_code = "candidate_repair_stopped"
@@ -128,28 +115,20 @@ class CandidateRepairRunStopped(RuntimeError):
 def _stopped_agent_reason_codes(view: Any) -> tuple[str, ...]:
     """Project only bounded stable codes from durable Tool observations."""
 
-    result: list[str] = []
-    for step in tuple(getattr(view, "steps", ()) or ()):
-        observation = getattr(step, "observation", None)
-        if not isinstance(observation, Mapping):
-            continue
-        planner_view = observation.get("planner_view")
-        if not isinstance(planner_view, Mapping):
-            continue
-        raw_codes = planner_view.get("reason_codes")
-        if not isinstance(raw_codes, (list, tuple)):
-            continue
-        for raw_code in raw_codes:
-            code = str(raw_code or "").strip()
-            if (
-                not _STABLE_REPAIR_REASON_CODE.fullmatch(code)
-                or code in result
-            ):
+    def iter_raw_reason_codes() -> Iterable[Any]:
+        for step in tuple(getattr(view, "steps", ()) or ()):
+            observation = getattr(step, "observation", None)
+            if not isinstance(observation, Mapping):
                 continue
-            result.append(code)
-            if len(result) >= _MAX_REPAIR_REASON_CODES:
-                return tuple(result)
-    return tuple(result)
+            planner_view = observation.get("planner_view")
+            if not isinstance(planner_view, Mapping):
+                continue
+            raw_codes = planner_view.get("reason_codes")
+            if not isinstance(raw_codes, (list, tuple)):
+                continue
+            yield from raw_codes
+
+    return project_stable_reason_codes(iter_raw_reason_codes())
 
 
 class _StateRepairProposalUnavailable(ValueError):

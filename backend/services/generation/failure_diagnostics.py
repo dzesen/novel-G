@@ -7,7 +7,6 @@ from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 import json
-import re
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
@@ -38,6 +37,10 @@ from backend.services.generation.prose_generation import (
 from backend.services.generation.reference_card_auto_creation import (
     parse_reference_card_creation_authorization,
 )
+from backend.services.generation.stable_reason_codes import (
+    normalize_stable_reason_code,
+    project_stable_reason_codes,
+)
 from backend.services.llm.context_builder import ContextBudgetError
 from backend.services.llm.pre_dispatch_boundaries import (
     pre_dispatch_boundary_code,
@@ -57,7 +60,6 @@ CATEGORY_ORDER = (
     "unknown_system",
 )
 EVIDENCE_LEVELS = ("confirmed", "strong_inference", "insufficient")
-_SAFE_REASON_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,119}$")
 _SAFE_COMPLETION_KEYS = (
     "status",
     "requested_word_count",
@@ -595,15 +597,7 @@ def _safe_text(value: Any, *, limit: int = 100) -> str:
 def _safe_reason_codes(values: Any, *, limit: int = 20) -> list[str]:
     if not isinstance(values, (list, tuple)):
         return []
-    result: list[str] = []
-    for value in values:
-        code = str(value or "").strip()
-        if not _SAFE_REASON_CODE_PATTERN.fullmatch(code) or code in result:
-            continue
-        result.append(code)
-        if len(result) >= limit:
-            break
-    return result
+    return list(project_stable_reason_codes(values, limit=limit))
 
 
 def _safe_completion(completion: Mapping[str, Any]) -> dict[str, Any]:
@@ -833,10 +827,10 @@ def build_failure_diagnostic(
         )
         if declared_reason_codes:
             details["reason_codes"] = declared_reason_codes
-        termination_reason_code = str(
-            getattr(declared_failure, "termination_reason_code", None) or ""
-        ).strip()
-        if _SAFE_REASON_CODE_PATTERN.fullmatch(termination_reason_code):
+        termination_reason_code = normalize_stable_reason_code(
+            getattr(declared_failure, "termination_reason_code", None)
+        )
+        if termination_reason_code is not None:
             details["termination_reason_code"] = termination_reason_code
     elif any(
         isinstance(
