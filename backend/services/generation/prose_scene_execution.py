@@ -46,6 +46,10 @@ from backend.services.generation.prose_generation import (
     _usage_sum,
     prose_completion_module,
 )
+from backend.services.generation.scene_word_budget import (
+    SceneWordBudgetTrim,
+    trim_scene_contribution_to_word_budget,
+)
 from backend.services.novel.chapter_service import count_chapter_words
 
 
@@ -87,22 +91,6 @@ class _SceneReplayMeasurement:
     replayed_characters_total: int
 
 
-@dataclass(frozen=True)
-class _SceneWordBudgetTrim:
-    text: str
-    original_word_count: int
-    discarded_word_count: int = 0
-    boundary: str | None = None
-
-    @property
-    def trimmed(self) -> bool:
-        return self.discarded_word_count > 0
-
-
-_SCENE_SENTENCE_END_CHARACTERS = frozenset("。！？!?…")
-_SCENE_SENTENCE_CLOSING_CHARACTERS = frozenset(
-    "”’」』】）》)]} \t\r\n"
-)
 _SCENE_WORD_BUDGET_TERMINALS = frozenset({
     "scene_word_budget_exceeded",
     "scene_word_budget_exhausted",
@@ -110,75 +98,7 @@ _SCENE_WORD_BUDGET_TERMINALS = frozenset({
 })
 
 
-def _longest_prefix_with_word_limit(text: str, maximum_words: int) -> str:
-    """Return the longest source prefix whose Novel-G word count fits."""
-
-    source = str(text or "")
-    limit = max(0, int(maximum_words))
-    low = 0
-    high = len(source)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if count_chapter_words(source[:middle]) <= limit:
-            low = middle
-        else:
-            high = middle - 1
-    return source[:low].rstrip()
-
-
-def _trim_scene_contribution_to_word_budget(
-    *,
-    current_text: str,
-    contribution: str,
-    maximum_words: int | None,
-    enabled: bool,
-) -> _SceneWordBudgetTrim:
-    """Converge one Provider contribution without inventing prose."""
-
-    source = str(contribution or "").strip()
-    original_word_count = count_chapter_words(source)
-    if not enabled or maximum_words is None:
-        return _SceneWordBudgetTrim(
-            text=source,
-            original_word_count=original_word_count,
-        )
-    current_word_count = count_chapter_words(current_text)
-    remaining_words = max(0, int(maximum_words) - current_word_count)
-    if original_word_count <= remaining_words:
-        return _SceneWordBudgetTrim(
-            text=source,
-            original_word_count=original_word_count,
-        )
-
-    hard_prefix = _longest_prefix_with_word_limit(source, remaining_words)
-    sentence_end = max(
-        (
-            hard_prefix.rfind(character) + 1
-            for character in _SCENE_SENTENCE_END_CHARACTERS
-        ),
-        default=0,
-    )
-    if sentence_end > 0:
-        while (
-            sentence_end < len(hard_prefix)
-            and hard_prefix[sentence_end] in _SCENE_SENTENCE_CLOSING_CHARACTERS
-        ):
-            sentence_end += 1
-        retained = hard_prefix[:sentence_end].rstrip()
-        boundary = "sentence"
-    else:
-        retained = hard_prefix
-        boundary = "word"
-    retained_word_count = count_chapter_words(retained)
-    return _SceneWordBudgetTrim(
-        text=retained,
-        original_word_count=original_word_count,
-        discarded_word_count=max(0, original_word_count - retained_word_count),
-        boundary=boundary,
-    )
-
-
-def _word_budget_trim_fields(trim: _SceneWordBudgetTrim) -> dict[str, Any]:
+def _word_budget_trim_fields(trim: SceneWordBudgetTrim) -> dict[str, Any]:
     if not trim.trimmed:
         return {}
     return {
@@ -403,11 +323,11 @@ def _prepare_bounded_scene_contribution(
     generated: str,
     maximum_words: int | None,
     trim_enabled: bool,
-) -> tuple[_SceneWordBudgetTrim, int]:
+) -> tuple[SceneWordBudgetTrim, int]:
     """Apply seam deduplication, the word bound, and repeat measurement once."""
 
     contribution = _deduplicate_exact_seam(current_text, generated).strip()
-    trim = _trim_scene_contribution_to_word_budget(
+    trim = trim_scene_contribution_to_word_budget(
         current_text=current_text,
         contribution=contribution,
         maximum_words=maximum_words,

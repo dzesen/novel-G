@@ -70,6 +70,9 @@ from backend.services.generation.prose_completion import (
     prose_completion_module,
 )
 from backend.services.generation.prose_runs import prose_revision
+from backend.services.generation.scene_word_budget import (
+    trim_scene_contribution_to_word_budget,
+)
 from backend.services.generation.prose_token_bounds import (
     conservative_prompt_input_bound,
     structured_schema_request_payload,
@@ -110,6 +113,25 @@ _MAX_PLANNER_OBSERVATIONS = 32
 _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
 _FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r4"
+PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
+    "adherence_review_invalid",
+    "below_minimum_word_ratio",
+    "finish_reason_cancelled",
+    "finish_reason_content_filter",
+    "finish_reason_error",
+    "finish_reason_length",
+    "finish_reason_tool_call",
+    "finish_reason_unreported",
+    "outline_revision_stale",
+    "remediation_verification_required",
+    "repair_no_progress",
+    "rewrite_output_invalid",
+    "scene_word_budget_below_minimum",
+    "scene_word_budget_exceeded",
+    "scene_word_budget_trimmed_without_sentence_boundary",
+    "scenes_incomplete",
+    "semantic_unknown",
+)
 
 def _blocked_error_summary(
     operation: Literal["rewrite", "adherence"],
@@ -203,6 +225,9 @@ class SceneContractValidationEntry(_StrictModel):
     end: int = Field(ge=1)
     content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     word_count: int = Field(ge=0)
+    provider_word_count: int = Field(ge=0)
+    discarded_word_count: int = Field(default=0, ge=0)
+    normalization_boundary: Literal["sentence", "word"] | None = None
     min: int = Field(ge=1)
     target: int = Field(ge=1)
     max: int = Field(ge=1)
@@ -213,6 +238,17 @@ class SceneContractValidationEntry(_StrictModel):
             raise ValueError("scene contract validation span is empty")
         if not self.min <= self.target <= self.max:
             raise ValueError("scene contract validation budget is invalid")
+        if self.provider_word_count < self.word_count:
+            raise ValueError("provider word count cannot be below retained count")
+        if (
+            self.discarded_word_count
+            != self.provider_word_count - self.word_count
+        ):
+            raise ValueError("discarded word count does not match retained count")
+        if bool(self.discarded_word_count) != bool(
+            self.normalization_boundary
+        ):
+            raise ValueError("normalization boundary does not match trimming")
         return self
 
 
@@ -762,21 +798,35 @@ def _assemble_v2_rewritten_prose(
             parts.append("\n\n")
             cursor += 2
         scene_id, minimum, target, maximum = budget
+        normalized = trim_scene_contribution_to_word_budget(
+            current_text="",
+            contribution=scene.prose,
+            maximum_words=maximum,
+            enabled=True,
+        )
+        scene_text = normalized.text
         start = cursor
-        parts.append(scene.prose)
-        cursor += len(scene.prose)
-        word_count = count_chapter_words(scene.prose)
+        parts.append(scene_text)
+        cursor += len(scene_text)
+        word_count = count_chapter_words(scene_text)
         if word_count < minimum:
             reason_codes.append("scene_word_budget_below_minimum")
-        if word_count > maximum:
+        if normalized.boundary == "word":
+            reason_codes.append(
+                "scene_word_budget_trimmed_without_sentence_boundary"
+            )
+        elif word_count > maximum:
             reason_codes.append("scene_word_budget_exceeded")
         entries.append(
             {
                 "scene_id": scene_id,
                 "start": start,
                 "end": cursor,
-                "content_digest": chapter_content_digest(scene.prose),
+                "content_digest": chapter_content_digest(scene_text),
                 "word_count": word_count,
+                "provider_word_count": normalized.original_word_count,
+                "discarded_word_count": normalized.discarded_word_count,
+                "normalization_boundary": normalized.boundary,
                 "min": minimum,
                 "target": target,
                 "max": maximum,
@@ -834,6 +884,7 @@ def _validate_v2_scene_contract_proof(
         if (
             entry.content_digest != chapter_content_digest(scene_text)
             or entry.word_count != word_count
+            or entry.normalization_boundary == "word"
             or word_count < minimum
             or word_count > maximum
         ):
@@ -2142,7 +2193,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r9-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r10-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2151,6 +2202,9 @@ class ProseRemediationToolRegistry:
                     "narrative_context",
                 ),
                 idempotent=True,
+                retryable_failure_reason_codes=(
+                    PROSE_REMEDIATION_RETRYABLE_REASON_CODES
+                ),
             ),
             RuntimeToolDescriptor(
                 reference=ADHERENCE_TOOL,
@@ -2175,19 +2229,25 @@ class ProseRemediationToolRegistry:
                     "narrative_context",
                 ),
                 idempotent=True,
+                retryable_failure_reason_codes=(
+                    PROSE_REMEDIATION_RETRYABLE_REASON_CODES
+                ),
             ),
         )
         self._descriptors = {
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r9-"
+            "prose-remediation-tools-r10-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
                     "implementation_revision": item.implementation_revision,
                     "max_paid_attempts_per_call": item.max_paid_attempts_per_call,
                     "max_tokens_per_call": item.max_tokens_per_call,
+                    "retryable_failure_reason_codes": list(
+                        item.retryable_failure_reason_codes
+                    ),
                 }
                 for item in descriptors
             ])[:20]

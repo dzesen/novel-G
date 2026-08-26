@@ -44,6 +44,7 @@ from backend.services.agent_runtime.contracts import (
     RuntimeAdapterKnownFailure,
     RuntimeCallUsage,
     RuntimeObservation,
+    RuntimeRetryableFailureObservation,
     RuntimeToolContext,
     RuntimeToolDescriptor,
     RuntimeToolReference,
@@ -273,6 +274,59 @@ def _tool_result_usage_is_complete(result: RuntimeToolResult) -> bool:
     )
 
 
+def _retryable_failure_observation(
+    result: RuntimeToolResult,
+    descriptor: RuntimeToolDescriptor,
+) -> dict[str, Any]:
+    """Preserve only bounded Planner evidence at retry exhaustion."""
+
+    if result.status != "retryable_error":
+        raise ValueError("failure observation requires a retryable Tool result")
+    allowed_reason_codes = set(descriptor.retryable_failure_reason_codes)
+    raw_reason_codes = result.planner_view.get("reason_codes")
+    projected_reason_codes: list[str] = []
+    if isinstance(raw_reason_codes, (list, tuple)):
+        for value in raw_reason_codes:
+            code = str(value or "").strip()
+            if (
+                code in allowed_reason_codes
+                and code not in projected_reason_codes
+            ):
+                projected_reason_codes.append(code)
+    return RuntimeRetryableFailureObservation(
+        code=result.code,
+        planner_view={"reason_codes": projected_reason_codes},
+    ).model_dump(mode="json")
+
+
+def _validate_retryable_failure_observation(
+    observation: Mapping[str, Any],
+) -> RuntimeRetryableFailureObservation:
+    return RuntimeRetryableFailureObservation.model_validate(observation)
+
+
+def _is_retryable_failure_observation(value: Any) -> bool:
+    if not isinstance(value, Mapping) or value.get("schema_version") != (
+        "agent_runtime_retryable_failure_observation.v1"
+    ):
+        return False
+    try:
+        _validate_retryable_failure_observation(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _parse_tool_observation(
+    observation: Mapping[str, Any],
+) -> RuntimeObservation | RuntimeRetryableFailureObservation:
+    if observation.get("schema_version") == (
+        "agent_runtime_retryable_failure_observation.v1"
+    ):
+        return _validate_retryable_failure_observation(observation)
+    return RuntimeObservation.model_validate(observation)
+
+
 def _step_audit_projection(step: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "step_id": str(step.get("step_id") or ""),
@@ -493,7 +547,7 @@ def _tool_observed_event_projection(
     ordinal: int,
     observation: Mapping[str, Any],
 ) -> tuple[str, str, dict[str, Any]]:
-    validated = RuntimeObservation.model_validate(observation)
+    validated = _parse_tool_observation(observation)
     return f"step-{ordinal}-tool-observed", "tool_observed", {
         "ordinal": ordinal,
         "status": validated.status,
@@ -2343,21 +2397,42 @@ class AgentRuntime:
                             add_violation("observation_mismatch")
                     elif isinstance(observation, Mapping):
                         try:
-                            validated_observation = RuntimeObservation.model_validate(
-                                observation
-                            )
-                            expected_observation_id = _digest({
-                                "run_id": run_id,
-                                "step_id": step_id,
-                                "tool": decision.tool.model_dump(mode="json"),
-                            })[:32]
-                            if (
-                                validated_observation.observation_id
-                                != expected_observation_id
-                                or validated_observation.step_id != step_id
-                                or validated_observation.tool != decision.tool
-                            ):
-                                add_violation("observation_mismatch")
+                            if _is_retryable_failure_observation(observation):
+                                validated_failure = (
+                                    _validate_retryable_failure_observation(
+                                        observation
+                                    )
+                                )
+                                if (
+                                    str(step.get("status") or "") != "failed"
+                                    or step.get("failure_reason")
+                                    != "tool_failure_exhausted"
+                                    or not isinstance(descriptor, Mapping)
+                                    or not set(
+                                        validated_failure.planner_view.reason_codes
+                                    ).issubset(
+                                        set(descriptor.get(
+                                            "retryable_failure_reason_codes"
+                                        ) or ())
+                                    )
+                                ):
+                                    add_violation("observation_mismatch")
+                            else:
+                                validated_observation = (
+                                    _parse_tool_observation(observation)
+                                )
+                                expected_observation_id = _digest({
+                                    "run_id": run_id,
+                                    "step_id": step_id,
+                                    "tool": decision.tool.model_dump(mode="json"),
+                                })[:32]
+                                if (
+                                    validated_observation.observation_id
+                                    != expected_observation_id
+                                    or validated_observation.step_id != step_id
+                                    or validated_observation.tool != decision.tool
+                                ):
+                                    add_violation("observation_mismatch")
                             observed_events = events_by_type.get(
                                 "tool_observed",
                                 [],
@@ -4257,6 +4332,24 @@ class AgentRuntime:
                     ))
                     or not descriptor.idempotent
                 ):
+                    failure_observation = _retryable_failure_observation(
+                        candidate,
+                        descriptor,
+                    )
+                    event_key, event_type, event_payload = (
+                        _tool_observed_event_projection(
+                            ordinal=ordinal,
+                            observation=failure_observation,
+                        )
+                    )
+                    await self._event(
+                        run_id=run_id,
+                        event_key=event_key,
+                        event_type=event_type,
+                        payload=event_payload,
+                        step_id=step_id,
+                        now=now,
+                    )
                     await self._fail_step_and_run(
                         run_id=run_id,
                         owner_id=owner_id,
@@ -4265,6 +4358,7 @@ class AgentRuntime:
                         step_id=step_id,
                         expected_step_status=step_status,
                         reason_code="tool_failure_exhausted",
+                        failure_observation=failure_observation,
                         now=now,
                     )
                     return False
@@ -5628,8 +5722,12 @@ class AgentRuntime:
         step_id: str,
         expected_step_status: str,
         reason_code: str,
+        failure_observation: Mapping[str, Any] | None = None,
         now: datetime,
     ) -> None:
+        fields: dict[str, Any] = {"failure_reason": reason_code}
+        if failure_observation is not None:
+            fields["observation"] = dict(failure_observation)
         await self._repository.transition_step(
             run_id=run_id,
             owner_id=owner_id,
@@ -5638,7 +5736,7 @@ class AgentRuntime:
             step_id=step_id,
             expected=expected_step_status,
             status="failed",
-            fields={"failure_reason": reason_code},
+            fields=fields,
             now=now,
         )
         await self._repository.archive_step_call_attempts(

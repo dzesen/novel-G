@@ -49,6 +49,7 @@ from backend.services.generation.candidate_repair_contracts import (
     PreDispatchFenceV1,
 )
 from backend.services.generation.prose_remediation_runtime import (
+    PROSE_REMEDIATION_RETRYABLE_REASON_CODES,
     REMEDIATION_SCOPE_KIND,
     build_prose_remediation_runtime,
 )
@@ -116,6 +117,7 @@ def _stopped_agent_reason_codes(view: Any) -> tuple[str, ...]:
     """Project only bounded stable codes from durable Tool observations."""
 
     def iter_raw_reason_codes() -> Iterable[Any]:
+        allowed_codes = set(PROSE_REMEDIATION_RETRYABLE_REASON_CODES)
         for step in tuple(getattr(view, "steps", ()) or ()):
             observation = getattr(step, "observation", None)
             if not isinstance(observation, Mapping):
@@ -126,7 +128,9 @@ def _stopped_agent_reason_codes(view: Any) -> tuple[str, ...]:
             raw_codes = planner_view.get("reason_codes")
             if not isinstance(raw_codes, (list, tuple)):
                 continue
-            yield from raw_codes
+            yield from (
+                code for code in raw_codes if str(code or "") in allowed_codes
+            )
 
     return project_stable_reason_codes(iter_raw_reason_codes())
 

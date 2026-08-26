@@ -7,9 +7,9 @@ from datetime import datetime
 import hashlib
 import json
 import re
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 
 RuntimeEffectClass = Literal["read_only", "paid_read", "proposal_only"]
@@ -28,6 +28,33 @@ V1_RUNTIME_PROPOSAL_KINDS = frozenset({"chapter_prose_candidate"})
 V1_RUNTIME_CHANGE_CLASSES = frozenset({"temporary_candidate"})
 MAX_PLANNER_VIEW_BYTES = 16_384
 MAX_RUNTIME_RESULT_PROJECTION_BYTES = 262_144
+MAX_RUNTIME_FAILURE_REASON_CODES = 20
+_RUNTIME_FAILURE_REASON_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,119}")
+
+
+def validate_runtime_failure_reason_codes(
+    value: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Validate the shared closed-list shape used by live and frozen Tool contracts."""
+    if not isinstance(value, tuple):
+        raise ValueError("retryable failure reason codes must be a tuple")
+    if len(value) > MAX_RUNTIME_FAILURE_REASON_CODES:
+        raise ValueError("retryable failure reason codes exceed the limit")
+    if len(set(value)) != len(value):
+        raise ValueError("retryable failure reason codes must be unique")
+    if any(
+        _RUNTIME_FAILURE_REASON_CODE_PATTERN.fullmatch(code) is None
+        for code in value
+    ):
+        raise ValueError("retryable failure reason code is invalid")
+    return value
+
+
+RuntimeFailureReasonCodes = Annotated[
+    tuple[str, ...],
+    Field(max_length=MAX_RUNTIME_FAILURE_REASON_CODES),
+    AfterValidator(validate_runtime_failure_reason_codes),
+]
 
 
 def _json_size(value: Any, *, label: str) -> int:
@@ -145,6 +172,7 @@ class RuntimeToolDescriptor:
     context_policy_revision: str
     external_data_categories: tuple[str, ...]
     idempotent: bool
+    retryable_failure_reason_codes: RuntimeFailureReasonCodes = ()
     schema_version: Literal["agent_runtime_tool_descriptor.v1"] = (
         "agent_runtime_tool_descriptor.v1"
     )
@@ -176,6 +204,7 @@ class RuntimeToolDescriptor:
             self.proposal_kinds or self.change_classes
         ):
             raise ValueError("read tools cannot declare proposal or change classes")
+        validate_runtime_failure_reason_codes(self.retryable_failure_reason_codes)
 
 
 def runtime_tool_descriptor_snapshot(
@@ -211,6 +240,9 @@ def runtime_tool_descriptor_snapshot(
         "context_policy_revision": descriptor.context_policy_revision,
         "external_data_categories": list(descriptor.external_data_categories),
         "idempotent": descriptor.idempotent,
+        "retryable_failure_reason_codes": list(
+            descriptor.retryable_failure_reason_codes
+        ),
     }
 
 
@@ -308,6 +340,27 @@ class RuntimeToolResult(_StrictModel):
             ),
         )
         return self
+
+
+class RuntimeRetryableFailurePlannerView(_StrictModel):
+    reason_codes: RuntimeFailureReasonCodes = ()
+
+
+class RuntimeRetryableFailureObservation(_StrictModel):
+    """Bounded Tool evidence retained when automatic retries are exhausted."""
+
+    schema_version: Literal["agent_runtime_retryable_failure_observation.v1"] = (
+        "agent_runtime_retryable_failure_observation.v1"
+    )
+    status: Literal["retryable_error"] = "retryable_error"
+    code: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[a-z][a-z0-9_.-]*$",
+    )
+    planner_view: RuntimeRetryableFailurePlannerView = Field(
+        default_factory=RuntimeRetryableFailurePlannerView
+    )
 
 
 class RuntimeObservation(_StrictModel):

@@ -23,6 +23,7 @@ from backend.services.agent_runtime.contracts import (
     PlannerDescriptor,
     RuntimeChangeClass,
     RuntimeEffectClass,
+    RuntimeFailureReasonCodes,
     RuntimeProposalKind,
     RuntimeToolDescriptor,
     RuntimeToolReference,
@@ -61,7 +62,7 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v5"
 )
-CANDIDATE_PIPELINE_REVISION = 28
+CANDIDATE_PIPELINE_REVISION = 29
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v2"
@@ -180,6 +181,7 @@ class RuntimeToolDescriptorSnapshot(_ClosedAuthorizationModel):
     context_policy_revision: str = Field(min_length=1, max_length=240)
     external_data_categories: tuple[str, ...] = Field(max_length=32)
     idempotent: StrictBool
+    retryable_failure_reason_codes: RuntimeFailureReasonCodes = ()
 
 
 class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
