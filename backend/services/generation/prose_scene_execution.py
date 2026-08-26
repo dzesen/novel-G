@@ -510,6 +510,31 @@ def _is_scene_complete(
     )
 
 
+def _bounded_scene_allows_completion(
+    *,
+    trim_boundary: str | None,
+    scene_text: str,
+    raw_word_count: int,
+    effective_word_count: int,
+    finish_reason: str,
+    plan: ProseExecutionPlan,
+    scene_index: int,
+) -> bool:
+    """Apply the production trim guard and scene-completion contract together."""
+
+    return bool(
+        trim_boundary != "word"
+        and _is_scene_complete(
+            scene_text=scene_text,
+            raw_word_count=raw_word_count,
+            effective_word_count=effective_word_count,
+            finish_reason=finish_reason,
+            plan=plan,
+            scene_index=scene_index,
+        )
+    )
+
+
 def _next_automatic_sequence(segments: Iterable[Mapping[str, Any]]) -> int:
     used = {
         int(segment.get("sequence_index") or 0)
@@ -1253,18 +1278,16 @@ async def execute_v3_prose_plan(
                 },
             ]
         )
-        scene_complete = (
-            trim.boundary != "word"
-            and _is_scene_complete(
-                scene_text=candidate_text,
-                raw_word_count=candidate_replay_measurement.raw_word_count,
-                effective_word_count=(
-                    candidate_replay_measurement.effective_word_count
-                ),
-                finish_reason=finish_reason,
-                plan=plan,
-                scene_index=scene_index,
-            )
+        scene_complete = _bounded_scene_allows_completion(
+            trim_boundary=trim.boundary,
+            scene_text=candidate_text,
+            raw_word_count=candidate_replay_measurement.raw_word_count,
+            effective_word_count=(
+                candidate_replay_measurement.effective_word_count
+            ),
+            finish_reason=finish_reason,
+            plan=plan,
+            scene_index=scene_index,
         )
         terminal = {
             **checkpoint,

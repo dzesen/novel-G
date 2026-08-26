@@ -573,10 +573,13 @@ async def build_batch_prose_prompt_input_bounds(
 def estimate_chapter_attempt_slots(
     chapter: Dict[str, Any],
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    runtime: Any | None = None,
 ) -> int:
     """按当前不可变 GenerationPlan 计算一章的最大语义调用数。"""
     overrides, runtime_kwargs = _generation_options(generation_params)
-    runtime = create_generation_runtime(**runtime_kwargs)
+    if runtime is None:
+        runtime = create_generation_runtime(**runtime_kwargs)
     continuation_policy = _continuation_policy(generation_params)
     slots = 0
     if not chapter.get("outline"):
@@ -662,11 +665,15 @@ def estimate_chapter_attempt_slots(
 def estimate_worklist_attempt_capacity(
     chapters: list[Dict[str, Any]],
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    runtime: Any | None = None,
 ) -> int:
     """固定总容量包含首次运行和每章至多一次偏离修订后的重新检查。"""
 
     _overrides, runtime_kwargs = _generation_options(generation_params)
-    runtime = create_generation_runtime(**runtime_kwargs)
+    reuse_runtime = runtime is not None
+    if runtime is None:
+        runtime = create_generation_runtime(**runtime_kwargs)
     adherence_recheck_slots = runtime.plan_structured(
         WorkflowStepTarget(
             PROSE_REMEDIATION_WORKFLOW,
@@ -674,7 +681,11 @@ def estimate_worklist_attempt_capacity(
         )
     ).max_semantic_attempts
     capacity = sum(
-        estimate_chapter_attempt_slots(chapter, generation_params)
+        estimate_chapter_attempt_slots(
+            chapter,
+            generation_params,
+            **({"runtime": runtime} if reuse_runtime else {}),
+        )
         + (
             adherence_recheck_slots
             if str(

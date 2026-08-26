@@ -105,6 +105,8 @@ class _BaseGenerationBudget:
     maximum_tokens_total: int
     token_bound_known: bool
     provider_bounds: tuple[ProviderBudgetBound, ...]
+    maximum_input_tokens_total: int | None = None
+    maximum_output_tokens_total: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,6 +124,28 @@ class _BaseGenerationBudget:
                 }
                 for bound in self.provider_bounds
             ],
+        }
+
+    def token_upper_bound(self) -> dict[str, int] | None:
+        if (
+            self.maximum_input_tokens_total is None
+            or self.maximum_output_tokens_total is None
+        ):
+            return None
+        input_tokens = _strict_non_negative_budget_int(
+            self.maximum_input_tokens_total,
+            field="base generation input-token bound",
+        )
+        output_tokens = _strict_non_negative_budget_int(
+            self.maximum_output_tokens_total,
+            field="base generation output-token bound",
+        )
+        if input_tokens + output_tokens != self.maximum_tokens_total:
+            raise ValueError("base generation token components changed")
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": self.maximum_tokens_total,
         }
 
 
@@ -1501,6 +1525,8 @@ async def _prepare_generation_params(
 def _base_structured_generation_budget(
     chapters: list[dict[str, Any]],
     generation_params: Mapping[str, Any] | None,
+    *,
+    runtime: Any | None = None,
 ) -> _BaseGenerationBudget:
     from backend.services.generation.headless_generation import (
         CHAPTER_OUTLINE_STEP,
@@ -1520,7 +1546,8 @@ def _base_structured_generation_budget(
         {} if values.get("allow_failure_retry", True)
         else {"max_provider_retries": 0}
     )
-    runtime = create_generation_runtime(**runtime_kwargs)
+    if runtime is None:
+        runtime = create_generation_runtime(**runtime_kwargs)
     outline_count = sum(not chapter.get("outline") for chapter in chapters)
     state_count = sum(
         str((chapter.get("state_completion") or {}).get("status") or "missing")
@@ -1559,6 +1586,8 @@ def _base_structured_generation_budget(
         ))
     provider_bounds: tuple[ProviderBudgetBound, ...] = ()
     maximum_attempts = 0
+    maximum_input_tokens = 0
+    maximum_output_tokens = 0
     maximum_tokens = 0
     for plan, multiplier in calls:
         call_budget = structured_call_budget(
@@ -1570,18 +1599,32 @@ def _base_structured_generation_budget(
             scale_provider_bounds(call_budget.provider_bounds, multiplier),
         )
         maximum_attempts += call_budget.max_paid_attempts * multiplier
+        maximum_input_tokens += (
+            call_budget.max_input_tokens_per_attempt
+            * call_budget.max_paid_attempts
+            * multiplier
+        )
+        maximum_output_tokens += (
+            call_budget.max_output_tokens_per_attempt
+            * call_budget.max_paid_attempts
+            * multiplier
+        )
         maximum_tokens += call_budget.max_tokens_per_call * multiplier
     return _BaseGenerationBudget(
         maximum_provider_attempts_total=maximum_attempts,
         maximum_tokens_total=maximum_tokens,
         token_bound_known=True,
         provider_bounds=provider_bounds,
+        maximum_input_tokens_total=maximum_input_tokens,
+        maximum_output_tokens_total=maximum_output_tokens,
     )
 
 
 def _plan_work(
     chapters: list[dict[str, Any]],
     generation_params: Mapping[str, Any] | None = None,
+    *,
+    runtime: Any | None = None,
 ) -> dict[str, Any]:
     from backend.services.generation.headless_generation import (
         CHAPTER_OUTLINE_STEP,
@@ -1602,7 +1645,9 @@ def _plan_work(
         prose_completion_module,
     )
 
-    runtime = create_generation_runtime()
+    reuse_runtime = runtime is not None
+    if runtime is None:
+        runtime = create_generation_runtime()
     plans = []
     candidate_chapters = [
         chapter for chapter in chapters if not _has_text(chapter, "content")
@@ -1713,7 +1758,11 @@ def _plan_work(
             else:
                 single_chapters += 1
     return {
-        "attempt_capacity": estimate_worklist_attempt_capacity(chapters),
+        "attempt_capacity": estimate_worklist_attempt_capacity(
+            chapters,
+            generation_params,
+            **({"runtime": runtime} if reuse_runtime else {}),
+        ),
         "providers": sorted({plan.provider_alias for plan in plans}),
         "config_revision": "|".join(revisions),
         "capability_snapshot": "|".join(capabilities),
@@ -1754,6 +1803,8 @@ def _plan_work_with_prose_continuation(
     chapters: list[dict[str, Any]],
     policy: ProseContinuationPolicy,
     generation_params: Mapping[str, Any] | None,
+    *,
+    runtime: Any | None = None,
 ) -> dict[str, Any]:
     """Deepen the existing batch plan with bounded per-scene prose authority."""
     from backend.llm.schemas.novel_pydantic import MAX_CHAPTER_OUTLINE_SCENES
@@ -1768,15 +1819,28 @@ def _plan_work_with_prose_continuation(
         create_generation_runtime,
     )
 
-    base = _plan_work(chapters, generation_params)
+    reuse_runtime = runtime is not None
+    base = _plan_work(
+        chapters,
+        generation_params,
+        **({"runtime": runtime} if reuse_runtime else {}),
+    )
     values = dict(generation_params or {})
-    structured_budget = _base_structured_generation_budget(chapters, values)
+    structured_budget = _base_structured_generation_budget(
+        chapters,
+        values,
+        **({"runtime": runtime} if reuse_runtime else {}),
+    )
     chapters_needing_prose = [
         chapter for chapter in chapters if not _has_text(chapter, "content")
     ]
     strategy = dict(base.get("prose_strategy") or {})
     if not chapters_needing_prose:
-        attempt_capacity = estimate_worklist_attempt_capacity(chapters, values)
+        attempt_capacity = estimate_worklist_attempt_capacity(
+            chapters,
+            values,
+            **({"runtime": runtime} if reuse_runtime else {}),
+        )
         return {
             **base,
             "attempt_capacity": attempt_capacity,
@@ -1785,6 +1849,9 @@ def _plan_work_with_prose_continuation(
                 for item in structured_budget.provider_bounds
             ],
             "base_generation_budget": structured_budget.to_dict(),
+            "base_generation_token_upper_bound": (
+                structured_budget.token_upper_bound()
+            ),
             "generation_params_digest": _digest(values),
             "prose_strategy": {
                 **strategy,
@@ -1820,7 +1887,8 @@ def _plan_work_with_prose_continuation(
         {} if values.get("allow_failure_retry", True)
         else {"max_provider_retries": 0}
     )
-    runtime = create_generation_runtime(**runtime_kwargs)
+    if runtime is None:
+        runtime = create_generation_runtime(**runtime_kwargs)
     prose_plan = runtime.plan_text(
         WorkflowStepTarget(PROSE_WORKFLOW, PROSE_STEP)
     )
@@ -1961,8 +2029,32 @@ def _plan_work_with_prose_continuation(
             structured_budget.token_bound_known and prose_token_bound_known
         ),
         provider_bounds=combined_provider_bounds,
+        maximum_input_tokens_total=(
+            (
+                structured_budget.maximum_input_tokens_total
+                + maximum_base_calls * base_prompt_input_bound
+                + maximum_automatic_calls * continuation_prompt_input_bound
+            )
+            if structured_budget.maximum_input_tokens_total is not None
+            and prose_token_bound_known
+            else None
+        ),
+        maximum_output_tokens_total=(
+            (
+                structured_budget.maximum_output_tokens_total
+                + maximum_base_calls * base_output_token_bound
+                + maximum_automatic_calls * continuation_output_token_bound
+            )
+            if structured_budget.maximum_output_tokens_total is not None
+            and prose_token_bound_known
+            else None
+        ),
     )
-    attempt_capacity = estimate_worklist_attempt_capacity(chapters, values)
+    attempt_capacity = estimate_worklist_attempt_capacity(
+        chapters,
+        values,
+        **({"runtime": runtime} if reuse_runtime else {}),
+    )
     maximum_call_target_words = max(
         maximum_base_call_target_words,
         policy.continuation_target_words,
@@ -1974,6 +2066,9 @@ def _plan_work_with_prose_continuation(
             item.provider_alias for item in combined_provider_bounds
         ],
         "base_generation_budget": base_generation_budget.to_dict(),
+        "base_generation_token_upper_bound": (
+            base_generation_budget.token_upper_bound()
+        ),
         "generation_params_digest": _digest(values),
         "prose_strategy": {
             **strategy,
