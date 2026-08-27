@@ -60,9 +60,9 @@ from backend.services.llm.generation_runtime import (
 
 
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_repair_authorization.v5"
+    "chapter_candidate_repair_authorization.v6"
 )
-CANDIDATE_PIPELINE_REVISION = 31
+CANDIDATE_PIPELINE_REVISION = 32
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v2"
@@ -72,7 +72,9 @@ PROSE_REMEDIATION_SCOPE_KIND = "chapter_prose_candidate"
 PROSE_REMEDIATION_MAX_STEPS = 3
 PROSE_REMEDIATION_MAX_PLANNER_CALLS = 3
 PROSE_REMEDIATION_MAX_TOOL_CALLS = 2
-PROSE_REMEDIATION_DEADLINE_SECONDS = 300
+# Provider windows come from the frozen plans; this margin covers only local
+# scheduling, ledger settlement, and terminal projection work between calls.
+PROSE_REMEDIATION_LOCAL_COMPLETION_MARGIN_SECONDS = 60
 PROSE_REMEDIATION_MAX_PREDISPATCH_RETRIES = 2
 PROSE_REMEDIATION_MAX_PLANNER_REPAIRS = 1
 PROSE_REMEDIATION_MAX_TOOL_RETRIES = 1
@@ -218,6 +220,81 @@ class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
         return self
 
 
+class CandidateRemediationDeadlineBudget(_ClosedAuthorizationModel):
+    schema_version: Literal["candidate_remediation_deadline_budget.v1"]
+    max_planner_calls: _PositiveInt
+    planner_timeout_seconds: _PositiveInt
+    max_tool_calls: _PositiveInt
+    maximum_tool_timeout_seconds: _PositiveInt
+    serial_logical_call_window_seconds: _PositiveInt
+    local_completion_margin_seconds: _PositiveInt
+    deadline_seconds: _PositiveInt
+
+    @model_validator(mode="after")
+    def validate_derived_deadline(self) -> "CandidateRemediationDeadlineBudget":
+        serial_window = (
+            self.max_planner_calls * self.planner_timeout_seconds
+            + self.max_tool_calls * self.maximum_tool_timeout_seconds
+        )
+        if self.serial_logical_call_window_seconds != serial_window:
+            raise ValueError("candidate remediation serial window changed")
+        if self.deadline_seconds != (
+            serial_window + self.local_completion_margin_seconds
+        ):
+            raise ValueError("candidate remediation deadline changed")
+        return self
+
+
+def _required_generation_timeout(
+    plan: CandidateStructuredGenerationPlan,
+    *,
+    label: str,
+) -> int:
+    timeout_seconds = plan.timeout_seconds
+    if timeout_seconds is None:
+        raise ValueError(f"candidate remediation {label} timeout is required")
+    return timeout_seconds
+
+
+def _prose_remediation_deadline_budget(
+    planner_generation: CandidateStructuredGenerationPlan,
+    rewrite_generation: CandidateStructuredGenerationPlan,
+    adherence_generation: CandidateStructuredGenerationPlan,
+) -> CandidateRemediationDeadlineBudget:
+    planner_timeout_seconds = _required_generation_timeout(
+        planner_generation,
+        label="Planner",
+    )
+    maximum_tool_timeout_seconds = max(
+        _required_generation_timeout(
+            rewrite_generation,
+            label="rewrite Tool",
+        ),
+        _required_generation_timeout(
+            adherence_generation,
+            label="adherence Tool",
+        ),
+    )
+    serial_window = (
+        PROSE_REMEDIATION_MAX_PLANNER_CALLS * planner_timeout_seconds
+        + PROSE_REMEDIATION_MAX_TOOL_CALLS * maximum_tool_timeout_seconds
+    )
+    return CandidateRemediationDeadlineBudget(
+        schema_version="candidate_remediation_deadline_budget.v1",
+        max_planner_calls=PROSE_REMEDIATION_MAX_PLANNER_CALLS,
+        planner_timeout_seconds=planner_timeout_seconds,
+        max_tool_calls=PROSE_REMEDIATION_MAX_TOOL_CALLS,
+        maximum_tool_timeout_seconds=maximum_tool_timeout_seconds,
+        serial_logical_call_window_seconds=serial_window,
+        local_completion_margin_seconds=(
+            PROSE_REMEDIATION_LOCAL_COMPLETION_MARGIN_SECONDS
+        ),
+        deadline_seconds=(
+            serial_window + PROSE_REMEDIATION_LOCAL_COMPLETION_MARGIN_SECONDS
+        ),
+    )
+
+
 class CandidateJobGenerationPlan(_ClosedAuthorizationModel):
     """Closed, reconstructable identity for one initial candidate Job call."""
 
@@ -332,6 +409,7 @@ class ProseRemediationAuthorization(_ClosedAuthorizationModel):
         max_length=1,
     )
     allowed_external_data_categories: tuple[str, ...] = Field(max_length=32)
+    deadline_budget: CandidateRemediationDeadlineBudget
     limits: AgentRuntimeLimits
     planner: PlannerDescriptor
     tools: tuple[RuntimeToolDescriptorSnapshot, ...] = Field(
@@ -379,6 +457,13 @@ class ProseRemediationAuthorization(_ClosedAuthorizationModel):
         if self.allowed_external_data_categories != expected_external:
             raise ValueError("candidate remediation external-data allowlist changed")
         _validate_remediation_generation_plans(self)
+        expected_deadline_budget = _prose_remediation_deadline_budget(
+            self.planner_generation,
+            self.rewrite_generation,
+            self.adherence_generation,
+        )
+        if self.deadline_budget != expected_deadline_budget:
+            raise ValueError("candidate remediation deadline budget changed")
         bounds = _prose_remediation_bounds(self)
         expected_limits = AgentRuntimeLimits(
             max_steps=PROSE_REMEDIATION_MAX_STEPS,
@@ -386,7 +471,7 @@ class ProseRemediationAuthorization(_ClosedAuthorizationModel):
             max_tool_calls=PROSE_REMEDIATION_MAX_TOOL_CALLS,
             max_paid_attempts=bounds.paid_attempts,
             token_budget=bounds.tokens,
-            deadline_seconds=PROSE_REMEDIATION_DEADLINE_SECONDS,
+            deadline_seconds=expected_deadline_budget.deadline_seconds,
             max_predispatch_retries=PROSE_REMEDIATION_MAX_PREDISPATCH_RETRIES,
             max_planner_repairs=PROSE_REMEDIATION_MAX_PLANNER_REPAIRS,
             max_tool_retries=PROSE_REMEDIATION_MAX_TOOL_RETRIES,
@@ -405,7 +490,7 @@ class CandidateProviderBudgetBound(_ClosedAuthorizationModel):
 
 
 class CandidateRepairAuthorization(_ClosedAuthorizationModel):
-    schema_version: Literal["chapter_candidate_repair_authorization.v5"]
+    schema_version: Literal["chapter_candidate_repair_authorization.v6"]
     narrative_quality_signal_authorization_digest: _Sha256
     authorization_revision: _PositiveInt
     eligible_chapter_count: _NonNegativeInt
@@ -1450,23 +1535,34 @@ def build_chapter_candidate_repair_authorization(
         planner,
         tools,
     )
-    planner_generation = _runtime_call_projection(
-        remediation_bundle.planner_call,
-        planner,
-        workflow=PROSE_REMEDIATION_WORKFLOW,
-        step=REMEDIATION_PLANNER_STEP,
+    planner_generation = CandidateStructuredGenerationPlan.model_validate(
+        _runtime_call_projection(
+            remediation_bundle.planner_call,
+            planner,
+            workflow=PROSE_REMEDIATION_WORKFLOW,
+            step=REMEDIATION_PLANNER_STEP,
+        )
     )
-    rewrite_generation = _runtime_call_projection(
-        remediation_bundle.rewrite_call,
-        tools[0],
-        workflow=PROSE_REMEDIATION_WORKFLOW,
-        step=PROSE_CANDIDATE_REWRITE_STEP,
+    rewrite_generation = CandidateStructuredGenerationPlan.model_validate(
+        _runtime_call_projection(
+            remediation_bundle.rewrite_call,
+            tools[0],
+            workflow=PROSE_REMEDIATION_WORKFLOW,
+            step=PROSE_CANDIDATE_REWRITE_STEP,
+        )
     )
-    adherence_generation = _runtime_call_projection(
-        remediation_bundle.adherence_call,
-        tools[1],
-        workflow=PROSE_REMEDIATION_WORKFLOW,
-        step=OUTLINE_ADHERENCE_STEP,
+    adherence_generation = CandidateStructuredGenerationPlan.model_validate(
+        _runtime_call_projection(
+            remediation_bundle.adherence_call,
+            tools[1],
+            workflow=PROSE_REMEDIATION_WORKFLOW,
+            step=OUTLINE_ADHERENCE_STEP,
+        )
+    )
+    deadline_budget = _prose_remediation_deadline_budget(
+        planner_generation,
+        rewrite_generation,
+        adherence_generation,
     )
     adherence_projection = CandidateStructuredGenerationPlan.model_validate(
         _structured_plan_projection(
@@ -1510,13 +1606,14 @@ def build_chapter_candidate_repair_authorization(
                 planner_external,
                 tool_external,
             ),
+            "deadline_budget": deadline_budget,
             "limits": {
                 "max_steps": PROSE_REMEDIATION_MAX_STEPS,
                 "max_planner_calls": PROSE_REMEDIATION_MAX_PLANNER_CALLS,
                 "max_tool_calls": PROSE_REMEDIATION_MAX_TOOL_CALLS,
                 "max_paid_attempts": prose_paid_attempts,
                 "token_budget": prose_token_bound,
-                "deadline_seconds": PROSE_REMEDIATION_DEADLINE_SECONDS,
+                "deadline_seconds": deadline_budget.deadline_seconds,
                 "max_predispatch_retries": (
                     PROSE_REMEDIATION_MAX_PREDISPATCH_RETRIES
                 ),
