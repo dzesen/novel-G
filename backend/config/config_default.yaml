@@ -218,31 +218,31 @@ llm:
       steps:
         chapter_outline:
           provider: ""
-          timeout_seconds: null
+          timeout_seconds: 300
     write_chapter_by_ai:
       default_provider: ""
       steps:
         chapter_content:
           provider: ""
-          timeout_seconds: null
+          timeout_seconds: 300
     extract_chapter_state_by_ai:
       default_provider: ""
       steps:
         chapter_state:
           provider: ""
-          timeout_seconds: null
+          timeout_seconds: 180
     remediate_chapter_prose_by_agent:
       default_provider: ""
       steps:
         remediation_planner:
           provider: ""
-          timeout_seconds: null
+          timeout_seconds: 180
         prose_candidate_rewrite:
           provider: ""
-          timeout_seconds: null
+          timeout_seconds: 300
         outline_adherence:
           provider: ""
-          timeout_seconds: null
+          timeout_seconds: 300
     rewrite_chapter_scene_by_agent:
       default_provider: ""
       steps:
