@@ -8,6 +8,11 @@ from typing import Any
 
 TOKENS_PER_WORD_ESTIMATE = 0.65
 MIN_DERIVED_OUTPUT_TOKENS = 256
+# V26 reserves a bounded tail after the nominal word target so the Provider
+# can emit its natural stop instead of being cut off exactly at the estimate.
+# The scene word maximum remains a separate deterministic local gate.
+NATURAL_STOP_HEADROOM_RATIO = 0.25
+MIN_NATURAL_STOP_HEADROOM_TOKENS = 256
 # The rendered prompt is counted in UTF-8 bytes, while this fixed allowance
 # covers Provider framing that is not present in the rendered text.  Keeping
 # it here makes the readiness calculation and the dispatch-time reservation
@@ -79,14 +84,19 @@ def v3_output_token_bound(
     target_words: Any,
     inherited_max_tokens: Any,
 ) -> int:
-    """Return the actual v3 output cap for one call without widening user intent."""
+    """Return the v3.6 output cap with bounded natural-stop headroom."""
     try:
         normalized_target = max(1, int(target_words))
     except (TypeError, ValueError):
         normalized_target = 1
-    derived = max(
+    nominal = max(
         MIN_DERIVED_OUTPUT_TOKENS,
         math.ceil(normalized_target / TOKENS_PER_WORD_ESTIMATE),
     )
+    headroom = max(
+        MIN_NATURAL_STOP_HEADROOM_TOKENS,
+        math.ceil(nominal * NATURAL_STOP_HEADROOM_RATIO),
+    )
+    derived = nominal + headroom
     inherited = positive_token_limit(inherited_max_tokens)
     return derived if inherited is None else min(inherited, derived)

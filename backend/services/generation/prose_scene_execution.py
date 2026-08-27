@@ -780,14 +780,23 @@ def _scene_prompt(
                 f"本场合同字数范围为 {minimum} / {target} / {maximum} 字"
                 "（最低 / 目标 / 最高）；不得用重复内容填充，也不要超过最高值。\n"
             )
+    beat_instruction = ""
+    if (
+        plan.protocol_revision == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+        and isinstance(current_scene.get("beats"), list)
+        and current_scene.get("beats")
+    ):
+        beat_instruction = (
+            "本场 beats 是有顺序的事件合同。先对照已写正文，只完成尚未发生的"
+            " required beats；已经发生的 beat 不得换词重写，收束前不得遗漏其"
+            "动作、反应或结果，也不要在正文中输出 beat_id。\n"
+        )
     if (
         continues_truncated_output
         and prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
     ):
         instruction += TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION
     if prompt_mode == "base":
-        # Keep the initial-call prompt byte-for-byte stable. This slice only
-        # changes continuation framing, never the base generation task.
         return (
             f"{base_prompt}\n\n"
             "【Novel-G 场景正文协议】\n"
@@ -795,6 +804,7 @@ def _scene_prompt(
             f"CONTINUATION_MODE={prompt_mode}\n"
             f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
             f"{contract_budget_instruction}"
+            f"{beat_instruction}"
             "本次只写当前场景，以本段目标为准。\n"
             f"{instruction}\n"
             f"当前场景：{current_scene}\n"
@@ -816,6 +826,7 @@ def _scene_prompt(
         f"CONTINUATION_MODE={prompt_mode}\n"
         f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
         f"{contract_budget_instruction}"
+        f"{beat_instruction}"
         "本次只写当前场景，以本段目标为准。\n"
         f"{instruction}\n"
         "【本场已完成正文】\n"

@@ -86,6 +86,9 @@ from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
+from backend.services.generation.prose_scene_repair import (
+    incomplete_scene_indexes,
+)
 from backend.services.novel.state_fact_accounting import (
     StateFactAccountingError,
     automatic_state_fact_decision,
@@ -3883,6 +3886,18 @@ def _completion_repair_request(
     source: ProseCandidateSource,
     chapter: Mapping[str, Any],
 ) -> ProseCandidateRepairRequest:
+    outline_indexes = _outline_scene_indexes(chapter)
+    try:
+        target_indexes = incomplete_scene_indexes(
+            completion=source.completion,
+            scene_count=len(outline_indexes),
+        )
+    except ValueError as exc:
+        raise ChapterCandidatePipelineBlocked(
+            "正文完成进度不能唯一定位未完成场景",
+            code="candidate_completion_progress_invalid",
+            gate="completion",
+        ) from exc
     return ProseCandidateRepairRequest(
         cycle=cycle,
         source_run_id=source.source_run_id,
@@ -3891,17 +3906,15 @@ def _completion_repair_request(
         trigger="completion",
         reason_codes=("completion_contract_failed",),
         issue_categories=(OutlineIssueCategory.SCENE_COVERAGE,),
-        scene_indexes=_outline_scene_indexes(chapter),
+        scene_indexes=target_indexes,
     )
 
 
-def _adherence_repair_request(
+def _project_adherence_repair_targets(
     *,
-    cycle: int,
-    source: ProseCandidateSource,
     adherence: Mapping[str, Any],
     chapter: Mapping[str, Any],
-) -> ProseCandidateRepairRequest:
+) -> tuple[tuple[OutlineIssueCategory, ...], tuple[int, ...]]:
     categories: list[OutlineIssueCategory] = []
     current_policy = adherence.get("evidence_schema_version") == (
         OUTLINE_ADHERENCE_EVIDENCE_VERSION
@@ -3922,8 +3935,32 @@ def _adherence_repair_request(
                 continue
             categories.append(category)
     expected_indexes = set(_outline_scene_indexes(chapter))
+    outline = chapter.get("outline")
+    outline_scenes = (
+        list(outline.get("scenes") or [])
+        if isinstance(outline, Mapping)
+        else []
+    )
+    scene_index_by_id = {
+        str(scene.get("scene_id") or ""): index
+        for index, scene in enumerate(outline_scenes, start=1)
+        if isinstance(scene, Mapping) and str(scene.get("scene_id") or "")
+    }
     covered_indexes: set[int] = set()
     repair_indexes: set[int] = set()
+    has_global_hard_issue = False
+    if current_policy and isinstance(issues, list):
+        for item in issues:
+            if (
+                not isinstance(item, Mapping)
+                or item.get("severity") not in {"blocker", "major"}
+            ):
+                continue
+            scene_id = str(item.get("scene_id") or "")
+            if scene_id and scene_id in scene_index_by_id:
+                repair_indexes.add(scene_index_by_id[scene_id])
+            elif not scene_id:
+                has_global_hard_issue = True
     coverage = adherence.get("scene_coverage")
     if isinstance(coverage, list):
         for item in coverage:
@@ -3936,10 +3973,30 @@ def _adherence_repair_request(
                 covered_indexes.add(index)
             else:
                 repair_indexes.add(index)
-    repair_indexes.update(expected_indexes - covered_indexes)
-    if repair_indexes:
+    uncovered_indexes = expected_indexes - covered_indexes
+    repair_indexes.update(uncovered_indexes)
+    if has_global_hard_issue:
+        repair_indexes.update(expected_indexes)
+    if uncovered_indexes:
         categories.append(OutlineIssueCategory.SCENE_COVERAGE)
     stable_categories = tuple(dict.fromkeys(categories))
+    return (
+        stable_categories or (OutlineIssueCategory.SCENE_COVERAGE,),
+        tuple(sorted(repair_indexes)),
+    )
+
+
+def _adherence_repair_request(
+    *,
+    cycle: int,
+    source: ProseCandidateSource,
+    adherence: Mapping[str, Any],
+    chapter: Mapping[str, Any],
+) -> ProseCandidateRepairRequest:
+    issue_categories, scene_indexes = _project_adherence_repair_targets(
+        adherence=adherence,
+        chapter=chapter,
+    )
     return ProseCandidateRepairRequest(
         cycle=cycle,
         source_run_id=source.source_run_id,
@@ -3947,9 +4004,8 @@ def _adherence_repair_request(
         source_content_digest=source.source_content_digest,
         trigger="outline_adherence",
         reason_codes=("outline_adherence_failed",),
-        issue_categories=stable_categories
-        or (OutlineIssueCategory.SCENE_COVERAGE,),
-        scene_indexes=tuple(sorted(repair_indexes)),
+        issue_categories=issue_categories,
+        scene_indexes=scene_indexes,
     )
 
 
