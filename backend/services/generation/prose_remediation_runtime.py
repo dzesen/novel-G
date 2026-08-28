@@ -250,7 +250,7 @@ class RemediationAdherenceProviderOutput(
 
 
 class RewriteProseCandidateOutput(_StrictModel):
-    outcome: Literal["rewritten", "stale", "blocked"]
+    outcome: Literal["rewritten", "checkpointed", "stale", "blocked"]
     prose_run_id: str = Field(min_length=1)
     source_revision: int = Field(ge=1)
     candidate_revision: int = Field(ge=1)
@@ -258,6 +258,119 @@ class RewriteProseCandidateOutput(_StrictModel):
     changed: bool
     summary: str = Field(min_length=1, max_length=1_000)
     addressed_categories: tuple[OutlineIssueCategoryValue, ...] = ()
+    resolved_scene_indexes: tuple[int, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+    remaining_scene_indexes: tuple[int, ...] = Field(
+        default=(),
+        max_length=20,
+    )
+
+    @model_validator(mode="after")
+    def validate_checkpoint_projection(self) -> "RewriteProseCandidateOutput":
+        for values in (
+            self.resolved_scene_indexes,
+            self.remaining_scene_indexes,
+        ):
+            if (
+                tuple(sorted(values)) != values
+                or len(set(values)) != len(values)
+                or any(index < 1 or index > 20 for index in values)
+            ):
+                raise ValueError("checkpoint scene indexes are invalid")
+        if self.outcome == "checkpointed":
+            if (
+                not self.changed
+                or not self.resolved_scene_indexes
+                or not self.remaining_scene_indexes
+                or set(self.resolved_scene_indexes).intersection(
+                    self.remaining_scene_indexes
+                )
+            ):
+                raise ValueError("checkpointed rewrite requires strict progress")
+        elif self.resolved_scene_indexes or self.remaining_scene_indexes:
+            raise ValueError("non-checkpoint rewrite cannot project scene progress")
+        return self
+
+
+class ResumableProseCandidateCheckpoint(_StrictModel):
+    schema_version: Literal["resumable_prose_candidate.v1"] = (
+        "resumable_prose_candidate.v1"
+    )
+    source_revision: int = Field(ge=1)
+    source_content_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    repair_root_revision: int = Field(ge=1)
+    repair_root_content_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    candidate_revision: int = Field(ge=2)
+    content_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    agent_run_id: str = Field(min_length=1, max_length=128)
+    issue_categories: tuple[OutlineIssueCategoryValue, ...] = Field(
+        min_length=1,
+        max_length=20,
+    )
+    target_scene_indexes: tuple[int, ...] = Field(
+        min_length=2,
+        max_length=20,
+    )
+    resolved_scene_indexes: tuple[int, ...] = Field(
+        min_length=1,
+        max_length=19,
+    )
+    remaining_scene_indexes: tuple[int, ...] = Field(
+        min_length=1,
+        max_length=19,
+    )
+
+    @model_validator(mode="after")
+    def validate_strict_target_reduction(
+        self,
+    ) -> "ResumableProseCandidateCheckpoint":
+        groups = (
+            self.target_scene_indexes,
+            self.resolved_scene_indexes,
+            self.remaining_scene_indexes,
+        )
+        if any(
+            tuple(sorted(group)) != group
+            or len(set(group)) != len(group)
+            or any(index < 1 or index > 20 for index in group)
+            for group in groups
+        ):
+            raise ValueError("resumable scene checkpoint indexes are invalid")
+        if len(set(self.issue_categories)) != len(self.issue_categories):
+            raise ValueError("resumable checkpoint issue categories are invalid")
+        if (
+            set(self.resolved_scene_indexes).intersection(
+                self.remaining_scene_indexes
+            )
+            or set(self.resolved_scene_indexes).union(
+                self.remaining_scene_indexes
+            )
+            != set(self.target_scene_indexes)
+            or self.candidate_revision != self.source_revision + 1
+            or self.repair_root_revision > self.source_revision
+            or (
+                self.repair_root_revision == self.source_revision
+                and self.repair_root_content_digest
+                != self.source_content_digest
+            )
+            or self.content_digest == self.source_content_digest
+        ):
+            raise ValueError("resumable scene checkpoint made no strict progress")
+        return self
 
 
 class CheckOutlineAdherenceOutput(_StrictModel):
@@ -563,7 +676,11 @@ def _validated_rewrite_receipt_result(
     result = RuntimeToolResult.model_validate(projection)
     if int(receipt.get("source_revision") or 0) != payload.expected_revision:
         raise StaleProseRun("正文修复 receipt 的来源版本不一致")
-    if result.status != "ok" or result.code != "prose_candidate_rewritten":
+    success_codes = {
+        "prose_candidate_rewritten": "rewritten",
+        "prose_candidate_checkpointed": "checkpointed",
+    }
+    if result.status != "ok" or result.code not in success_codes:
         if (
             result.resource_revision is not None
             and result.resource_revision != str(payload.expected_revision)
@@ -577,7 +694,7 @@ def _validated_rewrite_receipt_result(
         return result
     data = RewriteProseCandidateOutput.model_validate(result.data)
     if (
-        data.outcome != "rewritten"
+        data.outcome != success_codes[result.code]
         or data.prose_run_id != context.scope.object_id
         or data.source_revision != payload.expected_revision
         or result.resource_revision != str(data.candidate_revision)
@@ -585,6 +702,36 @@ def _validated_rewrite_receipt_result(
         or int(receipt.get("result_revision") or 0) != data.candidate_revision
     ):
         raise StaleProseRun("正文修复 receipt 的不可变结果投影不一致")
+    expected_status = (
+        "incomplete" if data.outcome == "checkpointed" else "complete"
+    )
+    if str(document.get("status") or "") != expected_status:
+        raise StaleProseRun("正文修复 receipt 的候选状态不一致")
+    if data.outcome == "checkpointed":
+        checkpoint = ResumableProseCandidateCheckpoint.model_validate(
+            (document.get("completion") or {}).get(
+                "resumable_scene_repair"
+            )
+        )
+        if (
+            checkpoint.source_revision != payload.expected_revision
+            or checkpoint.source_content_digest
+            != payload.expected_content_digest
+            or checkpoint.candidate_revision != data.candidate_revision
+            or checkpoint.content_digest != data.content_digest
+            or checkpoint.agent_run_id != context.run_id
+            or checkpoint.issue_categories != payload.issue_categories
+            or checkpoint.target_scene_indexes != payload.scene_indexes
+            or checkpoint.resolved_scene_indexes
+            != data.resolved_scene_indexes
+            or checkpoint.remaining_scene_indexes
+            != data.remaining_scene_indexes
+            or tuple(result.planner_view.get("issue_categories") or ())
+            != checkpoint.issue_categories
+            or tuple(result.planner_view.get("scene_indexes") or ())
+            != checkpoint.remaining_scene_indexes
+        ):
+            raise StaleProseRun("正文修复 checkpoint 的持久投影不一致")
     return result
 
 
@@ -792,6 +939,7 @@ def _planner_prompts(
 5. 只有最新 check 的 planner_view 明确 passed=true，且候选 revision/digest 与该检查一致时，才能 propose_finish，finish_code 固定 candidate_ready；
 6. scope 必须原样复制，不得请求 URL、文件路径、正式写入、资料卡或其他工具；
 7. revision 和 digest 必须来自 goal 或最新 Observation，不得猜测。
+8. 最新 Observation 为 prose_candidate_checkpointed 时，只能用其中的新 revision、digest、issue_categories 和 scene_indexes 再次 rewrite；不得复检、扩展场景或回退旧候选。
 
 运行输入：
 {json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)}
@@ -864,7 +1012,7 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r7-{call.revision[:20]}"
+                f"prose-remediation-planner-r8-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
@@ -1238,8 +1386,31 @@ class ProseRemediationToolApplication:
             SCENE_TRANSITION_CONTRACT_VERSION
         )
         scene_repair_plan: V2SceneRepairPlan | None = None
+        source_checkpoint: ResumableProseCandidateCheckpoint | None = None
         if uses_v2_contract:
             try:
+                persisted_checkpoint = (
+                    run.get("completion") or {}
+                ).get("resumable_scene_repair")
+                if persisted_checkpoint is not None:
+                    source_checkpoint = (
+                        ResumableProseCandidateCheckpoint.model_validate(
+                            persisted_checkpoint
+                        )
+                    )
+                    if (
+                        source_checkpoint.candidate_revision
+                        != payload.expected_revision
+                        or source_checkpoint.content_digest
+                        != payload.expected_content_digest
+                        or source_checkpoint.issue_categories
+                        != payload.issue_categories
+                        or source_checkpoint.remaining_scene_indexes
+                        != payload.scene_indexes
+                    ):
+                        raise ValueError(
+                            "resumable repair must target only remaining scenes"
+                        )
                 scene_repair_plan = build_v2_scene_repair_plan(
                     run=run,
                     current_text=current_text,
@@ -1247,6 +1418,14 @@ class ProseRemediationToolApplication:
                     plan=plan,
                     target_scene_indexes=payload.scene_indexes,
                 )
+                if (
+                    source_checkpoint is not None
+                    and scene_repair_plan.source_failing_scene_indexes
+                    != source_checkpoint.remaining_scene_indexes
+                ):
+                    raise ValueError(
+                        "resumable repair proof does not match remaining scenes"
+                    )
             except (TypeError, ValueError) as exc:
                 return self._stale_rewrite_result(
                     context=context,
@@ -1378,6 +1557,8 @@ class ProseRemediationToolApplication:
             )
         scene_contract_validation: dict[str, Any] | None = None
         scene_repair_evidence: dict[str, Any] = {}
+        checkpointed_scene_repair = False
+        checkpoint_marker: ResumableProseCandidateCheckpoint | None = None
         if uses_v2_contract:
             if not isinstance(output, RewrittenV2ProseProviderOutput):
                 return self._invalid_rewrite_result(
@@ -1416,31 +1597,47 @@ class ProseRemediationToolApplication:
                 "replaced_scene_indexes": list(
                     scene_repair.replaced_scene_indexes
                 ),
+                "resolved_scene_indexes": list(
+                    scene_repair.resolved_scene_indexes
+                ),
+                "remaining_scene_indexes": list(
+                    scene_repair.remaining_scene_indexes
+                ),
+                "can_checkpoint": scene_repair.can_checkpoint,
             }
             if scene_budget_reasons:
-                return RuntimeToolResult(
-                    status="retryable_error",
-                    code="candidate_completion_failed",
-                    planner_view={
-                        "reason_codes": list(scene_budget_reasons),
-                        "candidate_revision": payload.expected_revision,
-                        "content_digest": payload.expected_content_digest,
-                    },
-                    audit_view={
-                        "completion": {
-                            "scene_contract_validation": (
-                                scene_contract_validation
-                            ),
+                if not scene_repair.can_checkpoint:
+                    return RuntimeToolResult(
+                        status="retryable_error",
+                        code="candidate_completion_failed",
+                        planner_view={
+                            "reason_codes": list(scene_budget_reasons),
+                            "candidate_revision": payload.expected_revision,
+                            "content_digest": payload.expected_content_digest,
                         },
-                        **scene_repair_evidence,
-                        "source_revision": payload.expected_revision,
-                    },
-                    resource_revision=str(payload.expected_revision),
-                    resource_digest=payload.expected_content_digest,
-                    usage=usage,
-                    error_summary="改写结果违反逐场字数预算。",
+                        audit_view={
+                            "completion": {
+                                "scene_contract_validation": (
+                                    scene_contract_validation
+                                ),
+                            },
+                            **scene_repair_evidence,
+                            "source_revision": payload.expected_revision,
+                        },
+                        resource_revision=str(payload.expected_revision),
+                        resource_digest=payload.expected_content_digest,
+                        usage=usage,
+                        error_summary="改写结果违反逐场字数预算。",
+                    )
+                checkpointed_scene_repair = True
+                completed_scene_indexes = tuple(
+                    budget.scene_index - 1
+                    for budget in scene_repair_plan.budgets
+                    if budget.scene_index
+                    not in set(scene_repair.remaining_scene_indexes)
                 )
-            completed_scene_indexes = range(plan.scene_count)
+            else:
+                completed_scene_indexes = range(plan.scene_count)
         else:
             if not isinstance(output, RewrittenProseProviderOutput):
                 return self._invalid_rewrite_result(
@@ -1464,61 +1661,147 @@ class ProseRemediationToolApplication:
             outline_revision=str(run["outline_revision"]),
             expected_outline_revision=str(run["outline_revision"]),
         )
-        fatal_completion_reasons = set(draft_completion.reason_codes) - {
-            "scenes_incomplete"
-        }
-        if draft_completion.finish_reason != "stop":
-            fatal_completion_reasons.add(
-                f"finish_reason_{draft_completion.finish_reason}"
-            )
-        if fatal_completion_reasons:
+        if (
+            checkpointed_scene_repair
+            and draft_completion.finish_reason != "stop"
+        ):
             return RuntimeToolResult(
                 status="retryable_error",
                 code="candidate_completion_failed",
                 planner_view={
-                    "reason_codes": sorted(fatal_completion_reasons),
+                    "reason_codes": [
+                        f"finish_reason_{draft_completion.finish_reason}"
+                    ],
                     "candidate_revision": payload.expected_revision,
                     "content_digest": payload.expected_content_digest,
                 },
                 audit_view={
                     "completion": draft_completion.to_dict(),
                     "source_revision": payload.expected_revision,
+                    **scene_repair_evidence,
                 },
                 resource_revision=str(payload.expected_revision),
                 resource_digest=payload.expected_content_digest,
                 usage=usage,
-                error_summary="改写结果未通过正文完整性闸门",
+                error_summary="改写结果未自然结束，不能保存局部检查点。",
             )
-
-        locked_completion = {
-            **draft_completion.to_dict(),
-            "status": "incomplete",
-            "completed_scene_count": 0,
-            "completion_reason": "remediation_verification_required",
-            "reason_codes": list(dict.fromkeys([
-                *draft_completion.reason_codes,
-                "remediation_verification_required",
-            ])),
-            "can_write_formal_prose": False,
-            **(
-                {
-                    "scene_contract_validation": (
-                        scene_contract_validation
-                    )
-                }
-                if scene_contract_validation is not None
-                else {}
-            ),
-        }
+        if not checkpointed_scene_repair:
+            fatal_completion_reasons = set(draft_completion.reason_codes) - {
+                "scenes_incomplete"
+            }
+            if draft_completion.finish_reason != "stop":
+                fatal_completion_reasons.add(
+                    f"finish_reason_{draft_completion.finish_reason}"
+                )
+            if fatal_completion_reasons:
+                return RuntimeToolResult(
+                    status="retryable_error",
+                    code="candidate_completion_failed",
+                    planner_view={
+                        "reason_codes": sorted(fatal_completion_reasons),
+                        "candidate_revision": payload.expected_revision,
+                        "content_digest": payload.expected_content_digest,
+                    },
+                    audit_view={
+                        "completion": draft_completion.to_dict(),
+                        "source_revision": payload.expected_revision,
+                    },
+                    resource_revision=str(payload.expected_revision),
+                    resource_digest=payload.expected_content_digest,
+                    usage=usage,
+                    error_summary="改写结果未通过正文完整性闸门",
+                )
 
         new_digest = chapter_content_digest(rewritten_prose)
+        if checkpointed_scene_repair:
+            assert scene_repair_plan is not None
+            checkpoint_marker = ResumableProseCandidateCheckpoint(
+                source_revision=payload.expected_revision,
+                source_content_digest=payload.expected_content_digest,
+                repair_root_revision=(
+                    source_checkpoint.repair_root_revision
+                    if source_checkpoint is not None
+                    else payload.expected_revision
+                ),
+                repair_root_content_digest=(
+                    source_checkpoint.repair_root_content_digest
+                    if source_checkpoint is not None
+                    else payload.expected_content_digest
+                ),
+                candidate_revision=payload.expected_revision + 1,
+                content_digest=new_digest,
+                agent_run_id=context.run_id,
+                issue_categories=payload.issue_categories,
+                target_scene_indexes=(
+                    scene_repair_plan.target_scene_indexes
+                ),
+                resolved_scene_indexes=(
+                    scene_repair.resolved_scene_indexes
+                ),
+                remaining_scene_indexes=(
+                    scene_repair.remaining_scene_indexes
+                ),
+            )
+            locked_completion = {
+                **draft_completion.to_dict(),
+                "status": "incomplete",
+                "completion_reason": "scene_repair_checkpointed",
+                "reason_codes": list(dict.fromkeys([
+                    *draft_completion.reason_codes,
+                    *scene_budget_reasons,
+                ])),
+                "can_write_formal_prose": False,
+                "scene_progress": [
+                    {
+                        "scene_index": scene_index,
+                        "status": (
+                            "incomplete"
+                            if scene_index + 1
+                            in set(scene_repair.remaining_scene_indexes)
+                            else "complete"
+                        ),
+                    }
+                    for scene_index in range(plan.scene_count)
+                ],
+                "scene_contract_validation": scene_contract_validation,
+                "resumable_scene_repair": checkpoint_marker.model_dump(
+                    mode="json"
+                ),
+            }
+        else:
+            locked_completion = {
+                **draft_completion.to_dict(),
+                "status": "incomplete",
+                "completed_scene_count": 0,
+                "completion_reason": "remediation_verification_required",
+                "reason_codes": list(dict.fromkeys([
+                    *draft_completion.reason_codes,
+                    "remediation_verification_required",
+                ])),
+                "can_write_formal_prose": False,
+                "resumable_scene_repair": None,
+                **(
+                    {
+                        "scene_contract_validation": (
+                            scene_contract_validation
+                        )
+                    }
+                    if scene_contract_validation is not None
+                    else {}
+                ),
+            }
+
         addressed = tuple(
             item
             for item in output.addressed_categories
             if item in payload.issue_categories
         ) or tuple(payload.issue_categories)
         data = RewriteProseCandidateOutput(
-            outcome="rewritten",
+            outcome=(
+                "checkpointed"
+                if checkpointed_scene_repair
+                else "rewritten"
+            ),
             prose_run_id=str(run["_id"]),
             source_revision=payload.expected_revision,
             candidate_revision=payload.expected_revision + 1,
@@ -1526,17 +1809,45 @@ class ProseRemediationToolApplication:
             changed=new_digest != payload.expected_content_digest,
             summary=output.summary,
             addressed_categories=addressed,
+            resolved_scene_indexes=(
+                checkpoint_marker.resolved_scene_indexes
+                if checkpoint_marker is not None
+                else ()
+            ),
+            remaining_scene_indexes=(
+                checkpoint_marker.remaining_scene_indexes
+                if checkpoint_marker is not None
+                else ()
+            ),
+        )
+        result_code = (
+            "prose_candidate_checkpointed"
+            if checkpointed_scene_repair
+            else "prose_candidate_rewritten"
         )
         result = RuntimeToolResult(
             status="ok",
-            code="prose_candidate_rewritten",
+            code=result_code,
             data=data.model_dump(mode="json"),
             planner_view={
-                "observation_kind": "prose_candidate_rewritten",
+                "observation_kind": result_code,
                 "candidate_revision": data.candidate_revision,
                 "content_digest": data.content_digest,
                 "changed": data.changed,
                 "addressed_categories": list(data.addressed_categories),
+                **(
+                    {
+                        "issue_categories": list(
+                            payload.issue_categories
+                        ),
+                        "scene_indexes": list(
+                            data.remaining_scene_indexes
+                        ),
+                        "reason_codes": list(scene_budget_reasons),
+                    }
+                    if checkpointed_scene_repair
+                    else {}
+                ),
             },
             audit_view={
                 "prose_run_id": data.prose_run_id,
@@ -1637,6 +1948,11 @@ class ProseRemediationToolApplication:
                             target_scene_indexes=list(payload.scene_indexes),
                             result_projection=result.model_dump(mode="json"),
                             write_fence_token=fence_token,
+                            candidate_status=(
+                                "incomplete"
+                                if checkpointed_scene_repair
+                                else "complete"
+                            ),
                         )
                     )
                 finally:
@@ -2086,7 +2402,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r12-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r13-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2113,7 +2429,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r12-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r13-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2131,7 +2447,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r12-"
+            "prose-remediation-tools-r13-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

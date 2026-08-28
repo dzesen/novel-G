@@ -22,6 +22,7 @@ from backend.db.repositories.state_candidate_repair_receipt_repository import (
 from backend.services.agent_runtime.contracts import (
     AgentReadinessRequest,
     AgentScope,
+    RuntimeToolResult,
 )
 from backend.services.generation.chapter_candidate_authorization import (
     CandidateRepairAuthorization,
@@ -51,7 +52,12 @@ from backend.services.generation.candidate_repair_contracts import (
 from backend.services.generation.prose_remediation_runtime import (
     PROSE_REMEDIATION_RETRYABLE_REASON_CODES,
     REMEDIATION_SCOPE_KIND,
+    ResumableProseCandidateCheckpoint,
+    RewriteProseCandidateOutput,
     build_prose_remediation_runtime,
+)
+from backend.services.generation.prose_scene_repair import (
+    incomplete_scene_indexes,
 )
 from backend.services.generation.prose_runs import chapter_content_digest
 from backend.services.generation.stable_reason_codes import (
@@ -909,6 +915,123 @@ class ChapterCandidateRepairApplication:
             digest=digest,
         )
 
+    async def _resumable_prose_receipt(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        request: ProseCandidateRepairRequest,
+        agent_run_id: str,
+        usage: Mapping[str, Any],
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> ProseCandidateRepairReceipt | None:
+        """Recover only an exact, persisted non-formal scene checkpoint."""
+
+        run = await self._deps.get_prose_run(
+            request.source_run_id,
+            owner_id,
+        )
+        text = str(run.get("assembled_text") or "")
+        digest = chapter_content_digest(text)
+        completion = dict(run.get("completion") or {})
+        remediation = dict(run.get("remediation") or {})
+        latest = dict(remediation.get("latest_receipt") or {})
+        try:
+            marker = ResumableProseCandidateCheckpoint.model_validate(
+                completion.get("resumable_scene_repair")
+            )
+            result = RuntimeToolResult.model_validate(
+                latest.get("result_projection")
+            )
+            data = RewriteProseCandidateOutput.model_validate(result.data)
+            progress = completion.get("scene_progress")
+            if not isinstance(progress, list):
+                raise ValueError("resumable checkpoint scene progress is missing")
+            remaining = incomplete_scene_indexes(
+                completion=completion,
+                scene_count=len(progress),
+            )
+        except (TypeError, ValueError):
+            return None
+        if (
+            str(run.get("_id") or "") != request.source_run_id
+            or str(run.get("owner_id") or "") != owner_id
+            or str(run.get("novel_id") or "") != novel_id
+            or str(run.get("chapter_id") or "") != chapter_id
+            or str(run.get("status") or "") != "incomplete"
+            or type(run.get("revision")) is not int
+            or run["revision"] != marker.candidate_revision
+            or digest != marker.content_digest
+            or marker.agent_run_id != agent_run_id
+            or marker.source_revision != request.source_run_revision
+            or marker.source_content_digest
+            != request.source_content_digest
+            or marker.issue_categories
+            != tuple(item.value for item in request.issue_categories)
+            or marker.target_scene_indexes != request.scene_indexes
+            or tuple(remaining) != marker.remaining_scene_indexes
+            or completion.get("can_write_formal_prose") is not False
+            or str(completion.get("status") or "") != "incomplete"
+            or str(completion.get("finish_reason") or "") != "stop"
+            or remediation.get("schema_version")
+            != "prose_run_remediation.v1"
+            or int(remediation.get("latest_revision") or 0)
+            != marker.candidate_revision
+            or str(remediation.get("latest_content_digest") or "")
+            != marker.content_digest
+            or remediation.get("verification") is not None
+            or latest.get("schema_version")
+            != "prose_remediation_receipt_pointer.v1"
+            or int(latest.get("source_revision") or 0)
+            != marker.source_revision
+            or int(latest.get("result_revision") or 0)
+            != marker.candidate_revision
+            or result.status != "ok"
+            or result.code != "prose_candidate_checkpointed"
+            or result.resource_revision != str(marker.candidate_revision)
+            or result.resource_digest != marker.content_digest
+            or data.outcome != "checkpointed"
+            or data.prose_run_id != request.source_run_id
+            or data.source_revision != marker.source_revision
+            or data.candidate_revision != marker.candidate_revision
+            or data.content_digest != marker.content_digest
+            or data.resolved_scene_indexes
+            != marker.resolved_scene_indexes
+            or data.remaining_scene_indexes
+            != marker.remaining_scene_indexes
+            or tuple(result.planner_view.get("issue_categories") or ())
+            != marker.issue_categories
+            or tuple(result.planner_view.get("scene_indexes") or ())
+            != marker.remaining_scene_indexes
+        ):
+            return None
+        completion.update({
+            "source_run_id": request.source_run_id,
+            "source_run_revision": marker.candidate_revision,
+            "source_run_digest": marker.content_digest,
+        })
+        source = ProseCandidateSource(
+            text=text,
+            source_run_id=request.source_run_id,
+            source_run_revision=marker.candidate_revision,
+            source_content_digest=marker.content_digest,
+            completion=completion,
+        )
+        generation = ChapterGenerationResult(
+            stage=ChapterGenerationStage.PROSE,
+            value=text,
+            usage=dict(usage),
+            attempts=[dict(item) for item in attempts],
+            truncation={},
+            completion=completion,
+            accepted=False,
+        )
+        return ProseCandidateRepairReceipt(
+            generation=generation,
+            source=source,
+        )
+
     @staticmethod
     def _goal(request: ProseCandidateRepairRequest) -> str:
         categories = ",".join(item.value for item in request.issue_categories)
@@ -1018,6 +1141,24 @@ class ChapterCandidateRepairApplication:
             or view.termination is None
             or view.termination.reason_code != "goal_satisfied"
         ):
+            resumable = await self._resumable_prose_receipt(
+                owner_id=owner_id,
+                novel_id=novel_id,
+                chapter_id=chapter_id,
+                request=request,
+                agent_run_id=str(view.run_id),
+                usage=usage,
+                attempts=attempts,
+            )
+            if resumable is not None:
+                if (
+                    int(view.usage.paid_attempts) != len(attempts)
+                    or int(view.usage.total_tokens) != usage["total_tokens"]
+                ):
+                    raise ValueError(
+                        "candidate repair checkpoint usage evidence diverged"
+                    )
+                return resumable
             raise CandidateRepairRunStopped(
                 f"candidate prose repair stopped with status {view.status}",
                 usage=usage,

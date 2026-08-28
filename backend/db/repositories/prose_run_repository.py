@@ -1467,8 +1467,56 @@ class ProseRunRepository(BaseRepository):
         target_scene_indexes: list[int],
         result_projection: dict[str, Any],
         write_fence_token: str,
+        candidate_status: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """CAS one temporary candidate and publish one bounded receipt pointer."""
+        if candidate_status not in {"complete", "incomplete"}:
+            raise ValueError("正文修复候选状态无效")
+        expected_result_code = (
+            "prose_candidate_checkpointed"
+            if candidate_status == "incomplete"
+            else "prose_candidate_rewritten"
+        )
+        expected_result_revision = int(expected_revision) + 1
+        expected_result_digest = hashlib.sha256(
+            str(assembled_text).encode("utf-8")
+        ).hexdigest()
+        checkpoint = completion.get("resumable_scene_repair")
+        if (
+            completion.get("status") != "incomplete"
+            or completion.get("can_write_formal_prose") is not False
+            or result_projection.get("status") != "ok"
+            or result_projection.get("code") != expected_result_code
+            or result_projection.get("resource_revision")
+            != str(expected_result_revision)
+            or result_projection.get("resource_digest")
+            != expected_result_digest
+            or (
+                candidate_status == "incomplete"
+                and (
+                    not isinstance(checkpoint, dict)
+                    or checkpoint.get("schema_version")
+                    != "resumable_prose_candidate.v1"
+                    or checkpoint.get("source_revision")
+                    != int(expected_revision)
+                    or checkpoint.get("source_content_digest")
+                    != str(source_content_digest)
+                    or checkpoint.get("candidate_revision")
+                    != expected_result_revision
+                    or checkpoint.get("content_digest")
+                    != expected_result_digest
+                    or checkpoint.get("issue_categories")
+                    != list(target_issue_categories)
+                    or not checkpoint.get("resolved_scene_indexes")
+                    or not checkpoint.get("remaining_scene_indexes")
+                )
+            )
+            or (
+                candidate_status == "complete"
+                and checkpoint is not None
+            )
+        ):
+            raise ValueError("正文修复候选状态与本地结果投影不一致")
         receipt_id = self._remediation_receipt_id(
             run_id=run_id,
             owner_id=owner_id,
@@ -1564,7 +1612,7 @@ class ProseRunRepository(BaseRepository):
             query,
             {
                 "$set": {
-                    "status": "complete",
+                    "status": candidate_status,
                     "assembled_text": str(assembled_text),
                     "completion": dict(completion),
                     "updated_at": now,
