@@ -1280,6 +1280,18 @@ class ChapterCandidatePipelineDependencyFailed(RuntimeError):
         return _exception_unattributed_usage_projection(self.progress)
 
 
+def wrap_candidate_pipeline_dependency_failure(
+    progress: ChapterCandidatePipelineProgress,
+    cause: BaseException,
+) -> ChapterCandidatePipelineDependencyFailed:
+    """Preserve the typed cause through the candidate dependency boundary."""
+
+    failure = ChapterCandidatePipelineDependencyFailed(progress)
+    failure.__cause__ = cause
+    failure.__suppress_context__ = True
+    return failure
+
+
 @dataclass(frozen=True)
 class ChapterCandidateCompletionFailureRequest:
     """One in-process, source-bound request to persist a terminal decision."""
@@ -4613,9 +4625,10 @@ class ChapterCandidatePipeline:
             except ChapterCandidatePipelineBlocked as projection_error:
                 projection_error.attach_progress(trace.snapshot())
                 raise projection_error from exc
-            raise ChapterCandidatePipelineDependencyFailed(
-                trace.snapshot()
-            ) from exc
+            raise wrap_candidate_pipeline_dependency_failure(
+                trace.snapshot(),
+                exc,
+            )
 
     async def _run(
         self,

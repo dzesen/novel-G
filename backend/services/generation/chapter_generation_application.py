@@ -22,6 +22,19 @@ from pydantic import (
     field_validator,
 )
 
+from backend.llm.exceptions import (
+    LLMAuthError,
+    LLMConnectionError,
+    LLMError,
+    LLMHTTPStatusError,
+    LLMRateLimitError,
+    LLMResponseError,
+    LLMSchemaError,
+    LLMSchemaUnsupportedError,
+    LLMStructuredRepairError,
+    LLMStructuredValidationError,
+    LLMTimeoutError,
+)
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.services.llm.pre_dispatch_boundaries import (
     pre_dispatch_boundary_code,
@@ -75,6 +88,7 @@ from backend.services.generation.protected_generation_params import (
 )
 from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
+    OutlineAdherenceValidationError,
     assess_outline_adherence_evidence,
     normalize_outline_adherence,
 )
@@ -98,6 +112,7 @@ from backend.services.llm.generation_runtime import (
     PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
+    safe_structured_repair_failure_diagnostics,
 )
 from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.prose_runner import stream_prose
@@ -147,6 +162,145 @@ STATE_WORKFLOW = "extract_chapter_state_by_ai"
 STATE_STEP = "chapter_state"
 PROSE_REMEDIATION_WORKFLOW = "remediate_chapter_prose_by_agent"
 OUTLINE_ADHERENCE_STEP = "outline_adherence"
+
+OutlineAdherenceFailureReason = Literal[
+    "adherence_provider_generation_failed",
+    "adherence_review_invalid",
+    "structured_output_invalid",
+]
+
+_OUTLINE_ADHERENCE_FAILURE_CONTRACT: dict[
+    OutlineAdherenceFailureReason,
+    tuple[str, str],
+] = {
+    "adherence_provider_generation_failed": (
+        "provider_or_transport",
+        "章纲符合度生成调用失败",
+    ),
+    "adherence_review_invalid": (
+        "validation_logic",
+        "章纲符合度证据未通过本地校验",
+    ),
+    "structured_output_invalid": (
+        "validation_logic",
+        "章纲符合度结构化输出未通过本地校验",
+    ),
+}
+
+_OUTLINE_ADHERENCE_PROVIDER_FAILURE_TYPES = (
+    LLMAuthError,
+    LLMConnectionError,
+    LLMHTTPStatusError,
+    LLMRateLimitError,
+    LLMResponseError,
+    LLMSchemaUnsupportedError,
+    LLMTimeoutError,
+)
+
+
+class OutlineAdherenceWorkflowFailed(WorkflowFailed):
+    """Content-free, closed-set evidence for direct adherence failures."""
+
+    def __init__(
+        self,
+        reason_code: OutlineAdherenceFailureReason,
+        *,
+        usage: dict[str, Any] | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        contract = _OUTLINE_ADHERENCE_FAILURE_CONTRACT.get(reason_code)
+        if contract is None:  # defensive runtime guard for untyped callers
+            raise ValueError("unknown outline adherence failure reason")
+        category, message = contract
+        super().__init__(
+            message,
+            usage=usage,
+            attempts=attempts,
+            diagnostics=diagnostics,
+        )
+        self.reason_codes = (reason_code,)
+        self.diagnostic_category = category
+        self.diagnostic_code = reason_code
+        self.diagnostic_evidence = "confirmed"
+
+
+def _outline_adherence_failure_reason(
+    values: Any,
+) -> OutlineAdherenceFailureReason | None:
+    if not isinstance(values, (list, tuple)) or len(values) != 1:
+        return None
+    value = values[0]
+    if value not in _OUTLINE_ADHERENCE_FAILURE_CONTRACT:
+        return None
+    return value
+
+
+def _outline_adherence_generation_reason(
+    error: BaseException,
+    attempts: list[dict[str, Any]],
+) -> list[OutlineAdherenceFailureReason]:
+    if isinstance(
+        error,
+        (LLMStructuredRepairError, LLMStructuredValidationError),
+    ) or (
+        isinstance(error, LLMSchemaError)
+        and not isinstance(error, LLMSchemaUnsupportedError)
+    ):
+        return ["structured_output_invalid"]
+    if not attempts:
+        return []
+    if any(str(item.get("state") or "") != "accounted" for item in attempts):
+        return []
+    if isinstance(error, _OUTLINE_ADHERENCE_PROVIDER_FAILURE_TYPES):
+        return ["adherence_provider_generation_failed"]
+    return []
+
+
+def _outline_adherence_failure_payload(
+    reason_code: OutlineAdherenceFailureReason | None,
+    *,
+    usage: Mapping[str, Any],
+    attempts: list[dict[str, Any]],
+    diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = _OUTLINE_ADHERENCE_FAILURE_CONTRACT.get(reason_code)
+    safe_reason_codes = [reason_code] if contract is not None else []
+    payload = {
+        "success": False,
+        "failed_step": OUTLINE_ADHERENCE_STEP,
+        "error": (
+            contract[1]
+            if contract is not None
+            else "章纲符合度生成调用失败，原因证据不足"
+        ),
+        "usage": dict(usage),
+        "attempts": list(attempts),
+        "reason_codes": safe_reason_codes,
+    }
+    safe_diagnostics = safe_structured_repair_failure_diagnostics(diagnostics)
+    if safe_diagnostics:
+        payload["diagnostics"] = safe_diagnostics
+    return payload
+
+
+def project_outline_adherence_generation_failure(
+    error: BaseException,
+    *,
+    usage: Mapping[str, Any],
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Project only known LLM failures; local programming errors must escape."""
+
+    if not isinstance(error, LLMError):
+        return None
+    reason_codes = _outline_adherence_generation_reason(error, attempts)
+    return _outline_adherence_failure_payload(
+        reason_codes[0] if reason_codes else None,
+        usage=usage,
+        attempts=attempts,
+        diagnostics=getattr(error, "diagnostics", None),
+    )
 
 CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
@@ -687,6 +841,20 @@ class ChapterGenerationApplicationService:
             if event.name == "done" and not event.data.get("success"):
                 failure = event.data
         if failure is not None:
+            if isinstance(prepared, _PreparedOutlineAdherence):
+                reason_code = _outline_adherence_failure_reason(
+                    failure.get("reason_codes")
+                )
+                if reason_code is not None:
+                    raise OutlineAdherenceWorkflowFailed(
+                        reason_code,
+                        usage=(
+                            failure.get("usage")
+                            or failure.get("usage_so_far")
+                        ),
+                        attempts=failure.get("attempts"),
+                        diagnostics=failure.get("diagnostics"),
+                    )
             raise WorkflowFailed(
                 failure.get("error")
                 or f"workflow failed at {failure.get('failed_step')}",
@@ -1400,15 +1568,17 @@ class ChapterGenerationApplicationService:
             raise
         except Exception as exc:
             usage = _runtime_usage(prepared.runtime)
+            attempts = _serialize_attempts(prepared.runtime)
+            failure = project_outline_adherence_generation_failure(
+                exc,
+                usage=usage,
+                attempts=attempts,
+            )
+            if failure is None:
+                raise
             yield ChapterGenerationEvent(
                 name="done",
-                data={
-                    "success": False,
-                    "failed_step": "outline_adherence",
-                    "error": str(exc),
-                    "usage": usage,
-                    "attempts": _serialize_attempts(prepared.runtime),
-                },
+                data=failure,
             )
             return
 
@@ -1442,17 +1612,15 @@ class ChapterGenerationApplicationService:
                 }
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except OutlineAdherenceValidationError:
             usage = generated.usage.model_dump()
             yield ChapterGenerationEvent(
                 name="done",
-                data={
-                    "success": False,
-                    "failed_step": "outline_adherence",
-                    "error": str(exc),
-                    "usage": usage,
-                    "attempts": _serialize_attempts(prepared.runtime),
-                },
+                data=_outline_adherence_failure_payload(
+                    "adherence_review_invalid",
+                    usage=usage,
+                    attempts=_serialize_attempts(prepared.runtime),
+                ),
             )
             return
         usage = generated.usage.model_dump()
