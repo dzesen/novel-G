@@ -299,6 +299,26 @@ def _retryable_failure_observation(
     ).model_dump(mode="json")
 
 
+def _tool_budget_denial_resolution(
+    *,
+    retryable_failure: RuntimeToolResult | None,
+    descriptor: RuntimeToolDescriptor,
+) -> tuple[
+    Literal["paused", "failed"],
+    Literal["budget_exhausted", "tool_failure_exhausted"],
+    dict[str, Any] | None,
+]:
+    """Resolve a denied Tool reservation without losing settled evidence."""
+
+    if retryable_failure is None:
+        return "paused", "budget_exhausted", None
+    return (
+        "failed",
+        "tool_failure_exhausted",
+        _retryable_failure_observation(retryable_failure, descriptor),
+    )
+
+
 def _validate_retryable_failure_observation(
     observation: Mapping[str, Any],
 ) -> RuntimeRetryableFailureObservation:
@@ -4302,6 +4322,7 @@ class AgentRuntime:
             return False
 
         result: RuntimeToolResult | None = None
+        retryable_failure: RuntimeToolResult | None = None
         if latest is not None and latest.get("state") == "settled":
             checkpoint = latest.get("result_checkpoint")
             if not isinstance(checkpoint, Mapping):
@@ -4362,6 +4383,7 @@ class AgentRuntime:
                         now=now,
                     )
                     return False
+                retryable_failure = candidate
                 latest = dict(latest, state="retryable_failure")
             else:
                 result = candidate
@@ -4535,6 +4557,45 @@ class AgentRuntime:
                     now=now,
                 )
             except AgentRuntimeBudgetExceeded:
+                (
+                    budget_denial_status,
+                    budget_denial_reason,
+                    failure_observation,
+                ) = _tool_budget_denial_resolution(
+                    retryable_failure=retryable_failure,
+                    descriptor=descriptor,
+                )
+                if budget_denial_status == "failed":
+                    if failure_observation is None:
+                        raise RuntimeError(
+                            "failed Tool budget denial has no observation"
+                        )
+                    event_key, event_type, event_payload = (
+                        _tool_observed_event_projection(
+                            ordinal=ordinal,
+                            observation=failure_observation,
+                        )
+                    )
+                    await self._event(
+                        run_id=run_id,
+                        event_key=event_key,
+                        event_type=event_type,
+                        payload=event_payload,
+                        step_id=step_id,
+                        now=now,
+                    )
+                    await self._fail_step_and_run(
+                        run_id=run_id,
+                        owner_id=owner_id,
+                        worker_id=worker_id,
+                        lease_epoch=lease_epoch,
+                        step_id=step_id,
+                        expected_step_status=step_status,
+                        reason_code=budget_denial_reason,
+                        failure_observation=failure_observation,
+                        now=now,
+                    )
+                    return False
                 await self._pause_step_and_run(
                     run_id=run_id,
                     owner_id=owner_id,
@@ -4542,7 +4603,7 @@ class AgentRuntime:
                     lease_epoch=lease_epoch,
                     step_id=step_id,
                     expected_step_status=step_status,
-                    reason_code="budget_exhausted",
+                    reason_code=budget_denial_reason,
                     now=now,
                 )
                 return False

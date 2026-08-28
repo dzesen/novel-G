@@ -117,6 +117,7 @@ _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
 _FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r4"
 PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
+    "adherence_provider_generation_failed",
     "adherence_review_invalid",
     "below_minimum_word_ratio",
     "finish_reason_cancelled",
@@ -128,6 +129,7 @@ PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
     "outline_revision_stale",
     "remediation_verification_required",
     "repair_no_progress",
+    "rewrite_provider_generation_failed",
     "rewrite_output_invalid",
     "scene_word_budget_below_minimum",
     "scene_word_budget_exceeded",
@@ -1204,16 +1206,22 @@ class ProseRemediationToolApplication:
             and failure.usage.input_tokens == 0
             and failure.usage.output_tokens == 0
         )
+        code = (
+            f"{operation}_provider_result_unknown"
+            if failure.uncertain
+            else f"{operation}_provider_generation_failed"
+        )
         return RuntimeToolResult(
             status=("uncertain" if failure.uncertain else "retryable_error"),
-            code=(
-                f"{operation}_provider_result_unknown"
-                if failure.uncertain
-                else f"{operation}_provider_generation_failed"
-            ),
+            code=code,
             planner_view={
                 "operation": operation,
                 "known_outcome": not failure.uncertain,
+                **(
+                    {"reason_codes": [code]}
+                    if not failure.uncertain
+                    else {}
+                ),
             },
             audit_view={
                 "operation": operation,
@@ -2425,7 +2433,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r14-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r15-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2452,7 +2460,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r14-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r15-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2470,7 +2478,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r14-"
+            "prose-remediation-tools-r15-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
