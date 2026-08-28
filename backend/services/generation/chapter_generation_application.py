@@ -861,6 +861,7 @@ class ChapterGenerationApplicationService:
                 usage=failure.get("usage") or failure.get("usage_so_far"),
                 attempts=failure.get("attempts"),
                 diagnostics=failure.get("diagnostics"),
+                diagnostic=failure.get("diagnostic"),
             )
         raise WorkflowFailed("chapter generation ended without a successful result")
 

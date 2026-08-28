@@ -425,6 +425,24 @@ class GenerationPlan:
 class StaleGenerationPlan(RuntimeError):
     """计划生成后配置或能力快照发生变化。"""
 
+    diagnostic_category = "source_changed"
+    diagnostic_evidence = "confirmed"
+    provider_request_not_dispatched = True
+
+    _REASON_CODES = {
+        "configuration": "generation_plan_configuration_stale",
+        "capability": "generation_plan_capability_stale",
+    }
+
+    def __init__(self, reason: Literal["configuration", "capability"]) -> None:
+        self.reason = reason
+        self.diagnostic_code = self._REASON_CODES[reason]
+        super().__init__(
+            "Generation plan changed before Provider dispatch."
+            if reason == "configuration"
+            else "Provider capability changed before Provider dispatch."
+        )
+
 
 class UnsupportedStructuredMode(LLMSchemaUnsupportedError):
     """Adapter 明确报告当前结构化模式不受支持，可安全降级。"""
@@ -690,10 +708,14 @@ class GenerationRuntime:
         config_supplier: Callable[[], dict[str, Any]],
         adapter_factory: Callable[[str, int | None], Any],
         attempt_scope: AttemptScope | None = None,
+        secret_revision_supplier: (
+            Callable[[], Mapping[str, Any] | None] | None
+        ) = None,
     ) -> None:
         self._config_supplier = config_supplier
         self._adapter_factory = adapter_factory
         self._attempt_scope = attempt_scope or InMemoryAttemptScope()
+        self._secret_revision_supplier = secret_revision_supplier
         self._last_finish_reason: FinishReason = "unreported"
         self._last_raw_finish_reason = "unreported"
         self._attempt_evidence_errors: list[AttemptEvidenceError] = []
@@ -732,16 +754,128 @@ class GenerationRuntime:
         return self._last_raw_finish_reason
 
     @staticmethod
-    def _revision(config: dict[str, Any]) -> str:
-        explicit = str(config.get("revision") or "")
-        if explicit:
-            return explicit
-        # 自定义/测试 Runtime 没有 SecretVersionStore；fallback 只使用脱敏配置。
-        # 生产 create_generation_runtime 会注入带私有 HMAC 密钥世代的显式 revision。
-        return _redacted_config_revision(config)
+    def _structured_reviewer(
+        config: dict[str, Any],
+    ) -> str | None:
+        llm = config.get("llm", {})
+        policy = llm.get("format_review") if isinstance(llm, dict) else None
+        reviewer: str | None = None
+        if isinstance(policy, dict) and policy.get("mode") == "provider":
+            reviewer = str(policy.get("provider_alias") or "").strip() or None
+            if reviewer:
+                ProviderCatalog(config).resolve(
+                    ExplicitProviderTarget(reviewer)
+                )
+        elif isinstance(policy, dict) and policy.get("mode") == "auto":
+            candidates = [
+                alias
+                for alias, provider in ProviderCatalog(config).providers.items()
+                if isinstance(provider, dict)
+                and provider.get("enabled")
+                and _mode_for_provider(provider)
+                == StructuredOutputMode.SCHEMA_ENFORCED
+            ]
+            if not candidates:
+                raise ValueError(
+                    "Auto format reviewer has no eligible schema-enforced Provider"
+                )
+            reviewer = sorted(candidates)[0]
+        return reviewer
+
+    def _secret_revision_state(self) -> Mapping[str, Any] | None:
+        if self._secret_revision_supplier is None:
+            return None
+        return self._secret_revision_supplier()
 
     @staticmethod
-    def _capability_snapshot(config: dict[str, Any]) -> str:
+    def _target_projection(target: GenerationTarget) -> dict[str, Any]:
+        if isinstance(target, ExplicitProviderTarget):
+            return {
+                "kind": "explicit_provider",
+                "provider_alias": target.provider_alias,
+                "timeout_seconds": target.timeout_seconds,
+            }
+        return {
+            "kind": "workflow_step",
+            "workflow_name": target.workflow_name,
+            "step_name": target.step_name,
+            "provider_alias": target.provider_alias,
+        }
+
+    @staticmethod
+    def _provider_revision_projection(provider: Mapping[str, Any]) -> dict[str, Any]:
+        projected = json.loads(json.dumps(dict(provider)))
+        projected.pop("_capability_profile", None)
+        projected["api_key"] = bool(projected.get("api_key"))
+        return projected
+
+    @staticmethod
+    def _scoped_secret_revision_projection(
+        secret_state: Mapping[str, Any] | None,
+        provider_aliases: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        if secret_state is None:
+            return None
+        generations = secret_state.get("generations")
+        generation_map = generations if isinstance(generations, Mapping) else {}
+        return {
+            "store_id": str(secret_state.get("store_id") or ""),
+            "generations": {
+                f"llm:{alias}": generation_map.get(f"llm:{alias}")
+                for alias in provider_aliases
+            },
+        }
+
+    def _plan_config_revision(
+        self,
+        config: dict[str, Any],
+        *,
+        target: GenerationTarget,
+        resolved: ResolvedProvider,
+        reviewer_alias: str | None,
+        structured: bool,
+    ) -> str:
+        aliases = tuple(
+            sorted({resolved.alias, *([reviewer_alias] if reviewer_alias else [])})
+        )
+        providers = ProviderCatalog(config).providers
+        payload: dict[str, Any] = {
+            "schema_version": "generation_plan_config_scope.v1",
+            "explicit_revision": str(config.get("revision") or ""),
+            "target": self._target_projection(target),
+            "resolved": {
+                "provider_alias": resolved.alias,
+                "timeout_seconds": resolved.timeout_seconds,
+                "reviewer_alias": reviewer_alias,
+            },
+            "providers": {
+                alias: self._provider_revision_projection(providers[alias])
+                for alias in aliases
+            },
+        }
+        if structured:
+            llm = config.get("llm")
+            policy = llm.get("format_review") if isinstance(llm, dict) else None
+            payload["format_review"] = (
+                json.loads(json.dumps(policy))
+                if isinstance(policy, Mapping)
+                else None
+            )
+        secret_projection = self._scoped_secret_revision_projection(
+            self._secret_revision_state(),
+            aliases,
+        )
+        if secret_projection is not None:
+            payload["secret_revision_state"] = secret_projection
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _capability_snapshot(
+        config: dict[str, Any],
+        provider_aliases: tuple[str, ...],
+    ) -> str:
         providers = config.get("llm", {}).get("providers", {})
         payload = {
             alias: {
@@ -751,40 +885,34 @@ class GenerationRuntime:
                 "max_tokens": provider.get("max_tokens"),
                 "cached": provider.get("_capability_profile"),
             }
-            for alias, provider in providers.items()
-            if isinstance(provider, dict)
+            for alias in provider_aliases
+            if isinstance(providers, dict)
+            and isinstance((provider := providers.get(alias)), dict)
         } if isinstance(providers, dict) else {}
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def plan_structured(self, target: GenerationTarget) -> GenerationPlan:
         config = self._config_supplier()
         resolved = ProviderCatalog(config).resolve(target)
-        llm = config.get("llm", {})
-        policy = llm.get("format_review") if isinstance(llm, dict) else None
-        reviewer: str | None = None
-        if isinstance(policy, dict) and policy.get("mode") == "provider":
-            reviewer = str(policy.get("provider_alias") or "").strip() or None
-            if reviewer:
-                ProviderCatalog(config).resolve(ExplicitProviderTarget(reviewer))
-        elif isinstance(policy, dict) and policy.get("mode") == "auto":
-            candidates = [
-                alias for alias, provider in ProviderCatalog(config).providers.items()
-                if isinstance(provider, dict)
-                and provider.get("enabled")
-                and _mode_for_provider(provider) == StructuredOutputMode.SCHEMA_ENFORCED
-            ]
-            if not candidates:
-                raise ValueError("Auto format reviewer has no eligible schema-enforced Provider")
-            reviewer = sorted(candidates)[0]
+        reviewer = self._structured_reviewer(config)
         base_attempts = 3 if _mode_for_provider(resolved.config) == StructuredOutputMode.SCHEMA_ENFORCED else 2
+        aliases = tuple(
+            sorted({resolved.alias, *([reviewer] if reviewer else [])})
+        )
         return GenerationPlan(
             target=target,
             provider_alias=resolved.alias,
             timeout_seconds=resolved.timeout_seconds,
             mode=_mode_for_provider(resolved.config),
             reviewer_alias=reviewer,
-            config_revision=self._revision(config),
-            capability_snapshot=self._capability_snapshot(config),
+            config_revision=self._plan_config_revision(
+                config,
+                target=target,
+                resolved=resolved,
+                reviewer_alias=reviewer,
+                structured=True,
+            ),
+            capability_snapshot=self._capability_snapshot(config, aliases),
             max_semantic_attempts=base_attempts + (1 if reviewer else 0),
             provider_model=str(resolved.config.get("default_model") or ""),
             max_output_tokens=_positive_int(resolved.config.get("max_tokens")),
@@ -802,8 +930,17 @@ class GenerationRuntime:
             timeout_seconds=resolved.timeout_seconds,
             mode=_mode_for_provider(resolved.config),
             reviewer_alias=None,
-            config_revision=self._revision(config),
-            capability_snapshot=self._capability_snapshot(config),
+            config_revision=self._plan_config_revision(
+                config,
+                target=target,
+                resolved=resolved,
+                reviewer_alias=None,
+                structured=False,
+            ),
+            capability_snapshot=self._capability_snapshot(
+                config,
+                (resolved.alias,),
+            ),
             max_semantic_attempts=1,
             provider_model=str(resolved.config.get("default_model") or ""),
             max_output_tokens=_positive_int(resolved.config.get("max_tokens")),
@@ -811,12 +948,42 @@ class GenerationRuntime:
             thinking_mode=_thinking_mode_for(target, resolved),
         )
 
-    def _validate_plan(self, plan: GenerationPlan) -> None:
+    def _validate_plan(
+        self,
+        plan: GenerationPlan,
+        *,
+        structured: bool,
+    ) -> None:
         current = self._config_supplier()
-        if self._revision(current) != plan.config_revision:
-            raise StaleGenerationPlan("Configuration changed after generation planning")
-        if self._capability_snapshot(current) != plan.capability_snapshot:
-            raise StaleGenerationPlan("Provider capabilities changed after generation planning")
+        try:
+            resolved = ProviderCatalog(current).resolve(plan.target)
+            reviewer = (
+                self._structured_reviewer(current) if structured else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise StaleGenerationPlan("configuration") from exc
+        if (
+            resolved.alias != plan.provider_alias
+            or resolved.timeout_seconds != plan.timeout_seconds
+            or reviewer != plan.reviewer_alias
+            or self._plan_config_revision(
+                current,
+                target=plan.target,
+                resolved=resolved,
+                reviewer_alias=reviewer,
+                structured=structured,
+            )
+            != plan.config_revision
+        ):
+            raise StaleGenerationPlan("configuration")
+        aliases = tuple(
+            sorted({resolved.alias, *([reviewer] if reviewer else [])})
+        )
+        if (
+            self._capability_snapshot(current, aliases)
+            != plan.capability_snapshot
+        ):
+            raise StaleGenerationPlan("capability")
 
     @staticmethod
     def _request_kwargs_for_plan(
@@ -978,7 +1145,7 @@ class GenerationRuntime:
         call: Callable[[], Any],
         conservative_tokens: int | None,
     ) -> Any:
-        self._validate_plan(plan)
+        self._validate_plan(plan, structured=True)
         attempt_id = await self._claim_paid_attempt(
             provider,
             phase,
@@ -1040,6 +1207,9 @@ class GenerationRuntime:
         max_structured_raw_output_bytes: int | None = None,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
+        # Reject stale plans before even constructing an adapter.  Every
+        # subsequent paid attempt revalidates again in ``_paid_call``.
+        self._validate_plan(plan, structured=True)
         attempt_offset = len(self.attempts)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
         terminal_adapter = adapter
@@ -1293,7 +1463,7 @@ class GenerationRuntime:
         **gen_kwargs: Any,
     ):
         """流式纯文本入口；取消直接传播，流耗尽后立即记账。"""
-        self._validate_plan(plan)
+        self._validate_plan(plan, structured=False)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
         request_kwargs = self._request_kwargs_for_plan(plan, gen_kwargs)
         reservation_kwargs = dict(request_kwargs)
@@ -1366,10 +1536,10 @@ def create_generation_runtime(
     def supplied_config() -> dict[str, Any]:
         config = deepcopy(get_all_config(force_reload=True))
         secret_store.sync(config)
-        config["revision"] = _redacted_config_revision(
-            config,
-            secret_revision_state=secret_store.revision_state(),
-        )
+        # Generation plans bind only the LLM settings and secret generations
+        # used by their own call.  A global revision would make an unrelated
+        # image-pipeline edit invalidate in-flight prose work.
+        config.pop("revision", None)
         providers = config.get("llm", {}).get("providers", {})
         if isinstance(providers, dict):
             for alias, provider in providers.items():
@@ -1402,6 +1572,7 @@ def create_generation_runtime(
             max_retries=effective_max_provider_retries,
         ),
         attempt_scope=attempt_scope,
+        secret_revision_supplier=secret_store.revision_state,
     )
 
 

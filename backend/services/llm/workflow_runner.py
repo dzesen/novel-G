@@ -33,6 +33,73 @@ logger = logging.getLogger(__name__)
 # 心跳间隔。设定生成单步就要 60–120 秒静默，正文生成更长；
 # 代理与负载均衡通常在 30–60 秒空闲后掐连接，故取远小于此的值。
 KEEPALIVE_SECONDS = 15.0
+WORKFLOW_FAILURE_DIAGNOSTIC_SCHEMA_VERSION = "workflow_failure_diagnostic.v1"
+_WORKFLOW_FAILURE_DIAGNOSTIC_CONTRACT = {
+    "generation_plan_configuration_stale": (
+        "source_changed",
+        "confirmed",
+        True,
+    ),
+    "generation_plan_capability_stale": (
+        "source_changed",
+        "confirmed",
+        True,
+    ),
+}
+
+
+def safe_workflow_failure_diagnostic(value: Any) -> dict[str, Any] | None:
+    """Accept only closed, content-free workflow failure evidence."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "category",
+        "code",
+        "evidence",
+        "provider_request_not_dispatched",
+    }:
+        return None
+    code = str(value.get("code") or "")
+    contract = _WORKFLOW_FAILURE_DIAGNOSTIC_CONTRACT.get(code)
+    if contract is None:
+        return None
+    category, evidence, pre_dispatch = contract
+    expected = {
+        "schema_version": WORKFLOW_FAILURE_DIAGNOSTIC_SCHEMA_VERSION,
+        "category": category,
+        "code": code,
+        "evidence": evidence,
+        "provider_request_not_dispatched": pre_dispatch,
+    }
+    return expected if dict(value) == expected else None
+
+
+def project_workflow_failure_diagnostic(
+    error: BaseException,
+) -> dict[str, Any] | None:
+    code = str(getattr(error, "diagnostic_code", "") or "")
+    contract = _WORKFLOW_FAILURE_DIAGNOSTIC_CONTRACT.get(code)
+    if contract is None:
+        return None
+    category, evidence, pre_dispatch = contract
+    candidate = {
+        "schema_version": WORKFLOW_FAILURE_DIAGNOSTIC_SCHEMA_VERSION,
+        "category": getattr(error, "diagnostic_category", None),
+        "code": code,
+        "evidence": getattr(error, "diagnostic_evidence", None),
+        "provider_request_not_dispatched": bool(
+            getattr(error, "provider_request_not_dispatched", False)
+        ),
+    }
+    if candidate != {
+        "schema_version": WORKFLOW_FAILURE_DIAGNOSTIC_SCHEMA_VERSION,
+        "category": category,
+        "code": code,
+        "evidence": evidence,
+        "provider_request_not_dispatched": pre_dispatch,
+    }:
+        return None
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -367,6 +434,7 @@ async def run_workflow(
             diagnostics = safe_structured_repair_failure_diagnostics(
                 getattr(exc, "diagnostics", None)
             )
+            diagnostic = project_workflow_failure_diagnostic(exc)
             step_failure = {
                 "step": step.key,
                 "status": "error",
@@ -384,6 +452,9 @@ async def run_workflow(
             if diagnostics is not None:
                 step_failure["diagnostics"] = diagnostics
                 done_failure["diagnostics"] = diagnostics
+            if diagnostic is not None:
+                step_failure["diagnostic"] = diagnostic
+                done_failure["diagnostic"] = diagnostic
             yield sse_event(
                 "step",
                 step_failure,
@@ -434,6 +505,7 @@ class WorkflowFailed(Exception):
         usage: dict[str, Any] | None = None,
         attempts: list[dict[str, Any]] | None = None,
         diagnostics: Mapping[str, Any] | None = None,
+        diagnostic: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.usage = usage or {}
@@ -441,7 +513,15 @@ class WorkflowFailed(Exception):
         self.diagnostics = (
             safe_structured_repair_failure_diagnostics(diagnostics) or {}
         )
-        if self.diagnostics:
+        self.diagnostic = safe_workflow_failure_diagnostic(diagnostic) or {}
+        if self.diagnostic:
+            self.diagnostic_category = self.diagnostic["category"]
+            self.diagnostic_code = self.diagnostic["code"]
+            self.diagnostic_evidence = self.diagnostic["evidence"]
+            self.provider_request_not_dispatched = self.diagnostic[
+                "provider_request_not_dispatched"
+            ]
+        elif self.diagnostics:
             self.diagnostic_category = "validation_logic"
             self.diagnostic_code = "structured_output_invalid"
             self.diagnostic_evidence = "confirmed"
@@ -465,6 +545,7 @@ async def run_workflow_to_result(step_key: str, frames: AsyncGenerator[str, None
                     usage=data.get("usage"),
                     attempts=data.get("attempts"),
                     diagnostics=data.get("diagnostics"),
+                    diagnostic=data.get("diagnostic"),
                 )
             result = data.get("result") or {}
             usage = data.get("usage") or {}
