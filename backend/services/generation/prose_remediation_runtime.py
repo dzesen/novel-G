@@ -178,6 +178,8 @@ class RewriteProseCandidateInput(_StrictModel):
             raise ValueError("scene_indexes must be between 1 and 20")
         if len(set(self.scene_indexes)) != len(self.scene_indexes):
             raise ValueError("scene_indexes cannot contain duplicates")
+        if tuple(sorted(self.scene_indexes)) != self.scene_indexes:
+            raise ValueError("scene_indexes must be in ascending order")
         return self
 
 
@@ -702,36 +704,42 @@ def _validated_rewrite_receipt_result(
         or int(receipt.get("result_revision") or 0) != data.candidate_revision
     ):
         raise StaleProseRun("正文修复 receipt 的不可变结果投影不一致")
-    expected_status = (
-        "incomplete" if data.outcome == "checkpointed" else "complete"
-    )
-    if str(document.get("status") or "") != expected_status:
-        raise StaleProseRun("正文修复 receipt 的候选状态不一致")
-    if data.outcome == "checkpointed":
-        checkpoint = ResumableProseCandidateCheckpoint.model_validate(
-            (document.get("completion") or {}).get(
-                "resumable_scene_repair"
-            )
+    document_revision = int(document.get("revision") or 0)
+    if document_revision < data.candidate_revision:
+        raise StaleProseRun("正文修复 receipt 指向尚未存在的候选版本")
+    if document_revision == data.candidate_revision:
+        expected_status = (
+            "incomplete" if data.outcome == "checkpointed" else "complete"
         )
-        if (
-            checkpoint.source_revision != payload.expected_revision
-            or checkpoint.source_content_digest
-            != payload.expected_content_digest
-            or checkpoint.candidate_revision != data.candidate_revision
-            or checkpoint.content_digest != data.content_digest
-            or checkpoint.agent_run_id != context.run_id
-            or checkpoint.issue_categories != payload.issue_categories
-            or checkpoint.target_scene_indexes != payload.scene_indexes
-            or checkpoint.resolved_scene_indexes
-            != data.resolved_scene_indexes
-            or checkpoint.remaining_scene_indexes
-            != data.remaining_scene_indexes
-            or tuple(result.planner_view.get("issue_categories") or ())
-            != checkpoint.issue_categories
-            or tuple(result.planner_view.get("scene_indexes") or ())
-            != checkpoint.remaining_scene_indexes
-        ):
-            raise StaleProseRun("正文修复 checkpoint 的持久投影不一致")
+        if str(document.get("status") or "") != expected_status:
+            raise StaleProseRun("正文修复 receipt 的候选状态不一致")
+        if data.outcome == "checkpointed":
+            checkpoint = ResumableProseCandidateCheckpoint.model_validate(
+                (document.get("completion") or {}).get(
+                    "resumable_scene_repair"
+                )
+            )
+            if (
+                checkpoint.source_revision != payload.expected_revision
+                or checkpoint.source_content_digest
+                != payload.expected_content_digest
+                or checkpoint.candidate_revision != data.candidate_revision
+                or checkpoint.content_digest != data.content_digest
+                or checkpoint.agent_run_id != context.run_id
+                or checkpoint.issue_categories != payload.issue_categories
+                or checkpoint.target_scene_indexes != payload.scene_indexes
+                or checkpoint.resolved_scene_indexes
+                != data.resolved_scene_indexes
+                or checkpoint.remaining_scene_indexes
+                != data.remaining_scene_indexes
+                or tuple(result.planner_view.get("issue_categories") or ())
+                != checkpoint.issue_categories
+                or tuple(result.planner_view.get("scene_indexes") or ())
+                != checkpoint.remaining_scene_indexes
+            ):
+                raise StaleProseRun(
+                    "正文修复 checkpoint 的持久投影不一致"
+                )
     return result
 
 
@@ -1807,7 +1815,11 @@ class ProseRemediationToolApplication:
             candidate_revision=payload.expected_revision + 1,
             content_digest=new_digest,
             changed=new_digest != payload.expected_content_digest,
-            summary=output.summary,
+            summary=(
+                "已保存可恢复的分场修复进展。"
+                if checkpointed_scene_repair
+                else "正文候选已完成本次有界改写，等待后置复核。"
+            ),
             addressed_categories=addressed,
             resolved_scene_indexes=(
                 checkpoint_marker.resolved_scene_indexes
@@ -1993,11 +2005,22 @@ class ProseRemediationToolApplication:
     ) -> RuntimeToolResult:
         del idempotency_key
         try:
-            run, chapter, current_text, assembled = await self._candidate(
+            run, chapter, current_text = await self._candidate_snapshot(
                 context=context,
                 expected_revision=payload.expected_revision,
                 expected_content_digest=payload.expected_content_digest,
             )
+            if (run.get("completion") or {}).get(
+                "resumable_scene_repair"
+            ) is not None:
+                raise StaleProseRun(
+                    "可恢复正文检查点必须先只修复剩余场景"
+                )
+            inputs = await self._deps.fetch_context(
+                context.novel_id,
+                str(run["chapter_id"]),
+            )
+            assembled = self._deps.assemble_context(inputs)
             prompts = self._deps.load_prompts().get(
                 OUTLINE_ADHERENCE_PROMPT_NAME,
                 {},
@@ -2402,7 +2425,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r13-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r14-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2429,7 +2452,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r13-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r14-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2447,7 +2470,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r13-"
+            "prose-remediation-tools-r14-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
