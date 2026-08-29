@@ -62,6 +62,7 @@ from backend.services.generation.chapter_generation_application import (
 from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
     OutlineIssueCategoryValue,
+    OutlineAdherenceValidationError,
     assess_outline_adherence_evidence,
     normalize_outline_adherence,
 )
@@ -1262,7 +1263,11 @@ class ProseRemediationToolApplication:
         usage: RuntimeCallUsage,
         error: Exception,
     ) -> RuntimeToolResult:
-        del error
+        validation_code = (
+            error.code
+            if isinstance(error, OutlineAdherenceValidationError)
+            else "evidence_invalid"
+        )
         return RuntimeToolResult(
             status="retryable_error",
             code="adherence_review_invalid",
@@ -1275,12 +1280,12 @@ class ProseRemediationToolApplication:
                 "prose_run_id": context.scope.object_id,
                 "candidate_revision": payload.expected_revision,
                 "content_digest": payload.expected_content_digest,
-                "validation": "full_scene_coverage_required",
+                "validation_code": validation_code,
             },
             resource_revision=str(payload.expected_revision),
             resource_digest=payload.expected_content_digest,
             usage=usage,
-            error_summary="复检输出未通过完整场景证据校验。",
+            error_summary="复检输出未通过本地证据校验。",
         )
 
     @staticmethod
@@ -2166,8 +2171,9 @@ class ProseRemediationToolApplication:
                 len(actual_scene_indexes) != len(set(actual_scene_indexes))
                 or set(actual_scene_indexes) != expected_scene_indexes
             ):
-                raise ValueError(
-                    "adherence review must cover every outline scene exactly once"
+                raise OutlineAdherenceValidationError(
+                    "adherence review must cover every outline scene exactly once",
+                    code="scene_coverage_mismatch",
                 )
         except (TypeError, ValueError) as exc:
             return self._invalid_adherence_result(
@@ -2460,7 +2466,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"outline-adherence-check-r15-{adherence_call.revision[:20]}"
+                    f"outline-adherence-check-r16-{adherence_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2478,7 +2484,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r15-"
+            "prose-remediation-tools-r16-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

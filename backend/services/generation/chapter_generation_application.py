@@ -90,7 +90,9 @@ from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
     OutlineAdherenceValidationError,
     assess_outline_adherence_evidence,
+    build_outline_adherence_validation_failure_diagnostics,
     normalize_outline_adherence,
+    safe_outline_adherence_validation_failure_diagnostics,
 )
 from backend.scene_contract_versions import (
     MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
@@ -213,12 +215,17 @@ class OutlineAdherenceWorkflowFailed(WorkflowFailed):
         if contract is None:  # defensive runtime guard for untyped callers
             raise ValueError("unknown outline adherence failure reason")
         category, message = contract
+        safe_validation_diagnostics = (
+            safe_outline_adherence_validation_failure_diagnostics(diagnostics)
+        )
         super().__init__(
             message,
             usage=usage,
             attempts=attempts,
             diagnostics=diagnostics,
         )
+        if safe_validation_diagnostics is not None:
+            self.diagnostics = safe_validation_diagnostics
         self.reason_codes = (reason_code,)
         self.diagnostic_category = category
         self.diagnostic_code = reason_code
@@ -279,6 +286,10 @@ def _outline_adherence_failure_payload(
         "reason_codes": safe_reason_codes,
     }
     safe_diagnostics = safe_structured_repair_failure_diagnostics(diagnostics)
+    if safe_diagnostics is None:
+        safe_diagnostics = safe_outline_adherence_validation_failure_diagnostics(
+            diagnostics
+        )
     if safe_diagnostics:
         payload["diagnostics"] = safe_diagnostics
     return payload
@@ -1613,7 +1624,7 @@ class ChapterGenerationApplicationService:
                 }
         except asyncio.CancelledError:
             raise
-        except OutlineAdherenceValidationError:
+        except OutlineAdherenceValidationError as exc:
             usage = generated.usage.model_dump()
             yield ChapterGenerationEvent(
                 name="done",
@@ -1621,6 +1632,11 @@ class ChapterGenerationApplicationService:
                     "adherence_review_invalid",
                     usage=usage,
                     attempts=_serialize_attempts(prepared.runtime),
+                    diagnostics=(
+                        build_outline_adherence_validation_failure_diagnostics(
+                            exc
+                        )
+                    ),
                 ),
             )
             return

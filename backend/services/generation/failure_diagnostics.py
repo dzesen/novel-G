@@ -33,6 +33,9 @@ from backend.services.generation.chapter_repair_policy import RepairComponent
 from backend.services.generation.candidate_manual_takeover import (
     parse_candidate_manual_takeover,
 )
+from backend.services.generation.outline_adherence import (
+    safe_outline_adherence_validation_failure_diagnostics,
+)
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     UncertainProseAttempt,
@@ -837,6 +840,15 @@ def build_failure_diagnostic(
         )
         if declared_reason_codes:
             details["reason_codes"] = declared_reason_codes
+        adherence_validation = (
+            safe_outline_adherence_validation_failure_diagnostics(
+                getattr(declared_failure, "diagnostics", None)
+            )
+        )
+        if adherence_validation is not None:
+            details["validation_code"] = adherence_validation[
+                "validation_code"
+            ]
         termination_reason_code = normalize_stable_reason_code(
             getattr(declared_failure, "termination_reason_code", None)
         )

@@ -65,8 +65,78 @@ OUTLINE_ADHERENCE_SYSTEM_PROMPT = (
 )
 
 
+OUTLINE_ADHERENCE_VALIDATION_FAILURE_SCHEMA_VERSION = (
+    "outline_adherence_validation_failure.v1"
+)
+OUTLINE_ADHERENCE_VALIDATION_CODES = frozenset({
+    "evidence_invalid",
+    "provider_span_bounds_invalid",
+    "provider_span_quote_mismatch",
+    "provider_span_hash_mismatch",
+    "provider_span_order_invalid",
+    "provider_evidence_schema_invalid",
+    "provider_evidence_version_unknown",
+    "outline_contract_version_mismatch",
+    "source_run_missing",
+    "source_revision_invalid",
+    "source_digest_mismatch",
+    "beat_coverage_mismatch",
+    "target_scene_unknown",
+    "target_beat_unknown",
+    "target_beat_duplicate",
+    "target_scene_beat_mismatch",
+    "target_beat_order_invalid",
+    "forbidden_condition_reference_invalid",
+    "repetition_contract_reference_invalid",
+    "quality_scene_unknown",
+    "quality_profile_coverage_mismatch",
+    "quality_signal_invalid",
+    "local_issue_projection_invalid",
+    "scene_coverage_mismatch",
+})
+
+
 class OutlineAdherenceValidationError(ValueError):
     """章纲符合度证据不足以解锁正式正文。"""
+
+    def __init__(self, message: str, *, code: str = "evidence_invalid") -> None:
+        if code not in OUTLINE_ADHERENCE_VALIDATION_CODES:
+            raise ValueError("unknown outline adherence validation code")
+        super().__init__(message)
+        self.code = code
+
+
+def build_outline_adherence_validation_failure_diagnostics(
+    error: OutlineAdherenceValidationError,
+) -> dict[str, str]:
+    return {
+        "schema_version": OUTLINE_ADHERENCE_VALIDATION_FAILURE_SCHEMA_VERSION,
+        "failure_type": "adherence_evidence_invalid",
+        "validation_code": error.code,
+    }
+
+
+def safe_outline_adherence_validation_failure_diagnostics(
+    value: Any,
+) -> dict[str, str] | None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "failure_type",
+        "validation_code",
+    }:
+        return None
+    if value.get("schema_version") != (
+        OUTLINE_ADHERENCE_VALIDATION_FAILURE_SCHEMA_VERSION
+    ) or value.get("failure_type") != "adherence_evidence_invalid":
+        return None
+    validation_code = str(value.get("validation_code") or "")
+    if validation_code not in OUTLINE_ADHERENCE_VALIDATION_CODES:
+        return None
+    return {
+        "schema_version": OUTLINE_ADHERENCE_VALIDATION_FAILURE_SCHEMA_VERSION,
+        "failure_type": "adherence_evidence_invalid",
+        "validation_code": validation_code,
+    }
 
 
 def _outline_contract_digest(outline: Mapping[str, Any]) -> str:
@@ -95,7 +165,10 @@ def _span_bounds(
         or end <= start
         or end > len(prose)
     ):
-        raise OutlineAdherenceValidationError("正文证据 span 边界无效")
+        raise OutlineAdherenceValidationError(
+            "正文证据 span 边界无效",
+            code="provider_span_bounds_invalid",
+        )
     quote = prose[start:end]
     return start, end, quote
 
@@ -107,7 +180,10 @@ def _canonicalize_provider_span(
 ) -> dict[str, Any]:
     start, end, quote = _span_bounds(span, prose=prose)
     if span.get("quote") != quote:
-        raise OutlineAdherenceValidationError("正文证据 quote 与偏移原文不匹配")
+        raise OutlineAdherenceValidationError(
+            "正文证据 quote 与偏移原文不匹配",
+            code="provider_span_quote_mismatch",
+        )
     quote_hash = hashlib.sha256(quote.encode("utf-8")).hexdigest()
     return {"start": start, "end": end, "quote_hash": quote_hash}
 
@@ -120,7 +196,10 @@ def _validate_span(
     start, end, quote = _span_bounds(span, prose=prose)
     quote_hash = hashlib.sha256(quote.encode("utf-8")).hexdigest()
     if span.get("quote_hash") != quote_hash:
-        raise OutlineAdherenceValidationError("正文证据 quote hash 不匹配")
+        raise OutlineAdherenceValidationError(
+            "正文证据 quote hash 不匹配",
+            code="provider_span_hash_mismatch",
+        )
     return {"start": start, "end": end, "quote_hash": quote_hash}
 
 
@@ -204,7 +283,8 @@ def _canonical_provider_spans(
         key=lambda value: (value["start"], value["end"]),
     ):
         raise OutlineAdherenceValidationError(
-            f"{subject} 正文证据 span 顺序无效"
+            f"{subject} 正文证据 span 顺序无效",
+            code="provider_span_order_invalid",
         )
     return canonical
 
@@ -222,27 +302,46 @@ def assess_outline_adherence_evidence(
 
     if outline.get("scene_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
         raise OutlineAdherenceValidationError(
-            "legacy_v1 章纲不能生成 V4 符合度证据"
+            "legacy_v1 章纲不能生成 V4 符合度证据",
+            code="outline_contract_version_mismatch",
         )
     try:
         parsed = ChapterOutlineAdherenceEvidenceV4Schema.model_validate(result)
     except ValidationError as exc:
-        raise OutlineAdherenceValidationError("V4 符合度证据结构无效") from exc
+        raise OutlineAdherenceValidationError(
+            "V4 符合度证据结构无效",
+            code="provider_evidence_schema_invalid",
+        ) from exc
     if parsed.schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
-        raise OutlineAdherenceValidationError("V4 符合度证据版本未知")
+        raise OutlineAdherenceValidationError(
+            "V4 符合度证据版本未知",
+            code="provider_evidence_version_unknown",
+        )
     if parsed.outline_contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
-        raise OutlineAdherenceValidationError("V4 符合度证据没有绑定当前章纲合同版本")
+        raise OutlineAdherenceValidationError(
+            "V4 符合度证据没有绑定当前章纲合同版本",
+            code="outline_contract_version_mismatch",
+        )
 
     run_id = str(source_prose_run_id or "").strip()
     if not run_id:
-        raise OutlineAdherenceValidationError("V4 符合度证据缺少正文运行身份")
+        raise OutlineAdherenceValidationError(
+            "V4 符合度证据缺少正文运行身份",
+            code="source_run_missing",
+        )
     if (
         type(source_prose_run_revision) is not int
         or source_prose_run_revision < 0
     ):
-        raise OutlineAdherenceValidationError("V4 符合度证据正文版本无效")
+        raise OutlineAdherenceValidationError(
+            "V4 符合度证据正文版本无效",
+            code="source_revision_invalid",
+        )
     if source_content_digest != chapter_content_digest(prose):
-        raise OutlineAdherenceValidationError("V4 符合度证据正文摘要不匹配")
+        raise OutlineAdherenceValidationError(
+            "V4 符合度证据正文摘要不匹配",
+            code="source_digest_mismatch",
+        )
 
     scenes = list(outline.get("scenes") or [])
     expected = [
@@ -253,7 +352,8 @@ def assess_outline_adherence_evidence(
     actual = [(item.scene_id, item.beat_id) for item in parsed.beat_evidence]
     if not expected or actual != expected:
         raise OutlineAdherenceValidationError(
-            "V4 beat 证据身份或顺序没有精确覆盖当前章纲"
+            "V4 beat 证据身份或顺序没有精确覆盖当前章纲",
+            code="beat_coverage_mismatch",
         )
 
     canonical_beats: list[dict[str, Any]] = []
@@ -293,25 +393,30 @@ def assess_outline_adherence_evidence(
     ) -> None:
         if scene_id is not None and scene_id not in known_scene_ids:
             raise OutlineAdherenceValidationError(
-                f"{subject} 引用了未知 scene_id"
+                f"{subject} 引用了未知 scene_id",
+                code="target_scene_unknown",
             )
         if any(beat_id not in known_beat_ids for beat_id in beat_ids):
             raise OutlineAdherenceValidationError(
-                f"{subject} 引用了未知 beat_id"
+                f"{subject} 引用了未知 beat_id",
+                code="target_beat_unknown",
             )
         if len(beat_ids) != len(set(beat_ids)):
             raise OutlineAdherenceValidationError(
-                f"{subject} beat 引用不得重复"
+                f"{subject} beat 引用不得重复",
+                code="target_beat_duplicate",
             )
         if scene_id is not None and any(
             beat_scene_by_id[beat_id] != scene_id for beat_id in beat_ids
         ):
             raise OutlineAdherenceValidationError(
-                f"{subject} beat 引用与 scene_id 不匹配"
+                f"{subject} beat 引用与 scene_id 不匹配",
+                code="target_scene_beat_mismatch",
             )
         if beat_ids != sorted(beat_ids, key=beat_order.__getitem__):
             raise OutlineAdherenceValidationError(
-                f"{subject} beat 引用顺序无效"
+                f"{subject} beat 引用顺序无效",
+                code="target_beat_order_invalid",
             )
 
     canonical_findings: list[dict[str, Any]] = []
@@ -332,7 +437,8 @@ def assess_outline_adherence_evidence(
                 for condition_id in finding.condition_ids
             ):
                 raise OutlineAdherenceValidationError(
-                    "forbidden finding 没有引用当前场景的客观禁止条件"
+                    "forbidden finding 没有引用当前场景的客观禁止条件",
+                    code="forbidden_condition_reference_invalid",
                 )
         if finding.category == OutlineIssueCategory.EVENT_REPETITION.value:
             scene = scene_by_id[finding.scene_id or ""]
@@ -341,7 +447,8 @@ def assess_outline_adherence_evidence(
                 or scene.get("repetition_policy") != "forbid"
             ):
                 raise OutlineAdherenceValidationError(
-                    "repetition finding 没有引用当前场景的客观重复合同"
+                    "repetition finding 没有引用当前场景的客观重复合同",
+                    code="repetition_contract_reference_invalid",
                 )
         canonical_findings.append(
             {
@@ -361,7 +468,8 @@ def assess_outline_adherence_evidence(
             and observation.scene_id not in known_scene_ids
         ):
             raise OutlineAdherenceValidationError(
-                "quality dimension 引用了未知 scene_id"
+                "quality dimension 引用了未知 scene_id",
+                code="quality_scene_unknown",
             )
         canonical_quality.append(
             {
@@ -400,7 +508,8 @@ def assess_outline_adherence_evidence(
     ]
     if actual_profile_scene_ids != expected_profile_scene_ids:
         raise OutlineAdherenceValidationError(
-            "V4 质量画像没有按顺序精确覆盖当前章纲场景"
+            "V4 质量画像没有按顺序精确覆盖当前章纲场景",
+            code="quality_profile_coverage_mismatch",
         )
     canonical_quality_profiles = [
         {
@@ -424,7 +533,8 @@ def assess_outline_adherence_evidence(
         )
     except NarrativeQualitySignalError as exc:
         raise OutlineAdherenceValidationError(
-            "V4 叙事质量旁路证据无效"
+            "V4 叙事质量旁路证据无效",
+            code="quality_signal_invalid",
         ) from exc
 
     required_by_id = {
@@ -656,7 +766,8 @@ def assess_outline_adherence_evidence(
         ).model_dump(mode="python")
     except ValidationError as exc:  # local construction must fail closed
         raise OutlineAdherenceValidationError(
-            "V4 本地问题策略投影无效"
+            "V4 本地问题策略投影无效",
+            code="local_issue_projection_invalid",
         ) from exc
 
 
