@@ -30,6 +30,9 @@ from backend.services.generation.chapter_candidate_pipeline import (
     ChapterCandidatePipelineBlocked,
 )
 from backend.services.generation.chapter_repair_policy import RepairComponent
+from backend.services.generation.candidate_manual_takeover import (
+    parse_candidate_manual_takeover,
+)
 from backend.services.generation.prose_generation import (
     ProseContinuationLimit,
     UncertainProseAttempt,
@@ -315,6 +318,13 @@ def _event_matches_pause_reason(
             and code == "attempt_capacity_exhausted"
         )
     if pause_reason == "incomplete_scene":
+        raw_takeover = job.get("candidate_manual_takeover")
+        if raw_takeover is not None:
+            try:
+                takeover = parse_candidate_manual_takeover(raw_takeover)
+            except (TypeError, ValueError):
+                return False
+            return takeover.failure_event_id == str(event.get("event_id") or "")
         return is_diagnostic and category == "model_output_incomplete"
     if pause_reason == "outline_adherence_manual_review":
         return bool(

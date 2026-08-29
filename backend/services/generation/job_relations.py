@@ -47,6 +47,19 @@ def related_prose_run_ids(job: Mapping[str, Any]) -> tuple[str, ...]:
             if isinstance(checkpoint, Mapping):
                 add_source(checkpoint.get("source"))
 
+    active_takeover = job.get("candidate_manual_takeover")
+    if isinstance(active_takeover, Mapping):
+        add_source(active_takeover.get("source"))
+
+    takeover_events = job.get("candidate_manual_takeover_events")
+    if isinstance(takeover_events, list):
+        for event in takeover_events[-MAX_RELATED_PROSE_RUN_IDS:]:
+            if not isinstance(event, Mapping):
+                continue
+            takeover = event.get("takeover")
+            if isinstance(takeover, Mapping):
+                add_source(takeover.get("source"))
+
     progress = job.get("progress")
     if isinstance(progress, list):
         for entry in progress[-MAX_RELATED_PROSE_RUN_IDS:]:

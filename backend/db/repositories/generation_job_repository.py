@@ -49,6 +49,14 @@ from backend.services.generation.candidate_repair_contracts import (
     parse_candidate_pipeline_progress,
     validate_candidate_pipeline_completion_chain,
 )
+from backend.services.generation.candidate_manual_takeover import (
+    MAX_CANDIDATE_MANUAL_TAKEOVER_EVENTS,
+    CandidateManualTakeoverResolutionV1,
+    CandidateManualTakeoverV1,
+    parse_candidate_manual_takeover,
+    parse_candidate_manual_takeover_resolution,
+    validate_candidate_manual_takeover_binding,
+)
 from backend.services.generation.job_execution import (
     JOB_EXECUTION_LEASE_SECONDS,
     JobExecutionLeaseLost,
@@ -70,6 +78,8 @@ MAX_ACTIVE_TOKEN_RESERVATIONS = 32
 BOOK_COMPLETION_PUBLICATION_LEASE_SECONDS = 30
 BOOK_COMPLETION_PUBLICATION_SCHEMA = "book_completion_audit_publication.v1"
 _ATOMIC_JOB_FIELDS = frozenset({
+    "candidate_manual_takeover",
+    "candidate_manual_takeover_events",
     "candidate_pipeline_checkpoints",
     "chapter_completion_decisions",
     "completion_audit",
@@ -248,6 +258,11 @@ def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
         )
     if document.get("job_mutation_recovery") is not None:
         raise ValueError("Job mutation recovery binding must start empty")
+    if document.get("candidate_manual_takeover") is not None:
+        raise ValueError("Candidate manual takeover binding must start empty")
+    takeover_events = document.get("candidate_manual_takeover_events", [])
+    if not isinstance(takeover_events, list) or takeover_events:
+        raise ValueError("Candidate manual takeover ledger must start empty")
     decisions = document.get("chapter_completion_decisions", [])
     if not isinstance(decisions, list) or decisions:
         raise ValueError("Chapter completion decision ledger must start empty")
@@ -2605,6 +2620,118 @@ class GenerationJobRepository:
             "Job mutation completion lost its revision fence"
         )
 
+    async def pause_candidate_pipeline_for_manual_takeover(
+        self,
+        job_id: str,
+        *,
+        takeover: CandidateManualTakeoverV1,
+        expected_checkpoints: Sequence[Any],
+    ) -> bool:
+        """Atomically bind one incomplete candidate to an explicit author handoff."""
+
+        try:
+            binding = parse_candidate_manual_takeover(takeover)
+            checkpoints = validate_candidate_manual_takeover_binding(
+                binding,
+                expected_checkpoints,
+            )
+        except (TypeError, ValueError) as exc:
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate manual takeover evidence is invalid"
+            ) from exc
+        if binding.job_id != str(job_id):
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate manual takeover Job identity is invalid"
+            )
+        checkpoint_values = [
+            checkpoint.model_dump(mode="json") for checkpoint in checkpoints
+        ]
+        binding_value = binding.model_dump(mode="json")
+        confirmation = {
+            "status": "candidate_manual_takeover_required",
+            "requires_confirmation": True,
+            "chapter_id": binding.chapter_id,
+            "code": binding.termination_reason_code,
+            "reason_codes": list(binding.reason_codes),
+            "next_step": binding.next_step,
+        }
+        error = {
+            "step": "candidate_pipeline",
+            "chapter_id": binding.chapter_id,
+            "message": "Candidate prose requires bounded manual completion",
+            "reason_codes": list(binding.reason_codes),
+            "next_step": binding.next_step,
+        }
+        result = await self._collection_update_one(
+            {
+                "$and": [
+                    {
+                        "_id": to_object_id(job_id),
+                        "novel_id": to_object_id(binding.novel_id),
+                        "is_deleted": False,
+                        "status": "running",
+                        "active_slot": "global",
+                        "current_chapter_id": binding.chapter_id,
+                        "current_failure_event_id": binding.failure_event_id,
+                        "authorization_revision": (
+                            binding.authorization_revision
+                        ),
+                        "expected_narrative_revision": (
+                            binding.expected_narrative_revision
+                        ),
+                        "readiness.digest": binding.readiness_digest,
+                        "candidate_pipeline_checkpoints": checkpoint_values,
+                        "state_dispatch_resolution": None,
+                    },
+                    {
+                        "$or": [
+                            {"candidate_manual_takeover": {"$exists": False}},
+                            {"candidate_manual_takeover": None},
+                        ]
+                    },
+                ]
+            },
+            {
+                "$set": {
+                    "status": "paused",
+                    "pause_reason": "incomplete_scene",
+                    "current_chapter_id": binding.chapter_id,
+                    "active_slot": None,
+                    "error": error,
+                    "authorization_confirmation_required": confirmation,
+                    "candidate_manual_takeover": binding_value,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        current = await self.get_job(job_id)
+        current_readiness = current.get("readiness")
+        if (
+            current.get("status") == "paused"
+            and current.get("pause_reason") == "incomplete_scene"
+            and current.get("active_slot") is None
+            and str(current.get("novel_id") or "") == binding.novel_id
+            and current.get("current_chapter_id") == binding.chapter_id
+            and current.get("current_failure_event_id")
+            == binding.failure_event_id
+            and current.get("authorization_revision")
+            == binding.authorization_revision
+            and current.get("expected_narrative_revision")
+            == binding.expected_narrative_revision
+            and isinstance(current_readiness, Mapping)
+            and current_readiness.get("digest") == binding.readiness_digest
+            and current.get("state_dispatch_resolution") is None
+            and current.get("candidate_manual_takeover") == binding_value
+            and current.get("candidate_pipeline_checkpoints")
+            == checkpoint_values
+        ):
+            return True
+        raise CandidatePipelineCheckpointConflict(
+            "Candidate manual takeover lost its checkpoint fence"
+        )
+
     async def update_job_authorization(
         self,
         job_id: str,
@@ -2620,6 +2747,9 @@ class GenerationJobRepository:
         resolved_job_mutation_recovery: (
             JobMutationRecoveryBindingV1 | None
         ) = None,
+        resolved_candidate_manual_takeover: (
+            CandidateManualTakeoverResolutionV1 | None
+        ) = None,
     ) -> bool:
         """Rebind readiness and its revision cursor in one fenced update."""
 
@@ -2634,6 +2764,20 @@ class GenerationJobRepository:
                 raise ValueError(
                     "Resolved generation job mutation recovery is invalid"
                 ) from exc
+        resolved_takeover: CandidateManualTakeoverResolutionV1 | None = None
+        if resolved_candidate_manual_takeover is not None:
+            try:
+                resolved_takeover = parse_candidate_manual_takeover_resolution(
+                    resolved_candidate_manual_takeover
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Resolved candidate manual takeover is invalid"
+                ) from exc
+        if resolved_binding is not None and resolved_takeover is not None:
+            raise ValueError(
+                "Generation job cannot resolve two recovery bindings at once"
+            )
         if (
             (previous_revision is not None and type(previous_revision) is not int)
             or type(next_revision) is not int
@@ -2667,13 +2811,62 @@ class GenerationJobRepository:
                 "Resolved generation job mutation recovery does not match "
                 "the previous authorization"
             )
+        if resolved_takeover is not None:
+            takeover = resolved_takeover.takeover
+            if (
+                takeover.job_id != str(job_id)
+                or takeover.expected_narrative_revision != previous_revision
+                or takeover.authorization_revision
+                != previous_authorization_revision
+                or takeover.readiness_digest != previous_readiness_digest
+                or resolved_takeover.narrative_revision != next_revision
+            ):
+                raise ValueError(
+                    "Resolved candidate manual takeover does not match "
+                    "the previous authorization"
+                )
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
             "is_deleted": False,
             "status": previous_status,
             "active_slot": previous_active_slot,
-            "candidate_pipeline_checkpoints": [],
         }
+        resolved_checkpoint_values: list[dict[str, Any]] | None = None
+        if resolved_takeover is not None:
+            current = await self.get_job(job_id)
+            try:
+                current_takeover = parse_candidate_manual_takeover(
+                    current.get("candidate_manual_takeover")
+                )
+                resolved_checkpoints = validate_candidate_manual_takeover_binding(
+                    current_takeover,
+                    current.get("candidate_pipeline_checkpoints"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise CandidatePipelineCheckpointConflict(
+                    "Candidate manual takeover recovery binding is invalid"
+                ) from exc
+            if current_takeover != resolved_takeover.takeover:
+                raise CandidatePipelineCheckpointConflict(
+                    "Candidate manual takeover recovery binding changed"
+                )
+            resolved_checkpoint_values = [
+                checkpoint.model_dump(mode="json")
+                for checkpoint in resolved_checkpoints
+            ]
+            query.update({
+                "novel_id": to_object_id(current_takeover.novel_id),
+                "pause_reason": "incomplete_scene",
+                "current_chapter_id": current_takeover.chapter_id,
+                "current_failure_event_id": current_takeover.failure_event_id,
+                "candidate_manual_takeover": current_takeover.model_dump(
+                    mode="json"
+                ),
+                "candidate_pipeline_checkpoints": resolved_checkpoint_values,
+                "state_dispatch_resolution": None,
+            })
+        else:
+            query["candidate_pipeline_checkpoints"] = []
         if resolved_binding is None:
             query["$or"] = [
                 {"job_mutation_recovery": {"$exists": False}},
@@ -2710,17 +2903,37 @@ class GenerationJobRepository:
         unset_fields = {"execution_lease": ""}
         if resolved_binding is not None:
             unset_fields["job_mutation_recovery"] = ""
+        if resolved_takeover is not None:
+            unset_fields["candidate_manual_takeover"] = ""
+        set_fields = {
+            **dict(fields),
+            "expected_narrative_revision": next_revision,
+            "updated_at": get_utc_now(),
+        }
+        update: dict[str, Any] = {
+            "$inc": {"execution_epoch": 1},
+            "$unset": unset_fields,
+            "$set": set_fields,
+        }
+        if resolved_takeover is not None:
+            set_fields.update({
+                "candidate_pipeline_checkpoints": [],
+                "current_chapter_id": None,
+                "current_failure_event_id": None,
+            })
+            takeover_event = {
+                **resolved_takeover.model_dump(mode="json"),
+                "resolved_at": get_utc_now(),
+            }
+            update["$push"] = {
+                "candidate_manual_takeover_events": {
+                    "$each": [takeover_event],
+                    "$slice": -MAX_CANDIDATE_MANUAL_TAKEOVER_EVENTS,
+                }
+            }
         result = await self._collection_update_one(
             query,
-            {
-                "$inc": {"execution_epoch": 1},
-                "$unset": unset_fields,
-                "$set": {
-                    **dict(fields),
-                    "expected_narrative_revision": next_revision,
-                    "updated_at": get_utc_now(),
-                }
-            },
+            update,
         )
         if result.modified_count == 1:
             return True
@@ -3148,6 +3361,12 @@ class GenerationJobRepository:
                         "state_dispatch_resolution": None,
                     },
                     epoch_query,
+                    {
+                        "$or": [
+                            {"candidate_manual_takeover": {"$exists": False}},
+                            {"candidate_manual_takeover": None},
+                        ]
+                    },
                 ]
             },
             {

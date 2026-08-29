@@ -181,9 +181,11 @@ export function currentJobStatusByProseRun(
   ));
   for (const job of ordered) {
     if (TERMINAL_STATUSES.has(job.status)) continue;
-    const proseRunIds = unique(chapterProgressEntries(job.progress)
-      .map((entry) => entry.incomplete_prose?.source_run_id ?? "")
-      .filter(Boolean));
+    const proseRunIds = unique([
+      ...(job.related_prose_run_ids ?? []),
+      ...chapterProgressEntries(job.progress)
+        .map((entry) => entry.incomplete_prose?.source_run_id ?? ""),
+    ].filter(Boolean));
     for (const proseRunId of proseRunIds) {
       if (!result[proseRunId]) {
         result[proseRunId] = job.status;

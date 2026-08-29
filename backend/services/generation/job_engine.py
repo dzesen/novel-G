@@ -26,6 +26,9 @@ from backend.services.generation.candidate_repair_contracts import (
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
 )
+from backend.services.generation.candidate_manual_takeover import (
+    project_candidate_manual_takeover,
+)
 from backend.services.generation.chapter_pipeline import (
     ChapterOutcome,
     ChapterPipelineFailed,
@@ -554,6 +557,39 @@ async def _handle_candidate_chapter_failure(
     source_changed = source_changed or (
         candidate_code == "candidate_narrative_revision_changed"
     )
+    readiness = latest.get("readiness")
+    readiness_digest = (
+        readiness.get("digest") if isinstance(readiness, Mapping) else None
+    )
+    manual_takeover = None
+    if (
+        not has_uncertain
+        and not source_changed
+        and not authorization_scope_increased
+        and not adherence_manual_review
+        and isinstance(checkpoints, list)
+        and isinstance(readiness_digest, str)
+    ):
+        manual_takeover = project_candidate_manual_takeover(
+            exc,
+            novel_id=str(latest.get("novel_id") or ""),
+            job_id=str(latest.get("_id") or job_id),
+            chapter_id=chapter_id,
+            readiness_digest=readiness_digest,
+            authorization_revision=latest.get("authorization_revision"),
+            expected_narrative_revision=latest.get(
+                "expected_narrative_revision"
+            ),
+            failure_event_id=str(diagnostic.get("event_id") or ""),
+            checkpoints=checkpoints,
+        )
+    if manual_takeover is not None:
+        await repo.pause_candidate_pipeline_for_manual_takeover(
+            job_id,
+            takeover=manual_takeover,
+            expected_checkpoints=checkpoints,
+        )
+        return
     fields = {
         "status": (
             "interrupted"

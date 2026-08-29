@@ -47,6 +47,11 @@ from backend.services.generation.candidate_repair_contracts import (
     JobMutationReceiptV1,
     StateDispatchResolutionV3,
 )
+from backend.services.generation.candidate_manual_takeover import (
+    CandidateManualTakeoverResolutionV1,
+    parse_candidate_manual_takeover,
+    validate_candidate_manual_takeover_binding,
+)
 from backend.services.generation.job_execution import (
     JOB_EXECUTION_LEASE_SECONDS,
     JobExecutionLeaseLost,
@@ -112,7 +117,10 @@ from backend.services.generation.book_structure_initialization import (
     inspect_book_structure_initialization,
 )
 from backend.services.generation.readiness import generation_readiness_module
-from backend.services.novel.state_completion import state_completion_module
+from backend.services.novel.state_completion import (
+    chapter_content_digest,
+    state_completion_module,
+)
 from backend.services.novel.state_proposal import StaleStatePreview, state_proposal_module
 from backend.services.novel.emergent_reference_card_candidates import (
     emergent_reference_card_candidate_module,
@@ -698,6 +706,8 @@ def _new_job_doc(
         "usage_attempt_summaries": [],
         "attempt_slots": [],
         "attempt_reservation": None,
+        "candidate_manual_takeover": None,
+        "candidate_manual_takeover_events": [],
         "candidate_pipeline_checkpoints": [],
         "chapter_completion_decisions": [],
         "reference_card_auto_creation_events": [],
@@ -1380,6 +1390,81 @@ class GenerationJobService:
             or ""
         )
         return prose_state != "partial_manual_required"
+
+    @staticmethod
+    async def _candidate_manual_takeover_resolution(
+        job: Mapping[str, Any],
+    ) -> CandidateManualTakeoverResolutionV1 | None:
+        """Return the exact manual completion proof, or None while unfinished."""
+
+        raw_takeover = job.get("candidate_manual_takeover")
+        if raw_takeover is None:
+            return None
+        try:
+            takeover = parse_candidate_manual_takeover(raw_takeover)
+            validate_candidate_manual_takeover_binding(
+                takeover,
+                job.get("candidate_pipeline_checkpoints"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Generation job candidate manual takeover binding is invalid"
+            ) from exc
+        readiness = job.get("readiness")
+        readiness_digest = (
+            readiness.get("digest")
+            if isinstance(readiness, Mapping)
+            else None
+        )
+        if (
+            takeover.job_id != str(job.get("_id") or "")
+            or takeover.novel_id != str(job.get("novel_id") or "")
+            or takeover.chapter_id
+            != str(job.get("current_chapter_id") or "")
+            or takeover.readiness_digest
+            != str(readiness_digest or "")
+            or takeover.authorization_revision
+            != job.get("authorization_revision")
+            or takeover.expected_narrative_revision
+            != job.get("expected_narrative_revision")
+            or takeover.failure_event_id
+            != str(job.get("current_failure_event_id") or "")
+            or job.get("status") != "paused"
+            or job.get("pause_reason") != "incomplete_scene"
+        ):
+            raise ValueError(
+                "Generation job candidate manual takeover snapshot changed"
+            )
+        chapter = await chapter_repo.get_chapter_by_id(takeover.chapter_id)
+        if str(chapter.get("novel_id") or "") != takeover.novel_id:
+            raise ValueError(
+                "Candidate manual takeover chapter belongs to another novel"
+            )
+        content = str(chapter.get("content") or "")
+        acceptance = chapter.get("prose_acceptance")
+        if (
+            not content.strip()
+            or chapter.get("status") != "completed"
+            or not isinstance(acceptance, Mapping)
+            or acceptance.get("state") != "manual_complete"
+            or acceptance.get("content_origin") not in {None, "manual"}
+        ):
+            return None
+        digest = chapter_content_digest(content)
+        if acceptance.get("content_digest") != digest:
+            return None
+        current_revision = await narrative_revision_store.current(
+            takeover.novel_id
+        )
+        try:
+            return CandidateManualTakeoverResolutionV1(
+                schema_version="candidate_manual_takeover_resolution.v1",
+                takeover=takeover,
+                manual_content_digest=digest,
+                narrative_revision=current_revision,
+            )
+        except ValueError:
+            return None
 
     @staticmethod
     def _pending_scene_can_use_new_policy(
@@ -2451,6 +2536,15 @@ class GenerationJobService:
             raise ValueError(
                 "存在结果不确定的 Provider 请求，请先选择重试或跳过"
             )
+        if job.get("candidate_manual_takeover") is not None:
+            resolution = await (
+                GenerationJobService._candidate_manual_takeover_resolution(job)
+            )
+            if resolution is None:
+                raise ValueError(
+                    "当前候选已转人工接管；请先在章节编辑器中补完并标记完成，"
+                    "再重新预检"
+                )
         authorization = dict(job.get("prose_continuation_authorization") or {})
         stored_policy = ProseContinuationPolicy.from_mapping(
             authorization.get("policy")
@@ -2795,6 +2889,20 @@ class GenerationJobService:
                         "候选检查点绑定的 narrative revision 已失效；"
                         "请终止该作业并以新 readiness 启动 successor 作业"
                     )
+            resolved_candidate_manual_takeover: (
+                CandidateManualTakeoverResolutionV1 | None
+            ) = None
+            if job.get("candidate_manual_takeover") is not None:
+                resolved_candidate_manual_takeover = await (
+                    GenerationJobService._candidate_manual_takeover_resolution(
+                        job
+                    )
+                )
+                if resolved_candidate_manual_takeover is None:
+                    raise ValueError(
+                        "当前候选已转人工接管；请先在章节编辑器中补完并标记完成，"
+                        "再重新预检并继续"
+                    )
             if confirm_uncertain_retry and skip_uncertain:
                 raise ValueError(
                     "confirm_uncertain_retry and skip_uncertain are mutually exclusive"
@@ -3053,6 +3161,15 @@ class GenerationJobService:
                         if type(stored_revision) is int and stored_revision >= 0
                         else None
                     )
+                if (
+                    resolved_candidate_manual_takeover is not None
+                    and reauthorized_revision
+                    != resolved_candidate_manual_takeover.narrative_revision
+                ):
+                    raise ValueError(
+                        "Candidate manual takeover resolution is stale against "
+                        "the accepted readiness"
+                    )
                 remaining_capacity = max(
                     int(
                         (accepted_readiness.get("planning") or {}).get(
@@ -3217,6 +3334,10 @@ class GenerationJobService:
                     update_authorization_kwargs[
                         "resolved_job_mutation_recovery"
                     ] = resolved_job_mutation_recovery
+                if resolved_candidate_manual_takeover is not None:
+                    update_authorization_kwargs[
+                        "resolved_candidate_manual_takeover"
+                    ] = resolved_candidate_manual_takeover
                 await generation_job_repo.update_job_authorization(
                     job_id,
                     resume_fields,

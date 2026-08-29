@@ -101,10 +101,14 @@ class CandidateRepairRunStopped(RuntimeError):
         termination_reason_code: str | None = None,
         reason_codes: Sequence[str] = (),
         reason_evidence_expected: bool = False,
+        repair_trigger: str | None = None,
     ) -> None:
+        if repair_trigger not in {None, "completion", "outline_adherence", "state"}:
+            raise ValueError("candidate repair trigger is invalid")
         super().__init__(message)
         self.usage = dict(usage)
         self.attempts = [dict(item) for item in attempts]
+        self.repair_trigger = repair_trigger
         self.termination_reason_code = normalize_stable_reason_code(
             termination_reason_code
         )
@@ -1170,6 +1174,7 @@ class ChapterCandidateRepairApplication:
                 ),
                 reason_codes=_stopped_agent_reason_codes(view),
                 reason_evidence_expected=True,
+                repair_trigger=request.trigger,
             )
         if (
             int(view.usage.paid_attempts) != len(attempts)

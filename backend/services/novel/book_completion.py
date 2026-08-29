@@ -1534,6 +1534,7 @@ class BookCompletionAudit:
             if (
                 latest_job.get("candidate_pipeline_checkpoints")
                 or latest_job.get("job_mutation_recovery") is not None
+                or latest_job.get("candidate_manual_takeover") is not None
             ):
                 issues.append(
                     BookCompletionIssue(
