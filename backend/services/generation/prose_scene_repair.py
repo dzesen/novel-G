@@ -99,6 +99,13 @@ class V2SceneBudget:
 
 
 @dataclass(frozen=True)
+class V2SourceSceneNormalization:
+    provider_word_count: int
+    discarded_word_count: int
+    normalization_boundary: Literal["sentence", "word"] | None
+
+
+@dataclass(frozen=True)
 class V2SceneRepairTarget:
     scene_id: str
     scene_index: int
@@ -108,10 +115,19 @@ class V2SceneRepairTarget:
     right_context_head: str
 
     def to_prompt_dict(self) -> dict[str, Any]:
+        word_budget = self.outline_scene.get("word_budget")
         return {
             "scene_id": self.scene_id,
             "scene_index": self.scene_index,
             "outline_scene": dict(self.outline_scene),
+            "word_budget": (
+                dict(word_budget)
+                if isinstance(word_budget, Mapping)
+                else {}
+            ),
+            "current_word_count": count_chapter_words(
+                self.current_prose
+            ),
             "current_prose": self.current_prose,
             "left_context_tail": self.left_context_tail,
             "right_context_head": self.right_context_head,
@@ -122,6 +138,10 @@ class V2SceneRepairTarget:
 class V2SceneRepairPlan:
     budgets: tuple[V2SceneBudget, ...]
     source_scene_texts: tuple[str, ...]
+    source_scene_normalizations: tuple[
+        V2SourceSceneNormalization,
+        ...,
+    ]
     source_failure_reason_codes_by_scene: tuple[tuple[str, ...], ...]
     source_failing_scene_indexes: tuple[int, ...]
     requested_scene_indexes: tuple[int, ...]
@@ -346,10 +366,7 @@ def validate_v2_scene_contract_proof(
             normalization_boundary=entry.normalization_boundary,
             budget=budget,
         )
-        if reasons and (
-            not allow_incomplete
-            or set(reasons) != {"scene_word_budget_below_minimum"}
-        ):
+        if reasons and not allow_incomplete:
             raise ValueError(
                 "V2 scene budget proof failed deterministic validation"
             )
@@ -462,6 +479,71 @@ def _scene_texts_from_segments(
     )
 
 
+def _source_scene_normalizations_from_segments(
+    *,
+    segments: Sequence[Mapping[str, Any]],
+    scene_texts: Sequence[str],
+) -> tuple[V2SourceSceneNormalization, ...]:
+    discarded_by_scene = [0 for _text in scene_texts]
+    boundaries_by_scene: list[set[str]] = [
+        set() for _text in scene_texts
+    ]
+    for segment in segments:
+        if not isinstance(segment, Mapping):
+            raise ValueError("persisted prose segment is invalid")
+        scene_index = segment.get("scene_index")
+        if (
+            type(scene_index) is not int
+            or not 0 <= scene_index < len(scene_texts)
+        ):
+            raise ValueError("persisted prose segment scene identity is invalid")
+        trim_fields_present = any(
+            field in segment
+            for field in (
+                "word_budget_trimmed",
+                "word_budget_original_words",
+                "word_budget_discarded_words",
+                "word_budget_trim_boundary",
+            )
+        )
+        if not trim_fields_present:
+            continue
+        text = str(segment.get("text") or "").strip()
+        retained_words = count_chapter_words(text)
+        original_words = segment.get("word_budget_original_words")
+        discarded_words = segment.get("word_budget_discarded_words")
+        boundary = segment.get("word_budget_trim_boundary")
+        if (
+            segment.get("word_budget_trimmed") is not True
+            or type(original_words) is not int
+            or type(discarded_words) is not int
+            or discarded_words <= 0
+            or original_words != retained_words + discarded_words
+            or boundary not in {"sentence", "word"}
+        ):
+            raise ValueError(
+                "persisted prose segment trim evidence is invalid"
+            )
+        discarded_by_scene[scene_index] += discarded_words
+        boundaries_by_scene[scene_index].add(str(boundary))
+
+    normalizations: list[V2SourceSceneNormalization] = []
+    for scene_index, scene_text in enumerate(scene_texts):
+        discarded_words = discarded_by_scene[scene_index]
+        boundaries = boundaries_by_scene[scene_index]
+        boundary: Literal["sentence", "word"] | None = None
+        if discarded_words:
+            boundary = "word" if "word" in boundaries else "sentence"
+        normalizations.append(V2SourceSceneNormalization(
+            provider_word_count=(
+                count_chapter_words(scene_text) + discarded_words
+            ),
+            discarded_word_count=discarded_words,
+            normalization_boundary=boundary,
+        ))
+    return tuple(normalizations)
+
+
 def _local_budget_pause_reasons_by_scene(
     *,
     completion: Mapping[str, Any],
@@ -528,6 +610,7 @@ def _source_scene_evidence(
     tuple[str, ...],
     tuple[int, ...],
     tuple[tuple[str, ...], ...],
+    tuple[V2SourceSceneNormalization, ...],
 ]:
     completion = run.get("completion")
     if not isinstance(completion, Mapping):
@@ -566,12 +649,20 @@ def _source_scene_evidence(
             budget_reasons=budget_reasons,
             pause_reasons=pause_reasons,
         )
+        normalizations = tuple(
+            V2SourceSceneNormalization(
+                provider_word_count=entry.provider_word_count,
+                discarded_word_count=entry.discarded_word_count,
+                normalization_boundary=entry.normalization_boundary,
+            )
+            for entry in proof.scenes
+        )
         failing = tuple(
             budget.scene_index
             for budget, reasons in zip(budgets, failure_reasons, strict=True)
             if reasons
         )
-        return scene_texts, failing, failure_reasons
+        return scene_texts, failing, failure_reasons, normalizations
 
     segments = run.get("segments")
     if isinstance(segments, list) and segments:
@@ -600,12 +691,16 @@ def _source_scene_evidence(
             budget_reasons=budget_reasons,
             pause_reasons=pause_reasons,
         )
+        normalizations = _source_scene_normalizations_from_segments(
+            segments=segments,
+            scene_texts=scene_texts,
+        )
         failing = tuple(
             budget.scene_index
             for budget, reasons in zip(budgets, failure_reasons, strict=True)
             if reasons
         )
-        return scene_texts, failing, failure_reasons
+        return scene_texts, failing, failure_reasons, normalizations
 
     if plan.scene_count == 1 and current_text:
         budget = budgets[0]
@@ -620,7 +715,16 @@ def _source_scene_evidence(
             pause_reasons=pause_reasons,
         )
         failing = ((budget.scene_index,) if failure_reasons[0] else ())
-        return (current_text,), failing, failure_reasons
+        return (
+            (current_text,),
+            failing,
+            failure_reasons,
+            (V2SourceSceneNormalization(
+                provider_word_count=count_chapter_words(current_text),
+                discarded_word_count=0,
+                normalization_boundary=None,
+            ),),
+        )
     raise ValueError("V2 candidate has no closed per-scene source evidence")
 
 
@@ -660,6 +764,7 @@ def build_v2_scene_repair_plan(
         source_scene_texts,
         source_failing_scene_indexes,
         source_failure_reason_codes_by_scene,
+        source_scene_normalizations,
     ) = _source_scene_evidence(
         run=run,
         current_text=current_text,
@@ -708,6 +813,7 @@ def build_v2_scene_repair_plan(
     return V2SceneRepairPlan(
         budgets=budgets,
         source_scene_texts=source_scene_texts,
+        source_scene_normalizations=source_scene_normalizations,
         source_failure_reason_codes_by_scene=(
             source_failure_reason_codes_by_scene
         ),
@@ -765,9 +871,12 @@ def apply_v2_scene_replacements(
             normalization_boundary = normalized.boundary
         else:
             scene_text = repair_plan.source_scene_texts[zero_based_index]
-            provider_word_count = count_chapter_words(scene_text)
-            discarded_word_count = 0
-            normalization_boundary = None
+            normalization = repair_plan.source_scene_normalizations[
+                zero_based_index
+            ]
+            provider_word_count = normalization.provider_word_count
+            discarded_word_count = normalization.discarded_word_count
+            normalization_boundary = normalization.normalization_boundary
         if not scene_text and budget.scene_index in target_indexes:
             raise ValueError("V2 repaired scene cannot be empty")
 

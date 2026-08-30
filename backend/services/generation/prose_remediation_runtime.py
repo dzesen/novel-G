@@ -6,10 +6,18 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, ClassVar, Literal, Mapping
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    create_model,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 
 from backend.db.errors import NotFoundError
 from backend.db.narrative_revision import narrative_revision_store
@@ -28,6 +36,7 @@ from backend.llm.prompts.prompt_selector import (
     OUTLINE_ADHERENCE_PROMPT_NAME,
     load_prompt_config,
 )
+from backend.llm.exceptions import LLMStructuredRepairError
 from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineAdherenceEvidenceV4Schema,
     ChapterOutlineAdherenceResultSchema,
@@ -98,7 +107,9 @@ from backend.services.llm.generation_runtime import (
     PromptPlan,
     WorkflowStepTarget,
     create_generation_runtime,
+    safe_structured_repair_failure_diagnostics,
 )
+from backend.services.novel.chapter_service import count_chapter_words
 from backend.services.novel.state_completion import chapter_content_digest
 
 
@@ -134,6 +145,7 @@ PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
     "remediation_verification_required",
     "repair_no_progress",
     "rewrite_provider_generation_failed",
+    "rewrite_scene_minimum_validation_failed",
     "rewrite_output_invalid",
     "scene_word_budget_below_minimum",
     "scene_word_budget_exceeded",
@@ -246,6 +258,50 @@ class RewrittenV2ProseProviderOutput(_StrictModel):
     addressed_categories: tuple[OutlineIssueCategoryValue, ...] = Field(
         default=(),
         max_length=20,
+    )
+
+
+class _MinimumBoundRewrittenSceneProseProviderOutput(
+    RewrittenSceneProseProviderOutput
+):
+    minimum_words: ClassVar[int] = 1
+
+    @field_validator("prose")
+    @classmethod
+    def validate_minimum_words(cls, value: str) -> str:
+        if count_chapter_words(value) < cls.minimum_words:
+            raise PydanticCustomError(
+                "scene_word_budget_below_minimum",
+                "scene prose is below its authorized minimum",
+            )
+        return value
+
+
+def _v2_rewrite_provider_schema(
+    *,
+    repair_plan: V2SceneRepairPlan,
+    max_semantic_attempts: int,
+) -> type[BaseModel]:
+    """Use an already-authorized semantic retry for one short scene."""
+
+    if (
+        int(max_semantic_attempts) < 2
+        or len(repair_plan.targets) != 1
+    ):
+        return RewrittenV2ProseProviderOutput
+    target = repair_plan.targets[0]
+    budget = repair_plan.budgets[target.scene_index - 1]
+
+    class _BoundScene(_MinimumBoundRewrittenSceneProseProviderOutput):
+        minimum_words: ClassVar[int] = budget.minimum
+
+    return create_model(
+        "BudgetBoundRewrittenV2ProseProviderOutput",
+        __base__=RewrittenV2ProseProviderOutput,
+        scenes=(
+            tuple[_BoundScene, ...],
+            Field(min_length=1, max_length=1),
+        ),
     )
 
 
@@ -446,6 +502,7 @@ class _FrozenStructuredCallFailure(RuntimeError):
         *,
         usage: RuntimeCallUsage,
         uncertain: bool,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(
             "provider result is unknown"
@@ -454,6 +511,11 @@ class _FrozenStructuredCallFailure(RuntimeError):
         )
         self.usage = usage
         self.uncertain = bool(uncertain)
+        self.diagnostics = (
+            safe_structured_repair_failure_diagnostics(diagnostics)
+            if diagnostics is not None
+            else None
+        )
 
 
 @dataclass(frozen=True)
@@ -545,6 +607,11 @@ class FrozenStructuredCall:
                     ),
                 ),
                 uncertain=uncertain_after > uncertain_before,
+                diagnostics=(
+                    exc.diagnostics
+                    if isinstance(exc, LLMStructuredRepairError)
+                    else None
+                ),
             ) from exc
 
     @property
@@ -584,6 +651,30 @@ class FrozenStructuredCall:
             separators=(",", ":"),
         )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _repeated_structured_validation_error(
+    diagnostics: Mapping[str, Any] | None,
+    *,
+    error_type: str,
+) -> bool:
+    safe = (
+        safe_structured_repair_failure_diagnostics(diagnostics)
+        if diagnostics is not None
+        else None
+    )
+    if safe is None:
+        return False
+    return all(
+        any(
+            str(issue.get("error_type") or "") == error_type
+            for issue in list(
+                dict(safe.get(phase) or {}).get("issues") or []
+            )
+            if isinstance(issue, Mapping)
+        )
+        for phase in ("primary_validation", "repair_validation")
+    )
 
 
 def _attempt_usage_projection(
@@ -1288,6 +1379,25 @@ class ProseRemediationToolApplication:
             if failure.uncertain
             else f"{operation}_provider_generation_failed"
         )
+        validation_reason_codes = (
+            ["rewrite_scene_minimum_validation_failed"]
+            if (
+                operation == "rewrite"
+                and not failure.uncertain
+                and _repeated_structured_validation_error(
+                    failure.diagnostics,
+                    error_type="scene_word_budget_below_minimum",
+                )
+            )
+            else []
+        )
+        structured_validation_diagnostics = (
+            safe_structured_repair_failure_diagnostics(
+                failure.diagnostics
+            )
+            if validation_reason_codes
+            else None
+        )
         return RuntimeToolResult(
             status=("uncertain" if failure.uncertain else "retryable_error"),
             code=code,
@@ -1295,7 +1405,11 @@ class ProseRemediationToolApplication:
                 "operation": operation,
                 "known_outcome": not failure.uncertain,
                 **(
-                    {"reason_codes": [code]}
+                    {
+                        "reason_codes": (
+                            validation_reason_codes or [code]
+                        )
+                    }
                     if not failure.uncertain
                     else {}
                 ),
@@ -1304,6 +1418,24 @@ class ProseRemediationToolApplication:
                 "operation": operation,
                 "outcome": (
                     "unknown" if failure.uncertain else "known_failure"
+                ),
+                **(
+                    {
+                        "validation_reason_codes": (
+                            validation_reason_codes
+                        )
+                    }
+                    if validation_reason_codes
+                    else {}
+                ),
+                **(
+                    {
+                        "structured_validation_diagnostics": (
+                            structured_validation_diagnostics
+                        )
+                    }
+                    if structured_validation_diagnostics is not None
+                    else {}
                 ),
                 **(_NO_PROVIDER_DISPATCH if no_provider_dispatch else {}),
             },
@@ -1582,7 +1714,14 @@ class ProseRemediationToolApplication:
                     error=exc,
                 )
         rewrite_schema: type[BaseModel] = (
-            RewrittenV2ProseProviderOutput
+            _v2_rewrite_provider_schema(
+                repair_plan=scene_repair_plan,
+                max_semantic_attempts=(
+                    self._rewrite_call.max_paid_attempts
+                ),
+            )
+            if uses_v2_contract and scene_repair_plan is not None
+            else RewrittenV2ProseProviderOutput
             if uses_v2_contract
             else RewrittenProseProviderOutput
         )
@@ -2601,7 +2740,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r20-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r21-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2646,7 +2785,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r21-"
+            "prose-remediation-tools-r22-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
