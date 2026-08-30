@@ -98,6 +98,25 @@ _SCENE_WORD_BUDGET_TERMINALS = frozenset({
 })
 
 
+def _can_defer_scene_pause(
+    *,
+    pause_reason: str | None,
+    scene_index: int,
+    scene_count: int,
+    stop_after_scene_index: int | None,
+) -> bool:
+    """Allow only local contract failures to yield to later base scenes."""
+
+    return bool(
+        pause_reason in _SCENE_WORD_BUDGET_TERMINALS
+        and scene_index + 1 < scene_count
+        and (
+            stop_after_scene_index is None
+            or scene_index < int(stop_after_scene_index)
+        )
+    )
+
+
 def _word_budget_trim_fields(trim: SceneWordBudgetTrim) -> dict[str, Any]:
     if not trim.trimmed:
         return {}
@@ -1334,6 +1353,7 @@ async def execute_v3_prose_plan(
         return terminal
 
     pause_reason: str | None = None
+    deferred_scene_pause_reason: str | None = None
     retry_used = False
     for scene_index in range(plan.scene_count):
         while True:
@@ -1552,7 +1572,22 @@ async def execute_v3_prose_plan(
             )
 
         if pause_reason is not None:
-            break
+            if _can_defer_scene_pause(
+                pause_reason=pause_reason,
+                scene_index=scene_index,
+                scene_count=plan.scene_count,
+                stop_after_scene_index=stop_after_scene_index,
+            ):
+                # A local scene contract failure still makes the full chapter
+                # incomplete, but it must not discard already-authorized base
+                # calls for independent later scenes. Retain the first local
+                # reason for the final result while allowing those calls to run.
+                deferred_scene_pause_reason = (
+                    deferred_scene_pause_reason or pause_reason
+                )
+                pause_reason = None
+            else:
+                break
         if (
             stop_after_scene_index is not None
             and scene_index >= int(stop_after_scene_index)
@@ -1565,5 +1600,5 @@ async def execute_v3_prose_plan(
         by_sequence=by_sequence,
         progress_by_scene=progress_by_scene,
         outline_revision=outline_revision,
-        pause_reason=pause_reason,
+        pause_reason=pause_reason or deferred_scene_pause_reason,
     )

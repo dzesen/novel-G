@@ -548,6 +548,7 @@ def build_v2_scene_repair_plan(
     outline: Mapping[str, Any],
     plan: ProseExecutionPlan,
     target_scene_indexes: Sequence[int],
+    max_source_failure_targets: int | None = None,
 ) -> V2SceneRepairPlan:
     budgets = v2_scene_budgets(outline=outline, plan=plan)
     if not budgets:
@@ -562,6 +563,15 @@ def build_v2_scene_repair_plan(
         )
     ):
         raise ValueError("scene-local repair targets are invalid")
+    if (
+        max_source_failure_targets is not None
+        and (
+            type(max_source_failure_targets) is not int
+            or max_source_failure_targets < 1
+            or max_source_failure_targets > len(budgets)
+        )
+    ):
+        raise ValueError("scene-local repair target limit is invalid")
 
     source_scene_texts, source_failing_scene_indexes = (
         _source_scene_evidence(
@@ -582,6 +592,10 @@ def build_v2_scene_repair_plan(
                 "scene-local repair request omits a source budget failure"
             )
         normalized_targets = source_failing_scene_indexes
+        if max_source_failure_targets is not None:
+            normalized_targets = normalized_targets[
+                :max_source_failure_targets
+            ]
     outline_scenes = list(outline.get("scenes") or [])
     targets: list[V2SceneRepairTarget] = []
     for scene_index in normalized_targets:
@@ -715,12 +729,9 @@ def apply_v2_scene_replacements(
     )
     source_failing = set(repair_plan.source_failing_scene_indexes)
     new_failing_set = set(new_failing)
-    source_target_failures = source_failing.intersection(target_indexes)
-    remaining_target_failures = new_failing_set.intersection(target_indexes)
-    resolved = tuple(sorted(
-        source_target_failures - remaining_target_failures
-    ))
-    remaining = tuple(sorted(remaining_target_failures))
+    remaining_source_failures = new_failing_set.intersection(source_failing)
+    resolved = tuple(sorted(source_failing - remaining_source_failures))
+    remaining = tuple(sorted(remaining_source_failures))
     unique_reasons = tuple(dict.fromkeys(reason_codes))
     content_changed = (
         chapter_content_digest(prose)
@@ -732,11 +743,11 @@ def apply_v2_scene_replacements(
             checkpoint_block_reason_codes.append(
                 "checkpoint_no_target_failure_resolved"
             )
-        if source_failing != target_indexes:
+        if not target_indexes.issubset(source_failing):
             checkpoint_block_reason_codes.append(
                 "checkpoint_source_failure_scope_mismatch"
             )
-        if not remaining_target_failures < source_target_failures:
+        if not remaining_source_failures < source_failing:
             checkpoint_block_reason_codes.append(
                 "checkpoint_failure_scope_not_reduced"
             )

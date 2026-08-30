@@ -142,13 +142,19 @@ PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
 
 def classify_scene_repair_failure(
     checkpoint_block_reason_codes: tuple[str, ...],
+    *,
+    retry_single_scene_no_progress: bool = False,
 ) -> tuple[Literal["retryable_error", "permanent_error"], str]:
-    """Stop immediately when a paid rewrite resolves no source failure."""
+    """Classify bounded scene repair without hiding a settled failure."""
 
     if "checkpoint_no_target_failure_resolved" in (
         checkpoint_block_reason_codes
     ):
-        return "permanent_error", "repair_no_progress"
+        return (
+            "retryable_error"
+            if retry_single_scene_no_progress
+            else "permanent_error"
+        ), "repair_no_progress"
     return "retryable_error", "candidate_completion_failed"
 
 
@@ -677,9 +683,6 @@ def _checkpoint_scope_matches_request(
 ) -> bool:
     """Validate an exact local repair target against its broader request."""
 
-    if checkpoint.target_scene_indexes == payload.scene_indexes:
-        return True
-
     def indexes(key: str) -> tuple[int, ...] | None:
         raw = result.audit_view.get(key)
         if not isinstance(raw, (list, tuple)):
@@ -700,12 +703,37 @@ def _checkpoint_scope_matches_request(
     resolved = indexes("resolved_scene_indexes")
     remaining = indexes("remaining_scene_indexes")
     block_reasons = result.audit_view.get("checkpoint_block_reason_codes")
+    # Receipts created before the bounded-scope evidence upgrade did not
+    # project these fields. Preserve their exact-scope replay, while requiring
+    # the complete proof for every new or broader-scope receipt.
+    if (
+        checkpoint.target_scene_indexes == payload.scene_indexes
+        and not any(
+            key in result.audit_view
+            for key in (
+                "requested_scene_indexes",
+                "source_failing_scene_indexes",
+                "replaced_scene_indexes",
+                "resolved_scene_indexes",
+                "remaining_scene_indexes",
+            )
+        )
+    ):
+        return True
+    source_scope = set(checkpoint.target_scene_indexes)
+    replaced_scope = set(replaced or ())
+    resolved_scope = set(resolved or ())
     return bool(
         requested == payload.scene_indexes
         and source_failing == checkpoint.target_scene_indexes
-        and replaced == checkpoint.target_scene_indexes
+        and replaced_scope
+        and replaced_scope.issubset(source_scope)
+        and replaced_scope.issubset(set(payload.scene_indexes))
         and resolved == checkpoint.resolved_scene_indexes
+        and resolved_scope
+        and resolved_scope.issubset(replaced_scope)
         and remaining == checkpoint.remaining_scene_indexes
+        and set(remaining or ()) == source_scope - resolved_scope
         and set(checkpoint.target_scene_indexes).issubset(requested)
         and result.audit_view.get("can_checkpoint") is True
         and isinstance(block_reasons, (list, tuple))
@@ -1552,6 +1580,7 @@ class ProseRemediationToolApplication:
                     outline=outline,
                     plan=plan,
                     target_scene_indexes=payload.scene_indexes,
+                    max_source_failure_targets=1,
                 )
                 if (
                     source_checkpoint is not None
@@ -1725,7 +1754,7 @@ class ProseRemediationToolApplication:
             )
             scene_budget_reasons = scene_repair.reason_codes
             scene_repair_evidence = {
-                "repair_mode": "scene_local_v1",
+                "repair_mode": "scene_local_v2",
                 "requested_scene_indexes": list(
                     scene_repair_plan.requested_scene_indexes
                 ),
@@ -1756,7 +1785,13 @@ class ProseRemediationToolApplication:
                 if not scene_repair.can_checkpoint:
                     failure_status, failure_code = (
                         classify_scene_repair_failure(
-                            scene_repair.checkpoint_block_reason_codes
+                            scene_repair.checkpoint_block_reason_codes,
+                            retry_single_scene_no_progress=(
+                                len(
+                                    scene_repair_plan.target_scene_indexes
+                                )
+                                == 1
+                            ),
                         )
                     )
                     return self._scene_repair_failure_result(
@@ -1875,7 +1910,7 @@ class ProseRemediationToolApplication:
                 agent_run_id=context.run_id,
                 issue_categories=payload.issue_categories,
                 target_scene_indexes=(
-                    scene_repair_plan.target_scene_indexes
+                    scene_repair_plan.source_failing_scene_indexes
                 ),
                 resolved_scene_indexes=(
                     scene_repair.resolved_scene_indexes
@@ -2560,7 +2595,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r18-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r19-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2605,7 +2640,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r19-"
+            "prose-remediation-tools-r20-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),
