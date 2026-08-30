@@ -1612,6 +1612,9 @@ class ProseRemediationToolApplication:
             scene_budget_reasons = scene_repair.reason_codes
             scene_repair_evidence = {
                 "repair_mode": "scene_local_v1",
+                "source_failing_scene_indexes": list(
+                    scene_repair_plan.source_failing_scene_indexes
+                ),
                 "preserved_scene_indexes": list(
                     scene_repair.preserved_scene_indexes
                 ),
@@ -1625,6 +1628,12 @@ class ProseRemediationToolApplication:
                     scene_repair.remaining_scene_indexes
                 ),
                 "can_checkpoint": scene_repair.can_checkpoint,
+                "checkpoint_block_reason_codes": list(
+                    scene_repair.checkpoint_block_reason_codes
+                ),
+                "checkpoint_content_changed": (
+                    scene_repair.content_changed
+                ),
             }
             if scene_budget_reasons:
                 if not scene_repair.can_checkpoint:
@@ -2439,7 +2448,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r15-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r16-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2484,7 +2493,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r16-"
+            "prose-remediation-tools-r17-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

@@ -32,6 +32,14 @@ _SCENE_PROGRESS_STATUSES = frozenset({
     "paused",
     "complete",
 })
+PROSE_CHECKPOINT_BLOCK_REASON_CODES = (
+    "checkpoint_no_target_failure_resolved",
+    "checkpoint_source_failure_scope_mismatch",
+    "checkpoint_failure_scope_not_reduced",
+    "checkpoint_new_scene_failure",
+    "checkpoint_unsupported_scene_failure_reason",
+    "checkpoint_content_unchanged",
+)
 
 
 class _StrictModel(BaseModel):
@@ -132,6 +140,8 @@ class V2SceneRepairAssembly:
     resolved_scene_indexes: tuple[int, ...]
     remaining_scene_indexes: tuple[int, ...]
     can_checkpoint: bool
+    checkpoint_block_reason_codes: tuple[str, ...]
+    content_changed: bool
 
 
 @dataclass(frozen=True)
@@ -646,15 +656,38 @@ def apply_v2_scene_replacements(
     ))
     remaining = tuple(sorted(remaining_target_failures))
     unique_reasons = tuple(dict.fromkeys(reason_codes))
-    can_checkpoint = bool(
-        unique_reasons
-        and resolved
-        and source_failing == target_indexes
-        and remaining_target_failures < source_target_failures
-        and new_failing_set.issubset(source_failing)
-        and set(unique_reasons) == {"scene_word_budget_below_minimum"}
-        and chapter_content_digest(prose)
+    content_changed = (
+        chapter_content_digest(prose)
         != chapter_content_digest("\n\n".join(repair_plan.source_scene_texts))
+    )
+    checkpoint_block_reason_codes: list[str] = []
+    if unique_reasons:
+        if not resolved:
+            checkpoint_block_reason_codes.append(
+                "checkpoint_no_target_failure_resolved"
+            )
+        if source_failing != target_indexes:
+            checkpoint_block_reason_codes.append(
+                "checkpoint_source_failure_scope_mismatch"
+            )
+        if not remaining_target_failures < source_target_failures:
+            checkpoint_block_reason_codes.append(
+                "checkpoint_failure_scope_not_reduced"
+            )
+        if not new_failing_set.issubset(source_failing):
+            checkpoint_block_reason_codes.append(
+                "checkpoint_new_scene_failure"
+            )
+        if set(unique_reasons) != {"scene_word_budget_below_minimum"}:
+            checkpoint_block_reason_codes.append(
+                "checkpoint_unsupported_scene_failure_reason"
+            )
+        if not content_changed:
+            checkpoint_block_reason_codes.append(
+                "checkpoint_content_unchanged"
+            )
+    can_checkpoint = bool(
+        unique_reasons and not checkpoint_block_reason_codes
     )
     return V2SceneRepairAssembly(
         prose=prose,
@@ -665,4 +698,8 @@ def apply_v2_scene_replacements(
         resolved_scene_indexes=resolved,
         remaining_scene_indexes=remaining,
         can_checkpoint=can_checkpoint,
+        checkpoint_block_reason_codes=tuple(
+            checkpoint_block_reason_codes
+        ),
+        content_changed=content_changed,
     )
