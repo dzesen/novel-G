@@ -669,6 +669,51 @@ def _rewrite_request_digest(
     })
 
 
+def _checkpoint_scope_matches_request(
+    *,
+    checkpoint: ResumableProseCandidateCheckpoint,
+    payload: RewriteProseCandidateInput,
+    result: RuntimeToolResult,
+) -> bool:
+    """Validate an exact local repair target against its broader request."""
+
+    if checkpoint.target_scene_indexes == payload.scene_indexes:
+        return True
+
+    def indexes(key: str) -> tuple[int, ...] | None:
+        raw = result.audit_view.get(key)
+        if not isinstance(raw, (list, tuple)):
+            return None
+        values = tuple(raw)
+        if (
+            not values
+            or any(type(value) is not int or not 1 <= value <= 20 for value in values)
+            or tuple(sorted(values)) != values
+            or len(set(values)) != len(values)
+        ):
+            return None
+        return values
+
+    requested = indexes("requested_scene_indexes")
+    source_failing = indexes("source_failing_scene_indexes")
+    replaced = indexes("replaced_scene_indexes")
+    resolved = indexes("resolved_scene_indexes")
+    remaining = indexes("remaining_scene_indexes")
+    block_reasons = result.audit_view.get("checkpoint_block_reason_codes")
+    return bool(
+        requested == payload.scene_indexes
+        and source_failing == checkpoint.target_scene_indexes
+        and replaced == checkpoint.target_scene_indexes
+        and resolved == checkpoint.resolved_scene_indexes
+        and remaining == checkpoint.remaining_scene_indexes
+        and set(checkpoint.target_scene_indexes).issubset(requested)
+        and result.audit_view.get("can_checkpoint") is True
+        and isinstance(block_reasons, (list, tuple))
+        and not block_reasons
+        and result.audit_view.get("checkpoint_content_changed") is True
+    )
+
+
 def _validated_rewrite_receipt_result(
     *,
     document: Mapping[str, Any],
@@ -743,7 +788,11 @@ def _validated_rewrite_receipt_result(
                 or checkpoint.content_digest != data.content_digest
                 or checkpoint.agent_run_id != context.run_id
                 or checkpoint.issue_categories != payload.issue_categories
-                or checkpoint.target_scene_indexes != payload.scene_indexes
+                or not _checkpoint_scope_matches_request(
+                    checkpoint=checkpoint,
+                    payload=payload,
+                    result=result,
+                )
                 or checkpoint.resolved_scene_indexes
                 != data.resolved_scene_indexes
                 or checkpoint.remaining_scene_indexes
@@ -1331,6 +1380,57 @@ class ProseRemediationToolApplication:
             error_summary="改写输出未通过正文候选 Schema 校验。",
         )
 
+    @staticmethod
+    def _scene_repair_failure_result(
+        *,
+        context: RuntimeToolContext,
+        payload: RewriteProseCandidateInput,
+        usage: RuntimeCallUsage,
+        scene_budget_reasons: tuple[str, ...],
+        scene_contract_validation: Mapping[str, Any],
+        scene_repair_evidence: Mapping[str, Any],
+        failure_status: Literal["retryable_error", "permanent_error"],
+        failure_code: str,
+    ) -> RuntimeToolResult:
+        """Build the typed result for a V2 rewrite that is not persisted."""
+
+        summary = (
+            "改写没有解决任何原失败场景，已提前停止。"
+            if failure_code == "repair_no_progress"
+            else "改写结果违反逐场字数预算。"
+        )
+        data = RewriteProseCandidateOutput(
+            outcome="blocked",
+            prose_run_id=context.scope.object_id,
+            source_revision=payload.expected_revision,
+            candidate_revision=payload.expected_revision,
+            content_digest=payload.expected_content_digest,
+            changed=False,
+            summary=summary,
+            addressed_categories=(),
+        )
+        return RuntimeToolResult(
+            status=failure_status,
+            code=failure_code,
+            data=data.model_dump(mode="json"),
+            planner_view={
+                "reason_codes": list(scene_budget_reasons),
+                "candidate_revision": payload.expected_revision,
+                "content_digest": payload.expected_content_digest,
+            },
+            audit_view={
+                "completion": {
+                    "scene_contract_validation": scene_contract_validation,
+                },
+                **dict(scene_repair_evidence),
+                "source_revision": payload.expected_revision,
+            },
+            resource_revision=str(payload.expected_revision),
+            resource_digest=payload.expected_content_digest,
+            usage=usage,
+            error_summary=summary,
+        )
+
     async def _candidate_snapshot(
         self,
         *,
@@ -1659,31 +1759,17 @@ class ProseRemediationToolApplication:
                             scene_repair.checkpoint_block_reason_codes
                         )
                     )
-                    return RuntimeToolResult(
-                        status=failure_status,
-                        code=failure_code,
-                        planner_view={
-                            "reason_codes": list(scene_budget_reasons),
-                            "candidate_revision": payload.expected_revision,
-                            "content_digest": payload.expected_content_digest,
-                        },
-                        audit_view={
-                            "completion": {
-                                "scene_contract_validation": (
-                                    scene_contract_validation
-                                ),
-                            },
-                            **scene_repair_evidence,
-                            "source_revision": payload.expected_revision,
-                        },
-                        resource_revision=str(payload.expected_revision),
-                        resource_digest=payload.expected_content_digest,
+                    return self._scene_repair_failure_result(
+                        context=context,
+                        payload=payload,
                         usage=usage,
-                        error_summary=(
-                            "改写没有解决任何原失败场景，已提前停止。"
-                            if failure_code == "repair_no_progress"
-                            else "改写结果违反逐场字数预算。"
+                        scene_budget_reasons=scene_budget_reasons,
+                        scene_contract_validation=(
+                            scene_contract_validation
                         ),
+                        scene_repair_evidence=scene_repair_evidence,
+                        failure_status=failure_status,
+                        failure_code=failure_code,
                     )
                 checkpointed_scene_repair = True
                 completed_scene_indexes = tuple(
@@ -2474,7 +2560,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r17-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r18-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2519,7 +2605,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r18-"
+            "prose-remediation-tools-r19-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

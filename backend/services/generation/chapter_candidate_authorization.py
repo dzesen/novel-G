@@ -60,9 +60,9 @@ from backend.services.llm.generation_runtime import (
 
 
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
-    "chapter_candidate_repair_authorization.v11"
+    "chapter_candidate_repair_authorization.v12"
 )
-CANDIDATE_PIPELINE_REVISION = 37
+CANDIDATE_PIPELINE_REVISION = 38
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v2"
@@ -490,7 +490,7 @@ class CandidateProviderBudgetBound(_ClosedAuthorizationModel):
 
 
 class CandidateRepairAuthorization(_ClosedAuthorizationModel):
-    schema_version: Literal["chapter_candidate_repair_authorization.v11"]
+    schema_version: Literal["chapter_candidate_repair_authorization.v12"]
     narrative_quality_signal_authorization_digest: _Sha256
     authorization_revision: _PositiveInt
     eligible_chapter_count: _NonNegativeInt

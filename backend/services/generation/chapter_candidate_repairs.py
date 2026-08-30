@@ -53,7 +53,9 @@ from backend.services.generation.prose_remediation_runtime import (
     PROSE_REMEDIATION_RETRYABLE_REASON_CODES,
     REMEDIATION_SCOPE_KIND,
     ResumableProseCandidateCheckpoint,
+    RewriteProseCandidateInput,
     RewriteProseCandidateOutput,
+    _checkpoint_scope_matches_request,
     build_prose_remediation_runtime,
 )
 from backend.services.generation.prose_scene_repair import (
@@ -973,7 +975,18 @@ class ChapterCandidateRepairApplication:
             != request.source_content_digest
             or marker.issue_categories
             != tuple(item.value for item in request.issue_categories)
-            or marker.target_scene_indexes != request.scene_indexes
+            or not _checkpoint_scope_matches_request(
+                checkpoint=marker,
+                payload=RewriteProseCandidateInput(
+                    expected_revision=request.source_run_revision,
+                    expected_content_digest=request.source_content_digest,
+                    issue_categories=tuple(
+                        item.value for item in request.issue_categories
+                    ),
+                    scene_indexes=request.scene_indexes,
+                ),
+                result=result,
+            )
             or tuple(remaining) != marker.remaining_scene_indexes
             or completion.get("can_write_formal_prose") is not False
             or str(completion.get("status") or "") != "incomplete"
