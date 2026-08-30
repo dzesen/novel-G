@@ -23,6 +23,7 @@ from backend.services.llm.generation_runtime import (
     GenerationPlan,
     GenerationRuntime,
     PromptPlan,
+    StructuredOutputByteBudgetExceeded,
     StructuredOutputMode,
     WorkflowStepTarget,
     safe_structured_repair_failure_diagnostics,
@@ -44,6 +45,11 @@ _WORKFLOW_FAILURE_DIAGNOSTIC_CONTRACT = {
         "source_changed",
         "confirmed",
         True,
+    ),
+    "outline_response_byte_budget_exceeded": (
+        "validation_logic",
+        "confirmed",
+        False,
     ),
 }
 
@@ -76,8 +82,14 @@ def safe_workflow_failure_diagnostic(value: Any) -> dict[str, Any] | None:
 
 def project_workflow_failure_diagnostic(
     error: BaseException,
+    *,
+    diagnostic_code: str | None = None,
 ) -> dict[str, Any] | None:
-    code = str(getattr(error, "diagnostic_code", "") or "")
+    code = str(
+        diagnostic_code
+        or getattr(error, "diagnostic_code", "")
+        or ""
+    )
     contract = _WORKFLOW_FAILURE_DIAGNOSTIC_CONTRACT.get(code)
     if contract is None:
         return None
@@ -137,6 +149,8 @@ class WorkflowStep:
     config_key: str | None = None
     agent_id: str | None = None
     max_structured_raw_output_bytes: int | None = None
+    retry_oversized_structured_output_without_source: bool = False
+    structured_output_byte_budget_reason_code: str | None = None
 
     @property
     def resolved_config_key(self) -> str:
@@ -380,6 +394,10 @@ async def run_workflow(
                 structured_kwargs["max_structured_raw_output_bytes"] = (
                     step.max_structured_raw_output_bytes
                 )
+            if step.retry_oversized_structured_output_without_source:
+                structured_kwargs[
+                    "retry_oversized_structured_output_without_source"
+                ] = True
             coro = deps.runtime.generate_structured(
                 generation_plan,
                 step.schema,
@@ -434,7 +452,17 @@ async def run_workflow(
             diagnostics = safe_structured_repair_failure_diagnostics(
                 getattr(exc, "diagnostics", None)
             )
-            diagnostic = project_workflow_failure_diagnostic(exc)
+            diagnostic = project_workflow_failure_diagnostic(
+                exc,
+                diagnostic_code=(
+                    step.structured_output_byte_budget_reason_code
+                    if isinstance(
+                        exc,
+                        StructuredOutputByteBudgetExceeded,
+                    )
+                    else None
+                ),
+            )
             step_failure = {
                 "step": step.key,
                 "status": "error",

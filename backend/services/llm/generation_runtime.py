@@ -67,6 +67,12 @@ Validation guidance (raw values intentionally omitted):
 
 Invalid output:
 {produced}"""
+_STRUCTURED_BYTE_BUDGET_REGENERATION_PROMPT_TEMPLATE = """The previous Provider response exceeded the authorized structured-output byte budget and is intentionally not included.
+Regenerate the complete answer from the Original task without referring to or reconstructing the previous response.
+Return one concise, complete answer that satisfies every original schema and content requirement and fits within {max_bytes} UTF-8 bytes after compact JSON serialization.
+
+Original task:
+{original_prompt}"""
 STRUCTURED_REPAIR_PROMPT_REVISION = hashlib.sha256(
     json.dumps(
         {
@@ -83,6 +89,17 @@ STRUCTURED_REPAIR_PROMPT_REVISION = hashlib.sha256(
         separators=(",", ":"),
     ).encode("utf-8")
 ).hexdigest()
+STRUCTURED_BYTE_BUDGET_REGENERATION_PROMPT_REVISION = hashlib.sha256(
+    json.dumps(
+        {
+            "template": _STRUCTURED_BYTE_BUDGET_REGENERATION_PROMPT_TEMPLATE,
+            "source_output_included": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+STRUCTURED_BYTE_BUDGET_REGENERATION_PHASE = "byte_budget_regeneration"
 
 
 def _stable_validation_error_type(value: Any) -> str:
@@ -331,6 +348,25 @@ def render_structured_repair_prompt(
     )
 
 
+def render_structured_byte_budget_regeneration_prompt(
+    *,
+    original_prompt: str,
+    max_bytes: int,
+) -> str:
+    """Re-ask for a concise result without retaining the oversized source."""
+
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 1
+    ):
+        raise ValueError("structured raw-output byte cap is invalid")
+    return _STRUCTURED_BYTE_BUDGET_REGENERATION_PROMPT_TEMPLATE.format(
+        original_prompt=original_prompt,
+        max_bytes=max_bytes,
+    )
+
+
 def _redacted_config_revision(
     config: dict[str, Any],
     *,
@@ -452,6 +488,14 @@ class ConservativeGenerationBoundExceeded(ValueError):
     """A nested structured call would exceed its caller-frozen reservation."""
 
     provider_request_not_dispatched = True
+
+
+class StructuredOutputByteBudgetExceeded(ConservativeGenerationBoundExceeded):
+    """A settled structured response exceeded its frozen local byte budget."""
+
+    diagnostic_category = "validation_logic"
+    diagnostic_evidence = "confirmed"
+    provider_request_not_dispatched = False
 
 
 @dataclass(frozen=True)
@@ -1205,6 +1249,7 @@ class GenerationRuntime:
         max_conservative_input_tokens: int | None = None,
         max_conservative_total_tokens: int | None = None,
         max_structured_raw_output_bytes: int | None = None,
+        retry_oversized_structured_output_without_source: bool = False,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         # Reject stale plans before even constructing an adapter.  Every
@@ -1245,6 +1290,18 @@ class GenerationRuntime:
             or max_structured_raw_output_bytes < 1
         ):
             raise ValueError("structured raw-output byte cap is invalid")
+        if not isinstance(
+            retry_oversized_structured_output_without_source,
+            bool,
+        ):
+            raise ValueError("structured byte-budget regeneration flag is invalid")
+        if (
+            retry_oversized_structured_output_without_source
+            and max_structured_raw_output_bytes is None
+        ):
+            raise ValueError(
+                "structured byte-budget regeneration requires a byte cap"
+            )
 
         schema_request_payload = structured_schema_request_payload(schema)
 
@@ -1260,7 +1317,7 @@ class GenerationRuntime:
             else:
                 rendered = str(output)
             if len(rendered.encode("utf-8")) > max_structured_raw_output_bytes:
-                raise ConservativeGenerationBoundExceeded(
+                raise StructuredOutputByteBudgetExceeded(
                     "structured output exceeds the frozen local-repair byte cap"
                 )
 
@@ -1370,7 +1427,54 @@ class GenerationRuntime:
                 fallback_call,
                 bounded_reservation(prompts.prompt_json_prompt),
             )
-        enforce_structured_output_byte_cap(produced)
+        oversized_regeneration_used = False
+        try:
+            enforce_structured_output_byte_cap(produced)
+        except StructuredOutputByteBudgetExceeded:
+            if not retry_oversized_structured_output_without_source:
+                raise
+            oversized_regeneration_used = True
+            byte_budget_regeneration_prompt = (
+                render_structured_byte_budget_regeneration_prompt(
+                    original_prompt=primary_prompt,
+                    max_bytes=int(max_structured_raw_output_bytes or 0),
+                )
+            )
+
+            async def byte_budget_regeneration_call() -> Any:
+                if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED:
+                    return await adapter.generate_structured(
+                        byte_budget_regeneration_prompt,
+                        schema,
+                        **request_kwargs,
+                    )
+                if plan.mode == StructuredOutputMode.JSON_OBJECT and hasattr(
+                    adapter,
+                    "generate_json_object",
+                ):
+                    return await adapter.generate_json_object(
+                        byte_budget_regeneration_prompt,
+                        **request_kwargs,
+                    )
+                return await adapter.generate_text(
+                    byte_budget_regeneration_prompt,
+                    **request_kwargs,
+                )
+
+            produced = await self._paid_call(
+                plan,
+                plan.provider_alias,
+                STRUCTURED_BYTE_BUDGET_REGENERATION_PHASE,
+                adapter,
+                byte_budget_regeneration_call,
+                bounded_reservation(
+                    byte_budget_regeneration_prompt,
+                    includes_native_schema=(
+                        plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
+                    ),
+                ),
+            )
+            enforce_structured_output_byte_cap(produced)
         try:
             value = produced if isinstance(produced, BaseModel) else _parse_structured_text(str(produced), schema)
         except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
@@ -1378,6 +1482,21 @@ class GenerationRuntime:
                 first_error,
                 schema=schema,
             )
+            if oversized_regeneration_used:
+                oversized_validation = {
+                    "schema_version": STRUCTURED_VALIDATION_ISSUES_SCHEMA_VERSION,
+                    "issues": [{
+                        "path": "$",
+                        "error_type": "structured_output_byte_budget_exceeded",
+                    }],
+                    "truncated": False,
+                }
+                raise LLMStructuredRepairError(
+                    diagnostics=build_structured_repair_failure_diagnostics(
+                        primary_validation=oversized_validation,
+                        repair_validation=primary_validation,
+                    )
+                ) from None
             repair_prompt = render_structured_repair_prompt(
                 original_prompt=primary_prompt,
                 schema=schema,

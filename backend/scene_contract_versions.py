@@ -41,6 +41,9 @@ OUTLINE_ADHERENCE_DECISIONS = frozenset({
 # as one token and Latin text at roughly four characters per token.
 MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES = 20_000
 MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES = 16_000
+OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE = (
+    "outline_response_byte_budget_exceeded"
+)
 
 SceneContractVersion = Literal["legacy_v1", "scene_transition_contract.v2"]
 OutlineAdherenceDecision = Literal["pass", "repair", "manual_review"]

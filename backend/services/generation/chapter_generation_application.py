@@ -96,6 +96,7 @@ from backend.services.generation.outline_adherence import (
 )
 from backend.scene_contract_versions import (
     MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+    OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     SCENE_TRANSITION_CONTRACT_VERSION,
     require_known_scene_contract_version,
@@ -320,6 +321,10 @@ CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
         agent_id="chapter_planner",
         max_structured_raw_output_bytes=(
             MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+        ),
+        retry_oversized_structured_output_without_source=True,
+        structured_output_byte_budget_reason_code=(
+            OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE
         ),
         prompt_args=lambda ctx: {
             "context": ctx.params["context"],
