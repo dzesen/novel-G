@@ -18,6 +18,7 @@ from backend.scene_contract_versions import (
 )
 from backend.services.generation.prose_completion import ProseExecutionPlan
 from backend.services.generation.scene_word_budget import (
+    SCENE_WORD_BUDGET_TERMINAL_REASONS,
     trim_scene_contribution_to_word_budget,
 )
 from backend.services.novel.chapter_service import count_chapter_words
@@ -121,6 +122,7 @@ class V2SceneRepairTarget:
 class V2SceneRepairPlan:
     budgets: tuple[V2SceneBudget, ...]
     source_scene_texts: tuple[str, ...]
+    source_failure_reason_codes_by_scene: tuple[tuple[str, ...], ...]
     source_failing_scene_indexes: tuple[int, ...]
     requested_scene_indexes: tuple[int, ...]
     target_scene_indexes: tuple[int, ...]
@@ -460,6 +462,61 @@ def _scene_texts_from_segments(
     )
 
 
+def _local_budget_pause_reasons_by_scene(
+    *,
+    completion: Mapping[str, Any],
+    scene_count: int,
+) -> tuple[tuple[str, ...], ...]:
+    progress = completion.get("scene_progress")
+    if progress is None:
+        return tuple(() for _index in range(scene_count))
+    if not isinstance(progress, list) or len(progress) != scene_count:
+        raise ValueError("completion scene_progress must cover every scene")
+
+    reasons_by_index: dict[int, tuple[str, ...]] = {}
+    for item in progress:
+        if not isinstance(item, Mapping):
+            raise ValueError("completion scene_progress entry is invalid")
+        scene_index = item.get("scene_index")
+        status = str(item.get("status") or "")
+        if (
+            type(scene_index) is not int
+            or not 0 <= scene_index < scene_count
+            or scene_index in reasons_by_index
+            or status not in _SCENE_PROGRESS_STATUSES
+        ):
+            raise ValueError("completion scene_progress identity is invalid")
+        pause_reason = item.get("pause_reason")
+        if pause_reason is not None and not isinstance(pause_reason, str):
+            raise ValueError("completion scene pause reason is invalid")
+        if pause_reason in SCENE_WORD_BUDGET_TERMINAL_REASONS:
+            if status not in {"incomplete", "paused"}:
+                raise ValueError(
+                    "completed scene cannot retain a local budget failure"
+                )
+            reasons_by_index[scene_index] = (pause_reason,)
+        else:
+            reasons_by_index[scene_index] = ()
+    if set(reasons_by_index) != set(range(scene_count)):
+        raise ValueError("completion scene_progress is not contiguous")
+    return tuple(reasons_by_index[index] for index in range(scene_count))
+
+
+def _merge_scene_failure_reasons(
+    *,
+    budget_reasons: Sequence[tuple[str, ...]],
+    pause_reasons: Sequence[tuple[str, ...]],
+) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        tuple(dict.fromkeys((*budget, *pause)))
+        for budget, pause in zip(
+            budget_reasons,
+            pause_reasons,
+            strict=True,
+        )
+    )
+
+
 def _source_scene_evidence(
     *,
     run: Mapping[str, Any],
@@ -467,10 +524,18 @@ def _source_scene_evidence(
     outline: Mapping[str, Any],
     plan: ProseExecutionPlan,
     budgets: tuple[V2SceneBudget, ...],
-) -> tuple[tuple[str, ...], tuple[int, ...]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[int, ...],
+    tuple[tuple[str, ...], ...],
+]:
     completion = run.get("completion")
     if not isinstance(completion, Mapping):
         raise ValueError("V2 candidate completion evidence is missing")
+    pause_reasons = _local_budget_pause_reasons_by_scene(
+        completion=completion,
+        scene_count=plan.scene_count,
+    )
     if completion.get("scene_contract_validation") is not None:
         allow_incomplete = (
             str(run.get("status") or "") == "incomplete"
@@ -489,16 +554,24 @@ def _source_scene_evidence(
         scene_texts = tuple(
             current_text[entry.start:entry.end] for entry in proof.scenes
         )
-        failing = tuple(
-            budget.scene_index
-            for entry, budget in zip(proof.scenes, budgets, strict=True)
-            if _scene_budget_reason_codes(
+        budget_reasons = tuple(
+            _scene_budget_reason_codes(
                 word_count=entry.word_count,
                 normalization_boundary=entry.normalization_boundary,
                 budget=budget,
             )
+            for entry, budget in zip(proof.scenes, budgets, strict=True)
         )
-        return scene_texts, failing
+        failure_reasons = _merge_scene_failure_reasons(
+            budget_reasons=budget_reasons,
+            pause_reasons=pause_reasons,
+        )
+        failing = tuple(
+            budget.scene_index
+            for budget, reasons in zip(budgets, failure_reasons, strict=True)
+            if reasons
+        )
+        return scene_texts, failing, failure_reasons
 
     segments = run.get("segments")
     if isinstance(segments, list) and segments:
@@ -511,33 +584,43 @@ def _source_scene_evidence(
         )
         if reconstructed != current_text:
             raise ValueError("persisted V2 segments do not bind the candidate")
-        failing = tuple(
-            budget.scene_index
+        budget_reasons = tuple(
+            _scene_budget_reason_codes(
+                word_count=count_chapter_words(scene_text),
+                normalization_boundary=None,
+                budget=budget,
+            )
             for scene_text, budget in zip(
                 scene_texts,
                 budgets,
                 strict=True,
             )
-            if _scene_budget_reason_codes(
-                word_count=count_chapter_words(scene_text),
-                normalization_boundary=None,
-                budget=budget,
-            )
         )
-        return scene_texts, failing
+        failure_reasons = _merge_scene_failure_reasons(
+            budget_reasons=budget_reasons,
+            pause_reasons=pause_reasons,
+        )
+        failing = tuple(
+            budget.scene_index
+            for budget, reasons in zip(budgets, failure_reasons, strict=True)
+            if reasons
+        )
+        return scene_texts, failing, failure_reasons
 
     if plan.scene_count == 1 and current_text:
         budget = budgets[0]
-        failing = (
-            (budget.scene_index,)
-            if _scene_budget_reason_codes(
-                word_count=count_chapter_words(current_text),
-                normalization_boundary=None,
-                budget=budget,
-            )
-            else ()
+        failure_reasons = _merge_scene_failure_reasons(
+            budget_reasons=(
+                _scene_budget_reason_codes(
+                    word_count=count_chapter_words(current_text),
+                    normalization_boundary=None,
+                    budget=budget,
+                ),
+            ),
+            pause_reasons=pause_reasons,
         )
-        return (current_text,), failing
+        failing = ((budget.scene_index,) if failure_reasons[0] else ())
+        return (current_text,), failing, failure_reasons
     raise ValueError("V2 candidate has no closed per-scene source evidence")
 
 
@@ -573,14 +656,16 @@ def build_v2_scene_repair_plan(
     ):
         raise ValueError("scene-local repair target limit is invalid")
 
-    source_scene_texts, source_failing_scene_indexes = (
-        _source_scene_evidence(
-            run=run,
-            current_text=current_text,
-            outline=outline,
-            plan=plan,
-            budgets=budgets,
-        )
+    (
+        source_scene_texts,
+        source_failing_scene_indexes,
+        source_failure_reason_codes_by_scene,
+    ) = _source_scene_evidence(
+        run=run,
+        current_text=current_text,
+        outline=outline,
+        plan=plan,
+        budgets=budgets,
     )
     normalized_targets = requested_targets
     if source_failing_scene_indexes:
@@ -623,6 +708,9 @@ def build_v2_scene_repair_plan(
     return V2SceneRepairPlan(
         budgets=budgets,
         source_scene_texts=source_scene_texts,
+        source_failure_reason_codes_by_scene=(
+            source_failure_reason_codes_by_scene
+        ),
         source_failing_scene_indexes=source_failing_scene_indexes,
         requested_scene_indexes=requested_targets,
         target_scene_indexes=normalized_targets,
@@ -657,6 +745,7 @@ def apply_v2_scene_replacements(
     parts: list[str] = []
     entries: list[SceneContractValidationEntry] = []
     reason_codes: list[str] = []
+    current_reason_codes_by_scene: list[tuple[str, ...]] = []
     cursor = 0
     target_indexes = set(repair_plan.target_scene_indexes)
     for zero_based_index, budget in enumerate(repair_plan.budgets):
@@ -686,11 +775,13 @@ def apply_v2_scene_replacements(
         parts.append(scene_text)
         cursor += len(scene_text)
         word_count = count_chapter_words(scene_text)
-        reason_codes.extend(_scene_budget_reason_codes(
+        scene_reasons = _scene_budget_reason_codes(
             word_count=word_count,
             normalization_boundary=normalization_boundary,
             budget=budget,
-        ))
+        )
+        current_reason_codes_by_scene.append(scene_reasons)
+        reason_codes.extend(scene_reasons)
         entries.append(SceneContractValidationEntry(
             scene_id=budget.scene_id,
             start=start,
@@ -720,19 +811,31 @@ def apply_v2_scene_replacements(
     )
     new_failing = tuple(
         budget.scene_index
-        for entry, budget in zip(entries, repair_plan.budgets, strict=True)
-        if _scene_budget_reason_codes(
-            word_count=entry.word_count,
-            normalization_boundary=entry.normalization_boundary,
-            budget=budget,
+        for budget, reasons in zip(
+            repair_plan.budgets,
+            current_reason_codes_by_scene,
+            strict=True,
         )
+        if reasons
     )
     source_failing = set(repair_plan.source_failing_scene_indexes)
-    new_failing_set = set(new_failing)
+    carried_source_failures = source_failing - target_indexes
+    for scene_index in sorted(carried_source_failures):
+        reason_codes.extend(
+            repair_plan.source_failure_reason_codes_by_scene[
+                scene_index - 1
+            ]
+        )
+    new_failing_set = set(new_failing).union(carried_source_failures)
     remaining_source_failures = new_failing_set.intersection(source_failing)
     resolved = tuple(sorted(source_failing - remaining_source_failures))
     remaining = tuple(sorted(remaining_source_failures))
     unique_reasons = tuple(dict.fromkeys(reason_codes))
+    target_repair_reason_codes = {
+        reason
+        for scene_index in target_indexes
+        for reason in current_reason_codes_by_scene[scene_index - 1]
+    }
     content_changed = (
         chapter_content_digest(prose)
         != chapter_content_digest("\n\n".join(repair_plan.source_scene_texts))
@@ -755,7 +858,9 @@ def apply_v2_scene_replacements(
             checkpoint_block_reason_codes.append(
                 "checkpoint_new_scene_failure"
             )
-        if set(unique_reasons) != {"scene_word_budget_below_minimum"}:
+        if target_repair_reason_codes - {
+            "scene_word_budget_below_minimum"
+        }:
             checkpoint_block_reason_codes.append(
                 "checkpoint_unsupported_scene_failure_reason"
             )

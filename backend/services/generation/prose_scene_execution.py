@@ -47,6 +47,7 @@ from backend.services.generation.prose_generation import (
     prose_completion_module,
 )
 from backend.services.generation.scene_word_budget import (
+    SCENE_WORD_BUDGET_TERMINAL_REASONS as _SCENE_WORD_BUDGET_TERMINALS,
     SceneWordBudgetTrim,
     trim_scene_contribution_to_word_budget,
 )
@@ -89,13 +90,6 @@ class _SceneReplayMeasurement:
     raw_word_count: int
     effective_word_count: int
     replayed_characters_total: int
-
-
-_SCENE_WORD_BUDGET_TERMINALS = frozenset({
-    "scene_word_budget_exceeded",
-    "scene_word_budget_exhausted",
-    "scene_word_budget_trimmed_without_sentence_boundary",
-})
 
 
 def _can_defer_scene_pause(

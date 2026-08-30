@@ -79,6 +79,9 @@ from backend.services.generation.prose_scene_repair import (
     evaluate_repair_target_progress,
     validate_v2_scene_contract_proof,
 )
+from backend.services.generation.scene_word_budget import (
+    SCENE_WORD_BUDGET_TERMINAL_REASONS,
+)
 from backend.services.generation.prose_token_bounds import (
     conservative_prompt_input_bound,
     structured_schema_request_payload,
@@ -1901,6 +1904,38 @@ class ProseRemediationToolApplication:
                     scene_repair.remaining_scene_indexes
                 ),
             )
+            remaining_scene_indexes = set(
+                scene_repair.remaining_scene_indexes
+            )
+            checkpoint_scene_progress: list[dict[str, Any]] = []
+            for scene_index in range(plan.scene_count):
+                one_based_index = scene_index + 1
+                progress_entry: dict[str, Any] = {
+                    "scene_index": scene_index,
+                    "status": (
+                        "incomplete"
+                        if one_based_index in remaining_scene_indexes
+                        else "complete"
+                    ),
+                }
+                if one_based_index in remaining_scene_indexes:
+                    pause_reason = next(
+                        (
+                            reason
+                            for reason in (
+                                scene_repair_plan
+                                .source_failure_reason_codes_by_scene[
+                                    scene_index
+                                ]
+                            )
+                            if reason
+                            in SCENE_WORD_BUDGET_TERMINAL_REASONS
+                        ),
+                        None,
+                    )
+                    if pause_reason is not None:
+                        progress_entry["pause_reason"] = pause_reason
+                checkpoint_scene_progress.append(progress_entry)
             locked_completion = {
                 **draft_completion.to_dict(),
                 "status": "incomplete",
@@ -1910,18 +1945,7 @@ class ProseRemediationToolApplication:
                     *scene_budget_reasons,
                 ])),
                 "can_write_formal_prose": False,
-                "scene_progress": [
-                    {
-                        "scene_index": scene_index,
-                        "status": (
-                            "incomplete"
-                            if scene_index + 1
-                            in set(scene_repair.remaining_scene_indexes)
-                            else "complete"
-                        ),
-                    }
-                    for scene_index in range(plan.scene_count)
-                ],
+                "scene_progress": checkpoint_scene_progress,
                 "scene_contract_validation": scene_contract_validation,
                 "resumable_scene_repair": checkpoint_marker.model_dump(
                     mode="json"
@@ -2577,7 +2601,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r19-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r20-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2622,7 +2646,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r20-"
+            "prose-remediation-tools-r21-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

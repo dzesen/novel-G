@@ -8,6 +8,13 @@ from typing import Literal
 from backend.services.novel.chapter_service import count_chapter_words
 
 
+SCENE_WORD_BUDGET_TERMINAL_REASONS = frozenset({
+    "scene_word_budget_exceeded",
+    "scene_word_budget_exhausted",
+    "scene_word_budget_trimmed_without_sentence_boundary",
+})
+
+
 @dataclass(frozen=True)
 class SceneWordBudgetTrim:
     text: str

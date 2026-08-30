@@ -62,7 +62,7 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v13"
 )
-CANDIDATE_PIPELINE_REVISION = 39
+CANDIDATE_PIPELINE_REVISION = 40
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v2"
