@@ -139,6 +139,19 @@ PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
     "semantic_unknown",
 )
 
+
+def classify_scene_repair_failure(
+    checkpoint_block_reason_codes: tuple[str, ...],
+) -> tuple[Literal["retryable_error", "permanent_error"], str]:
+    """Stop immediately when a paid rewrite resolves no source failure."""
+
+    if "checkpoint_no_target_failure_resolved" in (
+        checkpoint_block_reason_codes
+    ):
+        return "permanent_error", "repair_no_progress"
+    return "retryable_error", "candidate_completion_failed"
+
+
 def _blocked_error_summary(
     operation: Literal["rewrite", "adherence"],
     code: Literal["resource_stale", "manual_approval_required"],
@@ -951,6 +964,7 @@ def _planner_prompts(
 6. scope 必须原样复制，不得请求 URL、文件路径、正式写入、资料卡或其他工具；
 7. revision 和 digest 必须来自 goal 或最新 Observation，不得猜测。
 8. 最新 Observation 为 prose_candidate_checkpointed 时，只能用其中的新 revision、digest、issue_categories 和 scene_indexes 再次 rewrite；不得复检、扩展场景或回退旧候选。
+9. completion 修复的 scene_indexes 必须精确复制 goal 或最新 Observation 的当前失败场景；不得加入其他 incomplete 场景或已通过场景。
 
 运行输入：
 {json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)}
@@ -1023,7 +1037,7 @@ class ProseRemediationPlanner:
             name="prose-remediation-supervisor",
             version=1,
             implementation_revision=(
-                f"prose-remediation-planner-r8-{call.revision[:20]}"
+                f"prose-remediation-planner-r9-{call.revision[:20]}"
             ),
             provider_alias=str(call.plan.provider_alias),
             provider_model=str(call.plan.provider_model),
@@ -1612,6 +1626,9 @@ class ProseRemediationToolApplication:
             scene_budget_reasons = scene_repair.reason_codes
             scene_repair_evidence = {
                 "repair_mode": "scene_local_v1",
+                "requested_scene_indexes": list(
+                    scene_repair_plan.requested_scene_indexes
+                ),
                 "source_failing_scene_indexes": list(
                     scene_repair_plan.source_failing_scene_indexes
                 ),
@@ -1637,9 +1654,14 @@ class ProseRemediationToolApplication:
             }
             if scene_budget_reasons:
                 if not scene_repair.can_checkpoint:
+                    failure_status, failure_code = (
+                        classify_scene_repair_failure(
+                            scene_repair.checkpoint_block_reason_codes
+                        )
+                    )
                     return RuntimeToolResult(
-                        status="retryable_error",
-                        code="candidate_completion_failed",
+                        status=failure_status,
+                        code=failure_code,
                         planner_view={
                             "reason_codes": list(scene_budget_reasons),
                             "candidate_revision": payload.expected_revision,
@@ -1657,7 +1679,11 @@ class ProseRemediationToolApplication:
                         resource_revision=str(payload.expected_revision),
                         resource_digest=payload.expected_content_digest,
                         usage=usage,
-                        error_summary="改写结果违反逐场字数预算。",
+                        error_summary=(
+                            "改写没有解决任何原失败场景，已提前停止。"
+                            if failure_code == "repair_no_progress"
+                            else "改写结果违反逐场字数预算。"
+                        ),
                     )
                 checkpointed_scene_repair = True
                 completed_scene_indexes = tuple(
@@ -2448,7 +2474,7 @@ class ProseRemediationToolRegistry:
                     _TOOL_INPUT_TOKEN_BOUND
                 ),
                 implementation_revision=(
-                    f"prose-candidate-rewrite-r16-{rewrite_call.revision[:20]}"
+                    f"prose-candidate-rewrite-r17-{rewrite_call.revision[:20]}"
                 ),
                 context_policy_revision="chapter-context-id-whitelist-r1",
                 external_data_categories=(
@@ -2493,7 +2519,7 @@ class ProseRemediationToolRegistry:
             descriptor.reference: descriptor for descriptor in descriptors
         }
         self.registry_revision = (
-            "prose-remediation-tools-r17-"
+            "prose-remediation-tools-r18-"
             + _canonical_digest([
                 {
                     "reference": item.reference.model_dump(mode="json"),

@@ -88,6 +88,7 @@ from backend.services.generation.prose_completion_contract import (
 )
 from backend.services.generation.prose_scene_repair import (
     incomplete_scene_indexes,
+    scene_budget_failure_indexes,
 )
 from backend.services.novel.state_fact_accounting import (
     StateFactAccountingError,
@@ -3900,13 +3901,21 @@ def _completion_repair_request(
 ) -> ProseCandidateRepairRequest:
     outline_indexes = _outline_scene_indexes(chapter)
     try:
-        target_indexes = incomplete_scene_indexes(
-            completion=source.completion,
-            scene_count=len(outline_indexes),
-        )
+        target_indexes: tuple[int, ...] = ()
+        if source.completion.get("scene_contract_validation") is not None:
+            target_indexes = scene_budget_failure_indexes(
+                completion=source.completion,
+                scene_count=len(outline_indexes),
+                text=source.text,
+            )
+        if not target_indexes:
+            target_indexes = incomplete_scene_indexes(
+                completion=source.completion,
+                scene_count=len(outline_indexes),
+            )
     except ValueError as exc:
         raise ChapterCandidatePipelineBlocked(
-            "正文完成进度不能唯一定位未完成场景",
+            "正文完成证据不能唯一定位待修复场景",
             code="candidate_completion_progress_invalid",
             gate="completion",
         ) from exc

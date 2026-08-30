@@ -122,6 +122,7 @@ class V2SceneRepairPlan:
     budgets: tuple[V2SceneBudget, ...]
     source_scene_texts: tuple[str, ...]
     source_failing_scene_indexes: tuple[int, ...]
+    requested_scene_indexes: tuple[int, ...]
     target_scene_indexes: tuple[int, ...]
     targets: tuple[V2SceneRepairTarget, ...]
 
@@ -374,6 +375,60 @@ def _scene_budget_reason_codes(
     return tuple(reasons)
 
 
+def scene_budget_failure_indexes(
+    *,
+    completion: Mapping[str, Any],
+    scene_count: int,
+    text: str,
+) -> tuple[int, ...]:
+    """Project exact budget-failing scenes from a candidate-bound proof."""
+
+    if type(scene_count) is not int or not 1 <= scene_count <= 20:
+        raise ValueError("scene_count must be between 1 and 20")
+    proof = SceneContractValidationProof.model_validate(
+        completion.get("scene_contract_validation")
+    )
+    if proof.source_content_digest != chapter_content_digest(text):
+        raise ValueError("V2 scene budget proof does not bind the candidate")
+    if len(proof.scenes) != scene_count:
+        raise ValueError("V2 scene budget proof does not cover every scene")
+    if len({entry.scene_id for entry in proof.scenes}) != scene_count:
+        raise ValueError("V2 scene budget proof scene identity is ambiguous")
+
+    failing: list[int] = []
+    previous_end = 0
+    for zero_based_index, entry in enumerate(proof.scenes):
+        expected_start = 0 if zero_based_index == 0 else previous_end + 2
+        if (
+            entry.start != expected_start
+            or entry.end > len(text)
+            or (
+                zero_based_index
+                and text[previous_end:entry.start] != "\n\n"
+            )
+        ):
+            raise ValueError("V2 scene budget proof order is invalid")
+        scene_text = text[entry.start:entry.end]
+        word_count = count_chapter_words(scene_text)
+        if (
+            entry.content_digest != chapter_content_digest(scene_text)
+            or entry.word_count != word_count
+        ):
+            raise ValueError(
+                "V2 scene budget proof failed deterministic validation"
+            )
+        if (
+            word_count < entry.min
+            or entry.normalization_boundary == "word"
+            or word_count > entry.max
+        ):
+            failing.append(zero_based_index + 1)
+        previous_end = entry.end
+    if previous_end != len(text):
+        raise ValueError("V2 scene budget proof leaves unowned prose")
+    return tuple(failing)
+
+
 def _scene_texts_from_segments(
     *,
     segments: Sequence[Mapping[str, Any]],
@@ -497,13 +552,13 @@ def build_v2_scene_repair_plan(
     budgets = v2_scene_budgets(outline=outline, plan=plan)
     if not budgets:
         raise ValueError("scene-local repair requires a V2 scene contract")
-    normalized_targets = tuple(sorted(target_scene_indexes))
+    requested_targets = tuple(sorted(target_scene_indexes))
     if (
-        not normalized_targets
-        or len(set(normalized_targets)) != len(normalized_targets)
+        not requested_targets
+        or len(set(requested_targets)) != len(requested_targets)
         or any(
             type(index) is not int or not 1 <= index <= len(budgets)
-            for index in normalized_targets
+            for index in requested_targets
         )
     ):
         raise ValueError("scene-local repair targets are invalid")
@@ -517,6 +572,16 @@ def build_v2_scene_repair_plan(
             budgets=budgets,
         )
     )
+    normalized_targets = requested_targets
+    if source_failing_scene_indexes:
+        missing_source_failures = set(source_failing_scene_indexes) - set(
+            requested_targets
+        )
+        if missing_source_failures:
+            raise ValueError(
+                "scene-local repair request omits a source budget failure"
+            )
+        normalized_targets = source_failing_scene_indexes
     outline_scenes = list(outline.get("scenes") or [])
     targets: list[V2SceneRepairTarget] = []
     for scene_index in normalized_targets:
@@ -545,6 +610,7 @@ def build_v2_scene_repair_plan(
         budgets=budgets,
         source_scene_texts=source_scene_texts,
         source_failing_scene_indexes=source_failing_scene_indexes,
+        requested_scene_indexes=requested_targets,
         target_scene_indexes=normalized_targets,
         targets=tuple(targets),
     )
