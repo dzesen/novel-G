@@ -49,7 +49,7 @@ class _StrictModel(BaseModel):
 class SceneContractValidationEntry(_StrictModel):
     scene_id: str = Field(min_length=1, max_length=100)
     start: int = Field(ge=0)
-    end: int = Field(ge=1)
+    end: int = Field(ge=0)
     content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     word_count: int = Field(ge=0)
     provider_word_count: int = Field(ge=0)
@@ -61,8 +61,8 @@ class SceneContractValidationEntry(_StrictModel):
 
     @model_validator(mode="after")
     def validate_bounds_and_budget(self) -> "SceneContractValidationEntry":
-        if self.end <= self.start:
-            raise ValueError("scene contract validation span is empty")
+        if self.end < self.start:
+            raise ValueError("scene contract validation span is reversed")
         if not self.min <= self.target <= self.max:
             raise ValueError("scene contract validation budget is invalid")
         if self.provider_word_count < self.word_count:
@@ -679,7 +679,7 @@ def apply_v2_scene_replacements(
             provider_word_count = count_chapter_words(scene_text)
             discarded_word_count = 0
             normalization_boundary = None
-        if not scene_text:
+        if not scene_text and budget.scene_index in target_indexes:
             raise ValueError("V2 repaired scene cannot be empty")
 
         start = cursor

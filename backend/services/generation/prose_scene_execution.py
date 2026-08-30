@@ -101,6 +101,7 @@ _SCENE_WORD_BUDGET_TERMINALS = frozenset({
 def _can_defer_scene_pause(
     *,
     pause_reason: str | None,
+    latest_finish_reason: str,
     scene_index: int,
     scene_count: int,
     stop_after_scene_index: int | None,
@@ -109,6 +110,7 @@ def _can_defer_scene_pause(
 
     return bool(
         pause_reason in _SCENE_WORD_BUDGET_TERMINALS
+        and _provider_failure_reason(latest_finish_reason) is None
         and scene_index + 1 < scene_count
         and (
             stop_after_scene_index is None
@@ -1389,7 +1391,29 @@ async def execute_v3_prose_plan(
                 )
                 if missing_base is None or may_end_before_remaining_base:
                     break
+            latest_provider_failure = (
+                _provider_failure_reason(
+                    str(latest.get("finish_reason") or "unreported")
+                )
+                if latest is not None
+                else None
+            )
+            persisted_reported_error_recovery = bool(
+                latest is not None
+                and latest_provider_failure == "finish_reason_error"
+                and policy.permits_automatic_continuation
+                and _is_settled_reported_error(latest)
+                and int(latest.get("sequence_index") or 0)
+                in persisted_sequences
+            )
             if state.get("pause_reason") in _SCENE_WORD_BUDGET_TERMINALS:
+                if (
+                    latest_provider_failure is not None
+                    and not persisted_reported_error_recovery
+                ):
+                    state["status"] = "paused"
+                    state["pause_reason"] = latest_provider_failure
+                    await publish_progress()
                 pause_reason = str(state["pause_reason"])
                 break
 
@@ -1466,19 +1490,12 @@ async def execute_v3_prose_plan(
                 pause_reason = state["pause_reason"]
                 break
 
-            failure = _provider_failure_reason(
-                str(latest.get("finish_reason") or "unreported")
-            )
-            persisted_reported_error_recovery = bool(
-                failure == "finish_reason_error"
-                and policy.permits_automatic_continuation
-                and _is_settled_reported_error(latest)
-                and int(latest.get("sequence_index") or 0)
-                in persisted_sequences
-            )
-            if failure is not None and not persisted_reported_error_recovery:
+            if (
+                latest_provider_failure is not None
+                and not persisted_reported_error_recovery
+            ):
                 state["status"] = "paused"
-                state["pause_reason"] = failure
+                state["pause_reason"] = latest_provider_failure
                 await publish_progress()
                 pause_reason = state["pause_reason"]
                 break
@@ -1574,6 +1591,11 @@ async def execute_v3_prose_plan(
         if pause_reason is not None:
             if _can_defer_scene_pause(
                 pause_reason=pause_reason,
+                latest_finish_reason=(
+                    str(latest.get("finish_reason") or "unreported")
+                    if latest is not None
+                    else "unreported"
+                ),
                 scene_index=scene_index,
                 scene_count=plan.scene_count,
                 stop_after_scene_index=stop_after_scene_index,

@@ -703,31 +703,13 @@ def _checkpoint_scope_matches_request(
     resolved = indexes("resolved_scene_indexes")
     remaining = indexes("remaining_scene_indexes")
     block_reasons = result.audit_view.get("checkpoint_block_reason_codes")
-    # Receipts created before the bounded-scope evidence upgrade did not
-    # project these fields. Preserve their exact-scope replay, while requiring
-    # the complete proof for every new or broader-scope receipt.
-    if (
-        checkpoint.target_scene_indexes == payload.scene_indexes
-        and not any(
-            key in result.audit_view
-            for key in (
-                "requested_scene_indexes",
-                "source_failing_scene_indexes",
-                "replaced_scene_indexes",
-                "resolved_scene_indexes",
-                "remaining_scene_indexes",
-            )
-        )
-    ):
-        return True
     source_scope = set(checkpoint.target_scene_indexes)
     replaced_scope = set(replaced or ())
     resolved_scope = set(resolved or ())
     return bool(
         requested == payload.scene_indexes
         and source_failing == checkpoint.target_scene_indexes
-        and replaced_scope
-        and replaced_scope.issubset(source_scope)
+        and replaced == source_failing[:1]
         and replaced_scope.issubset(set(payload.scene_indexes))
         and resolved == checkpoint.resolved_scene_indexes
         and resolved_scope
