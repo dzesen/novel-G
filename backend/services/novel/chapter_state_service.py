@@ -31,6 +31,9 @@ from backend.llm.schemas.novel_pydantic import ChapterStateAcceptSchema
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
 )
+from backend.services.generation.required_chapter_state_contracts import (
+    RequiredStateGenerationBinding,
+)
 from backend.services.llm.context_builder import fetch_roster
 from backend.services.novel.state_validation import validate_state_ids
 from backend.services.novel.state_completion import (
@@ -439,6 +442,11 @@ class ChapterStateService:
             if proposal_claim
             else None
         )
+        raw_required_binding = (
+            proposal_claim.get("required_state_generation_binding")
+            if proposal_claim
+            else None
+        )
         if proposal_claim and proposal_claim.get("claim_id") is not None and (
             raw_job_binding is None
         ):
@@ -452,8 +460,43 @@ class ChapterStateService:
                 raise ValueError(
                     "State mutation Job binding is invalid"
                 ) from exc
+            required_binding = None
+            if raw_required_binding is not None:
+                try:
+                    required_binding = (
+                        RequiredStateGenerationBinding.model_validate(
+                            raw_required_binding
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "State mutation required binding is invalid"
+                    ) from exc
+            required_finalization = (
+                required_binding is not None
+                and job_binding.operation == "finalize_chapter_generation"
+                and job_binding.job_id != required_binding.job_id
+                and job_binding.novel_id == required_binding.novel_id
+                and job_binding.chapter_id == required_binding.chapter_id
+                and job_binding.expected_narrative_revision
+                == required_binding.expected_narrative_revision
+                and job_binding.idempotency_key
+                == (
+                    "finalize-chapter-generation:"
+                    f"{required_binding.source_run_id}:"
+                    f"{required_binding.source_run_revision}:"
+                    f"{proposal_claim.get('proposal_id') or ''}"
+                )
+            )
             if (
-                job_binding.operation != "accept_chapter_state"
+                (
+                    job_binding.operation != "accept_chapter_state"
+                    and not required_finalization
+                )
+                or (
+                    job_binding.operation == "accept_chapter_state"
+                    and required_binding is not None
+                )
                 or job_binding.novel_id != novel_id
                 or job_binding.chapter_id != chapter_id
                 or proposal_claim.get("claim_id")
@@ -468,6 +511,10 @@ class ChapterStateService:
             idempotency_key = job_binding.idempotency_key
             expected_narrative_revision = (
                 job_binding.expected_narrative_revision
+            )
+        elif raw_required_binding is not None:
+            raise ValueError(
+                "State mutation required binding needs a formal Job binding"
             )
         return MutationCommand(
             novel_id=novel_id,

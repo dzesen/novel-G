@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -50,6 +51,7 @@ class ProseRunRepository(BaseRepository):
         *,
         replace_run_id: str | None = None,
         expected_revision: int | None = None,
+        require_no_current: bool = False,
     ) -> dict[str, Any]:
         owner_id = to_object_id(document["owner_id"])
         chapter_id = to_object_id(document["chapter_id"])
@@ -82,6 +84,19 @@ class ProseRunRepository(BaseRepository):
             if replaced.modified_count != 1:
                 raise StaleProseRun(
                     "正文草稿已被其他页面继续或重新生成"
+                )
+        elif require_no_current:
+            if expected_revision is not None:
+                raise ValueError(
+                    "expected_revision is only valid for a replacement run"
+                )
+            current = await self.find_active(
+                chapter_id=str(chapter_id),
+                owner_id=str(owner_id),
+            )
+            if current is not None:
+                raise StaleProseRun(
+                    "当前章节已有正文草稿，不能替换本次作业的初稿身份"
                 )
         else:
             if expected_revision is not None:
@@ -160,6 +175,32 @@ class ProseRunRepository(BaseRepository):
             limit=1,
             sort=[("updated_at", -1)],
         )
+        return documents[0] if documents else None
+
+    async def find_required_initial(
+        self,
+        *,
+        owner_id: str,
+        chapter_id: str,
+        job_id: str,
+        request_digest: str,
+    ) -> dict[str, Any] | None:
+        """Locate only the original run for one frozen initial request."""
+
+        documents = await self.find_many(
+            {
+                "owner_id": to_object_id(owner_id),
+                "chapter_id": to_object_id(chapter_id),
+                "generation_job_id": to_object_id(job_id),
+                "required_initial_origin.request_digest": str(request_digest),
+                "status": {"$in": list(DISCARDABLE_PROSE_RUN_STATUSES)},
+                "is_deleted": False,
+            },
+            limit=2,
+            sort=[("updated_at", -1)],
+        )
+        if len(documents) > 1:
+            raise StaleProseRun("本次作业的初稿身份不唯一")
         return documents[0] if documents else None
 
     async def list_leftovers(
@@ -1468,6 +1509,7 @@ class ProseRunRepository(BaseRepository):
         result_projection: dict[str, Any],
         write_fence_token: str,
         candidate_status: str,
+        required_adherence_origin: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """CAS one temporary candidate and publish one bounded receipt pointer."""
         if candidate_status not in {"complete", "incomplete"}:
@@ -1477,13 +1519,33 @@ class ProseRunRepository(BaseRepository):
             if candidate_status == "incomplete"
             else "prose_candidate_rewritten"
         )
+        if required_adherence_origin is not None:
+            from backend.services.generation.required_prose_rewrite_contracts import (
+                REQUIRED_REWRITE_RESULT, RequiredRewriteCandidateOrigin, RequiredRewriteOrigin,
+            )
+
+            origin = RequiredRewriteCandidateOrigin.model_validate_json(
+                json.dumps(required_adherence_origin)
+            )
+            if (
+                origin.request.source_run_id != run_id
+                or origin.request.source_revision != expected_revision
+                or origin.request.source_content_digest != source_content_digest
+                or list(origin.request.issue_categories) != target_issue_categories
+                or list(origin.request.scene_indexes) != target_scene_indexes
+            ):
+                raise ValueError("required rewrite source does not match candidate mutation")
+            if candidate_status == "complete":
+                expected_result_code = REQUIRED_REWRITE_RESULT
         expected_result_revision = int(expected_revision) + 1
         expected_result_digest = hashlib.sha256(
             str(assembled_text).encode("utf-8")
         ).hexdigest()
         checkpoint = completion.get("resumable_scene_repair")
         if (
-            completion.get("status") != "incomplete"
+            completion.get("status") != (
+                candidate_status if required_adherence_origin is not None else "incomplete"
+            )
             or completion.get("can_write_formal_prose") is not False
             or result_projection.get("status") != "ok"
             or result_projection.get("code") != expected_result_code
@@ -1544,6 +1606,8 @@ class ProseRunRepository(BaseRepository):
             owner_id=owner_id,
             novel_id=novel_id,
         )
+        if required_adherence_origin is not None and str(current_document.get("generation_job_id")) != origin.job_id:
+            raise StaleProseRun("required rewrite candidate belongs to another Job")
         previous_pointer = await self._drain_latest_remediation_receipt(
             document=current_document,
             run_id=run_id,
@@ -1561,6 +1625,15 @@ class ProseRunRepository(BaseRepository):
         ):
             raise StaleProseRun("正文修复 Provider 派发权已经失效")
 
+        if required_adherence_origin is not None:
+            from backend.db.required_prose_rewrite_journal import validate_required_rewrite_origin
+
+            # Receipt draining and fence renewal may have yielded since the
+            # Tool's check. Re-prove parent authority at this write seam too.
+            await validate_required_rewrite_origin(
+                RequiredRewriteOrigin.model_validate_json(origin.model_dump_json(exclude={"agent_run_id"})),
+                agent_run_id=origin.agent_run_id, owner_id=owner_id,
+            )
         now = get_utc_now()
         next_revision = int(expected_revision) + 1
         query: dict[str, Any] = {
@@ -1617,7 +1690,12 @@ class ProseRunRepository(BaseRepository):
                     "completion": dict(completion),
                     "updated_at": now,
                     "remediation": {
-                        "schema_version": "prose_run_remediation.v1",
+                        "schema_version": (
+                            "prose_run_remediation.v2" if required_adherence_origin is not None
+                            else "prose_run_remediation.v1"
+                        ),
+                        **({"required_adherence_origin": dict(required_adherence_origin)}
+                           if required_adherence_origin is not None else {}),
                         "latest_idempotency_key": str(idempotency_key),
                         "latest_revision": next_revision,
                         "latest_content_digest": str(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -30,6 +31,9 @@ from backend.services.generation.prose_protocol import (
     is_scene_continuation_v3_family,
 )
 from backend.services.generation.prose_generation import UncertainProseAttempt
+from backend.services.generation.required_initial_prose_contracts import (
+    RequiredInitialProseOrigin,
+)
 from backend.scene_contract_versions import require_known_scene_contract_version
 from backend.services.generation.job_relations import related_prose_run_ids
 from backend.services.llm.context_builder import normalize_outline_references
@@ -50,6 +54,73 @@ def prose_revision(value: Any) -> str:
         default=str,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+_REQUIRED_COMPLETION_PROMOTION_KEYS = frozenset({
+    "schema_version",
+    "finalization_job_id",
+    "readiness_digest",
+    "authorization_contract_digest",
+    "reviewed_job_id",
+    "reviewed_result_digest",
+    "state_job_id",
+    "state_result_digest",
+    "source_run_id",
+    "source_run_revision",
+    "source_content_digest",
+    "stored_completion_digest",
+    "effective_completion_digest",
+    "promotion_digest",
+})
+
+
+def _validated_required_completion_promotion(
+    value: Mapping[str, Any],
+    *,
+    run_id: str,
+    run_revision: int,
+    text_digest: str,
+    effective_completion: Mapping[str, Any],
+    stored_completion: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate the one-way reviewed-candidate completion promotion proof."""
+
+    from backend.services.generation.required_chapter_state_contracts import (
+        required_state_digest,
+    )
+
+    if not isinstance(value, Mapping) or set(value) != _REQUIRED_COMPLETION_PROMOTION_KEYS:
+        raise ValueError("已审查正文完成升级证明格式无效")
+    parsed = deepcopy(dict(value))
+    promotion_digest = parsed.pop("promotion_digest", None)
+    effective = deepcopy(dict(effective_completion))
+    if (
+        parsed.get("schema_version")
+        != "required_reviewed_completion_promotion.v1"
+        or parsed.get("source_run_id") != str(run_id)
+        or parsed.get("source_run_revision") != int(run_revision)
+        or parsed.get("source_content_digest") != str(text_digest)
+        or required_state_digest(parsed) != promotion_digest
+        or parsed.get("effective_completion_digest")
+        != required_state_digest(effective)
+        or effective.get("status") != "complete"
+        or effective.get("finish_reason") != "stop"
+        or effective.get("can_write_formal_prose") is not True
+    ):
+        raise ValueError("已审查正文完成升级证明已经漂移")
+    if stored_completion is not None:
+        stored = deepcopy(dict(stored_completion))
+        expected_effective = {**stored, "can_write_formal_prose": True}
+        if (
+            stored.get("status") != "complete"
+            or stored.get("finish_reason") != "stop"
+            or stored.get("can_write_formal_prose") is not False
+            or parsed.get("stored_completion_digest")
+            != required_state_digest(stored)
+            or effective != expected_effective
+        ):
+            raise ValueError("非正式正文不满足完成升级前置条件")
+    return dict(value)
 
 
 def _normalize_context_lineage(
@@ -629,7 +700,21 @@ class ProseRunModule:
         confirm_uncertain_retry: bool = False,
         replace_exhausted: bool = False,
         authorization: dict[str, Any] | None = None,
+        required_initial_origin: RequiredInitialProseOrigin | None = None,
     ) -> dict[str, Any]:
+        initial_origin = (
+            None
+            if required_initial_origin is None
+            else RequiredInitialProseOrigin.model_validate_json(
+                required_initial_origin.model_dump_json()
+            )
+        )
+        if initial_origin is not None and (
+            generation_job_id != initial_origin.job_id
+            or chapter_id != initial_origin.chapter_id
+            or prose_revision(outline) != initial_origin.outline_revision
+        ):
+            raise ValueError("初稿来源与当前作业或章纲不匹配")
         outline_revision = prose_revision(outline)
         context_revision = prose_revision(context_text)
         normalized_context_lineage = _normalize_context_lineage(
@@ -658,6 +743,13 @@ class ProseRunModule:
                 != generation_job_id
             ):
                 raise ValueError("正文草稿不属于当前生成作业")
+            if initial_origin is not None and (
+                existing.get("required_initial_origin") is None
+                or RequiredInitialProseOrigin.model_validate(
+                    existing.get("required_initial_origin")
+                ) != initial_origin
+            ):
+                raise ValueError("正文草稿不属于当前初稿请求")
             if (
                 str(existing.get("chapter_id")) != str(chapter_id)
                 or existing.get("outline_revision") != outline_revision
@@ -808,11 +900,23 @@ class ProseRunModule:
             "completion": None,
             "assembled_text": "",
             "acceptance_state": None,
+            **(
+                {
+                    "required_initial_origin": initial_origin.model_dump(
+                        mode="json"
+                    )
+                }
+                if initial_origin is not None
+                else {}
+            ),
         }
         created = await prose_run_repo.create_run(
             document,
             replace_run_id=replace_run_id,
             expected_revision=replace_revision,
+            require_no_current=(
+                initial_origin is not None and replace_run_id is None
+            ),
         )
         return await prose_run_repo.claim(
             run_id=str(created["_id"]),
@@ -1111,6 +1215,38 @@ class ProseRunModule:
             raise ValueError("正文尚未完成；不能进入 AI 完成评估")
         return context
 
+    async def inspect_required_reviewed_completion_candidate(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+        chapter_id: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Read a complete, independently reviewed candidate before promotion.
+
+        This Interface does not grant write authority.  It only recognizes the
+        deliberately deferred completion shape produced by the review
+        successor; the finalization Module must supply a current certificate
+        and a separate promotion proof before ``prepare_accept_mutation`` can
+        turn it into formal prose.
+        """
+
+        context = await self._load_accept_context(
+            owner_id=owner_id,
+            run_id=run_id,
+            chapter_id=chapter_id,
+            expected_revision=expected_revision,
+        )
+        completion = dict(context["completion"] or {})
+        if (
+            completion.get("status") != "complete"
+            or completion.get("finish_reason") != "stop"
+            or completion.get("can_write_formal_prose") is not False
+        ):
+            raise ValueError("正文不是可由 successor 升级的已审查完整候选")
+        return context
+
     async def prepare_accept_mutation(
         self,
         *,
@@ -1121,6 +1257,7 @@ class ProseRunModule:
         accept_partial: bool,
         partial_acknowledgement: bool,
         chapter_completion_certificate: Mapping[str, Any] | None = None,
+        required_completion_promotion: Mapping[str, Any] | None = None,
     ) -> MutationCommand:
         context = await self._load_accept_context(
             owner_id=owner_id,
@@ -1130,11 +1267,29 @@ class ProseRunModule:
         )
         run = context["run"]
         chapter = context["chapter"]
-        completion = context["completion"]
+        stored_completion = dict(context["completion"] or {})
         text_digest = str(context["text_digest"])
         captured_narrative_revision = int(
             context["captured_narrative_revision"]
         )
+        serialized_promotion: dict[str, Any] | None = None
+        completion = stored_completion
+        if required_completion_promotion is not None:
+            if accept_partial:
+                raise ValueError("部分正文不能携带 successor 完成升级证明")
+            effective = {
+                **stored_completion,
+                "can_write_formal_prose": True,
+            }
+            serialized_promotion = _validated_required_completion_promotion(
+                required_completion_promotion,
+                run_id=run_id,
+                run_revision=expected_revision,
+                text_digest=text_digest,
+                effective_completion=effective,
+                stored_completion=stored_completion,
+            )
+            completion = effective
         can_write = bool(completion.get("can_write_formal_prose"))
         if not can_write and not accept_partial:
             raise ValueError("正文尚未完成；只能继续生成或明确接受部分正文")
@@ -1168,6 +1323,14 @@ class ProseRunModule:
                 or binding.volume_id != str(chapter.get("volume_id") or "")
             ):
                 raise ValueError("章节完成证书没有绑定当前正文候选")
+            if serialized_promotion is not None and (
+                certificate.authorization_binding.kind != "job_readiness"
+                or certificate.authorization_binding.job_id
+                != serialized_promotion["finalization_job_id"]
+                or certificate.authorization_binding.readiness_digest
+                != serialized_promotion["readiness_digest"]
+            ):
+                raise ValueError("章节完成证书没有绑定 successor 正式授权")
             serialized_certificate = certificate.model_dump(mode="json")
 
         acceptance_state = (
@@ -1191,6 +1354,7 @@ class ProseRunModule:
                 "accepted_partial": bool(accept_partial),
                 "content_origin": "ai",
                 "completion": completion,
+                "required_completion_promotion": serialized_promotion,
                 "captured_narrative_revision": int(captured_narrative_revision),
                 "chapter_completion_certificate": serialized_certificate,
             },
@@ -1278,6 +1442,30 @@ class ProseRunModule:
         if chapter_content_digest(text) != command["text_digest"]:
             raise ValueError("正文草稿内容摘要已经变化")
 
+        command_completion = command.get("completion")
+        if not isinstance(command_completion, Mapping):
+            raise ValueError("正文接受命令缺少完成证据")
+        effective_completion = deepcopy(dict(command_completion))
+        raw_promotion = command.get("required_completion_promotion")
+        if raw_promotion is None:
+            if effective_completion != dict(run.get("completion") or {}):
+                raise ValueError("正文接受命令的完成证据已经变化")
+        else:
+            _validated_required_completion_promotion(
+                raw_promotion,
+                run_id=run_id,
+                run_revision=expected_revision,
+                text_digest=command["text_digest"],
+                effective_completion=effective_completion,
+                stored_completion=(
+                    None
+                    if already_applied
+                    else dict(run.get("completion") or {})
+                ),
+            )
+            if already_applied and dict(run.get("completion") or {}) != effective_completion:
+                raise ValueError("已完成升级的正文证据与重放命令不一致")
+
         serialized_certificate: dict[str, Any] | None = None
         if command_version == 2:
             raw_certificate = command.get("chapter_completion_certificate")
@@ -1302,6 +1490,14 @@ class ProseRunModule:
                     != str(run["novel_id"])
                 ):
                     raise ValueError("章节完成证书没有绑定当前正文候选")
+                if raw_promotion is not None and (
+                    certificate.authorization_binding.kind != "job_readiness"
+                    or certificate.authorization_binding.job_id
+                    != raw_promotion["finalization_job_id"]
+                    or certificate.authorization_binding.readiness_digest
+                    != raw_promotion["readiness_digest"]
+                ):
+                    raise ValueError("章节完成证书没有绑定 successor 正式授权")
                 serialized_certificate = certificate.model_dump(mode="json")
             elif raw_certificate is not None:
                 raise ValueError("部分正文不能绑定章节完成证书")
@@ -1313,8 +1509,8 @@ class ProseRunModule:
             "accepted_partial": bool(command.get("accepted_partial")),
             "source_run_id": run_id,
             "content_digest": command["text_digest"],
-            "completion_status": (run.get("completion") or {}).get("status"),
-            "finish_reason": (run.get("completion") or {}).get("finish_reason"),
+            "completion_status": effective_completion.get("status"),
+            "finish_reason": effective_completion.get("finish_reason"),
             "accepted_at": accepted_at,
         }
         if serialized_certificate is not None:
@@ -1360,6 +1556,7 @@ class ProseRunModule:
                         "accepted_at": accepted_at,
                         "updated_at": accepted_at,
                         "lease": None,
+                        "completion": effective_completion,
                     },
                     "$inc": {"revision": 1},
                 },

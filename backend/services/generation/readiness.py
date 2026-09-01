@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Mapping
@@ -1361,9 +1362,50 @@ class GenerationReadinessModule:
         volume_id = report.get("volume_id")
         outline_deviation_policy = report.get("outline_deviation_policy")
         planning = report.get("planning")
-        candidate_readiness = (
+        legacy_candidate_readiness = (
             isinstance(planning, Mapping)
             and "chapter_candidate_pipeline_revision" in planning
+        )
+        successor_readiness = False
+        if isinstance(planning, Mapping):
+            from backend.services.generation.required_book_successor import (
+                required_book_successor_planning_present,
+                validate_required_book_successor_readiness,
+            )
+            from backend.services.generation.required_chapter_finalization_job import (
+                required_chapter_finalization_planning_present,
+                validate_required_chapter_finalization_readiness,
+            )
+            from backend.services.generation.required_chapter_review_job import (
+                required_chapter_review_planning_present,
+                validate_required_chapter_review_readiness,
+            )
+            from backend.services.generation.required_chapter_state_job import (
+                required_chapter_state_planning_present,
+                validate_required_chapter_state_readiness,
+            )
+
+            successor_validator = None
+            if required_book_successor_planning_present(planning):
+                successor_validator = validate_required_book_successor_readiness
+            elif required_chapter_finalization_planning_present(planning):
+                successor_validator = (
+                    validate_required_chapter_finalization_readiness
+                )
+            elif required_chapter_state_planning_present(planning):
+                successor_validator = validate_required_chapter_state_readiness
+            elif required_chapter_review_planning_present(planning):
+                successor_validator = validate_required_chapter_review_readiness
+            successor_readiness = successor_validator is not None
+            if successor_readiness:
+                try:
+                    successor_validator(report)
+                except ValueError as exc:
+                    raise StaleReadiness(
+                        "必需章节审查 readiness 已失效，请重新检查"
+                    ) from exc
+        candidate_readiness = (
+            legacy_candidate_readiness or successor_readiness
         )
         resources = report.get("resources")
         owner_id = resources.get("owner_id") if isinstance(resources, Mapping) else None
@@ -1447,7 +1489,7 @@ class GenerationReadinessModule:
         if required:
             raise ReadinessBlocked(f"以下警告需要明确确认: {', '.join(required)}")
 
-        return {
+        authorized = {
             "version": 2,
             "novel_id": novel_id,
             "scope": scope,
@@ -1460,6 +1502,11 @@ class GenerationReadinessModule:
             "resources": report.get("resources") or {},
             "planning": report.get("planning") or {},
         }
+        if "source_binding" in report:
+            authorized["source_binding"] = deepcopy(
+                report.get("source_binding")
+            )
+        return authorized
 
 
 async def _load_resource_counts(novel_id: str) -> dict[str, Any]:

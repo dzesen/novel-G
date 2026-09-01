@@ -33,6 +33,7 @@ from backend.llm.schemas.scene_contract_pydantic import (
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
     AdherenceCandidateCheckpointV5,
+    JobMutationRecoveryBindingV1,
     parse_candidate_pipeline_checkpoint,
 )
 from backend.services.generation.chapter_completion_certificate import (
@@ -155,6 +156,34 @@ def _state_proposal_failure_fact(
     )
 
 
+def _required_finalization_authority(
+    job: Mapping[str, Any],
+) -> Any | None:
+    """Return the exact formal successor authority, or fail on a partial mode."""
+
+    readiness = job.get("readiness")
+    planning = (
+        readiness.get("planning")
+        if isinstance(readiness, Mapping)
+        else None
+    )
+    if not isinstance(planning, Mapping):
+        return None
+    from backend.services.generation.required_chapter_finalization_job import (
+        required_chapter_finalization_planning_present,
+        validate_required_chapter_finalization_readiness,
+    )
+
+    if not required_chapter_finalization_planning_present(planning):
+        return None
+    try:
+        return validate_required_chapter_finalization_readiness(readiness)
+    except ValueError as exc:
+        raise ChapterFinalizationDenied(
+            "章节正式 successor readiness 无效"
+        ) from exc
+
+
 def _trusted_outline_adherence_evidence(
     *,
     job: Mapping[str, Any],
@@ -163,8 +192,20 @@ def _trusted_outline_adherence_evidence(
     """Load the exact server-persisted V4 evidence for this finalization."""
 
     raw_trusted: Any = None
+    successor = _required_finalization_authority(job)
+    if successor is not None:
+        if successor.chapter_id != str(chapter_id):
+            raise _CompletionGateDenied(
+                "章节正式 successor 没有绑定当前章节",
+                _failure_fact("evidence_invalid", "outline_adherence"),
+            )
+        raw_trusted = successor.outline_adherence
     interactive = job.get("interactive_completion_evidence")
-    if isinstance(interactive, Mapping) and "outline_adherence" in interactive:
+    if (
+        raw_trusted is None
+        and isinstance(interactive, Mapping)
+        and "outline_adherence" in interactive
+    ):
         raw_trusted = interactive.get("outline_adherence")
     if raw_trusted is None:
         raw_checkpoints = job.get("candidate_pipeline_checkpoints")
@@ -590,6 +631,17 @@ def _provider_attempt_ledger_projection(
 ) -> list[dict[str, Any]]:
     """Whitelist bounded attempt metadata; never hash prose or raw responses."""
 
+    successor = _required_finalization_authority(job)
+    if successor is not None:
+        if successor.chapter_id != str(chapter_id):
+            raise ChapterFinalizationDenied(
+                "章节正式 successor 付费账本没有绑定当前章节"
+            )
+        return [
+            item.model_dump(mode="json")
+            for item in successor.attempt_ledger
+        ]
+
     projected: list[dict[str, Any]] = []
     for raw in list(job.get("attempt_slots") or []):
         if not isinstance(raw, Mapping):
@@ -846,6 +898,28 @@ class ChapterFinalizationService:
         scope = str(job.get("scope") or "")
         job_kind = str(job.get("job_kind") or "")
         if authorization.kind == "job_readiness":
+            successor = _required_finalization_authority(job)
+            if successor is not None:
+                if (
+                    scope != "book"
+                    or job_kind == "interactive_chapter_completion"
+                    or str(job.get("owner_id") or "") != str(owner_id)
+                    or str(job.get("current_chapter_id") or "")
+                    != str(chapter_id)
+                    or successor.chapter_id != str(chapter_id)
+                    or successor.reviewed_candidate.source_run_id
+                    != str(prose_run_id)
+                    or successor.reviewed_candidate.source_run_revision
+                    != int(prose_run_revision)
+                    or successor.reviewed_candidate.source_content_digest
+                    != str(content_digest)
+                    or str(prose_run.get("generation_job_id") or "")
+                    != successor.reviewed_candidate.job_id
+                ):
+                    raise ChapterFinalizationDenied(
+                        "章节正式 successor 不能跨来源作用域写入"
+                    )
+                return
             if (
                 scope not in {"book", "volume"}
                 or job_kind == "interactive_chapter_completion"
@@ -1263,13 +1337,51 @@ class ChapterFinalizationService:
         authorization: ChapterFinalizationAuthorization,
         evidence: ChapterFinalizationEvidence,
     ) -> dict[str, Any]:
+        job = await self._deps.job_repo.get_job(authorization.job_id)
+        successor = _required_finalization_authority(job)
         try:
-            candidate = await self._deps.prose_runs.inspect_ai_completion_candidate(
-                owner_id=owner_id,
-                run_id=prose_run_id,
-                chapter_id=chapter_id,
-                expected_revision=prose_run_revision,
-            )
+            if successor is None:
+                candidate = (
+                    await self._deps.prose_runs.inspect_ai_completion_candidate(
+                        owner_id=owner_id,
+                        run_id=prose_run_id,
+                        chapter_id=chapter_id,
+                        expected_revision=prose_run_revision,
+                    )
+                )
+                completion_promotion = None
+            else:
+                candidate = await self._deps.prose_runs.inspect_required_reviewed_completion_candidate(
+                    owner_id=owner_id,
+                    run_id=prose_run_id,
+                    chapter_id=chapter_id,
+                    expected_revision=prose_run_revision,
+                )
+                from backend.services.generation.required_chapter_finalization_job import (
+                    build_required_completion_promotion,
+                )
+
+                effective_completion, completion_promotion = (
+                    build_required_completion_promotion(
+                        finalization_job_id=authorization.job_id,
+                        readiness_digest=authorization.readiness_digest,
+                        authorization=successor,
+                        stored_completion=candidate["completion"],
+                    )
+                )
+                candidate = {
+                    **candidate,
+                    "completion": effective_completion,
+                }
+                expected_evidence = ChapterFinalizationEvidence(
+                    outline_adherence=successor.outline_adherence,
+                    repair_cycles_used=successor.repair_cycles_used,
+                    repair_trace=successor.repair_trace,
+                )
+                if evidence != expected_evidence:
+                    raise ChapterFinalizationDenied(
+                        "章节正式 successor 证据与冻结授权不一致"
+                    )
         except ValueError as exc:
             raise ChapterFinalizationDenied(str(exc)) from exc
         run = dict(candidate["run"])
@@ -1277,7 +1389,6 @@ class ChapterFinalizationService:
         candidate_digest = str(candidate["text_digest"])
         novel_id = str(run.get("novel_id") or "")
         chapter = await self._deps.chapter_repo.get_chapter_by_id(chapter_id)
-        job = await self._deps.job_repo.get_job(authorization.job_id)
         self._assert_completion_decision_scope(
             job=job,
             authorization=authorization,
@@ -1337,14 +1448,50 @@ class ChapterFinalizationService:
             )
             raise ChapterFinalizationDenied(str(failure)) from failure
         try:
-            state_payload, state_metadata, proposal_claim = (
-                await self._deps.state_proposals.prepare_policy_decision(
-                    chapter_id=chapter_id,
-                    proposal_id=state_proposal_id,
-                    acceptance_token=state_acceptance_token,
-                    policy=FactAccountingPolicy(),
+            if successor is None:
+                state_payload, state_metadata, proposal_claim = (
+                    await self._deps.state_proposals.prepare_policy_decision(
+                        chapter_id=chapter_id,
+                        proposal_id=state_proposal_id,
+                        acceptance_token=state_acceptance_token,
+                        policy=FactAccountingPolicy(),
+                    )
                 )
-            )
+            else:
+                finalization_binding = JobMutationRecoveryBindingV1(
+                    novel_id=novel_id,
+                    job_id=authorization.job_id,
+                    chapter_id=chapter_id,
+                    readiness_digest=authorization.readiness_digest,
+                    authorization_revision=(
+                        authorization.authorization_revision
+                    ),
+                    expected_narrative_revision=int(
+                        candidate["captured_narrative_revision"]
+                    ),
+                    operation="finalize_chapter_generation",
+                    idempotency_key=chapter_finalization_idempotency_key(
+                        prose_run_id=prose_run_id,
+                        prose_run_revision=prose_run_revision,
+                        state_proposal_id=state_proposal_id,
+                    ),
+                )
+                prepare_required_state = getattr(
+                    self._deps.state_proposals,
+                    "prepare_required_state_policy_decision",
+                )
+                state_payload, state_metadata, proposal_claim = (
+                    await prepare_required_state(
+                        chapter_id=chapter_id,
+                        proposal_id=state_proposal_id,
+                        acceptance_token=state_acceptance_token,
+                        policy=FactAccountingPolicy(),
+                        required_state_generation_binding=(
+                            successor.state_generation_binding
+                        ),
+                        finalization_binding=finalization_binding,
+                    )
+                )
         except StateProposalCompletionFailure as exc:
             failure = _CompletionGateDenied(
                 str(exc),
@@ -1633,6 +1780,7 @@ class ChapterFinalizationService:
                 chapter_completion_certificate=certificate.model_dump(
                     mode="json"
                 ),
+                required_completion_promotion=completion_promotion,
             )
         except ValueError as exc:
             failure = _CompletionGateDenied(
@@ -1816,12 +1964,28 @@ class ChapterFinalizationService:
             recover_bound_mutation_revision,
         )
 
-        if (
+        job = await self._deps.job_repo.get_job(authorization.job_id)
+        successor = _required_finalization_authority(job)
+        interactive_recovery = (
             authorization.kind != "interactive_completion_readiness"
             or authorization.authorization_id != authorization.job_id
-        ):
+        ) is False
+        successor_recovery = (
+            authorization.kind == "job_readiness"
+            and successor is not None
+            and successor.owner_id == str(owner_id)
+            and successor.novel_id == str(novel_id)
+            and successor.chapter_id == str(chapter_id)
+            and successor.reviewed_candidate.source_run_id
+            == str(prose_run_id)
+            and successor.reviewed_candidate.source_run_revision
+            == int(prose_run_revision)
+            and successor.state_candidate.state_proposal_id
+            == str(state_proposal_id)
+        )
+        if not interactive_recovery and not successor_recovery:
             raise ChapterFinalizationDenied(
-                "交互式章节正式提交恢复授权无效"
+                "章节正式提交恢复授权无效"
             )
         binding = await find_job_bound_finalization_recovery_binding(
             novel_id=novel_id,
@@ -2315,7 +2479,16 @@ class ChapterFinalizationService:
                     "completion_gates",
                 ),
             )
-        if completion_evidence.get("source_prose_acceptance_state") != "ai_complete":
+        source_acceptance_state = completion_evidence.get(
+            "source_prose_acceptance_state"
+        )
+        successor = _required_finalization_authority(job)
+        accepted_source_states = (
+            {"required_reviewed_candidate"}
+            if successor is not None
+            else {"ai_complete"}
+        )
+        if source_acceptance_state not in accepted_source_states:
             raise _CompletionGateDenied(
                 "状态候选未绑定完整正文",
                 _failure_fact(

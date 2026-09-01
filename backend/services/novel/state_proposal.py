@@ -36,6 +36,9 @@ from backend.services.generation.candidate_repair_contracts import (
     STATE_DISPATCH_RESOLUTION_ACTIONS,
     StateContextProjection,
 )
+from backend.services.generation.required_chapter_state_contracts import (
+    RequiredStateGenerationBinding,
+)
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
 from backend.services.novel.state_completion import (
     chapter_content_digest,
@@ -193,6 +196,97 @@ def _job_mutation_binding_query(
     }
 
 
+def _required_state_generation_binding(
+    proposal: dict[str, Any],
+) -> RequiredStateGenerationBinding | None:
+    audit = proposal.get("generation_audit")
+    raw_audit = (
+        audit.get("required_state_generation_binding")
+        if isinstance(audit, dict)
+        else None
+    )
+    raw_top_level = proposal.get("required_state_generation_binding")
+    raw_key = proposal.get("required_state_generation_key")
+    if raw_audit is None and raw_top_level is None and raw_key is None:
+        return None
+    if raw_audit is None or raw_top_level is None or raw_key is None:
+        raise MutationConflictError(
+            "Required state generation binding is incomplete"
+        )
+    try:
+        binding = RequiredStateGenerationBinding.model_validate(raw_audit)
+        top_level = RequiredStateGenerationBinding.model_validate(raw_top_level)
+    except (TypeError, ValueError) as exc:
+        raise MutationConflictError(
+            "Required state generation binding is invalid"
+        ) from exc
+    revision = proposal.get("narrative_revision")
+    if (
+        binding != top_level
+        or raw_key != binding.recovery_key
+        or binding.novel_id != str(proposal.get("novel_id") or "")
+        or binding.chapter_id != str(proposal.get("chapter_id") or "")
+        or binding.source_run_id
+        != str(proposal.get("source_prose_run_id") or "")
+        or binding.source_run_revision
+        != proposal.get("source_prose_run_revision")
+        or binding.source_content_digest
+        != str(proposal.get("source_content_digest") or "")
+        or type(revision) is not int
+        or binding.expected_narrative_revision != revision
+        or binding.can_accept_formal_state is not False
+    ):
+        raise MutationConflictError(
+            "Required state generation binding diverged"
+        )
+    return binding
+
+
+def _required_state_generation_binding_query(
+    binding: RequiredStateGenerationBinding,
+) -> dict[str, Any]:
+    frozen = RequiredStateGenerationBinding.model_validate(
+        binding.model_dump(mode="python")
+    )
+    canonical = frozen.model_dump(mode="json")
+    return {
+        "required_state_generation_key": frozen.recovery_key,
+        "required_state_generation_binding": canonical,
+        "generation_audit.required_state_generation_binding": canonical,
+    }
+
+
+def _validate_required_state_finalization_handoff(
+    proposal: Mapping[str, Any],
+    *,
+    required_binding: RequiredStateGenerationBinding,
+    finalization_binding: JobMutationRecoveryBindingV1,
+) -> None:
+    """Prove that a new formal Job consumes this exact deferred proposal."""
+
+    stored = _required_state_generation_binding(dict(proposal))
+    proposal_id = str(proposal.get("_id") or "")
+    expected_idempotency_key = (
+        "finalize-chapter-generation:"
+        f"{required_binding.source_run_id}:"
+        f"{required_binding.source_run_revision}:{proposal_id}"
+    )
+    if (
+        stored != required_binding
+        or finalization_binding.operation != "finalize_chapter_generation"
+        or finalization_binding.job_id == required_binding.job_id
+        or finalization_binding.novel_id != required_binding.novel_id
+        or finalization_binding.chapter_id != required_binding.chapter_id
+        or finalization_binding.expected_narrative_revision
+        != required_binding.expected_narrative_revision
+        or finalization_binding.idempotency_key
+        != expected_idempotency_key
+    ):
+        raise StaleStatePreview(
+            "Required state proposal finalization handoff diverged"
+        )
+
+
 def _merged_generation_audit(
     proposal: dict[str, Any],
     audit: Mapping[str, Any] | None,
@@ -204,6 +298,7 @@ def _merged_generation_audit(
         raise StaleStatePreview("Persisted generation audit is invalid")
     incoming = dict(deepcopy(audit or {}))
     binding = _job_mutation_binding(proposal)
+    required_binding = _required_state_generation_binding(proposal)
     if "job_mutation_binding" in incoming:
         try:
             supplied = JobMutationRecoveryBindingV1.model_validate(
@@ -220,6 +315,23 @@ def _merged_generation_audit(
     merged = {**deepcopy(dict(existing)), **incoming}
     if binding is not None:
         merged["job_mutation_binding"] = binding.model_dump(mode="json")
+    if "required_state_generation_binding" in incoming:
+        try:
+            supplied_required = RequiredStateGenerationBinding.model_validate(
+                incoming["required_state_generation_binding"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise StaleStatePreview(
+                "Generation audit required state binding is invalid"
+            ) from exc
+        if required_binding is None or supplied_required != required_binding:
+            raise StaleStatePreview(
+                "Generation audit cannot replace required state authority"
+            )
+    if required_binding is not None:
+        merged["required_state_generation_binding"] = (
+            required_binding.model_dump(mode="json")
+        )
     return merged, binding
 
 
@@ -534,6 +646,161 @@ class StateProposalModule:
             dropped_reference_count=dropped_count,
         )
 
+    async def recover_required_state_generation(
+        self,
+        binding: RequiredStateGenerationBinding,
+    ) -> RecoveredStateProposal | None:
+        """Recover one exact non-formal successor proposal after any TTL age.
+
+        The binding only reconstructs the deferred proposal handle.  It is not
+        accepted here and cannot be used as a formal mutation authorization.
+        """
+
+        try:
+            frozen = RequiredStateGenerationBinding.model_validate(
+                binding.model_dump(mode="python")
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise StaleStatePreview(
+                "Required state generation recovery binding is invalid"
+            ) from exc
+        novel = await novel_repo.collection.find_one(
+            {
+                "_id": to_object_id(frozen.novel_id),
+                "owner_id": to_object_id(frozen.owner_id),
+                "is_deleted": False,
+            },
+            projection={"_id": 1},
+        )
+        if novel is None:
+            raise StaleStatePreview(
+                "Required state generation owner scope is invalid"
+            )
+        proposal = await self.collection.find_one({
+            "required_state_generation_key": frozen.recovery_key,
+            "is_deleted": False,
+        })
+        if proposal is None:
+            return None
+        try:
+            stored = _required_state_generation_binding(proposal)
+        except MutationConflictError as exc:
+            raise StaleStatePreview(str(exc)) from exc
+        if stored != frozen or not _uses_current_dispatch_protocol(proposal):
+            raise StaleStatePreview(
+                "Required state generation recovery authority diverged"
+            )
+        status = str(proposal.get("status") or "")
+        if status == "generating":
+            released = await self.collection.update_one(
+                {
+                    "_id": proposal["_id"],
+                    "status": "generating",
+                    **_required_state_generation_binding_query(frozen),
+                    "dispatch_protocol_revision": _dispatch_protocol_query(),
+                    "is_deleted": False,
+                },
+                {
+                    "$set": {
+                        "status": "released_pre_dispatch",
+                        "release_reason": (
+                            "required_state_recovery_before_provider_dispatch"
+                        ),
+                        "released_at": get_utc_now(),
+                        "updated_at": get_utc_now(),
+                    },
+                    "$unset": {
+                        "required_state_generation_key": "",
+                        "required_state_generation_binding": "",
+                        "generation_audit.required_state_generation_binding": "",
+                    },
+                },
+            )
+            if released.modified_count == 1:
+                return None
+            raise StaleStatePreview(
+                "Required state generation pre-dispatch recovery raced"
+            )
+        if status in {"dispatched", "failed"}:
+            raise StaleStatePreview(
+                "Required state generation result is unknown after dispatch"
+            )
+        if status != "proposed":
+            raise StaleStatePreview(
+                "Required state generation result is not recoverable"
+            )
+        candidate = proposal.get("candidate")
+        audit = proposal.get("generation_audit")
+        expires_at = proposal.get("acceptance_expires_at") or proposal.get(
+            "expires_at"
+        )
+        if (
+            not isinstance(candidate, dict)
+            or not isinstance(audit, dict)
+            or not isinstance(expires_at, datetime)
+        ):
+            raise StaleStatePreview(
+                "Required state generation result projection is invalid"
+            )
+        candidate_digest = _digest(candidate)
+        if candidate_digest != str(proposal.get("candidate_digest") or ""):
+            raise StaleStatePreview(
+                "Required state generation candidate digest diverged"
+            )
+        token = _proposal_acceptance_token(
+            proposal_id=proposal["_id"],
+            content_digest=str(proposal.get("content_digest") or ""),
+            narrative_revision=int(proposal.get("narrative_revision") or 0),
+            candidate_digest=candidate_digest,
+            source_content_digest=str(
+                proposal.get("source_content_digest") or ""
+            ),
+            expires_at=expires_at,
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(token.encode("ascii")).hexdigest(),
+            str(proposal.get("token_digest") or ""),
+        ):
+            raise StaleStatePreview(
+                "Required state generation token digest diverged"
+            )
+        reference_resolution = audit.get("reference_resolution")
+        dropped = (
+            reference_resolution.get("dropped")
+            if isinstance(reference_resolution, dict)
+            else None
+        )
+        dropped_count = 0
+        if isinstance(dropped, dict):
+            dropped_count = min(
+                1_000,
+                sum(
+                    len(items) if isinstance(items, list) else int(bool(items))
+                    for items in dropped.values()
+                ),
+            )
+        try:
+            context_projection = StateContextProjection.model_validate(
+                audit.get("state_context_projection")
+            )
+        except Exception as exc:
+            raise StaleStatePreview(
+                "Required state generation context projection is invalid"
+            ) from exc
+        return RecoveredStateProposal(
+            value={
+                **deepcopy(candidate),
+                "proposal_id": str(proposal["_id"]),
+                "acceptance_token": token,
+                "proposal_expires_at": expires_at.isoformat(),
+            },
+            truncated_section_count=(
+                context_projection.truncated_section_count
+            ),
+            dropped_item_count=context_projection.dropped_item_count,
+            dropped_reference_count=dropped_count,
+        )
+
     async def capture(
         self,
         novel_id: str,
@@ -600,6 +867,9 @@ class StateProposalModule:
         snapshot: StateGenerationSnapshot | None = None,
         chapter: dict[str, Any] | None = None,
         audit: dict[str, Any] | None = None,
+        required_state_generation_binding: (
+            RequiredStateGenerationBinding | None
+        ) = None,
     ) -> StateProposalLease:
         """Persist a generation lease before any Provider request is started."""
         active_snapshot = snapshot or await self.capture(
@@ -610,6 +880,7 @@ class StateProposalModule:
         generation_audit = deepcopy(audit or {})
         raw_job_binding = generation_audit.get("job_mutation_binding")
         job_binding: JobMutationRecoveryBindingV1 | None = None
+        required_binding: RequiredStateGenerationBinding | None = None
         if raw_job_binding is not None:
             try:
                 job_binding = JobMutationRecoveryBindingV1.model_validate(
@@ -636,6 +907,80 @@ class StateProposalModule:
             if existing is not None:
                 raise StaleStatePreview(
                     "State proposal Job result already exists and must be recovered"
+                )
+        raw_required_binding = generation_audit.get(
+            "required_state_generation_binding"
+        )
+        if required_state_generation_binding is not None:
+            try:
+                required_binding = RequiredStateGenerationBinding.model_validate(
+                    required_state_generation_binding.model_dump(mode="python")
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise StaleStatePreview(
+                    "Required state generation binding is invalid"
+                ) from exc
+            if raw_required_binding is None:
+                generation_audit["required_state_generation_binding"] = (
+                    required_binding.model_dump(mode="json")
+                )
+            else:
+                try:
+                    audited = RequiredStateGenerationBinding.model_validate(
+                        raw_required_binding
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StaleStatePreview(
+                        "Required state generation audit binding is invalid"
+                    ) from exc
+                if audited != required_binding:
+                    raise StaleStatePreview(
+                        "Required state generation audit binding diverged"
+                    )
+        elif raw_required_binding is not None:
+            raise StaleStatePreview(
+                "Required state generation authority was not supplied"
+            )
+        if job_binding is not None and required_binding is not None:
+            raise StaleStatePreview(
+                "State proposal cannot mix formal and non-formal Job authority"
+            )
+        if required_binding is not None:
+            if (
+                required_binding.novel_id != str(novel_id)
+                or required_binding.chapter_id != str(chapter_id)
+                or required_binding.expected_narrative_revision
+                != active_snapshot.narrative_revision
+                or required_binding.source_run_id
+                != active_snapshot.source_prose_run_id
+                or required_binding.source_run_revision
+                != active_snapshot.source_prose_run_revision
+                or required_binding.source_content_digest
+                != active_snapshot.source_content_digest
+                or required_binding.can_accept_formal_state is not False
+            ):
+                raise StaleStatePreview(
+                    "Required state generation source binding diverged"
+                )
+            owned_novel = await novel_repo.collection.find_one(
+                {
+                    "_id": to_object_id(required_binding.novel_id),
+                    "owner_id": to_object_id(required_binding.owner_id),
+                    "is_deleted": False,
+                },
+                projection={"_id": 1},
+            )
+            if owned_novel is None:
+                raise StaleStatePreview(
+                    "Required state generation owner scope is invalid"
+                )
+            existing = await self.collection.find_one({
+                "required_state_generation_key": required_binding.recovery_key,
+                "is_deleted": False,
+            })
+            if existing is not None:
+                raise StaleStatePreview(
+                    "Required state generation result must be recovered"
                 )
         proposal_id = ObjectId()
         now = get_utc_now()
@@ -667,6 +1012,18 @@ class StateProposalModule:
                     "job_mutation_binding": job_binding.model_dump(mode="json"),
                 }
                 if job_binding is not None
+                else {}
+            ),
+            **(
+                {
+                    "required_state_generation_key": (
+                        required_binding.recovery_key
+                    ),
+                    "required_state_generation_binding": (
+                        required_binding.model_dump(mode="json")
+                    ),
+                }
+                if required_binding is not None
                 else {}
             ),
         }
@@ -728,6 +1085,7 @@ class StateProposalModule:
             expires_at=expires_at,
         )
         generation_audit, job_binding = _merged_generation_audit(current, audit)
+        required_binding = _required_state_generation_binding(current)
         update: dict[str, Any] = {
             "$set": {
                 "status": "proposed",
@@ -739,12 +1097,12 @@ class StateProposalModule:
                 "updated_at": get_utc_now(),
                 **(
                     {"acceptance_expires_at": expires_at}
-                    if job_binding is not None
+                    if job_binding is not None or required_binding is not None
                     else {}
                 ),
             }
         }
-        if job_binding is not None:
+        if job_binding is not None or required_binding is not None:
             update["$unset"] = {"expires_at": ""}
         publish_query: dict[str, Any] = {
             "_id": lease.proposal_id,
@@ -753,6 +1111,10 @@ class StateProposalModule:
         }
         if job_binding is not None:
             publish_query.update(_job_mutation_binding_query(job_binding))
+        if required_binding is not None:
+            publish_query.update(
+                _required_state_generation_binding_query(required_binding)
+            )
         published = await self.collection.find_one_and_update(
             publish_query,
             update,
@@ -778,13 +1140,33 @@ class StateProposalModule:
         if current is None or not _uses_current_dispatch_protocol(current):
             return
         generation_audit, job_binding = _merged_generation_audit(current, audit)
+        required_binding = _required_state_generation_binding(current)
         now = get_utc_now()
-        if current.get("status") == "generating" and job_binding is not None:
+        if current.get("status") == "generating" and (
+            job_binding is not None or required_binding is not None
+        ):
+            authority_query = (
+                _job_mutation_binding_query(job_binding)
+                if job_binding is not None
+                else _required_state_generation_binding_query(required_binding)
+            )
+            unset_fields = (
+                {"job_mutation_key": ""}
+                if job_binding is not None
+                else {
+                    "required_state_generation_key": "",
+                    "required_state_generation_binding": "",
+                }
+            )
+            released_audit = generation_audit
+            if required_binding is not None:
+                released_audit = dict(generation_audit)
+                released_audit.pop("required_state_generation_binding", None)
             await self.collection.update_one(
                 {
                     "_id": lease.proposal_id,
                     "status": "generating",
-                    **_job_mutation_binding_query(job_binding),
+                    **authority_query,
                     "dispatch_protocol_revision": _dispatch_protocol_query(),
                 },
                 {
@@ -794,12 +1176,12 @@ class StateProposalModule:
                             "error_type": type(exc).__name__,
                             "message": str(exc),
                         },
-                        "generation_audit": generation_audit,
+                        "generation_audit": released_audit,
                         "release_reason": "state_generation_failed_before_dispatch",
                         "released_at": now,
                         "updated_at": now,
                     },
-                    "$unset": {"job_mutation_key": ""},
+                    "$unset": unset_fields,
                 },
             )
             return
@@ -810,6 +1192,10 @@ class StateProposalModule:
         }
         if job_binding is not None:
             failure_query.update(_job_mutation_binding_query(job_binding))
+        if required_binding is not None:
+            failure_query.update(
+                _required_state_generation_binding_query(required_binding)
+            )
         await self.collection.update_one(
             failure_query,
             {
@@ -841,6 +1227,7 @@ class StateProposalModule:
                 "State generation pre-dispatch projection lost its lease"
             )
         job_binding = _job_mutation_binding(current)
+        required_binding = _required_state_generation_binding(current)
         projection_query: dict[str, Any] = {
             "_id": lease.proposal_id,
             "status": "generating",
@@ -851,6 +1238,10 @@ class StateProposalModule:
         }
         if job_binding is not None:
             projection_query.update(_job_mutation_binding_query(job_binding))
+        if required_binding is not None:
+            projection_query.update(
+                _required_state_generation_binding_query(required_binding)
+            )
         result = await self.collection.update_one(
             projection_query,
             {
@@ -896,6 +1287,7 @@ class StateProposalModule:
                 "State generation lease could not cross the dispatch boundary"
             )
         job_binding = _job_mutation_binding(current)
+        required_binding = _required_state_generation_binding(current)
         now = get_utc_now()
         query: dict[str, Any] = {
             "_id": lease.proposal_id,
@@ -912,13 +1304,18 @@ class StateProposalModule:
                 "updated_at": now,
             }
         }
-        if job_binding is not None:
+        if job_binding is not None or required_binding is not None:
             acceptance_expires_at = current.get("expires_at")
             if not isinstance(acceptance_expires_at, datetime):
                 raise StaleStatePreview(
                     "State generation Job lease has no valid acceptance expiry"
                 )
-            query.update(_job_mutation_binding_query(job_binding))
+            if job_binding is not None:
+                query.update(_job_mutation_binding_query(job_binding))
+            if required_binding is not None:
+                query.update(
+                    _required_state_generation_binding_query(required_binding)
+                )
             update["$set"]["acceptance_expires_at"] = acceptance_expires_at
             update["$unset"] = {"expires_at": ""}
         dispatched = await self.collection.update_one(
@@ -940,12 +1337,18 @@ class StateProposalModule:
         if current is None:
             return
         generation_audit, job_binding = _merged_generation_audit(current, audit)
+        required_binding = _required_state_generation_binding(current)
         query: dict[str, Any] = {
             "_id": lease.proposal_id,
             "status": {"$in": ["generating", "dispatched", "proposed"]},
         }
         if job_binding is not None:
             query.update(_job_mutation_binding_query(job_binding))
+            query["dispatch_protocol_revision"] = _dispatch_protocol_query()
+        if required_binding is not None:
+            query.update(
+                _required_state_generation_binding_query(required_binding)
+            )
             query["dispatch_protocol_revision"] = _dispatch_protocol_query()
         updated = await self.collection.update_one(
             query,
@@ -1112,6 +1515,9 @@ class StateProposalModule:
         proposal_id: str,
         acceptance_token: str,
         job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
+        required_state_generation_binding: (
+            RequiredStateGenerationBinding | None
+        ) = None,
     ) -> dict[str, Any]:
         proposal = await self.collection.find_one({"_id": to_object_id(proposal_id)})
         if not proposal:
@@ -1119,9 +1525,16 @@ class StateProposalModule:
                 "State proposal is missing",
                 reason="evidence_invalid",
             )
-        if proposal.get("status") not in {"proposed", "claimed", "applied"}:
+        proposal_status = str(proposal.get("status") or "")
+        if proposal_status not in {
+            "proposed",
+            "claimed",
+            "applied",
+            "expired",
+        }:
             raise StaleStatePreview("State proposal is not available for acceptance")
         stored_job_binding = _job_mutation_binding(proposal)
+        stored_required_binding = _required_state_generation_binding(proposal)
         if stored_job_binding is not None and not _uses_current_dispatch_protocol(
             proposal
         ):
@@ -1129,7 +1542,45 @@ class StateProposalModule:
                 "State proposal Provider dispatch evidence is unknown",
                 reason="evidence_invalid",
             )
-        allow_expired = False
+        required_handoff = False
+        if stored_required_binding is not None:
+            if (
+                required_state_generation_binding is None
+                or job_mutation_binding is None
+            ):
+                raise StaleStatePreview(
+                    "Required state proposal needs a formal successor authority"
+                )
+            try:
+                supplied_required_binding = (
+                    RequiredStateGenerationBinding.model_validate(
+                        required_state_generation_binding.model_dump(
+                            mode="python"
+                        )
+                    )
+                )
+                supplied_finalization_binding = (
+                    JobMutationRecoveryBindingV1.model_validate(
+                        job_mutation_binding.model_dump(mode="python")
+                    )
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise StaleStatePreview(
+                    "Required state proposal finalization authority is invalid"
+                ) from exc
+            _validate_required_state_finalization_handoff(
+                proposal,
+                required_binding=supplied_required_binding,
+                finalization_binding=supplied_finalization_binding,
+            )
+            required_handoff = True
+        elif required_state_generation_binding is not None:
+            raise StaleStatePreview(
+                "State proposal has no required successor binding"
+            )
+        if proposal_status == "expired" and not required_handoff:
+            raise StaleStatePreview("State proposal is not available for acceptance")
+        allow_expired = required_handoff
         if job_mutation_binding is not None:
             try:
                 supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
@@ -1139,7 +1590,10 @@ class StateProposalModule:
                 raise StaleStatePreview(
                     "State proposal Job mutation binding is invalid"
                 ) from exc
-            if stored_job_binding != supplied_job_binding:
+            if (
+                stored_job_binding != supplied_job_binding
+                and not required_handoff
+            ):
                 raise StaleStatePreview(
                     "State proposal belongs to another Job authorization"
                 )
@@ -1184,6 +1638,9 @@ class StateProposalModule:
         policy_name: str = "human_review",
         policy_version: str = "1",
         job_mutation_binding: JobMutationRecoveryBindingV1 | None = None,
+        required_state_generation_binding: (
+            RequiredStateGenerationBinding | None
+        ) = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Validate a decision without consuming the proposal or creating a gap."""
         proposal = await self._load_verified_proposal(
@@ -1191,13 +1648,26 @@ class StateProposalModule:
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
             job_mutation_binding=job_mutation_binding,
+            required_state_generation_binding=(
+                required_state_generation_binding
+            ),
         )
         novel_id = str(proposal["novel_id"])
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-        if proposal.get("status") == "proposed":
+        revalidate_deferred_source = (
+            proposal.get("status") == "proposed"
+            or (
+                proposal.get("status") == "expired"
+                and required_state_generation_binding is not None
+            )
+        )
+        if revalidate_deferred_source:
             if _content_digest(chapter) != proposal.get("content_digest"):
                 await self.collection.update_one(
-                    {"_id": proposal["_id"], "status": "proposed"},
+                    {
+                        "_id": proposal["_id"],
+                        "status": proposal.get("status"),
+                    },
                     {
                         "$set": {
                             "status": "stale",
@@ -1212,7 +1682,10 @@ class StateProposalModule:
             )
             if await narrative_revision_store.current(novel_id) != stored_revision:
                 await self.collection.update_one(
-                    {"_id": proposal["_id"], "status": "proposed"},
+                    {
+                        "_id": proposal["_id"],
+                        "status": proposal.get("status"),
+                    },
                     {
                         "$set": {
                             "status": "stale",
@@ -1435,7 +1908,20 @@ class StateProposalModule:
             if thread["selection_id"] in selected_thread_ids
         ]
         policy = {"name": policy_name, "version": policy_version}
-        job_binding = _job_mutation_binding(proposal)
+        stored_job_binding = _job_mutation_binding(proposal)
+        required_binding = _required_state_generation_binding(proposal)
+        job_binding = stored_job_binding
+        if required_binding is not None:
+            if (
+                required_state_generation_binding is None
+                or job_mutation_binding is None
+            ):
+                raise StaleStatePreview(
+                    "Required state proposal needs a formal successor authority"
+                )
+            job_binding = JobMutationRecoveryBindingV1.model_validate(
+                job_mutation_binding.model_dump(mode="python")
+            )
         metadata = {
             "novel_id": novel_id,
             "manual_edits": allowed_edits,
@@ -1479,6 +1965,15 @@ class StateProposalModule:
             **(
                 {"job_mutation_binding": job_binding.model_dump(mode="json")}
                 if job_binding is not None
+                else {}
+            ),
+            **(
+                {
+                    "required_state_generation_binding": (
+                        required_binding.model_dump(mode="json")
+                    )
+                }
+                if required_binding is not None
                 else {}
             ),
             "state_completion": {
@@ -1529,6 +2024,15 @@ class StateProposalModule:
                     "job_mutation_binding": job_binding.model_dump(mode="json"),
                 }
                 if job_binding is not None
+                else {}
+            ),
+            **(
+                {
+                    "required_state_generation_binding": (
+                        required_binding.model_dump(mode="json")
+                    )
+                }
+                if required_binding is not None
                 else {}
             ),
         }
@@ -1986,6 +2490,47 @@ class StateProposalModule:
             policy_version=policy.version,
         )
 
+    async def prepare_required_state_policy_decision(
+        self,
+        *,
+        chapter_id: str,
+        proposal_id: str,
+        acceptance_token: str,
+        policy: SelectAllPolicy | FactAccountingPolicy,
+        required_state_generation_binding: RequiredStateGenerationBinding,
+        finalization_binding: JobMutationRecoveryBindingV1,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Consume one deferred state result under a new formal authority."""
+
+        stored = await self._load_verified_proposal(
+            chapter_id=chapter_id,
+            proposal_id=proposal_id,
+            acceptance_token=acceptance_token,
+            job_mutation_binding=finalization_binding,
+            required_state_generation_binding=(
+                required_state_generation_binding
+            ),
+        )
+        candidate = deepcopy(stored.get("candidate") or {})
+        policy_decision = policy.decide(candidate)
+        return await self.prepare_decision(
+            chapter_id=chapter_id,
+            proposal_id=proposal_id,
+            acceptance_token=acceptance_token,
+            selected_character_ids=list(
+                policy_decision.selected_character_ids
+            ),
+            selected_fact_ids=list(policy_decision.selected_fact_ids),
+            selected_thread_ids=list(policy_decision.selected_thread_ids),
+            drop_reasons=dict(policy_decision.drop_reasons),
+            policy_name=policy.name,
+            policy_version=policy.version,
+            job_mutation_binding=finalization_binding,
+            required_state_generation_binding=(
+                required_state_generation_binding
+            ),
+        )
+
     async def claim_for_mutation(
         self,
         claim: dict[str, Any],
@@ -2006,6 +2551,7 @@ class StateProposalModule:
                 return
             raise MutationConflictError("State proposal disappeared before acceptance")
         stored_job_binding = _job_mutation_binding(current)
+        stored_required_binding = _required_state_generation_binding(current)
         if stored_job_binding is not None and not _uses_current_dispatch_protocol(
             current
         ):
@@ -2013,7 +2559,11 @@ class StateProposalModule:
                 "State proposal Provider dispatch evidence is unknown"
             )
         raw_claim_binding = claim.get("job_mutation_binding")
+        raw_required_binding = claim.get(
+            "required_state_generation_binding"
+        )
         supplied_job_binding = None
+        supplied_required_binding = None
         if raw_claim_binding is not None:
             try:
                 supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
@@ -2023,13 +2573,49 @@ class StateProposalModule:
                 raise MutationConflictError(
                     "State proposal claim Job binding is invalid"
                 ) from exc
+        if raw_required_binding is not None:
+            try:
+                supplied_required_binding = (
+                    RequiredStateGenerationBinding.model_validate(
+                        raw_required_binding
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise MutationConflictError(
+                    "State proposal claim required binding is invalid"
+                ) from exc
+        required_finalization_handoff = False
+        if stored_required_binding is not None:
+            if (
+                supplied_required_binding is None
+                or supplied_job_binding is None
+            ):
+                raise MutationConflictError(
+                    "Required state proposal claim lost its successor binding"
+                )
+            try:
+                _validate_required_state_finalization_handoff(
+                    current,
+                    required_binding=supplied_required_binding,
+                    finalization_binding=supplied_job_binding,
+                )
+            except StaleStatePreview as exc:
+                raise MutationConflictError(str(exc)) from exc
+            required_finalization_handoff = True
+        elif supplied_required_binding is not None:
+            raise MutationConflictError(
+                "State proposal claim invented a required binding"
+            )
         if stored_job_binding is not None and supplied_job_binding is None:
             raise MutationConflictError(
                 "State proposal claim lost its Job binding"
             )
         binding_allows_expired = (
             supplied_job_binding is not None
-            and supplied_job_binding == stored_job_binding
+            and (
+                supplied_job_binding == stored_job_binding
+                or required_finalization_handoff
+            )
         )
         if supplied_job_binding is not None and not binding_allows_expired:
             raise MutationConflictError(
@@ -2137,6 +2723,15 @@ class StateProposalModule:
         if stored_job_binding is not None:
             claim_query.update(_job_mutation_binding_query(stored_job_binding))
             claim_query["dispatch_protocol_revision"] = _dispatch_protocol_query()
+        if required_finalization_handoff:
+            claim_query.update(
+                _required_state_generation_binding_query(
+                    stored_required_binding
+                )
+            )
+            claim_query["dispatch_protocol_revision"] = (
+                _dispatch_protocol_query()
+            )
         claimed = await self.collection.find_one_and_update(
             claim_query,
             {
@@ -2195,8 +2790,13 @@ class StateProposalModule:
                 "State proposal disappeared before applied publication"
             )
         stored_job_binding = _job_mutation_binding(current)
+        stored_required_binding = _required_state_generation_binding(current)
         raw_claim_binding = claim.get("job_mutation_binding")
+        raw_required_binding = claim.get(
+            "required_state_generation_binding"
+        )
         supplied_job_binding: JobMutationRecoveryBindingV1 | None = None
+        supplied_required_binding: RequiredStateGenerationBinding | None = None
         if raw_claim_binding is not None:
             try:
                 supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
@@ -2206,6 +2806,39 @@ class StateProposalModule:
                 raise MutationConflictError(
                     "State proposal applied Job binding is invalid"
                 ) from exc
+        if raw_required_binding is not None:
+            try:
+                supplied_required_binding = (
+                    RequiredStateGenerationBinding.model_validate(
+                        raw_required_binding
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise MutationConflictError(
+                    "State proposal applied required binding is invalid"
+                ) from exc
+        required_finalization_handoff = False
+        if stored_required_binding is not None:
+            if (
+                supplied_required_binding is None
+                or supplied_job_binding is None
+            ):
+                raise MutationConflictError(
+                    "Required state applied result lost its successor binding"
+                )
+            try:
+                _validate_required_state_finalization_handoff(
+                    current,
+                    required_binding=supplied_required_binding,
+                    finalization_binding=supplied_job_binding,
+                )
+            except StaleStatePreview as exc:
+                raise MutationConflictError(str(exc)) from exc
+            required_finalization_handoff = True
+        elif supplied_required_binding is not None:
+            raise MutationConflictError(
+                "State proposal applied result invented a required binding"
+            )
         if stored_job_binding is not None:
             if supplied_job_binding is None:
                 raise MutationConflictError(
@@ -2219,7 +2852,10 @@ class StateProposalModule:
                 raise MutationConflictError(
                     "State proposal Provider dispatch evidence is unknown"
                 )
-        elif supplied_job_binding is not None:
+        elif (
+            supplied_job_binding is not None
+            and not required_finalization_handoff
+        ):
             raise MutationConflictError(
                 "State proposal applied result has an unexpected Job binding"
             )
@@ -2233,6 +2869,15 @@ class StateProposalModule:
                 _dispatch_protocol_query()
             )
             applied_query.update(_job_mutation_binding_query(stored_job_binding))
+        if required_finalization_handoff:
+            applied_query["dispatch_protocol_revision"] = (
+                _dispatch_protocol_query()
+            )
+            applied_query.update(
+                _required_state_generation_binding_query(
+                    stored_required_binding
+                )
+            )
         applied = await self.collection.find_one_and_update(
             applied_query,
             {
@@ -2251,9 +2896,10 @@ class StateProposalModule:
         if applied is not None:
             return
         current = await self.collection.find_one({"_id": proposal_id}, session=session)
-        if stored_job_binding is not None and not _uses_current_dispatch_protocol(
-            current or {}
-        ):
+        if (
+            stored_job_binding is not None
+            or stored_required_binding is not None
+        ) and not _uses_current_dispatch_protocol(current or {}):
             raise MutationConflictError(
                 "State proposal Provider dispatch evidence is unknown"
             )

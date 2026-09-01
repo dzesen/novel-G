@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -82,7 +82,17 @@ from backend.services.generation.prose_readiness import (
 from backend.services.generation.prose_run_attempt_scope import (
     ProseRunAttemptScope,
 )
-from backend.services.generation.prose_runs import prose_run_module
+from backend.services.generation.required_initial_prose_contracts import (
+    RequiredInitialProseOrigin,
+    stable_digest,
+)
+from backend.services.generation.required_chapter_state_contracts import (
+    RequiredStateGenerationBinding,
+)
+from backend.services.generation.prose_scene_repair import (
+    build_v2_scene_contract_proof_from_run,
+)
+from backend.services.generation.prose_runs import prose_revision, prose_run_module
 from backend.services.generation.protected_generation_params import (
     validate_protected_generation_params,
 )
@@ -504,6 +514,7 @@ class ProseGenerationCommand(_ChapterGenerationCommand):
         default=None,
         pattern=r"^[0-9a-f]{24}$",
     )
+    required_initial_origin: RequiredInitialProseOrigin | None = None
     resume_run_id: str | None = None
     expected_run_revision: int | None = None
     confirm_uncertain_retry: bool = False
@@ -535,6 +546,7 @@ class StateGenerationCommand(_ChapterGenerationCommand):
     generation_plan: GenerationPlan | None = None
     repair_guidance: StateRepairGuidance | None = None
     job_mutation_binding: JobMutationRecoveryBindingV1 | None = None
+    required_state_generation_binding: RequiredStateGenerationBinding | None = None
     request_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
@@ -1105,7 +1117,12 @@ class ChapterGenerationApplicationService:
             if not content:
                 raise ValueError("本章还没有已保存的正文，请先写好并保存正文")
             if candidate is not None:
-                self._validate_prose_candidate(candidate)
+                self._validate_prose_candidate(
+                    candidate,
+                    required_state_generation_binding=(
+                        command.required_state_generation_binding
+                    ),
+                )
             elif prose_acceptance_state(chapter) == "partial_manual_required":
                 raise PartialProseRequiresCompletion(
                     "本章正文只接受了部分 AI 结果；请先补写并将章节状态设为完成，"
@@ -1158,12 +1175,19 @@ class ChapterGenerationApplicationService:
                     else legacy_source_run_revision
                 ),
                 source_prose_acceptance_state=(
-                    "ai_complete"
+                    (
+                        "required_reviewed_candidate"
+                        if command.required_state_generation_binding is not None
+                        else "ai_complete"
+                    )
                     if candidate is not None
                     else prose_acceptance_state(chapter)
                 ),
             )
             binding = command.job_mutation_binding
+            required_binding = command.required_state_generation_binding
+            if binding is not None and required_binding is not None:
+                raise ValueError("状态生成不能同时携带正式 mutation 与非正式 successor 绑定")
             if binding is not None and (
                 command.authority is not AcceptanceAuthority.SYSTEM
                 or command.acceptance_timing is not AcceptanceTiming.IMMEDIATE
@@ -1174,9 +1198,29 @@ class ChapterGenerationApplicationService:
                 != snapshot.narrative_revision
             ):
                 raise ValueError("状态 mutation 的 Job 授权绑定无效")
-            provider_alias = self._deps.resolve_provider(
-                STATE_WORKFLOW,
-                STATE_STEP,
+            if required_binding is not None and (
+                command.authority is not AcceptanceAuthority.SYSTEM
+                or command.acceptance_timing is not AcceptanceTiming.DEFERRED
+                or candidate is None
+                or not required_binding.validates_source(
+                    novel_id=command.novel_id,
+                    chapter_id=command.chapter_id,
+                    source_run_id=candidate.source_run_id,
+                    source_run_revision=candidate.source_run_revision,
+                    source_content_digest=candidate.source_content_digest,
+                )
+                or required_binding.expected_narrative_revision
+                != snapshot.narrative_revision
+                or required_binding.can_accept_formal_state is not False
+            ):
+                raise ValueError("状态 successor 的非正式生成绑定无效")
+            provider_alias = (
+                command.generation_plan.provider_alias
+                if command.generation_plan is not None
+                else self._deps.resolve_provider(
+                    STATE_WORKFLOW,
+                    STATE_STEP,
+                )
             )
             provider_config = self._deps.get_provider_config(provider_alias)
             lease = await self._deps.state_proposals.begin(
@@ -1208,7 +1252,17 @@ class ChapterGenerationApplicationService:
                         if binding is not None
                         else {}
                     ),
+                    **(
+                        {
+                            "required_state_generation_binding": (
+                                required_binding.model_dump(mode="json")
+                            )
+                        }
+                        if required_binding is not None
+                        else {}
+                    ),
                 },
+                required_state_generation_binding=required_binding,
             )
             inputs = await self._deps.fetch_context_inputs(
                 command.novel_id,
@@ -1543,10 +1597,33 @@ class ChapterGenerationApplicationService:
         )
 
     @staticmethod
-    def _validate_prose_candidate(candidate: ProseCandidateSource) -> None:
+    def _validate_prose_candidate(
+        candidate: ProseCandidateSource,
+        *,
+        required_state_generation_binding: (
+            RequiredStateGenerationBinding | None
+        ) = None,
+    ) -> None:
         if chapter_content_digest(candidate.text) != candidate.source_content_digest:
             raise ValueError("正文候选摘要与候选内容不一致")
         completion = dict(candidate.completion or {})
+        if required_state_generation_binding is not None:
+            if (
+                str(completion.get("status") or "") != "complete"
+                or str(completion.get("finish_reason") or "") != "stop"
+                or completion.get("can_write_formal_prose") is not False
+                or not required_state_generation_binding.validates_source(
+                    novel_id=required_state_generation_binding.novel_id,
+                    chapter_id=required_state_generation_binding.chapter_id,
+                    source_run_id=candidate.source_run_id,
+                    source_run_revision=candidate.source_run_revision,
+                    source_content_digest=candidate.source_content_digest,
+                )
+            ):
+                raise PartialProseRequiresCompletion(
+                    "已审查正文候选没有匹配状态 successor 的精确非正式授权"
+                )
+            return
         if (
             completion.get("can_write_formal_prose") is not True
             or str(completion.get("status") or "") != "complete"
@@ -1775,6 +1852,16 @@ class ChapterGenerationApplicationService:
             provider_capability=provider_capability,
             request_overrides=gen_kwargs,
         )
+        if command.required_initial_origin is not None and (
+            plan is None
+            or stable_digest(asdict(plan))
+            != command.required_initial_origin.generation_plan_digest
+            or stable_digest(execution_plan.to_dict())
+            != command.required_initial_origin.execution_plan_digest
+            or prose_revision(outline)
+            != command.required_initial_origin.outline_revision
+        ):
+            raise ValueError("冻结的初稿来源与当前生成计划不匹配")
         owner_id = command.owner_id
         if command.authority is AcceptanceAuthority.SYSTEM and not owner_id:
             owner_id = str(novel.get("owner_id") or "") or None
@@ -1822,12 +1909,22 @@ class ChapterGenerationApplicationService:
             and owner_id is not None
             and resume_run_id is None
         ):
-            active = await self._deps.prose_runs.inspect_active(
-                owner_id=owner_id,
-                chapter_id=command.chapter_id,
-                outline=outline,
-                context_text=context.to_prompt_text(),
-            )
+            if command.required_initial_origin is not None:
+                active = await self._deps.prose_run_repo.find_required_initial(
+                    owner_id=owner_id,
+                    chapter_id=command.chapter_id,
+                    job_id=command.required_initial_origin.job_id,
+                    request_digest=(
+                        command.required_initial_origin.request_digest
+                    ),
+                )
+            else:
+                active = await self._deps.prose_runs.inspect_active(
+                    owner_id=owner_id,
+                    chapter_id=command.chapter_id,
+                    outline=outline,
+                    context_text=context.to_prompt_text(),
+                )
             if active is not None:
                 stored_protocol = str(
                     ((active.get("plan") or {}).get("protocol_revision") or "")
@@ -1836,6 +1933,10 @@ class ChapterGenerationApplicationService:
                     stored_protocol != execution_plan.protocol_revision
                     or active.get("status") == "stale"
                 ):
+                    if command.required_initial_origin is not None:
+                        raise ValueError(
+                            "本次作业的初稿来源已经失效，不能重新生成"
+                        )
                     await self._deps.prose_run_repo.mark_status(
                         run_id=str(active["_id"]),
                         owner_id=owner_id,
@@ -1963,6 +2064,9 @@ class ChapterGenerationApplicationService:
                         command.authority is AcceptanceAuthority.SYSTEM
                     ),
                     authorization=prepared.authorization,
+                    required_initial_origin=(
+                        command.required_initial_origin
+                    ),
                 )
         except Exception as exc:
             yield ChapterGenerationEvent(
@@ -2126,11 +2230,39 @@ class ChapterGenerationApplicationService:
                 if latest_run is not None and owner_id is not None:
                     stored_completion = {
                         **generated.completion.to_dict(),
+                        "source_run_id": str(latest_run["_id"]),
+                        "source_run_revision": int(
+                            latest_run.get("revision") or 0
+                        ) + 1,
+                        "source_content_digest": chapter_content_digest(
+                            generated.text
+                        ),
                         "scene_progress": [
                             dict(item) for item in generated.scene_progress
                         ],
                         "pause_reason": generated.pause_reason,
                     }
+                    if (
+                        command.required_initial_origin is not None
+                        and generated.completion.status == "complete"
+                    ):
+                        stored_completion["can_write_formal_prose"] = False
+                        stored_completion["scene_contract_validation"] = (
+                            build_v2_scene_contract_proof_from_run(
+                                run={
+                                    **latest_run,
+                                    "segments": [
+                                        dict(item)
+                                        for item in generated.segments
+                                    ],
+                                    "status": "complete",
+                                    "completion": stored_completion,
+                                },
+                                current_text=generated.text,
+                                outline=(prepared.chapter.get("outline") or {}),
+                                plan=prepared.execution_plan,
+                            ).model_dump(mode="python")
+                        )
                     lease = latest_run.get("lease") or {}
                     latest_run = await self._deps.prose_run_repo.finish(
                         run_id=str(latest_run["_id"]),
@@ -2138,7 +2270,7 @@ class ChapterGenerationApplicationService:
                         lease_token=str(lease.get("token") or ""),
                         status=(
                             "complete"
-                            if generated.completion.can_write_formal_prose
+                            if generated.completion.status == "complete"
                             else generated.completion.status
                         ),
                         completion=stored_completion,
@@ -2168,7 +2300,15 @@ class ChapterGenerationApplicationService:
                     "source_run_digest": chapter_content_digest(
                         generated.text
                     ),
+                    "source_content_digest": chapter_content_digest(
+                        generated.text
+                    ),
                 }
+                if (
+                    command.required_initial_origin is not None
+                    and generated.completion.status == "complete"
+                ):
+                    completion["can_write_formal_prose"] = False
                 usage = generated.usage.model_dump()
                 payload = {
                     "success": generated.completion.can_write_formal_prose,

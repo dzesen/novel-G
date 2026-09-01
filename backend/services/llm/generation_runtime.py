@@ -498,6 +498,10 @@ class StructuredOutputByteBudgetExceeded(ConservativeGenerationBoundExceeded):
     provider_request_not_dispatched = False
 
 
+class UnsettledGenerationAttempts(RuntimeError):
+    """An opt-in logical call may neither retry nor return unaccounted evidence."""
+
+
 @dataclass(frozen=True)
 class AttemptUsage:
     attempt_id: str
@@ -767,6 +771,11 @@ class GenerationRuntime:
     @property
     def attempts(self) -> tuple[AttemptUsage, ...]:
         return tuple(getattr(self._attempt_scope, "attempts", ()))
+
+    def uses_attempt_scope(self, scope: Any) -> bool:
+        """Prove that a caller's evidence projection is this runtime's ledger."""
+
+        return self._attempt_scope is scope
 
     @property
     def claimed_attempt_count(self) -> int:
@@ -1250,11 +1259,24 @@ class GenerationRuntime:
         max_conservative_total_tokens: int | None = None,
         max_structured_raw_output_bytes: int | None = None,
         retry_oversized_structured_output_without_source: bool = False,
+        require_settled_attempts: bool = False,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         # Reject stale plans before even constructing an adapter.  Every
         # subsequent paid attempt revalidates again in ``_paid_call``.
         self._validate_plan(plan, structured=True)
+        if type(require_settled_attempts) is not bool:
+            raise ValueError("settled-attempt requirement must be a boolean")
+
+        def require_current_settlement() -> None:
+            if require_settled_attempts and (
+                self.uncertain_attempt_count or self.attempt_evidence_errors
+            ):
+                raise UnsettledGenerationAttempts(
+                    "logical generation has unsettled attempt evidence"
+                )
+
+        require_current_settlement()
         attempt_offset = len(self.attempts)
         adapter = self._adapter_factory(plan.provider_alias, plan.timeout_seconds)
         terminal_adapter = adapter
@@ -1328,6 +1350,7 @@ class GenerationRuntime:
             provider_alias: str | None = None,
         ) -> int | None:
             nonlocal reserved_conservative_tokens
+            require_current_settlement()
             additional_request_payload = (
                 schema_request_payload if includes_native_schema else ""
             )
@@ -1427,6 +1450,7 @@ class GenerationRuntime:
                 fallback_call,
                 bounded_reservation(prompts.prompt_json_prompt),
             )
+        require_current_settlement()
         oversized_regeneration_used = False
         try:
             enforce_structured_output_byte_cap(produced)
@@ -1556,6 +1580,7 @@ class GenerationRuntime:
                     ),
                 )
 
+        require_current_settlement()
         enforce_structured_output_byte_cap(value)
 
         attempts = self.attempts[attempt_offset:]

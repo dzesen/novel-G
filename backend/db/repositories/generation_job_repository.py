@@ -5,13 +5,15 @@ from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TYPE_CHECKING
 from uuid import uuid4
 
 from bson import ObjectId
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.results import BulkWriteResult
+from pydantic import ValidationError
 
 from backend.db import collections
 from backend.db.base import BaseRepository
@@ -70,6 +72,11 @@ from backend.services.generation.job_authorization_contracts import (
     parse_prose_authorization,
 )
 
+if TYPE_CHECKING:
+    from backend.db.required_adherence_journal import JobRequiredReviewJournal, RequiredReviewJobBinding
+    from backend.services.generation.independent_outline_review import IndependentReviewPlan
+    from backend.services.generation.required_adherence_handoff import RequiredReviewCandidate
+
 
 USAGE_SUMMARY_LIMIT = 100
 
@@ -89,6 +96,18 @@ _ATOMIC_JOB_FIELDS = frozenset({
     "execution_lease",
     "job_mutation_recovery",
     "progress",
+    "required_adherence_journal",
+    "required_initial_prose_journal",
+    "required_prose_rewrite_journal",
+    "required_reviewed_candidate",
+    "required_state_candidate_journal",
+    "required_state_candidate",
+    "required_chapter_finalization_result",
+    "required_book_successor_journal",
+    "required_book_successor_recovery_checkpoint",
+    "required_book_successor_action",
+    "required_book_successor_parent_job_id",
+    "successor_acceptance_outline_journal",
     "state_dispatch_resolution",
 })
 _LEASED_RUNTIME_PATCH_FIELDS = frozenset({
@@ -236,6 +255,34 @@ def _validated_pre_dispatch_fence(
 
 
 def _validate_initial_candidate_ledgers(document: Mapping[str, Any]) -> None:
+    if document.get("required_initial_prose_journal") is not None:
+        raise ValueError("Required initial prose journal must start empty")
+    if document.get("required_prose_rewrite_journal") is not None:
+        raise ValueError("Required rewrite journal must start empty")
+    if document.get("required_adherence_journal") is not None:
+        raise ValueError("Required review journal must start empty")
+    if document.get("required_reviewed_candidate") is not None:
+        raise ValueError("Required reviewed candidate must start empty")
+    if document.get("required_state_candidate_journal") is not None:
+        raise ValueError("Required state candidate journal must start empty")
+    if document.get("required_state_candidate") is not None:
+        raise ValueError("Required state candidate must start empty")
+    if document.get("required_chapter_finalization_result") is not None:
+        raise ValueError("Required chapter finalization result must start empty")
+    if document.get("required_book_successor_journal") is not None:
+        raise ValueError("Required book successor journal must start empty")
+    if document.get("required_book_successor_recovery_checkpoint") is not None:
+        raise ValueError(
+            "Required book successor recovery checkpoint must start empty"
+        )
+    if document.get("required_book_successor_action") is not None:
+        raise ValueError("Required book successor action must start empty")
+    if document.get("required_book_successor_parent_job_id") is not None:
+        raise ValueError("Required book successor parent must start empty")
+    if document.get("successor_acceptance_outline_journal") is not None:
+        raise ValueError(
+            "Successor acceptance outline journal must start empty"
+        )
     checkpoints = document.get("candidate_pipeline_checkpoints", [])
     if not isinstance(checkpoints, list) or checkpoints:
         raise ValueError("Candidate checkpoint ledger must start empty")
@@ -483,6 +530,46 @@ def _execution_interruption_pipeline(
                                         "object",
                                     ]
                                 },
+                                {
+                                    "$eq": [
+                                        {"$type": "$required_initial_prose_journal"},
+                                        "object",
+                                    ]
+                                },
+                                {
+                                    "$eq": [
+                                        {"$type": "$required_prose_rewrite_journal"},
+                                        "object",
+                                    ]
+                                },
+                                {
+                                    "$eq": [
+                                        {"$type": "$required_adherence_journal"},
+                                        "object",
+                                    ]
+                                },
+                                {
+                                    "$eq": [
+                                        {"$type": "$required_reviewed_candidate"},
+                                        "object",
+                                    ]
+                                },
+                                {
+                                    "$eq": [
+                                        {
+                                            "$type": (
+                                                "$required_state_candidate_journal"
+                                            )
+                                        },
+                                        "object",
+                                    ]
+                                },
+                                {
+                                    "$eq": [
+                                        {"$type": "$required_state_candidate"},
+                                        "object",
+                                    ]
+                                },
                             ]
                         },
                         "$current_chapter_id",
@@ -530,6 +617,47 @@ class GenerationJobRepository:
 
     def __init__(self) -> None:
         self._base = BaseRepository(collections.GENERATION_JOBS)
+
+    def required_review_journal(
+        self, binding: RequiredReviewJobBinding, *, candidate: RequiredReviewCandidate,
+        plan: IndependentReviewPlan,
+    ) -> JobRequiredReviewJournal:
+        """Open the opt-in review journal behind this repository's lease fence."""
+        from backend.db.required_adherence_journal import JobRequiredReviewJournal
+
+        return JobRequiredReviewJournal(
+            binding, candidate=candidate, plan=plan,
+            read_job=self.get_job, write_job=self._collection_update_one,
+        )
+
+    def required_initial_prose_journal(
+        self,
+        binding,
+        *,
+        origin,
+        authorization,
+    ):
+        """Open the single initial-source journal behind the Job lease."""
+        from backend.db.required_initial_prose_journal import (
+            JobRequiredInitialProseJournal,
+        )
+
+        return JobRequiredInitialProseJournal(
+            binding,
+            origin=origin,
+            authorization=authorization,
+            read_job=self.get_job,
+            write_job=self._collection_update_one,
+        )
+
+    def required_rewrite_journal(self, binding, *, authorization, review_plan):
+        """Open the candidate-only writer journal with the same Job lease gate."""
+        from backend.db.required_prose_rewrite_journal import JobRequiredProseRewriteJournal
+
+        return JobRequiredProseRewriteJournal(
+            binding, authorization=authorization, review_plan=review_plan,
+            read_job=self.get_job, write_job=self._collection_update_one,
+        )
 
     @staticmethod
     def _assert_unowned_creation() -> None:
@@ -1123,6 +1251,1044 @@ class GenerationJobRepository:
     async def create_job(self, data: Dict[str, Any]) -> str:
         self._assert_unowned_creation()
         return await self.insert_one(dict(data))
+
+    async def ensure_successor_acceptance_outline_control_job(
+        self,
+        document: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Create or recover the deterministic outline control Job."""
+
+        from backend.evaluation.required_book_successor_acceptance_outline import (
+            SUCCESSOR_ACCEPTANCE_OUTLINE_JOB_KIND,
+            parse_successor_acceptance_outline_journal,
+        )
+
+        self._assert_unowned_creation()
+        candidate = deepcopy(dict(document))
+        for identity_field in ("_id", "novel_id", "owner_id"):
+            identity_value = candidate.get(identity_field)
+            if identity_value is None:
+                raise ValueError(
+                    "Successor acceptance outline control Job identity is invalid"
+                )
+            candidate[identity_field] = to_object_id(identity_value)
+        _validate_initial_candidate_ledgers(candidate)
+        if (
+            candidate.get("job_kind")
+            != SUCCESSOR_ACCEPTANCE_OUTLINE_JOB_KIND
+            or candidate.get("successor_acceptance_outline_journal")
+            is not None
+            or candidate.get("is_deleted") is not False
+        ):
+            raise ValueError(
+                "Successor acceptance outline control Job is invalid"
+            )
+        existing = await self._base.collection.find_one({
+            "_id": candidate["_id"],
+        })
+        if existing is None:
+            try:
+                await self._base.insert_one(candidate)
+            except DuplicateKeyError:
+                pass
+            existing = await self._base.collection.find_one({
+                "_id": candidate["_id"],
+            })
+        if existing is None:
+            raise ValueError(
+                "Successor acceptance outline control Job was not durable"
+            )
+        immutable_fields = (
+            "_id",
+            "novel_id",
+            "owner_id",
+            "scope",
+            "volume_id",
+            "job_kind",
+            "token_budget",
+            "usage_attempt_capacity",
+            "authorization_revision",
+            "generation_params",
+            "readiness",
+            "successor_acceptance_claim",
+            "progress",
+            "is_deleted",
+        )
+        if (
+            any(
+                existing.get(field) != candidate.get(field)
+                for field in immutable_fields
+            )
+            or existing.get("status")
+            not in {"running", "paused", "interrupted"}
+            or type(existing.get("expected_narrative_revision")) is not int
+            or not 0 <= existing["expected_narrative_revision"] <= 3
+        ):
+            raise ValueError(
+                "Successor acceptance outline control Job changed"
+            )
+        raw_journal = existing.get("successor_acceptance_outline_journal")
+        if raw_journal is not None:
+            parse_successor_acceptance_outline_journal(raw_journal)
+        return existing
+
+    async def begin_successor_acceptance_outline(
+        self,
+        job_id: str,
+        request,
+    ) -> bool:
+        """Persist one ordered outline request before any paid dispatch."""
+
+        from backend.evaluation.required_book_successor_acceptance_outline import (
+            begin_successor_acceptance_outline_value,
+            parse_successor_acceptance_outline_journal,
+        )
+
+        current = await self.get_job(job_id)
+        next_journal, changed = begin_successor_acceptance_outline_value(
+            current,
+            request,
+        )
+        if not changed:
+            return False
+        raw = current.get("successor_acceptance_outline_journal")
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "expected_narrative_revision": (
+                    request.expected_narrative_revision
+                ),
+                "successor_acceptance_outline_journal": raw,
+            },
+            {
+                "$set": {
+                    "successor_acceptance_outline_journal": (
+                        next_journal.model_dump(mode="json")
+                    ),
+                    "current_chapter_id": request.chapter_id,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        stored = parse_successor_acceptance_outline_journal(
+            latest.get("successor_acceptance_outline_journal")
+        )
+        if stored == next_journal:
+            return False
+        raise ValueError(
+            "Successor acceptance outline request CAS was lost"
+        )
+
+    async def publish_successor_acceptance_outline_candidate(
+        self,
+        job_id: str,
+        request,
+        provider_outline: Mapping[str, Any],
+        attempt_ids: Sequence[str],
+    ) -> bool:
+        """Persist the paid Provider candidate before formal acceptance."""
+
+        from backend.evaluation.required_book_successor_acceptance_outline import (
+            parse_successor_acceptance_outline_journal,
+            publish_successor_acceptance_outline_candidate_value,
+        )
+
+        current = await self.get_job(job_id)
+        previous, updated = (
+            publish_successor_acceptance_outline_candidate_value(
+                current,
+                request,
+                provider_outline,
+                attempt_ids,
+            )
+        )
+        if previous == updated:
+            return False
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "expected_narrative_revision": (
+                    request.expected_narrative_revision
+                ),
+                "successor_acceptance_outline_journal": (
+                    previous.model_dump(mode="json")
+                ),
+                "attempt_slots": deepcopy(current.get("attempt_slots")),
+                "attempt_reservation": None,
+            },
+            {
+                "$set": {
+                    "successor_acceptance_outline_journal": (
+                        updated.model_dump(mode="json")
+                    ),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        stored = parse_successor_acceptance_outline_journal(
+            latest.get("successor_acceptance_outline_journal")
+        )
+        if stored == updated:
+            return False
+        raise ValueError(
+            "Successor acceptance outline candidate CAS was lost"
+        )
+
+    async def publish_successor_acceptance_outline_accepted(
+        self,
+        job_id: str,
+        request,
+        formal_outline_revision: str,
+    ) -> bool:
+        """Publish formal acceptance and its revision cursor atomically."""
+
+        from backend.evaluation.required_book_successor_acceptance_outline import (
+            SUCCESSOR_ACCEPTANCE_OUTLINES_READY,
+            parse_successor_acceptance_outline_journal,
+            publish_successor_acceptance_outline_accepted_value,
+        )
+
+        current = await self.get_job(job_id)
+        previous, updated = (
+            publish_successor_acceptance_outline_accepted_value(
+                current,
+                request,
+                formal_outline_revision,
+            )
+        )
+        if previous == updated:
+            return False
+        pause_reason = (
+            SUCCESSOR_ACCEPTANCE_OUTLINES_READY
+            if request.chapter_order == 3
+            else "successor_acceptance_outline_chapter_ready"
+        )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "expected_narrative_revision": (
+                    request.expected_narrative_revision
+                ),
+                "successor_acceptance_outline_journal": (
+                    previous.model_dump(mode="json")
+                ),
+                "attempt_reservation": None,
+            },
+            {
+                "$set": {
+                    "successor_acceptance_outline_journal": (
+                        updated.model_dump(mode="json")
+                    ),
+                    "expected_narrative_revision": (
+                        request.expected_narrative_revision + 1
+                    ),
+                    "status": "paused",
+                    "pause_reason": pause_reason,
+                    "active_slot": None,
+                    "current_chapter_id": None,
+                    "error": None,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        stored = parse_successor_acceptance_outline_journal(
+            latest.get("successor_acceptance_outline_journal")
+        )
+        if (
+            stored == updated
+            and latest.get("expected_narrative_revision")
+            == request.expected_narrative_revision + 1
+            and latest.get("status") == "paused"
+            and latest.get("pause_reason") == pause_reason
+        ):
+            return False
+        raise ValueError(
+            "Successor acceptance formal outline CAS was lost"
+        )
+
+    async def block_successor_acceptance_outline(
+        self,
+        job_id: str,
+        request,
+        failure_code: str,
+    ) -> bool:
+        """Stop this outline stage without erasing its paid evidence."""
+
+        from backend.evaluation.required_book_successor_acceptance_outline import (
+            block_successor_acceptance_outline_value,
+            parse_successor_acceptance_outline_journal,
+            validate_successor_acceptance_outline_attempts,
+        )
+
+        current = await self.get_job(job_id)
+        attempts = validate_successor_acceptance_outline_attempts(
+            current,
+            request,
+        )
+        if any(item.get("state") == "claimed" for item in attempts):
+            raise ValueError(
+                "Successor acceptance outline attempt is still in flight"
+            )
+        previous, updated = block_successor_acceptance_outline_value(
+            current,
+            request,
+            failure_code,
+        )
+        if previous == updated:
+            return False
+        current_status = str(current.get("status") or "")
+        if current_status not in {"running", "interrupted"}:
+            raise ValueError(
+                "Successor acceptance outline block state changed"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": current_status,
+                "expected_narrative_revision": (
+                    request.expected_narrative_revision
+                ),
+                "successor_acceptance_outline_journal": (
+                    previous.model_dump(mode="json")
+                ),
+                "attempt_slots": deepcopy(current.get("attempt_slots")),
+            },
+            {
+                "$set": {
+                    "successor_acceptance_outline_journal": (
+                        updated.model_dump(mode="json")
+                    ),
+                    "status": "paused",
+                    "pause_reason": "successor_acceptance_outline_blocked",
+                    "active_slot": None,
+                    "current_chapter_id": None,
+                    "attempt_reservation": None,
+                    "error": {
+                        "step": "successor_acceptance_outline",
+                        "code": str(failure_code),
+                        "reason_codes": [str(failure_code)],
+                    },
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        stored = parse_successor_acceptance_outline_journal(
+            latest.get("successor_acceptance_outline_journal")
+        )
+        if (
+            stored == updated
+            and latest.get("status") == "paused"
+            and latest.get("pause_reason")
+            == "successor_acceptance_outline_blocked"
+        ):
+            return False
+        raise ValueError(
+            "Successor acceptance outline block CAS was lost"
+        )
+
+    async def resume_successor_acceptance_outline(
+        self,
+        job_id: str,
+        request,
+    ) -> bool:
+        """Resume only a safe ordered outline prefix or interrupted replay."""
+
+        from backend.evaluation.required_book_successor_acceptance_outline import (
+            parse_successor_acceptance_outline_journal,
+            validate_successor_acceptance_outline_attempts,
+            validate_successor_acceptance_outline_control_job,
+        )
+
+        current = await self.get_job(job_id)
+        validate_successor_acceptance_outline_control_job(current, request)
+        status = str(current.get("status") or "")
+        raw_journal = current.get("successor_acceptance_outline_journal")
+        journal = (
+            parse_successor_acceptance_outline_journal(raw_journal)
+            if raw_journal is not None
+            else None
+        )
+        if status == "paused":
+            if (
+                current.get("pause_reason")
+                != "successor_acceptance_outline_chapter_ready"
+                or journal is None
+                or request.chapter_order <= 1
+                or len(journal.entries) != request.chapter_order - 1
+                or any(entry.phase != "accepted" for entry in journal.entries)
+            ):
+                raise ValueError(
+                    "Successor acceptance outline resume prefix changed"
+                )
+        elif status == "interrupted":
+            if raw_journal is None:
+                if request.chapter_order != 1:
+                    raise ValueError(
+                        "Successor acceptance outline interrupted prefix changed"
+                    )
+            else:
+                assert journal is not None
+                index = request.chapter_order - 1
+                request_not_started = (
+                    index == len(journal.entries)
+                    and request.chapter_order == len(journal.entries) + 1
+                    and all(
+                        entry.phase == "accepted"
+                        for entry in journal.entries
+                    )
+                )
+                if not request_not_started and (
+                    index >= len(journal.entries)
+                    or journal.entries[index].request != request
+                    or journal.entries[index].phase
+                    not in {"reserved", "produced"}
+                ):
+                    raise ValueError(
+                        "Successor acceptance outline interrupted prefix changed"
+                    )
+                if request_not_started:
+                    attempts = ()
+                    entry_phase = None
+                else:
+                    attempts = validate_successor_acceptance_outline_attempts(
+                        current,
+                        request,
+                    )
+                    entry_phase = journal.entries[index].phase
+                if any(
+                    item.get("state") in {"claimed", "uncertain"}
+                    for item in attempts
+                ):
+                    raise ValueError(
+                        "Successor acceptance outline interrupted attempt is unsettled"
+                    )
+                if (
+                    entry_phase == "reserved"
+                    and any(
+                        item.get("state") == "accounted"
+                        for item in attempts
+                    )
+                ):
+                    raise ValueError(
+                        "Successor acceptance outline result confirmation was lost"
+                    )
+        else:
+            raise ValueError(
+                "Successor acceptance outline Job is not resumable"
+            )
+        if (
+            current.get("has_uncertain_attempts") is not False
+            or current.get("active_token_reservations") != []
+            or any(
+                item.get("state") in {"claimed", "uncertain"}
+                for item in list(current.get("attempt_slots") or [])
+            )
+        ):
+            raise ValueError(
+                "Successor acceptance outline Job has unsettled attempts"
+            )
+        previous_epoch = current.get("execution_epoch")
+        if type(previous_epoch) is not int or not 0 <= previous_epoch < (
+            _MAX_NARRATIVE_REVISION
+        ):
+            raise ValueError(
+                "Successor acceptance outline execution epoch is invalid"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": status,
+                "execution_epoch": previous_epoch,
+                "successor_acceptance_outline_journal": raw_journal,
+                "attempt_slots": deepcopy(current.get("attempt_slots")),
+                "active_token_reservations": [],
+                "has_uncertain_attempts": False,
+                "expected_narrative_revision": (
+                    request.expected_narrative_revision
+                ),
+            },
+            {
+                "$inc": {"execution_epoch": 1},
+                "$unset": {"execution_lease": ""},
+                "$set": {
+                    "status": "running",
+                    "pause_reason": None,
+                    "active_slot": "global",
+                    "current_chapter_id": None,
+                    "error": None,
+                    "updated_at": get_utc_now(),
+                },
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        if (
+            latest.get("status") == "running"
+            and latest.get("successor_acceptance_outline_journal")
+            == raw_journal
+            and latest.get("expected_narrative_revision")
+            == request.expected_narrative_revision
+            and latest.get("execution_epoch") == previous_epoch + 1
+            and latest.get("execution_lease") is None
+        ):
+            return False
+        raise ValueError(
+            "Successor acceptance outline resume CAS was lost"
+        )
+
+    async def initialize_required_book_successor(
+        self,
+        job_id: str,
+    ):
+        """Create the root journal once under the root Job execution lease."""
+
+        from backend.services.generation.required_book_successor import (
+            RequiredBookSuccessorCoordinator,
+            parse_required_book_successor_journal,
+            readiness_uses_required_book_successor,
+        )
+
+        current = await self.get_job(job_id)
+        if not readiness_uses_required_book_successor(current.get("readiness")):
+            raise ValueError("Required book successor authority is unavailable")
+        coordinator = RequiredBookSuccessorCoordinator(
+            coordinator_job_id=str(job_id),
+            readiness=current["readiness"],
+        )
+        initial = coordinator.initial_journal()
+        raw = current.get("required_book_successor_journal")
+        if raw is not None:
+            stored = parse_required_book_successor_journal(raw)
+            coordinator.next_action(stored)
+            return stored
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "required_book_successor_journal": None,
+            },
+            {
+                "$set": {
+                    "required_book_successor_journal": initial.model_dump(
+                        mode="json"
+                    ),
+                    "job_kind": "required_book_successor",
+                }
+            },
+        )
+        if result.modified_count != 1:
+            latest = await self.get_job(job_id)
+            stored = parse_required_book_successor_journal(
+                latest.get("required_book_successor_journal")
+            )
+            coordinator.next_action(stored)
+            return stored
+        return initial
+
+    async def create_required_book_successor_child(
+        self,
+        parent_job_id: str,
+        *,
+        action,
+        document: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Idempotently insert the one child authorized by the root journal."""
+
+        from backend.services.generation.required_book_successor import (
+            RequiredBookSuccessorCoordinator,
+            parse_required_book_successor_action,
+            parse_required_book_successor_journal,
+        )
+
+        parent = await self.get_job(parent_job_id)
+        coordinator = RequiredBookSuccessorCoordinator(
+            coordinator_job_id=str(parent_job_id),
+            readiness=parent.get("readiness") or {},
+        )
+        journal = parse_required_book_successor_journal(
+            parent.get("required_book_successor_journal")
+        )
+        parsed_action = parse_required_book_successor_action(action)
+        candidate = deepcopy(dict(document))
+        raw_child_id = candidate.pop("_id", None)
+        child_object_id = (
+            to_object_id(raw_child_id)
+            if raw_child_id is not None
+            else ObjectId()
+        )
+        child_id = str(child_object_id)
+        _validate_initial_candidate_ledgers(candidate)
+        candidate.update({
+            "_id": child_object_id,
+            "required_book_successor_action": parsed_action.model_dump(
+                mode="json"
+            ),
+            "required_book_successor_parent_job_id": to_object_id(
+                parent_job_id
+            ),
+            "active_slot": f"required_book_successor_child:{parent_job_id}",
+            "job_kind": f"required_book_successor_{parsed_action.stage}",
+        })
+        coordinator.validate_child_authority(
+            journal,
+            parsed_action,
+            candidate,
+        )
+        await self._assert_execution_current()
+        existing = await self._base.collection.find_one({
+            "is_deleted": False,
+            "required_book_successor_parent_job_id": to_object_id(
+                parent_job_id
+            ),
+            "required_book_successor_action.action_digest": (
+                parsed_action.action_digest
+            ),
+        })
+        if existing is None:
+            try:
+                await self._base.insert_one(candidate)
+            except DuplicateKeyError:
+                pass
+            existing = await self._base.collection.find_one({
+                "is_deleted": False,
+                "required_book_successor_parent_job_id": to_object_id(
+                    parent_job_id
+                ),
+                "required_book_successor_action.action_digest": (
+                    parsed_action.action_digest
+                ),
+            })
+        if existing is None:
+            raise JobExecutionLeaseLost(
+                "Required book successor child creation was not durable"
+            )
+        if (
+            existing.get("required_book_successor_parent_job_id")
+            != to_object_id(parent_job_id)
+            or existing.get("readiness") != candidate.get("readiness")
+            or existing.get("required_book_successor_action")
+            != candidate.get("required_book_successor_action")
+        ):
+            raise ValueError("Required book successor child identity changed")
+        coordinator.validate_child_authority(
+            journal,
+            parsed_action,
+            existing,
+        )
+        return existing
+
+    async def read_required_book_successor_child(
+        self,
+        parent_job_id: str,
+        child_job_id: str,
+    ) -> Dict[str, Any]:
+        """Read only a current or previously accepted child of this root."""
+
+        from backend.services.generation.required_book_successor import (
+            RequiredBookSuccessorCoordinator,
+            parse_required_book_successor_action,
+            parse_required_book_successor_journal,
+        )
+
+        parent = await self.get_job(parent_job_id)
+        coordinator = RequiredBookSuccessorCoordinator(
+            coordinator_job_id=str(parent_job_id),
+            readiness=parent.get("readiness") or {},
+        )
+        journal = parse_required_book_successor_journal(
+            parent.get("required_book_successor_journal")
+        )
+        allowed = {item.child_job_id for item in journal.stages}
+        next_action = coordinator.next_action(journal)
+        if (
+            str(child_job_id) not in allowed
+            and (next_action is None or next_action.stage == "book_audit")
+        ):
+            raise ValueError("Required book successor child read is stale")
+        child = await self._base.collection.find_one({
+            "_id": to_object_id(child_job_id),
+            "is_deleted": False,
+            "required_book_successor_parent_job_id": to_object_id(
+                parent_job_id
+            ),
+        })
+        if child is None:
+            raise NotFoundError(
+                f"Required book successor child not found: {child_job_id}"
+            )
+        stored_action = parse_required_book_successor_action(
+            child.get("required_book_successor_action")
+        )
+        matching_record = next(
+            (
+                item
+                for item in journal.stages
+                if item.child_job_id == str(child_job_id)
+            ),
+            None,
+        )
+        if matching_record is not None:
+            if matching_record.action_digest != stored_action.action_digest:
+                raise ValueError("Required book successor child action changed")
+        elif next_action != stored_action:
+            raise ValueError("Required book successor current child changed")
+        return child
+
+    async def advance_required_book_successor_child(
+        self,
+        parent_job_id: str,
+        child_job_id: str,
+    ):
+        """Atomically append one fully validated child result to the root."""
+
+        from backend.services.generation.required_book_successor import (
+            RequiredBookSuccessorCoordinator,
+            parse_required_book_successor_journal,
+        )
+        parent = await self.get_job(parent_job_id)
+        raw_journal = parent.get("required_book_successor_journal")
+        journal = parse_required_book_successor_journal(raw_journal)
+        child = await self.read_required_book_successor_child(
+            parent_job_id,
+            child_job_id,
+        )
+        coordinator = RequiredBookSuccessorCoordinator(
+            coordinator_job_id=str(parent_job_id),
+            readiness=parent.get("readiness") or {},
+        )
+        advanced = coordinator.accept_child_job(journal, child)
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(parent_job_id),
+                "is_deleted": False,
+                "status": "running",
+                "required_book_successor_journal": raw_journal,
+            },
+            {
+                "$set": {
+                    "required_book_successor_journal": advanced.model_dump(
+                        mode="json"
+                    ),
+                    "expected_narrative_revision": (
+                        advanced.expected_narrative_revision
+                    ),
+                    "current_chapter_id": None,
+                    "last_checkpoint_index": len(advanced.stages) // 3,
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return advanced
+        latest = await self.get_job(parent_job_id)
+        stored = parse_required_book_successor_journal(
+            latest.get("required_book_successor_journal")
+        )
+        if stored == advanced:
+            return stored
+        raise JobExecutionLeaseLost(
+            "Required book successor journal advance fence was lost"
+        )
+
+    async def complete_required_book_successor(
+        self,
+        parent_job_id: str,
+        report,
+        *,
+        fence_token: str,
+        previous_status: str,
+        previous_pause_reason: str | None,
+        previous_execution_epoch: int,
+        previous_expected_narrative_revision: int | None,
+    ):
+        """Publish the exact final audit and root terminal state together."""
+
+        from backend.services.generation.required_book_successor import (
+            RequiredBookSuccessorCoordinator,
+            parse_required_book_successor_journal,
+        )
+        from backend.services.novel.book_completion import BookCompletionReport
+
+        parent = await self.get_job(parent_job_id)
+        raw_journal = parent.get("required_book_successor_journal")
+        journal = parse_required_book_successor_journal(raw_journal)
+        coordinator = RequiredBookSuccessorCoordinator(
+            coordinator_job_id=str(parent_job_id),
+            readiness=parent.get("readiness") or {},
+        )
+        completed = coordinator.accept_book_audit(journal, report)
+        canonical_report = (
+            report.model_dump(mode="json")
+            if hasattr(report, "model_dump")
+            else deepcopy(dict(report))
+        )
+        parsed_report = BookCompletionReport.model_validate(canonical_report)
+        now = get_utc_now()
+        fenced_novel = await get_database()[collections.NOVELS].find_one(
+            {
+                "_id": to_object_id(parsed_report.novel_id),
+                "$expr": {
+                    "$eq": [
+                        {"$ifNull": ["$narrative_revision", 0]},
+                        parsed_report.narrative_revision,
+                    ]
+                },
+                "narrative_write_fence.token": str(fence_token),
+                "narrative_write_fence.resource_kind": (
+                    "book_completion_audit"
+                ),
+                "narrative_write_fence.resource_id": str(parent_job_id),
+                "narrative_write_fence.expires_at": {"$exists": False},
+            },
+            projection={"_id": 1},
+        )
+        if fenced_novel is None:
+            raise CandidatePipelineCheckpointConflict(
+                "Required book successor lost its narrative revision fence"
+            )
+        query = self._book_completion_snapshot_query(
+            parent_job_id,
+            previous_status=previous_status,
+            previous_pause_reason=previous_pause_reason,
+            previous_execution_epoch=previous_execution_epoch,
+            previous_expected_narrative_revision=(
+                previous_expected_narrative_revision
+            ),
+            novel_id=parsed_report.novel_id,
+        )
+        query["$and"].extend([
+            {"required_book_successor_journal": raw_journal},
+            self._book_completion_publication_query(
+                parent_job_id,
+                fence_token,
+                live_after=now,
+            ),
+        ])
+        result = await self._collection_update_one(
+            query,
+            {
+                "$set": {
+                    "required_book_successor_journal": completed.model_dump(
+                        mode="json"
+                    ),
+                    "completion_audit": canonical_report,
+                    "status": "completed",
+                    "pause_reason": None,
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                    "error": None,
+                    "current_failure_event_id": None,
+                    "last_checkpoint_index": completed.chapter_count,
+                    "expected_narrative_revision": (
+                        completed.expected_narrative_revision
+                    ),
+                    "updated_at": now,
+                },
+                "$unset": {"completion_audit_publication": ""},
+            },
+        )
+        if result.modified_count != 1:
+            raise CandidatePipelineCheckpointConflict(
+                "Required book successor completion fence was lost"
+            )
+        return completed
+
+    async def block_required_book_successor(
+        self,
+        parent_job_id: str,
+        reason: str,
+    ):
+        """Persist one stable root stop without discarding child evidence."""
+
+        from backend.services.generation.required_book_successor import (
+            RequiredBookSuccessorCoordinator,
+            parse_required_book_successor_journal,
+        )
+
+        parent = await self.get_job(parent_job_id)
+        raw_journal = parent.get("required_book_successor_journal")
+        journal = parse_required_book_successor_journal(raw_journal)
+        coordinator = RequiredBookSuccessorCoordinator(
+            coordinator_job_id=str(parent_job_id),
+            readiness=parent.get("readiness") or {},
+        )
+        blocked = coordinator.block(journal, reason)
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(parent_job_id),
+                "is_deleted": False,
+                "status": "running",
+                "required_book_successor_journal": raw_journal,
+            },
+            {
+                "$set": {
+                    "required_book_successor_journal": blocked.model_dump(
+                        mode="json"
+                    ),
+                    "status": "paused",
+                    "pause_reason": "required_book_successor_blocked",
+                    "active_slot": None,
+                    "current_chapter_id": None,
+                    "error": {
+                        "step": "required_book_successor",
+                        "code": reason,
+                        "reason_codes": [reason],
+                    },
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return blocked
+        latest = await self.get_job(parent_job_id)
+        stored = parse_required_book_successor_journal(
+            latest.get("required_book_successor_journal")
+        )
+        if stored == blocked:
+            return stored
+        raise JobExecutionLeaseLost(
+            "Required book successor block fence was lost"
+        )
+
+    async def pause_required_book_successor_recovery_checkpoint(
+        self,
+        parent_job_id: str,
+        journal_digest: str,
+    ) -> bool:
+        """Pause the acceptance root once before any child Provider work."""
+
+        from backend.services.generation.required_book_successor import (
+            REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_BEFORE_FIRST_CHILD,
+            RequiredBookSuccessorRecoveryCheckpoint,
+            parse_required_book_successor_journal,
+            parse_required_book_successor_recovery_checkpoint,
+            validate_required_book_successor_readiness,
+        )
+
+        parent = await self.get_job(parent_job_id)
+        authority = validate_required_book_successor_readiness(
+            parent.get("readiness") or {}
+        )
+        journal = parse_required_book_successor_journal(
+            parent.get("required_book_successor_journal")
+        )
+        execution_epoch = parent.get("execution_epoch")
+        if (
+            authority.recovery_checkpoint
+            != REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_BEFORE_FIRST_CHILD
+            or journal.journal_digest != str(journal_digest)
+            or journal.stages
+            or journal.phase != "review"
+            or type(execution_epoch) is not int
+            or execution_epoch < 1
+            or list(parent.get("attempt_slots") or [])
+            or parent.get("has_uncertain_attempts") is True
+            or parent.get("current_chapter_id") is not None
+            or parent.get("required_book_successor_action") is not None
+        ):
+            raise JobExecutionLeaseLost(
+                "Required book successor recovery checkpoint changed"
+            )
+        raw_journal = parent.get("required_book_successor_journal")
+        raw_checkpoint = parent.get(
+            "required_book_successor_recovery_checkpoint"
+        )
+        if raw_checkpoint is not None:
+            checkpoint = parse_required_book_successor_recovery_checkpoint(
+                raw_checkpoint
+            )
+            if (
+                checkpoint.coordinator_job_id != str(parent_job_id)
+                or checkpoint.coordinator_readiness_digest
+                != journal.coordinator_readiness_digest
+                or checkpoint.journal_digest != journal.journal_digest
+                or str(parent.get("status") or "") != "paused"
+                or str(parent.get("pause_reason") or "")
+                != "required_book_successor_recovery_checkpoint"
+            ):
+                raise JobExecutionLeaseLost(
+                    "Required book successor recovery checkpoint changed"
+                )
+            return True
+        checkpoint = RequiredBookSuccessorRecoveryCheckpoint.create(
+            coordinator_job_id=str(parent_job_id),
+            coordinator_readiness_digest=(
+                journal.coordinator_readiness_digest
+            ),
+            journal_digest=journal.journal_digest,
+            execution_epoch=execution_epoch,
+        )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(parent_job_id),
+                "is_deleted": False,
+                "status": "running",
+                "execution_epoch": execution_epoch,
+                "required_book_successor_journal": raw_journal,
+                "required_book_successor_recovery_checkpoint": None,
+                "required_book_successor_action": None,
+                "current_chapter_id": None,
+                "attempt_slots": [],
+                "has_uncertain_attempts": False,
+            },
+            {
+                "$set": {
+                    "required_book_successor_recovery_checkpoint": (
+                        checkpoint.model_dump(mode="json")
+                    ),
+                    "status": "paused",
+                    "pause_reason": (
+                        "required_book_successor_recovery_checkpoint"
+                    ),
+                    "active_slot": None,
+                    "current_chapter_id": None,
+                    "error": None,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(parent_job_id)
+        try:
+            stored_checkpoint = (
+                parse_required_book_successor_recovery_checkpoint(
+                    latest.get(
+                        "required_book_successor_recovery_checkpoint"
+                    )
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            str(latest.get("status") or "") == "paused"
+            and str(latest.get("pause_reason") or "")
+            == "required_book_successor_recovery_checkpoint"
+            and latest.get("required_book_successor_journal") == raw_journal
+            and stored_checkpoint == checkpoint
+            and not list(latest.get("attempt_slots") or [])
+            and latest.get("has_uncertain_attempts") is False
+        )
 
     async def insert_one(
         self,
@@ -3705,6 +4871,1099 @@ class GenerationJobRepository:
     async def update_job_fields(self, job_id: str, fields: Dict[str, Any]) -> bool:
         return await self.update_one({"_id": to_object_id(job_id)}, dict(fields))
 
+    async def publish_required_reviewed_candidate(
+        self,
+        job_id: str,
+        candidate: Any,
+    ) -> bool:
+        """Atomically publish one non-formal reviewed-candidate handoff.
+
+        The command deliberately leaves ``progress`` and the narrative revision
+        unchanged. Its only terminal effect is to pause the Job on the exact
+        current chapter so a later, separately authorized Module can consume
+        the metadata-only result.
+        """
+
+        from backend.services.generation.required_chapter_review_job import (
+            RequiredChapterReviewJobConflict,
+            parse_required_reviewed_candidate,
+            validate_required_chapter_review_readiness,
+        )
+        from backend.db.required_adherence_journal import (
+            RequiredReviewJobBinding,
+            _read_owned_complete_source,
+            candidate_write_fences,
+        )
+        from backend.services.generation.prose_runs import prose_revision
+        from backend.services.novel.state_completion import (
+            chapter_content_digest,
+        )
+
+        parsed = parse_required_reviewed_candidate(candidate)
+        binding = RequiredReviewJobBinding(
+            job_id=parsed.job_id,
+            owner_id=parsed.owner_id,
+            novel_id=parsed.novel_id,
+            chapter_id=parsed.chapter_id,
+            readiness_digest=parsed.readiness_digest,
+            authorization_revision=parsed.authorization_revision,
+            narrative_revision=parsed.narrative_revision,
+        )
+        try:
+            async with candidate_write_fences(
+                binding,
+                run_id=parsed.source_run_id,
+                run_revision=parsed.source_run_revision,
+            ):
+                run, chapter = await _read_owned_complete_source(
+                    binding,
+                    run_id=parsed.source_run_id,
+                    run_revision=parsed.source_run_revision,
+                )
+                current = await self.get_job(job_id)
+                authorization = validate_required_chapter_review_readiness(
+                    current.get("readiness")
+                )
+                chapter_authorization = authorization.chapter(
+                    parsed.chapter_id
+                )
+                text = run.get("assembled_text")
+                outline = chapter.get("outline")
+                if (
+                    not isinstance(text, str)
+                    or not isinstance(outline, Mapping)
+                    or chapter_content_digest(text)
+                    != parsed.source_content_digest
+                    or run.get("outline_revision")
+                    != chapter_authorization.outline_revision
+                    or prose_revision(outline)
+                    != chapter_authorization.outline_revision
+                    or bool(str(chapter.get("content") or "").strip())
+                ):
+                    raise RequiredChapterReviewJobConflict(
+                        "required_reviewed_candidate_source_stale"
+                    )
+                return await self._publish_required_reviewed_candidate_snapshot(
+                    job_id,
+                    parsed=parsed,
+                    current=current,
+                )
+        except RequiredChapterReviewJobConflict:
+            raise
+        except (KeyError, TypeError, ValueError, NotFoundError) as exc:
+            raise RequiredChapterReviewJobConflict(
+                "required_reviewed_candidate_source_stale"
+            ) from exc
+
+    async def _publish_required_reviewed_candidate_snapshot(
+        self,
+        job_id: str,
+        *,
+        parsed: Any,
+        current: Mapping[str, Any],
+    ) -> bool:
+        """Commit a source-fenced reviewed result against one exact Job view."""
+
+        from backend.services.generation.required_chapter_review_job import (
+            REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON,
+            RequiredChapterReviewJobConflict,
+            parse_required_reviewed_candidate,
+            validate_required_reviewed_candidate_job,
+        )
+
+        value = parsed.model_dump(mode="json")
+        existing = current.get("required_reviewed_candidate")
+        if existing is not None:
+            stored = parse_required_reviewed_candidate(existing)
+            validate_required_reviewed_candidate_job(current, stored)
+            if (
+                stored == parsed
+                and current.get("status") == "paused"
+                and current.get("pause_reason")
+                == REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON
+                and current.get("active_slot") is None
+                and current.get("current_chapter_id") == parsed.chapter_id
+            ):
+                return False
+            raise RequiredChapterReviewJobConflict(
+                "required_reviewed_candidate_replay_diverged"
+            )
+        validate_required_reviewed_candidate_job(current, parsed)
+        journal_fields = {
+            name: deepcopy(current.get(name))
+            for name in (
+                "required_initial_prose_journal",
+                "required_prose_rewrite_journal",
+                "required_adherence_journal",
+            )
+        }
+        accounting_fields = {
+            name: deepcopy(current.get(name))
+            for name in (
+                "attempt_slots",
+                "usage_attempt_capacity",
+                "usage_attempt_claimed",
+                "usage_attempt_ids",
+                "token_budget",
+                "tokens_used",
+            )
+        }
+        error = {
+            "step": "required_chapter_review",
+            "chapter_id": parsed.chapter_id,
+            "message": (
+                "Reviewed prose candidate is ready for the next authorized stage"
+            ),
+            "reason_codes": [REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON],
+            "next_step": parsed.next_step,
+            "result_digest": parsed.result_digest,
+            "can_write_formal_prose": False,
+            "can_generate_state": False,
+        }
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": parsed.chapter_id,
+                "readiness.digest": parsed.readiness_digest,
+                "authorization_revision": parsed.authorization_revision,
+                "expected_narrative_revision": parsed.narrative_revision,
+                "has_uncertain_attempts": False,
+                "active_token_reservations": [],
+                "tokens_reserved": 0,
+                "attempt_reservation": None,
+                "state_dispatch_resolution": None,
+                "job_mutation_recovery": None,
+                "candidate_pipeline_checkpoints": [],
+                "required_reviewed_candidate": None,
+                "progress": deepcopy(current.get("progress")),
+                **journal_fields,
+                **accounting_fields,
+            },
+            {
+                "$set": {
+                    "required_reviewed_candidate": value,
+                    "status": "paused",
+                    "pause_reason": REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON,
+                    "active_slot": None,
+                    "error": error,
+                    "current_failure_event_id": None,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        replay = latest.get("required_reviewed_candidate")
+        if replay is not None:
+            stored = parse_required_reviewed_candidate(replay)
+            validate_required_reviewed_candidate_job(latest, stored)
+            if (
+                stored == parsed
+                and latest.get("status") == "paused"
+                and latest.get("pause_reason")
+                == REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON
+                and latest.get("current_chapter_id") == parsed.chapter_id
+            ):
+                return False
+        raise RequiredChapterReviewJobConflict(
+            "required_reviewed_candidate_publish_fence_lost"
+        )
+
+    async def pause_required_chapter_review(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        phase: str,
+        reason_code: str,
+        repair_count: int,
+    ) -> bool:
+        """Pause a bounded review failure without advancing formal progress."""
+
+        from backend.services.generation.required_chapter_review_job import (
+            RequiredChapterReviewJobConflict,
+            RequiredChapterReviewJobOutcome,
+            required_review_repair_count,
+            validate_required_chapter_review_readiness,
+        )
+        from backend.db.required_adherence_journal import _checked_bookkeeping
+
+        outcome = RequiredChapterReviewJobOutcome(
+            phase=phase,
+            reviewed_candidate=None,
+            repair_count=repair_count,
+            reason_code=reason_code,
+        )
+        current = await self.get_job(job_id)
+        authorization = validate_required_chapter_review_readiness(
+            current.get("readiness")
+        )
+        authorization.chapter(str(chapter_id))
+        _checked_bookkeeping(current)
+        durable_repair_count = required_review_repair_count(current)
+        if (
+            str(current.get("novel_id") or "") != authorization.novel_id
+            or str(current.get("owner_id") or "") != authorization.owner_id
+            or current.get("is_deleted") is not False
+            or current.get("status") != "running"
+            or current.get("authorization_revision")
+            != authorization.authorization_revision
+            or current.get("expected_narrative_revision")
+            != authorization.narrative_revision
+            or current.get("required_reviewed_candidate") is not None
+            or current.get("candidate_pipeline_checkpoints") not in (None, [])
+            or current.get("job_mutation_recovery") is not None
+            or current.get("state_dispatch_resolution") is not None
+            or current.get("has_uncertain_attempts") is not False
+            or current.get("active_token_reservations") not in (None, [])
+            or current.get("tokens_reserved") not in (None, 0)
+            or current.get("attempt_reservation") is not None
+            or repair_count != durable_repair_count
+        ):
+            raise RequiredChapterReviewJobConflict(
+                "required_chapter_review_pause_proof_invalid"
+            )
+        pause_reason = (
+            reason_code
+            if reason_code in {"cost_cap", "attempt_capacity"}
+            else f"required_review_{outcome.phase}"
+        )
+        error = {
+            "step": "required_chapter_review",
+            "chapter_id": str(chapter_id),
+            "message": "Required chapter review stopped before formal completion",
+            "reason_codes": [reason_code],
+            "next_step": (
+                "resume_required_review"
+                if outcome.phase == "incomplete"
+                else "manual_review"
+            ),
+            "repair_count": repair_count,
+            "can_write_formal_prose": False,
+            "can_generate_state": False,
+        }
+        journals = {
+            name: deepcopy(current.get(name))
+            for name in (
+                "required_initial_prose_journal",
+                "required_prose_rewrite_journal",
+                "required_adherence_journal",
+            )
+        }
+        accounting = {
+            name: deepcopy(current.get(name))
+            for name in (
+                "attempt_slots",
+                "usage_attempt_capacity",
+                "usage_attempt_claimed",
+                "usage_attempt_ids",
+                "token_budget",
+                "tokens_used",
+                "has_uncertain_attempts",
+                "active_token_reservations",
+                "tokens_reserved",
+                "attempt_reservation",
+            )
+        }
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": str(chapter_id),
+                "readiness.digest": current["readiness"]["digest"],
+                "authorization_revision": authorization.authorization_revision,
+                "expected_narrative_revision": authorization.narrative_revision,
+                "required_reviewed_candidate": None,
+                "progress": deepcopy(current.get("progress")),
+                **journals,
+                **accounting,
+            },
+            {
+                "$set": {
+                    "status": "paused",
+                    "pause_reason": pause_reason,
+                    "current_chapter_id": str(chapter_id),
+                    "active_slot": None,
+                    "error": error,
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        if (
+            latest.get("status") == "paused"
+            and latest.get("pause_reason") == pause_reason
+            and latest.get("current_chapter_id") == str(chapter_id)
+            and latest.get("required_reviewed_candidate") is None
+            and latest.get("error") == error
+        ):
+            return False
+        raise RequiredChapterReviewJobConflict(
+            "required_chapter_review_pause_fence_lost"
+        )
+
+    async def begin_required_state_candidate(
+        self,
+        job_id: str,
+        request: Any,
+    ) -> bool:
+        """Append one exact state request before its first paid claim."""
+
+        from backend.db.required_state_candidate_journal import (
+            begin_required_state_entry_value,
+        )
+        from backend.services.generation.required_chapter_state_job import (
+            RequiredChapterStateJobConflict,
+            RequiredStateCandidateRequest,
+        )
+
+        try:
+            parsed = RequiredStateCandidateRequest.model_validate(request)
+            current = await self.get_job(job_id)
+            before, changed = begin_required_state_entry_value(current, parsed)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise RequiredChapterStateJobConflict(
+                "required_state_candidate_begin_invalid"
+            ) from exc
+        if not changed:
+            return False
+        raw_before = current.get("required_state_candidate_journal")
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": parsed.binding.chapter_id,
+                "readiness.digest": parsed.binding.readiness_digest,
+                "authorization_revision": parsed.binding.authorization_revision,
+                "expected_narrative_revision": (
+                    parsed.binding.expected_narrative_revision
+                ),
+                "required_state_candidate_journal": deepcopy(raw_before),
+                "required_state_candidate": None,
+                "progress": deepcopy(current.get("progress")),
+            },
+            {
+                "$set": {
+                    "required_state_candidate_journal": before.model_dump(
+                        mode="json"
+                    ),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        replay, replay_changed = begin_required_state_entry_value(latest, parsed)
+        if not replay_changed and replay == before:
+            return False
+        raise RequiredChapterStateJobConflict(
+            "required_state_candidate_begin_fence_lost"
+        )
+
+    async def read_required_state_predecessor_job(
+        self,
+        state_job_id: str,
+        predecessor_job_id: str,
+    ) -> Dict[str, Any]:
+        """Read only the reviewed Job frozen into the leased state Job.
+
+        A worker lease normally (and deliberately) forbids reading any other
+        Generation Job.  The state successor needs one cross-Job read, so this
+        Adapter re-proves the exact predecessor from the current readiness
+        before using the underlying read-only collection Interface.  It does
+        not permit writes or arbitrary cross-Job lookup.
+        """
+
+        from backend.services.generation.required_chapter_review_job import (
+            parse_required_reviewed_candidate,
+            validate_required_reviewed_candidate_job,
+        )
+        from backend.services.generation.required_chapter_state_job import (
+            RequiredChapterStateJobConflict,
+            validate_required_chapter_state_readiness,
+        )
+
+        lease = current_job_execution()
+        if lease is None or lease.job_id != str(state_job_id):
+            raise RequiredChapterStateJobConflict(
+                "required_state_predecessor_read_unowned"
+            )
+        current = await self.get_job(state_job_id)
+        authorization = validate_required_chapter_state_readiness(
+            current.get("readiness")
+        )
+        frozen = authorization.predecessor_candidate
+        if (
+            current.get("status") != "running"
+            or str(current.get("owner_id") or "") != authorization.owner_id
+            or str(current.get("novel_id") or "") != authorization.novel_id
+            or current.get("authorization_revision")
+            != authorization.authorization_revision
+            or current.get("expected_narrative_revision")
+            != authorization.narrative_revision
+            or frozen.job_id != str(predecessor_job_id)
+        ):
+            raise RequiredChapterStateJobConflict(
+                "required_state_predecessor_read_stale"
+            )
+        predecessor = await self._base.find_one({
+            "_id": to_object_id(frozen.job_id),
+            "owner_id": to_object_id(frozen.owner_id),
+            "novel_id": to_object_id(frozen.novel_id),
+            "is_deleted": False,
+            "status": "paused",
+            "pause_reason": "required_reviewed_candidate_ready",
+            "current_chapter_id": frozen.chapter_id,
+        })
+        if predecessor is None:
+            raise RequiredChapterStateJobConflict(
+                "required_state_predecessor_unavailable"
+            )
+        parsed = parse_required_reviewed_candidate(
+            predecessor.get("required_reviewed_candidate")
+        )
+        validate_required_reviewed_candidate_job(predecessor, parsed)
+        if parsed != frozen:
+            raise RequiredChapterStateJobConflict(
+                "required_state_predecessor_changed"
+            )
+        return predecessor
+
+    async def publish_required_state_observation(
+        self,
+        job_id: str,
+        request: Any,
+        observation: Any,
+    ) -> bool:
+        """Settle one state observation against its exact paid attempts."""
+
+        from backend.db.required_state_candidate_journal import (
+            observation_entry_value,
+        )
+        from backend.services.generation.required_chapter_state_job import (
+            RequiredChapterStateJobConflict,
+            RequiredStateCandidateObservation,
+            RequiredStateCandidateRequest,
+        )
+
+        try:
+            parsed_request = RequiredStateCandidateRequest.model_validate(request)
+            parsed_observation = RequiredStateCandidateObservation.model_validate(
+                observation
+            )
+            current = await self.get_job(job_id)
+            before, after = observation_entry_value(
+                current,
+                parsed_request,
+                parsed_observation,
+            )
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise RequiredChapterStateJobConflict(
+                "required_state_observation_invalid"
+            ) from exc
+        if before == after:
+            return False
+        accounting = {
+            name: deepcopy(current.get(name))
+            for name in (
+                "attempt_slots",
+                "usage_attempt_capacity",
+                "usage_attempt_claimed",
+                "usage_attempt_ids",
+                "token_budget",
+                "tokens_used",
+                "tokens_reserved",
+                "active_token_reservations",
+                "attempt_reservation",
+                "has_uncertain_attempts",
+            )
+        }
+        if (
+            accounting["tokens_reserved"] not in (None, 0)
+            or accounting["active_token_reservations"] not in (None, [])
+            or accounting["has_uncertain_attempts"] is not False
+        ):
+            raise RequiredChapterStateJobConflict(
+                "required_state_observation_accounting_unsettled"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": parsed_request.binding.chapter_id,
+                "readiness.digest": parsed_request.binding.readiness_digest,
+                "authorization_revision": (
+                    parsed_request.binding.authorization_revision
+                ),
+                "expected_narrative_revision": (
+                    parsed_request.binding.expected_narrative_revision
+                ),
+                "required_state_candidate_journal": before.model_dump(
+                    mode="json"
+                ),
+                "required_state_candidate": None,
+                "progress": deepcopy(current.get("progress")),
+                **accounting,
+            },
+            {
+                "$set": {
+                    "required_state_candidate_journal": after.model_dump(
+                        mode="json"
+                    ),
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        replay_before, replay_after = observation_entry_value(
+            latest,
+            parsed_request,
+            parsed_observation,
+        )
+        if replay_before == replay_after and replay_before == after:
+            return False
+        raise RequiredChapterStateJobConflict(
+            "required_state_observation_fence_lost"
+        )
+
+    async def publish_required_state_candidate(
+        self,
+        job_id: str,
+        candidate: Any,
+    ) -> bool:
+        """Publish a consistent, recoverable state handoff without mutation."""
+
+        from backend.db.required_adherence_journal import (
+            RequiredReviewJobBinding,
+            _read_owned_complete_source,
+            candidate_write_fences,
+        )
+        from backend.db.required_state_candidate_journal import (
+            parse_required_state_candidate_journal,
+        )
+        from backend.services.generation.chapter_generation_application import (
+            ChapterGenerationResult,
+            ChapterGenerationStage,
+        )
+        from backend.services.generation.required_chapter_review_job import (
+            parse_required_reviewed_candidate,
+            validate_required_reviewed_candidate_job,
+        )
+        from backend.services.generation.required_chapter_state_job import (
+            REQUIRED_STATE_CANDIDATE_PAUSE_REASON,
+            RequiredChapterStateJobConflict,
+            evaluate_required_state_candidate,
+            parse_required_state_candidate,
+            required_state_source_from_run,
+            validate_required_chapter_state_readiness,
+            validate_required_state_candidate_job,
+        )
+        from backend.services.novel.state_proposal import state_proposal_module
+
+        parsed = parse_required_state_candidate(candidate)
+        current = await self.get_job(job_id)
+        existing = current.get("required_state_candidate")
+        if existing is not None:
+            stored = parse_required_state_candidate(existing)
+            validate_required_state_candidate_job(current, stored)
+            if (
+                stored == parsed
+                and current.get("status") == "paused"
+                and current.get("pause_reason")
+                == REQUIRED_STATE_CANDIDATE_PAUSE_REASON
+            ):
+                return False
+            raise RequiredChapterStateJobConflict(
+                "required_state_candidate_replay_diverged"
+            )
+        validate_required_state_candidate_job(current, parsed)
+        authorization = validate_required_chapter_state_readiness(
+            current.get("readiness")
+        )
+        predecessor_job = await self.read_required_state_predecessor_job(
+            job_id,
+            parsed.predecessor_job_id,
+        )
+        predecessor = parse_required_reviewed_candidate(
+            predecessor_job.get("required_reviewed_candidate")
+        )
+        validate_required_reviewed_candidate_job(predecessor_job, predecessor)
+        if predecessor != authorization.predecessor_candidate:
+            raise RequiredChapterStateJobConflict(
+                "required_state_predecessor_changed"
+            )
+        predecessor_binding = RequiredReviewJobBinding(
+            job_id=predecessor.job_id,
+            owner_id=predecessor.owner_id,
+            novel_id=predecessor.novel_id,
+            chapter_id=predecessor.chapter_id,
+            readiness_digest=predecessor.readiness_digest,
+            authorization_revision=predecessor.authorization_revision,
+            narrative_revision=predecessor.narrative_revision,
+        )
+        async with candidate_write_fences(
+            predecessor_binding,
+            run_id=predecessor.source_run_id,
+            run_revision=predecessor.source_run_revision,
+        ):
+            run, chapter = await _read_owned_complete_source(
+                predecessor_binding,
+                run_id=predecessor.source_run_id,
+                run_revision=predecessor.source_run_revision,
+            )
+            if bool(str(chapter.get("content") or "").strip()):
+                raise RequiredChapterStateJobConflict(
+                    "required_state_source_stale"
+                )
+            source = required_state_source_from_run(run, authorization)
+            journal = parse_required_state_candidate_journal(
+                current.get("required_state_candidate_journal")
+            )
+            latest = journal.entries[-1]
+            if latest.observation is None:
+                raise RequiredChapterStateJobConflict(
+                    "required_state_observation_missing"
+                )
+            recovered = await state_proposal_module.recover_required_state_generation(
+                latest.request.binding
+            )
+            if recovered is None:
+                raise RequiredChapterStateJobConflict(
+                    "required_state_proposal_missing"
+                )
+            generation = ChapterGenerationResult(
+                stage=ChapterGenerationStage.STATE,
+                value=recovered.value,
+                usage={},
+                attempts=[],
+                truncation={
+                    "truncated_section_count": recovered.truncated_section_count,
+                    "dropped_item_count": recovered.dropped_item_count,
+                },
+                dropped=(
+                    {
+                        "dropped_reference_count": (
+                            recovered.dropped_reference_count
+                        )
+                    }
+                    if recovered.dropped_reference_count
+                    else {}
+                ),
+                accepted=False,
+            )
+            reprojection = evaluate_required_state_candidate(
+                generation,
+                source=source,
+                chapter=chapter,
+                attempt_ids=latest.observation.attempt_ids,
+            )
+            if reprojection != latest.observation:
+                raise RequiredChapterStateJobConflict(
+                    "required_state_proposal_projection_changed"
+                )
+            current = await self.get_job(job_id)
+            validate_required_state_candidate_job(current, parsed)
+            value = parsed.model_dump(mode="json")
+            protected = {
+                name: deepcopy(current.get(name))
+                for name in (
+                    "required_state_candidate_journal",
+                    "attempt_slots",
+                    "usage_attempt_capacity",
+                    "usage_attempt_claimed",
+                    "usage_attempt_ids",
+                    "token_budget",
+                    "tokens_used",
+                    "progress",
+                )
+            }
+            result = await self._collection_update_one(
+                {
+                    "_id": to_object_id(job_id),
+                    "is_deleted": False,
+                    "status": "running",
+                    "current_chapter_id": parsed.chapter_id,
+                    "readiness.digest": parsed.readiness_digest,
+                    "authorization_revision": parsed.authorization_revision,
+                    "expected_narrative_revision": parsed.narrative_revision,
+                    "required_state_candidate": None,
+                    "has_uncertain_attempts": False,
+                    "active_token_reservations": [],
+                    "tokens_reserved": 0,
+                    "attempt_reservation": None,
+                    **protected,
+                },
+                {
+                    "$set": {
+                        "required_state_candidate": value,
+                        "status": "paused",
+                        "pause_reason": REQUIRED_STATE_CANDIDATE_PAUSE_REASON,
+                        "active_slot": None,
+                        "error": {
+                            "step": "required_chapter_state",
+                            "chapter_id": parsed.chapter_id,
+                            "message": (
+                                "Consistent deferred state candidate is ready"
+                            ),
+                            "reason_codes": [
+                                REQUIRED_STATE_CANDIDATE_PAUSE_REASON
+                            ],
+                            "next_step": parsed.next_step,
+                            "result_digest": parsed.result_digest,
+                            "can_write_formal_prose": False,
+                            "can_accept_formal_state": False,
+                        },
+                        "current_failure_event_id": None,
+                        "updated_at": get_utc_now(),
+                    }
+                },
+            )
+            if result.modified_count == 1:
+                return True
+        latest_job = await self.get_job(job_id)
+        replay = latest_job.get("required_state_candidate")
+        if replay is not None:
+            stored = parse_required_state_candidate(replay)
+            validate_required_state_candidate_job(latest_job, stored)
+            if stored == parsed:
+                return False
+        raise RequiredChapterStateJobConflict(
+            "required_state_candidate_publish_fence_lost"
+        )
+
+    async def read_required_finalization_predecessor_jobs(
+        self,
+        finalization_job_id: str,
+        state_job_id: str,
+        reviewed_job_id: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Read only the two Jobs frozen into a leased finalization Job."""
+
+        from backend.services.generation.required_chapter_finalization_job import (
+            RequiredChapterFinalizationJobConflict,
+            build_required_chapter_finalization_authorization,
+            validate_required_chapter_finalization_readiness,
+        )
+        from backend.services.generation.required_chapter_review_job import (
+            REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON,
+            parse_required_reviewed_candidate,
+            validate_required_reviewed_candidate_job,
+        )
+        from backend.services.generation.required_chapter_state_job import (
+            REQUIRED_STATE_CANDIDATE_PAUSE_REASON,
+            parse_required_state_candidate,
+            validate_required_state_candidate_job,
+        )
+
+        lease = current_job_execution()
+        if lease is None or lease.job_id != str(finalization_job_id):
+            raise RequiredChapterFinalizationJobConflict(
+                "required_finalization_predecessor_read_unowned"
+            )
+        current = await self.get_job(finalization_job_id)
+        authorization = validate_required_chapter_finalization_readiness(
+            current.get("readiness")
+        )
+        if (
+            current.get("status") != "running"
+            or current.get("authorization_revision")
+            != authorization.authorization_revision
+            or current.get("expected_narrative_revision")
+            != authorization.narrative_revision
+            or authorization.state_candidate.job_id != str(state_job_id)
+            or authorization.reviewed_candidate.job_id != str(reviewed_job_id)
+        ):
+            raise RequiredChapterFinalizationJobConflict(
+                "required_finalization_predecessor_read_stale"
+            )
+        state_job = await self._base.find_one({
+            "_id": to_object_id(authorization.state_candidate.job_id),
+            "owner_id": to_object_id(authorization.owner_id),
+            "novel_id": to_object_id(authorization.novel_id),
+            "is_deleted": False,
+            "status": "paused",
+            "pause_reason": REQUIRED_STATE_CANDIDATE_PAUSE_REASON,
+            "current_chapter_id": authorization.chapter_id,
+        })
+        reviewed_job = await self._base.find_one({
+            "_id": to_object_id(authorization.reviewed_candidate.job_id),
+            "owner_id": to_object_id(authorization.owner_id),
+            "novel_id": to_object_id(authorization.novel_id),
+            "is_deleted": False,
+            "status": "paused",
+            "pause_reason": REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON,
+            "current_chapter_id": authorization.chapter_id,
+        })
+        if state_job is None or reviewed_job is None:
+            raise RequiredChapterFinalizationJobConflict(
+                "required_finalization_predecessor_unavailable"
+            )
+        state = parse_required_state_candidate(
+            state_job.get("required_state_candidate")
+        )
+        reviewed = parse_required_reviewed_candidate(
+            reviewed_job.get("required_reviewed_candidate")
+        )
+        validate_required_state_candidate_job(state_job, state)
+        validate_required_reviewed_candidate_job(reviewed_job, reviewed)
+        rebuilt = build_required_chapter_finalization_authorization(
+            state_job=state_job,
+            reviewed_job=reviewed_job,
+            authorization_revision=authorization.authorization_revision,
+            created_at=authorization.created_at,
+            deadline_at=authorization.deadline_at,
+        )
+        if rebuilt != authorization:
+            raise RequiredChapterFinalizationJobConflict(
+                "required_finalization_predecessor_changed"
+            )
+        return state_job, reviewed_job
+
+    async def complete_required_chapter_finalization(
+        self,
+        job_id: str,
+        outcome: Any,
+    ) -> bool:
+        """Publish one recovered formal mutation receipt and terminal result."""
+
+        from backend.services.generation.required_chapter_finalization_job import (
+            RequiredChapterFinalizationJobConflict,
+            RequiredChapterFinalizationJobOutcome,
+            parse_required_chapter_finalization_result,
+            validate_required_chapter_finalization_readiness,
+            validate_required_chapter_finalization_result_job,
+        )
+
+        if not isinstance(outcome, RequiredChapterFinalizationJobOutcome):
+            raise RequiredChapterFinalizationJobConflict(
+                "required_finalization_outcome_invalid"
+            )
+        result = parse_required_chapter_finalization_result(outcome.result)
+        receipt = JobMutationReceiptV1.model_validate(
+            outcome.mutation_receipt
+        )
+        binding = receipt.binding
+        current = await self.get_job(job_id)
+        authorization = validate_required_chapter_finalization_readiness(
+            current.get("readiness")
+        )
+        validate_required_chapter_finalization_result_job(current, result)
+        expected_binding = JobMutationRecoveryBindingV1(
+            novel_id=authorization.novel_id,
+            job_id=str(job_id),
+            chapter_id=authorization.chapter_id,
+            readiness_digest=str(current["readiness"]["digest"]),
+            authorization_revision=authorization.authorization_revision,
+            expected_narrative_revision=authorization.narrative_revision,
+            operation="finalize_chapter_generation",
+            idempotency_key=(
+                f"finalize-chapter-generation:{result.source_run_id}:"
+                f"{result.source_run_revision}:{result.state_proposal_id}"
+            ),
+        )
+        if (
+            binding != expected_binding
+            or receipt.next_narrative_revision
+            != result.narrative_revision_after
+        ):
+            raise RequiredChapterFinalizationJobConflict(
+                "required_finalization_mutation_receipt_changed"
+            )
+        canonical_result = result.model_dump(mode="json")
+        canonical_receipt = receipt.model_dump(mode="json")
+        progress = {
+            "schema_version": "required_chapter_finalization_progress.v1",
+            "chapter_id": result.chapter_id,
+            "steps_done": ["chapter_finalization"],
+            "steps_skipped": [],
+            "tokens": 0,
+            "attempts": [],
+            "summary_written": True,
+            "result_digest": result.result_digest,
+            "certificate_digest": result.certificate_digest,
+            "completion_receipt_digest": result.completion_receipt_digest,
+            "job_mutation_receipt": canonical_receipt,
+            "job_mutation_tokens_delta": 0,
+        }
+        result_update = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": result.chapter_id,
+                "authorization_revision": result.authorization_revision,
+                "expected_narrative_revision": result.narrative_revision_before,
+                "readiness.digest": result.readiness_digest,
+                "job_mutation_recovery": binding.model_dump(mode="json"),
+                "required_chapter_finalization_result": None,
+                "progress": deepcopy(current.get("progress")),
+                "attempt_slots": [],
+                "usage_attempt_claimed": 0,
+                "tokens_used": 0,
+                "tokens_reserved": 0,
+                "active_token_reservations": [],
+                "attempt_reservation": None,
+                "has_uncertain_attempts": False,
+            },
+            {
+                "$set": {
+                    "required_chapter_finalization_result": canonical_result,
+                    "progress": [progress],
+                    "status": "completed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "current_chapter_id": None,
+                    "current_failure_event_id": None,
+                    "expected_narrative_revision": (
+                        result.narrative_revision_after
+                    ),
+                    "error": None,
+                    "updated_at": get_utc_now(),
+                },
+                "$unset": {"job_mutation_recovery": ""},
+            },
+        )
+        if result_update.modified_count == 1:
+            return True
+        latest = await self.get_job(job_id)
+        stored = latest.get("required_chapter_finalization_result")
+        if stored is not None:
+            parsed = parse_required_chapter_finalization_result(stored)
+            validate_required_chapter_finalization_result_job(latest, parsed)
+            if (
+                parsed == result
+                and latest.get("status") == "completed"
+                and latest.get("expected_narrative_revision")
+                == result.narrative_revision_after
+                and latest.get("job_mutation_recovery") is None
+                and latest.get("progress") == [progress]
+            ):
+                return False
+        raise RequiredChapterFinalizationJobConflict(
+            "required_finalization_publish_fence_lost"
+        )
+
+    async def pause_required_chapter_state(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str,
+        reason_code: str,
+        reextraction_count: int,
+    ) -> bool:
+        """Pause a locally failed state gate without formal progress."""
+
+        from backend.db.required_state_candidate_journal import (
+            parse_required_state_candidate_journal,
+            validate_required_state_attempt_accounting,
+        )
+        from backend.services.generation.required_chapter_state_job import (
+            RequiredChapterStateJobConflict,
+            RequiredChapterStateJobOutcome,
+            validate_required_chapter_state_readiness,
+        )
+
+        RequiredChapterStateJobOutcome(
+            phase="blocked",
+            state_candidate=None,
+            reextraction_count=reextraction_count,
+            reason_code=reason_code,
+        )
+        current = await self.get_job(job_id)
+        authorization = validate_required_chapter_state_readiness(
+            current.get("readiness")
+        )
+        journal = parse_required_state_candidate_journal(
+            current.get("required_state_candidate_journal")
+        )
+        for entry in journal.entries:
+            validate_required_state_attempt_accounting(
+                current,
+                entry,
+                authorization,
+            )
+        latest = journal.entries[-1]
+        if (
+            str(chapter_id) != authorization.chapter_id
+            or current.get("status") != "running"
+            or current.get("current_chapter_id") != str(chapter_id)
+            or current.get("required_state_candidate") is not None
+            or len(journal.entries) != 3
+            or reextraction_count != 2
+            or latest.phase != "produced"
+            or latest.observation is None
+            or latest.observation.gate_passed
+            or current.get("has_uncertain_attempts") is not False
+            or current.get("active_token_reservations") not in (None, [])
+            or current.get("tokens_reserved") not in (None, 0)
+            or current.get("attempt_reservation") is not None
+            or current.get("progress") not in (None, [])
+        ):
+            raise RequiredChapterStateJobConflict(
+                "required_state_pause_proof_invalid"
+            )
+        result = await self._collection_update_one(
+            {
+                "_id": to_object_id(job_id),
+                "is_deleted": False,
+                "status": "running",
+                "current_chapter_id": str(chapter_id),
+                "readiness.digest": current["readiness"]["digest"],
+                "authorization_revision": authorization.authorization_revision,
+                "expected_narrative_revision": authorization.narrative_revision,
+                "required_state_candidate_journal": journal.model_dump(
+                    mode="json"
+                ),
+                "required_state_candidate": None,
+                "attempt_slots": deepcopy(current.get("attempt_slots")),
+                "tokens_used": current.get("tokens_used"),
+                "progress": deepcopy(current.get("progress")),
+            },
+            {
+                "$set": {
+                    "status": "paused",
+                    "pause_reason": "required_state_blocked",
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_state",
+                        "chapter_id": str(chapter_id),
+                        "message": (
+                            "Required state gate exhausted bounded re-extraction"
+                        ),
+                        "reason_codes": [reason_code],
+                        "next_step": "manual_state_review",
+                        "reextraction_count": reextraction_count,
+                        "can_write_formal_prose": False,
+                        "can_accept_formal_state": False,
+                    },
+                    "updated_at": get_utc_now(),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return True
+        latest_job = await self.get_job(job_id)
+        if (
+            latest_job.get("status") == "paused"
+            and latest_job.get("pause_reason") == "required_state_blocked"
+            and latest_job.get("current_chapter_id") == str(chapter_id)
+        ):
+            return False
+        raise RequiredChapterStateJobConflict(
+            "required_state_pause_fence_lost"
+        )
+
     async def publish_outline_authorization_recalculation(
         self,
         job_id: str,
@@ -4380,11 +6639,189 @@ class GenerationJobRepository:
             "state": "claimed",
             "reserved_at": now,
         }
-        result = await self._collection_update_one(query, update)
+        required_protocol: str | None = None
+        if str(step_id).startswith("successor-acceptance-outline:"):
+            required_protocol = "successor_acceptance_outline"
+            from backend.evaluation.required_book_successor_acceptance_outline import (
+                write_successor_acceptance_outline_claim,
+            )
+
+            result = await write_successor_acceptance_outline_claim(
+                await self.get_job(job_id),
+                chapter_id=str(chapter_id),
+                step_id=str(step_id),
+                phase=phase,
+                provider_alias=provider_alias,
+                conservative_tokens=reserved,
+                query=query,
+                update=update,
+                write_job=self._collection_update_one,
+            )
+        elif str(step_id).startswith("required-initial-prose:"):
+            required_protocol = "initial"
+            from backend.db.required_initial_prose_journal import (
+                write_required_initial_prose_claim,
+            )
+
+            result = await write_required_initial_prose_claim(
+                await self.get_job(job_id),
+                chapter_id=str(chapter_id),
+                step_id=str(step_id),
+                phase=phase,
+                provider_alias=provider_alias,
+                conservative_tokens=reserved,
+                query=query,
+                update=update,
+                write_job=self._collection_update_one,
+            )
+        elif str(step_id).startswith("required-adherence:"):
+            required_protocol = "review"
+            from backend.db.required_adherence_journal import write_required_review_claim
+
+            result = await write_required_review_claim(
+                await self.get_job(job_id), chapter_id=str(chapter_id), step_id=str(step_id),
+                phase=phase, provider_alias=provider_alias, conservative_tokens=reserved,
+                query=query, update=update, write_job=self._collection_update_one,
+            )
+        elif str(step_id).startswith("required-prose-rewrite:"):
+            required_protocol = "rewrite"
+            from backend.db.required_prose_rewrite_journal import write_required_rewrite_claim
+
+            result = await write_required_rewrite_claim(
+                await self.get_job(job_id), chapter_id=str(chapter_id), step_id=str(step_id),
+                phase=phase, provider_alias=provider_alias, conservative_tokens=reserved,
+                query=query, update=update, write_job=self._collection_update_one,
+            )
+        elif str(step_id).startswith("required-state-candidate:"):
+            required_protocol = "state_candidate"
+            from backend.db.required_state_candidate_journal import (
+                write_required_state_claim,
+            )
+
+            result = await write_required_state_claim(
+                await self.get_job(job_id),
+                chapter_id=str(chapter_id),
+                step_id=str(step_id),
+                phase=phase,
+                provider_alias=provider_alias,
+                conservative_tokens=reserved,
+                query=query,
+                update=update,
+                write_job=self._collection_update_one,
+            )
+        else:
+            # An opt-in successor Job cannot borrow the legacy generic pool.
+            # Other successor phases have not been activated by this adapter.
+            query["required_adherence_journal"] = None
+            query["required_initial_prose_journal"] = None
+            query["required_prose_rewrite_journal"] = None
+            query["required_reviewed_candidate"] = None
+            query["readiness.planning.required_initial_prose"] = {"$exists": False}
+            query["readiness.planning.required_adherence_review"] = {"$exists": False}
+            query["readiness.planning.required_prose_rewrite"] = {"$exists": False}
+            query[
+                "readiness.planning.required_chapter_review_authorization"
+            ] = {"$exists": False}
+            query[
+                "readiness.planning.required_chapter_review_pipeline_revision"
+            ] = {"$exists": False}
+            query["required_state_candidate_journal"] = None
+            query["required_state_candidate"] = None
+            query[
+                "readiness.planning.required_chapter_state_authorization"
+            ] = {"$exists": False}
+            query[
+                "readiness.planning.required_chapter_state_pipeline_revision"
+            ] = {"$exists": False}
+            result = await self._collection_update_one(query, update)
         if result.modified_count == 1:
             return attempt_id
 
         job = await self.get_job(job_id)
+        if required_protocol == "successor_acceptance_outline":
+            from backend.evaluation.required_book_successor_acceptance_outline import (
+                SuccessorAcceptanceOutlineDispatchRejected,
+            )
+
+            raise SuccessorAcceptanceOutlineDispatchRejected(
+                "successor_acceptance_outline_dispatch_rejected"
+            )
+        if required_protocol == "initial":
+            from backend.db.required_initial_prose_journal import (
+                RequiredInitialProseDispatchRejected,
+            )
+
+            raise RequiredInitialProseDispatchRejected(
+                "initial_prose_dispatch_rejected"
+            )
+        if required_protocol == "review":
+            from backend.db.required_adherence_journal import (
+                RequiredReviewDispatchRejected,
+            )
+
+            raise RequiredReviewDispatchRejected(
+                "review_dispatch_rejected"
+            )
+        if required_protocol == "rewrite":
+            from backend.db.required_prose_rewrite_journal import (
+                RequiredRewriteDispatchRejected,
+            )
+
+            raise RequiredRewriteDispatchRejected(
+                "rewrite_dispatch_rejected"
+            )
+        if required_protocol == "state_candidate":
+            from backend.services.generation.required_chapter_state_job import (
+                RequiredStateDispatchRejected,
+            )
+
+            raise RequiredStateDispatchRejected(
+                "required_state_dispatch_rejected"
+            )
+        readiness = job.get("readiness")
+        planning = readiness.get("planning") if isinstance(readiness, Mapping) else None
+        if isinstance(planning, Mapping):
+            from backend.services.generation.required_chapter_review_job import (
+                RequiredChapterReviewJobConflict,
+                required_chapter_review_planning_present,
+            )
+
+            if (
+                required_chapter_review_planning_present(planning)
+                or job.get("required_reviewed_candidate") is not None
+            ):
+                raise RequiredChapterReviewJobConflict(
+                    "required_chapter_review_generic_dispatch_rejected"
+                )
+            from backend.services.generation.required_chapter_state_job import (
+                RequiredChapterStateJobConflict,
+                required_chapter_state_planning_present,
+            )
+
+            if (
+                required_chapter_state_planning_present(planning)
+                or job.get("required_state_candidate_journal") is not None
+                or job.get("required_state_candidate") is not None
+            ):
+                raise RequiredChapterStateJobConflict(
+                    "required_chapter_state_generic_dispatch_rejected"
+                )
+        if job.get("required_initial_prose_journal") is not None or (
+            isinstance(planning, Mapping) and "required_initial_prose" in planning
+        ):
+            from backend.db.required_initial_prose_journal import (
+                RequiredInitialProseDispatchRejected,
+            )
+
+            raise RequiredInitialProseDispatchRejected(
+                "initial_prose_dispatch_rejected"
+            )
+        if job.get("required_adherence_journal") is not None or (
+            isinstance(planning, Mapping) and "required_adherence_review" in planning
+        ):
+            from backend.db.required_adherence_journal import RequiredReviewDispatchRejected
+
+            raise RequiredReviewDispatchRejected("review_dispatch_rejected")
         if interactive_execution_token is not None:
             execution_claim = job.get("interactive_execution_claim")
             active_token = (

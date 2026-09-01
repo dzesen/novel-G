@@ -111,6 +111,23 @@ def planned_base_call_target_words(plan: ProseExecutionPlan) -> tuple[int, ...]:
     return tuple(spec.target_words for spec in _call_specs(plan))
 
 
+def planned_base_call_contracts(
+    plan: ProseExecutionPlan,
+) -> tuple[dict[str, int], ...]:
+    """Expose stable per-call identities for durable execution evidence."""
+
+    return tuple(
+        {
+            "sequence_index": spec.sequence_index,
+            "scene_index": spec.scene_index,
+            "part_index": spec.part_index,
+            "part_count": spec.part_count,
+            "target_word_count": spec.target_words,
+        }
+        for spec in _call_specs(plan)
+    )
+
+
 def _segment_prompt(
     *,
     plan: ProseExecutionPlan,

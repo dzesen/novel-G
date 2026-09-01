@@ -747,6 +747,22 @@ async def init_generation_job_indexes():
                 partialFilterExpression={"active_slot": "global", "is_deleted": False},
                 name="single_active_generation_job",
             ),
+            pymongo.IndexModel(
+                [
+                    (
+                        "required_book_successor_action.action_digest",
+                        pymongo.ASCENDING,
+                    )
+                ],
+                unique=True,
+                partialFilterExpression={
+                    "required_book_successor_action.action_digest": {
+                        "$type": "string"
+                    },
+                    "is_deleted": False,
+                },
+                name="required_book_successor_child_action",
+            ),
         ]
         await jobs_collection.create_indexes(indexes)
         logger.info("成功初始化'generation_jobs'集合的索引。")

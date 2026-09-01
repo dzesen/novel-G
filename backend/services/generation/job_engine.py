@@ -38,6 +38,25 @@ from backend.services.generation.chapter_candidate_authorization import (
     readiness_chapter_uses_candidate_pipeline,
     readiness_uses_candidate_pipeline,
 )
+from backend.services.generation.required_chapter_review_job import (
+    RequiredChapterReviewJobOutcome,
+    readiness_chapter_uses_required_chapter_review,
+    readiness_uses_required_chapter_review,
+    required_review_repair_count,
+)
+from backend.services.generation.required_chapter_state_job import (
+    RequiredChapterStateJobOutcome,
+    readiness_chapter_uses_required_chapter_state,
+    readiness_uses_required_chapter_state,
+)
+from backend.services.generation.required_chapter_finalization_job import (
+    RequiredChapterFinalizationJobOutcome,
+    readiness_chapter_uses_required_chapter_finalization,
+    readiness_uses_required_chapter_finalization,
+)
+from backend.services.generation.required_book_successor import (
+    readiness_uses_required_book_successor,
+)
 from backend.services.generation.failure_diagnostics import (
     build_failure_diagnostic,
     candidate_repair_stop_projection,
@@ -92,6 +111,31 @@ class JobEngineDeps:
             [str, Dict[str, Any]],
             Awaitable[CandidateChapterOutcome],
         ]
+    ] = None
+
+    run_required_review_chapter: Optional[
+        Callable[
+            [str, Dict[str, Any]],
+            Awaitable[RequiredChapterReviewJobOutcome],
+        ]
+    ] = None
+
+    run_required_state_chapter: Optional[
+        Callable[
+            [str, Dict[str, Any]],
+            Awaitable[RequiredChapterStateJobOutcome],
+        ]
+    ] = None
+
+    run_required_finalization_chapter: Optional[
+        Callable[
+            [str, Dict[str, Any]],
+            Awaitable[RequiredChapterFinalizationJobOutcome],
+        ]
+    ] = None
+
+    run_required_book_successor: Optional[
+        Callable[[], Awaitable[None]]
     ] = None
 
     inspect_reference_card_blockers: Optional[
@@ -375,6 +419,26 @@ async def _pause_candidate_execution(
     latest = await repo.get_job(job_id)
     checkpoints = latest.get("candidate_pipeline_checkpoints")
     preserve = isinstance(checkpoints, list) and bool(checkpoints)
+    await repo.update_job_fields(job_id, {
+        "status": "paused",
+        "pause_reason": reason,
+        "current_chapter_id": chapter_id if preserve else None,
+        "active_slot": None,
+    })
+
+
+async def _pause_required_state_execution(
+    repo,
+    job_id: str,
+    *,
+    chapter_id: str,
+    reason: str,
+) -> None:
+    latest = await repo.get_job(job_id)
+    preserve = isinstance(
+        latest.get("required_state_candidate_journal"),
+        Mapping,
+    )
     await repo.update_job_fields(job_id, {
         "status": "paused",
         "pause_reason": reason,
@@ -678,8 +742,10 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             job = await repo.get_job(job_id)
 
             try:
-                candidate_authorized = readiness_uses_candidate_pipeline(
-                    job.get("readiness")
+                required_book_successor = (
+                    readiness_uses_required_book_successor(
+                        job.get("readiness")
+                    )
                 )
             except ValueError as exc:
                 await repo.update_job_fields(job_id, {
@@ -687,7 +753,65 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     "pause_reason": None,
                     "active_slot": None,
                     "error": {
-                        "step": "candidate_pipeline_recovery",
+                        "step": "required_book_successor_authorization",
+                        "message": str(exc),
+                    },
+                })
+                return
+            if required_book_successor:
+                if deps.run_required_book_successor is None:
+                    await repo.update_job_fields(job_id, {
+                        "status": "failed",
+                        "pause_reason": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": "required_book_successor",
+                            "message": (
+                                "Required book successor runner is unavailable"
+                            ),
+                        },
+                    })
+                    return
+                await deps.run_required_book_successor()
+                return
+
+            try:
+                required_finalization_authorized = (
+                    readiness_uses_required_chapter_finalization(
+                        job.get("readiness")
+                    )
+                )
+                required_state_authorized = (
+                    False
+                    if required_finalization_authorized
+                    else readiness_uses_required_chapter_state(
+                        job.get("readiness")
+                    )
+                )
+                required_review_authorized = (
+                    False
+                    if required_finalization_authorized
+                    or required_state_authorized
+                    else readiness_uses_required_chapter_review(
+                        job.get("readiness")
+                    )
+                )
+                candidate_authorized = (
+                    False
+                    if required_finalization_authorized
+                    or required_review_authorized
+                    or required_state_authorized
+                    else readiness_uses_candidate_pipeline(
+                        job.get("readiness")
+                    )
+                )
+            except ValueError as exc:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "chapter_execution_authorization",
                         "message": str(exc),
                     },
                 })
@@ -709,6 +833,65 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 })
                 return
             candidate_recovery = bool(raw_candidate_checkpoints)
+            required_journal_names = (
+                "required_initial_prose_journal",
+                "required_prose_rewrite_journal",
+                "required_adherence_journal",
+                "required_reviewed_candidate",
+            )
+            invalid_required_journal = next(
+                (
+                    name
+                    for name in required_journal_names
+                    if job.get(name) is not None
+                    and not isinstance(job.get(name), Mapping)
+                ),
+                None,
+            )
+            if invalid_required_journal is not None:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_review_recovery",
+                        "message": (
+                            "Required chapter review journal is invalid"
+                        ),
+                    },
+                })
+                return
+            required_review_recovery = any(
+                job.get(name) is not None
+                for name in required_journal_names
+            )
+            required_state_names = (
+                "required_state_candidate_journal",
+                "required_state_candidate",
+            )
+            invalid_required_state = next(
+                (
+                    name
+                    for name in required_state_names
+                    if job.get(name) is not None
+                    and not isinstance(job.get(name), Mapping)
+                ),
+                None,
+            )
+            if invalid_required_state is not None:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_state_recovery",
+                        "message": "Required chapter state journal is invalid",
+                    },
+                })
+                return
+            required_state_recovery = any(
+                job.get(name) is not None for name in required_state_names
+            )
             raw_job_mutation_recovery = job.get("job_mutation_recovery")
             if raw_job_mutation_recovery is not None and not isinstance(
                 raw_job_mutation_recovery,
@@ -725,7 +908,13 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 })
                 return
             job_mutation_recovery = raw_job_mutation_recovery is not None
-            if candidate_recovery and job_mutation_recovery:
+            recovery_modes = sum((
+                bool(candidate_recovery),
+                bool(required_review_recovery),
+                bool(required_state_recovery),
+                bool(job_mutation_recovery),
+            ))
+            if recovery_modes > 1:
                 await repo.update_job_fields(job_id, {
                     "status": "failed",
                     "pause_reason": None,
@@ -749,14 +938,44 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     },
                 })
                 return
-            if job_mutation_recovery and not candidate_authorized:
+            if required_review_recovery and not required_review_authorized:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_review_recovery",
+                        "message": (
+                            "Required review journals have no bound authorization"
+                        ),
+                    },
+                })
+                return
+            if required_state_recovery and not required_state_authorized:
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_state_recovery",
+                        "message": (
+                            "Required state journal has no bound authorization"
+                        ),
+                    },
+                })
+                return
+            if (
+                job_mutation_recovery
+                and not candidate_authorized
+                and not required_finalization_authorized
+            ):
                 await repo.update_job_fields(job_id, {
                     "status": "failed",
                     "pause_reason": None,
                     "active_slot": None,
                     "error": {
                         "step": "job_mutation_recovery",
-                        "message": "Job mutation has no bound candidate authorization",
+                        "message": "Job mutation has no bound formal authorization",
                     },
                 })
                 return
@@ -766,6 +985,8 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             )
             if (
                 not candidate_recovery
+                and not required_review_recovery
+                and not required_state_recovery
                 and job_planner.over_budget(
                     committed_or_reserved,
                     job.get("token_budget"),
@@ -787,7 +1008,12 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             chapters = await deps.list_worklist_chapters()
-            if candidate_recovery or job_mutation_recovery:
+            if (
+                candidate_recovery
+                or required_review_recovery
+                or required_state_recovery
+                or job_mutation_recovery
+            ):
                 current_chapter_id = str(
                     job.get("current_chapter_id") or ""
                 )
@@ -806,15 +1032,56 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                         "pause_reason": None,
                         "active_slot": None,
                         "error": {
-                            "step": "candidate_pipeline_recovery",
+                            "step": (
+                                "required_chapter_state_recovery"
+                                if required_state_recovery
+                                else "required_chapter_review_recovery"
+                                if required_review_recovery
+                                else "candidate_pipeline_recovery"
+                            ),
                             "message": (
-                                "Candidate checkpoint chapter is unavailable"
+                                "Bound recovery chapter is unavailable"
                             ),
                         },
                     })
                     return
             else:
-                chapter = job_planner.first_needing_work(chapters)
+                if (
+                    required_finalization_authorized
+                    or required_review_authorized
+                    or required_state_authorized
+                ):
+                    readiness = job.get("readiness")
+                    work = (
+                        readiness.get("work")
+                        if isinstance(readiness, Mapping)
+                        else None
+                    )
+                    raw_work = (
+                        work.get("chapters")
+                        if isinstance(work, Mapping)
+                        else None
+                    )
+                    ordered_ids = [
+                        str(item.get("chapter_id") or "")
+                        for item in (raw_work or [])
+                        if isinstance(item, Mapping)
+                        and item.get("has_content") is False
+                    ]
+                    live_by_id = {
+                        str(item.get("_id") or ""): item
+                        for item in chapters
+                    }
+                    chapter = next(
+                        (
+                            live_by_id[chapter_id]
+                            for chapter_id in ordered_ids
+                            if chapter_id in live_by_id
+                        ),
+                        None,
+                    )
+                else:
+                    chapter = job_planner.first_needing_work(chapters)
             if chapter is not None:
                 await repo.update_job_fields(
                     job_id,
@@ -826,7 +1093,10 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
             )
             if (
                 not candidate_recovery
+                and not required_review_recovery
+                and not required_state_recovery
                 and not job_mutation_recovery
+                and not required_finalization_authorized
                 and chapter is not None
                 and reference_card_blocker_check is not None
             ):
@@ -925,6 +1195,45 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     })
                     return
             if chapter is None:
+                if required_finalization_authorized:
+                    await repo.update_job_fields(job_id, {
+                        "status": "failed",
+                        "pause_reason": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": "required_chapter_finalization_recovery",
+                            "message": (
+                                "Required finalization worklist changed before execution"
+                            ),
+                        },
+                    })
+                    return
+                if required_state_authorized:
+                    await repo.update_job_fields(job_id, {
+                        "status": "failed",
+                        "pause_reason": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": "required_chapter_state_recovery",
+                            "message": (
+                                "Required state worklist changed before execution"
+                            ),
+                        },
+                    })
+                    return
+                if required_review_authorized:
+                    await repo.update_job_fields(job_id, {
+                        "status": "failed",
+                        "pause_reason": None,
+                        "active_slot": None,
+                        "error": {
+                            "step": "required_chapter_review_recovery",
+                            "message": (
+                                "Required review worklist changed before execution"
+                            ),
+                        },
+                    })
+                    return
                 if job.get("scope") == "book":
                     await finalize_book_job(
                         repo,
@@ -941,10 +1250,48 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             try:
-                candidate_execution = readiness_chapter_uses_candidate_pipeline(
-                    job.get("readiness"),
-                    chapter_id=str(chapter.get("_id") or ""),
+                required_finalization_execution = (
+                    readiness_chapter_uses_required_chapter_finalization(
+                        job.get("readiness"),
+                        chapter_id=str(chapter.get("_id") or ""),
+                    )
+                    if required_finalization_authorized
+                    else False
                 )
+                required_state_execution = (
+                    readiness_chapter_uses_required_chapter_state(
+                        job.get("readiness"),
+                        chapter_id=str(chapter.get("_id") or ""),
+                    )
+                    if required_state_authorized
+                    else False
+                )
+                required_review_execution = (
+                    readiness_chapter_uses_required_chapter_review(
+                        job.get("readiness"),
+                        chapter_id=str(chapter.get("_id") or ""),
+                    )
+                    if required_review_authorized
+                    else False
+                )
+                candidate_execution = (
+                    False
+                    if required_finalization_execution
+                    or required_review_execution
+                    or required_state_execution
+                    else readiness_chapter_uses_candidate_pipeline(
+                        job.get("readiness"),
+                        chapter_id=str(chapter.get("_id") or ""),
+                    )
+                )
+                if required_review_recovery and not required_review_execution:
+                    raise ValueError(
+                        "Required review journals do not match the frozen chapter"
+                    )
+                if required_state_recovery and not required_state_execution:
+                    raise ValueError(
+                        "Required state journal does not match the frozen chapter"
+                    )
                 if candidate_recovery and not candidate_execution:
                     raise ValueError(
                         "Candidate checkpoints do not match the frozen chapter mode"
@@ -959,8 +1306,60 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     "pause_reason": None,
                     "active_slot": None,
                     "error": {
-                        "step": "candidate_pipeline_recovery",
+                        "step": (
+                            "required_chapter_finalization_recovery"
+                            if required_finalization_authorized
+                            else "required_chapter_state_recovery"
+                            if required_state_authorized
+                            else "required_chapter_review_recovery"
+                            if required_review_authorized
+                            else "candidate_pipeline_recovery"
+                        ),
                         "message": str(exc),
+                    },
+                })
+                return
+            if (
+                required_finalization_execution
+                and deps.run_required_finalization_chapter is None
+            ):
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_finalization_recovery",
+                        "message": (
+                            "Required chapter finalization runner is unavailable"
+                        ),
+                    },
+                })
+                return
+            if (
+                required_state_execution
+                and deps.run_required_state_chapter is None
+            ):
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_state_recovery",
+                        "message": "Required chapter state runner is unavailable",
+                    },
+                })
+                return
+            if (
+                required_review_execution
+                and deps.run_required_review_chapter is None
+            ):
+                await repo.update_job_fields(job_id, {
+                    "status": "failed",
+                    "pause_reason": None,
+                    "active_slot": None,
+                    "error": {
+                        "step": "required_chapter_review_recovery",
+                        "message": "Required chapter review runner is unavailable",
                     },
                 })
                 return
@@ -977,6 +1376,64 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             try:
+                if required_finalization_execution:
+                    assert deps.run_required_finalization_chapter is not None
+                    finalization_outcome = (
+                        await deps.run_required_finalization_chapter(
+                            str(job["novel_id"]),
+                            chapter,
+                        )
+                    )
+                    await repo.complete_required_chapter_finalization(
+                        job_id,
+                        finalization_outcome,
+                    )
+                    return
+                if required_state_execution:
+                    assert deps.run_required_state_chapter is not None
+                    state_outcome = await deps.run_required_state_chapter(
+                        str(job["novel_id"]),
+                        chapter,
+                    )
+                    if state_outcome.phase == "ready":
+                        assert state_outcome.state_candidate is not None
+                        await repo.publish_required_state_candidate(
+                            job_id,
+                            state_outcome.state_candidate,
+                        )
+                    else:
+                        assert state_outcome.reason_code is not None
+                        await repo.pause_required_chapter_state(
+                            job_id,
+                            chapter_id=str(chapter["_id"]),
+                            reason_code=state_outcome.reason_code,
+                            reextraction_count=(
+                                state_outcome.reextraction_count
+                            ),
+                        )
+                    return
+                if required_review_execution:
+                    assert deps.run_required_review_chapter is not None
+                    required_outcome = await deps.run_required_review_chapter(
+                        str(job["novel_id"]),
+                        chapter,
+                    )
+                    if required_outcome.phase == "reviewed":
+                        assert required_outcome.reviewed_candidate is not None
+                        await repo.publish_required_reviewed_candidate(
+                            job_id,
+                            required_outcome.reviewed_candidate,
+                        )
+                    else:
+                        assert required_outcome.reason_code is not None
+                        await repo.pause_required_chapter_review(
+                            job_id,
+                            chapter_id=str(chapter["_id"]),
+                            phase=required_outcome.phase,
+                            reason_code=required_outcome.reason_code,
+                            repair_count=required_outcome.repair_count,
+                        )
+                    return
                 if candidate_execution:
                     assert deps.run_candidate_chapter is not None
                     candidate_outcome = await deps.run_candidate_chapter(
@@ -1009,7 +1466,23 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     occurred_at=get_utc_now(),
                 )
                 await _persist_diagnostic(repo, job_id, diagnostic)
-                if candidate_execution:
+                if required_state_execution:
+                    await _pause_required_state_execution(
+                        repo,
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        reason="cost_cap",
+                    )
+                elif required_review_execution:
+                    latest = await repo.get_job(job_id)
+                    await repo.pause_required_chapter_review(
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        phase="blocked",
+                        reason_code="cost_cap",
+                        repair_count=required_review_repair_count(latest),
+                    )
+                elif candidate_execution:
                     await _pause_candidate_execution(
                         repo,
                         job_id,
@@ -1028,7 +1501,23 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     occurred_at=get_utc_now(),
                 )
                 await _persist_diagnostic(repo, job_id, diagnostic)
-                if candidate_execution:
+                if required_state_execution:
+                    await _pause_required_state_execution(
+                        repo,
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        reason="attempt_capacity",
+                    )
+                elif required_review_execution:
+                    latest = await repo.get_job(job_id)
+                    await repo.pause_required_chapter_review(
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        phase="blocked",
+                        reason_code="attempt_capacity",
+                        repair_count=required_review_repair_count(latest),
+                    )
+                elif candidate_execution:
                     await _pause_candidate_execution(
                         repo,
                         job_id,
@@ -1039,6 +1528,26 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                     await _pause(repo, job_id, "attempt_capacity")
                 return
             except ChapterPipelineFailed as exc:
+                if required_state_execution:
+                    await _handle_chapter_failure(repo, job_id, chapter, exc)
+                    return
+                if required_review_execution:
+                    diagnostic = build_failure_diagnostic(
+                        exc,
+                        step="required_chapter_review",
+                        chapter_id=str(chapter["_id"]),
+                        occurred_at=get_utc_now(),
+                    )
+                    await _persist_diagnostic(repo, job_id, diagnostic)
+                    latest = await repo.get_job(job_id)
+                    await repo.pause_required_chapter_review(
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        phase="blocked",
+                        reason_code="required_review_execution_failed",
+                        repair_count=required_review_repair_count(latest),
+                    )
+                    return
                 if candidate_execution:
                     await _handle_candidate_chapter_failure(
                         repo,
@@ -1097,7 +1606,45 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                 return
 
             except Exception as exc:  # noqa: BLE001 — fail-fast，人工 resume 即重试
-                if candidate_execution:
+                if required_state_execution:
+                    diagnostic = build_failure_diagnostic(
+                        exc,
+                        step="required_chapter_state",
+                        chapter_id=str(chapter["_id"]),
+                        occurred_at=get_utc_now(),
+                    )
+                    await _persist_diagnostic(repo, job_id, diagnostic)
+                    await repo.update_job_fields(job_id, {
+                        "status": "paused",
+                        "pause_reason": "required_state_execution_failed",
+                        "current_chapter_id": str(chapter["_id"]),
+                        "active_slot": None,
+                        "error": {
+                            "step": "required_chapter_state",
+                            "chapter_id": str(chapter["_id"]),
+                            "message": str(exc),
+                            "reason_codes": [
+                                "required_state_execution_failed"
+                            ],
+                        },
+                    })
+                elif required_review_execution:
+                    diagnostic = build_failure_diagnostic(
+                        exc,
+                        step="required_chapter_review",
+                        chapter_id=str(chapter["_id"]),
+                        occurred_at=get_utc_now(),
+                    )
+                    await _persist_diagnostic(repo, job_id, diagnostic)
+                    latest = await repo.get_job(job_id)
+                    await repo.pause_required_chapter_review(
+                        job_id,
+                        chapter_id=str(chapter["_id"]),
+                        phase="blocked",
+                        reason_code="required_review_execution_failed",
+                        repair_count=required_review_repair_count(latest),
+                    )
+                elif candidate_execution:
                     await _handle_candidate_chapter_failure(
                         repo,
                         job_id,

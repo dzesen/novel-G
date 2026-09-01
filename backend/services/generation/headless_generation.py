@@ -66,6 +66,9 @@ from backend.services.generation.chapter_pipeline import ChapterPipelineDeps
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
 )
+from backend.services.generation.required_chapter_state_contracts import (
+    RequiredStateGenerationBinding,
+)
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
 )
@@ -910,6 +913,7 @@ async def generate_state_candidate(
     generation_plan: GenerationPlan | None = None,
     repair_guidance: StateRepairGuidance | None = None,
     request_id: str | None = None,
+    required_state_generation_binding: RequiredStateGenerationBinding | None = None,
 ) -> ChapterGenerationResult:
     """Extract a persisted state proposal without accepting chapter state."""
     execution = await _chapter_capability_registry().execute(
@@ -925,6 +929,9 @@ async def generate_state_candidate(
             generation_plan=generation_plan,
             repair_guidance=repair_guidance,
             request_id=request_id,
+            required_state_generation_binding=(
+                required_state_generation_binding
+            ),
         ),
         call=CapabilityCall(source="job_engine"),
     )

@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import Context
 import hashlib
 import logging
 import re
 import secrets
 import time
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal, Mapping, Optional, TypedDict
 
 from pymongo.errors import DuplicateKeyError
@@ -19,7 +20,10 @@ from backend.db.repositories.generation_job_repository import (
     TokenBudgetExceeded,
     generation_job_repo,
 )
-from backend.db.narrative_revision import narrative_revision_store
+from backend.db.narrative_revision import (
+    NarrativeRevisionConflict,
+    narrative_revision_store,
+)
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.generation import job_planner
@@ -35,6 +39,45 @@ from backend.services.generation.chapter_candidate_authorization import (
     plan_candidate_job_generation,
     readiness_uses_candidate_pipeline,
     validate_candidate_job_execution_authorization,
+)
+from backend.services.generation.required_chapter_review import (
+    RequiredChapterReviewPlan,
+)
+from backend.services.generation.required_chapter_review_job import (
+    REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON,
+    RequiredChapterReviewJobRunner,
+    prepare_required_chapter_review_readiness,
+    readiness_uses_required_chapter_review,
+    validate_required_chapter_review_readiness,
+)
+from backend.services.generation.required_chapter_state_job import (
+    REQUIRED_STATE_CANDIDATE_PAUSE_REASON,
+    RequiredChapterStateJobRunner,
+    prepare_required_chapter_state_readiness,
+    readiness_uses_required_chapter_state,
+    validate_required_chapter_state_readiness,
+)
+from backend.services.generation.required_chapter_finalization_job import (
+    REQUIRED_CHAPTER_FINALIZATION_JOB_TOKEN_BUDGET,
+    RequiredChapterFinalizationJobRunner,
+    prepare_required_chapter_finalization_readiness,
+    readiness_uses_required_chapter_finalization,
+    validate_required_chapter_finalization_readiness,
+)
+from backend.services.generation.required_book_successor import (
+    REQUIRED_BOOK_SUCCESSOR_ACKNOWLEDGEMENT,
+    REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_BEFORE_FIRST_CHILD,
+    REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_NONE,
+    RequiredBookSuccessorCoordinator,
+    parse_required_book_successor_journal,
+    parse_required_book_successor_recovery_checkpoint,
+    prepare_required_book_successor_readiness,
+    readiness_uses_required_book_successor,
+    validate_required_book_successor_readiness,
+)
+from backend.services.generation.required_book_successor_job import (
+    RequiredBookSuccessorJobDeps,
+    RequiredBookSuccessorJobRunner,
 )
 from backend.services.generation.chapter_candidate_job import (
     CandidateJobExecution,
@@ -92,6 +135,7 @@ from backend.services.generation.headless_generation import (
     generate_state_candidate,
     review_prose_candidate,
 )
+from backend.services.llm.generation_runtime import GenerationPlan
 from backend.services.generation.failure_diagnostics import (
     build_failure_diagnostic,
     summarize_jobs,
@@ -108,7 +152,10 @@ from backend.services.generation.outline_adherence import (
     validate_outline_deviation_policy,
 )
 from backend.services.novel.chapter_service import ChapterService
-from backend.services.novel.book_completion import book_completion_audit
+from backend.services.novel.book_completion import (
+    BookCompletionReport,
+    book_completion_audit,
+)
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.generation.book_worklist import get_book_worklist
@@ -287,8 +334,113 @@ def _validate_resumable_job_authorization(
             or contract.readiness_digest != digest
         ):
             raise ValueError("batch authorization contract changed")
-        if not readiness_uses_candidate_pipeline(readiness):
+        book_successor_readiness = readiness_uses_required_book_successor(
+            readiness
+        )
+        finalization_successor_readiness = (
+            False
+            if book_successor_readiness
+            else readiness_uses_required_chapter_finalization(readiness)
+        )
+        state_successor_readiness = (
+            False
+            if book_successor_readiness
+            or finalization_successor_readiness
+            else readiness_uses_required_chapter_state(readiness)
+        )
+        successor_readiness = (
+            False
+            if book_successor_readiness
+            or finalization_successor_readiness
+            or state_successor_readiness
+            else readiness_uses_required_chapter_review(readiness)
+        )
+        candidate_readiness = (
+            False
+            if book_successor_readiness
+            or finalization_successor_readiness
+            or successor_readiness
+            or state_successor_readiness
+            else readiness_uses_candidate_pipeline(readiness)
+        )
+        if not (
+            book_successor_readiness
+            or
+            candidate_readiness
+            or finalization_successor_readiness
+            or successor_readiness
+            or state_successor_readiness
+        ):
             raise ValueError("legacy execution protocol")
+        if book_successor_readiness:
+            book_successor = validate_required_book_successor_readiness(
+                readiness
+            )
+            raw_book_journal = job.get("required_book_successor_journal")
+            expected_root_revision = (
+                book_successor.base_narrative_revision
+            )
+            if raw_book_journal is not None:
+                book_journal = parse_required_book_successor_journal(
+                    raw_book_journal
+                )
+                coordinator = RequiredBookSuccessorCoordinator(
+                    coordinator_job_id=str(job.get("_id") or ""),
+                    readiness=readiness,
+                )
+                coordinator.next_action(book_journal)
+                expected_root_revision = (
+                    book_journal.expected_narrative_revision
+                )
+            if (
+                job.get("authorization_revision")
+                != book_successor.authorization_revision
+                or job.get("expected_narrative_revision")
+                != expected_root_revision
+                or str(job.get("owner_id") or "")
+                != book_successor.owner_id
+            ):
+                raise ValueError("required book successor Job authority changed")
+        if finalization_successor_readiness:
+            finalization_successor = (
+                validate_required_chapter_finalization_readiness(readiness)
+            )
+            if (
+                job.get("authorization_revision")
+                != finalization_successor.authorization_revision
+                or job.get("expected_narrative_revision")
+                != finalization_successor.narrative_revision
+                or str(job.get("owner_id") or "")
+                != finalization_successor.owner_id
+            ):
+                raise ValueError(
+                    "required finalization Job authority changed"
+                )
+        if state_successor_readiness:
+            state_successor = validate_required_chapter_state_readiness(
+                readiness
+            )
+            if (
+                job.get("authorization_revision")
+                != state_successor.authorization_revision
+                or job.get("expected_narrative_revision")
+                != state_successor.narrative_revision
+                or str(job.get("owner_id") or "")
+                != state_successor.owner_id
+            ):
+                raise ValueError("required state Job authority changed")
+        if successor_readiness:
+            successor = validate_required_chapter_review_readiness(
+                readiness
+            )
+            if (
+                job.get("authorization_revision")
+                != successor.authorization_revision
+                or job.get("expected_narrative_revision")
+                != successor.narrative_revision
+                or str(job.get("owner_id") or "") != successor.owner_id
+            ):
+                raise ValueError("required review Job authority changed")
         expected_volume_id = (
             str(job.get("volume_id"))
             if job.get("volume_id") is not None
@@ -311,6 +463,15 @@ def _validate_resumable_job_authorization(
     except ValueError as exc:
         raise ValueError(_SUCCESSOR_REQUIRED_MESSAGE) from exc
     return params
+
+
+def _reject_external_required_book_child_control(
+    job: Mapping[str, Any],
+) -> None:
+    if job.get("required_book_successor_parent_job_id") is not None:
+        raise ValueError(
+            "整本 successor 的内部子作业只能由其根作业恢复或控制"
+        )
 
 
 async def _recover_job_mutation_revision(
@@ -663,9 +824,60 @@ def _new_job_doc(
         generation_params
     )
     planning = readiness.get("planning")
+    book_successor_readiness = readiness_uses_required_book_successor(readiness)
+    finalization_successor_readiness = (
+        False
+        if book_successor_readiness
+        else readiness_uses_required_chapter_finalization(readiness)
+    )
+    state_successor_readiness = (
+        False
+        if book_successor_readiness
+        or finalization_successor_readiness
+        else readiness_uses_required_chapter_state(readiness)
+    )
+    review_successor_readiness = (
+        False
+        if book_successor_readiness
+        or finalization_successor_readiness
+        or state_successor_readiness
+        else readiness_uses_required_chapter_review(readiness)
+    )
+    finalization_successor_authorization = (
+        validate_required_chapter_finalization_readiness(readiness)
+        if finalization_successor_readiness
+        else None
+    )
+    book_successor_authorization = (
+        validate_required_book_successor_readiness(readiness)
+        if book_successor_readiness
+        else None
+    )
+    review_successor_authorization = (
+        validate_required_chapter_review_readiness(readiness)
+        if review_successor_readiness
+        else None
+    )
+    state_successor_authorization = (
+        validate_required_chapter_state_readiness(readiness)
+        if state_successor_readiness
+        else None
+    )
+    successor_authorization = (
+        book_successor_authorization
+        or finalization_successor_authorization
+        or state_successor_authorization
+        or review_successor_authorization
+    )
     candidate_readiness = (
-        isinstance(planning, Mapping)
-        and "chapter_candidate_pipeline_revision" in planning
+        book_successor_readiness
+        or finalization_successor_readiness
+        or state_successor_readiness
+        or review_successor_readiness
+        or (
+            isinstance(planning, Mapping)
+            and "chapter_candidate_pipeline_revision" in planning
+        )
     )
     resources = readiness.get("resources")
     expected_revision = (
@@ -678,6 +890,12 @@ def _new_job_doc(
         and (type(expected_revision) is not int or expected_revision < 0)
     ):
         raise ValueError("Job readiness narrative revision is invalid")
+    if successor_authorization is not None and (
+        token_budget != successor_authorization.token_budget
+        or int(attempt_capacity)
+        != successor_authorization.maximum_provider_attempts_total
+    ):
+        raise ValueError("Required successor Job budget diverged from readiness")
     readiness_digest = readiness.get("digest")
     if readiness_digest != confirmed_readiness_digest:
         raise ValueError("Job readiness digest diverged from explicit confirmation")
@@ -709,6 +927,17 @@ def _new_job_doc(
         "candidate_manual_takeover": None,
         "candidate_manual_takeover_events": [],
         "candidate_pipeline_checkpoints": [],
+        "required_initial_prose_journal": None,
+        "required_prose_rewrite_journal": None,
+        "required_adherence_journal": None,
+        "required_reviewed_candidate": None,
+        "required_state_candidate_journal": None,
+        "required_state_candidate": None,
+        "required_chapter_finalization_result": None,
+        "required_book_successor_journal": None,
+        "required_book_successor_recovery_checkpoint": None,
+        "required_book_successor_action": None,
+        "required_book_successor_parent_job_id": None,
         "chapter_completion_decisions": [],
         "reference_card_auto_creation_events": [],
         "reference_card_repair_events": [],
@@ -734,14 +963,130 @@ def _new_job_doc(
                 "prose_continuation_authorization"
             ) or {})
         ),
-        "authorization_revision": int(((readiness.get("planning") or {}).get(
-            "prose_continuation_authorization"
-        ) or {}).get("authorization_revision") or 0),
+        "authorization_revision": (
+            successor_authorization.authorization_revision
+            if successor_authorization is not None
+            else int(((readiness.get("planning") or {}).get(
+                "prose_continuation_authorization"
+            ) or {}).get("authorization_revision") or 0)
+        ),
         "readiness": readiness,
     }
+    if successor_authorization is not None:
+        document["owner_id"] = to_object_id(successor_authorization.owner_id)
     if type(expected_revision) is int and expected_revision >= 0:
         document["expected_narrative_revision"] = expected_revision
     return document
+
+
+def _stable_required_book_successor_replay_state(
+    job: Mapping[str, Any],
+    *,
+    expected_job: Mapping[str, Any],
+) -> Literal["checkpoint_reached", "startable"]:
+    """Validate one deterministic acceptance root after confirmation loss.
+
+    A persisted checkpoint is the durable completion receipt for ``start``.
+    Without it, the root may be restarted only while no child or paid evidence
+    exists.  This keeps an idempotent host retry from creating or advancing a
+    second root execution.
+    """
+
+    stable_job_id = str(expected_job.get("_id") or "")
+    if re.fullmatch(r"[0-9a-f]{24}", stable_job_id) is None:
+        raise ValueError("required book successor stable Job id is invalid")
+    try:
+        _validate_resumable_job_authorization(job)
+        authority = validate_required_book_successor_readiness(
+            job.get("readiness") or {}
+        )
+        expected_authority = validate_required_book_successor_readiness(
+            expected_job.get("readiness") or {}
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "required book successor stable Job authority changed"
+        ) from exc
+    immutable_fields = (
+        "scope",
+        "volume_id",
+        "token_budget",
+        "usage_attempt_capacity",
+        "generation_params",
+        "batch_authorization_contract",
+        "authorization_revision",
+        "outline_deviation_policy",
+        "required_book_successor_parent_job_id",
+    )
+    if (
+        str(job.get("_id") or "") != stable_job_id
+        or str(job.get("novel_id") or "")
+        != str(expected_job.get("novel_id") or "")
+        or str(job.get("owner_id") or "")
+        != str(expected_job.get("owner_id") or "")
+        or job.get("is_deleted") is not False
+        or any(job.get(field) != expected_job.get(field) for field in immutable_fields)
+        or authority != expected_authority
+        or (job.get("readiness") or {}).get("digest")
+        != (expected_job.get("readiness") or {}).get("digest")
+        or list((job.get("readiness") or {}).get(
+            "acknowledged_warning_codes"
+        ) or [])
+        != list((expected_job.get("readiness") or {}).get(
+            "acknowledged_warning_codes"
+        ) or [])
+    ):
+        raise ValueError(
+            "required book successor stable Job authority changed"
+        )
+    coordinator = RequiredBookSuccessorCoordinator(
+        coordinator_job_id=stable_job_id,
+        readiness=job["readiness"],
+    )
+    initial = coordinator.initial_journal()
+    raw_checkpoint = job.get(
+        "required_book_successor_recovery_checkpoint"
+    )
+    if raw_checkpoint is not None:
+        checkpoint = parse_required_book_successor_recovery_checkpoint(
+            raw_checkpoint
+        )
+        if (
+            checkpoint.coordinator_job_id != stable_job_id
+            or checkpoint.coordinator_readiness_digest
+            != initial.coordinator_readiness_digest
+            or checkpoint.journal_digest != initial.journal_digest
+        ):
+            raise ValueError(
+                "required book successor stable checkpoint changed"
+            )
+        return "checkpoint_reached"
+
+    raw_journal = job.get("required_book_successor_journal")
+    if raw_journal is not None:
+        journal = parse_required_book_successor_journal(raw_journal)
+        if journal != initial:
+            raise ValueError(
+                "required book successor advanced without its checkpoint"
+            )
+    execution_epoch = job.get("execution_epoch")
+    if (
+        str(job.get("status") or "")
+        not in {"running", "interrupted", "failed"}
+        or type(execution_epoch) is not int
+        or execution_epoch < 0
+        or job.get("current_chapter_id") is not None
+        or job.get("required_book_successor_action") is not None
+        or list(job.get("progress") or [])
+        or list(job.get("attempt_slots") or [])
+        or int(job.get("usage_attempt_claimed") or 0) != 0
+        or int(job.get("tokens_used") or 0) != 0
+        or job.get("has_uncertain_attempts") is not False
+    ):
+        raise ValueError(
+            "required book successor advanced without its checkpoint"
+        )
+    return "startable"
 
 
 class GenerationJobService:
@@ -1623,6 +1968,63 @@ class GenerationJobService:
         )
 
     @staticmethod
+    async def _run_required_book_successor_child(
+        parent_job_id: str,
+        child_job_id: str,
+    ) -> Dict[str, Any]:
+        """Run one internally-authorized child in a fresh lease context."""
+
+        async def run_clean() -> Dict[str, Any]:
+            child = await generation_job_repo.get_job(child_job_id)
+            if str(child.get("required_book_successor_parent_job_id") or "") != (
+                str(parent_job_id)
+            ):
+                raise ValueError("Required book successor child parent changed")
+            if child.get("has_uncertain_attempts"):
+                return child
+            status = str(child.get("status") or "")
+            if status == "interrupted":
+                previous_epoch = child.get("execution_epoch", 0)
+                if type(previous_epoch) is not int or previous_epoch < 0:
+                    raise ValueError(
+                        "Required book successor child epoch is invalid"
+                    )
+                await generation_job_repo.transition_job_resume(
+                    child_job_id,
+                    {
+                        "status": "running",
+                        "pause_reason": None,
+                        "error": None,
+                        "active_slot": (
+                            f"required_book_successor_child:{parent_job_id}"
+                        ),
+                        "has_uncertain_attempts": False,
+                        "confirm_uncertain_prose_retry": False,
+                    },
+                    previous_status=status,
+                    previous_execution_epoch=previous_epoch,
+                )
+                child = await generation_job_repo.get_job(child_job_id)
+                status = str(child.get("status") or "")
+            if status != "running":
+                return child
+            control = JobControl()
+            spawned = await GenerationJobService._spawn(
+                child_job_id,
+                control,
+            )
+            if not spawned:
+                return await generation_job_repo.get_job(child_job_id)
+            entry = _REGISTRY.get(child_job_id)
+            if entry is None:
+                return await generation_job_repo.get_job(child_job_id)
+            await entry[0]
+            return await generation_job_repo.get_job(child_job_id)
+
+        task = asyncio.create_task(run_clean(), context=Context())
+        return await task
+
+    @staticmethod
     async def _spawn(job_id: str, control: JobControl) -> bool:
         """Acquire the durable execution lease before scheduling JobEngine."""
 
@@ -1673,6 +2075,26 @@ class GenerationJobService:
                     str(job["volume_id"]), include_content=True
                 )
                 chapters = await state_completion_module.attach_many(chapters)
+            if readiness_uses_required_chapter_finalization(
+                job.get("readiness")
+            ):
+                authority = validate_required_chapter_finalization_readiness(
+                    job["readiness"]
+                )
+                chapters = [
+                    chapter
+                    for chapter in chapters
+                    if str(chapter.get("_id") or "") == authority.chapter_id
+                ]
+            elif readiness_uses_required_chapter_state(job.get("readiness")):
+                authority = validate_required_chapter_state_readiness(
+                    job["readiness"]
+                )
+                chapters = [
+                    chapter
+                    for chapter in chapters
+                    if str(chapter.get("_id") or "") == authority.chapter_id
+                ]
             logger.info(
                 "[job %s] worklist chapters=%d content_chars=%d elapsed_ms=%d",
                 job_id,
@@ -1859,6 +2281,57 @@ class GenerationJobService:
                 return await attach_state_receipt(outcome)
             finally:
                 await generation_job_repo.finish_attempt_reservation(job_id, chapter_id)
+
+        async def _run_required_review_chapter(
+            novel_id: str,
+            chapter: Dict[str, Any],
+        ):
+            current_job = await generation_job_repo.get_job(job_id)
+            _validate_resumable_job_authorization(current_job)
+            if not readiness_uses_required_chapter_review(
+                current_job.get("readiness")
+            ):
+                raise ValueError(
+                    "Required chapter review Job authorization is unavailable"
+                )
+            return await RequiredChapterReviewJobRunner(
+                job_id,
+                repository=generation_job_repo,
+            ).run(novel_id, chapter)
+
+        async def _run_required_state_chapter(
+            novel_id: str,
+            chapter: Dict[str, Any],
+        ):
+            current_job = await generation_job_repo.get_job(job_id)
+            _validate_resumable_job_authorization(current_job)
+            if not readiness_uses_required_chapter_state(
+                current_job.get("readiness")
+            ):
+                raise ValueError(
+                    "Required chapter state Job authorization is unavailable"
+                )
+            return await RequiredChapterStateJobRunner(
+                job_id,
+                repository=generation_job_repo,
+            ).run(novel_id, chapter)
+
+        async def _run_required_finalization_chapter(
+            novel_id: str,
+            chapter: Dict[str, Any],
+        ):
+            current_job = await generation_job_repo.get_job(job_id)
+            _validate_resumable_job_authorization(current_job)
+            if not readiness_uses_required_chapter_finalization(
+                current_job.get("readiness")
+            ):
+                raise ValueError(
+                    "Required chapter finalization Job authorization is unavailable"
+                )
+            return await RequiredChapterFinalizationJobRunner(
+                job_id,
+                repository=generation_job_repo,
+            ).run(novel_id, chapter)
 
         async def _run_candidate_chapter(
             novel_id: str,
@@ -2158,10 +2631,206 @@ class GenerationJobService:
                 fence_token=fence_token,
             )
 
+        def _required_book_child_document(
+            readiness: Mapping[str, Any],
+        ) -> Dict[str, Any]:
+            if readiness_uses_required_chapter_finalization(readiness):
+                authority = validate_required_chapter_finalization_readiness(
+                    readiness
+                )
+            elif readiness_uses_required_chapter_state(readiness):
+                authority = validate_required_chapter_state_readiness(readiness)
+            else:
+                authority = validate_required_chapter_review_readiness(readiness)
+            return _new_job_doc(
+                str(authority.novel_id),
+                "book",
+                None,
+                None,
+                int(authority.token_budget),
+                int(authority.maximum_provider_attempts_total),
+                readiness,
+                PAUSE_FOR_REWRITE,
+                dict(job.get("generation_params") or {}),
+                str(readiness.get("digest") or ""),
+            )
+
+        async def _run_required_book_successor() -> None:
+            async def create_child(action, readiness):
+                return await (
+                    generation_job_repo.create_required_book_successor_child(
+                        job_id,
+                        action=action,
+                        document=_required_book_child_document(readiness),
+                    )
+                )
+
+            async def finalize_required_book_audit() -> bool:
+                parent = await generation_job_repo.get_job(job_id)
+                previous_epoch = parent.get("execution_epoch", 0)
+                previous_revision = parent.get("expected_narrative_revision")
+                if (
+                    type(previous_epoch) is not int
+                    or previous_epoch < 0
+                    or type(previous_revision) is not int
+                    or previous_revision < 0
+                ):
+                    raise ValueError(
+                        "Required book successor audit cursor is invalid"
+                    )
+                previous_status = str(parent.get("status") or "")
+                previous_pause_reason = (
+                    str(parent.get("pause_reason"))
+                    if parent.get("pause_reason") is not None
+                    else None
+                )
+                fence_token = secrets.token_hex(16)
+                snapshot = {
+                    "previous_status": previous_status,
+                    "previous_pause_reason": previous_pause_reason,
+                    "previous_execution_epoch": previous_epoch,
+                    "previous_expected_narrative_revision": previous_revision,
+                    "novel_id": str(parent.get("novel_id") or ""),
+                }
+                await generation_job_repo.reserve_book_completion_audit_publication(
+                    job_id,
+                    fence_token=fence_token,
+                    **snapshot,
+                )
+                try:
+                    async with _guard_book_completion_publication(
+                        previous_revision,
+                        fence_token,
+                    ) as fence:
+                        report = BookCompletionReport.model_validate(
+                            await _inspect_book_completion(fence)
+                        )
+                        await generation_job_repo.renew_book_completion_audit_publication(
+                            job_id,
+                            fence_token=fence_token,
+                            **snapshot,
+                        )
+                        if report.complete:
+                            await generation_job_repo.complete_required_book_successor(
+                                job_id,
+                                report,
+                                fence_token=fence_token,
+                                previous_status=previous_status,
+                                previous_pause_reason=previous_pause_reason,
+                                previous_execution_epoch=previous_epoch,
+                                previous_expected_narrative_revision=(
+                                    previous_revision
+                                ),
+                            )
+                            return True
+                        await generation_job_repo.publish_book_completion_audit(
+                            job_id,
+                            report.model_dump(mode="json"),
+                            fence_token=fence_token,
+                            previous_status=previous_status,
+                            previous_pause_reason=previous_pause_reason,
+                            previous_execution_epoch=previous_epoch,
+                            previous_expected_narrative_revision=(
+                                previous_revision
+                            ),
+                        )
+                        return False
+                except (
+                    CandidatePipelineCheckpointConflict,
+                    JobExecutionLeaseLost,
+                ):
+                    raise
+                except Exception as exc:  # noqa: BLE001 - stable fail-close
+                    await generation_job_repo.publish_book_completion_audit_failure(
+                        job_id,
+                        novel_id=str(parent.get("novel_id") or ""),
+                        fence_token=fence_token,
+                        message=str(exc),
+                        source_changed=isinstance(
+                            exc,
+                            NarrativeRevisionConflict,
+                        ),
+                        previous_status=previous_status,
+                        previous_pause_reason=previous_pause_reason,
+                        previous_execution_epoch=previous_epoch,
+                        previous_expected_narrative_revision=(
+                            previous_revision
+                        ),
+                    )
+                    return False
+
+            async def pause_parent() -> None:
+                await generation_job_repo.update_job_fields(job_id, {
+                    "status": "paused",
+                    "pause_reason": "manual",
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                })
+
+            async def abort_parent() -> None:
+                await generation_job_repo.update_job_fields(job_id, {
+                    "status": "aborted",
+                    "pause_reason": None,
+                    "current_chapter_id": None,
+                    "active_slot": None,
+                    "error": None,
+                })
+
+            await RequiredBookSuccessorJobRunner(
+                job_id,
+                deps=RequiredBookSuccessorJobDeps(
+                    get_parent=lambda: generation_job_repo.get_job(job_id),
+                    initialize=(
+                        lambda: generation_job_repo
+                        .initialize_required_book_successor(job_id)
+                    ),
+                    get_chapter=chapter_repo.get_chapter_by_id,
+                    read_child=(
+                        lambda child_id: generation_job_repo
+                        .read_required_book_successor_child(job_id, child_id)
+                    ),
+                    create_child=create_child,
+                    run_child=(
+                        lambda child_id: GenerationJobService
+                        ._run_required_book_successor_child(job_id, child_id)
+                    ),
+                    advance_child=(
+                        lambda child_id: generation_job_repo
+                        .advance_required_book_successor_child(job_id, child_id)
+                    ),
+                    block=(
+                        lambda reason: generation_job_repo
+                        .block_required_book_successor(job_id, reason)
+                    ),
+                    finalize_audit=finalize_required_book_audit,
+                    pause_parent=pause_parent,
+                    abort_parent=abort_parent,
+                    pause_requested=lambda: control.pause_requested,
+                    abort_requested=lambda: control.abort_requested,
+                    pause_for_recovery_checkpoint=(
+                        lambda journal_digest: generation_job_repo
+                        .pause_required_book_successor_recovery_checkpoint(
+                            job_id,
+                            journal_digest,
+                        )
+                    ),
+                ),
+            ).run()
+
         deps = JobEngineDeps(
             list_worklist_chapters=_list_worklist,
             run_chapter=_run_chapter,
             run_candidate_chapter=_run_candidate_chapter,
+            run_required_review_chapter=(
+                _run_required_review_chapter
+            ),
+            run_required_state_chapter=(
+                _run_required_state_chapter
+            ),
+            run_required_finalization_chapter=(
+                _run_required_finalization_chapter
+            ),
+            run_required_book_successor=_run_required_book_successor,
             resolve_reference_card_blockers=_resolve_reference_card_blockers,
             inspect_book_completion=_inspect_book_completion,
             guard_book_completion_publication=(
@@ -2450,6 +3119,705 @@ class GenerationJobService:
         )
 
     @staticmethod
+    async def inspect_required_chapter_finalization_readiness(
+        state_job_id: str,
+        *,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Freeze a zero-Provider formal-write successor over both candidates."""
+
+        validate_protected_generation_params(generation_params)
+        state_job = await generation_job_repo.get_job(state_job_id)
+        state_authority = validate_required_chapter_state_readiness(
+            state_job.get("readiness")
+        )
+        reviewed_job = await generation_job_repo.get_job(
+            state_authority.predecessor_candidate.job_id
+        )
+        return prepare_required_chapter_finalization_readiness(
+            state_job,
+            reviewed_job,
+            authorization_revision=authorization_revision,
+            created_at=created_at,
+            deadline_at=deadline_at,
+        )
+
+    @staticmethod
+    async def start_required_chapter_finalization_job(
+        state_job_id: str,
+        *,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        readiness_digest: str,
+        acknowledged_warning_codes: tuple[str, ...] | list[str],
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Create the formal successor only after its new digest is confirmed."""
+
+        protected = _validate_start_authorization(
+            token_budget=REQUIRED_CHAPTER_FINALIZATION_JOB_TOKEN_BUDGET,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
+        async with _get_start_lock():
+            await GenerationJobService._guard_no_running()
+            report = await (
+                GenerationJobService.inspect_required_chapter_finalization_readiness(
+                    state_job_id,
+                    authorization_revision=authorization_revision,
+                    created_at=created_at,
+                    deadline_at=deadline_at,
+                    generation_params=protected,
+                )
+            )
+            accepted = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            authority = validate_required_chapter_finalization_readiness(
+                accepted
+            )
+            try:
+                job_id = await generation_job_repo.create_job(
+                    _new_job_doc(
+                        authority.novel_id,
+                        "book",
+                        None,
+                        None,
+                        REQUIRED_CHAPTER_FINALIZATION_JOB_TOKEN_BUDGET,
+                        0,
+                        accepted,
+                        PAUSE_FOR_REWRITE,
+                        protected,
+                        readiness_digest,
+                    )
+                )
+            except DuplicateKeyError as exc:
+                raise ConflictError(
+                    "已有正在运行的批量作业，请先暂停或等待其结束"
+                ) from exc
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def resume_required_chapter_finalization_job(
+        job_id: str,
+    ) -> Dict[str, Any]:
+        """Resume only the same frozen mutation; never rebuild its evidence."""
+
+        async with _get_start_lock():
+            job = await generation_job_repo.get_job(job_id)
+            _reject_external_required_book_child_control(job)
+            _validate_resumable_job_authorization(job)
+            if not readiness_uses_required_chapter_finalization(
+                job.get("readiness")
+            ):
+                raise ValueError("当前作业不是章节正式提交 successor")
+            if job.get("required_chapter_finalization_result") is not None:
+                if job.get("status") != "completed":
+                    raise ValueError("章节正式提交结果与作业状态不一致")
+                return job
+            if job.get("has_uncertain_attempts"):
+                raise ValueError("零 Provider 正式提交作业不得出现 uncertain 请求")
+            if not job_planner.can_resume(str(job.get("status") or "")):
+                raise ValueError(f"作业当前状态 {job.get('status')} 不可恢复")
+            if job.get("job_mutation_recovery") is None:
+                raise ValueError("章节正式提交没有可恢复的冻结 mutation")
+            await GenerationJobService._guard_no_running()
+            previous_epoch = job.get("execution_epoch", 0)
+            if type(previous_epoch) is not int or previous_epoch < 0:
+                raise ValueError("Generation job execution epoch is invalid")
+            await generation_job_repo.transition_job_resume(
+                job_id,
+                {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "has_uncertain_attempts": False,
+                    "confirm_uncertain_prose_retry": False,
+                },
+                previous_status=str(job.get("status") or ""),
+                previous_execution_epoch=previous_epoch,
+            )
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def inspect_required_chapter_state_readiness(
+        predecessor_job_id: str,
+        *,
+        state_plan: GenerationPlan,
+        token_budget: int,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Freeze the separate state-only successor over one reviewed result."""
+
+        validate_protected_generation_params(generation_params)
+        predecessor = await generation_job_repo.get_job(predecessor_job_id)
+        return prepare_required_chapter_state_readiness(
+            predecessor,
+            state_plan=state_plan,
+            token_budget=token_budget,
+            authorization_revision=authorization_revision,
+            created_at=created_at,
+            deadline_at=deadline_at,
+        )
+
+    @staticmethod
+    async def start_required_chapter_state_job(
+        predecessor_job_id: str,
+        *,
+        state_plan: GenerationPlan,
+        token_budget: int,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        readiness_digest: str,
+        acknowledged_warning_codes: tuple[str, ...] | list[str],
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Create and launch the explicitly authorized state-only Job."""
+
+        protected = _validate_start_authorization(
+            token_budget=token_budget,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
+        async with _get_start_lock():
+            await GenerationJobService._guard_no_running()
+            report = await GenerationJobService.inspect_required_chapter_state_readiness(
+                predecessor_job_id,
+                state_plan=state_plan,
+                token_budget=token_budget,
+                authorization_revision=authorization_revision,
+                created_at=created_at,
+                deadline_at=deadline_at,
+                generation_params=protected,
+            )
+            accepted = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            authority = validate_required_chapter_state_readiness(accepted)
+            try:
+                job_id = await generation_job_repo.create_job(
+                    _new_job_doc(
+                        authority.novel_id,
+                        "book",
+                        None,
+                        None,
+                        token_budget,
+                        authority.maximum_provider_attempts_total,
+                        accepted,
+                        PAUSE_FOR_REWRITE,
+                        protected,
+                        readiness_digest,
+                    )
+                )
+            except DuplicateKeyError as exc:
+                raise ConflictError(
+                    "已有正在运行的批量作业，请先暂停或等待其结束"
+                ) from exc
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def resume_required_chapter_state_job(
+        job_id: str,
+    ) -> Dict[str, Any]:
+        """Resume only a non-terminal state journal under unchanged authority."""
+
+        async with _get_start_lock():
+            job = await generation_job_repo.get_job(job_id)
+            _reject_external_required_book_child_control(job)
+            _validate_resumable_job_authorization(job)
+            if not readiness_uses_required_chapter_state(job.get("readiness")):
+                raise ValueError("当前作业不是必需状态候选 successor")
+            if job.get("required_state_candidate") is not None:
+                if (
+                    job.get("status") != "paused"
+                    or job.get("pause_reason")
+                    != REQUIRED_STATE_CANDIDATE_PAUSE_REASON
+                ):
+                    raise ValueError("状态候选结果与作业状态不一致")
+                return job
+            if job.get("has_uncertain_attempts"):
+                raise ValueError(
+                    "状态候选存在 uncertain 请求，原授权不允许自动重派发"
+                )
+            if not job_planner.can_resume(str(job.get("status") or "")):
+                raise ValueError(f"作业当前状态 {job.get('status')} 不可恢复")
+            if job.get("pause_reason") in {
+                "required_state_blocked",
+                "cost_cap",
+                "attempt_capacity",
+            }:
+                raise ValueError(
+                    "当前状态候选已在原授权边界内收敛，不能重复运行"
+                )
+            await GenerationJobService._guard_no_running()
+            previous_epoch = job.get("execution_epoch", 0)
+            if type(previous_epoch) is not int or previous_epoch < 0:
+                raise ValueError("Generation job execution epoch is invalid")
+            await generation_job_repo.transition_job_resume(
+                job_id,
+                {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "last_checkpoint_index": 0,
+                    "has_uncertain_attempts": False,
+                    "confirm_uncertain_prose_retry": False,
+                },
+                previous_status=str(job.get("status") or ""),
+                previous_execution_epoch=previous_epoch,
+            )
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def inspect_required_book_successor_readiness(
+        novel_id: str,
+        *,
+        review_plan: RequiredChapterReviewPlan,
+        state_plan: GenerationPlan,
+        token_budget: int,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        generation_params: Mapping[str, Any] | None = None,
+        recovery_checkpoint: Literal[
+            "none",
+            "before_first_child",
+        ] = REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_NONE,
+    ) -> Dict[str, Any]:
+        """Freeze the full review/state/formalization/audit book envelope."""
+
+        review = await (
+            GenerationJobService.inspect_required_chapter_review_book_readiness(
+                novel_id,
+                plan=review_plan,
+                token_budget=token_budget,
+                authorization_revision=authorization_revision,
+                created_at=created_at,
+                deadline_at=deadline_at,
+                generation_params=generation_params,
+            )
+        )
+        return prepare_required_book_successor_readiness(
+            review,
+            state_plan=state_plan,
+            token_budget=token_budget,
+            recovery_checkpoint=recovery_checkpoint,
+        )
+
+    @staticmethod
+    async def start_required_book_successor_job(
+        novel_id: str,
+        *,
+        review_plan: RequiredChapterReviewPlan,
+        state_plan: GenerationPlan,
+        token_budget: int,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        readiness_digest: str,
+        acknowledged_warning_codes: tuple[str, ...] | list[str],
+        generation_params: Mapping[str, Any] | None = None,
+        recovery_checkpoint: Literal[
+            "none",
+            "before_first_child",
+        ] = REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_NONE,
+        stable_job_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Start one explicitly-authorized root; children need no new grant.
+
+        ``stable_job_id`` is reserved for the host acceptance parent.  It is
+        legal only with the durable pre-child checkpoint and turns a lost host
+        receipt into recovery of the same root instead of a second execution.
+        """
+
+        protected = _validate_start_authorization(
+            token_budget=token_budget,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
+        stable = str(stable_job_id or "") or None
+        if stable is not None and (
+            re.fullmatch(r"[0-9a-f]{24}", stable) is None
+            or recovery_checkpoint
+            != REQUIRED_BOOK_SUCCESSOR_RECOVERY_CHECKPOINT_BEFORE_FIRST_CHILD
+        ):
+            raise ValueError(
+                "稳定根作业 ID 只允许用于首个子作业前恢复检查点"
+            )
+        should_spawn = False
+        async with _get_start_lock():
+            report = await (
+                GenerationJobService.inspect_required_book_successor_readiness(
+                    novel_id,
+                    review_plan=review_plan,
+                    state_plan=state_plan,
+                    token_budget=token_budget,
+                    authorization_revision=authorization_revision,
+                    created_at=created_at,
+                    deadline_at=deadline_at,
+                    generation_params=protected,
+                    recovery_checkpoint=recovery_checkpoint,
+                )
+            )
+            accepted = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            authority = validate_required_book_successor_readiness(accepted)
+            if REQUIRED_BOOK_SUCCESSOR_ACKNOWLEDGEMENT not in set(
+                accepted.get("acknowledged_warning_codes") or []
+            ):
+                raise ValueError(
+                    "整本 successor 必须显式确认正式正文与状态写入"
+                )
+            document = _new_job_doc(
+                novel_id,
+                "book",
+                None,
+                None,
+                token_budget,
+                authority.maximum_provider_attempts_total,
+                accepted,
+                PAUSE_FOR_REWRITE,
+                protected,
+                readiness_digest,
+            )
+            if stable is not None:
+                document["_id"] = to_object_id(stable)
+
+            async def recover_existing(
+                existing: Mapping[str, Any],
+            ) -> tuple[str, bool]:
+                existing_id = str(existing.get("_id") or "")
+                if stable is None or existing_id != stable:
+                    raise ValueError(
+                        "required book successor stable Job identity changed"
+                    )
+                replay = _stable_required_book_successor_replay_state(
+                    existing,
+                    expected_job=document,
+                )
+                if replay == "checkpoint_reached":
+                    return existing_id, False
+                status = str(existing.get("status") or "")
+                if status in {"interrupted", "failed"}:
+                    await GenerationJobService._guard_no_running()
+                    previous_epoch = existing.get("execution_epoch")
+                    assert type(previous_epoch) is int
+                    await generation_job_repo.transition_job_resume(
+                        existing_id,
+                        {
+                            "status": "running",
+                            "pause_reason": None,
+                            "error": None,
+                            "active_slot": "global",
+                            "has_uncertain_attempts": False,
+                            "confirm_uncertain_prose_retry": False,
+                        },
+                        previous_status=status,
+                        previous_execution_epoch=previous_epoch,
+                    )
+                return existing_id, True
+
+            if stable is not None:
+                existing = await generation_job_repo.find_one({
+                    "_id": to_object_id(stable),
+                })
+                if existing is not None:
+                    job_id, should_spawn = await recover_existing(existing)
+                else:
+                    await GenerationJobService._guard_no_running()
+                    try:
+                        job_id = await generation_job_repo.create_job(document)
+                        should_spawn = True
+                    except DuplicateKeyError as exc:
+                        raced = await generation_job_repo.find_one({
+                            "_id": to_object_id(stable),
+                        })
+                        if raced is None:
+                            raise ConflictError(
+                                "已有正在运行的批量作业，请先暂停或等待其结束"
+                            ) from exc
+                        job_id, should_spawn = await recover_existing(raced)
+            else:
+                await GenerationJobService._guard_no_running()
+                try:
+                    job_id = await generation_job_repo.create_job(document)
+                    should_spawn = True
+                except DuplicateKeyError as exc:
+                    raise ConflictError(
+                        "已有正在运行的批量作业，请先暂停或等待其结束"
+                    ) from exc
+        if should_spawn:
+            control = JobControl()
+            await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def resume_required_book_successor_job(
+        job_id: str,
+    ) -> Dict[str, Any]:
+        """Resume the same root and the exact next child without reauthorization."""
+
+        async with _get_start_lock():
+            job = await generation_job_repo.get_job(job_id)
+            _reject_external_required_book_child_control(job)
+            _validate_resumable_job_authorization(job)
+            if not readiness_uses_required_book_successor(job.get("readiness")):
+                raise ValueError("当前作业不是整本 successor")
+            authority = validate_required_book_successor_readiness(
+                job["readiness"]
+            )
+            if get_utc_now() >= authority.deadline_at:
+                raise ValueError("整本 successor 原授权已过期，必须重新检查")
+            raw_journal = job.get("required_book_successor_journal")
+            if raw_journal is not None:
+                journal = parse_required_book_successor_journal(raw_journal)
+                if journal.phase == "completed":
+                    if job.get("status") != "completed":
+                        raise ValueError("整本 successor 完成状态不一致")
+                    return job
+                if journal.phase == "blocked":
+                    raise ValueError("整本 successor 已在原授权内失败关闭")
+            if job.get("has_uncertain_attempts"):
+                raise ValueError("整本 successor 存在未结算请求")
+            if str(job.get("status") or "") not in {
+                "paused",
+                "interrupted",
+                "failed",
+            }:
+                if job.get("status") == "running":
+                    control = JobControl()
+                    await GenerationJobService._spawn(job_id, control)
+                    return await generation_job_repo.get_job(job_id)
+                raise ValueError(f"作业当前状态 {job.get('status')} 不可恢复")
+            await GenerationJobService._guard_no_running()
+            previous_epoch = job.get("execution_epoch", 0)
+            if type(previous_epoch) is not int or previous_epoch < 0:
+                raise ValueError("Generation job execution epoch is invalid")
+            await generation_job_repo.transition_job_resume(
+                job_id,
+                {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "has_uncertain_attempts": False,
+                    "confirm_uncertain_prose_retry": False,
+                },
+                previous_status=str(job.get("status") or ""),
+                previous_execution_epoch=previous_epoch,
+            )
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def inspect_required_chapter_review_book_readiness(
+        novel_id: str,
+        *,
+        plan: RequiredChapterReviewPlan,
+        token_budget: int,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Build the opt-in, non-formal successor readiness for one book.
+
+        The caller must provide every Provider plan and both timestamps. This
+        Interface never chooses a reviewer model and can be recomputed at start
+        against the same frozen inputs without changing the digest.
+        """
+
+        protected_generation_params = validate_protected_generation_params(
+            generation_params
+        )
+        await novel_repo.get_novel_by_id(novel_id)
+        chapters = await get_book_worklist(novel_id, include_content=True)
+        target_chapters = [
+            chapter
+            for chapter in chapters
+            if not str(chapter.get("content") or "").strip()
+        ]
+        if not target_chapters:
+            raise ValueError(
+                "本书没有可进入必需章节审查 successor 的空白正文章节"
+            )
+        base_report = await generation_readiness_module.inspect(
+            novel_id=novel_id,
+            scope="book",
+            volume_id=None,
+            chapters=chapters,
+            book_structure_initialization=(
+                await inspect_book_structure_initialization(
+                    novel_id,
+                    generation_params=protected_generation_params,
+                )
+            ),
+            outline_deviation_policy=PAUSE_FOR_REWRITE,
+            prose_continuation_policy=ProseContinuationPolicy(
+                automatic_continuations_per_scene=0,
+            ),
+            token_budget=token_budget,
+            generation_params=protected_generation_params,
+            authorization_revision=authorization_revision,
+            reference_card_auto_creation_policy=None,
+        )
+        return prepare_required_chapter_review_readiness(
+            base_report,
+            chapters=target_chapters,
+            plan=plan,
+            token_budget=token_budget,
+            authorization_revision=authorization_revision,
+            created_at=created_at,
+            deadline_at=deadline_at,
+        )
+
+    @staticmethod
+    async def start_required_chapter_review_book_job(
+        novel_id: str,
+        *,
+        plan: RequiredChapterReviewPlan,
+        token_budget: int,
+        authorization_revision: int,
+        created_at: datetime,
+        deadline_at: datetime,
+        readiness_digest: str,
+        acknowledged_warning_codes: tuple[str, ...] | list[str],
+        generation_params: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Create and launch the explicitly authorized successor Job."""
+
+        protected_generation_params = _validate_start_authorization(
+            token_budget=token_budget,
+            readiness_digest=readiness_digest,
+            generation_params=generation_params,
+        )
+        async with _get_start_lock():
+            await GenerationJobService._guard_no_running()
+            report = await (
+                GenerationJobService.inspect_required_chapter_review_book_readiness(
+                    novel_id,
+                    plan=plan,
+                    token_budget=token_budget,
+                    authorization_revision=authorization_revision,
+                    created_at=created_at,
+                    deadline_at=deadline_at,
+                    generation_params=protected_generation_params,
+                )
+            )
+            accepted = generation_readiness_module.authorize(
+                report,
+                supplied_digest=readiness_digest,
+                acknowledged_warning_codes=acknowledged_warning_codes,
+            )
+            authority = validate_required_chapter_review_readiness(accepted)
+            try:
+                job_id = await generation_job_repo.create_job(
+                    _new_job_doc(
+                        novel_id,
+                        "book",
+                        None,
+                        None,
+                        token_budget,
+                        authority.maximum_provider_attempts_total,
+                        accepted,
+                        PAUSE_FOR_REWRITE,
+                        protected_generation_params,
+                        readiness_digest,
+                    )
+                )
+            except DuplicateKeyError as exc:
+                raise ConflictError(
+                    "已有正在运行的批量作业，请先暂停或等待其结束"
+                ) from exc
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
+    async def resume_required_chapter_review_job(
+        job_id: str,
+    ) -> Dict[str, Any]:
+        """Resume only a recoverable successor journal under its old authority."""
+
+        async with _get_start_lock():
+            job = await generation_job_repo.get_job(job_id)
+            _reject_external_required_book_child_control(job)
+            _validate_resumable_job_authorization(job)
+            if not readiness_uses_required_chapter_review(
+                job.get("readiness")
+            ):
+                raise ValueError("当前作业不是必需章节审查 successor")
+            if job.get("required_reviewed_candidate") is not None:
+                if (
+                    job.get("status") != "paused"
+                    or job.get("pause_reason")
+                    != REQUIRED_REVIEWED_CANDIDATE_PAUSE_REASON
+                ):
+                    raise ValueError("已审查候选的作业状态不一致")
+                return job
+            if job.get("has_uncertain_attempts"):
+                raise ValueError(
+                    "必需审查存在 uncertain 请求，原授权不允许自动重派发"
+                )
+            if not job_planner.can_resume(str(job.get("status") or "")):
+                raise ValueError(f"作业当前状态 {job.get('status')} 不可恢复")
+            if job.get("pause_reason") in {
+                "required_review_blocked",
+                "cost_cap",
+                "attempt_capacity",
+            }:
+                raise ValueError(
+                    "当前必需审查已在原授权边界内收敛，不能重复运行"
+                )
+            await GenerationJobService._guard_no_running()
+            previous_epoch = job.get("execution_epoch", 0)
+            if type(previous_epoch) is not int or previous_epoch < 0:
+                raise ValueError("Generation job execution epoch is invalid")
+            await generation_job_repo.transition_job_resume(
+                job_id,
+                {
+                    "status": "running",
+                    "pause_reason": None,
+                    "error": None,
+                    "active_slot": "global",
+                    "last_checkpoint_index": len(job.get("progress") or []),
+                    "has_uncertain_attempts": False,
+                    "confirm_uncertain_prose_retry": False,
+                },
+                previous_status=str(job.get("status") or ""),
+                previous_execution_epoch=previous_epoch,
+            )
+        control = JobControl()
+        await GenerationJobService._spawn(job_id, control)
+        return await generation_job_repo.get_job(job_id)
+
+    @staticmethod
     async def initialize_book_structure(
         novel_id: str,
         *,
@@ -2532,6 +3900,10 @@ class GenerationJobService:
         protected_generation_params = _validate_resumable_job_authorization(
             job
         )
+        if readiness_uses_required_chapter_review(job.get("readiness")):
+            raise ValueError(
+                "必需章节审查 successor 不接受旧式 reauthorization 预检"
+            )
         if job.get("has_uncertain_attempts"):
             raise ValueError(
                 "存在结果不确定的 Provider 请求，请先选择重试或跳过"
@@ -2784,6 +4156,7 @@ class GenerationJobService:
         retry_resolution_to_launch: StateDispatchResolutionV3 | None = None
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            _reject_external_required_book_child_control(job)
             job_mutation_recovery_binding: JobMutationRecoveryBindingV1 | None = None
             state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None
             raw_job_mutation_recovery = job.get("job_mutation_recovery")
@@ -2830,6 +4203,23 @@ class GenerationJobService:
             protected_generation_params = _validate_resumable_job_authorization(
                 job
             )
+            readiness = job.get("readiness")
+            if readiness_uses_required_book_successor(readiness):
+                raise ValueError(
+                    "整本 successor 必须使用其专用恢复接口"
+                )
+            if readiness_uses_required_chapter_finalization(readiness):
+                raise ValueError(
+                    "章节正式提交 successor 必须使用其专用恢复接口"
+                )
+            if readiness_uses_required_chapter_state(readiness):
+                raise ValueError(
+                    "必需状态候选 successor 必须使用其专用恢复接口"
+                )
+            if readiness_uses_required_chapter_review(readiness):
+                raise ValueError(
+                    "必需章节审查 successor 必须使用其专用恢复接口"
+                )
             if job.get("pause_reason") == "final_audit":
                 if (
                     confirm_uncertain_retry
@@ -3396,7 +4786,8 @@ class GenerationJobService:
 
     @staticmethod
     async def pause_job(job_id: str) -> Dict[str, Any]:
-        await generation_job_repo.get_job(job_id)
+        job = await generation_job_repo.get_job(job_id)
+        _reject_external_required_book_child_control(job)
         entry = _REGISTRY.get(job_id)
         if entry is not None:
             entry[1].pause_requested = True
@@ -3405,6 +4796,7 @@ class GenerationJobService:
     @staticmethod
     async def abort_job(job_id: str) -> Dict[str, Any]:
         job = await generation_job_repo.get_job(job_id)
+        _reject_external_required_book_child_control(job)
         state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None
         raw_job_mutation_recovery = job.get("job_mutation_recovery")
         if raw_job_mutation_recovery is not None:

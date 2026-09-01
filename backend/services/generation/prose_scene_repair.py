@@ -824,6 +824,69 @@ def build_v2_scene_repair_plan(
     )
 
 
+def build_v2_scene_contract_proof_from_run(
+    *,
+    run: Mapping[str, Any],
+    current_text: str,
+    outline: Mapping[str, Any],
+    plan: ProseExecutionPlan,
+) -> SceneContractValidationProof:
+    """Build the deterministic initial-candidate proof from persisted scenes."""
+
+    budgets = v2_scene_budgets(outline=outline, plan=plan)
+    if not budgets:
+        raise ValueError("V2 scene contract proof is unavailable")
+    (
+        scene_texts,
+        failing_scene_indexes,
+        _,
+        normalizations,
+    ) = _source_scene_evidence(
+        run=run,
+        current_text=current_text,
+        outline=outline,
+        plan=plan,
+        budgets=budgets,
+    )
+    if failing_scene_indexes:
+        raise ValueError("V2 complete candidate retains a scene budget failure")
+    entries: list[SceneContractValidationEntry] = []
+    cursor = 0
+    for scene_text, budget, normalization in zip(
+        scene_texts,
+        budgets,
+        normalizations,
+        strict=True,
+    ):
+        end = cursor + len(scene_text)
+        entries.append(SceneContractValidationEntry(
+            scene_id=budget.scene_id,
+            start=cursor,
+            end=end,
+            content_digest=chapter_content_digest(scene_text),
+            word_count=count_chapter_words(scene_text),
+            provider_word_count=normalization.provider_word_count,
+            discarded_word_count=normalization.discarded_word_count,
+            normalization_boundary=normalization.normalization_boundary,
+            min=budget.minimum,
+            target=budget.target,
+            max=budget.maximum,
+        ))
+        cursor = end + 2
+    proof = SceneContractValidationProof(
+        contract_version=SCENE_TRANSITION_CONTRACT_VERSION,
+        source_content_digest=chapter_content_digest(current_text),
+        scenes=tuple(entries),
+    )
+    validate_v2_scene_contract_proof(
+        text=current_text,
+        outline=outline,
+        plan=plan,
+        completion={"scene_contract_validation": proof.model_dump(mode="python")},
+    )
+    return proof
+
+
 def apply_v2_scene_replacements(
     *,
     repair_plan: V2SceneRepairPlan,
