@@ -60,7 +60,7 @@ SceneProgressCallback = Callable[[tuple[dict[str, Any], ...]], Awaitable[None] |
 # were 230–2,045.  100 is deliberately in that measured gap.
 MIN_REPLAY_CHARACTERS = 100
 _TRUNCATED_OUTPUT_CONTINUATION_MODES = frozenset(
-    {"fill", "converge", "final_converge"}
+    {"base", "fill", "converge", "final_converge"}
 )
 CONTINUATION_PROMPT_MODES = frozenset(
     {
@@ -748,9 +748,15 @@ def _scene_prompt(
         )
     )
     tail = str(prior_text or "")[-seam_window:] or "（无）"
+    is_base_continuation = prompt_mode == "base" and bool(
+        str(prior_text or "").strip()
+    )
     mode_instructions = {
         "base": (
-            "只写当前场景，不提前进入后续场景；在合适的位置自然收束当前场景。"
+            "这是同一场景的后续基础分段。紧接已有正文继续，不重写开头、不总结前文；"
+            "只完成尚未发生的当前场景内容，不提前进入后续场景。"
+            if is_base_continuation
+            else "只写当前场景，不提前进入后续场景；在合适的位置自然收束当前场景。"
         ),
         "fill": (
             "当前场景尚未达到最低字数。紧接已有正文补足必要动作、反应和结果，"
@@ -811,7 +817,7 @@ def _scene_prompt(
         and prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
     ):
         instruction += TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION
-    if prompt_mode == "base":
+    if prompt_mode == "base" and not is_base_continuation:
         return (
             f"{base_prompt}\n\n"
             "【Novel-G 场景正文协议】\n"
