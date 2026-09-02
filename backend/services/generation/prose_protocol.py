@@ -12,13 +12,16 @@ from backend.llm.schemas.novel_pydantic import (
 
 SCENE_CONTINUATION_V3_PROTOCOL_REVISION = "scene-continuation-v3"
 CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION = (
-    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.8"
+    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.9"
+)
+SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISION = (
+    CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 )
 
-# V2 scene contracts carry an explicit hard maximum for the whole scene, but a
-# single Provider call can materially overshoot its approximate word target.
-# Keep each planned base request small enough to make that overrun recoverable;
-# the scene executor still enforces the unchanged contract min/target/max.
+# V2 scene contracts carry an explicit planning range, but a single Provider
+# call can materially overshoot its approximate word target. Keep each planned
+# base request small enough to bound cost and context. Since v3.9, semantic
+# scene evidence -- not this range -- decides whether the prose is complete.
 MAX_V2_SCENE_BASE_CALL_TARGET_WORDS = 600
 
 # This constant is part of the v3 continuation protocol, not a user control.
@@ -77,15 +80,38 @@ def maximum_v2_chapter_base_calls(
 
 
 def scene_continuation_seam_window_characters(scene_target_words: Any) -> int:
-    """Return the fixed v3.8 tail window for every logical scene.
+    """Return the fixed v3.9 tail window for every logical scene.
 
     ``scene_target_words`` remains part of this stable call boundary because
-    readiness and the executor share it, but v3.8 intentionally does not
+    readiness and the executor share it, but v3.9 intentionally does not
     derive model-visible context from the target.  The prior v3.2 expansion
     added cost without an observed benefit in the four-cell retest.
     """
     del scene_target_words
     return SEAM_TAIL_MIN_CHARACTERS
+
+
+def uses_scene_evidence_first_completion(
+    *,
+    protocol_revision: Any,
+    plan_reason_codes: Any,
+) -> bool:
+    """Return whether V2 scene lengths are advisory for this exact plan.
+
+    The reason-code check prevents legacy outlines, which have no required-beat
+    evidence contract, from losing their historical anti-truncation floor.
+    Exact revision matching also keeps recovery of pre-v3.9 plans deterministic.
+    """
+
+    try:
+        reasons = {str(item) for item in plan_reason_codes}
+    except TypeError:
+        return False
+    return bool(
+        str(protocol_revision or "")
+        == SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISION
+        and "scene_contract_word_budgets" in reasons
+    )
 
 
 def is_scene_continuation_v3_family(revision: Any) -> bool:

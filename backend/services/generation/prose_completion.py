@@ -18,6 +18,7 @@ from backend.services.generation.prose_completion_contract import (
 )
 from backend.services.generation.prose_protocol import (
     CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
+    uses_scene_evidence_first_completion,
     v2_scene_base_call_safe_output_budget,
 )
 from backend.services.novel.chapter_service import count_chapter_words
@@ -101,6 +102,9 @@ class ProseCompletion:
     completion_reason: str
     mode: Literal["single_call", "scene_segments"]
     reason_codes: tuple[str, ...]
+    # Length remains measurable and source-bound, but v3.9 V2 scene contracts
+    # report its deviation without turning it into a completion failure.
+    advisory_codes: tuple[str, ...] = ()
     # The raw assembled text remains the authoritative stored prose.  Scene-v3
     # callers may additionally provide a stricter completion count after
     # excluding deterministic replay coverage.
@@ -132,6 +136,7 @@ class ProseCompletion:
             "completion_reason": self.completion_reason,
             "mode": self.mode,
             "reason_codes": list(self.reason_codes),
+            "advisory_codes": list(self.advisory_codes),
             "can_write_formal_prose": self.can_write_formal_prose,
         }
 
@@ -314,6 +319,7 @@ class ProseCompletionModule:
             if 0 <= int(index) < plan.scene_count
         }
         reasons: list[str] = []
+        advisories: list[str] = []
         if outline_revision != expected_outline_revision:
             reasons.append("outline_revision_stale")
         if normalized_reason in {
@@ -342,7 +348,17 @@ class ProseCompletionModule:
             plan.requested_word_count * plan.minimum_completion_ratio
         )
         if completion_words < required_words:
-            reasons.append("below_minimum_word_ratio")
+            if (
+                completion_words > 0
+                and bool(str(text or "").strip())
+                and uses_scene_evidence_first_completion(
+                    protocol_revision=plan.protocol_revision,
+                    plan_reason_codes=plan.reason_codes,
+                )
+            ):
+                advisories.append("below_minimum_word_ratio")
+            else:
+                reasons.append("below_minimum_word_ratio")
 
         if "outline_revision_stale" in reasons:
             status: Literal["complete", "degraded", "incomplete", "stale"] = "stale"
@@ -387,6 +403,7 @@ class ProseCompletionModule:
             completion_reason=completion_reason,
             mode=plan.mode,
             reason_codes=tuple(reasons),
+            advisory_codes=tuple(advisories),
             effective_word_count=completion_words,
         )
 

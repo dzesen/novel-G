@@ -35,6 +35,12 @@ const PROSE_REASON_KEYS = {
   completion_contract_failed: "completionContractFailed",
 } as const;
 
+const PROSE_ADVISORY_KEYS = {
+  below_minimum_word_ratio: "belowMinimumWordRatio",
+  scene_below_minimum_word_budget: "sceneBelowMinimumWordBudget",
+  scene_above_maximum_word_budget: "sceneAboveMaximumWordBudget",
+} as const;
+
 const FINISH_REASON_KEYS = {
   stop: "finishReasonStop",
   end_turn: "finishReasonStop",
@@ -75,6 +81,17 @@ export function proseReasonTranslationKey(
 ): ProseReasonTranslationKey | null {
   return PROSE_REASON_KEYS[
     reasonCode as keyof typeof PROSE_REASON_KEYS
+  ] ?? null;
+}
+
+export type ProseAdvisoryTranslationKey =
+  (typeof PROSE_ADVISORY_KEYS)[keyof typeof PROSE_ADVISORY_KEYS];
+
+export function proseAdvisoryTranslationKey(
+  advisoryCode: string,
+): ProseAdvisoryTranslationKey | null {
+  return PROSE_ADVISORY_KEYS[
+    advisoryCode as keyof typeof PROSE_ADVISORY_KEYS
   ] ?? null;
 }
 

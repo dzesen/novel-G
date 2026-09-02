@@ -37,7 +37,16 @@ CHAPTER_COMPLETION_CERTIFICATE_SCHEMA = "chapter_completion_certificate.v2"
 CHAPTER_COMPLETION_VERIFICATION_SCHEMA = (
     "chapter_completion_certificate_verification.v2"
 )
-CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v2"
+LEGACY_CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v2"
+CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v3"
+SUPPORTED_CHAPTER_COMPLETION_POLICY_REVISIONS = frozenset({
+    LEGACY_CHAPTER_COMPLETION_POLICY_REVISION,
+    CHAPTER_COMPLETION_POLICY_REVISION,
+})
+ChapterCompletionPolicyRevision = Literal[
+    "chapter_completion_policy.v2",
+    "chapter_completion_policy.v3",
+]
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 _OBJECT_ID_PATTERN = r"^[0-9a-f]{24}$"
@@ -423,7 +432,7 @@ class ChapterCompletionDecision(_ClosedCompletionModel):
     decision_id: Digest
     decision_digest: Digest
     decision: CompletionDecisionValue
-    policy_revision: Literal["chapter_completion_policy.v2"]
+    policy_revision: ChapterCompletionPolicyRevision
     source_binding_digest: Digest
     evidence_bundle_digest: Digest
     blocking_issue_signatures: tuple[str, ...] = Field(max_length=200)
@@ -498,7 +507,7 @@ class ChapterCompletionCertificate(_ClosedCompletionModel):
     certificate_digest: Digest
     issued_at: datetime
     issuer: Literal["local_completion_policy"]
-    policy_revision: Literal["chapter_completion_policy.v2"]
+    policy_revision: ChapterCompletionPolicyRevision
     decision_id: Digest
     decision_digest: Digest
     source_binding_digest: Digest
@@ -712,7 +721,7 @@ class ChapterCompletionPolicy:
         ),
         policy_revision: str,
     ) -> ChapterCompletionDecision:
-        if policy_revision != CHAPTER_COMPLETION_POLICY_REVISION:
+        if policy_revision not in SUPPORTED_CHAPTER_COMPLETION_POLICY_REVISIONS:
             raise ChapterCompletionPolicyError(
                 "unknown chapter completion policy revision"
             )
@@ -889,7 +898,7 @@ class ChapterCompletionPolicy:
         fresh_decision = self.assess(
             current.candidate_snapshot,
             current.evidence_bundle,
-            CHAPTER_COMPLETION_POLICY_REVISION,
+            parsed_certificate.policy_revision,
         )
         if fresh_decision.decision != "pass":
             raise ChapterCompletionPolicyError(

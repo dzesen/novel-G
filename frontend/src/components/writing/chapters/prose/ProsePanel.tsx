@@ -27,6 +27,7 @@ import {
   buildInteractiveCompletionResolutionPayload,
   buildProseAcceptPayload,
   finishReasonTranslationKey,
+  proseAdvisoryTranslationKey,
   proseReasonTranslationKey,
   proseRequiresPartialAcknowledgement,
   interactiveCompletionErrorCode,
@@ -174,6 +175,7 @@ export default function ProsePanel({
       ? selectedInitialRun.reason_codes
       : stream.completion?.reason_codes
   ) ?? [];
+  const advisoryCodes = stream.completion?.advisory_codes ?? [];
   const automaticContinuationsEnabled = permitsAutomaticContinuation(
     continuationPolicy,
   );
@@ -623,6 +625,13 @@ export default function ProsePanel({
       : t("reasons.unknown", { code: reasonCode });
   };
 
+  const advisoryLabel = (advisoryCode: string) => {
+    const key = proseAdvisoryTranslationKey(advisoryCode);
+    return key
+      ? t(`advisories.${key}`)
+      : t("advisories.unknown");
+  };
+
   const resumeUnavailableMessage = selectedInitialRun?.status === "stale"
     ? t("leftoverResumeStale")
     : selectedInitialRun?.status === "superseded"
@@ -1011,6 +1020,24 @@ export default function ProsePanel({
                   <li key={reasonCode}>{reasonLabel(reasonCode)}</li>
                 ))}
               </ul>
+            </Notice>
+          )}
+          {advisoryCodes.length > 0 && (
+            <Notice tone="info">
+              <section
+                data-testid="prose-length-advisories"
+                aria-live="polite"
+                className="min-w-0"
+              >
+                <p className="font-medium">{t("advisoryTitle")}</p>
+                <ul className="mt-1 list-disc space-y-1 ps-5">
+                  {advisoryCodes.map((advisoryCode) => (
+                    <li key={advisoryCode} className="break-words">
+                      {advisoryLabel(advisoryCode)}
+                    </li>
+                  ))}
+                </ul>
+              </section>
             </Notice>
           )}
           {selectedInitialRun?.can_resume === false && (

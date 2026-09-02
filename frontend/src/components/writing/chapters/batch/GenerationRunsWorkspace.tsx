@@ -20,6 +20,7 @@ import { buildReferenceCardAutomationAudit } from "./referenceCardAutomationAudi
 import ResumeJobDialog, { isResumeReadinessRequired } from "./ResumeJobDialog";
 import {
   finishReasonTranslationKey,
+  proseAdvisoryTranslationKey,
   proseReasonTranslationKey,
 } from "../prose/prosePresentation";
 import {
@@ -56,6 +57,7 @@ interface ProseRunTelemetry {
     completed_scene_count: number;
     finish_reason: string;
     reason_codes: string[];
+    advisory_codes?: string[];
   };
   scene_progress: Array<{
     scene_index: number;
@@ -76,6 +78,7 @@ interface ProseRunTelemetry {
     last_prompt_mode: string | null;
     last_finish_reason: string;
     consecutive_no_progress: number;
+    advisory_codes?: string[];
   }>;
   usage: {
     provider_attempt_count: number;
@@ -369,6 +372,13 @@ export default function GenerationRunsWorkspace({
     const key = proseReasonTranslationKey(reasonCode);
     if (key) return tProse(`reasons.${key}`);
     return tProse(`reasons.${finishReasonTranslationKey(reasonCode)}`);
+  };
+
+  const advisoryLabel = (advisoryCode: string) => {
+    const key = proseAdvisoryTranslationKey(advisoryCode);
+    return key
+      ? tProse(`advisories.${key}`)
+      : tProse("advisories.unknown");
   };
 
   const load = useCallback(async (initial = false) => {
@@ -1333,6 +1343,20 @@ export default function GenerationRunsWorkspace({
                     </dd>
                   </div>
                 </dl>
+                {(run.completion.advisory_codes ?? []).length > 0 && (
+                  <div
+                    data-testid="telemetry-length-advisories"
+                    role="status"
+                    className="mt-3 min-w-0 text-xs leading-5 text-amber-800 dark:text-amber-200"
+                  >
+                    <span className="font-medium">
+                      {t("lengthAdvisoryTitle")}
+                    </span>{" "}
+                    {(run.completion.advisory_codes ?? [])
+                      .map(advisoryLabel)
+                      .join(t("advisorySeparator"))}
+                  </div>
+                )}
                 <div className="mt-3 grid gap-2 border-t border-border pt-3">
                   {run.scene_progress.map((scene) => (
                     <div key={scene.scene_index} className="grid gap-1 text-xs leading-5 text-muted sm:grid-cols-[auto_minmax(0,1fr)] sm:gap-x-3">
@@ -1390,6 +1414,15 @@ export default function GenerationRunsWorkspace({
                         <span className="min-w-0 break-words">
                           {t("sceneFinishReason", {
                             reason: pauseReasonLabel(scene.last_finish_reason),
+                          })}
+                        </span>
+                      )}
+                      {(scene.advisory_codes ?? []).length > 0 && (
+                        <span className="min-w-0 break-words text-amber-800 dark:text-amber-200">
+                          {t("sceneLengthAdvisory", {
+                            message: (scene.advisory_codes ?? [])
+                              .map(advisoryLabel)
+                              .join(t("advisorySeparator")),
                           })}
                         </span>
                       )}

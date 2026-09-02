@@ -568,6 +568,11 @@ def _telemetry_scene_progress(document: dict[str, Any]) -> list[dict[str, Any]]:
                 "consecutive_no_progress": _safe_non_negative_int(
                     item.get("consecutive_no_progress")
                 ),
+                "advisory_codes": [
+                    str(code)
+                    for code in item.get("advisory_codes") or []
+                    if str(code).strip()
+                ][:10],
             }
         )
     return sorted(result, key=lambda item: item["scene_index"])
@@ -629,6 +634,11 @@ def serialize_prose_run_telemetry(document: dict[str, Any]) -> dict[str, Any]:
                 for code in completion.get("reason_codes") or []
                 if str(code).strip()
             ][:20],
+            "advisory_codes": [
+                str(code)
+                for code in completion.get("advisory_codes") or []
+                if str(code).strip()
+            ][:10],
         },
         "scene_progress": scene_progress,
         "usage": {

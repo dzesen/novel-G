@@ -2873,10 +2873,11 @@
       "partialConfirm": "这不是完整章节。再次点击「接受部分正文」确认后，草稿会写入编辑器并标记为「需要人工补写」。请手动补完并将章节状态设为「已完成」；在此之前，批量生成和状态回填都不会恢复。",
       "uncertainRetryConfirm": "上一条正文请求已经派发，但未取得可确认的结果或用量，可能已经计费。再次点击「继续未完成正文」才会重新请求，可能产生重复费用。",
       "segmentedPlan": "本章将按 {scenes} 个场景分段生成，含有限恢复在内最多 {calls} 次正文调用；每段完成后都会保存，可从断点继续。",
-      "completionWords": "字数 {actual} / 目标 {requested}",
+      "completionWords": "字数 {actual} / 参考目标 {requested}",
       "completionScenes": "场景 {completed} / {total}",
       "completionFinish": "结束原因：{reason}",
       "reasonTitle": "未完成原因",
+      "advisoryTitle": "篇幅提醒（不影响完整性判定）",
       "leftoverResumeUnavailable": "这份草稿当前不能安全续写；请只使用未禁用的操作，或关闭面板后重新检查。",
       "leftoverResumeAvailable": "这份保留草稿仍符合续写条件；点击“继续未完成正文”后才会发起下一次请求。",
       "leftoverResumeExhausted": "这份旧稿已达到续写次数上限，继续按钮已停用。",
@@ -2913,6 +2914,12 @@
       "continuationBudgetMissing": "自动续写预检前需要填写正数的硬 token 预算。",
       "continuationTokenBoundMissing": "当前 Provider 能力无法证明有限的 token 上界，自动续写不可用。",
       "continuationConfirmationMissing": "启动前请确认已查看的自动续写调用容量。",
+      "advisories": {
+        "belowMinimumWordRatio": "本章少于规划篇幅。字数只作参考；场景和必要事件证据完整时仍可验收。",
+        "sceneBelowMinimumWordBudget": "本场少于规划篇幅，这不会单独阻止章节完成。",
+        "sceneAboveMaximumWordBudget": "本场超过规划篇幅，这不会单独阻止章节完成。",
+        "unknown": "存在篇幅偏差，但它不会单独阻止章节完成。"
+      },
       "reasons": {
         "outlineRevisionStale": "章节细纲版本已经变化",
         "finishReasonStop": "模型已自然结束本次输出",
@@ -3053,11 +3060,14 @@
       "sceneLabel": "场景 {index}",
       "sceneCalls": "基础 {base} · 自动 {automatic}（剩余 {remaining}）· 人工 {manual} · {words} 字 · {status}",
       "sceneWordMetrics": "原始字数 {raw} / 有效字数 {effective} / 重放字数 {replayed}",
-      "sceneDivergenceMetrics": "本场产出 {actual} / 目标 {target} 字（{ratio}×）；收束调用 {converge} 次，其中未自然结束 {withoutStop} 次",
+      "sceneDivergenceMetrics": "本场产出 {actual} / 参考目标 {target} 字（{ratio}×）；收束调用 {converge} 次，其中未自然结束 {withoutStop} 次",
       "sceneDivergenceMetricsTargetUnknown": "本场产出 {actual} 字；未记录本场目标；收束调用 {converge} 次，其中未自然结束 {withoutStop} 次",
       "sceneContinuityMetrics": "跨调用最长逐字重复 {repeat} 字；硬截断续接 {truncated} 次",
       "scenePause": "暂停原因：{reason}",
       "sceneFinishReason": "本场最后一次输出：{reason}",
+      "lengthAdvisoryTitle": "篇幅提醒（不影响完整性判定）：",
+      "sceneLengthAdvisory": "篇幅提醒：{message}",
+      "advisorySeparator": "；",
       "sceneEmpty": "尚未持久化逐场检查点。"
     },
     "referenceCards": {

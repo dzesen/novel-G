@@ -2873,10 +2873,11 @@
       "partialConfirm": "This is not a complete chapter. Click “Accept partial prose” again to confirm; the draft will enter the editor marked as needing manual completion. Finish it manually and set the chapter status to “Completed”; until then, neither batch generation nor state backfill can resume.",
       "uncertainRetryConfirm": "The previous prose request was dispatched but returned no confirmed result or usage, so it may already have been billed. Click “Resume incomplete prose” again to retry and accept the risk of duplicate cost.",
       "segmentedPlan": "This chapter is being generated across {scenes} scene segments, with up to {calls} prose calls including bounded resumes. Each completed segment is saved and resumable.",
-      "completionWords": "{actual} / {requested} words",
+      "completionWords": "{actual} words / planning target {requested}",
       "completionScenes": "{completed} / {total} scenes",
       "completionFinish": "Finish reason: {reason}",
       "reasonTitle": "Why it is incomplete",
+      "advisoryTitle": "Length note (does not affect completeness)",
       "leftoverResumeUnavailable": "This draft cannot resume safely right now. Use only enabled actions, or close the panel and check again.",
       "leftoverResumeAvailable": "This saved draft is still eligible to resume. The next request starts only after you select Resume incomplete prose.",
       "leftoverResumeExhausted": "This older draft reached its continuation limit, so resume is disabled.",
@@ -2913,6 +2914,12 @@
       "continuationBudgetMissing": "Automatic continuation needs a positive hard token budget before preflight.",
       "continuationTokenBoundMissing": "The current Provider capability cannot prove a finite token bound, so automatic continuation is unavailable.",
       "continuationConfirmationMissing": "Confirm the reviewed automatic-continuation capacity before starting.",
+      "advisories": {
+        "belowMinimumWordRatio": "This chapter is shorter than planned. Word count is guidance only; complete scene and required-event evidence can still pass review.",
+        "sceneBelowMinimumWordBudget": "This scene is shorter than planned. That alone does not block chapter completion.",
+        "sceneAboveMaximumWordBudget": "This scene is longer than planned. That alone does not block chapter completion.",
+        "unknown": "There is a length variance, but that alone does not block chapter completion."
+      },
       "reasons": {
         "outlineRevisionStale": "The chapter outline revision changed",
         "finishReasonStop": "The model ended this output naturally",
@@ -3053,11 +3060,14 @@
       "sceneLabel": "Scene {index}",
       "sceneCalls": "Base {base} · automatic {automatic} ({remaining} remaining) · manual {manual} · {words} words · {status}",
       "sceneWordMetrics": "Raw words {raw} / effective words {effective} / replayed characters {replayed}",
-      "sceneDivergenceMetrics": "Scene output: {actual} / target {target} words ({ratio}×); {converge} convergence call(s), {withoutStop} not ending naturally",
+      "sceneDivergenceMetrics": "Scene output: {actual} / planning target {target} words ({ratio}×); {converge} convergence call(s), {withoutStop} not ending naturally",
       "sceneDivergenceMetricsTargetUnknown": "Scene output: {actual} words; no per-scene target was recorded; {converge} convergence call(s), {withoutStop} not ending naturally",
       "sceneContinuityMetrics": "Longest verbatim cross-call repeat: {repeat} chars; hard-truncation continuations: {truncated}",
       "scenePause": "Pause reason: {reason}",
       "sceneFinishReason": "Last output for this scene: {reason}",
+      "lengthAdvisoryTitle": "Length note (does not affect completeness):",
+      "sceneLengthAdvisory": "Length note: {message}",
+      "advisorySeparator": "; ",
       "sceneEmpty": "No scene-level checkpoint has been persisted yet."
     },
     "referenceCards": {

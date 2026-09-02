@@ -36,6 +36,7 @@ export interface ProseCompletionInfo {
   finish_reason: string;
   mode: "single_call" | "scene_segments";
   reason_codes: string[];
+  advisory_codes?: string[];
 }
 
 export interface ProseRunSnapshot {
@@ -246,6 +247,9 @@ export function useProseStream() {
                   mode: data.mode === "scene_segments" ? "scene_segments" : "single_call",
                   reason_codes: Array.isArray(data.reason_codes)
                     ? data.reason_codes.map(String)
+                    : [],
+                  advisory_codes: Array.isArray(data.advisory_codes)
+                    ? data.advisory_codes.map(String)
                     : [],
                 });
               }

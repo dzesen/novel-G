@@ -37,6 +37,7 @@ from backend.services.generation.job_planner import order_book_chapters
 from backend.services.generation.chapter_completion_certificate import (
     ChapterCompletionCertificate,
     ChapterCompletionPolicyError,
+    LEGACY_CHAPTER_COMPLETION_POLICY_REVISION,
     verify_persisted_chapter_completion_certificate,
 )
 from backend.services.generation.failure_diagnostics import (
@@ -322,6 +323,10 @@ def _prose_status(
         target_word_count is None
         or actual_word_count >= math.ceil(target_word_count * 0.8)
     )
+    # An author-completed chapter and a current evidence-first AI certificate
+    # both treat length as a pacing budget. Legacy AI completion keeps the 80%
+    # floor because it has no equivalent current scene-evidence guarantee.
+    word_budget_is_advisory = state == "manual_complete"
     if not acceptance_digest_current:
         issues.append(
             BookCompletionIssue(
@@ -423,6 +428,11 @@ def _prose_status(
                     )
                 )
             else:
+                certificate_requires_word_gate = bool(
+                    certificate.policy_revision
+                    == LEGACY_CHAPTER_COMPLETION_POLICY_REVISION
+                )
+                word_budget_is_advisory = not certificate_requires_word_gate
                 owner_is_bound = (
                     certificate.chapter_binding.owner_id == owner_id
                 )
@@ -493,7 +503,10 @@ def _prose_status(
                 certificate_verified = bool(
                     owner_is_bound
                     and acceptance_digest_current
-                    and word_gate_passed
+                    and (
+                        word_gate_passed
+                        or not certificate_requires_word_gate
+                    )
                     and completion_status == "complete"
                     and finish_reason == "stop"
                     and scene_gate_passed
@@ -562,6 +575,9 @@ def _prose_status(
             BookCompletionIssue(
                 code="chapter_prose_below_word_gate",
                 category="word_count",
+                level=(
+                    "advisory" if word_budget_is_advisory else "blocking"
+                ),
                 volume_id=volume_id,
                 chapter_id=chapter_id,
                 details={

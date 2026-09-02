@@ -79,6 +79,9 @@ from backend.services.generation.prose_completion import (
     ProseExecutionPlan,
     prose_completion_module,
 )
+from backend.services.generation.prose_protocol import (
+    uses_scene_evidence_first_completion,
+)
 from backend.services.generation.prose_runs import prose_revision
 from backend.services.generation.required_initial_prose_contracts import (
     RequiredInitialProseOrigin,
@@ -290,7 +293,13 @@ def _v2_rewrite_provider_schema(
     repair_plan: V2SceneRepairPlan,
     max_semantic_attempts: int,
 ) -> type[BaseModel]:
-    """Use an already-authorized semantic retry for one short scene."""
+    """Keep the historical hard minimum only for pre-v3.9 repair plans."""
+
+    if uses_scene_evidence_first_completion(
+        protocol_revision=repair_plan.protocol_revision,
+        plan_reason_codes=("scene_contract_word_budgets",),
+    ):
+        return RewrittenV2ProseProviderOutput
 
     if (
         int(max_semantic_attempts) < 2
@@ -1629,7 +1638,7 @@ class ProseRemediationToolApplication:
         summary = (
             "改写没有解决任何原失败场景，已提前停止。"
             if failure_code == "repair_no_progress"
-            else "改写结果违反逐场字数预算。"
+            else "改写结果未满足逐场完成与证据约束。"
         )
         data = RewriteProseCandidateOutput(
             outcome="blocked",
@@ -1824,6 +1833,19 @@ class ProseRemediationToolApplication:
             else RewrittenProseProviderOutput
         )
         if scene_repair_plan is not None:
+            scene_length_rule = (
+                "- word_budget 是篇幅规划范围，不是完成条件；"
+                "优先完整覆盖 required beats 与状态变化，"
+                "禁止为凑字数填充，也不得裁掉有效正文；"
+                if uses_scene_evidence_first_completion(
+                    protocol_revision=scene_repair_plan.protocol_revision,
+                    plan_reason_codes=("scene_contract_word_budgets",),
+                )
+                else (
+                    "- 每场正文必须落在该场 word_budget.min 与 "
+                    "word_budget.max 之间，并覆盖其 required beats；"
+                )
+            )
             prompt_data = {
                 "chapter_id": str(run["chapter_id"]),
                 "candidate_revision": payload.expected_revision,
@@ -1848,7 +1870,7 @@ class ProseRemediationToolApplication:
 - 未列入目标的场景由本地代码逐字保留，禁止返回、改写或概述；
 - left_context_tail 与 right_context_head 只用于衔接，禁止复述或改写；
 - 每个 scenes[].prose 只包含该场完整正文，不加场景标题、编号或 Markdown；
-- 每场正文必须落在该场 word_budget.min 与 word_budget.max 之间，并覆盖其 required beats；
+{scene_length_rule}
 - 不写正式章节、不输出 Markdown 代码块。
 
 修复输入：
@@ -2175,6 +2197,7 @@ class ProseRemediationToolApplication:
                 checkpoint_scene_progress.append(progress_entry)
             locked_completion = {
                 **draft_completion.to_dict(),
+                "protocol_revision": plan.protocol_revision,
                 "status": "incomplete",
                 "completion_reason": "scene_repair_checkpointed",
                 "reason_codes": list(dict.fromkeys([
@@ -2191,6 +2214,7 @@ class ProseRemediationToolApplication:
         else:
             locked_completion = {
                 **draft_completion.to_dict(),
+                "protocol_revision": plan.protocol_revision,
                 "status": "incomplete",
                 "completed_scene_count": 0,
                 "completion_reason": "remediation_verification_required",

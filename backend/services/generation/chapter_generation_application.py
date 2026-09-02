@@ -2331,6 +2331,9 @@ class ChapterGenerationApplicationService:
                     "scene_progress": completion["scene_progress"],
                     "pause_reason": generated.pause_reason,
                     "reason_codes": list(generated.completion.reason_codes),
+                    "advisory_codes": list(
+                        generated.completion.advisory_codes
+                    ),
                     "run_id": completion["source_run_id"],
                     "run_revision": completion["source_run_revision"],
                 }

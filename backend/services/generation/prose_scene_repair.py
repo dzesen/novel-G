@@ -17,6 +17,9 @@ from backend.scene_contract_versions import (
     require_known_scene_contract_version,
 )
 from backend.services.generation.prose_completion import ProseExecutionPlan
+from backend.services.generation.prose_protocol import (
+    uses_scene_evidence_first_completion,
+)
 from backend.services.generation.scene_word_budget import (
     SCENE_WORD_BUDGET_TERMINAL_REASONS,
     trim_scene_contribution_to_word_budget,
@@ -147,6 +150,7 @@ class V2SceneRepairPlan:
     requested_scene_indexes: tuple[int, ...]
     target_scene_indexes: tuple[int, ...]
     targets: tuple[V2SceneRepairTarget, ...]
+    protocol_revision: str = ""
 
     @property
     def target_scene_ids(self) -> tuple[str, ...]:
@@ -361,10 +365,24 @@ def validate_v2_scene_contract_proof(
             raise ValueError(
                 "V2 scene budget proof failed deterministic validation"
             )
-        reasons = _scene_budget_reason_codes(
+        if (
+            _word_budget_is_advisory(plan.protocol_revision)
+            and (
+                entry.normalization_boundary is not None
+                or entry.discarded_word_count != 0
+                or entry.provider_word_count != word_count
+            )
+        ):
+            raise ValueError(
+                "V2 scene evidence cannot discard prose to satisfy a word budget"
+            )
+        reasons = _scene_contract_reason_codes(
             word_count=word_count,
             normalization_boundary=entry.normalization_boundary,
             budget=budget,
+            word_budget_is_advisory=_word_budget_is_advisory(
+                plan.protocol_revision
+            ),
         )
         if reasons and not allow_incomplete:
             raise ValueError(
@@ -392,6 +410,36 @@ def _scene_budget_reason_codes(
     elif word_count > budget.maximum:
         reasons.append("scene_word_budget_exceeded")
     return tuple(reasons)
+
+
+def _word_budget_is_advisory(protocol_revision: Any) -> bool:
+    return uses_scene_evidence_first_completion(
+        protocol_revision=protocol_revision,
+        plan_reason_codes=("scene_contract_word_budgets",),
+    )
+
+
+def _scene_contract_reason_codes(
+    *,
+    word_count: int,
+    normalization_boundary: str | None,
+    budget: V2SceneBudget,
+    word_budget_is_advisory: bool,
+) -> tuple[str, ...]:
+    if word_budget_is_advisory:
+        if normalization_boundary is not None:
+            return ("scene_word_budget_content_discarded",)
+        # A positive-length deviation is advisory. An entirely missing scene
+        # remains structurally incomplete; retain the established closed code
+        # so recovery/report readers do not need a new failure vocabulary.
+        if word_count == 0:
+            return ("scene_word_budget_below_minimum",)
+        return ()
+    return _scene_budget_reason_codes(
+        word_count=word_count,
+        normalization_boundary=normalization_boundary,
+        budget=budget,
+    )
 
 
 def scene_budget_failure_indexes(
@@ -544,7 +592,7 @@ def _source_scene_normalizations_from_segments(
     return tuple(normalizations)
 
 
-def _local_budget_pause_reasons_by_scene(
+def _local_scene_failure_reasons_by_scene(
     *,
     completion: Mapping[str, Any],
     scene_count: int,
@@ -577,6 +625,11 @@ def _local_budget_pause_reasons_by_scene(
                     "completed scene cannot retain a local budget failure"
                 )
             reasons_by_index[scene_index] = (pause_reason,)
+        elif status in {"incomplete", "paused"}:
+            # v3.9 no longer turns a positive-length deviation into a scene
+            # failure. An executor-level incomplete/paused status remains
+            # hard evidence that the logical scene did not naturally finish.
+            reasons_by_index[scene_index] = ("scenes_incomplete",)
         else:
             reasons_by_index[scene_index] = ()
     if set(reasons_by_index) != set(range(scene_count)):
@@ -615,7 +668,7 @@ def _source_scene_evidence(
     completion = run.get("completion")
     if not isinstance(completion, Mapping):
         raise ValueError("V2 candidate completion evidence is missing")
-    pause_reasons = _local_budget_pause_reasons_by_scene(
+    pause_reasons = _local_scene_failure_reasons_by_scene(
         completion=completion,
         scene_count=plan.scene_count,
     )
@@ -638,10 +691,13 @@ def _source_scene_evidence(
             current_text[entry.start:entry.end] for entry in proof.scenes
         )
         budget_reasons = tuple(
-            _scene_budget_reason_codes(
+            _scene_contract_reason_codes(
                 word_count=entry.word_count,
                 normalization_boundary=entry.normalization_boundary,
                 budget=budget,
+                word_budget_is_advisory=_word_budget_is_advisory(
+                    plan.protocol_revision
+                ),
             )
             for entry, budget in zip(proof.scenes, budgets, strict=True)
         )
@@ -676,10 +732,13 @@ def _source_scene_evidence(
         if reconstructed != current_text:
             raise ValueError("persisted V2 segments do not bind the candidate")
         budget_reasons = tuple(
-            _scene_budget_reason_codes(
+            _scene_contract_reason_codes(
                 word_count=count_chapter_words(scene_text),
                 normalization_boundary=None,
                 budget=budget,
+                word_budget_is_advisory=_word_budget_is_advisory(
+                    plan.protocol_revision
+                ),
             )
             for scene_text, budget in zip(
                 scene_texts,
@@ -706,10 +765,13 @@ def _source_scene_evidence(
         budget = budgets[0]
         failure_reasons = _merge_scene_failure_reasons(
             budget_reasons=(
-                _scene_budget_reason_codes(
+                _scene_contract_reason_codes(
                     word_count=count_chapter_words(current_text),
                     normalization_boundary=None,
                     budget=budget,
+                    word_budget_is_advisory=_word_budget_is_advisory(
+                        plan.protocol_revision
+                    ),
                 ),
             ),
             pause_reasons=pause_reasons,
@@ -821,6 +883,7 @@ def build_v2_scene_repair_plan(
         requested_scene_indexes=requested_targets,
         target_scene_indexes=normalized_targets,
         targets=tuple(targets),
+        protocol_revision=plan.protocol_revision,
     )
 
 
@@ -922,16 +985,22 @@ def apply_v2_scene_replacements(
             parts.append("\n\n")
             cursor += 2
         if budget.scene_index in target_indexes:
-            normalized = trim_scene_contribution_to_word_budget(
-                current_text="",
-                contribution=replacements_by_index[budget.scene_index],
-                maximum_words=budget.maximum,
-                enabled=True,
-            )
-            scene_text = normalized.text
-            provider_word_count = normalized.original_word_count
-            discarded_word_count = normalized.discarded_word_count
-            normalization_boundary = normalized.boundary
+            if _word_budget_is_advisory(repair_plan.protocol_revision):
+                scene_text = replacements_by_index[budget.scene_index].strip()
+                provider_word_count = count_chapter_words(scene_text)
+                discarded_word_count = 0
+                normalization_boundary = None
+            else:
+                normalized = trim_scene_contribution_to_word_budget(
+                    current_text="",
+                    contribution=replacements_by_index[budget.scene_index],
+                    maximum_words=budget.maximum,
+                    enabled=True,
+                )
+                scene_text = normalized.text
+                provider_word_count = normalized.original_word_count
+                discarded_word_count = normalized.discarded_word_count
+                normalization_boundary = normalized.boundary
         else:
             scene_text = repair_plan.source_scene_texts[zero_based_index]
             normalization = repair_plan.source_scene_normalizations[
@@ -947,10 +1016,13 @@ def apply_v2_scene_replacements(
         parts.append(scene_text)
         cursor += len(scene_text)
         word_count = count_chapter_words(scene_text)
-        scene_reasons = _scene_budget_reason_codes(
+        scene_reasons = _scene_contract_reason_codes(
             word_count=word_count,
             normalization_boundary=normalization_boundary,
             budget=budget,
+            word_budget_is_advisory=_word_budget_is_advisory(
+                repair_plan.protocol_revision
+            ),
         )
         current_reason_codes_by_scene.append(scene_reasons)
         reason_codes.extend(scene_reasons)

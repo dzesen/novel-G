@@ -33,6 +33,7 @@ from backend.services.generation.prose_protocol import (
     AUTOMATIC_PROSE_SEQUENCE_FLOOR,
     CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
     scene_continuation_seam_window_characters,
+    uses_scene_evidence_first_completion,
 )
 from backend.services.generation.prose_token_bounds import v3_output_token_bound
 from backend.services.generation.prose_generation import (
@@ -150,6 +151,13 @@ def _scene_maximum_words(
         min(max(0, scene_index), len(plan.segment_maximums) - 1)
     ]
     return max(1, int(budget))
+
+
+def _scene_word_budget_is_advisory(plan: ProseExecutionPlan) -> bool:
+    return uses_scene_evidence_first_completion(
+        protocol_revision=plan.protocol_revision,
+        plan_reason_codes=plan.reason_codes,
+    )
 
 
 def effective_scene_divergence_stop_factor(
@@ -513,8 +521,15 @@ def _is_scene_complete(
 ) -> bool:
     # A length terminal is deliberately never accepted as a scene boundary, even
     # when it happened to reach the target length.
-    maximum_words = _scene_maximum_words(plan, scene_index)
     normalized_effective_word_count = max(0, int(effective_word_count))
+    if _scene_word_budget_is_advisory(plan):
+        return bool(
+            finish_reason == "stop"
+            and scene_text.strip()
+            and normalized_effective_word_count > 0
+        )
+
+    maximum_words = _scene_maximum_words(plan, scene_index)
     normalized_raw_word_count = max(0, int(raw_word_count))
     return bool(
         finish_reason == "stop"
@@ -537,8 +552,13 @@ def _bounded_scene_allows_completion(
 ) -> bool:
     """Apply the production trim guard and scene-completion contract together."""
 
+    acceptable_trim_boundary = (
+        trim_boundary is None
+        if _scene_word_budget_is_advisory(plan)
+        else trim_boundary != "word"
+    )
     return bool(
-        trim_boundary != "word"
+        acceptable_trim_boundary
         and _is_scene_complete(
             scene_text=scene_text,
             raw_word_count=raw_word_count,
@@ -629,6 +649,16 @@ def _scene_progress_snapshot(
     state["scene_target_words"] = _scene_target_words(plan, scene_index)
     state["scene_minimum_words"] = _scene_minimum_words(plan, scene_index)
     state["scene_maximum_words"] = _scene_maximum_words(plan, scene_index)
+    length_advisories: list[str] = []
+    if _scene_word_budget_is_advisory(plan):
+        if replay_measurement.effective_word_count < state["scene_minimum_words"]:
+            length_advisories.append("scene_below_minimum_word_budget")
+        if (
+            state["scene_maximum_words"] is not None
+            and replay_measurement.raw_word_count > state["scene_maximum_words"]
+        ):
+            length_advisories.append("scene_above_maximum_word_budget")
+    state["advisory_codes"] = length_advisories
     converge_segments = [
         segment
         for segment in scene_segments
@@ -693,10 +723,13 @@ def _scene_progress_snapshot(
     latest_error_code = str(
         (scene_segments[-1] if scene_segments else {}).get("error_code") or ""
     )
+    word_budget_is_advisory = _scene_word_budget_is_advisory(plan)
     if latest_error_code == "scene_word_budget_trimmed_without_sentence_boundary":
         state["status"] = "paused"
         state["pause_reason"] = latest_error_code
     elif (
+        not word_budget_is_advisory
+        and
         maximum_words is not None
         and replay_measurement.raw_word_count > maximum_words
     ):
@@ -713,7 +746,8 @@ def _scene_progress_snapshot(
         state["status"] = "complete"
         state["pause_reason"] = None
     elif (
-        plan.protocol_revision == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+        not word_budget_is_advisory
+        and plan.protocol_revision == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
         and maximum_words is not None
         and scene_segments
         and replay_measurement.raw_word_count >= maximum_words
@@ -748,6 +782,7 @@ def _scene_prompt(
         )
     )
     tail = str(prior_text or "")[-seam_window:] or "（无）"
+    word_budget_is_advisory = _scene_word_budget_is_advisory(plan)
     is_base_continuation = prompt_mode == "base" and bool(
         str(prior_text or "").strip()
     )
@@ -759,15 +794,24 @@ def _scene_prompt(
             else "只写当前场景，不提前进入后续场景；在合适的位置自然收束当前场景。"
         ),
         "fill": (
-            "当前场景尚未达到最低字数。紧接已有正文补足必要动作、反应和结果，"
+            "当前场景仍有必要事件或状态结果没有落下。紧接已有正文补足这些内容，"
+            "不要为凑字复述或重写前文，也不要提前写后续场景。"
+            if word_budget_is_advisory
+            else "当前场景尚未达到最低字数。紧接已有正文补足必要动作、反应和结果，"
             "不要复述或重写前文，也不要提前写后续场景。"
         ),
         "converge": (
-            "当前场景已达到最低字数。不要新增事件、不要回顾前文；只完成当前动作或"
+            "不要新增合同之外的事件、不要回顾前文；只完成尚未落实的必要事件、当前"
+            "动作或反应，落下场景结果后立即停止。"
+            if word_budget_is_advisory
+            else "当前场景已达到最低字数。不要新增事件、不要回顾前文；只完成当前动作或"
             "反应，落下场景结果后立即停止。"
         ),
         "final_converge": (
-            "这是本场最后一次已授权自动尝试。优先保证衔接：如仍低于最低字数，只补"
+            "这是本场最后一次已授权自动尝试。只补尚未落实的必要事件与状态结果；"
+            "不要为字数展开新支线，完成当前动作、反应和场景结果后停止。"
+            if word_budget_is_advisory
+            else "这是本场最后一次已授权自动尝试。优先保证衔接：如仍低于最低字数，只补"
             "必要内容；无论如何都不要展开新支线，完成当前动作、反应和场景结果后停止。"
         ),
         "final_recovery": (
@@ -797,10 +841,17 @@ def _scene_prompt(
         target = contract_budget.get("target")
         maximum = contract_budget.get("max")
         if all(type(value) is int for value in (minimum, target, maximum)):
-            contract_budget_instruction = (
-                f"本场合同字数范围为 {minimum} / {target} / {maximum} 字"
-                "（最低 / 目标 / 最高）；不得用重复内容填充，也不要超过最高值。\n"
-            )
+            if word_budget_is_advisory:
+                contract_budget_instruction = (
+                    f"本场规划字数范围为 {minimum} / {target} / {maximum} 字"
+                    "（参考下限 / 目标 / 参考上限）；它只用于节奏和篇幅规划。"
+                    "优先完整落实必要事件与状态变化，不得为凑字扩写，也不得为压字删除情节。\n"
+                )
+            else:
+                contract_budget_instruction = (
+                    f"本场合同字数范围为 {minimum} / {target} / {maximum} 字"
+                    "（最低 / 目标 / 最高）；不得用重复内容填充，也不要超过最高值。\n"
+                )
     beat_instruction = ""
     if (
         plan.protocol_revision == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
@@ -1163,10 +1214,7 @@ async def execute_v3_prose_plan(
                 current_text=current_text,
                 generated=generated,
                 maximum_words=_scene_maximum_words(plan, scene_index),
-                trim_enabled=(
-                    plan.protocol_revision
-                    == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
-                ),
+                trim_enabled=not _scene_word_budget_is_advisory(plan),
             )
             contribution = trim.text
             try:
@@ -1207,10 +1255,7 @@ async def execute_v3_prose_plan(
                 current_text=current_text,
                 generated=generated,
                 maximum_words=_scene_maximum_words(plan, scene_index),
-                trim_enabled=(
-                    plan.protocol_revision
-                    == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
-                ),
+                trim_enabled=not _scene_word_budget_is_advisory(plan),
             )
             contribution = trim.text
             terminal = {
@@ -1242,10 +1287,7 @@ async def execute_v3_prose_plan(
                 current_text=current_text,
                 generated=generated,
                 maximum_words=_scene_maximum_words(plan, scene_index),
-                trim_enabled=(
-                    plan.protocol_revision
-                    == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
-                ),
+                trim_enabled=not _scene_word_budget_is_advisory(plan),
             )
             contribution = trim.text
             try:
@@ -1278,10 +1320,7 @@ async def execute_v3_prose_plan(
             current_text=current_text,
             generated=generated,
             maximum_words=_scene_maximum_words(plan, scene_index),
-            trim_enabled=(
-                plan.protocol_revision
-                == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
-            ),
+            trim_enabled=not _scene_word_budget_is_advisory(plan),
         )
         contribution = trim.text
         observed_finish = finish_reason_reader()
@@ -1370,12 +1409,13 @@ async def execute_v3_prose_plan(
                 (spec for spec in scene_specs if spec.sequence_index not in by_sequence),
                 None,
             )
-            # Scene ``min`` and the chapter-wide 80% floor are independent.
-            # A low-minimum stop proves a scene boundary, but may skip frozen
-            # base parts only after supplying its proportional 80% share (the
-            # historical independent-completion seam), or after reaching the
-            # hard scene maximum where another call could only risk overrun.
+            # Since v3.9, a natural scene boundary is sufficient to hand the
+            # candidate to the independent beat/state review. Unused planned
+            # base calls are budgets, not prose that must be generated. Older
+            # plans retain the historical proportional word-floor behavior.
             if state.get("status") == "complete":
+                if _scene_word_budget_is_advisory(plan):
+                    break
                 maximum_words = _scene_maximum_words(plan, scene_index)
                 may_end_before_remaining_base = bool(
                     int(state.get("effective_word_count") or 0)
@@ -1577,7 +1617,10 @@ async def execute_v3_prose_plan(
                 )
             elif remaining_automatic == 1:
                 prompt_mode = "final_converge"
-            elif scene_word_count < minimum_words:
+            elif (
+                not _scene_word_budget_is_advisory(plan)
+                and scene_word_count < minimum_words
+            ):
                 prompt_mode = "fill"
             else:
                 prompt_mode = "converge"
