@@ -21,7 +21,6 @@ from backend.services.generation.chapter_generation_application import (
 )
 from backend.services.generation.independent_outline_review import (
     IndependentOutlineReviewer,
-    OutlineReviewSnapshot,
 )
 from backend.services.generation.chapter_repair_policy import (
     ChapterRepairPolicy,
@@ -673,20 +672,17 @@ class RequiredChapterReviewLoop:
             ))
             text = str(run.get("assembled_text") or "")
             digest = chapter_content_digest(text)
-            snapshot = OutlineReviewSnapshot.create(
+            candidate = RequiredReviewCandidate.create(
                 source_run_id=str(run["_id"]),
                 source_run_revision=int(run["revision"]),
                 source_content_digest=digest,
                 prose=text,
                 outline=outline,
                 authorized_context=prepared.context.to_prompt_text(),
+                prose_plan=execution,
+                completion=dict(run.get("completion") or {}),
             )
-            candidate = RequiredReviewCandidate(
-                snapshot,
-                execution,
-                dict(run.get("completion") or {}),
-            )
-            candidate.require_complete()
+            snapshot = candidate.snapshot
             receipt = InitialAwaitingAdherenceReceipt(
                 schema_version="initial_prose_candidate_awaiting_adherence.v1",
                 source_run_id=snapshot.source_run_id,

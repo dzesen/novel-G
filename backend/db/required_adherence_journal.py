@@ -24,7 +24,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.prose_run_repository import prose_run_repo
 from backend.db.utils import get_utc_now
 from backend.llm.models import TokenUsage
-from backend.services.generation.independent_outline_review import IndependentReviewPlan, OutlineReviewSnapshot
+from backend.services.generation.independent_outline_review import IndependentReviewPlan
 from backend.services.generation.attempt_ledger_contracts import (
     MAX_PERSISTED_ATTEMPT_TOKENS, PERSISTED_ATTEMPT_STATES,
 )
@@ -391,14 +391,14 @@ class JobRequiredReviewJournal:
         ):
             raise RequiredAdherenceHandoffError("review_handoff_stale")
         completion = dict(run.get("completion") or {})
-        snapshot = OutlineReviewSnapshot.create(
+        current = RequiredReviewCandidate.create(
             source_run_id=expected.snapshot.source_run_id,
             source_run_revision=int(run["revision"]), source_content_digest=expected.snapshot.source_content_digest,
             prose=run["assembled_text"], outline=chapter["outline"],
             authorized_context=expected.snapshot.authorized_context,
+            prose_plan=expected.prose_plan,
+            completion=completion,
         )
-        current = RequiredReviewCandidate(snapshot, expected.prose_plan, completion)
-        current.require_complete()
         if current.check_digest != self._candidate_digest:
             raise RequiredAdherenceHandoffError("review_handoff_stale")
         return current

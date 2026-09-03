@@ -23,7 +23,6 @@ from backend.services.agent_runtime.contracts import (
 )
 from backend.services.agent_runtime.runtime import AgentRuntime
 from backend.services.generation.attempt_scope import JobAttemptScope
-from backend.services.generation.independent_outline_review import OutlineReviewSnapshot
 from backend.services.generation.prose_remediation_runtime import (
     FrozenStructuredCall, ProseRemediationPlanner, ProseRemediationToolApplication,
     ProseRemediationToolRegistry, _execution_plan, _validate_candidate_snapshot,
@@ -72,13 +71,13 @@ async def _candidate(binding, entry, agent_run_id: str) -> RequiredReviewCandida
         allow_unverified_remediation=True, required_origin=entry.origin,
     )
     context = assemble_context(await fetch_context_inputs(binding.novel_id, binding.chapter_id))
-    snapshot = OutlineReviewSnapshot.create(
+    result = RequiredReviewCandidate.create(
         source_run_id=entry.origin.request.source_run_id, source_run_revision=int(run["revision"]),
         source_content_digest=chapter_content_digest(text), prose=text, outline=chapter["outline"],
         authorized_context=context.to_prompt_text(),
+        prose_plan=_execution_plan(run),
+        completion=dict(run["completion"]),
     )
-    result = RequiredReviewCandidate(snapshot, _execution_plan(run), dict(run["completion"]))
-    result.require_complete()
     return result
 
 

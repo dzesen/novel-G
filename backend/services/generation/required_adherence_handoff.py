@@ -27,7 +27,10 @@ from backend.services.generation.prose_completion import (
     ProseExecutionPlan,
     prose_completion_module,
 )
-from backend.services.generation.prose_scene_repair import validate_v2_scene_contract_proof
+from backend.services.generation.prose_scene_repair import (
+    SceneContractValidationProof,
+    validate_v2_scene_contract_proof,
+)
 from backend.services.generation.required_adherence_capacity import RequiredAdherenceCapacity
 from backend.services.llm.generation_runtime import AttemptUsage
 
@@ -126,6 +129,56 @@ class RequiredReviewCandidate:
     prose_plan: ProseExecutionPlan
     completion: Mapping[str, Any]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        source_run_id: str,
+        source_run_revision: int,
+        source_content_digest: str,
+        prose: str,
+        outline: Mapping[str, Any],
+        authorized_context: str,
+        prose_plan: ProseExecutionPlan,
+        completion: Mapping[str, Any],
+    ) -> "RequiredReviewCandidate":
+        """Build one review candidate from its deterministic completion proof."""
+
+        try:
+            proof = validate_v2_scene_contract_proof(
+                text=prose,
+                outline=outline,
+                plan=prose_plan,
+                completion=completion,
+            )
+            if proof is None:
+                raise ValueError("review_requires_v2_proof")
+            snapshot = OutlineReviewSnapshot.create(
+                source_run_id=source_run_id,
+                source_run_revision=source_run_revision,
+                source_content_digest=source_content_digest,
+                prose=prose,
+                outline=outline,
+                authorized_context=authorized_context,
+                scene_ranges=tuple({
+                    "scene_id": scene.scene_id,
+                    "start": scene.start,
+                    "end": scene.end,
+                } for scene in proof.scenes),
+            )
+            candidate = cls(snapshot, prose_plan, dict(completion))
+            candidate._require_complete_with_proof(
+                outline=json.loads(snapshot.outline_json),
+                proof=proof,
+            )
+            return candidate
+        except RequiredAdherenceHandoffError:
+            raise
+        except (ValueError, TypeError, KeyError):
+            raise RequiredAdherenceHandoffError(
+                "review_candidate_incomplete"
+            ) from None
+
     @property
     def check_digest(self) -> str:
         """Bind the exact live completion proof inspected before an await."""
@@ -146,6 +199,23 @@ class RequiredReviewCandidate:
 
     def require_complete(self) -> None:
         outline = json.loads(self.snapshot.outline_json)
+        try:
+            proof = validate_v2_scene_contract_proof(
+                text=self.snapshot.prose, outline=outline,
+                plan=self.prose_plan, completion=self.completion,
+            )
+            if proof is None:
+                raise ValueError("review_requires_v2_proof")
+        except (ValueError, TypeError, KeyError):
+            raise RequiredAdherenceHandoffError("review_candidate_incomplete") from None
+        self._require_complete_with_proof(outline=outline, proof=proof)
+
+    def _require_complete_with_proof(
+        self,
+        *,
+        outline: Mapping[str, Any],
+        proof: SceneContractValidationProof,
+    ) -> None:
         if (
             self.completion.get("status") != "complete"
             or self.completion.get("finish_reason") != "stop"
@@ -158,12 +228,16 @@ class RequiredReviewCandidate:
         ):
             raise RequiredAdherenceHandoffError("review_candidate_incomplete")
         try:
-            proof = validate_v2_scene_contract_proof(
-                text=self.snapshot.prose, outline=outline,
-                plan=self.prose_plan, completion=self.completion,
+            proof_ranges = tuple(
+                (scene.scene_id, scene.start, scene.end, scene.content_digest)
+                for scene in proof.scenes
             )
-            if proof is None:
-                raise ValueError("review_requires_v2_proof")
+            snapshot_ranges = tuple(
+                (scene.scene_id, scene.start, scene.end, scene.content_digest)
+                for scene in self.snapshot.scene_ranges
+            )
+            if snapshot_ranges != proof_ranges:
+                raise ValueError("review_scene_range_mismatch")
             completion = prose_completion_module.inspect(
                 text=self.snapshot.prose, plan=self.prose_plan,
                 finish_reason=self.completion["finish_reason"],

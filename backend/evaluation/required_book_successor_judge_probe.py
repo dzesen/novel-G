@@ -71,12 +71,15 @@ _SYNTHETIC_SAMPLE_BLUEPRINT = {
     ),
 }
 
-_SYNTHETIC_PROSE = (
+_SYNTHETIC_SCENE_1 = (
     "冷雨停在旧站台外。林舟认出失散多年的苏遥，两人各自取出保留的半枚"
-    "蓝色车票，拼合后的编号完全一致，他们终于确认了彼此的身份。\n"
+    "蓝色车票，拼合后的编号完全一致，他们终于确认了彼此的身份。"
+)
+_SYNTHETIC_SCENE_2 = (
     "远处警笛逼近。苏遥把藏在袖口的铜钥匙交给林舟，说明仓库里留有撤离"
     "路线；林舟收好钥匙，决定立刻与她离开站台，共同前往仓库。"
 )
+_SYNTHETIC_PROSE = f"{_SYNTHETIC_SCENE_1}\n\n{_SYNTHETIC_SCENE_2}"
 _SYNTHETIC_AUTHORIZED_CONTEXT = (
     "合成事实：林舟与苏遥幼年失散，各自保存同一张蓝色车票的一半；"
     "铜钥匙可以打开旧站台外的仓库。"
@@ -204,6 +207,18 @@ def required_judge_probe_snapshot() -> OutlineReviewSnapshot:
         prose=_SYNTHETIC_PROSE,
         outline=_SYNTHETIC_OUTLINE,
         authorized_context=_SYNTHETIC_AUTHORIZED_CONTEXT,
+        scene_ranges=(
+            {
+                "scene_id": "scene-1",
+                "start": 0,
+                "end": len(_SYNTHETIC_SCENE_1),
+            },
+            {
+                "scene_id": "scene-2",
+                "start": len(_SYNTHETIC_SCENE_1) + 2,
+                "end": len(_SYNTHETIC_PROSE),
+            },
+        ),
     )
 
 

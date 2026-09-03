@@ -474,7 +474,6 @@ class JobRequiredProseRewriteJournal:
         expected_review_ordinal,
     ):
         from backend.db.repositories.generation_job_repository import generation_job_repo
-        from backend.services.generation.independent_outline_review import OutlineReviewSnapshot
         from backend.services.generation.prose_remediation_runtime import _execution_plan
         from backend.services.generation.required_adherence_handoff import RequiredReviewCandidate, RequiredAdherenceHandoff
         from backend.services.llm.context_builder import fetch_context_inputs, assemble_context
@@ -482,12 +481,13 @@ class JobRequiredProseRewriteJournal:
         try:
             source, chapter = await _source(self.binding, request)
             context = assemble_context(await fetch_context_inputs(self.binding.novel_id, self.binding.chapter_id))
-            snapshot = OutlineReviewSnapshot.create(
+            candidate = RequiredReviewCandidate.create(
                 source_run_id=request.source_run_id, source_run_revision=request.source_revision,
                 source_content_digest=request.source_content_digest, prose=source["assembled_text"],
                 outline=chapter["outline"], authorized_context=context.to_prompt_text(),
+                prose_plan=_execution_plan(source),
+                completion=source["completion"],
             )
-            candidate = RequiredReviewCandidate(snapshot, _execution_plan(source), source["completion"])
             journal = generation_job_repo.required_review_journal(self.binding, candidate=candidate, plan=self._review_plan)
             checkpoint, current = await journal.read()
             RequiredAdherenceHandoff.validate_terminal(

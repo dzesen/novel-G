@@ -10,7 +10,7 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 from pydantic_core import PydanticCustomError
@@ -44,7 +44,7 @@ from backend.services.llm.generation_runtime import (
 )
 
 
-ANCHOR_PROTOCOL = "exact_prose_anchor_view.v1"
+ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v2"
 REVIEW_PROTOCOL = "independent_outline_review.v1"
 ANCHOR_WIDTH = 512
 MAX_QUOTE_LENGTH = 500
@@ -52,6 +52,7 @@ MAX_PROSE_CODEPOINTS = 100_000
 REVIEW_TASK = (
     "阅读完整当前正文、章纲与获准上下文，仅报告符合度证据，不决定通过或严重度。"
     "按章纲顺序覆盖所有 beat，并为每场提供完整质量画像。"
+    "每个锚点都绑定唯一 scene_id；beat 证据和场景质量画像只能引用同场锚点。"
     "引用须逐字复制，返回锚点 ID 和 quote，不计算字符位置。"
     "锚点按原文顺序排列，每段前 512 个字符是本段引用起点范围；"
     "右侧至多 499 个字符仅供跨边界引用，不代表正文重复。"
@@ -109,6 +110,16 @@ AnchoredOutlineAdherenceEvidenceV1 = _anchor_transport_schema()
 
 
 @dataclass(frozen=True)
+class OutlineReviewSceneRange:
+    """A deterministic prose span owned by one outline scene."""
+
+    scene_id: str
+    start: int
+    end: int
+    content_digest: str
+
+
+@dataclass(frozen=True)
 class OutlineReviewSnapshot:
     source_run_id: str
     source_run_revision: int
@@ -116,6 +127,7 @@ class OutlineReviewSnapshot:
     prose: str
     outline_json: str
     authorized_context: str
+    scene_ranges: tuple[OutlineReviewSceneRange, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -134,6 +146,31 @@ class OutlineReviewSnapshot:
         outline = json.loads(self.outline_json)
         if not isinstance(outline, dict) or outline.get("scene_contract_version") != "scene_transition_contract.v2":
             raise ValueError("independent review requires a V2 outline")
+        scenes = outline.get("scenes")
+        if not isinstance(scenes, list) or len(scenes) != len(self.scene_ranges):
+            raise ValueError("independent review scene ranges are invalid")
+        previous_end = 0
+        for index, (scene, scene_range) in enumerate(
+            zip(scenes, self.scene_ranges, strict=True)
+        ):
+            expected_start = 0 if index == 0 else previous_end + 2
+            if (
+                not isinstance(scene, dict)
+                or type(scene_range) is not OutlineReviewSceneRange
+                or scene_range.scene_id != scene.get("scene_id")
+                or type(scene_range.start) is not int
+                or type(scene_range.end) is not int
+                or scene_range.start != expected_start
+                or scene_range.end <= scene_range.start
+                or scene_range.end > len(self.prose)
+                or (index and self.prose[previous_end:scene_range.start] != "\n\n")
+                or scene_range.content_digest
+                != _digest(self.prose[scene_range.start:scene_range.end])
+            ):
+                raise ValueError("independent review scene ranges are invalid")
+            previous_end = scene_range.end
+        if previous_end != len(self.prose):
+            raise ValueError("independent review scene ranges are invalid")
         object.__setattr__(self, "outline_json", _json(outline))
 
     @classmethod
@@ -146,10 +183,50 @@ class OutlineReviewSnapshot:
         prose: str,
         outline: Mapping[str, Any],
         authorized_context: str,
+        scene_ranges: Sequence[Mapping[str, Any] | OutlineReviewSceneRange] | None = None,
     ) -> "OutlineReviewSnapshot":
+        outline_value = dict(outline)
+        outline_scenes = outline_value.get("scenes")
+        if scene_ranges is None:
+            if not isinstance(outline_scenes, list) or len(outline_scenes) != 1:
+                raise ValueError("independent review scene ranges are required")
+            scene_ranges = ({
+                "scene_id": outline_scenes[0].get("scene_id"),
+                "start": 0,
+                "end": len(prose),
+            },)
+        normalized_ranges = []
+        for value in scene_ranges:
+            if isinstance(value, OutlineReviewSceneRange):
+                scene_id, start, end = value.scene_id, value.start, value.end
+            elif isinstance(value, Mapping) and set(value) == {"scene_id", "start", "end"}:
+                scene_id, start, end = value["scene_id"], value["start"], value["end"]
+            else:
+                raise ValueError("independent review scene ranges are invalid")
+            if (
+                not isinstance(scene_id, str)
+                or not scene_id
+                or type(start) is not int
+                or type(end) is not int
+                or start < 0
+                or end < start
+                or end > len(prose)
+            ):
+                raise ValueError("independent review scene ranges are invalid")
+            normalized_ranges.append(OutlineReviewSceneRange(
+                scene_id=scene_id,
+                start=start,
+                end=end,
+                content_digest=_digest(prose[start:end]),
+            ))
         return cls(
-            source_run_id, source_run_revision, source_content_digest,
-            prose, _json(dict(outline)), authorized_context,
+            source_run_id=source_run_id,
+            source_run_revision=source_run_revision,
+            source_content_digest=source_content_digest,
+            prose=prose,
+            outline_json=_json(outline_value),
+            authorized_context=authorized_context,
+            scene_ranges=tuple(normalized_ranges),
         )
 
     @property
@@ -161,6 +238,7 @@ class OutlineReviewSnapshot:
             "source_content_digest": self.source_content_digest,
             "outline_digest": _digest(self.outline_json),
             "context_digest": _digest(self.authorized_context),
+            "scene_ranges": [asdict(item) for item in self.scene_ranges],
         }))
 
 
@@ -254,21 +332,39 @@ class IndependentReviewResult:
     attempts: tuple[AttemptUsage, ...]
 
 
-def _anchors(snapshot: OutlineReviewSnapshot) -> dict[str, tuple[int, int, str]]:
+@dataclass(frozen=True)
+class _ProseAnchor:
+    scene_id: str
+    start: int
+    primary_end: int
+    text: str
+
+
+def _anchors(snapshot: OutlineReviewSnapshot) -> dict[str, _ProseAnchor]:
     result = {}
-    for ordinal, start in enumerate(range(0, len(snapshot.prose), ANCHOR_WIDTH)):
-        primary_end = min(start + ANCHOR_WIDTH, len(snapshot.prose))
-        # An exact quote can start at every code point in the primary range,
-        # including the last one, and extend a full 500 characters to the right.
-        text = snapshot.prose[start:primary_end + MAX_QUOTE_LENGTH - 1]
-        result[f"{snapshot.view_digest}:{ordinal}"] = (start, primary_end, text)
+    ordinal = 0
+    for scene_range in snapshot.scene_ranges:
+        for start in range(scene_range.start, scene_range.end, ANCHOR_WIDTH):
+            primary_end = min(start + ANCHOR_WIDTH, scene_range.end)
+            # Quotes may overlap anchor chunks, but never cross a semantic
+            # scene boundary. That boundary is part of the signed view.
+            text = snapshot.prose[
+                start:min(primary_end + MAX_QUOTE_LENGTH - 1, scene_range.end)
+            ]
+            result[f"{snapshot.view_digest}:{ordinal}"] = _ProseAnchor(
+                scene_id=scene_range.scene_id,
+                start=start,
+                primary_end=primary_end,
+                text=text,
+            )
+            ordinal += 1
     return result
 
 
 def _assess_anchored(
     value: BaseModel,
     snapshot: OutlineReviewSnapshot,
-    anchors: Mapping[str, tuple[int, int, str]],
+    anchors: Mapping[str, _ProseAnchor],
 ) -> dict[str, Any]:
     payload = value.model_dump(mode="json")
     if payload.pop("view_digest") != snapshot.view_digest:
@@ -290,7 +386,14 @@ def _assess_anchored(
                 anchor = anchors.get(span["anchor_id"])
                 if anchor is None:
                     raise invalid_quote("review_anchor_unknown")
-                start, primary_end, text = anchor
+                if (
+                    field in {"beat_evidence", "scene_quality_profiles"}
+                    and anchor.scene_id != item.get("scene_id")
+                ):
+                    raise invalid_quote("review_quote_scene_mismatch")
+                start, primary_end, text = (
+                    anchor.start, anchor.primary_end, anchor.text
+                )
                 quote = span["quote"]
                 offset = text.find(quote)
                 if offset < 0 or start + offset >= primary_end:
@@ -352,7 +455,14 @@ class IndependentOutlineReviewer:
                 "source_content_digest": snapshot.source_content_digest,
                 "outline": json.loads(snapshot.outline_json),
                 "authorized_context": snapshot.authorized_context,
-                "anchors": [{"anchor_id": key, "text": item[2]} for key, item in anchors.items()],
+                "anchors": [
+                    {
+                        "anchor_id": key,
+                        "scene_id": item.scene_id,
+                        "text": item.text,
+                    }
+                    for key, item in anchors.items()
+                ],
             },
         })
         offset = len(self._runtime.attempts)
