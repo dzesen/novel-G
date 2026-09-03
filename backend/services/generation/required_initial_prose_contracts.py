@@ -139,7 +139,7 @@ def build_required_initial_prose_authorization(
         "provider_model": generation.provider_model,
         "generation_plan_digest": stable_digest(asdict(generation)),
         "execution_plan_digest": stable_digest(execution.to_dict()),
-        "max_calls": execution.scheduled_base_call_count,
+        "max_calls": execution.maximum_base_call_count,
         "input_tokens_per_call": INITIAL_PROSE_INPUT_BOUND,
         "output_tokens_per_call": generation.max_output_tokens,
         "timeout_seconds_per_call": generation.timeout_seconds,

@@ -286,6 +286,12 @@ def _validated_initial_attempts(
                 "target": expected is not None
                 and segment.get("target_word_count")
                 == expected["target_word_count"],
+                "output_capacity": expected is not None
+                and (
+                    "output_capacity_word_estimate" not in expected
+                    or segment.get("output_capacity_word_estimate")
+                    == expected["output_capacity_word_estimate"]
+                ),
                 "scene_call": segment.get("scene_call_index")
                 == len(scene_calls),
                 "text": isinstance(text, str),

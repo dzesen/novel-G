@@ -12,17 +12,23 @@ from backend.llm.schemas.novel_pydantic import (
 
 SCENE_CONTINUATION_V3_PROTOCOL_REVISION = "scene-continuation-v3"
 CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION = (
-    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.9"
+    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.10"
 )
 SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISION = (
     CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
 )
+SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISIONS = frozenset({
+    f"{SCENE_CONTINUATION_V3_PROTOCOL_REVISION}.9",
+    SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISION,
+})
+SEMANTIC_SCENE_DISPATCH_PROTOCOL_REVISION = (
+    CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+)
 
-# V2 scene contracts carry an explicit planning range, but a single Provider
-# call can materially overshoot its approximate word target. Keep each planned
-# base request small enough to bound cost and context. Since v3.9, semantic
-# scene evidence -- not this range -- decides whether the prose is complete.
-MAX_V2_SCENE_BASE_CALL_TARGET_WORDS = 600
+# v3.4--v3.9 capped every V2 base request at 600 words.  Retain the value only
+# as historical protocol documentation; v3.10 uses the Provider-derived output
+# capacity as a resource ceiling and no longer turns it into narrative slices.
+LEGACY_MAX_V2_SCENE_BASE_CALL_TARGET_WORDS = 600
 
 # This constant is part of the v3 continuation protocol, not a user control.
 # Keep it here so dispatch, readiness and protocol identity move together when
@@ -35,13 +41,17 @@ AUTOMATIC_PROSE_SEQUENCE_FLOOR = 1_000_000
 
 
 def v2_scene_base_call_safe_output_budget(safe_output_budget: Any) -> int:
-    """Apply the V2 per-call word ceiling to a Provider-derived safe budget."""
+    """Normalize the Provider-derived v3.10 capacity for one prose call.
+
+    This value is a resource ceiling.  It must never be presented to the model
+    as a required narrative chunk size.
+    """
 
     try:
         parsed = int(safe_output_budget)
     except (TypeError, ValueError):
         parsed = 1
-    return min(max(1, parsed), MAX_V2_SCENE_BASE_CALL_TARGET_WORDS)
+    return max(1, parsed)
 
 
 def maximum_v2_chapter_base_calls(
@@ -54,8 +64,9 @@ def maximum_v2_chapter_base_calls(
 
     For positive scene targets with a fixed sum, the conservative bound is
     ``ceil(total / effective_call_budget) + scene_count - 1``.  The effective
-    call budget must remain Provider-specific: a model configured below the
-    600-word seam needs more calls than the default 103-call ceiling.
+    call budget remains Provider-specific, so readiness reserves every
+    possible length-only continuation without exposing that partition to the
+    model as a narrative requirement.
     """
 
     if (
@@ -80,10 +91,10 @@ def maximum_v2_chapter_base_calls(
 
 
 def scene_continuation_seam_window_characters(scene_target_words: Any) -> int:
-    """Return the fixed v3.9 tail window for every logical scene.
+    """Return the fixed v3.9+ tail window for every logical scene.
 
     ``scene_target_words`` remains part of this stable call boundary because
-    readiness and the executor share it, but v3.9 intentionally does not
+    readiness and the executor share it, but v3.9+ intentionally does not
     derive model-visible context from the target.  The prior v3.2 expansion
     added cost without an observed benefit in the four-cell retest.
     """
@@ -100,7 +111,9 @@ def uses_scene_evidence_first_completion(
 
     The reason-code check prevents legacy outlines, which have no required-beat
     evidence contract, from losing their historical anti-truncation floor.
-    Exact revision matching also keeps recovery of pre-v3.9 plans deterministic.
+    v3.9 and v3.10 share the evidence-first completion rule.  Keeping both
+    explicit prevents a protocol bump from silently restoring the historical
+    word-count gate when old candidates are audited.
     """
 
     try:
@@ -109,7 +122,30 @@ def uses_scene_evidence_first_completion(
         return False
     return bool(
         str(protocol_revision or "")
-        == SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISION
+        in SCENE_EVIDENCE_FIRST_COMPLETION_PROTOCOL_REVISIONS
+        and "scene_contract_word_budgets" in reasons
+    )
+
+
+def uses_semantic_scene_dispatch(
+    *,
+    protocol_revision: Any,
+    plan_reason_codes: Any,
+) -> bool:
+    """Return whether initial prose is dispatched by semantic scene.
+
+    Only v3.10 plans get this behavior.  Persisted v3.9 plans keep their exact
+    600-word base-part identities and remain deterministically replayable.
+    """
+
+    try:
+        reasons = {str(item) for item in plan_reason_codes}
+    except TypeError:
+        return False
+    return bool(
+        str(protocol_revision or "")
+        == SEMANTIC_SCENE_DISPATCH_PROTOCOL_REVISION
+        and "scene_contract_semantic_scene_calls" in reasons
         and "scene_contract_word_budgets" in reasons
     )
 

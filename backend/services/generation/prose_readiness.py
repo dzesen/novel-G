@@ -18,6 +18,9 @@ from backend.services.generation.prose_continuation import (
     ProseContinuationPolicy,
     prose_authorization_module,
 )
+from backend.services.generation.prose_generation import (
+    planned_base_call_output_capacity_words,
+)
 from backend.services.generation.prose_protocol import (
     scene_continuation_seam_window_characters,
 )
@@ -133,7 +136,8 @@ def runtime_scene_prompt_input_bounds(
     renderer with the largest possible UTF-8 continuation tail and every
     continuation mode, then applies the same input formula as
     ``GenerationRuntime._conservative_token_bound``.  The returned pair is
-    input-only; callers add the target-derived output cap for each call kind.
+    input-only; callers add the independently planned output-capacity bound for
+    each call kind.
     """
     # Local imports keep this pure module usable by the lightweight readiness
     # tools without creating a module-import cycle at startup.
@@ -153,21 +157,29 @@ def runtime_scene_prompt_input_bounds(
 
     base_inputs: list[int] = []
     for spec in _call_specs(execution_plan):
-        prompt = _scene_prompt(
-            plan=execution_plan,
-            base_prompt=base_prompt,
-            outline=normalized_outline,
-            scene_index=int(spec.scene_index),
-            target_words=int(spec.target_words),
-            prior_text=maximum_tail,
-            prompt_mode="base",
-        )
-        base_inputs.append(
-            conservative_prompt_input_bound(
-                prompt=prompt,
-                system_prompt=system_prompt,
+        # Cover both base prompt shapes: a length continuation carrying the
+        # current-scene tail, and the first call of a later scene carrying the
+        # preceding-scene tail.  Runtime uses at most one of these tails.
+        for current_scene_text, previous_scene_text in (
+            (maximum_tail, ""),
+            ("", maximum_tail),
+        ):
+            prompt = _scene_prompt(
+                plan=execution_plan,
+                base_prompt=base_prompt,
+                outline=normalized_outline,
+                scene_index=int(spec.scene_index),
+                target_words=int(spec.target_words),
+                prior_text=current_scene_text,
+                previous_scene_text=previous_scene_text,
+                prompt_mode="base",
             )
-        )
+            base_inputs.append(
+                conservative_prompt_input_bound(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                )
+            )
 
     continuation_inputs: list[int] = []
     for scene_index in range(max(1, int(execution_plan.scene_count))):
@@ -236,10 +248,12 @@ def build_prose_readiness(
     generation_kwargs: Mapping[str, Any] | None,
 ) -> ProseReadiness:
     provider_identity = _provider_identity(generation_plan)
-    maximum_base_call_target = max(execution_plan.segment_budgets or (1,))
+    maximum_base_call_output_capacity = max(
+        planned_base_call_output_capacity_words(execution_plan) or (1,)
+    )
     inherited_max_tokens = dict(generation_kwargs or {}).get("max_tokens")
     base_output_token_bound = v3_output_token_bound(
-        target_words=maximum_base_call_target,
+        target_words=maximum_base_call_output_capacity,
         inherited_max_tokens=inherited_max_tokens,
     )
     continuation_output_token_bound = v3_output_token_bound(
@@ -295,7 +309,7 @@ def build_prose_readiness(
         authorization_revision=authorization_revision,
         content_identity=content_identity,
         provider_plan_revision=provider_plan_revision,
-        scheduled_base_calls=execution_plan.scheduled_base_call_count,
+        scheduled_base_calls=execution_plan.maximum_base_call_count,
         scene_count=execution_plan.scene_count,
         conservative_token_bound=conservative_bound,
         base_output_token_bound=base_output_token_bound,

@@ -1,9 +1,11 @@
-"""Execute a prose plan through one bounded call per planned segment.
+"""Execute a prose plan through bounded semantic-scene calls.
 
-This module owns segmentation and deterministic assembly. It knows nothing about
-HTTP, MongoDB, jobs, or a concrete Provider; callers inject the streaming Adapter
-and persist both the pre-dispatch checkpoint and terminal segment through
-``on_segment``.
+For the current V2 protocol, one call is scheduled per semantic scene and extra
+Provider-capacity slots remain dormant until a real output-limit termination.
+Historical plans keep their persisted fixed-part layout.  This module knows
+nothing about HTTP, MongoDB, jobs, or a concrete Provider; callers inject the
+streaming Adapter and persist both the pre-dispatch checkpoint and terminal
+segment through ``on_segment``.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from backend.services.generation.prose_completion import (
 from backend.services.generation.prose_continuation import ProseContinuationPolicy
 from backend.services.generation.prose_protocol import (
     is_scene_continuation_v3_family,
+    uses_semantic_scene_dispatch,
 )
 from backend.services.novel.chapter_service import count_chapter_words
 
@@ -60,6 +63,9 @@ class _CallSpec:
     part_index: int
     part_count: int
     target_words: int
+    # v3.10 keeps the semantic scene target separate from the Provider output
+    # ceiling.  ``None`` preserves the exact identity of historical plans.
+    output_capacity_words: int | None = None
 
 
 async def _notify(callback: Callable[[Any], Any] | None, value: Any) -> None:
@@ -75,7 +81,41 @@ def _split_budget(total: int, count: int) -> list[int]:
     return [base + (1 if index >= count - remainder else 0) for index in range(count)]
 
 
+def _capacity_call_count(total: int, capacity: int) -> int:
+    """Return a resource reserve count without creating narrative slices."""
+
+    return max(1, math.ceil(max(1, int(total)) / max(1, int(capacity))))
+
+
 def _call_specs(plan: ProseExecutionPlan) -> list[_CallSpec]:
+    semantic_scene_dispatch = uses_semantic_scene_dispatch(
+        protocol_revision=plan.protocol_revision,
+        plan_reason_codes=plan.reason_codes,
+    )
+    if semantic_scene_dispatch:
+        specs: list[_CallSpec] = []
+        sequence = 0
+        for scene_index, scene_budget in enumerate(plan.segment_budgets):
+            part_count = _capacity_call_count(
+                scene_budget,
+                plan.safe_output_budget,
+            )
+            for part_index in range(part_count):
+                specs.append(
+                    _CallSpec(
+                        sequence_index=sequence,
+                        scene_index=scene_index,
+                        part_index=part_index,
+                        part_count=part_count,
+                        # Every reserve still belongs to the whole semantic
+                        # scene.  The Provider ceiling is a separate resource
+                        # value and is deliberately not a residual word target.
+                        target_words=max(1, int(scene_budget)),
+                        output_capacity_words=plan.safe_output_budget,
+                    )
+                )
+                sequence += 1
+        return specs
     if plan.mode == "single_call":
         return [
             _CallSpec(
@@ -107,8 +147,19 @@ def _call_specs(plan: ProseExecutionPlan) -> list[_CallSpec]:
 
 
 def planned_base_call_target_words(plan: ProseExecutionPlan) -> tuple[int, ...]:
-    """Expose the exact v3/legacy base-call targets without executing them."""
+    """Expose the semantic/legacy target identity for each base call."""
     return tuple(spec.target_words for spec in _call_specs(plan))
+
+
+def planned_base_call_output_capacity_words(
+    plan: ProseExecutionPlan,
+) -> tuple[int, ...]:
+    """Expose the resource ceiling used to bound each base Provider call."""
+
+    return tuple(
+        max(1, int(spec.output_capacity_words or spec.target_words))
+        for spec in _call_specs(plan)
+    )
 
 
 def planned_base_call_contracts(
@@ -116,16 +167,22 @@ def planned_base_call_contracts(
 ) -> tuple[dict[str, int], ...]:
     """Expose stable per-call identities for durable execution evidence."""
 
-    return tuple(
-        {
+    contracts: list[dict[str, int]] = []
+    for spec in _call_specs(plan):
+        contract = {
             "sequence_index": spec.sequence_index,
             "scene_index": spec.scene_index,
             "part_index": spec.part_index,
             "part_count": spec.part_count,
             "target_word_count": spec.target_words,
         }
-        for spec in _call_specs(plan)
-    )
+        if spec.output_capacity_words is not None:
+            contract["output_capacity_word_estimate"] = max(
+                1,
+                int(spec.output_capacity_words),
+            )
+        contracts.append(contract)
+    return tuple(contracts)
 
 
 def _segment_prompt(

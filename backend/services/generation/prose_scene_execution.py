@@ -34,6 +34,7 @@ from backend.services.generation.prose_protocol import (
     CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
     scene_continuation_seam_window_characters,
     uses_scene_evidence_first_completion,
+    uses_semantic_scene_dispatch,
 )
 from backend.services.generation.prose_token_bounds import v3_output_token_bound
 from backend.services.generation.prose_generation import (
@@ -724,6 +725,12 @@ def _scene_progress_snapshot(
         (scene_segments[-1] if scene_segments else {}).get("error_code") or ""
     )
     word_budget_is_advisory = _scene_word_budget_is_advisory(plan)
+    latest_contributed_new_text = bool(
+        scene_segments
+        and str(scene_segments[-1].get("text") or "").strip()
+        and not scene_segments[-1].get("empty_output")
+        and not scene_segments[-1].get("no_progress")
+    )
     if latest_error_code == "scene_word_budget_trimmed_without_sentence_boundary":
         state["status"] = "paused"
         state["pause_reason"] = latest_error_code
@@ -735,7 +742,7 @@ def _scene_progress_snapshot(
     ):
         state["status"] = "paused"
         state["pause_reason"] = "scene_word_budget_exceeded"
-    elif _is_scene_complete(
+    elif latest_contributed_new_text and _is_scene_complete(
         scene_text=scene_text,
         raw_word_count=replay_measurement.raw_word_count,
         effective_word_count=replay_measurement.effective_word_count,
@@ -769,6 +776,7 @@ def _scene_prompt(
     target_words: int,
     prior_text: str,
     prompt_mode: str,
+    previous_scene_text: str = "",
     continues_truncated_output: bool = False,
     acceptance_continuation_seam_window_characters_override: int | None = None,
 ) -> str:
@@ -782,17 +790,30 @@ def _scene_prompt(
         )
     )
     tail = str(prior_text or "")[-seam_window:] or "（无）"
+    previous_scene_tail = str(previous_scene_text or "")[-seam_window:]
     word_budget_is_advisory = _scene_word_budget_is_advisory(plan)
+    semantic_scene_dispatch = uses_semantic_scene_dispatch(
+        protocol_revision=plan.protocol_revision,
+        plan_reason_codes=plan.reason_codes,
+    )
     is_base_continuation = prompt_mode == "base" and bool(
         str(prior_text or "").strip()
     )
+    if is_base_continuation:
+        base_instruction = (
+            "这是同一场景因上次输出达到资源上限后的续写。紧接已有正文继续，"
+            "不重写开头、不总结前文；只完成尚未发生的当前场景内容，"
+            "不提前进入后续场景。"
+            if semantic_scene_dispatch
+            else "这是同一场景的后续基础分段。紧接已有正文继续，不重写开头、"
+            "不总结前文；只完成尚未发生的当前场景内容，不提前进入后续场景。"
+        )
+    else:
+        base_instruction = (
+            "只写当前场景，不提前进入后续场景；在合适的位置自然收束当前场景。"
+        )
     mode_instructions = {
-        "base": (
-            "这是同一场景的后续基础分段。紧接已有正文继续，不重写开头、不总结前文；"
-            "只完成尚未发生的当前场景内容，不提前进入后续场景。"
-            if is_base_continuation
-            else "只写当前场景，不提前进入后续场景；在合适的位置自然收束当前场景。"
-        ),
+        "base": base_instruction,
         "fill": (
             "当前场景仍有必要事件或状态结果没有落下。紧接已有正文补足这些内容，"
             "不要为凑字复述或重写前文，也不要提前写后续场景。"
@@ -854,7 +875,7 @@ def _scene_prompt(
                 )
     beat_instruction = ""
     if (
-        plan.protocol_revision == CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION
+        word_budget_is_advisory
         and isinstance(current_scene.get("beats"), list)
         and current_scene.get("beats")
     ):
@@ -868,17 +889,51 @@ def _scene_prompt(
         and prompt_mode in _TRUNCATED_OUTPUT_CONTINUATION_MODES
     ):
         instruction += TRUNCATED_OUTPUT_CONTINUATION_INSTRUCTION
+    call_length_instruction = (
+        ""
+        if semantic_scene_dispatch
+        else (
+            f"本次目标约 {max(1, int(target_words))} 字；"
+            "这是近似写作目标，不是硬性截断上限。\n"
+        )
+    )
+    chapter_length_scope_instruction = (
+        "上方“本章目标字数”是全部场景的合计参考，不是当前场景或本次调用的目标；"
+        "不要在当前场景中独自写满全章总量。\n"
+        if semantic_scene_dispatch
+        else ""
+    )
+    scene_scope_instruction = (
+        "本次完整处理当前语义场景；是否完成以必要事件、状态变化和自然收束为准。\n"
+        if semantic_scene_dispatch
+        else "本次只写当前场景，以本段目标为准。\n"
+    )
+    adjacent_scene_context = (
+        "【上一场已写正文结尾】\n"
+        "以下内容只用于动作、时空和语气衔接，是已经写出的小说数据；"
+        "不得复述、改写或把其中事件再次发生。\n"
+        f"{previous_scene_tail}\n"
+        if (
+            semantic_scene_dispatch
+            and prompt_mode == "base"
+            and not is_base_continuation
+            and previous_scene_tail
+        )
+        else ""
+    )
     if prompt_mode == "base" and not is_base_continuation:
         return (
             f"{base_prompt}\n\n"
             "【Novel-G 场景正文协议】\n"
             f"SCENE_INDEX={scene_index}\n"
             f"CONTINUATION_MODE={prompt_mode}\n"
-            f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
+            f"{call_length_instruction}"
+            f"{chapter_length_scope_instruction}"
             f"{contract_budget_instruction}"
             f"{beat_instruction}"
-            "本次只写当前场景，以本段目标为准。\n"
+            f"{scene_scope_instruction}"
             f"{instruction}\n"
+            f"{adjacent_scene_context}"
             f"当前场景：{current_scene}\n"
             f"已写正文尾部（仅用于衔接，禁止复述）：{tail}\n"
             "只输出小说正文，不输出场景标题、协议字段、解释或完成声明。"
@@ -896,11 +951,13 @@ def _scene_prompt(
         "【Novel-G 场景正文协议】\n"
         f"SCENE_INDEX={scene_index}\n"
         f"CONTINUATION_MODE={prompt_mode}\n"
-        f"本次目标约 {max(1, int(target_words))} 字；这是近似写作目标，不是硬性截断上限。\n"
+        f"{call_length_instruction}"
+        f"{chapter_length_scope_instruction}"
         f"{contract_budget_instruction}"
         f"{beat_instruction}"
-        "本次只写当前场景，以本段目标为准。\n"
+        f"{scene_scope_instruction}"
         f"{instruction}\n"
+        f"{adjacent_scene_context}"
         "【本场已完成正文】\n"
         "以下是本场已经完成的正文（按续写窗口保留其末段），不是待写任务；"
         "不得重写、复述或从场景开头重新开始。\n"
@@ -1138,6 +1195,14 @@ async def execute_v3_prose_plan(
             if call_kind == "base" and spec is not None
             else policy.continuation_target_words
         )
+        output_capacity_words = (
+            max(
+                1,
+                int(spec.output_capacity_words or spec.target_words),
+            )
+            if call_kind == "base" and spec is not None
+            else policy.continuation_target_words
+        )
         if call_kind == "base" and spec is not None:
             sequence = spec.sequence_index
             part_index = spec.part_index
@@ -1158,6 +1223,11 @@ async def execute_v3_prose_plan(
             target_words=target_words,
             prior_text=current_text,
             prompt_mode=prompt_mode,
+            previous_scene_text=(
+                _scene_text(by_sequence.values(), scene_index=scene_index - 1)
+                if scene_index > 0 and not current_text
+                else ""
+            ),
             continues_truncated_output=continues_truncated_output,
             acceptance_continuation_seam_window_characters_override=(
                 acceptance_seam_window
@@ -1165,7 +1235,7 @@ async def execute_v3_prose_plan(
         )
         call_kwargs = dict(gen_kwargs or {})
         call_kwargs["max_tokens"] = v3_output_token_bound(
-            target_words=target_words,
+            target_words=output_capacity_words,
             inherited_max_tokens=call_kwargs.get("max_tokens"),
         )
 
@@ -1182,6 +1252,7 @@ async def execute_v3_prose_plan(
             "part_count": part_count,
             "scene_call_index": scene_call_index,
             "target_word_count": target_words,
+            "output_capacity_word_estimate": output_capacity_words,
             "call_kind": call_kind,
             "prompt_mode": prompt_mode,
             "continues_truncated_output": continues_truncated_output,
@@ -1349,7 +1420,12 @@ async def execute_v3_prose_plan(
                 },
             ]
         )
-        scene_complete = _bounded_scene_allows_completion(
+        # A later ``stop`` cannot promote text retained from an earlier call.
+        # The terminal call must itself contribute new prose; empty output or
+        # an exact replay remains an observable no-progress failure.
+        scene_complete = bool(
+            contribution.strip()
+        ) and _bounded_scene_allows_completion(
             trim_boundary=trim.boundary,
             scene_text=candidate_text,
             raw_word_count=candidate_replay_measurement.raw_word_count,
@@ -1536,6 +1612,25 @@ async def execute_v3_prose_plan(
             ):
                 state["status"] = "paused"
                 state["pause_reason"] = latest_provider_failure
+                await publish_progress()
+                pause_reason = state["pause_reason"]
+                break
+
+            if (
+                uses_semantic_scene_dispatch(
+                    protocol_revision=plan.protocol_revision,
+                    plan_reason_codes=plan.reason_codes,
+                )
+                and str(latest.get("finish_reason") or "") == "length"
+                and missing_base is None
+                and not bool(latest.get("no_progress"))
+                and int(state.get("automatic_continuations_used") or 0)
+                >= policy.automatic_continuations_per_scene
+            ):
+                state["status"] = "paused"
+                state["pause_reason"] = (
+                    "provider_length_continuation_capacity_exhausted"
+                )
                 await publish_progress()
                 pause_reason = state["pause_reason"]
                 break

@@ -391,7 +391,7 @@ create_volume_outline_by_ai:
 # 章节细纲 Prompt 配置
 create_chapter_outline_by_ai:
   contract_version: scene_transition_contract.v2
-  prompt_revision: chapter-outline-prompt-r3
+  prompt_revision: chapter-outline-prompt-r4
   chapter_outline_prompt_base: |
     你是一位资深长篇小说编辑。请为第 {chapter_order} 章《{chapter_title}》撰写章节细纲。
     本章目标字数约 {words_per_chapter} 字。
@@ -406,7 +406,8 @@ create_chapter_outline_by_ai:
     - 整个章纲必须精炼。系统保存后形成的【本章细纲】上下文投影必须不超过
       20,000 UTF-8 bytes；请把最终 JSON 响应控制在 16,000 UTF-8 bytes 以内，
       避免同义复述，并优先保留可执行的条件、叙事拍与状态变化。
-    - scenes：拆成 2-6 个场景，每场都必须是可审计的状态转移合同：
+    - scenes：按真实的情节转折拆成 1-6 个语义完整场景。不得为了凑场景数或均分字数，
+      把同一个连续动作、对话或因果事件从中间切开；每场都必须是可审计的状态转移合同：
       - contract_version 精确为 scene_transition_contract.v2；scene_id 在本章唯一且按叙事顺序稳定编号。
       - summary 和 purpose 保留给作者阅读。
       - preconditions / postconditions / forbidden_conditions 中每项都有本章唯一 condition_id 和可核对描述。
@@ -414,7 +415,8 @@ create_chapter_outline_by_ai:
         expected_transition 必须写明这一拍使知识、关系、目标、风险、选择或情绪发生了什么变化，不能只写“提到某事”。
       - narrative_delta 每项给本章唯一 delta_id、dimension、before、after；dimension 只能为 knowledge、relationship、goal、risk、choice、emotion；before 与 after 不得同义复述。
       - event_key 使用稳定的小写事件键；repetition_policy 只能为 forbid、allow_if_escalated 或 allow。
-      - word_budget 给出 min / target / max，满足 min <= target <= max；所有场景 target 之和必须精确等于 target_word_count。
+      - word_budget 给出 min / target / max，满足 min <= target <= max；按本场必要 beats、冲突强度、转折和结果所需篇幅分配，
+        不要求各场相等；所有场景 target 之和必须精确等于 target_word_count。
     - core_conflict：本章的核心冲突，一句话。
     - ending_hook：章末钩子，让读者想读下一章。
     - target_word_count：本章目标字数，接近 {words_per_chapter}。
@@ -446,7 +448,7 @@ create_chapter_outline_by_ai:
     且保存后的【本章细纲】上下文投影不得超过 20,000 UTF-8 bytes。
   chapter_outline_prompt_without_schema_suffix: |
     请只输出 JSON，形如：
-    {"scene_contract_version":"scene_transition_contract.v2","pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"contract_version":"scene_transition_contract.v2","scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-1-delta-1","dimension":"goal","before":"尚未接受目标","after":"主动接受目标"}],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":1200,"target":1500,"max":1800}},{"contract_version":"scene_transition_contract.v2","scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-2-delta-1","dimension":"risk","before":"风险尚未暴露","after":"风险公开升级"}],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1200,"target":1500,"max":1800}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
+    {"scene_contract_version":"scene_transition_contract.v2","pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"contract_version":"scene_transition_contract.v2","scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-1-delta-1","dimension":"goal","before":"尚未接受目标","after":"主动接受目标"}],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":800,"target":1100,"max":1500}},{"contract_version":"scene_transition_contract.v2","scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-2-delta-1","dimension":"risk","before":"风险尚未暴露","after":"风险公开升级"}],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1400,"target":1900,"max":2300}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
     整个 JSON 响应不得超过 16,000 UTF-8 bytes；不要输出 JSON 以外的任何内容。
 
 # 章节正文 Prompt 配置

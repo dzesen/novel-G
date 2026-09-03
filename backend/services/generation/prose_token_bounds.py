@@ -10,7 +10,8 @@ TOKENS_PER_WORD_ESTIMATE = 0.65
 MIN_DERIVED_OUTPUT_TOKENS = 256
 # V26 reserves a bounded tail after the nominal word target so the Provider
 # can emit its natural stop instead of being cut off exactly at the estimate.
-# The scene word maximum remains a separate deterministic local gate.
+# Since v3.9, V2 scene word ranges are advisory; this token cap remains a
+# resource and cost boundary, not a narrative completion or trimming gate.
 NATURAL_STOP_HEADROOM_RATIO = 0.25
 MIN_NATURAL_STOP_HEADROOM_TOKENS = 256
 # The rendered prompt is counted in UTF-8 bytes, while this fixed allowance

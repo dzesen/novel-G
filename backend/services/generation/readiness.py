@@ -42,7 +42,7 @@ from backend.services.generation.prose_protocol import (
     v2_scene_base_call_safe_output_budget,
 )
 from backend.services.generation.prose_generation import (
-    planned_base_call_target_words,
+    planned_base_call_output_capacity_words,
 )
 from backend.services.generation.reference_card_auto_creation import (
     ReferenceCardAutoCreationPolicy,
@@ -1908,7 +1908,7 @@ def _plan_work_with_prose_continuation(
                 "maximum_automatic_continuation_calls": 0,
                 "maximum_logical_prose_calls": 0,
                 "max_actual_provider_attempts": 0,
-                "maximum_base_call_target_words": 0,
+                "maximum_base_call_output_capacity_words": 0,
                 "continuation_call_target_words": 0,
                 "base_output_token_bound": 0,
                 "continuation_output_token_bound": 0,
@@ -1958,15 +1958,17 @@ def _plan_work_with_prose_continuation(
     maximum_base_calls = 0
     estimated_scene_count = 0
     unknown_outline_chapters = 0
-    maximum_base_call_target_words = (
-        v2_scene_base_call_safe_output_budget(
-            capability_plan.safe_output_budget
-        )
-    )
+    maximum_base_call_output_capacity_words = 1
     for chapter in chapters_needing_prose:
         outline = chapter.get("outline") or {}
         if not outline:
             unknown_outline_chapters += 1
+            maximum_base_call_output_capacity_words = max(
+                maximum_base_call_output_capacity_words,
+                v2_scene_base_call_safe_output_budget(
+                    capability_plan.safe_output_budget
+                ),
+            )
             maximum_base_calls += maximum_v2_chapter_base_calls(
                 safe_output_budget=capability_plan.safe_output_budget,
             )
@@ -1986,16 +1988,16 @@ def _plan_work_with_prose_continuation(
             },
             request_overrides=overrides,
         )
-        maximum_base_calls += chapter_plan.scheduled_base_call_count
+        maximum_base_calls += chapter_plan.maximum_base_call_count
         estimated_scene_count += chapter_plan.scene_count
-        maximum_base_call_target_words = max(
-            maximum_base_call_target_words,
-            *planned_base_call_target_words(chapter_plan),
+        maximum_base_call_output_capacity_words = max(
+            maximum_base_call_output_capacity_words,
+            *planned_base_call_output_capacity_words(chapter_plan),
         )
 
     inherited_max_tokens = values.get("max_tokens")
     base_output_token_bound = v3_output_token_bound(
-        target_words=maximum_base_call_target_words,
+        target_words=maximum_base_call_output_capacity_words,
         inherited_max_tokens=inherited_max_tokens,
     )
     continuation_output_token_bound = v3_output_token_bound(
@@ -2102,8 +2104,8 @@ def _plan_work_with_prose_continuation(
         values,
         **({"runtime": runtime} if reuse_runtime else {}),
     )
-    maximum_call_target_words = max(
-        maximum_base_call_target_words,
+    maximum_call_output_capacity_words = max(
+        maximum_base_call_output_capacity_words,
         policy.continuation_target_words,
     )
     return {
@@ -2139,9 +2141,13 @@ def _plan_work_with_prose_continuation(
             "maximum_automatic_continuation_calls": maximum_automatic_calls,
             "maximum_logical_prose_calls": maximum_logical_calls,
             "max_actual_provider_attempts": maximum_logical_calls,
-            "maximum_base_call_target_words": maximum_base_call_target_words,
+            "maximum_base_call_output_capacity_words": (
+                maximum_base_call_output_capacity_words
+            ),
             "continuation_call_target_words": policy.continuation_target_words,
-            "maximum_call_target_words": maximum_call_target_words,
+            "maximum_call_output_capacity_words": (
+                maximum_call_output_capacity_words
+            ),
             "base_output_token_bound": base_output_token_bound,
             "continuation_output_token_bound": continuation_output_token_bound,
             "conservative_base_token_bound": conservative_base_token_bound,

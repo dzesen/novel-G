@@ -19,6 +19,7 @@ from backend.services.generation.prose_completion_contract import (
 from backend.services.generation.prose_protocol import (
     CURRENT_SCENE_CONTINUATION_PROTOCOL_REVISION,
     uses_scene_evidence_first_completion,
+    uses_semantic_scene_dispatch,
     v2_scene_base_call_safe_output_budget,
 )
 from backend.services.novel.chapter_service import count_chapter_words
@@ -46,11 +47,35 @@ class ProseExecutionPlan:
     max_continuations: int = field(default=0, compare=False, repr=False)
 
     @property
-    def scheduled_base_call_count(self) -> int:
+    def maximum_base_call_count(self) -> int:
+        """Maximum initial-prose calls, including length-only reserves."""
         return sum(
             max(1, math.ceil(budget / self.safe_output_budget))
             for budget in self.segment_budgets
         ) if self.mode == "scene_segments" else 1
+
+    @property
+    def scheduled_base_call_count(self) -> int:
+        """Calls scheduled before any Provider termination is observed.
+
+        A v3.10 V2 scene schedules one semantic call per scene.  Additional
+        Provider-capacity slots are dormant until a real ``length`` terminal.
+        Older protocols retain their historical fixed-part count.
+        """
+
+        if uses_semantic_scene_dispatch(
+            protocol_revision=self.protocol_revision,
+            plan_reason_codes=self.reason_codes,
+        ):
+            return max(1, self.scene_count)
+        return self.maximum_base_call_count
+
+    @property
+    def reserved_length_continuation_call_count(self) -> int:
+        return max(
+            0,
+            self.maximum_base_call_count - self.scheduled_base_call_count,
+        )
 
     @property
     def scheduled_call_count(self) -> int:
@@ -59,14 +84,14 @@ class ProseExecutionPlan:
 
     @property
     def call_count(self) -> int:
-        """Compatibility alias; v3 continuation calls are authorization-derived."""
-        return self.scheduled_base_call_count
+        """Compatibility alias for the maximum initial-prose call bound."""
+        return self.maximum_base_call_count
 
     def maximum_logical_call_count(
         self,
         policy: ProseContinuationPolicy,
     ) -> int:
-        return self.scheduled_base_call_count + (
+        return self.maximum_base_call_count + (
             self.scene_count * policy.automatic_continuations_per_scene
         )
 
@@ -84,6 +109,10 @@ class ProseExecutionPlan:
             "reason_codes": list(self.reason_codes),
             "protocol_revision": self.protocol_revision,
             "scheduled_base_call_count": self.scheduled_base_call_count,
+            "reserved_length_continuation_call_count": (
+                self.reserved_length_continuation_call_count
+            ),
+            "maximum_base_call_count": self.maximum_base_call_count,
             "scheduled_call_count": self.scheduled_call_count,
             "call_count": self.call_count,
         }
@@ -102,7 +131,7 @@ class ProseCompletion:
     completion_reason: str
     mode: Literal["single_call", "scene_segments"]
     reason_codes: tuple[str, ...]
-    # Length remains measurable and source-bound, but v3.9 V2 scene contracts
+    # Length remains measurable and source-bound, but v3.9+ V2 scene contracts
     # report its deviation without turning it into a completion failure.
     advisory_codes: tuple[str, ...] = ()
     # The raw assembled text remains the authoritative stored prose.  Scene-v3
@@ -197,16 +226,22 @@ class ProseCompletionModule:
         capability = provider_capability or {}
         overrides = request_overrides or {}
 
-        output_limit = _positive_int(capability.get("max_output_words"))
-        if output_limit is None:
-            output_tokens = (
-                _positive_int(overrides.get("max_tokens"))
-                or _positive_int(capability.get("max_output_tokens"))
-            )
-            if output_tokens is not None:
-                # Mixed Chinese/English prose varies substantially. Treat one output
-                # token as at most 0.65 Novel-G words so planning errs toward segments.
-                output_limit = max(1, math.floor(output_tokens * 0.65))
+        output_limits: list[int] = []
+        output_word_limit = _positive_int(capability.get("max_output_words"))
+        if output_word_limit is not None:
+            output_limits.append(output_word_limit)
+        output_tokens = (
+            _positive_int(overrides.get("max_tokens"))
+            or _positive_int(capability.get("max_output_tokens"))
+        )
+        if output_tokens is not None:
+            # Mixed Chinese/English prose varies substantially. Treat one output
+            # token as at most 0.65 Novel-G words so planning errs toward reserves.
+            output_limits.append(max(1, math.floor(output_tokens * 0.65)))
+        # An explicit Provider word capability remains a hard ceiling. The
+        # configured token value is a request default, so an authorized
+        # per-job token override replaces it rather than being capped by it.
+        output_limit = min(output_limits) if output_limits else None
 
         reason_codes: list[str] = []
         if output_limit is None:
@@ -220,12 +255,13 @@ class ProseCompletionModule:
             bounded_safe_budget = v2_scene_base_call_safe_output_budget(
                 safe_budget
             )
-            if bounded_safe_budget != safe_budget:
-                reason_codes.append("scene_contract_base_call_bound")
             safe_budget = bounded_safe_budget
+            reason_codes.append("scene_contract_semantic_scene_calls")
 
-        # Every multi-scene chapter is executed scene-by-scene in v3. A long
-        # one-scene chapter may still be split into base parts by output capacity.
+        # Every multi-scene chapter is executed scene-by-scene in v3.10. A
+        # scene larger than one Provider call reserves additional capacity,
+        # but those calls stay dormant unless the preceding call ends at the
+        # output limit.
         scene_count_requires_segmentation = scene_count >= 2
         mode: Literal["single_call", "scene_segments"] = (
             "scene_segments"

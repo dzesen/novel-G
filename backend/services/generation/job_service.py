@@ -1819,7 +1819,10 @@ class GenerationJobService:
         allow_divergence_stop: bool = False,
     ) -> bool:
         pause_reason = str(pending.get("pause_reason") or "")
-        if pause_reason != "automatic_continuations_exhausted" and not (
+        if pause_reason not in {
+            "automatic_continuations_exhausted",
+            "provider_length_continuation_capacity_exhausted",
+        } and not (
             allow_divergence_stop
             and pause_reason == "prose_scene_divergence_stopped"
         ):

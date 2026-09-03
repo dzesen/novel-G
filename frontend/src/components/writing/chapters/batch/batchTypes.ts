@@ -260,8 +260,9 @@ export interface GenerationReadiness {
       maximum_logical_prose_calls?: number;
       max_actual_provider_attempts?: number;
       estimated_prose_chapter_count?: number;
-      maximum_base_call_target_words?: number;
+      maximum_base_call_output_capacity_words?: number;
       continuation_call_target_words?: number;
+      maximum_call_output_capacity_words?: number;
       base_output_token_bound?: number;
       continuation_output_token_bound?: number;
       conservative_base_token_bound?: number;

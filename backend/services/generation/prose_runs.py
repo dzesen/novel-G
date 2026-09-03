@@ -389,6 +389,21 @@ def _stored_run_has_exhausted_segment(document: dict[str, Any]) -> bool:
     )
 
 
+_CONTINUATION_EXHAUSTION_PAUSE_REASONS = frozenset({
+    "automatic_continuations_exhausted",
+    "provider_length_continuation_capacity_exhausted",
+})
+
+
+def _stored_run_has_exhausted_continuation(document: dict[str, Any]) -> bool:
+    return _stored_run_has_exhausted_segment(document) or any(
+        str(item.get("pause_reason") or "")
+        in _CONTINUATION_EXHAUSTION_PAUSE_REASONS
+        for item in document.get("scene_progress") or []
+        if isinstance(item, Mapping)
+    )
+
+
 def _run_has_uncertain_attempt(document: dict[str, Any]) -> bool:
     return any(
         segment.get("status") == "uncertain"
@@ -585,11 +600,23 @@ def serialize_prose_run_telemetry(document: dict[str, Any]) -> dict[str, Any]:
     provider_plan = document.get("provider_plan") or {}
     authorization = document.get("prose_continuation_authorization") or {}
     policy = authorization.get("policy") or {}
-    scene_progress = _telemetry_scene_progress(document)
-    continuation_exhausted = _stored_run_has_exhausted_segment(document) or any(
-        item.get("pause_reason") == "automatic_continuations_exhausted"
-        for item in scene_progress
+    scheduled_base_calls = _safe_non_negative_int(
+        plan.get("scheduled_base_call_count", plan.get("call_count"))
     )
+    maximum_base_calls = _safe_non_negative_int(
+        plan.get(
+            "maximum_base_call_count",
+            plan.get("call_count", scheduled_base_calls),
+        )
+    )
+    reserved_length_calls = _safe_non_negative_int(
+        plan.get(
+            "reserved_length_continuation_call_count",
+            max(0, maximum_base_calls - scheduled_base_calls),
+        )
+    )
+    scene_progress = _telemetry_scene_progress(document)
+    continuation_exhausted = _stored_run_has_exhausted_continuation(document)
     return {
         "run_id": str(document["_id"]),
         "novel_id": str(document["novel_id"]),
@@ -611,9 +638,9 @@ def serialize_prose_run_telemetry(document: dict[str, Any]) -> dict[str, Any]:
                 plan.get("requested_word_count")
             ),
             "scene_count": _safe_non_negative_int(plan.get("scene_count")),
-            "scheduled_base_call_count": _safe_non_negative_int(
-                plan.get("scheduled_base_call_count", plan.get("call_count"))
-            ),
+            "scheduled_base_call_count": scheduled_base_calls,
+            "reserved_length_continuation_call_count": reserved_length_calls,
+            "maximum_base_call_count": maximum_base_calls,
             "protocol_revision": str(plan.get("protocol_revision") or ""),
         },
         "completion": {
@@ -992,7 +1019,7 @@ class ProseRunModule:
                     chapter.get("outline") or {},
                 )
             )
-            continuation_exhausted = _stored_run_has_exhausted_segment(run)
+            continuation_exhausted = _stored_run_has_exhausted_continuation(run)
             has_uncertain_attempt = _run_has_uncertain_attempt(run)
             has_live_lease = _run_has_live_lease(run)
             status = str(run.get("status") or "")

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 SCENE_TRANSITION_CONTRACT_VERSION = "scene_transition_contract.v2"
-CHAPTER_OUTLINE_PROMPT_REVISION = "chapter-outline-prompt-r3"
+CHAPTER_OUTLINE_PROMPT_REVISION = "chapter-outline-prompt-r4"
 LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION = (
     "chapter_outline_adherence_evidence.v2"
 )
