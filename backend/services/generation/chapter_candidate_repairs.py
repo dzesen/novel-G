@@ -42,6 +42,7 @@ from backend.services.generation.chapter_generation_application import (
     OUTLINE_ADHERENCE_STEP,
     PROSE_REMEDIATION_WORKFLOW,
     ProseCandidateSource,
+    build_prose_candidate_source,
     STATE_STEP,
     STATE_WORKFLOW,
     StateRepairGuidance,
@@ -892,12 +893,13 @@ class ChapterCandidateRepairApplication:
             "source_run_revision": revision,
             "source_run_digest": digest,
         })
-        return ProseCandidateSource(
+        return build_prose_candidate_source(
             text=text,
             source_run_id=run_id,
             source_run_revision=revision,
             source_content_digest=digest,
             completion=completion,
+            run=run,
         )
 
     async def recover_source(
@@ -1028,12 +1030,13 @@ class ChapterCandidateRepairApplication:
             "source_run_revision": marker.candidate_revision,
             "source_run_digest": marker.content_digest,
         })
-        source = ProseCandidateSource(
+        source = build_prose_candidate_source(
             text=text,
             source_run_id=request.source_run_id,
             source_run_revision=marker.candidate_revision,
             source_content_digest=marker.content_digest,
             completion=completion,
+            run=run,
         )
         generation = ChapterGenerationResult(
             stage=ChapterGenerationStage.PROSE,
@@ -1041,7 +1044,7 @@ class ChapterCandidateRepairApplication:
             usage=dict(usage),
             attempts=[dict(item) for item in attempts],
             truncation={},
-            completion=completion,
+            completion=dict(source.completion),
             accepted=False,
         )
         return ProseCandidateRepairReceipt(
@@ -1231,12 +1234,13 @@ class ChapterCandidateRepairApplication:
             "source_run_revision": repaired_revision,
             "source_run_digest": repaired_digest,
         })
-        source = ProseCandidateSource(
+        source = build_prose_candidate_source(
             text=repaired_text,
             source_run_id=request.source_run_id,
             source_run_revision=repaired_revision,
             source_content_digest=repaired_digest,
             completion=completion,
+            run=repaired_run,
         )
         generation = ChapterGenerationResult(
             stage=ChapterGenerationStage.PROSE,
@@ -1244,7 +1248,7 @@ class ChapterCandidateRepairApplication:
             usage=usage,
             attempts=attempts,
             truncation={},
-            completion=completion,
+            completion=dict(source.completion),
             accepted=False,
         )
         return ProseCandidateRepairReceipt(

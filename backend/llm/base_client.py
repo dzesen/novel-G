@@ -19,6 +19,12 @@ from backend.llm.stream_terminal import FinishReason
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 _THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
+_PRIVATE_REASONING_KEYS = frozenset({
+    "reasoning_content",
+    "reasoning",
+    "thinking",
+    "thinking_content",
+})
 
 
 class _ThinkStreamFilter:
@@ -176,7 +182,7 @@ class BaseLLMClient(ABC):
 
     @classmethod
     def _sanitize_raw_response(cls, payload: Any) -> Any:
-        """递归清洗原始响应中的 think 标签。"""
+        """递归清洗原始响应，且不保留 Provider 的私有思考正文。"""
         if isinstance(payload, str):
             return cls._sanitize_text_content(payload)
         if isinstance(payload, list):
@@ -184,7 +190,11 @@ class BaseLLMClient(ABC):
         if isinstance(payload, tuple):
             return tuple(cls._sanitize_raw_response(item) for item in payload)
         if isinstance(payload, dict):
-            return {key: cls._sanitize_raw_response(value) for key, value in payload.items()}
+            return {
+                key: cls._sanitize_raw_response(value)
+                for key, value in payload.items()
+                if str(key).strip().casefold() not in _PRIVATE_REASONING_KEYS
+            }
         return payload
 
     def _finalize_response(self, response: LLMResponse) -> LLMResponse:

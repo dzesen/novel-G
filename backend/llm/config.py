@@ -43,6 +43,12 @@ class LLMProviderConfig(BaseModel):
         default="prompt_json",
         description="结构化输出协议",
     )
+    thinking_mode: Literal["enabled", "disabled"] | None = Field(
+        default=None,
+        description=(
+            "显式冻结支持该协议的 Provider 思考模式；留空时沿用工作流或厂商默认"
+        ),
+    )
     supports_stream_usage: bool = Field(
         default=False,
         description=(

@@ -8,6 +8,7 @@ import time
 from copy import deepcopy
 from collections.abc import Awaitable, Callable
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,8 @@ PROBE_TOKEN = "probe-token-73"
 FUNCTION_TOOL_NAME = "report_provider_probe"
 FUNCTION_EXPECTED_TEXT = f"PROVIDER_FUNCTION_OK {PROBE_TOKEN}"
 SECRET_PATTERN = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|Bearer\s+[A-Za-z0-9._-]{12,})")
+_KIMI_K2_6_MODEL = "kimi-k2.6"
+_KIMI_OFFICIAL_HOSTS = frozenset({"api.moonshot.cn", "api.moonshot.ai"})
 
 
 class ProviderTestRequest(BaseModel):
@@ -148,7 +151,22 @@ def _default_client_factory(config: LLMProviderConfig, alias: str) -> BaseLLMCli
     return create_llm_client_from_config(config, provider_name=alias, require_enabled=False)
 
 
-def _build_probe_request(prompt: str) -> LLMRequest:
+def _is_official_kimi_k2_6(provider: LLMProviderConfig) -> bool:
+    """Return whether the generic probe needs the K2.6 compatibility profile."""
+
+    endpoint = urlsplit(provider.base_url.strip())
+    return (
+        provider.type == "openai"
+        and (endpoint.hostname or "").lower() in _KIMI_OFFICIAL_HOSTS
+        and provider.default_model.strip().lower() == _KIMI_K2_6_MODEL
+    )
+
+
+def _build_probe_request(
+    prompt: str,
+    *,
+    provider: LLMProviderConfig,
+) -> LLMRequest:
     """构造低成本的接口测试请求。
 
     Args:
@@ -157,9 +175,15 @@ def _build_probe_request(prompt: str) -> LLMRequest:
     Returns:
         可直接传入底层客户端的 LLM 请求。
     """
+    metadata = (
+        {"thinking_mode": "disabled"}
+        if _is_official_kimi_k2_6(provider)
+        else {}
+    )
     return LLMRequest(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=64,
+        metadata=metadata,
     )
 
 
@@ -363,7 +387,12 @@ async def test_llm_provider_capabilities(
         Returns:
             无。
         """
-        response = await client.text_generate(_build_probe_request(prompts["text_probe_prompt"]))
+        response = await client.text_generate(
+            _build_probe_request(
+                prompts["text_probe_prompt"],
+                provider=provider,
+            )
+        )
         log_provider_test_raw_response(
             alias,
             "connection",
@@ -382,7 +411,10 @@ async def test_llm_provider_capabilities(
             无。
         """
         chunks: list[str] = []
-        stream_request = _build_probe_request(prompts["stream_probe_prompt"]).model_copy(update={"stream": True})
+        stream_request = _build_probe_request(
+            prompts["stream_probe_prompt"],
+            provider=provider,
+        ).model_copy(update={"stream": True})
         async for chunk in client.stream_text(stream_request):
             chunks.append(chunk)
         full_text = "".join(chunks)
@@ -460,7 +492,10 @@ async def test_llm_provider_capabilities(
             provider.model_copy(update={"supports_stream_usage": True}),
             alias,
         )
-        stream_request = _build_probe_request(prompts["stream_probe_prompt"]).model_copy(
+        stream_request = _build_probe_request(
+            prompts["stream_probe_prompt"],
+            provider=provider,
+        ).model_copy(
             update={"stream": True}
         )
         async for _chunk in usage_client.stream_text(stream_request, usage_sink=seen.append):
@@ -488,7 +523,10 @@ async def test_llm_provider_capabilities(
             无。
         """
         response = await client.schema_generate(
-            _build_probe_request(prompts["json_schema_probe_prompt"]),
+            _build_probe_request(
+                prompts["json_schema_probe_prompt"],
+                provider=provider,
+            ),
             ProviderJsonProbeSchema,
         )
         log_provider_test_raw_response(
@@ -501,9 +539,18 @@ async def test_llm_provider_capabilities(
             raise ValueError("结构化响应字段不符合预期")
 
     async def run_json_object() -> None:
+        probe_request = _build_probe_request(
+            prompts["json_object_probe_prompt"],
+            provider=provider,
+        )
         response = await client.text_generate(
-            _build_probe_request(prompts["json_object_probe_prompt"]).model_copy(
-                update={"metadata": {"structured_output": "json_object"}}
+            probe_request.model_copy(
+                update={
+                    "metadata": {
+                        **(probe_request.metadata or {}),
+                        "structured_output": "json_object",
+                    }
+                }
             )
         )
         log_provider_test_raw_response(
@@ -525,7 +572,10 @@ async def test_llm_provider_capabilities(
             无。
         """
         response = await client.function_call_probe(
-            _build_probe_request(prompts["function_call_probe_prompt"]),
+            _build_probe_request(
+                prompts["function_call_probe_prompt"],
+                provider=provider,
+            ),
             _build_function_probe(prompts),
         )
         log_provider_test_raw_response(
@@ -563,24 +613,34 @@ async def test_llm_provider_capabilities(
 
     # 按 capability 取，不按下标：插入新能力时下标会静默错位。
     statuses = {item.capability: item.status for item in results}
+    structured_output = (
+        "schema_enforced"
+        if statuses.get("json_schema") == "passed"
+        else "json_object"
+        if statuses.get("json_object") == "passed"
+        else "prompt_json"
+    )
+    kimi_probe_profile = _is_official_kimi_k2_6(provider)
+    if kimi_probe_profile and statuses.get("json_object") == "passed":
+        # The generic capability check deliberately runs K2.6 without
+        # reasoning.  A dedicated Judge readiness remains a separate immutable
+        # contract even when it independently freezes the same mode.
+        structured_output = "json_object"
     recommendation = ProviderCapabilityRecommendation(
         supports_streaming=statuses.get("streaming") == "passed",
         supports_function_calling=statuses.get("function_calling") == "passed",
         supports_stream_usage=statuses.get("stream_usage") == "passed",
-        structured_output=(
-            "schema_enforced"
-            if statuses.get("json_schema") == "passed"
-            else "json_object"
-            if statuses.get("json_object") == "passed"
-            else "prompt_json"
-        ),
+        structured_output=structured_output,
     )
     passed_count = sum(1 for item in results if item.status == "passed")
+    summary = f"{passed_count}/{len(results)} 项测试通过，能力开关已生成建议值"
+    if kimi_probe_profile:
+        summary += "；K2.6 使用非思考低成本探针，不替代 Judge 合成探针"
     return ProviderTestResponse(
         alias=alias,
         provider_type=provider.type,
         model=provider.default_model,
-        summary=f"{passed_count}/{len(results)} 项测试通过，能力开关已生成建议值",
+        summary=summary,
         results=results,
         recommendations=recommendation,
     )

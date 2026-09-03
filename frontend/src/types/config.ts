@@ -13,6 +13,7 @@ export interface ProviderConfig {
   supports_function_calling: boolean;
   supports_stream_usage: boolean;
   structured_output: "prompt_json" | "json_object" | "schema_enforced";
+  thinking_mode?: "enabled" | "disabled" | null;
   has_api_key: boolean;
   /** 仅存在于浏览器草稿，永不放进 changes。 */
   api_key?: string;
@@ -356,6 +357,7 @@ export function newProviderConfig(): ProviderConfig {
     supports_stream_usage: false, has_api_key: false, api_key: "", api_key_mode: "keep",
     structured_output: "prompt_json",
     temperature: null, top_p: null, max_tokens: null, system_prompt: null,
+    thinking_mode: null,
     billing_currency: null, input_cost_per_million_tokens: null,
     output_cost_per_million_tokens: null, pricing_basis: null,
     presence_penalty: null, frequency_penalty: null,

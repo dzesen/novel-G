@@ -90,7 +90,18 @@ from backend.services.generation.required_chapter_state_contracts import (
     RequiredStateGenerationBinding,
 )
 from backend.services.generation.prose_scene_repair import (
+    SceneContractValidationProof,
     build_v2_scene_contract_proof_from_run,
+)
+from backend.services.generation.prose_protocol import (
+    uses_scene_evidence_first_completion,
+)
+from backend.services.generation.independent_outline_review import (
+    IndependentOutlineReviewer,
+    IndependentReviewPlan,
+    IndependentReviewFailureCode,
+    OutlineReviewSnapshot,
+    REVIEW_PROTOCOL as INDEPENDENT_REVIEW_PROTOCOL,
 )
 from backend.services.generation.prose_runs import prose_revision, prose_run_module
 from backend.services.generation.protected_generation_params import (
@@ -143,7 +154,10 @@ from backend.services.llm.workflow_runner import (
     parse_sse_event,
     run_workflow,
 )
-from backend.services.novel.chapter_service import ChapterService
+from backend.services.novel.chapter_service import (
+    ChapterService,
+    count_chapter_words,
+)
 from backend.services.novel.legacy_chapter_completion import (
     LegacyChapterCompletionProof,
     verify_legacy_chapter_completion_for_state,
@@ -175,6 +189,7 @@ STATE_WORKFLOW = "extract_chapter_state_by_ai"
 STATE_STEP = "chapter_state"
 PROSE_REMEDIATION_WORKFLOW = "remediate_chapter_prose_by_agent"
 OUTLINE_ADHERENCE_STEP = "outline_adherence"
+INDEPENDENT_REVIEW_MAX_RESPONSE_BYTES = 64_000
 
 OutlineAdherenceFailureReason = Literal[
     "adherence_provider_generation_failed",
@@ -243,6 +258,87 @@ class OutlineAdherenceWorkflowFailed(WorkflowFailed):
         self.diagnostic_evidence = "confirmed"
 
 
+_INDEPENDENT_REVIEW_FAILURE_CONTRACT: dict[
+    IndependentReviewFailureCode,
+    tuple[str, str, str],
+] = {
+    "review_uncertain": (
+        "provider_or_transport",
+        "unproven",
+        "独立审查存在未结算的 Provider 请求",
+    ),
+    "review_plan_stale": (
+        "configuration_or_authorization",
+        "confirmed",
+        "独立审查的冻结计划已经变化",
+    ),
+    "review_budget_exhausted": (
+        "authorization_or_budget",
+        "confirmed",
+        "独立审查超过冻结预算",
+    ),
+    "review_accounting_invalid": (
+        "accounting",
+        "confirmed",
+        "独立审查的请求账本未完整结算",
+    ),
+    "review_dispatch_rejected": (
+        "provider_or_transport",
+        "confirmed",
+        "独立审查请求在 Provider 派发前被拒绝",
+    ),
+    "review_not_natural_end": (
+        "provider_or_transport",
+        "confirmed",
+        "独立审查没有自然结束",
+    ),
+    "review_evidence_invalid": (
+        "validation_logic",
+        "confirmed",
+        "独立审查证据未通过本地校验",
+    ),
+    "review_response_limit": (
+        "validation_logic",
+        "confirmed",
+        "独立审查结构化结果超过本地上限",
+    ),
+    "review_generation_failed": (
+        "provider_or_transport",
+        "confirmed",
+        "独立审查生成调用失败",
+    ),
+}
+
+
+class IndependentOutlineReviewWorkflowFailed(WorkflowFailed):
+    """Content-free failure preserving the independent review boundary."""
+
+    def __init__(
+        self,
+        failure_code: IndependentReviewFailureCode,
+        *,
+        usage: dict[str, Any] | None = None,
+        attempts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        contract = _INDEPENDENT_REVIEW_FAILURE_CONTRACT.get(failure_code)
+        if contract is None:  # defensive runtime guard for untyped callers
+            raise ValueError("unknown independent review failure code")
+        category, evidence, message = contract
+        super().__init__(message, usage=usage, attempts=attempts)
+        self.reason_codes = (failure_code,)
+        self.diagnostic_category = category
+        self.diagnostic_code = failure_code
+        self.diagnostic_evidence = evidence
+        self.provider_request_not_dispatched = (
+            failure_code in {
+                "review_plan_stale",
+                "review_budget_exhausted",
+                "review_dispatch_rejected",
+            }
+            and not self.attempts
+        )
+
+
 def _outline_adherence_failure_reason(
     values: Any,
 ) -> OutlineAdherenceFailureReason | None:
@@ -304,6 +400,26 @@ def _outline_adherence_failure_payload(
     if safe_diagnostics:
         payload["diagnostics"] = safe_diagnostics
     return payload
+
+
+def _independent_review_failure_payload(
+    failure_code: IndependentReviewFailureCode,
+    *,
+    usage: Mapping[str, Any],
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    contract = _INDEPENDENT_REVIEW_FAILURE_CONTRACT.get(failure_code)
+    if contract is None:  # defensive runtime guard for untyped callers
+        raise ValueError("unknown independent review failure code")
+    return {
+        "success": False,
+        "failed_step": OUTLINE_ADHERENCE_STEP,
+        "error": contract[2],
+        "usage": dict(usage),
+        "attempts": list(attempts),
+        "reason_codes": [failure_code],
+        "review_failure_code": failure_code,
+    }
 
 
 def project_outline_adherence_generation_failure(
@@ -423,7 +539,77 @@ class ProseCandidateSource(BaseModel):
     source_run_id: str = ModelField(min_length=1)
     source_run_revision: int = ModelField(ge=0)
     source_content_digest: str = ModelField(min_length=64, max_length=64)
+    writer_model: str | None = ModelField(
+        default=None,
+        min_length=1,
+        max_length=240,
+    )
     completion: Mapping[str, Any]
+
+
+def resolve_prose_candidate_writer_model(
+    *,
+    completion: Mapping[str, Any],
+    run: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Read the author model from durable run evidence, never live config."""
+
+    completion_model = completion.get("source_provider_model")
+    provider_plan = (
+        run.get("provider_plan")
+        if isinstance(run, Mapping)
+        else None
+    )
+    run_model = (
+        provider_plan.get("provider_model")
+        if isinstance(provider_plan, Mapping)
+        else None
+    )
+    normalized_completion = (
+        completion_model.strip()
+        if isinstance(completion_model, str) and completion_model.strip()
+        else None
+    )
+    normalized_run = (
+        run_model.strip()
+        if isinstance(run_model, str) and run_model.strip()
+        else None
+    )
+    if (
+        normalized_run is not None
+        and normalized_completion is not None
+        and normalized_run != normalized_completion
+    ):
+        raise ValueError("正文候选的作者模型证据不一致")
+    return normalized_run or normalized_completion
+
+
+def build_prose_candidate_source(
+    *,
+    text: str,
+    source_run_id: str,
+    source_run_revision: int,
+    source_content_digest: str,
+    completion: Mapping[str, Any],
+    run: Mapping[str, Any] | None = None,
+) -> ProseCandidateSource:
+    """Build one candidate projection from the same durable writer evidence."""
+
+    projected_completion = dict(completion)
+    writer_model = resolve_prose_candidate_writer_model(
+        completion=projected_completion,
+        run=run,
+    )
+    if writer_model is not None:
+        projected_completion["source_provider_model"] = writer_model
+    return ProseCandidateSource(
+        text=text,
+        source_run_id=source_run_id,
+        source_run_revision=source_run_revision,
+        source_content_digest=source_content_digest,
+        writer_model=writer_model,
+        completion=projected_completion,
+    )
 
 
 class StateRepairGuidance(StateRepairDirective):
@@ -682,6 +868,75 @@ class _PreparedOutlineAdherence:
     prose: str
     outline: dict[str, Any]
     result_schema: type[BaseModel]
+    independent_plan: IndependentReviewPlan | None = None
+    independent_snapshot: OutlineReviewSnapshot | None = None
+
+
+def _build_independent_review_snapshot(
+    *,
+    candidate: ProseCandidateSource,
+    outline: Mapping[str, Any],
+    authorized_context: str,
+) -> OutlineReviewSnapshot:
+    """Bind the independent Judge to persisted semantic scene boundaries."""
+
+    proof = SceneContractValidationProof.model_validate(
+        dict(candidate.completion or {}).get("scene_contract_validation")
+    )
+    if proof.source_content_digest != candidate.source_content_digest:
+        raise ValueError("独立审查的分场证据没有绑定当前正文候选")
+    ranges: list[dict[str, Any]] = []
+    for entry in proof.scenes:
+        scene_text = candidate.text[entry.start:entry.end]
+        if (
+            chapter_content_digest(scene_text) != entry.content_digest
+            or count_chapter_words(scene_text) != entry.word_count
+        ):
+            raise ValueError("独立审查的分场证据未通过确定性校验")
+        ranges.append({
+            "scene_id": entry.scene_id,
+            "start": entry.start,
+            "end": entry.end,
+        })
+    return OutlineReviewSnapshot.create(
+        source_run_id=candidate.source_run_id,
+        source_run_revision=candidate.source_run_revision,
+        source_content_digest=candidate.source_content_digest,
+        prose=candidate.text,
+        outline=outline,
+        authorized_context=authorized_context,
+        scene_ranges=tuple(ranges),
+    )
+
+
+def _build_independent_review_plan(
+    *,
+    candidate: ProseCandidateSource,
+    generation_plan: GenerationPlan,
+) -> IndependentReviewPlan | None:
+    writer_model = str(candidate.writer_model or "").strip()
+    judge_model = str(generation_plan.provider_model or "").strip()
+    if (
+        not writer_model
+        or not judge_model
+        or writer_model.casefold() == judge_model.casefold()
+    ):
+        return None
+    max_output_tokens = generation_plan.max_output_tokens
+    max_context_tokens = generation_plan.max_context_tokens
+    if (
+        type(max_output_tokens) is not int
+        or max_output_tokens < 1
+        or type(max_context_tokens) is not int
+        or max_context_tokens <= max_output_tokens
+    ):
+        raise ValueError("独立审查缺少完整的上下文与输出预算")
+    return IndependentReviewPlan(
+        generation=generation_plan,
+        writer_model=writer_model,
+        input_token_bound=max_context_tokens - max_output_tokens,
+        max_response_bytes=INDEPENDENT_REVIEW_MAX_RESPONSE_BYTES,
+    )
 
 
 @dataclass(frozen=True)
@@ -870,6 +1125,16 @@ class ChapterGenerationApplicationService:
                 failure = event.data
         if failure is not None:
             if isinstance(prepared, _PreparedOutlineAdherence):
+                review_failure_code = failure.get("review_failure_code")
+                if review_failure_code in _INDEPENDENT_REVIEW_FAILURE_CONTRACT:
+                    raise IndependentOutlineReviewWorkflowFailed(
+                        review_failure_code,
+                        usage=(
+                            failure.get("usage")
+                            or failure.get("usage_so_far")
+                        ),
+                        attempts=failure.get("attempts"),
+                    )
                 reason_code = _outline_adherence_failure_reason(
                     failure.get("reason_codes")
                 )
@@ -1489,8 +1754,6 @@ class ChapterGenerationApplicationService:
             if candidate is not None
             else str(chapter.get("content") or "")
         )
-        if candidate is not None:
-            self._validate_prose_candidate(candidate)
         if not content.strip():
             raise ValueError("本章尚无可供细纲符合度检查的正文")
         if not chapter.get("outline"):
@@ -1499,6 +1762,11 @@ class ChapterGenerationApplicationService:
         uses_versioned_evidence = require_known_scene_contract_version(outline) == (
             SCENE_TRANSITION_CONTRACT_VERSION
         )
+        if candidate is not None:
+            self._validate_prose_candidate(
+                candidate,
+                require_writer_identity=uses_versioned_evidence,
+            )
         if uses_versioned_evidence and candidate is None:
             raise ValueError("版本化 beat 证据必须绑定精确正文候选")
 
@@ -1575,6 +1843,23 @@ class ChapterGenerationApplicationService:
                 )
             )
         )
+        independent_plan = (
+            _build_independent_review_plan(
+                candidate=candidate,
+                generation_plan=plan,
+            )
+            if uses_versioned_evidence and candidate is not None
+            else None
+        )
+        independent_snapshot = (
+            _build_independent_review_snapshot(
+                candidate=candidate,
+                outline=outline,
+                authorized_context=context.to_prompt_text(),
+            )
+            if independent_plan is not None and candidate is not None
+            else None
+        )
         return _PreparedOutlineAdherence(
             command=command,
             chapter=chapter,
@@ -1594,12 +1879,15 @@ class ChapterGenerationApplicationService:
                 if uses_versioned_evidence
                 else ChapterOutlineAdherenceResultSchema
             ),
+            independent_plan=independent_plan,
+            independent_snapshot=independent_snapshot,
         )
 
     @staticmethod
     def _validate_prose_candidate(
         candidate: ProseCandidateSource,
         *,
+        require_writer_identity: bool = False,
         required_state_generation_binding: (
             RequiredStateGenerationBinding | None
         ) = None,
@@ -1607,6 +1895,18 @@ class ChapterGenerationApplicationService:
         if chapter_content_digest(candidate.text) != candidate.source_content_digest:
             raise ValueError("正文候选摘要与候选内容不一致")
         completion = dict(candidate.completion or {})
+        durable_writer_model = resolve_prose_candidate_writer_model(
+            completion=completion,
+        )
+        if require_writer_identity and (
+            candidate.writer_model is None or durable_writer_model is None
+        ):
+            raise ValueError("版本化正文候选缺少作者模型证据")
+        if candidate.writer_model is not None and (
+            durable_writer_model is None
+            or durable_writer_model != candidate.writer_model.strip()
+        ):
+            raise ValueError("正文候选的作者模型证据不一致")
         if required_state_generation_binding is not None:
             if (
                 str(completion.get("status") or "") != "complete"
@@ -1651,6 +1951,67 @@ class ChapterGenerationApplicationService:
                 "agent": "continuity_editor",
             },
         )
+        if prepared.independent_plan is not None:
+            if prepared.independent_snapshot is None:
+                raise RuntimeError("独立审查缺少冻结的正文快照")
+            reviewed = await IndependentOutlineReviewer(
+                prepared.runtime
+            ).review(
+                prepared.independent_snapshot,
+                prepared.independent_plan,
+            )
+            usage = reviewed.usage.model_dump()
+            attempts = _serialize_attempts(prepared.runtime)
+            if reviewed.failure_code is not None:
+                failure = _independent_review_failure_payload(
+                    reviewed.failure_code,
+                    usage=usage,
+                    attempts=attempts,
+                )
+                yield ChapterGenerationEvent(name="done", data=failure)
+                return
+            if reviewed.evidence is None:
+                raise RuntimeError("独立审查成功结果缺少证据")
+            candidate = prepared.command.prose_candidate
+            if candidate is None:
+                raise RuntimeError("独立审查成功结果缺少正文候选")
+            review = reviewed.evidence
+            completion = {
+                "review_protocol": INDEPENDENT_REVIEW_PROTOCOL,
+                "writer_model": prepared.independent_plan.writer_model,
+                "judge_model": (
+                    prepared.independent_plan.generation.provider_model
+                ),
+            }
+            yield ChapterGenerationEvent(
+                name="step",
+                data={
+                    "step": "outline_adherence",
+                    "status": "done",
+                    "data": review,
+                    "usage": usage,
+                    **completion,
+                },
+            )
+            result = ChapterGenerationResult(
+                stage=ChapterGenerationStage.OUTLINE_ADHERENCE,
+                value=review,
+                usage=usage,
+                attempts=attempts,
+                truncation=prepared.truncation,
+                completion=completion,
+            )
+            yield ChapterGenerationEvent(
+                name="done",
+                data={
+                    "success": True,
+                    "result": {"outline_adherence": review},
+                    "usage": usage,
+                    **completion,
+                },
+                result=result,
+            )
+            return
         try:
             generated = await prepared.runtime.generate_structured(
                 prepared.plan,
@@ -2227,9 +2588,13 @@ class ChapterGenerationApplicationService:
                     on_segment=on_segment,
                     on_scene_progress=on_scene_progress,
                 )
+                scene_contract_validation: dict[str, Any] | None = None
                 if latest_run is not None and owner_id is not None:
                     stored_completion = {
                         **generated.completion.to_dict(),
+                        "source_provider_model": _provider_capability(plan)[
+                            "model"
+                        ],
                         "source_run_id": str(latest_run["_id"]),
                         "source_run_revision": int(
                             latest_run.get("revision") or 0
@@ -2243,11 +2608,24 @@ class ChapterGenerationApplicationService:
                         "pause_reason": generated.pause_reason,
                     }
                     if (
-                        command.required_initial_origin is not None
-                        and generated.completion.status == "complete"
+                        generated.completion.status == "complete"
+                        and (
+                            command.required_initial_origin is not None
+                            or uses_scene_evidence_first_completion(
+                                protocol_revision=getattr(
+                                    prepared.execution_plan,
+                                    "protocol_revision",
+                                    "",
+                                ),
+                                plan_reason_codes=getattr(
+                                    prepared.execution_plan,
+                                    "reason_codes",
+                                    (),
+                                ),
+                            )
+                        )
                     ):
-                        stored_completion["can_write_formal_prose"] = False
-                        stored_completion["scene_contract_validation"] = (
+                        scene_contract_validation = (
                             build_v2_scene_contract_proof_from_run(
                                 run={
                                     **latest_run,
@@ -2263,6 +2641,14 @@ class ChapterGenerationApplicationService:
                                 plan=prepared.execution_plan,
                             ).model_dump(mode="python")
                         )
+                        stored_completion["scene_contract_validation"] = (
+                            scene_contract_validation
+                        )
+                    if (
+                        command.required_initial_origin is not None
+                        and generated.completion.status == "complete"
+                    ):
+                        stored_completion["can_write_formal_prose"] = False
                     lease = latest_run.get("lease") or {}
                     latest_run = await self._deps.prose_run_repo.finish(
                         run_id=str(latest_run["_id"]),
@@ -2285,6 +2671,9 @@ class ChapterGenerationApplicationService:
 
                 completion = {
                     **generated.completion.to_dict(),
+                    "source_provider_model": _provider_capability(plan)[
+                        "model"
+                    ],
                     "source_run_id": (
                         str(latest_run["_id"]) if latest_run else None
                     ),
@@ -2309,6 +2698,10 @@ class ChapterGenerationApplicationService:
                     and generated.completion.status == "complete"
                 ):
                     completion["can_write_formal_prose"] = False
+                if scene_contract_validation is not None:
+                    completion["scene_contract_validation"] = (
+                        scene_contract_validation
+                    )
                 usage = generated.usage.model_dump()
                 payload = {
                     "success": generated.completion.can_write_formal_prose,

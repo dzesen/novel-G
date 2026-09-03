@@ -62,8 +62,8 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v14"
 )
-CANDIDATE_PIPELINE_REVISION = 41
-CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v3"
+CANDIDATE_PIPELINE_REVISION = 42
+CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v4"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v2"
 )
@@ -187,7 +187,7 @@ class RuntimeToolDescriptorSnapshot(_ClosedAuthorizationModel):
 
 
 class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
-    schema_version: Literal["candidate_structured_generation_plan.v3"]
+    schema_version: Literal["candidate_structured_generation_plan.v4"]
     runtime_budget_protocol: Literal["structured_request_budget.v2"]
     workflow: str = Field(min_length=1, max_length=160)
     step: str = Field(min_length=1, max_length=160)
@@ -199,6 +199,7 @@ class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
         "schema_enforced",
     ]
     reviewer_alias: str | None = Field(default=None, min_length=1, max_length=160)
+    thinking_mode: Literal["enabled", "disabled"] | None
     timeout_seconds: _PositiveInt | None = None
     config_revision: str = Field(min_length=1, max_length=240)
     capability_snapshot: str = Field(min_length=1, max_length=240)
@@ -324,8 +325,6 @@ class CandidateJobGenerationPlan(_ClosedAuthorizationModel):
         if self.call_kind == "text":
             if self.reviewer_alias is not None:
                 raise ValueError("text generation plan cannot use a reviewer")
-        elif self.thinking_mode is not None:
-            raise ValueError("structured generation plan cannot use thinking mode")
         return self
 
 
@@ -1337,6 +1336,7 @@ def _structured_plan_projection(
         "reviewer_alias": (
             str(plan.reviewer_alias) if plan.reviewer_alias else None
         ),
+        "thinking_mode": plan.thinking_mode,
         "timeout_seconds": timeout_seconds,
         "config_revision": config_revision,
         "capability_snapshot": capability_snapshot,

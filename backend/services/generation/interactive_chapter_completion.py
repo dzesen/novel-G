@@ -63,6 +63,7 @@ from backend.services.generation.chapter_generation_application import (
     STATE_WORKFLOW,
     OutlineAdherenceCommand,
     ProseCandidateSource,
+    build_prose_candidate_source,
     StateGenerationCommand,
 )
 from backend.services.generation.outline_adherence import (
@@ -506,12 +507,13 @@ def _source_key(source: InteractiveCompletionSourceBinding) -> str:
 
 def _candidate_source(candidate: Mapping[str, Any]) -> ProseCandidateSource:
     run = candidate["run"]
-    return ProseCandidateSource(
+    return build_prose_candidate_source(
         text=str(candidate["text"]),
         source_run_id=str(run["_id"]),
         source_run_revision=int(run["revision"]),
         source_content_digest=str(candidate["text_digest"]),
         completion=dict(candidate["completion"]),
+        run=run,
     )
 
 

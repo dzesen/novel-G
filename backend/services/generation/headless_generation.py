@@ -56,6 +56,7 @@ from backend.services.generation.chapter_generation_application import (
     STATE_WORKFLOW,
     StateGenerationCommand,
     StateRepairGuidance,
+    build_prose_candidate_source,
 )
 from backend.services.generation.chapter_capability_registry import (
     build_chapter_capability_registry,
@@ -863,7 +864,7 @@ async def generate_prose_candidate(
     digest = str(completion.get("source_run_digest") or "")
     if chapter_content_digest(text) != digest:
         raise RuntimeError("deferred prose candidate digest does not match its text")
-    source = ProseCandidateSource(
+    source = build_prose_candidate_source(
         text=text,
         source_run_id=run_id,
         source_run_revision=revision,

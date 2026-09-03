@@ -604,19 +604,40 @@ def _thinking_mode_for(
         target.step_name,
     )
     requested = definition.thinking_mode if definition is not None else None
-    if requested is None:
-        return None
     provider_type = str(resolved.config.get("type") or "openai").strip().lower()
     model = str(resolved.config.get("default_model") or "").strip().lower()
     host = (
         urlparse(str(resolved.config.get("base_url") or "")).hostname or ""
     ).lower()
+    is_kimi_k2_6 = (
+        provider_type == "openai"
+        and host in {"api.moonshot.cn", "api.moonshot.ai"}
+        and model == "kimi-k2.6"
+    )
+    configured = resolved.config.get("thinking_mode")
+    if is_kimi_k2_6 and configured is not None:
+        configured = str(configured).strip().lower()
+        if configured not in {"enabled", "disabled"}:
+            raise ValueError("Unknown Kimi K2.6 thinking mode")
+        if requested is not None and requested != configured:
+            raise ValueError(
+                "Kimi K2.6 thinking mode conflicts with the workflow contract"
+            )
+    if requested is None and not is_kimi_k2_6:
+        return None
     if (
         provider_type == "openai"
         and host == "api.deepseek.com"
         and model.startswith("deepseek-v4-")
     ):
         return requested
+    if is_kimi_k2_6:
+        # K2.6 defaults to thinking enabled.  Freeze and transmit that
+        # behavior explicitly so a readiness never depends on an implicit
+        # Provider default.  A dedicated Provider alias may explicitly select
+        # disabled for the separately versioned Judge experiment; a catalog
+        # workflow contract still wins and conflicting configuration fails.
+        return configured or requested or "enabled"
     return None
 
 

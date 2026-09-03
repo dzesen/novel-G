@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import hashlib
 from importlib import metadata as importlib_metadata
 import json
@@ -43,6 +43,19 @@ JUDGE_PROBE_RECEIPT_VALIDITY_SECONDS = 32 * 24 * 60 * 60
 _SHA256 = r"^[0-9a-f]{64}$"
 _MAX = 2**63 - 1
 _PRICE_QUANTUM = Decimal("0.000001")
+_MOONSHOT_CHINA_API_HOST = "api.moonshot.cn"
+_KIMI_K2_6_MODEL = "kimi-k2.6"
+_KIMI_K2_6_REASONING_POLICY = "kimi_k2_6_thinking_enabled"
+_KIMI_K2_6_NON_THINKING_POLICY = "kimi_k2_6_thinking_disabled"
+_KIMI_K2_6_REASONING_POLICIES = frozenset(
+    {
+        _KIMI_K2_6_REASONING_POLICY,
+        _KIMI_K2_6_NON_THINKING_POLICY,
+    }
+)
+_MOONSHOT_CHINA_STANDARD_RETENTION = (
+    "moonshot_china_standard_service"
+)
 
 JUDGE_PROBE_COST_AUTHORIZATION_CODE = (
     "successor_judge_probe_cost_upper_bound"
@@ -296,6 +309,8 @@ class RequiredJudgeCapabilityProbeAuthorization(_Closed):
     request_reasoning_policy: Literal[
         "provider_default",
         "openai_default_medium",
+        "kimi_k2_6_thinking_enabled",
+        "kimi_k2_6_thinking_disabled",
         "not_applicable",
     ]
     declared_data_retention_tier: Literal[
@@ -303,6 +318,7 @@ class RequiredJudgeCapabilityProbeAuthorization(_Closed):
         "zero_data_retention",
         "modified_abuse_monitoring",
         "paid_service",
+        "moonshot_china_standard_service",
     ]
     credential_configured: Literal[True] = True
     review_contract_digest: str = Field(pattern=_SHA256)
@@ -342,6 +358,32 @@ class RequiredJudgeCapabilityProbeAuthorization(_Closed):
             "gemini": "google-genai",
             "claude": "anthropic",
         }[self.provider_type]
+        provider_model = plan.provider_model.strip().lower()
+        provider_host = (endpoint.hostname or "").lower()
+        moonshot_or_kimi = (
+            provider_host in {
+                _MOONSHOT_CHINA_API_HOST,
+                "api.moonshot.ai",
+            }
+            or provider_model.startswith("kimi-")
+        )
+        kimi_reasoning_policy = {
+            "enabled": _KIMI_K2_6_REASONING_POLICY,
+            "disabled": _KIMI_K2_6_NON_THINKING_POLICY,
+        }.get(plan.thinking_mode)
+        if moonshot_or_kimi and (
+            self.provider_type != "openai"
+            or provider_host != _MOONSHOT_CHINA_API_HOST
+            or endpoint.port not in {None, 443}
+            or endpoint.path.rstrip("/") not in {"", "/v1"}
+            or provider_model != _KIMI_K2_6_MODEL
+            or plan.structured_output_mode != "json_object"
+            or kimi_reasoning_policy is None
+            or self.request_reasoning_policy != kimi_reasoning_policy
+            or self.declared_data_retention_tier
+            != _MOONSHOT_CHINA_STANDARD_RETENTION
+        ):
+            raise ValueError("required_judge_probe_kimi_contract_invalid")
         if (
             self.created_at.tzinfo is None
             or self.deadline_at.tzinfo is None
@@ -369,6 +411,15 @@ class RequiredJudgeCapabilityProbeAuthorization(_Closed):
             or (
                 self.provider_type == "gemini"
                 and self.declared_data_retention_tier != "paid_service"
+            )
+            or (
+                not moonshot_or_kimi
+                and (
+                    self.request_reasoning_policy
+                    in _KIMI_K2_6_REASONING_POLICIES
+                    or self.declared_data_retention_tier
+                    == _MOONSHOT_CHINA_STANDARD_RETENTION
+                )
             )
             or self.maximum_provider_attempts != plan.max_semantic_attempts
             or self.maximum_input_tokens
@@ -410,6 +461,17 @@ def _probe_cost_upper_bound(
     return amount.quantize(_PRICE_QUANTUM, rounding=ROUND_CEILING)
 
 
+def _optional_decimal_matches(value: Any, expected: str) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    try:
+        return Decimal(str(value)) == Decimal(expected)
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
 def _readonly_runtime(config: Mapping[str, Any]) -> GenerationRuntime:
     frozen = deepcopy(dict(config))
 
@@ -437,6 +499,8 @@ def build_required_judge_capability_probe_authorization(
     request_reasoning_policy: Literal[
         "provider_default",
         "openai_default_medium",
+        "kimi_k2_6_thinking_enabled",
+        "kimi_k2_6_thinking_disabled",
         "not_applicable",
     ],
     declared_data_retention_tier: Literal[
@@ -444,6 +508,7 @@ def build_required_judge_capability_probe_authorization(
         "zero_data_retention",
         "modified_abuse_monitoring",
         "paid_service",
+        "moonshot_china_standard_service",
     ],
     review_input_token_bound: int | None = None,
     runtime: GenerationRuntime | None = None,
@@ -476,6 +541,24 @@ def build_required_judge_capability_probe_authorization(
         "claude": "anthropic",
     }.get(provider_type)
     base_url = str(provider.get("base_url") or "").strip().rstrip("/")
+    endpoint = urlsplit(base_url)
+    is_kimi_k2_6 = (
+        provider_type == "openai"
+        and (endpoint.hostname or "").lower() == _MOONSHOT_CHINA_API_HOST
+        and str(provider.get("default_model") or "").strip().lower()
+        == _KIMI_K2_6_MODEL
+    )
+    if is_kimi_k2_6 and not all(
+        (
+            _optional_decimal_matches(provider.get("temperature"), "1.0"),
+            _optional_decimal_matches(provider.get("top_p"), "0.95"),
+            _optional_decimal_matches(provider.get("presence_penalty"), "0"),
+            _optional_decimal_matches(provider.get("frequency_penalty"), "0"),
+        )
+    ):
+        raise ValueError(
+            "required_judge_probe_kimi_request_parameters_invalid"
+        )
     if (
         sdk_package is None
         or not base_url

@@ -150,6 +150,28 @@ llm:
       # 第三方兼容端点默认关闭：不确认支持 stream_options 就发，会打断本来能跑的流式。
       # 确认端点支持后改 true，即可统计流式 token 用量。
       supports_stream_usage: false
+    # 独立证据审查候选。默认关闭、无密钥、不会自动接管任何工作流；
+    # 启用后仍须单独生成并授权 capability probe readiness。
+    # K2.6 Judge successor 默认启用思考并为长推理预留 128k 完成窗口；
+    # 私有思考正文不进入适配器 raw_response，最终 JSON 与 token 用量照常保留。
+    # 不要配置 temperature / top_p / penalty。
+    kimi_judge:
+      type: openai
+      base_url: "https://api.moonshot.cn/v1"
+      api_key: ""
+      default_model: "kimi-k2.6"
+      enabled: false
+      timeout_seconds: 300
+      max_retries: 0
+      max_concurrency: 1
+      use_system_proxy: false
+      supports_streaming: true
+      structured_output: json_object
+      thinking_mode: enabled
+      max_context_tokens: 256000
+      supports_function_calling: false
+      supports_stream_usage: false
+      max_tokens: 128000
     gemini_flash:
       type: gemini
       base_url: ""
