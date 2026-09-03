@@ -205,7 +205,7 @@ export function buildBlueprintRegenerationRequest(
 
 export function buildBlueprintRegenerationReadinessRequest(
   source: BlueprintGenerationSource,
-  tokenBudget: number,
+  tokenBudget: number | null,
 ) {
   return {
     ...buildBlueprintRegenerationRequest(source),
@@ -216,13 +216,15 @@ export function buildBlueprintRegenerationReadinessRequest(
 
 export function buildBlueprintRegenerationStartRequest(
   source: BlueprintGenerationSource,
-  tokenBudget: number,
+  tokenBudget: number | null,
   readinessDigest: string,
+  acknowledgeAutomaticTokenBudget = false,
 ) {
   return {
     ...buildBlueprintRegenerationRequest(source),
     token_budget: tokenBudget,
     readiness_digest: readinessDigest,
+    acknowledge_automatic_token_budget: acknowledgeAutomaticTokenBudget,
     allow_failure_retry: false,
   };
 }

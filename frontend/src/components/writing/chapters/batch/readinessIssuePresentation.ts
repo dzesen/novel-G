@@ -161,6 +161,13 @@ export function readinessIssueCopy(
           maximum: Number(issue.details.maximum_tokens_total ?? 0),
         }),
       };
+    case "automatic_token_budget_requires_confirmation":
+      return {
+        title: t("readinessIssueAutomaticTokenBudgetTitle"),
+        body: t("readinessIssueAutomaticTokenBudgetBody", {
+          maximum: Number(issue.details.maximum_tokens_total ?? 0),
+        }),
+      };
     case "batch_generation_budget_may_pause":
       return {
         title: t("readinessIssueBatchBudgetShortTitle"),

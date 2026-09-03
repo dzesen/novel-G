@@ -38,10 +38,12 @@ MIN_AUTOMATIC_CONTINUATIONS_BEFORE_DIVERGENCE_STOP = 1
 # This is intentionally separate from ``protocol_revision``. The ruleset
 # controls mutable dispatch authorization (like N, M and the token budget), not
 # model-visible content identity.  v2 made the first-continuation floor
-# explicit; v3 records the calibrated 4x stop authorization.  The bump forces
-# fresh N>0 authorization without making a v3.3 draft stale.
+# explicit; v3 records the calibrated 4x stop authorization; v4 lets an
+# explicitly confirmed readiness use its own conservative total when the user
+# leaves the optional token-budget field empty.  The bump forces fresh N>0
+# authorization without making an existing prose draft stale.
 CURRENT_CONTINUATION_AUTHORIZATION_RULESET_REVISION = (
-    "scene-continuation-authorization-v3"
+    "scene-continuation-authorization-v4"
 )
 
 
@@ -360,7 +362,14 @@ class ProseAuthorizationModule:
             + automatic_calls * continuation_conservative_bound
         )
         normalized_budget = (
-            None if token_budget is None else max(1, int(token_budget))
+            conservative_total
+            if token_budget is None
+            and policy.permits_automatic_continuation
+            and known_bound
+            and conservative_total > 0
+            else None
+            if token_budget is None
+            else max(1, int(token_budget))
         )
         budget_coverage = self.estimate_budget_coverage(
             token_budget=normalized_budget,

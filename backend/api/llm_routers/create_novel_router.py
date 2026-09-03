@@ -201,11 +201,12 @@ class BlueprintRegenerationRequest(AICreateNovelRequest):
     system_prompt: None = Field(default=None)
     allow_failure_retry: Literal[False] = False
     max_tokens: int = Field(default=16_384, ge=1, le=200_000)
-    token_budget: int = Field(ge=1, le=2**63 - 1)
+    token_budget: int | None = Field(default=None, ge=1, le=2**63 - 1)
 
 
 class BlueprintRegenerationStartRequest(BlueprintRegenerationRequest):
     readiness_digest: str = Field(min_length=64, max_length=64)
+    acknowledge_automatic_token_budget: bool = False
 
 
 class _BlueprintBudgetBoundary(ValueError):
@@ -360,6 +361,16 @@ def _blueprint_regeneration_snapshot(
             "max_output_tokens": output_bound,
             "max_context_tokens": context_bound,
         })
+    uses_system_token_budget = bool(
+        req.token_budget is None
+        and token_bound_known
+        and maximum_tokens_total > 0
+    )
+    effective_token_budget = (
+        maximum_tokens_total
+        if uses_system_token_budget
+        else req.token_budget
+    )
     source = {
         "user_idea": req.user_idea,
         "number_of_chapters": req.number_of_chapters,
@@ -372,10 +383,11 @@ def _blueprint_regeneration_snapshot(
     }
     prompts = dict(_load_prompts().get(WORKFLOW_NAME, {}))
     authorization_snapshot = {
-        "version": 1,
+        "version": 2,
         "workflow": "blueprint_regeneration",
         "source": source,
-        "token_budget": req.token_budget,
+        "token_budget": effective_token_budget,
+        "uses_system_token_budget": uses_system_token_budget,
         "generation_params": {
             **build_gen_kwargs(req),
             "allow_failure_retry": False,
@@ -402,15 +414,24 @@ def _blueprint_regeneration_snapshot(
         ).encode("utf-8")
     ).hexdigest()
     report = {
-        "version": 1,
-        "status": "ready" if token_bound_known else "blocked",
+        "version": 2,
+        "status": (
+            "blocked"
+            if not token_bound_known
+            else "warning_requires_ack"
+            if uses_system_token_budget
+            else "ready"
+        ),
         "digest": digest,
-        "token_budget": req.token_budget,
+        "token_budget": effective_token_budget,
+        "uses_system_token_budget": uses_system_token_budget,
         "maximum_provider_attempts": maximum_provider_attempts,
         "maximum_tokens_total": maximum_tokens_total,
         "token_bound_known": token_bound_known,
         "budget_covers_conservative_maximum": bool(
-            token_bound_known and req.token_budget >= maximum_tokens_total
+            token_bound_known
+            and effective_token_budget is not None
+            and effective_token_budget >= maximum_tokens_total
         ),
         "providers": [
             {
@@ -422,12 +443,17 @@ def _blueprint_regeneration_snapshot(
             for item in plan_items
         ],
         "issues": (
-            []
-            if token_bound_known
-            else [{
+            [{
                 "code": "blueprint_token_bound_unproven",
                 "level": "blocked",
             }]
+            if not token_bound_known
+            else [{
+                "code": "automatic_token_budget_requires_confirmation",
+                "level": "warning_requires_ack",
+            }]
+            if uses_system_token_budget
+            else []
         ),
     }
     return report, plans, prompts
@@ -604,12 +630,23 @@ async def regenerate_blueprint(
                 "message": "Provider 或工作流计划已变化，请重新预检。",
             },
         ) from exc
-    if report["status"] != "ready":
+    if report["status"] == "blocked":
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "blueprint_regeneration_token_bound_unproven",
                 "message": "当前 Provider 缺少可证明的 token 上界。",
+            },
+        )
+    if (
+        report["uses_system_token_budget"]
+        and not req.acknowledge_automatic_token_budget
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "automatic_token_budget_confirmation_required",
+                "message": "请先确认系统计算的 Token 消耗上界。",
             },
         )
     if req.readiness_digest != report["digest"]:
@@ -623,7 +660,7 @@ async def regenerate_blueprint(
 
     scope = _BlueprintAttemptScope(
         maximum_attempts=int(report["maximum_provider_attempts"]),
-        token_budget=req.token_budget,
+        token_budget=int(report["token_budget"]),
     )
     execution_runtime = create_workflow_runtime(
         attempt_scope=scope,

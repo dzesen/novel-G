@@ -292,16 +292,75 @@ def _validate_start_authorization(
 ) -> dict[str, Any]:
     params = validate_protected_generation_params(generation_params)
     if (
-        isinstance(token_budget, bool)
-        or not isinstance(token_budget, int)
-        or token_budget <= 0
+        (
+            token_budget is not None
+            and (
+                isinstance(token_budget, bool)
+                or not isinstance(token_budget, int)
+                or token_budget <= 0
+            )
+        )
         or not isinstance(readiness_digest, str)
         or _READINESS_DIGEST_PATTERN.fullmatch(readiness_digest) is None
     ):
         raise ValueError(
-            "批量生成必须先确认正整数 token 预算与当前 64 位 readiness digest"
+            "批量生成必须先确认当前 64 位 readiness digest；"
+            "手动 token 预算如有填写则必须是正整数"
         )
     return params
+
+
+def _resolve_authorized_token_budget(
+    authorization: Mapping[str, Any],
+    requested_token_budget: int | None,
+) -> int:
+    """Return the concrete cap frozen by the accepted readiness.
+
+    An explicitly supplied cap remains authoritative. When the field is blank,
+    readiness may substitute only its complete conservative bound, and that
+    substitution must have been explicitly acknowledged.
+    """
+
+    planning = authorization.get("planning")
+    coverage = (
+        planning.get("batch_generation_budget_coverage")
+        if isinstance(planning, Mapping)
+        else None
+    )
+    if requested_token_budget is not None:
+        if isinstance(coverage, Mapping):
+            effective = coverage.get("token_budget")
+            if effective is not None and effective != requested_token_budget:
+                raise ValueError("批量生成 token 预算与 readiness 不一致")
+        return requested_token_budget
+
+    acknowledged = authorization.get("acknowledged_warning_codes")
+    effective = coverage.get("token_budget") if isinstance(coverage, Mapping) else None
+    maximum = (
+        coverage.get("maximum_tokens_total")
+        if isinstance(coverage, Mapping)
+        else None
+    )
+    if (
+        not isinstance(coverage, Mapping)
+        or coverage.get("schema_version")
+        != "batch_generation_budget_coverage.v1"
+        or coverage.get("token_bound_known") is not True
+        or coverage.get("covers_full_job_authority") is not True
+        or isinstance(effective, bool)
+        or not isinstance(effective, int)
+        or effective <= 0
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum <= 0
+        or effective < maximum
+        or not isinstance(acknowledged, list)
+        or "automatic_token_budget_requires_confirmation" not in acknowledged
+    ):
+        raise ValueError(
+            "系统无法从已确认的 readiness 冻结完整 Token 上界"
+        )
+    return effective
 
 
 def _validate_resumable_job_authorization(
@@ -3865,6 +3924,10 @@ class GenerationJobService:
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
+            authorized_token_budget = _resolve_authorized_token_budget(
+                authorization,
+                token_budget,
+            )
             planning = authorization.get("planning")
             structure_authorization = (
                 planning.get("book_structure_initialization")
@@ -3876,7 +3939,7 @@ class GenerationJobService:
             return await execute_book_structure_initialization(
                 novel_id,
                 authorization=structure_authorization,
-                token_budget=token_budget,
+                token_budget=authorized_token_budget,
                 generation_params=generation_params_snapshot,
             )
 
@@ -4034,6 +4097,10 @@ class GenerationJobService:
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
+            authorized_token_budget = _resolve_authorized_token_budget(
+                authorization,
+                token_budget,
+            )
             capacity = max(
                 int(
                     (authorization.get("planning") or {}).get(
@@ -4050,7 +4117,7 @@ class GenerationJobService:
                 job_id = await generation_job_repo.create_job(
                     _new_job_doc(
                         novel_id, "volume", volume_id, checkpoint_interval,
-                        token_budget, capacity, authorization,
+                        authorized_token_budget, capacity, authorization,
                         outline_deviation_policy,
                         generation_params_snapshot,
                         readiness_digest,
@@ -4116,6 +4183,10 @@ class GenerationJobService:
                 supplied_digest=readiness_digest,
                 acknowledged_warning_codes=acknowledged_warning_codes,
             )
+            authorized_token_budget = _resolve_authorized_token_budget(
+                authorization,
+                token_budget,
+            )
             capacity = max(
                 int(
                     (authorization.get("planning") or {}).get(
@@ -4132,7 +4203,7 @@ class GenerationJobService:
                 job_id = await generation_job_repo.create_job(
                     _new_job_doc(
                         novel_id, "book", None, checkpoint_interval,
-                        token_budget, capacity, authorization,
+                        authorized_token_budget, capacity, authorization,
                         outline_deviation_policy,
                         generation_params_snapshot,
                         readiness_digest,

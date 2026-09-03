@@ -29,10 +29,11 @@ type DialogStage = "confirm" | "running" | "review";
 type StepStatus = "pending" | "running" | "done" | "error";
 
 interface BlueprintRegenerationReadiness {
-  version: 1;
-  status: "ready" | "blocked";
+  version: 2;
+  status: "ready" | "warning_requires_ack" | "blocked";
   digest: string;
-  token_budget: number;
+  token_budget: number | null;
+  uses_system_token_budget: boolean;
   maximum_provider_attempts: number;
   maximum_tokens_total: number;
   token_bound_known: boolean;
@@ -88,6 +89,8 @@ export default function BlueprintRegenerationPanel({
   const [readiness, setReadiness] =
     useState<BlueprintRegenerationReadiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
+  const [automaticBudgetConfirmed, setAutomaticBudgetConfirmed] =
+    useState(false);
   const [candidate, setCandidate] = useState<AICreateResponse | null>(null);
   const [error, setError] = useState("");
   const [stepStatuses, setStepStatuses] = useState<
@@ -99,11 +102,14 @@ export default function BlueprintRegenerationPanel({
     novel_meta: "pending",
   }));
 
-  const parsedTokenBudget = /^\d+$/.test(tokenBudget)
-    ? Number(tokenBudget)
-    : 0;
-  const validTokenBudget = Number.isSafeInteger(parsedTokenBudget)
-    && parsedTokenBudget > 0;
+  const parsedTokenBudget = tokenBudget === ""
+    ? null
+    : /^\d+$/.test(tokenBudget)
+      ? Number(tokenBudget)
+      : Number.NaN;
+  const validTokenBudget = parsedTokenBudget === null || (
+    Number.isSafeInteger(parsedTokenBudget) && parsedTokenBudget > 0
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -118,6 +124,7 @@ export default function BlueprintRegenerationPanel({
     setTokenBudget("");
     setReadiness(null);
     setReadinessLoading(false);
+    setAutomaticBudgetConfirmed(false);
     setCandidate(null);
     setError("");
     setStepStatuses({
@@ -179,7 +186,8 @@ export default function BlueprintRegenerationPanel({
         ),
       );
       setReadiness(report);
-      if (report.status !== "ready") {
+      setAutomaticBudgetConfirmed(false);
+      if (report.status === "blocked") {
         setError(t("readinessBlocked"));
       }
     } catch (cause) {
@@ -195,8 +203,12 @@ export default function BlueprintRegenerationPanel({
       setError(t(`blocked.${currentInspection.blocked_code}`));
       return;
     }
-    if (!readiness || readiness.status !== "ready" || !validTokenBudget) {
+    if (!readiness || readiness.status === "blocked" || !validTokenBudget) {
       setError(t("readinessRequired"));
+      return;
+    }
+    if (readiness.uses_system_token_budget && !automaticBudgetConfirmed) {
+      setError(t("automaticBudgetConfirmationRequired"));
       return;
     }
 
@@ -218,6 +230,7 @@ export default function BlueprintRegenerationPanel({
           currentInspection.source,
           parsedTokenBudget,
           readiness.digest,
+          automaticBudgetConfirmed,
         ),
         (event, data) => {
           if (event === "step" && isStepKey(data.step)) {
@@ -379,6 +392,7 @@ export default function BlueprintRegenerationPanel({
                       onChange={(event) => {
                         setTokenBudget(event.target.value);
                         setReadiness(null);
+                        setAutomaticBudgetConfirmed(false);
                         setError("");
                       }}
                       aria-invalid={tokenBudget !== "" && !validTokenBudget}
@@ -422,6 +436,27 @@ export default function BlueprintRegenerationPanel({
                       <p role="note" className="mt-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
                         {t("budgetMayStop")}
                       </p>
+                    )}
+                    {readiness?.uses_system_token_budget && readiness.token_budget != null && (
+                      <div className="mt-3 rounded-lg border border-warning/40 bg-warning/5 p-3">
+                        <p className="text-xs leading-5 text-foreground">
+                          {t("automaticBudgetNotice", {
+                            budget: readiness.token_budget.toLocaleString(),
+                          })}
+                        </p>
+                        <label className="mt-2 flex min-w-0 items-start gap-2 text-xs leading-5 text-foreground">
+                          <input
+                            type="checkbox"
+                            checked={automaticBudgetConfirmed}
+                            onChange={(event) => {
+                              setAutomaticBudgetConfirmed(event.target.checked);
+                              setError("");
+                            }}
+                            className="mt-1 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+                          />
+                          <span>{t("automaticBudgetConfirm")}</span>
+                        </label>
+                      </div>
                     )}
                   </section>
                   {error && (
@@ -502,10 +537,14 @@ export default function BlueprintRegenerationPanel({
                   <Button variant="ghost" onPress={closeDialog}>
                     {t("keepCurrent")}
                   </Button>
-                  {readiness?.status === "ready" ? (
+                  {readiness && readiness.status !== "blocked" ? (
                     <Button
                       variant="primary"
                       className="bg-accent text-white hover:bg-accent-hover"
+                      isDisabled={
+                        readiness.uses_system_token_budget
+                        && !automaticBudgetConfirmed
+                      }
                       onPress={() => void startRegeneration()}
                     >
                       {t("confirmPaidCall")}

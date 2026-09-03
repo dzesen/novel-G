@@ -328,7 +328,7 @@ def build_prose_readiness(
         if not token_bound_known:
             warnings.append("prose_token_bound_unproven")
         if token_budget is None:
-            warnings.append("automatic_continuations_require_token_budget")
+            warnings.append("automatic_token_budget_requires_confirmation")
     return ProseReadiness(
         execution_plan=execution_plan,
         authorization=authorization,
@@ -354,7 +354,6 @@ def validate_prose_readiness(
         if code
         in {
             "prose_token_bound_unproven",
-            "automatic_continuations_require_token_budget",
         }
     ]
     if blocked:

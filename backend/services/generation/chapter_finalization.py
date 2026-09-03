@@ -942,8 +942,10 @@ class ChapterFinalizationService:
             or str(job.get("owner_id") or "") != str(owner_id)
             or str(job.get("current_chapter_id") or "") != str(chapter_id)
             or not isinstance(readiness, Mapping)
-            or readiness.get("schema_version")
-            != "interactive_chapter_completion_readiness.v1"
+            or readiness.get("schema_version") not in {
+                "interactive_chapter_completion_readiness.v1",
+                "interactive_chapter_completion_readiness.v2",
+            }
             or readiness.get("authorization_id")
             != authorization.authorization_id
             or not isinstance(source, Mapping)
@@ -2151,8 +2153,10 @@ class ChapterFinalizationService:
                 or str(current_job.get("status") or "")
                 != "completion_running"
                 or str(current_job.get("owner_id") or "") != str(owner_id)
-                or readiness.get("schema_version")
-                != "interactive_chapter_completion_readiness.v1"
+                or readiness.get("schema_version") not in {
+                    "interactive_chapter_completion_readiness.v1",
+                    "interactive_chapter_completion_readiness.v2",
+                }
                 or readiness.get("authorization_id")
                 != supplied.authorization_id
                 or readiness.get("authorization_revision")

@@ -91,7 +91,7 @@ from backend.scene_contract_versions import (
 
 
 INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
-    "interactive_chapter_completion_readiness.v1"
+    "interactive_chapter_completion_readiness.v2"
 )
 INTERACTIVE_COMPLETION_JOB_KIND = "interactive_chapter_completion"
 INTERACTIVE_COMPLETION_RUNNING = "completion_running"
@@ -121,10 +121,6 @@ class InteractiveCompletionBlocked(ValueError):
         self.code = code
 
 
-class InteractiveCompletionPricingError(ValueError):
-    """A Provider used by this readiness has no valid price snapshot."""
-
-
 class _ClosedModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -146,11 +142,39 @@ class InteractiveCompletionProviderBound(_ClosedModel):
     provider_alias: str = Field(min_length=1, max_length=160)
     maximum_paid_attempts: int = Field(ge=1, le=1_000)
     conservative_token_bound: int = Field(ge=1, le=1_000_000_000)
-    currency: str = Field(pattern=r"^[A-Z][A-Z0-9]{2,11}$")
-    maximum_cost: DecimalText
-    price_upper_bound_per_million_tokens: DecimalText
-    pricing_basis: str = Field(min_length=1, max_length=240)
-    pricing_snapshot_digest: Digest
+    pricing_status: Literal["available", "unavailable"]
+    currency: Annotated[
+        str,
+        Field(pattern=r"^[A-Z][A-Z0-9]{2,11}$"),
+    ] | None = None
+    maximum_cost: DecimalText | None = None
+    price_upper_bound_per_million_tokens: DecimalText | None = None
+    pricing_basis: Annotated[str, Field(min_length=1, max_length=240)] | None = None
+    pricing_snapshot_digest: Digest | None = None
+
+    @model_validator(mode="after")
+    def validate_pricing_projection(self) -> "InteractiveCompletionProviderBound":
+        pricing_values = (
+            self.currency,
+            self.maximum_cost,
+            self.price_upper_bound_per_million_tokens,
+            self.pricing_basis,
+            self.pricing_snapshot_digest,
+        )
+        if self.pricing_status == "available" and any(
+            value is None for value in pricing_values
+        ):
+            raise ValueError("available Provider pricing is incomplete")
+        if self.pricing_status == "unavailable" and any(
+            value is not None for value in pricing_values
+        ):
+            raise ValueError("unavailable Provider pricing has stale values")
+        return self
+
+
+class InteractiveCompletionWarning(_ClosedModel):
+    code: Literal["provider_pricing_unavailable"]
+    provider_alias: str = Field(min_length=1, max_length=160)
 
 
 class InteractiveCompletionPricing(_ClosedModel):
@@ -213,7 +237,7 @@ class InteractiveCompletionPlanning(_ClosedModel):
 
 class InteractiveChapterCompletionReadiness(_ClosedModel):
     schema_version: Literal[
-        "interactive_chapter_completion_readiness.v1"
+        "interactive_chapter_completion_readiness.v2"
     ]
     digest: Digest
     authorization_id: ObjectIdText
@@ -223,6 +247,10 @@ class InteractiveChapterCompletionReadiness(_ClosedModel):
     generation_plans: InteractiveCompletionPlans
     provider_bounds: tuple[InteractiveCompletionProviderBound, ...] = Field(
         min_length=1,
+        max_length=8,
+    )
+    warnings: tuple[InteractiveCompletionWarning, ...] = Field(
+        default=(),
         max_length=8,
     )
     logical_call_count: Literal[2]
@@ -236,6 +264,11 @@ class InteractiveChapterCompletionReadiness(_ClosedModel):
     def tupleize_provider_bounds(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
 
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def tupleize_warnings(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
     @model_validator(mode="after")
     def validate_identity_and_bounds(self) -> "InteractiveChapterCompletionReadiness":
         attempts = sum(item.maximum_paid_attempts for item in self.provider_bounds)
@@ -244,6 +277,14 @@ class InteractiveChapterCompletionReadiness(_ClosedModel):
             raise ValueError("interactive completion attempt bound changed")
         if tokens != self.conservative_token_bound:
             raise ValueError("interactive completion token bound changed")
+        unavailable_aliases = tuple(
+            item.provider_alias
+            for item in self.provider_bounds
+            if item.pricing_status == "unavailable"
+        )
+        warning_aliases = tuple(item.provider_alias for item in self.warnings)
+        if unavailable_aliases != warning_aliases:
+            raise ValueError("interactive completion pricing warnings changed")
         finalization = parse_chapter_finalization_authorization(
             self.planning.chapter_finalization_authorization
         )
@@ -280,10 +321,14 @@ def _provider_bound_projection(
             pricing = InteractiveCompletionPricing.model_validate(
                 resolve_pricing(item.provider_alias)
             )
-        except (TypeError, ValueError, ValidationError) as exc:
-            raise InteractiveCompletionPricingError(
-                f"Provider {item.provider_alias} has no valid price snapshot"
-            ) from exc
+        except (TypeError, ValueError, ValidationError):
+            projected.append(InteractiveCompletionProviderBound(
+                provider_alias=item.provider_alias,
+                maximum_paid_attempts=item.paid_attempts,
+                conservative_token_bound=item.tokens,
+                pricing_status="unavailable",
+            ))
+            continue
         if pricing.provider_alias != item.provider_alias:
             raise ValueError("Provider price snapshot identity changed")
         price_upper_bound = max(
@@ -295,6 +340,7 @@ def _provider_bound_projection(
             provider_alias=item.provider_alias,
             maximum_paid_attempts=item.paid_attempts,
             conservative_token_bound=item.tokens,
+            pricing_status="available",
             currency=pricing.currency,
             maximum_cost=_decimal_text(
                 Decimal(item.tokens) * price_upper_bound / Decimal(1_000_000)
@@ -358,6 +404,14 @@ def _build_readiness(
         },
         "provider_bounds": [
             item.model_dump(mode="json") for item in projected_bounds
+        ],
+        "warnings": [
+            {
+                "code": "provider_pricing_unavailable",
+                "provider_alias": item.provider_alias,
+            }
+            for item in projected_bounds
+            if item.pricing_status == "unavailable"
         ],
         "logical_call_count": 2,
         "recovery_replay_limit": INTERACTIVE_COMPLETION_RECOVERY_REPLAY_LIMIT,
@@ -470,7 +524,7 @@ class InteractiveChapterCompletionDeps:
                 provider.pricing_basis,
             )
             if any(value is None for value in values):
-                raise InteractiveCompletionPricingError(
+                raise ValueError(
                     f"Provider {alias} has no complete price snapshot"
                 )
             return InteractiveCompletionPricing(
@@ -791,11 +845,6 @@ class InteractiveChapterCompletionService:
                 ),
                 resolve_pricing=self._deps.resolve_pricing,
             )
-        except InteractiveCompletionPricingError as exc:
-            raise InteractiveCompletionBlocked(
-                "interactive completion requires a complete Provider price snapshot",
-                code="interactive_pricing_required",
-            ) from exc
         except (TypeError, ValueError, ValidationError) as exc:
             raise InteractiveCompletionBlocked(
                 "interactive completion Provider plan is invalid",

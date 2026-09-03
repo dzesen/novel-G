@@ -272,6 +272,22 @@ export interface GenerationReadiness {
       token_bound_known?: boolean;
     };
     prose_continuation_authorization?: ProseContinuationAuthorization;
+    batch_generation_budget_coverage?: {
+      schema_version: "batch_generation_budget_coverage.v1";
+      base_generation_maximum_tokens: number;
+      candidate_repair_maximum_tokens: number;
+      reference_card_repair_maximum_tokens: number;
+      maximum_tokens_total: number;
+      maximum_provider_attempts_total: number;
+      provider_bounds: Array<{
+        provider_alias: string;
+        maximum_paid_attempts_total: number;
+        maximum_tokens_total: number;
+      }>;
+      token_bound_known: boolean;
+      token_budget: number | null;
+      covers_full_job_authority: boolean;
+    };
     reference_card_auto_creation_policy?: ReferenceCardAutoCreationPolicy;
     reference_card_creation_authorization?: {
       schema_version: "reference_card_creation_authorization.v1";

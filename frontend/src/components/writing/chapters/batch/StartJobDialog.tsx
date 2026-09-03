@@ -116,6 +116,7 @@ export default function StartJobDialog({
     () => ({ ...EMPTY_GENERATION_PARAMS }),
   );
   const parsedTokenBudget = parsePositiveInteger(tokenBudget);
+  const tokenBudgetInputValid = tokenBudget === "" || parsedTokenBudget !== null;
   const automaticContinuationsEnabled = permitsAutomaticContinuation(
     continuationPolicy,
   );
@@ -154,6 +155,10 @@ export default function StartJobDialog({
   const effectiveChapterCount = readinessChapterCount(
     readiness,
     fillableCount,
+  );
+  const authorizedTokenBudget = (
+    readiness?.planning.batch_generation_budget_coverage?.token_budget
+    ?? parsedTokenBudget
   );
 
   const loadReadiness = useCallback(async (preserveError = false) => {
@@ -329,7 +334,10 @@ export default function StartJobDialog({
 
   const advance = async () => {
     if (stage === "authorization") {
-      if (!initialAuthorizationAllowsNext(parsedTokenBudget)) return;
+      if (
+        !tokenBudgetInputValid
+        || !initialAuthorizationAllowsNext(parsedTokenBudget)
+      ) return;
       setStage(nextStartJobStage(stage));
       return;
     }
@@ -456,13 +464,13 @@ export default function StartJobDialog({
                   value={tokenBudget}
                   onChange={(e) => setTokenBudget(e.target.value)}
                   placeholder={t("dialogTokenPlaceholder")}
-                  aria-invalid={tokenBudget !== "" && !parsedTokenBudget}
+                  aria-invalid={!tokenBudgetInputValid}
                   aria-describedby="batch-token-budget-hint"
                   className="min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
                 />
                 <span id="batch-token-budget-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">{t("dialogTokenHint")}</span>
               </div>
-              {!parsedTokenBudget && (
+              {!tokenBudgetInputValid && (
                 <p role="note" className="text-xs leading-5 text-amber-800 dark:text-amber-200">
                   {t("dialogTokenRequired")}
                 </p>
@@ -972,6 +980,12 @@ export default function StartJobDialog({
                                 ? t("readinessAcknowledgeAutoCards")
                                 : issue.code === "prose_output_risk_requires_ack"
                                 ? t("readinessAcknowledgeOutputRisk")
+                                : issue.code === "automatic_token_budget_requires_confirmation"
+                                  ? t("readinessAcknowledgeTokenBudget", {
+                                      maximum: Number(
+                                        issue.details.maximum_tokens_total ?? 0,
+                                      ),
+                                    })
                                 : t("readinessAcknowledge")}
                           </span>
                         </label>
@@ -1087,7 +1101,9 @@ export default function StartJobDialog({
                 <div className="min-w-0 bg-background p-3">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationBudget")}</dt>
                   <dd className="mt-1 font-medium tabular-nums text-foreground">
-                    {t("dialogConfirmationBudgetValue", { budget: parsedTokenBudget ?? 0 })}
+                    {t("dialogConfirmationBudgetValue", {
+                      budget: authorizedTokenBudget ?? 0,
+                    })}
                   </dd>
                 </div>
                 <div className="min-w-0 bg-background p-3">
@@ -1211,7 +1227,10 @@ export default function StartJobDialog({
               isDisabled={
                 submitting
                 || readinessLoading
-                || (stage === "authorization" && !initialAuthorizationAllowsNext(parsedTokenBudget))
+                || (stage === "authorization" && (
+                  !tokenBudgetInputValid
+                  || !initialAuthorizationAllowsNext(parsedTokenBudget)
+                ))
                 || (stage === "behavior" && !checkpointIntervalAllowsNext(
                   effectiveCheckpointInterval,
                 ))

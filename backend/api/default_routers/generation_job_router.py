@@ -221,7 +221,7 @@ class ProtectedBatchGenerationParamsMixin(GenerationParamsMixin):
 
 class StartJobRequest(ProtectedBatchGenerationParamsMixin):
     checkpoint_interval: Optional[int] = Field(default=5, ge=1, le=1000)
-    token_budget: int = Field(ge=1)
+    token_budget: Optional[int] = Field(default=None, ge=1)
     readiness_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     acknowledged_warning_codes: list[str] = Field(default_factory=list, max_length=50)
     outline_deviation_policy: Literal[

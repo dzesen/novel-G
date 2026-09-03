@@ -41,9 +41,9 @@ export function batchGenerationOverrides(
 export function initialAuthorizationAllowsNext(
   tokenBudget: number | null,
 ): boolean {
-  return tokenBudget !== null
-    && Number.isInteger(tokenBudget)
-    && tokenBudget > 0;
+  return tokenBudget === null || (
+    Number.isInteger(tokenBudget) && tokenBudget > 0
+  );
 }
 
 export function checkpointIntervalAllowsNext(value: number | null): boolean {

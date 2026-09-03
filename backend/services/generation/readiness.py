@@ -737,6 +737,7 @@ class GenerationReadinessModule:
                 )
             )
 
+        effective_token_budget = token_budget
         try:
             planning_generation_params = generation_params
             needs_prose = work["steps"]["prose"]["generate"] > 0
@@ -865,6 +866,13 @@ class GenerationReadinessModule:
                     + repair_attempts
                     + reference_repair_attempts
                 )
+                uses_system_token_budget = bool(
+                    token_budget is None
+                    and base_budget.token_bound_known
+                    and full_token_bound > 0
+                )
+                if uses_system_token_budget:
+                    effective_token_budget = full_token_bound
                 planning = {
                     **planning,
                     "attempt_capacity": full_attempt_bound,
@@ -914,11 +922,11 @@ class GenerationReadinessModule:
                             for item in full_provider_bounds
                         ],
                         "token_bound_known": base_budget.token_bound_known,
-                        "token_budget": token_budget,
+                        "token_budget": effective_token_budget,
                         "covers_full_job_authority": bool(
                             base_budget.token_bound_known
-                            and token_budget is not None
-                            and token_budget >= full_token_bound
+                            and effective_token_budget is not None
+                            and effective_token_budget >= full_token_bound
                         ),
                     },
                 }
@@ -930,15 +938,15 @@ class GenerationReadinessModule:
                             action_codes=["review_provider_settings"],
                         )
                     )
-                if full_token_bound > 0 and token_budget is None:
+                if uses_system_token_budget:
                     issues.append(
                         _issue(
-                            "batch_generation_requires_token_budget",
-                            "blocked",
+                            "automatic_token_budget_requires_confirmation",
+                            "warning_requires_ack",
                             details={
                                 "maximum_tokens_total": full_token_bound
                             },
-                            action_codes=["set_token_budget"],
+                            action_codes=["review_token_budget"],
                         )
                     )
                 elif (
@@ -969,20 +977,27 @@ class GenerationReadinessModule:
                                 action_codes=["set_token_budget"],
                             )
                         )
-            elif has_structure_work:
+            elif has_chapter_work:
                 base_budget = _parse_base_generation_budget(
                     planning.get("base_generation_budget")
                 )
                 base_attempt_capacity = _strict_non_negative_budget_int(
                     planning.get("attempt_capacity"),
-                    field="book structure attempt capacity",
+                    field="base generation attempt capacity",
                 )
                 if (
                     base_attempt_capacity
                     != base_budget.maximum_provider_attempts_total
                 ):
-                    raise ValueError("book structure attempt capacity changed")
+                    raise ValueError("base generation attempt capacity changed")
                 maximum_tokens_total = base_budget.maximum_tokens_total
+                uses_system_token_budget = bool(
+                    token_budget is None
+                    and base_budget.token_bound_known
+                    and maximum_tokens_total > 0
+                )
+                if uses_system_token_budget:
+                    effective_token_budget = maximum_tokens_total
                 planning["batch_generation_budget_coverage"] = {
                     "schema_version": "batch_generation_budget_coverage.v1",
                     "base_generation_maximum_tokens": maximum_tokens_total,
@@ -999,11 +1014,11 @@ class GenerationReadinessModule:
                         for item in base_budget.provider_bounds
                     ],
                     "token_bound_known": base_budget.token_bound_known,
-                    "token_budget": token_budget,
+                    "token_budget": effective_token_budget,
                     "covers_full_job_authority": bool(
                         base_budget.token_bound_known
-                        and token_budget is not None
-                        and token_budget >= maximum_tokens_total
+                        and effective_token_budget is not None
+                        and effective_token_budget >= maximum_tokens_total
                     ),
                 }
                 if not base_budget.token_bound_known:
@@ -1014,15 +1029,94 @@ class GenerationReadinessModule:
                             action_codes=["review_provider_settings"],
                         )
                     )
-                if maximum_tokens_total > 0 and token_budget is None:
+                if uses_system_token_budget:
                     issues.append(
                         _issue(
-                            "batch_generation_requires_token_budget",
-                            "blocked",
+                            "automatic_token_budget_requires_confirmation",
+                            "warning_requires_ack",
                             details={
                                 "maximum_tokens_total": maximum_tokens_total
                             },
-                            action_codes=["set_token_budget"],
+                            action_codes=["review_token_budget"],
+                        )
+                    )
+                elif (
+                    maximum_tokens_total > 0
+                    and token_budget is not None
+                    and token_budget < maximum_tokens_total
+                ):
+                    issues.append(
+                        _issue(
+                            "batch_generation_budget_may_pause",
+                            "warning",
+                            details={
+                                "maximum_tokens_total": maximum_tokens_total,
+                                "token_budget": token_budget,
+                            },
+                            action_codes=["review_token_budget"],
+                        )
+                    )
+            elif has_structure_work:
+                base_budget = _parse_base_generation_budget(
+                    planning.get("base_generation_budget")
+                )
+                base_attempt_capacity = _strict_non_negative_budget_int(
+                    planning.get("attempt_capacity"),
+                    field="book structure attempt capacity",
+                )
+                if (
+                    base_attempt_capacity
+                    != base_budget.maximum_provider_attempts_total
+                ):
+                    raise ValueError("book structure attempt capacity changed")
+                maximum_tokens_total = base_budget.maximum_tokens_total
+                uses_system_token_budget = bool(
+                    token_budget is None
+                    and base_budget.token_bound_known
+                    and maximum_tokens_total > 0
+                )
+                if uses_system_token_budget:
+                    effective_token_budget = maximum_tokens_total
+                planning["batch_generation_budget_coverage"] = {
+                    "schema_version": "batch_generation_budget_coverage.v1",
+                    "base_generation_maximum_tokens": maximum_tokens_total,
+                    "candidate_repair_maximum_tokens": 0,
+                    "reference_card_repair_maximum_tokens": 0,
+                    "maximum_tokens_total": maximum_tokens_total,
+                    "maximum_provider_attempts_total": base_attempt_capacity,
+                    "provider_bounds": [
+                        {
+                            "provider_alias": item.provider_alias,
+                            "maximum_paid_attempts_total": item.paid_attempts,
+                            "maximum_tokens_total": item.tokens,
+                        }
+                        for item in base_budget.provider_bounds
+                    ],
+                    "token_bound_known": base_budget.token_bound_known,
+                    "token_budget": effective_token_budget,
+                    "covers_full_job_authority": bool(
+                        base_budget.token_bound_known
+                        and effective_token_budget is not None
+                        and effective_token_budget >= maximum_tokens_total
+                    ),
+                }
+                if not base_budget.token_bound_known:
+                    issues.append(
+                        _issue(
+                            "batch_generation_token_bound_unproven",
+                            "blocked",
+                            action_codes=["review_provider_settings"],
+                        )
+                    )
+                if uses_system_token_budget:
+                    issues.append(
+                        _issue(
+                            "automatic_token_budget_requires_confirmation",
+                            "warning_requires_ack",
+                            details={
+                                "maximum_tokens_total": maximum_tokens_total
+                            },
+                            action_codes=["review_token_budget"],
                         )
                     )
                 elif (
@@ -1130,7 +1224,7 @@ class GenerationReadinessModule:
             work=work,
             planning=planning,
             policy=continuation_policy,
-            token_budget=token_budget,
+            token_budget=effective_token_budget,
             authorization_revision=authorization_revision,
         )
         raw_candidate_repair_authorization = planning.get(
@@ -1290,13 +1384,6 @@ class GenerationReadinessModule:
             )
             if not prose_authorization.get("token_bound_known"):
                 issues.append(_issue("prose_token_bound_unproven", "blocked"))
-            if token_budget is None:
-                issues.append(
-                    _issue(
-                        "automatic_continuations_require_token_budget",
-                        "blocked",
-                    )
-                )
 
         snapshot = {
             "version": 2,

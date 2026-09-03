@@ -49,7 +49,7 @@ import {
 } from "./proseContinuation";
 
 interface InteractiveCompletionReadiness {
-  schema_version: "interactive_chapter_completion_readiness.v1";
+  schema_version: "interactive_chapter_completion_readiness.v2";
   digest: string;
   authorization_id: string;
   authorization_revision: number;
@@ -62,11 +62,16 @@ interface InteractiveCompletionReadiness {
     provider_alias: string;
     maximum_paid_attempts: number;
     conservative_token_bound: number;
-    currency: string;
-    maximum_cost: string;
-    price_upper_bound_per_million_tokens: string;
-    pricing_basis: string;
-    pricing_snapshot_digest: string;
+    pricing_status: "available" | "unavailable";
+    currency: string | null;
+    maximum_cost: string | null;
+    price_upper_bound_per_million_tokens: string | null;
+    pricing_basis: string | null;
+    pricing_snapshot_digest: string | null;
+  }>;
+  warnings: Array<{
+    code: "provider_pricing_unavailable";
+    provider_alias: string;
   }>;
 }
 
@@ -180,6 +185,8 @@ export default function ProsePanel({
     continuationPolicy,
   );
   const continuationBudgetValue = parsePositiveInteger(continuationBudget);
+  const continuationBudgetInputValid = continuationBudget === ""
+    || continuationBudgetValue !== null;
   const continuationConfigurationKey = JSON.stringify({
     policy: continuationPolicy,
     tokenBudget: continuationBudgetValue,
@@ -451,8 +458,8 @@ export default function ProsePanel({
 
   const inspectContinuationReadiness = useCallback(async (): Promise<boolean> => {
     if (!automaticContinuationsEnabled) return true;
-    if (!continuationBudgetValue) {
-      setContinuationReadinessError(t("continuationBudgetMissing"));
+    if (!continuationBudgetInputValid) {
+      setContinuationReadinessError(t("continuationBudgetInvalid"));
       return false;
     }
     setContinuationReadinessLoading(true);
@@ -490,6 +497,7 @@ export default function ProsePanel({
   }, [
     automaticContinuationsEnabled,
     chapterId,
+    continuationBudgetInputValid,
     continuationBudgetValue,
     continuationConfigurationKey,
     continuationPolicy,
@@ -513,8 +521,8 @@ export default function ProsePanel({
     }
     const resuming = resumableDraft;
     if (automaticContinuationsEnabled) {
-      if (!continuationBudgetValue) {
-        setContinuationReadinessError(t("continuationBudgetMissing"));
+      if (!continuationBudgetInputValid) {
+        setContinuationReadinessError(t("continuationBudgetInvalid"));
         return;
       }
       if (!continuationReadinessIsCurrent) {
@@ -799,6 +807,7 @@ export default function ProsePanel({
                     disabled={running || runActionsBlocked}
                     onChange={(event) => setContinuationBudget(event.target.value)}
                     placeholder={t("continuationBudgetPlaceholder")}
+                    aria-invalid={!continuationBudgetInputValid}
                     className="min-h-9 w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
                   />
                   <span className="text-xs leading-5 text-muted">
@@ -814,7 +823,7 @@ export default function ProsePanel({
                       running
                       || runActionsBlocked
                       || continuationReadinessLoading
-                      || !continuationBudgetValue
+                      || !continuationBudgetInputValid
                     }
                     className="min-h-9 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-surface disabled:cursor-not-allowed disabled:opacity-60"
                   >
@@ -856,6 +865,16 @@ export default function ProsePanel({
                         {t("continuationTokenBoundMissing")}
                       </p>
                     )}
+                    {continuationReadiness.warnings.includes(
+                      "automatic_token_budget_requires_confirmation",
+                    ) && (
+                      <p className="font-medium text-amber-800 dark:text-amber-200">
+                        {t("continuationAutomaticBudgetNotice", {
+                          budget: continuationReadiness.authorization.token_budget
+                            ?? t("continuationUnknown"),
+                        })}
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -873,9 +892,17 @@ export default function ProsePanel({
                     className="mt-0.5 size-4"
                   />
                   <span className="text-xs leading-5 text-muted">
-                    {t("continuationConfirmation", {
-                      count: continuationPolicy.automatic_continuations_per_scene,
-                    })}
+                    {continuationReadiness?.warnings.includes(
+                      "automatic_token_budget_requires_confirmation",
+                    )
+                      ? t("continuationConfirmationWithSystemBudget", {
+                          count: continuationPolicy.automatic_continuations_per_scene,
+                          budget: continuationReadiness.authorization.token_budget
+                            ?? t("continuationUnknown"),
+                        })
+                      : t("continuationConfirmation", {
+                          count: continuationPolicy.automatic_continuations_per_scene,
+                        })}
                   </span>
                 </label>
               </section>
@@ -930,23 +957,42 @@ export default function ProsePanel({
                       </p>
                       <p className="min-w-0 break-words sm:col-span-2">
                         {t("completionReadinessCost", {
-                          costs: completionReadiness.provider_bounds
-                            .map((item) => (
-                              `${item.provider_alias} ${item.currency} ${item.maximum_cost}`
-                            ))
-                            .join("；"),
+                          costs: completionReadiness.provider_bounds.some(
+                            (item) => item.pricing_status === "available",
+                          )
+                            ? completionReadiness.provider_bounds
+                              .filter((item) => item.pricing_status === "available")
+                              .map((item) => (
+                                `${item.provider_alias} ${item.currency} ${item.maximum_cost}`
+                              ))
+                              .join("；")
+                            : t("completionReadinessCostUnavailable"),
                         })}
                       </p>
                       <p className="min-w-0 break-words sm:col-span-2">
                         {t("completionReadinessPricingBasis", {
-                          basis: completionReadiness.provider_bounds
-                            .map((item) => (
-                              `${item.provider_alias}: ${item.pricing_basis}`
-                            ))
-                            .join("；"),
+                          basis: completionReadiness.provider_bounds.some(
+                            (item) => item.pricing_status === "available",
+                          )
+                            ? completionReadiness.provider_bounds
+                              .filter((item) => item.pricing_status === "available")
+                              .map((item) => (
+                                `${item.provider_alias}: ${item.pricing_basis}`
+                              ))
+                              .join("；")
+                            : t("completionReadinessCostUnavailable"),
                         })}
                       </p>
                     </div>
+                    {completionReadiness.warnings.length > 0 && (
+                      <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                        {t("completionReadinessPricingUnavailable", {
+                          providers: completionReadiness.warnings
+                            .map((warning) => warning.provider_alias)
+                            .join(", "),
+                        })}
+                      </p>
+                    )}
                     <label className="flex cursor-pointer items-start gap-2">
                       <input
                         type="checkbox"
@@ -959,7 +1005,9 @@ export default function ProsePanel({
                         className="mt-0.5 size-4 shrink-0"
                       />
                       <span className="text-xs leading-5 text-muted">
-                        {t("completionReadinessConfirmation")}
+                        {completionReadiness.warnings.length > 0
+                          ? t("completionReadinessConfirmationWithUnknownPricing")
+                          : t("completionReadinessConfirmation")}
                       </span>
                     </label>
                   </>
