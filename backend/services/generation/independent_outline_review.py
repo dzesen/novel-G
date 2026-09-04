@@ -10,8 +10,10 @@ import hashlib
 import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, Mapping, Sequence
 
+from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 from pydantic_core import PydanticCustomError
 
@@ -68,8 +70,33 @@ _EVIDENCE_SPAN_FIELDS = (
 )
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, datetime):
+        normalized = (
+            value.replace(tzinfo=UTC)
+            if value.tzinfo is None
+            else value.astimezone(UTC)
+        )
+        return normalized.isoformat(timespec="milliseconds").replace(
+            "+00:00",
+            "Z",
+        )
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        _jsonable(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _digest(value: str) -> str:

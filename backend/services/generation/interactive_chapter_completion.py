@@ -71,7 +71,17 @@ from backend.services.generation.outline_adherence import (
     revalidate_current_outline_adherence_evidence,
     validate_complete_outline_adherence,
 )
+from backend.services.generation.prose_completion import (
+    prose_execution_plan_from_snapshot,
+)
+from backend.services.generation.prose_protocol import (
+    uses_scene_evidence_first_completion,
+)
 from backend.services.generation.prose_runs import prose_revision, prose_run_module
+from backend.services.generation.prose_scene_repair import (
+    SceneContractValidationProof,
+    build_v2_scene_contract_proof_from_run,
+)
 from backend.services.generation.provider_budget import (
     ProviderBudgetBound,
     merge_provider_bounds,
@@ -666,6 +676,49 @@ def _candidate_source(candidate: Mapping[str, Any]) -> ProseCandidateSource:
     )
 
 
+def _candidate_with_reconstructed_scene_proof(
+    candidate: Mapping[str, Any],
+    *,
+    outline: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Recover structural scene ranges from the candidate's frozen segments."""
+
+    completion = candidate.get("completion")
+    run = candidate.get("run")
+    if not isinstance(completion, Mapping) or not isinstance(run, Mapping):
+        raise ValueError("interactive completion candidate evidence is invalid")
+    persisted_proof = completion.get("scene_contract_validation")
+    if persisted_proof is not None:
+        SceneContractValidationProof.model_validate(persisted_proof)
+        return candidate
+    plan = prose_execution_plan_from_snapshot(dict(run.get("plan") or {}))
+    if not uses_scene_evidence_first_completion(
+        protocol_revision=plan.protocol_revision,
+        plan_reason_codes=plan.reason_codes,
+    ):
+        raise ValueError(
+            "interactive completion candidate predates scene evidence completion"
+        )
+    segments = run.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise ValueError(
+            "interactive completion candidate has no persisted scene segments"
+        )
+    text = str(candidate.get("text") or "")
+    proof = build_v2_scene_contract_proof_from_run(
+        run={**dict(run), "completion": dict(completion)},
+        current_text=text,
+        outline=outline,
+        plan=plan,
+    )
+    enriched = dict(candidate)
+    enriched["completion"] = {
+        **dict(completion),
+        "scene_contract_validation": proof.model_dump(mode="python"),
+    }
+    return enriched
+
+
 def build_interactive_completion_request_binding(
     *,
     owner_id: str,
@@ -992,6 +1045,16 @@ class InteractiveChapterCompletionService:
                 "interactive completion source binding is stale",
                 code="interactive_source_stale",
             )
+        try:
+            candidate = _candidate_with_reconstructed_scene_proof(
+                candidate,
+                outline=outline,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise InteractiveCompletionBlocked(
+                "interactive completion scene boundary evidence is unavailable",
+                code="interactive_scene_evidence_invalid",
+            ) from exc
         source = InteractiveCompletionSourceBinding(
             owner_id=owner_id,
             novel_id=novel_id,

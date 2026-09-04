@@ -8,6 +8,7 @@ definitions of a complete chapter.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal
 
@@ -116,6 +117,83 @@ class ProseExecutionPlan:
             "scheduled_call_count": self.scheduled_call_count,
             "call_count": self.call_count,
         }
+
+
+def prose_execution_plan_from_snapshot(
+    raw: Mapping[str, Any],
+) -> ProseExecutionPlan:
+    """Restore one frozen prose plan without recalculating its authority."""
+
+    mode = raw.get("mode")
+    if mode not in {"single_call", "scene_segments"}:
+        raise ValueError("persisted prose execution mode is invalid")
+    required_integers = {
+        "requested_word_count": raw.get("requested_word_count"),
+        "scene_count": raw.get("scene_count"),
+        "safe_output_budget": raw.get("safe_output_budget"),
+    }
+    if any(
+        type(value) is not int or value < 1
+        for value in required_integers.values()
+    ):
+        raise ValueError("persisted prose execution plan is invalid")
+    provider_output_limit = raw.get("provider_output_limit")
+    if provider_output_limit is not None and (
+        type(provider_output_limit) is not int or provider_output_limit < 1
+    ):
+        raise ValueError("persisted prose provider output limit is invalid")
+    minimum_completion_ratio = raw.get("minimum_completion_ratio")
+    if (
+        isinstance(minimum_completion_ratio, bool)
+        or not isinstance(minimum_completion_ratio, (int, float))
+        or not 0 < float(minimum_completion_ratio) <= 1
+    ):
+        raise ValueError("persisted prose completion ratio is invalid")
+
+    def positive_integer_tuple(field_name: str, *, allow_empty: bool) -> tuple[int, ...]:
+        values = raw.get(field_name)
+        if not isinstance(values, (list, tuple)) or (
+            not allow_empty and not values
+        ):
+            raise ValueError(f"persisted prose {field_name} is invalid")
+        if any(type(value) is not int or value < 1 for value in values):
+            raise ValueError(f"persisted prose {field_name} is invalid")
+        return tuple(values)
+
+    segment_budgets = positive_integer_tuple(
+        "segment_budgets",
+        allow_empty=False,
+    )
+    segment_minimums = positive_integer_tuple(
+        "segment_minimums",
+        allow_empty=True,
+    )
+    segment_maximums = positive_integer_tuple(
+        "segment_maximums",
+        allow_empty=True,
+    )
+    reason_codes = raw.get("reason_codes")
+    if not isinstance(reason_codes, (list, tuple)) or any(
+        not isinstance(item, str) or not item
+        for item in reason_codes
+    ):
+        raise ValueError("persisted prose reason codes are invalid")
+    protocol_revision = raw.get("protocol_revision")
+    if not isinstance(protocol_revision, str) or not protocol_revision:
+        raise ValueError("persisted prose protocol revision is invalid")
+    return ProseExecutionPlan(
+        requested_word_count=required_integers["requested_word_count"],
+        scene_count=required_integers["scene_count"],
+        mode=mode,
+        provider_output_limit=provider_output_limit,
+        safe_output_budget=required_integers["safe_output_budget"],
+        minimum_completion_ratio=float(minimum_completion_ratio),
+        segment_budgets=segment_budgets,
+        reason_codes=tuple(reason_codes),
+        segment_minimums=segment_minimums,
+        segment_maximums=segment_maximums,
+        protocol_revision=protocol_revision,
+    )
 
 
 @dataclass(frozen=True)
