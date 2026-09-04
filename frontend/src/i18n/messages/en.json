@@ -2856,6 +2856,7 @@
       "completionReadinessCostUnavailable": "No pricing snapshot configured",
       "completionReadinessPricingBasis": "Pricing basis: {basis}",
       "completionReadinessPricingUnavailable": "These Providers do not have a complete pricing snapshot: {providers}. The call and token bounds remain valid, so you may continue after confirmation, but no reliable monetary cost bound can be shown for this run.",
+      "completionLegacyReadinessReauthorizationRequired": "A legacy completion readiness was found. It had not started, so it was safely retired. Review and confirm this new readiness before continuing.",
       "completionReadinessConfirmation": "I confirm these additional calls, token and cost bounds, and chapter-prose disclosure scope, and authorize the completion review.",
       "completionReadinessConfirmationWithUnknownPricing": "I confirm these additional calls, token bounds, and chapter-prose disclosure scope, understand that some Providers have no pricing snapshot and no reliable monetary cost bound is available, and authorize the completion review.",
       "completionConfirmationRequired": "Confirm the additional calls, token bounds, prose-disclosure scope, and currently available pricing information first.",

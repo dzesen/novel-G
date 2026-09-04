@@ -2856,6 +2856,7 @@
       "completionReadinessCostUnavailable": "未配置价格快照",
       "completionReadinessPricingBasis": "价格依据：{basis}",
       "completionReadinessPricingUnavailable": "以下 Provider 暂无完整价格快照：{providers}。调用与 Token 上界仍然有效；确认后可以继续，但本次无法显示可靠的费用金额上界。",
+      "completionLegacyReadinessReauthorizationRequired": "旧版预检需要重新确认。旧记录尚未开始执行，已安全终止；请重新核对并确认这份新版预检后再继续。",
       "completionReadinessConfirmation": "我确认以上新增调用、token、费用上界和本章正文外发范围，并授权执行完成验收。",
       "completionReadinessConfirmationWithUnknownPricing": "我确认以上新增调用、Token 和本章正文外发范围，并知悉部分 Provider 暂无价格快照、当前无法给出可靠费用金额；授权执行完成验收。",
       "completionConfirmationRequired": "请先确认完成验收的新增调用、Token、正文外发范围及当前可得的费用信息。",

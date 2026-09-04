@@ -93,12 +93,22 @@ from backend.scene_contract_versions import (
 INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
     "interactive_chapter_completion_readiness.v2"
 )
+LEGACY_INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
+    "interactive_chapter_completion_readiness.v1"
+)
+INTERACTIVE_COMPLETION_INSPECTION_SCHEMA = (
+    "interactive_chapter_completion_inspection.v1"
+)
 INTERACTIVE_COMPLETION_JOB_KIND = "interactive_chapter_completion"
 INTERACTIVE_COMPLETION_RUNNING = "completion_running"
 INTERACTIVE_COMPLETION_UNCERTAIN = "completion_uncertain"
 INTERACTIVE_COMPLETION_RESOLVING = "completion_resolving_uncertain"
 INTERACTIVE_COMPLETION_COMPLETED = "completion_completed"
 INTERACTIVE_COMPLETION_MANUAL_REVIEW = "completion_manual_review"
+INTERACTIVE_COMPLETION_SUPERSEDED = "completion_superseded"
+LEGACY_READINESS_REAUTHORIZATION_NOTICE = (
+    "legacy_readiness_reauthorization_required"
+)
 INTERACTIVE_COMPLETION_RECOVERY_REPLAY_LIMIT = 1
 INTERACTIVE_COMPLETION_EXECUTION_SCHEMA = (
     "interactive_chapter_completion_execution.v1"
@@ -170,6 +180,19 @@ class InteractiveCompletionProviderBound(_ClosedModel):
         ):
             raise ValueError("unavailable Provider pricing has stale values")
         return self
+
+
+class LegacyInteractiveCompletionProviderBoundV1(_ClosedModel):
+    """Frozen parser for readiness records written before pricing became optional."""
+
+    provider_alias: str = Field(min_length=1, max_length=160)
+    maximum_paid_attempts: int = Field(ge=1, le=1_000)
+    conservative_token_bound: int = Field(ge=1, le=1_000_000_000)
+    currency: str = Field(pattern=r"^[A-Z][A-Z0-9]{2,11}$")
+    maximum_cost: DecimalText
+    price_upper_bound_per_million_tokens: DecimalText
+    pricing_basis: str = Field(min_length=1, max_length=240)
+    pricing_snapshot_digest: Digest
 
 
 class InteractiveCompletionWarning(_ClosedModel):
@@ -301,6 +324,78 @@ class InteractiveChapterCompletionReadiness(_ClosedModel):
         if canonical_completion_digest(payload) != self.digest:
             raise ValueError("interactive completion readiness digest changed")
         return self
+
+
+class LegacyInteractiveChapterCompletionReadinessV1(_ClosedModel):
+    """Exact, read-only V1 contract used only to retire untouched authority."""
+
+    schema_version: Literal[
+        "interactive_chapter_completion_readiness.v1"
+    ]
+    digest: Digest
+    authorization_id: ObjectIdText
+    authorization_revision: int = Field(ge=1)
+    source_binding: InteractiveCompletionSourceBinding
+    planning: InteractiveCompletionPlanning
+    generation_plans: InteractiveCompletionPlans
+    provider_bounds: tuple[
+        LegacyInteractiveCompletionProviderBoundV1,
+        ...,
+    ] = Field(min_length=1, max_length=8)
+    logical_call_count: Literal[2]
+    recovery_replay_limit: Literal[1]
+    maximum_paid_attempts: int = Field(ge=2, le=1_000)
+    conservative_token_bound: int = Field(ge=1, le=1_000_000_000)
+    externalized_prose_utf8_bytes: int = Field(ge=1, le=100_000_000)
+
+    @field_validator("provider_bounds", mode="before")
+    @classmethod
+    def tupleize_provider_bounds(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_identity_and_bounds(
+        self,
+    ) -> "LegacyInteractiveChapterCompletionReadinessV1":
+        attempts = sum(item.maximum_paid_attempts for item in self.provider_bounds)
+        tokens = sum(item.conservative_token_bound for item in self.provider_bounds)
+        if attempts != self.maximum_paid_attempts:
+            raise ValueError("legacy interactive completion attempt bound changed")
+        if tokens != self.conservative_token_bound:
+            raise ValueError("legacy interactive completion token bound changed")
+        finalization = parse_chapter_finalization_authorization(
+            self.planning.chapter_finalization_authorization
+        )
+        if finalization["authorization_revision"] != self.authorization_revision:
+            raise ValueError("legacy interactive finalization authorization changed")
+        identity_payload = self.model_dump(
+            mode="json",
+            exclude={"digest", "authorization_id"},
+        )
+        if canonical_completion_digest(identity_payload)[:24] != self.authorization_id:
+            raise ValueError("legacy interactive authorization identity changed")
+        payload = self.model_dump(mode="json", exclude={"digest"})
+        if canonical_completion_digest(payload) != self.digest:
+            raise ValueError("legacy interactive readiness digest changed")
+        return self
+
+
+class InteractiveChapterCompletionInspection(_ClosedModel):
+    """Read-only presentation envelope; notices never enter readiness authority."""
+
+    schema_version: Literal[
+        "interactive_chapter_completion_inspection.v1"
+    ] = INTERACTIVE_COMPLETION_INSPECTION_SCHEMA
+    readiness: InteractiveChapterCompletionReadiness
+    notices: tuple[
+        Literal["legacy_readiness_reauthorization_required"],
+        ...,
+    ] = ()
+
+    @field_validator("notices", mode="before")
+    @classmethod
+    def tupleize_notices(cls, value: Any) -> Any:
+        return tuple(value) if isinstance(value, list) else value
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -635,6 +730,101 @@ def _bound_readiness(
     return readiness
 
 
+def _parse_legacy_readiness(
+    job: Mapping[str, Any],
+) -> LegacyInteractiveChapterCompletionReadinessV1:
+    try:
+        return LegacyInteractiveChapterCompletionReadinessV1.model_validate(
+            job.get("readiness")
+        )
+    except ValidationError as exc:
+        raise InteractiveCompletionBlocked(
+            "legacy interactive completion readiness history is invalid",
+            code="interactive_authorization_invalid",
+        ) from exc
+
+
+def _legacy_readiness_matches_job(
+    job: Mapping[str, Any],
+    readiness: LegacyInteractiveChapterCompletionReadinessV1,
+) -> bool:
+    source = readiness.source_binding
+    return (
+        str(job.get("_id") or "") == readiness.authorization_id
+        and str(job.get("owner_id") or "") == source.owner_id
+        and str(job.get("novel_id") or "") == source.novel_id
+        and str(job.get("volume_id") or "") == source.volume_id
+        and job.get("scope") == "interactive_completion"
+        and job.get("job_kind") == INTERACTIVE_COMPLETION_JOB_KIND
+        and job.get("interactive_source_key") == _source_key(source)
+        and str(job.get("current_chapter_id") or "") == source.chapter_id
+        and job.get("expected_narrative_revision")
+        == source.expected_narrative_revision
+        and job.get("authorization_revision")
+        == readiness.authorization_revision
+        and job.get("readiness") == readiness.model_dump(mode="json")
+        and job.get("is_deleted") is False
+    )
+
+
+def _legacy_initial_execution_state(
+    readiness: LegacyInteractiveChapterCompletionReadinessV1,
+) -> dict[str, Any]:
+    return {
+        "status": INTERACTIVE_COMPLETION_RUNNING,
+        "pause_reason": None,
+        "token_budget": readiness.conservative_token_bound,
+        "tokens_used": 0,
+        "tokens_reserved": 0,
+        "active_token_reservations": [],
+        "usage_attempt_capacity": readiness.maximum_paid_attempts,
+        "usage_attempt_claimed": 0,
+        "usage_attempt_ids": [],
+        "usage_attempt_summaries": [],
+        "attempt_slots": [],
+        "attempt_reservation": None,
+        "candidate_pipeline_checkpoints": [],
+        "chapter_completion_decisions": [],
+        "progress": [],
+        "state_dispatch_resolution": None,
+        "job_mutation_recovery": None,
+        "execution_epoch": 0,
+        "execution_lease": None,
+        "interactive_execution_claim": None,
+        "interactive_execution_uncertain": False,
+        "uncertain_attempt_ids": [],
+        "has_uncertain_attempts": False,
+        "interactive_completion_evidence": {},
+    }
+
+
+def _legacy_readiness_has_no_execution_trace(
+    job: Mapping[str, Any],
+    readiness: LegacyInteractiveChapterCompletionReadinessV1,
+) -> bool:
+    exact_initial_values = _legacy_initial_execution_state(readiness)
+    if not _legacy_readiness_matches_job(job, readiness):
+        return False
+    if any(
+        key not in job or job.get(key) != expected
+        for key, expected in exact_initial_values.items()
+    ):
+        return False
+    never_started_fields = (
+        "completion_certificate",
+        "required_initial_prose_journal",
+        "required_prose_rewrite_journal",
+        "required_adherence_journal",
+        "required_reviewed_candidate",
+        "required_state_candidate_journal",
+        "required_state_candidate",
+        "required_chapter_finalization_result",
+        "uncertain_resolution_action",
+        "last_uncertain_resolution_action",
+    )
+    return all(job.get(field) is None for field in never_started_fields)
+
+
 def _execution_window_seconds(
     readiness: InteractiveChapterCompletionReadiness,
 ) -> int:
@@ -781,6 +971,88 @@ class InteractiveChapterCompletionService:
         )
         return candidate, chapter, source
 
+    async def _supersede_legacy_readiness(
+        self,
+        *,
+        job: Mapping[str, Any],
+        legacy: LegacyInteractiveChapterCompletionReadinessV1,
+        successor: InteractiveChapterCompletionReadiness,
+    ) -> None:
+        if not _legacy_readiness_has_no_execution_trace(job, legacy):
+            raise InteractiveCompletionBlocked(
+                "legacy interactive completion has execution evidence and "
+                "requires explicit recovery or manual review",
+                code="interactive_legacy_readiness_recovery_required",
+            )
+        expected = {
+            "_id": to_object_id(legacy.authorization_id),
+            "owner_id": to_object_id(legacy.source_binding.owner_id),
+            "novel_id": to_object_id(legacy.source_binding.novel_id),
+            "job_kind": INTERACTIVE_COMPLETION_JOB_KIND,
+            "interactive_source_key": _source_key(legacy.source_binding),
+            "authorization_revision": legacy.authorization_revision,
+            "readiness.schema_version": legacy.schema_version,
+            "readiness.digest": legacy.digest,
+            "updated_at": job.get("updated_at"),
+            **_legacy_initial_execution_state(legacy),
+        }
+        now = get_utc_now()
+        updated = await self._deps.job_repo.update_one(
+            expected,
+            {
+                "status": INTERACTIVE_COMPLETION_SUPERSEDED,
+                "pause_reason": LEGACY_READINESS_REAUTHORIZATION_NOTICE,
+                "successor_authorization_id": successor.authorization_id,
+                "successor_authorization_revision": (
+                    successor.authorization_revision
+                ),
+                "successor_readiness_digest": successor.digest,
+                "superseded_at": now,
+                "updated_at": now,
+            },
+        )
+        if updated is True:
+            return
+        current = await self._deps.job_repo.get_job(legacy.authorization_id)
+        if (
+            current.get("status") == INTERACTIVE_COMPLETION_SUPERSEDED
+            and current.get("pause_reason")
+            == LEGACY_READINESS_REAUTHORIZATION_NOTICE
+            and current.get("successor_authorization_id")
+            == successor.authorization_id
+            and current.get("successor_authorization_revision")
+            == successor.authorization_revision
+            and current.get("successor_readiness_digest") == successor.digest
+        ):
+            return
+        raise InteractiveCompletionBlocked(
+            "legacy interactive completion changed during reauthorization",
+            code="interactive_authorization_conflict",
+        )
+
+    @staticmethod
+    def _validate_superseded_legacy_successor(
+        *,
+        job: Mapping[str, Any],
+        legacy: LegacyInteractiveChapterCompletionReadinessV1,
+        successor: InteractiveChapterCompletionReadiness,
+    ) -> None:
+        if (
+            not _legacy_readiness_matches_job(job, legacy)
+            or job.get("status") != INTERACTIVE_COMPLETION_SUPERSEDED
+            or job.get("pause_reason")
+            != LEGACY_READINESS_REAUTHORIZATION_NOTICE
+            or job.get("successor_authorization_id")
+            != successor.authorization_id
+            or job.get("successor_authorization_revision")
+            != successor.authorization_revision
+            or job.get("successor_readiness_digest") != successor.digest
+        ):
+            raise InteractiveCompletionBlocked(
+                "legacy interactive completion successor is stale",
+                code="interactive_authorization_stale",
+            )
+
     async def inspect(
         self,
         *,
@@ -790,6 +1062,24 @@ class InteractiveChapterCompletionService:
         run_id: str,
         run_revision: int,
     ) -> InteractiveChapterCompletionReadiness:
+        inspection = await self.inspect_with_notices(
+            owner_id=owner_id,
+            novel_id=novel_id,
+            chapter_id=chapter_id,
+            run_id=run_id,
+            run_revision=run_revision,
+        )
+        return inspection.readiness
+
+    async def inspect_with_notices(
+        self,
+        *,
+        owner_id: str,
+        novel_id: str,
+        chapter_id: str,
+        run_id: str,
+        run_revision: int,
+    ) -> InteractiveChapterCompletionInspection:
         candidate, _chapter, source = await self._snapshot(
             owner_id=owner_id,
             novel_id=novel_id,
@@ -816,6 +1106,9 @@ class InteractiveChapterCompletionService:
             limit=1,
         )
         latest = jobs[0] if jobs else None
+        legacy: LegacyInteractiveChapterCompletionReadinessV1 | None = None
+        legacy_active = False
+        legacy_superseded = False
         if isinstance(latest, Mapping):
             prior_revision = latest.get("authorization_revision")
             if type(prior_revision) is not int or prior_revision < 1:
@@ -823,8 +1116,30 @@ class InteractiveChapterCompletionService:
                     "interactive completion authorization history is invalid",
                     code="interactive_authorization_invalid",
                 )
+            persisted_readiness = latest.get("readiness")
+            persisted_schema = (
+                persisted_readiness.get("schema_version")
+                if isinstance(persisted_readiness, Mapping)
+                else None
+            )
+            legacy_active = (
+                persisted_schema == LEGACY_INTERACTIVE_COMPLETION_READINESS_SCHEMA
+                and latest.get("status") in {
+                    INTERACTIVE_COMPLETION_RUNNING,
+                    INTERACTIVE_COMPLETION_UNCERTAIN,
+                    INTERACTIVE_COMPLETION_RESOLVING,
+                }
+            )
+            legacy_superseded = (
+                persisted_schema == LEGACY_INTERACTIVE_COMPLETION_READINESS_SCHEMA
+                and latest.get("status") == INTERACTIVE_COMPLETION_SUPERSEDED
+            )
+            if legacy_active or legacy_superseded:
+                legacy = _parse_legacy_readiness(latest)
             authorization_revision = (
-                prior_revision
+                prior_revision + 1
+                if legacy_active or legacy_superseded
+                else prior_revision
                 if latest.get("status") in {
                     INTERACTIVE_COMPLETION_RUNNING,
                     INTERACTIVE_COMPLETION_UNCERTAIN,
@@ -850,7 +1165,25 @@ class InteractiveChapterCompletionService:
                 "interactive completion Provider plan is invalid",
                 code="interactive_plan_invalid",
             ) from exc
-        if (
+        notices: tuple[
+            Literal["legacy_readiness_reauthorization_required"],
+            ...,
+        ] = ()
+        if legacy_active and legacy is not None:
+            await self._supersede_legacy_readiness(
+                job=latest,
+                legacy=legacy,
+                successor=readiness,
+            )
+            notices = (LEGACY_READINESS_REAUTHORIZATION_NOTICE,)
+        elif legacy_superseded and legacy is not None:
+            self._validate_superseded_legacy_successor(
+                job=latest,
+                legacy=legacy,
+                successor=readiness,
+            )
+            notices = (LEGACY_READINESS_REAUTHORIZATION_NOTICE,)
+        elif (
             isinstance(latest, Mapping)
             and latest.get("status") in {
                 INTERACTIVE_COMPLETION_RUNNING,
@@ -872,7 +1205,10 @@ class InteractiveChapterCompletionService:
                     "interactive completion configuration changed during authorization",
                     code="interactive_authorization_stale",
                 )
-        return readiness
+        return InteractiveChapterCompletionInspection(
+            readiness=readiness,
+            notices=notices,
+        )
 
     async def _ensure_job(
         self,

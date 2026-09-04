@@ -75,6 +75,12 @@ interface InteractiveCompletionReadiness {
   }>;
 }
 
+interface InteractiveCompletionInspection {
+  schema_version: "interactive_chapter_completion_inspection.v1";
+  readiness: InteractiveCompletionReadiness;
+  notices: Array<"legacy_readiness_reauthorization_required">;
+}
+
 interface ProsePanelProps {
   novelId: string;
   chapterId: string;
@@ -113,6 +119,8 @@ export default function ProsePanel({
   const [automaticContinuationsConfirmed, setAutomaticContinuationsConfirmed] = useState(false);
   const [completionReadiness, setCompletionReadiness] =
     useState<InteractiveCompletionReadiness | null>(null);
+  const [completionInspectionNotices, setCompletionInspectionNotices] =
+    useState<InteractiveCompletionInspection["notices"]>([]);
   const [completionReadinessLoading, setCompletionReadinessLoading] =
     useState(false);
   const [completionReadinessConfirmed, setCompletionReadinessConfirmed] =
@@ -210,6 +218,7 @@ export default function ProsePanel({
 
   useEffect(() => {
     setCompletionReadiness(null);
+    setCompletionInspectionNotices([]);
     setCompletionReadinessConfirmed(false);
     setCompletionUncertain(false);
   }, [completionReadinessKey]);
@@ -343,7 +352,7 @@ export default function ProsePanel({
     if (!partialAcceptance && !completionReadiness) {
       setCompletionReadinessLoading(true);
       try {
-        const readiness = await apiPost<InteractiveCompletionReadiness>(
+        const inspection = await apiPost<InteractiveCompletionInspection>(
           `/api/llm/prose-runs/${runId}/completion-readiness`,
           buildInteractiveCompletionReadinessPayload({
             novelId,
@@ -351,7 +360,8 @@ export default function ProsePanel({
             runRevision,
           }),
         );
-        setCompletionReadiness(readiness);
+        setCompletionReadiness(inspection.readiness);
+        setCompletionInspectionNotices(inspection.notices);
         setCompletionReadinessConfirmed(false);
       } catch (error) {
         setActionError(error instanceof Error ? error.message : String(error));
@@ -445,6 +455,7 @@ export default function ProsePanel({
         return;
       }
       setCompletionReadiness(null);
+      setCompletionInspectionNotices([]);
       setCompletionReadinessConfirmed(false);
       setSyncNotice(t("completionUncertainAborted"));
     } catch (error) {
@@ -984,6 +995,13 @@ export default function ProsePanel({
                         })}
                       </p>
                     </div>
+                    {completionInspectionNotices.includes(
+                      "legacy_readiness_reauthorization_required",
+                    ) && (
+                      <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                        {t("completionLegacyReadinessReauthorizationRequired")}
+                      </p>
+                    )}
                     {completionReadiness.warnings.length > 0 && (
                       <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
                         {t("completionReadinessPricingUnavailable", {

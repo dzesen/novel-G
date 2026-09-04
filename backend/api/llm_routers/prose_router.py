@@ -494,14 +494,16 @@ async def inspect_interactive_completion_readiness(
     if actor is None:
         raise HTTPException(status_code=401, detail="需要登录")
     try:
-        readiness = await interactive_chapter_completion_service.inspect(
-            owner_id=str(actor.id),
-            novel_id=req.novel_id,
-            chapter_id=req.chapter_id,
-            run_id=run_id,
-            run_revision=req.expected_run_revision,
+        inspection = (
+            await interactive_chapter_completion_service.inspect_with_notices(
+                owner_id=str(actor.id),
+                novel_id=req.novel_id,
+                chapter_id=req.chapter_id,
+                run_id=run_id,
+                run_revision=req.expected_run_revision,
+            )
         )
-        return readiness.model_dump(mode="json")
+        return inspection.model_dump(mode="json")
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InteractiveCompletionBlocked as exc:
