@@ -782,7 +782,6 @@ def _legacy_initial_execution_state(
         "usage_attempt_ids": [],
         "usage_attempt_summaries": [],
         "attempt_slots": [],
-        "attempt_reservation": None,
         "candidate_pipeline_checkpoints": [],
         "chapter_completion_decisions": [],
         "progress": [],
@@ -798,12 +797,50 @@ def _legacy_initial_execution_state(
     }
 
 
+def _legacy_attempt_reservation_is_unclaimed(
+    job: Mapping[str, Any],
+    readiness: LegacyInteractiveChapterCompletionReadinessV1,
+) -> bool:
+    if "attempt_reservation" not in job:
+        return False
+    reservation = job.get("attempt_reservation")
+    if reservation is None:
+        return True
+    if not isinstance(reservation, Mapping) or set(reservation) != {
+        "chapter_id",
+        "reserved_slots",
+        "claimed_slots",
+        "created_at",
+    }:
+        return False
+    created_at = job.get("created_at")
+    reserved_at = reservation.get("created_at")
+    updated_at = job.get("updated_at")
+    if not all(
+        isinstance(value, datetime) and value.tzinfo is not None
+        for value in (created_at, reserved_at, updated_at)
+    ):
+        return False
+    return (
+        str(reservation.get("chapter_id") or "")
+        == readiness.source_binding.chapter_id
+        and type(reservation.get("reserved_slots")) is int
+        and reservation.get("reserved_slots")
+        == readiness.maximum_paid_attempts
+        and type(reservation.get("claimed_slots")) is int
+        and reservation.get("claimed_slots") == 0
+        and created_at <= reserved_at <= updated_at
+    )
+
+
 def _legacy_readiness_has_no_execution_trace(
     job: Mapping[str, Any],
     readiness: LegacyInteractiveChapterCompletionReadinessV1,
 ) -> bool:
     exact_initial_values = _legacy_initial_execution_state(readiness)
     if not _legacy_readiness_matches_job(job, readiness):
+        return False
+    if not _legacy_attempt_reservation_is_unclaimed(job, readiness):
         return False
     if any(
         key not in job or job.get(key) != expected
@@ -994,6 +1031,7 @@ class InteractiveChapterCompletionService:
             "readiness.schema_version": legacy.schema_version,
             "readiness.digest": legacy.digest,
             "updated_at": job.get("updated_at"),
+            "attempt_reservation": deepcopy(job.get("attempt_reservation")),
             **_legacy_initial_execution_state(legacy),
         }
         now = get_utc_now()
@@ -1007,6 +1045,7 @@ class InteractiveChapterCompletionService:
                     successor.authorization_revision
                 ),
                 "successor_readiness_digest": successor.digest,
+                "attempt_reservation": None,
                 "superseded_at": now,
                 "updated_at": now,
             },
