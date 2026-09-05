@@ -1856,7 +1856,10 @@ class ChapterGenerationApplicationService:
             _build_independent_review_snapshot(
                 candidate=candidate,
                 outline=outline,
-                authorized_context=context.to_prompt_text(),
+                authorized_context="\n\n".join(
+                    section.content for section in context.sections
+                    if section.name != "chapter_outline" and section.content
+                ),
             )
             if independent_plan is not None and candidate is not None
             else None

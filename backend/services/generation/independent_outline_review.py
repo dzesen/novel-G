@@ -1,4 +1,4 @@
-"""An opt-in, side-effect-free semantic review boundary (ADR-0008).
+"""An opt-in, side-effect-free semantic review boundary (ADR-0008 / ADR-0011).
 
 The injected GenerationRuntime owns paid-attempt accounting. This module owns
 the versioned evidence transport and local validation, never a repository,
@@ -21,11 +21,9 @@ from backend.llm.models import TokenUsage
 from backend.llm.exceptions import LLMError, LLMStructuredRepairError
 from backend.llm.schemas.scene_contract_pydantic import (
     BeatEvidenceSchema,
-    ChapterOutlineAdherenceEvidenceV4Schema,
+    ChapterOutlineAdherenceEvidenceV5Schema,
     OutlineContractFindingV3Schema,
-    OutlineQualityDimensionSchema,
     OutlineSemanticUnknownSchema,
-    SceneQualityProfileSchema,
 )
 from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
@@ -43,31 +41,31 @@ from backend.services.llm.generation_runtime import (
     StructuredOutputByteBudgetExceeded,
     StructuredStreamProgress,
     STRUCTURED_REPAIR_PROMPT_REVISION,
+    EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
     UnsettledGenerationAttempts,
 )
 
 
-ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v2"
-REVIEW_PROTOCOL = "independent_outline_review.v2"
+ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v3"
+REVIEW_PROTOCOL = "independent_outline_review.v3"
 ANCHOR_WIDTH = 512
 MAX_QUOTE_LENGTH = 500
 MAX_PROSE_CODEPOINTS = 100_000
 REVIEW_TASK = (
     "阅读完整当前正文、章纲与获准上下文，仅报告符合度证据，不决定通过或严重度。"
-    "按章纲顺序覆盖所有 beat，并为每场提供完整质量画像。"
-    "每个锚点都绑定唯一 scene_id；beat 证据和场景质量画像只能引用同场锚点。"
+    "按章纲顺序覆盖所有 beat，检查必要事件、进入与结束状态、禁止条件及重复规则。"
+    "本次只审查完成证据，不生成质量画像或质量维度报告；quality_dimensions 保持空数组。"
+    "每个锚点都绑定唯一 scene_id；beat 证据只能引用同场锚点。"
     "引用须逐字复制，返回锚点 ID 和 quote，不计算字符位置。"
-    "锚点按原文顺序排列，每段前 512 个字符是本段引用起点范围；"
-    "右侧至多 499 个字符仅供跨边界引用，不代表正文重复。"
+    "锚点按原文顺序排列，文本不重叠；依次拼接同场锚点就是该场完整原文。"
+    "引文可跨相邻同场锚点，anchor_id 必须指向引文首字所在锚点，quote 最多 500 字符。"
     "同一锚点内起点范围中必须唯一匹配；有歧义时使用更完整的原文引文。"
     "修正只限格式或证据定位；有效的语义问题不得改成通过。"
 )
 _EVIDENCE_SPAN_FIELDS = (
     ("beat_evidence", BeatEvidenceSchema, "spans"),
     ("findings", OutlineContractFindingV3Schema, "spans"),
-    ("quality_dimensions", OutlineQualityDimensionSchema, "spans"),
     ("unknowns", OutlineSemanticUnknownSchema, "spans"),
-    ("scene_quality_profiles", SceneQualityProfileSchema, "representative_spans"),
 )
 
 
@@ -112,7 +110,7 @@ class AnchoredProseSpan(BaseModel):
 
 
 def _anchor_transport_schema() -> type[BaseModel]:
-    # Inherit V4's *entire* field contract and validators, changing only the
+    # Inherit V5's *entire* field contract and validators, changing only the
     # transport of spans. Copy FieldInfo so its min/max/defaults cannot drift.
     replacements = {}
     for field, base, span_field in _EVIDENCE_SPAN_FIELDS:
@@ -123,18 +121,18 @@ def _anchor_transport_schema() -> type[BaseModel]:
         )
         replacements[field] = (
             list[anchored_item],
-            deepcopy(ChapterOutlineAdherenceEvidenceV4Schema.model_fields[field]),
+            deepcopy(ChapterOutlineAdherenceEvidenceV5Schema.model_fields[field]),
         )
     return create_model(
-        "AnchoredOutlineAdherenceEvidenceV1",
-        __base__=ChapterOutlineAdherenceEvidenceV4Schema,
-        schema_version=(Literal["anchored_outline_adherence_evidence.v1"], Field()),
+        "AnchoredOutlineAdherenceEvidenceV2",
+        __base__=ChapterOutlineAdherenceEvidenceV5Schema,
+        schema_version=(Literal["anchored_outline_adherence_evidence.v2"], Field()),
         view_digest=(str, Field(pattern=r"^[0-9a-f]{64}$")),
         **replacements,
     )
 
 
-AnchoredOutlineAdherenceEvidenceV1 = _anchor_transport_schema()
+AnchoredOutlineAdherenceEvidenceV2 = _anchor_transport_schema()
 
 
 @dataclass(frozen=True)
@@ -276,7 +274,7 @@ class IndependentReviewPlan:
     writer_model: str
     input_token_bound: int
     max_response_bytes: int
-    protocol: Literal["independent_outline_review.v2"] = REVIEW_PROTOCOL
+    protocol: Literal["independent_outline_review.v3"] = REVIEW_PROTOCOL
 
     def __post_init__(self) -> None:
         if (
@@ -339,8 +337,9 @@ def independent_review_semantic_protocol_digest() -> str:
         "max_prose_codepoints": MAX_PROSE_CODEPOINTS,
         "task": REVIEW_TASK,
         "system_prompt": OUTLINE_ADHERENCE_SYSTEM_PROMPT,
-        "schema": AnchoredOutlineAdherenceEvidenceV1.model_json_schema(),
+        "schema": AnchoredOutlineAdherenceEvidenceV2.model_json_schema(),
         "structured_correction_revision": STRUCTURED_REPAIR_PROMPT_REVISION,
+        "embedded_schema_correction_revision": EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
         "require_settled_attempts": True,
     }))
 
@@ -397,14 +396,14 @@ def _assess_anchored(
     payload = value.model_dump(mode="json")
     if payload.pop("view_digest") != snapshot.view_digest:
         raise PydanticCustomError("review_source_mismatch", "review source does not match")
-    payload["schema_version"] = "chapter_outline_adherence_evidence.v4"
+    payload["schema_version"] = "chapter_outline_adherence_evidence.v5"
     for field, _base, span_field in _EVIDENCE_SPAN_FIELDS:
         for item_index, item in enumerate(payload[field]):
             located = []
             for span_index, span in enumerate(item[span_field]):
                 def invalid_quote(code: str) -> ValidationError:
                     return ValidationError.from_exception_data(
-                        "AnchoredOutlineAdherenceEvidenceV1",
+                        "AnchoredOutlineAdherenceEvidenceV2",
                         [{
                             "type": PydanticCustomError(code, "exact quote location failed"),
                             "loc": (field, item_index, span_field, span_index),
@@ -415,7 +414,7 @@ def _assess_anchored(
                 if anchor is None:
                     raise invalid_quote("review_anchor_unknown")
                 if (
-                    field in {"beat_evidence", "scene_quality_profiles"}
+                    field == "beat_evidence"
                     and anchor.scene_id != item.get("scene_id")
                 ):
                     raise invalid_quote("review_quote_scene_mismatch")
@@ -474,7 +473,7 @@ class IndependentOutlineReviewer:
 
         schema = create_model(
             "SnapshotBoundIndependentReview",
-            __base__=AnchoredOutlineAdherenceEvidenceV1,
+            __base__=AnchoredOutlineAdherenceEvidenceV2,
             __validators__={"validate_current_evidence": model_validator(mode="after")(validate_current_evidence)},
         )
         prompt = _json({
@@ -491,7 +490,9 @@ class IndependentOutlineReviewer:
                     {
                         "anchor_id": key,
                         "scene_id": item.scene_id,
-                        "text": item.text,
+                        # Keep overlap only in the local locator. The model
+                        # receives every source character exactly once.
+                        "text": item.text[:item.primary_end - item.start],
                     }
                     for key, item in anchors.items()
                 ],

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Annotated, Literal
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -384,6 +385,15 @@ class ChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
         if any(len(values) != len(set(values)) for values in identity_groups):
             raise ValueError("Provider evidence identities must be unique by kind")
         return self
+
+
+class ChapterOutlineAdherenceEvidenceV5Schema(
+    ChapterOutlineAdherenceEvidenceV3Schema
+):
+    """Completion evidence without the optional quality analysis (ADR-0011)."""
+
+    schema_version: Literal["chapter_outline_adherence_evidence.v5"]
+    quality_dimensions: list[None] = Field(default_factory=list, max_length=0)
 
 
 class SceneEventFingerprintSchema(BaseModel):
@@ -978,10 +988,32 @@ class ValidatedChapterOutlineAdherenceEvidenceV3Schema(BaseModel):
         return self
 
 
+class ValidatedChapterOutlineAdherenceEvidenceV5Schema(
+    ValidatedChapterOutlineAdherenceEvidenceV3Schema
+):
+    """Current completion-only projection; no quality result is fabricated."""
+
+    evidence_schema_version: Literal["chapter_outline_adherence_evidence.v5"]
+    issue_policy_version: Literal["chapter_outline_issue_policy.v3"]
+    quality_dimensions: list[None] = Field(default_factory=list, max_length=0)
+    quality_review_status: Literal["not_requested"]
+
+    @model_validator(mode="after")
+    def validate_no_quality_projection(
+        self,
+    ) -> "ValidatedChapterOutlineAdherenceEvidenceV5Schema":
+        if any(
+            item.source_kind in {"quality_dimension", "quality_signal"}
+            for item in self.local_issues
+        ):
+            raise ValueError("unrequested quality cannot supply local issues")
+        return self
+
+
 class ValidatedChapterOutlineAdherenceEvidenceV4Schema(
     ValidatedChapterOutlineAdherenceEvidenceV3Schema
 ):
-    """Current local projection with a source-bound quality-debt sidecar."""
+    """V4 local projection with a source-bound quality-debt sidecar."""
 
     evidence_schema_version: Literal["chapter_outline_adherence_evidence.v4"]
     issue_policy_version: Literal["chapter_outline_issue_policy.v2"]
@@ -1042,3 +1074,20 @@ class ValidatedChapterOutlineAdherenceEvidenceV4Schema(
         ):
             raise ValueError("quality sidecar issues changed")
         return self
+
+
+def parse_current_outline_adherence_evidence(value: Any) -> (
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema
+    | ValidatedChapterOutlineAdherenceEvidenceV5Schema
+):
+    """Select the exact evidence contract; never reinterpret V4 as V5."""
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="python")
+    schema = (
+        ValidatedChapterOutlineAdherenceEvidenceV5Schema
+        if isinstance(value, Mapping)
+        and value.get("evidence_schema_version")
+        == "chapter_outline_adherence_evidence.v5"
+        else ValidatedChapterOutlineAdherenceEvidenceV4Schema
+    )
+    return schema.model_validate(value)

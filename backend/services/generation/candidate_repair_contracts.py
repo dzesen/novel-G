@@ -15,14 +15,14 @@ from backend.llm.schemas.scene_contract_pydantic import (
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
     ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV5Schema,
 )
 from backend.llm.stream_terminal import FinishReason
 from backend.scene_contract_versions import (
     LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
-    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
+    CURRENT_OUTLINE_ADHERENCE_POLICIES,
 )
 from backend.services.generation.outline_adherence import (
     OutlineIssueCategoryValue,
@@ -458,7 +458,7 @@ class _CandidatePipelineCheckpointV5(_CandidatePipelineCheckpointV1):
 
 
 class AdherenceCandidateCheckpointV5(_CandidatePipelineCheckpointV5):
-    """Current checkpoint: V4 evidence, local V2 policy, and quality sidecar."""
+    """Checkpoint envelope with explicitly versioned V4 or V5 evidence."""
 
     kind: Literal["outline_adherence"] = "outline_adherence"
     decision: Literal["pass", "repair", "manual_review"]
@@ -474,15 +474,20 @@ class AdherenceCandidateCheckpointV5(_CandidatePipelineCheckpointV5):
         default=(),
         max_length=20,
     )
-    validated_evidence: ValidatedChapterOutlineAdherenceEvidenceV4Schema
+    validated_evidence: (
+        ValidatedChapterOutlineAdherenceEvidenceV4Schema
+        | ValidatedChapterOutlineAdherenceEvidenceV5Schema
+    ) = Field(discriminator="evidence_schema_version")
 
     @model_validator(mode="after")
     def validate_evidence_projection(self) -> "AdherenceCandidateCheckpointV5":
         evidence = self.validated_evidence
-        if evidence.evidence_schema_version != OUTLINE_ADHERENCE_EVIDENCE_VERSION:
-            raise ValueError("V4 adherence checkpoint evidence version is invalid")
-        if evidence.issue_policy_version != OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION:
-            raise ValueError("V4 adherence checkpoint issue policy is invalid")
+        if evidence.evidence_schema_version not in CURRENT_OUTLINE_ADHERENCE_POLICIES:
+            raise ValueError("current adherence checkpoint evidence version is invalid")
+        if evidence.issue_policy_version != CURRENT_OUTLINE_ADHERENCE_POLICIES[
+            evidence.evidence_schema_version
+        ]:
+            raise ValueError("current adherence checkpoint issue policy is invalid")
         blocking_issues = [
             item
             for item in evidence.local_issues

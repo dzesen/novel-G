@@ -16,6 +16,8 @@ from backend.llm.schemas.scene_contract_pydantic import (
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
     ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV5Schema,
+    parse_current_outline_adherence_evidence,
 )
 from backend.llm.schemas.state_fact_pydantic import (
     ChapterStateFactEvidenceSchema,

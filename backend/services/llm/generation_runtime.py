@@ -38,6 +38,7 @@ class StructuredOutputMode(str, Enum):
 
 
 STRUCTURED_REQUEST_BUDGET_PROTOCOL = "structured_request_budget.v2"
+STRUCTURED_PROGRESS_TIMEOUT_SECONDS = 0.25
 STRUCTURED_VALIDATION_ISSUES_SCHEMA_VERSION = (
     "structured_validation_issues.v1"
 )
@@ -68,6 +69,12 @@ Validation guidance (raw values intentionally omitted):
 
 Invalid output:
 {produced}"""
+_EMBEDDED_SCHEMA_REPAIR_PROMPT_TEMPLATE = _STRUCTURED_REPAIR_PROMPT_TEMPLATE.replace(
+    "\nJSON Schema:\n{schema_json}\n", "\nUse the JSON Schema already included in the Original task.\n"
+)
+EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION = hashlib.sha256(
+    _EMBEDDED_SCHEMA_REPAIR_PROMPT_TEMPLATE.encode("utf-8")
+).hexdigest()
 _STRUCTURED_BYTE_BUDGET_REGENERATION_PROMPT_TEMPLATE = """The previous Provider response exceeded the authorized structured-output byte budget and is intentionally not included.
 Regenerate the complete answer from the Original task without referring to or reconstructing the previous response.
 Return one concise, complete answer that satisfies every original schema and content requirement and fits within {max_bytes} UTF-8 bytes after compact JSON serialization.
@@ -333,10 +340,20 @@ def render_structured_repair_prompt(
     safe_issues = _normalize_structured_validation_issues(validation_issues)
     if safe_issues is None:
         raise ValueError("structured repair validation guidance is invalid")
-    return _STRUCTURED_REPAIR_PROMPT_TEMPLATE.format(
+    schema_payload = schema.model_json_schema()
+    try:
+        original_task = json.loads(original_prompt)
+    except (TypeError, ValueError):
+        original_task = None
+    template = (
+        _EMBEDDED_SCHEMA_REPAIR_PROMPT_TEMPLATE
+        if isinstance(original_task, dict) and original_task.get("schema") == schema_payload
+        else _STRUCTURED_REPAIR_PROMPT_TEMPLATE
+    )
+    return template.format(
         original_prompt=original_prompt,
         schema_json=json.dumps(
-            schema.model_json_schema(),
+            schema_payload,
             ensure_ascii=False,
         ),
         validation_issues_json=json.dumps(
@@ -955,6 +972,17 @@ class GenerationRuntime:
                 if isinstance(policy, Mapping)
                 else None
             )
+            if isinstance(target, WorkflowStepTarget) and (
+                target.workflow_name == "remediate_chapter_prose_by_agent"
+                and target.step_name == "outline_adherence"
+            ):
+                # Freeze the execution contract as well as Provider settings:
+                # old interactive readiness cannot dispatch the lean review.
+                payload["adherence_execution_contract"] = {
+                    "review_protocol": "independent_outline_review.v3",
+                    "evidence_version": "chapter_outline_adherence_evidence.v5",
+                    "embedded_schema_correction": EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
+                }
         secret_projection = self._scoped_secret_revision_projection(
             self._secret_revision_state(),
             aliases,
@@ -1386,6 +1414,7 @@ class GenerationRuntime:
         schema_request_payload = structured_schema_request_payload(schema)
         provider_activity_count = 0
         content_chunks = 0
+        progress_observer_disabled = False
 
         async def emit_stream_progress(
             *,
@@ -1393,7 +1422,8 @@ class GenerationRuntime:
             phase: str,
             content_bytes: int,
         ) -> None:
-            if stream_progress is None:
+            nonlocal progress_observer_disabled
+            if stream_progress is None or progress_observer_disabled:
                 return
             try:
                 observed = stream_progress(StructuredStreamProgress(
@@ -1404,11 +1434,15 @@ class GenerationRuntime:
                     content_bytes=content_bytes,
                 ))
                 if isawaitable(observed):
-                    await observed
+                    async with asyncio.timeout(STRUCTURED_PROGRESS_TIMEOUT_SECONDS):
+                        await observed
             except Exception:
                 # Progress is an observer, not part of the paid-call contract.
                 # A transient status-write failure must not turn an otherwise
                 # healthy Provider request into an uncertain paid attempt.
+                # Disable a stalled/broken observer for the rest of this call;
+                # retrying it for each token would accumulate unbounded delay.
+                progress_observer_disabled = True
                 return
 
         async def collect_streamed_structured_text(

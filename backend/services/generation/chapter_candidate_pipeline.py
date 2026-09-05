@@ -16,12 +16,12 @@ from backend.llm.schemas.scene_contract_pydantic import (
     MAX_V3_LOCAL_ADHERENCE_ISSUES,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
-    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+    parse_current_outline_adherence_evidence,
 )
 from backend.scene_contract_versions import (
     LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    CURRENT_OUTLINE_ADHERENCE_POLICIES,
 )
 from backend.services.generation.chapter_generation_application import (
     ChapterGenerationResult,
@@ -109,7 +109,7 @@ from backend.services.generation.state_repair_contracts import (
 
 _LOCAL_POLICY_EVIDENCE_VERSIONS = frozenset({
     LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+    *CURRENT_OUTLINE_ADHERENCE_POLICIES,
 })
 
 
@@ -1579,20 +1579,20 @@ def _adherence_checkpoint(
     evidence_version = adherence.get("evidence_schema_version")
     validated_evidence_v2 = None
     validated_evidence_v3 = None
-    validated_evidence_v4 = None
+    validated_current_evidence = None
     if evidence_version is not None:
         if evidence_version not in {
             LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
             LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-            OUTLINE_ADHERENCE_EVIDENCE_VERSION,
+            *CURRENT_OUTLINE_ADHERENCE_POLICIES,
         }:
             raise ChapterCandidatePipelineBlocked(
                 "章纲符合度检查点证据版本无效"
             )
         try:
-            if evidence_version == OUTLINE_ADHERENCE_EVIDENCE_VERSION:
-                validated_evidence_v4 = (
-                    ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+            if evidence_version in CURRENT_OUTLINE_ADHERENCE_POLICIES:
+                validated_current_evidence = (
+                    parse_current_outline_adherence_evidence(
                         dict(adherence)
                     )
                 )
@@ -1622,7 +1622,7 @@ def _adherence_checkpoint(
         evidence=evidence,
     )
     try:
-        if validated_evidence_v4 is not None:
+        if validated_current_evidence is not None:
             checkpoint = AdherenceCandidateCheckpointV5(
                 **{
                     **common,
@@ -1633,7 +1633,7 @@ def _adherence_checkpoint(
                 issue_categories=categories,
                 blocking_issue_signatures=blocking_signatures,
                 scene_coverage=coverage,
-                validated_evidence=validated_evidence_v4,
+                validated_evidence=validated_current_evidence,
             )
         elif validated_evidence_v3 is not None:
             checkpoint = AdherenceCandidateCheckpointV4(
@@ -2305,17 +2305,17 @@ def _validate_resumed_adherence_projection(
     if isinstance(checkpoint, AdherenceCandidateCheckpointV5):
         try:
             restored_evidence = (
-                ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                parse_current_outline_adherence_evidence(
                     dict(adherence)
                 )
             )
         except ValueError as exc:
             raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复 V4 复检证据无效"
+                "候选管线恢复当前复检证据无效"
             ) from exc
         if restored_evidence != checkpoint.validated_evidence:
             raise ChapterCandidatePipelineBlocked(
-                "候选管线恢复 V4 复检证据与检查点不一致"
+                "候选管线恢复当前复检证据与检查点不一致"
             )
     elif isinstance(checkpoint, AdherenceCandidateCheckpointV4):
         try:
@@ -3937,9 +3937,7 @@ def _project_adherence_repair_targets(
     chapter: Mapping[str, Any],
 ) -> tuple[tuple[OutlineIssueCategory, ...], tuple[int, ...]]:
     categories: list[OutlineIssueCategory] = []
-    current_policy = adherence.get("evidence_schema_version") == (
-        OUTLINE_ADHERENCE_EVIDENCE_VERSION
-    )
+    current_policy = adherence.get("evidence_schema_version") in CURRENT_OUTLINE_ADHERENCE_POLICIES
     issues = adherence.get("local_issues" if current_policy else "issues")
     if isinstance(issues, list):
         for item in issues:
@@ -4813,9 +4811,7 @@ class ChapterCandidatePipeline:
                         trace=trace,
                         gate="outline_adherence",
                     )
-                if adherence.get("evidence_schema_version") == (
-                    OUTLINE_ADHERENCE_EVIDENCE_VERSION
-                ):
+                if adherence.get("evidence_schema_version") in CURRENT_OUTLINE_ADHERENCE_POLICIES:
                     repair_issues = _hard_repair_issues(adherence)
                     if repair_policy.observation_count == 0:
                         convergence = repair_policy.observe_adherence(
@@ -4905,7 +4901,7 @@ class ChapterCandidatePipeline:
             except ChapterCandidatePipelineBlocked as gate_error:
                 uses_stable_issue_policy = adherence.get(
                     "evidence_schema_version"
-                ) == OUTLINE_ADHERENCE_EVIDENCE_VERSION
+                ) in CURRENT_OUTLINE_ADHERENCE_POLICIES
                 component = _content_repair_component(adherence)
                 if last_repair_kept_digest and not uses_stable_issue_policy:
                     repair_failure = _repair_failure_for_component(

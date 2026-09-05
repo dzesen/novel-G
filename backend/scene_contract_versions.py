@@ -20,6 +20,12 @@ LEGACY_OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION = (
     "chapter_outline_issue_policy.v1"
 )
 OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION = "chapter_outline_issue_policy.v2"
+COMPLETION_REVIEW_EVIDENCE_VERSION = "chapter_outline_adherence_evidence.v5"
+COMPLETION_REVIEW_ISSUE_POLICY_VERSION = "chapter_outline_issue_policy.v3"
+CURRENT_OUTLINE_ADHERENCE_POLICIES = {
+    OUTLINE_ADHERENCE_EVIDENCE_VERSION: OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
+    COMPLETION_REVIEW_EVIDENCE_VERSION: COMPLETION_REVIEW_ISSUE_POLICY_VERSION,
+}
 NARRATIVE_QUALITY_SIDECAR_SCHEMA = "chapter_narrative_quality_sidecar.v1"
 NARRATIVE_REPETITION_SIGNAL_POLICY = "narrative_repetition_signal_policy.v1"
 NARRATIVE_REPETITION_SIGNAL_LAYERS = (
@@ -54,12 +60,14 @@ def current_outline_adherence_decision(
 ) -> OutlineAdherenceDecision | None:
     """Read a decision only when both current evidence contracts match."""
 
+    if not isinstance(value, Mapping):
+        return None
+    evidence_version = value.get("evidence_schema_version")
     if (
-        not isinstance(value, Mapping)
-        or value.get("evidence_schema_version")
-        != OUTLINE_ADHERENCE_EVIDENCE_VERSION
+        not isinstance(evidence_version, str)
+        or evidence_version not in CURRENT_OUTLINE_ADHERENCE_POLICIES
         or value.get("issue_policy_version")
-        != OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION
+        != CURRENT_OUTLINE_ADHERENCE_POLICIES[evidence_version]
     ):
         return None
     decision = value.get("decision")

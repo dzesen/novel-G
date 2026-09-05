@@ -29,6 +29,8 @@ from backend.db.repositories.generation_job_repository import (
 )
 from backend.llm.schemas.scene_contract_pydantic import (
     ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV5Schema,
+    parse_current_outline_adherence_evidence,
 )
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
@@ -198,8 +200,11 @@ def _trusted_outline_adherence_evidence(
     *,
     job: Mapping[str, Any],
     chapter_id: str,
-) -> ValidatedChapterOutlineAdherenceEvidenceV4Schema:
-    """Load the exact server-persisted V4 evidence for this finalization."""
+) -> (
+    ValidatedChapterOutlineAdherenceEvidenceV4Schema
+    | ValidatedChapterOutlineAdherenceEvidenceV5Schema
+):
+    """Load the exact server-persisted completion evidence for finalization."""
 
     raw_trusted: Any = None
     successor = _required_finalization_authority(job)
@@ -241,7 +246,7 @@ def _trusted_outline_adherence_evidence(
                     mode="python"
                 )
     try:
-        return ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+        return parse_current_outline_adherence_evidence(
             raw_trusted
         )
     except ValueError as exc:
@@ -2326,7 +2331,7 @@ class ChapterFinalizationService:
             )
         try:
             submitted_adherence = (
-                ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                parse_current_outline_adherence_evidence(
                     adherence
                 )
             )

@@ -43,6 +43,8 @@ from backend.llm.schemas.novel_pydantic import (
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
     ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+    ValidatedChapterOutlineAdherenceEvidenceV5Schema,
+    parse_current_outline_adherence_evidence,
 )
 from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
@@ -484,6 +486,7 @@ class CheckOutlineAdherenceOutput(_StrictModel):
         | ValidatedChapterOutlineAdherenceEvidenceSchema
         | ValidatedChapterOutlineAdherenceEvidenceV3Schema
         | ValidatedChapterOutlineAdherenceEvidenceV4Schema
+        | ValidatedChapterOutlineAdherenceEvidenceV5Schema
         | None
     ) = None
 
@@ -2591,7 +2594,7 @@ class ProseRemediationToolApplication:
                     source_content_digest=payload.expected_content_digest,
                 )
                 review = (
-                    ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                    parse_current_outline_adherence_evidence(
                         normalized
                     )
                 )

@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from backend.llm.schemas.scene_contract_pydantic import (
-    ValidatedChapterOutlineAdherenceEvidenceV4Schema,
+    parse_current_outline_adherence_evidence,
 )
 from backend.services.generation.candidate_repair_contracts import (
     JobMutationReceiptV1,
@@ -185,7 +185,7 @@ class RequiredChapterFinalizationAuthorization(_Closed):
         state = self.state_candidate
         try:
             adherence = (
-                ValidatedChapterOutlineAdherenceEvidenceV4Schema.model_validate(
+                parse_current_outline_adherence_evidence(
                     self.outline_adherence
                 )
             )
