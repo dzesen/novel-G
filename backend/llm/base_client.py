@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from inspect import isawaitable
 from typing import Any, AsyncGenerator, Callable
 
 from pydantic import BaseModel
@@ -264,6 +265,29 @@ class BaseLLMClient(ABC):
         if tail:
             yield tail
 
+    @staticmethod
+    async def _report_stream_activity(
+        activity_sink: Callable[[], Any] | None,
+    ) -> None:
+        """Report one raw transport event without exposing its content."""
+        if activity_sink is None:
+            return
+        observed = activity_sink()
+        if isawaitable(observed):
+            await observed
+
+    @staticmethod
+    async def _close_provider_stream(stream: Any) -> None:
+        """Release an interrupted SDK stream without assuming one close API."""
+        close = getattr(stream, "close", None)
+        if not callable(close):
+            close = getattr(stream, "aclose", None)
+        if not callable(close):
+            return
+        observed = close()
+        if isawaitable(observed):
+            await observed
+
     @abstractmethod
     async def text_generate(self, request: LLMRequest) -> LLMResponse:
         """普通文本生成。"""
@@ -279,6 +303,7 @@ class BaseLLMClient(ABC):
         self,
         request: LLMRequest,
         usage_sink: Callable[[TokenUsage], None] | None = None,
+        activity_sink: Callable[[], Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         """流式文本输出，逐块 yield 生成内容。
 
@@ -287,6 +312,7 @@ class BaseLLMClient(ABC):
             usage_sink: 可选回调，拿到 token 用量时调用一次。用量只在流末尾到达，
                 无法随返回值给出，故以回调回传。**尽力而为**：provider 不报用量时
                 不调用，调用方据此降级为零值，绝不可因此中断生成。
+            activity_sink: 每收到一个原始流事件时调用，不传递正文或私有思考内容。
         """
 
     @abstractmethod

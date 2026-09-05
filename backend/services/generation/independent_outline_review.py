@@ -11,7 +11,7 @@ import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
@@ -41,13 +41,14 @@ from backend.services.llm.generation_runtime import (
     StaleGenerationPlan,
     StructuredOutputMode,
     StructuredOutputByteBudgetExceeded,
+    StructuredStreamProgress,
     STRUCTURED_REPAIR_PROMPT_REVISION,
     UnsettledGenerationAttempts,
 )
 
 
 ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v2"
-REVIEW_PROTOCOL = "independent_outline_review.v1"
+REVIEW_PROTOCOL = "independent_outline_review.v2"
 ANCHOR_WIDTH = 512
 MAX_QUOTE_LENGTH = 500
 MAX_PROSE_CODEPOINTS = 100_000
@@ -275,7 +276,7 @@ class IndependentReviewPlan:
     writer_model: str
     input_token_bound: int
     max_response_bytes: int
-    protocol: Literal["independent_outline_review.v1"] = REVIEW_PROTOCOL
+    protocol: Literal["independent_outline_review.v2"] = REVIEW_PROTOCOL
 
     def __post_init__(self) -> None:
         if (
@@ -457,7 +458,11 @@ class IndependentOutlineReviewer:
             return False
 
     async def review(
-        self, snapshot: OutlineReviewSnapshot, plan: IndependentReviewPlan,
+        self,
+        snapshot: OutlineReviewSnapshot,
+        plan: IndependentReviewPlan,
+        *,
+        stream_progress: Callable[[StructuredStreamProgress], Any] | None = None,
     ) -> IndependentReviewResult:
         if not self.matches_plan(plan):
             return IndependentReviewResult(None, "review_plan_stale", TokenUsage(), ())
@@ -504,6 +509,8 @@ class IndependentOutlineReviewer:
                 max_conservative_total_tokens=plan.max_total_tokens,
                 max_structured_raw_output_bytes=plan.max_response_bytes,
                 require_settled_attempts=True,
+                stream_json_output=True,
+                stream_progress=stream_progress,
             )
             if not self.matches_plan(plan):
                 return IndependentReviewResult(

@@ -25,6 +25,7 @@ import {
   buildInteractiveCompletionPayload,
   buildInteractiveCompletionReadinessPayload,
   buildInteractiveCompletionResolutionPayload,
+  buildInteractiveCompletionStatusPayload,
   buildProseAcceptPayload,
   finishReasonTranslationKey,
   proseAdvisoryTranslationKey,
@@ -81,6 +82,24 @@ interface InteractiveCompletionInspection {
   notices: Array<"legacy_readiness_reauthorization_required">;
 }
 
+interface InteractiveCompletionProgress {
+  schema_version: "interactive_completion_progress.v1";
+  authorization_id: string;
+  status: string;
+  pause_reason: string | null;
+  stage: "outline_adherence" | "state_generation" | "finalization" | "completed";
+  stage_status: "running" | "completed" | "failed";
+  started_at: string;
+  updated_at: string;
+  provider_alias: string | null;
+  provider_model: string | null;
+  stream_phase: string | null;
+  failure_code: string | null;
+  provider_activity_count: number;
+  content_chunks: number;
+  content_bytes: number;
+}
+
 interface ProsePanelProps {
   novelId: string;
   chapterId: string;
@@ -128,6 +147,12 @@ export default function ProsePanel({
   const [completionUncertain, setCompletionUncertain] = useState(false);
   const [completionResolutionLoading, setCompletionResolutionLoading] =
     useState(false);
+  const [completionProgress, setCompletionProgress] =
+    useState<InteractiveCompletionProgress | null>(null);
+  const [completionProgressClock, setCompletionProgressClock] = useState(
+    () => Date.now(),
+  );
+  const completionProgressStartedAt = completionProgress?.started_at ?? null;
 
   const [overwriteArmed, setOverwriteArmed] = useState(false);
   const [partialArmed, setPartialArmed] = useState(false);
@@ -221,7 +246,17 @@ export default function ProsePanel({
     setCompletionInspectionNotices([]);
     setCompletionReadinessConfirmed(false);
     setCompletionUncertain(false);
+    setCompletionProgress(null);
   }, [completionReadinessKey]);
+
+  useEffect(() => {
+    if (!accepting || !completionProgressStartedAt) return;
+    setCompletionProgressClock(Date.now());
+    const timer = window.setInterval(() => {
+      setCompletionProgressClock(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [accepting, completionProgressStartedAt]);
 
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement
@@ -302,21 +337,78 @@ export default function ProsePanel({
     runRevision: number,
     readiness: InteractiveCompletionReadiness,
   ) => {
-    await apiPost(
-      `/api/llm/prose-runs/${runId}/complete`,
-      buildInteractiveCompletionPayload({
-        novelId,
-        chapterId,
-        runRevision,
-        authorizationId: readiness.authorization_id,
-        authorizationRevision: readiness.authorization_revision,
-        readinessDigest: readiness.digest,
-      }),
-    );
+    const authority = {
+      novelId,
+      chapterId,
+      runRevision,
+      authorizationId: readiness.authorization_id,
+      authorizationRevision: readiness.authorization_revision,
+      readinessDigest: readiness.digest,
+    };
+    let polling = true;
+    let progressRequest: Promise<void> | null = null;
+    const refreshProgress = (): Promise<void> => {
+      if (progressRequest) return progressRequest;
+      progressRequest = (async () => {
+        try {
+          const progress = await apiPost<InteractiveCompletionProgress>(
+            `/api/llm/prose-runs/${runId}/complete/status`,
+            buildInteractiveCompletionStatusPayload(authority),
+          );
+          if (polling) setCompletionProgress(progress);
+        } catch {
+          // The first poll may race job creation. The completion request remains
+          // authoritative and the next poll retries the read-only projection.
+        }
+      })().finally(() => {
+        progressRequest = null;
+      });
+      return progressRequest;
+    };
+    const timer = window.setInterval(() => {
+      void refreshProgress();
+    }, 1000);
+    void refreshProgress();
+    try {
+      await apiPost(
+        `/api/llm/prose-runs/${runId}/complete`,
+        buildInteractiveCompletionPayload(authority),
+      );
+    } finally {
+      window.clearInterval(timer);
+      if (progressRequest) await progressRequest;
+      await refreshProgress();
+      polling = false;
+    }
     onAccepted(stream.text, "ai_complete");
     onRunStateChanged?.();
     onClose();
   };
+
+  const completionElapsedSeconds = completionProgress
+    ? Math.max(
+      0,
+      Math.floor(
+        (completionProgressClock - Date.parse(completionProgress.started_at))
+          / 1000,
+      ),
+    )
+    : 0;
+
+  const completionProgressStage = completionProgress
+    ? t({
+      outline_adherence: "completionProgressStageAdherence",
+      state_generation: "completionProgressStageState",
+      finalization: "completionProgressStageFinalization",
+      completed: "completionProgressStageCompleted",
+    }[completionProgress.stage])
+    : "";
+  const completionProgressProvider = completionProgress
+    ? [
+      completionProgress.provider_alias,
+      completionProgress.provider_model,
+    ].filter(Boolean).join(" / ") || t("completionProgressLocal")
+    : "";
 
   const recordCompletionFailure = (error: unknown): boolean => {
     if (interactiveCompletionErrorCode(error) !== "interactive_uncertain_attempt") {
@@ -1029,6 +1121,49 @@ export default function ProsePanel({
                       </span>
                     </label>
                   </>
+                )}
+              </section>
+            </Notice>
+          )}
+          {completionProgress && (
+            <Notice
+              tone={completionProgress.stage_status === "failed"
+                ? "warning"
+                : "info"}
+            >
+              <section
+                data-testid="interactive-completion-progress"
+                className="grid min-w-0 gap-1 text-xs leading-5"
+                role="status"
+              >
+                <p className="font-medium text-foreground">
+                  {t("completionProgressTitle")}
+                </p>
+                <p>
+                  {t("completionProgressElapsed", {
+                    seconds: completionElapsedSeconds,
+                  })}
+                </p>
+                <p>
+                  {t("completionProgressStage", {
+                    stage: completionProgressStage,
+                  })}
+                </p>
+                <p className="min-w-0 break-words">
+                  {t("completionProgressProviderActivity", {
+                    provider: completionProgressProvider,
+                    count: completionProgress.provider_activity_count,
+                    bytes: completionProgress.content_bytes,
+                  })}
+                </p>
+                {completionProgress.stage_status === "failed" && (
+                  <p className="font-medium text-foreground">
+                    {t(completionProgress.failure_code === (
+                      "review_result_missing_after_settlement"
+                    )
+                      ? "completionProgressReviewResultMissing"
+                      : "completionProgressReviewFailed")}
+                  </p>
                 )}
               </section>
             </Notice>

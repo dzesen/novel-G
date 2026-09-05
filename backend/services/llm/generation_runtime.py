@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+from inspect import isawaitable
 import json
 import re
 from typing import Any, Callable, Literal, Mapping, Protocol, Union
@@ -571,6 +572,25 @@ class StructuredGenerationResult:
     plan: GenerationPlan
     finish_reason: FinishReason
     raw_finish_reason: str
+
+
+StructuredStreamState = Literal[
+    "request_started",
+    "provider_activity",
+    "content_received",
+    "response_complete",
+]
+
+
+@dataclass(frozen=True)
+class StructuredStreamProgress:
+    """Content-free progress from one streamed structured logical call."""
+
+    state: StructuredStreamState
+    phase: str
+    provider_activity_count: int
+    content_chunks: int
+    content_bytes: int
 
 
 def _positive_int(value: Any) -> int | None:
@@ -1241,7 +1261,11 @@ class GenerationRuntime:
             usage = _usage_delta(total_before, total_after)
             response_is_known = isinstance(
                 exc,
-                (LLMSchemaUnsupportedError, LLMStructuredValidationError),
+                (
+                    LLMSchemaUnsupportedError,
+                    LLMStructuredValidationError,
+                    StructuredOutputByteBudgetExceeded,
+                ),
             )
             if response_is_known and not _usage_has_any_value(usage):
                 # These exceptions are raised only after a concrete Provider
@@ -1281,6 +1305,8 @@ class GenerationRuntime:
         max_structured_raw_output_bytes: int | None = None,
         retry_oversized_structured_output_without_source: bool = False,
         require_settled_attempts: bool = False,
+        stream_json_output: bool = False,
+        stream_progress: Callable[[StructuredStreamProgress], Any] | None = None,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         # Reject stale plans before even constructing an adapter.  Every
@@ -1288,6 +1314,17 @@ class GenerationRuntime:
         self._validate_plan(plan, structured=True)
         if type(require_settled_attempts) is not bool:
             raise ValueError("settled-attempt requirement must be a boolean")
+        if type(stream_json_output) is not bool:
+            raise ValueError("structured streaming flag must be a boolean")
+        if stream_progress is not None and not callable(stream_progress):
+            raise ValueError("structured stream progress callback is invalid")
+        if (
+            stream_json_output
+            and plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
+        ):
+            raise ValueError(
+                "schema-enforced structured output cannot use text streaming"
+            )
 
         def require_current_settlement() -> None:
             if require_settled_attempts and (
@@ -1347,6 +1384,101 @@ class GenerationRuntime:
             )
 
         schema_request_payload = structured_schema_request_payload(schema)
+        provider_activity_count = 0
+        content_chunks = 0
+
+        async def emit_stream_progress(
+            *,
+            state: StructuredStreamState,
+            phase: str,
+            content_bytes: int,
+        ) -> None:
+            if stream_progress is None:
+                return
+            try:
+                observed = stream_progress(StructuredStreamProgress(
+                    state=state,
+                    phase=phase,
+                    provider_activity_count=provider_activity_count,
+                    content_chunks=content_chunks,
+                    content_bytes=content_bytes,
+                ))
+                if isawaitable(observed):
+                    await observed
+            except Exception:
+                # Progress is an observer, not part of the paid-call contract.
+                # A transient status-write failure must not turn an otherwise
+                # healthy Provider request into an uncertain paid attempt.
+                return
+
+        async def collect_streamed_structured_text(
+            prompt: str,
+            *,
+            phase: str,
+            json_object: bool,
+        ) -> str:
+            nonlocal provider_activity_count, content_chunks
+            response_bytes = 0
+            pieces: list[str] = []
+            stream_kwargs = dict(request_kwargs)
+            if json_object:
+                metadata = dict(stream_kwargs.get("metadata") or {})
+                metadata["structured_output"] = "json_object"
+                stream_kwargs["metadata"] = metadata
+
+            await emit_stream_progress(
+                state="request_started",
+                phase=phase,
+                content_bytes=0,
+            )
+
+            async def report_provider_activity() -> None:
+                nonlocal provider_activity_count
+                provider_activity_count += 1
+                await emit_stream_progress(
+                    state="provider_activity",
+                    phase=phase,
+                    content_bytes=response_bytes,
+                )
+
+            stream_kwargs["activity_sink"] = report_provider_activity
+            stream = adapter.stream_text(prompt, **stream_kwargs)
+            try:
+                async with asyncio.timeout(
+                    float(plan.timeout_seconds)
+                    if plan.timeout_seconds is not None
+                    else None
+                ):
+                    async for chunk in stream:
+                        rendered = str(chunk)
+                        next_bytes = response_bytes + len(
+                            rendered.encode("utf-8")
+                        )
+                        if (
+                            max_structured_raw_output_bytes is not None
+                            and next_bytes > max_structured_raw_output_bytes
+                        ):
+                            raise StructuredOutputByteBudgetExceeded(
+                                "structured output exceeds the frozen local-repair byte cap"
+                            )
+                        response_bytes = next_bytes
+                        content_chunks += 1
+                        pieces.append(rendered)
+                        await emit_stream_progress(
+                            state="content_received",
+                            phase=phase,
+                            content_bytes=response_bytes,
+                        )
+            finally:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    await close()
+            await emit_stream_progress(
+                state="response_complete",
+                phase=phase,
+                content_bytes=response_bytes,
+            )
+            return "".join(pieces)
 
         def enforce_structured_output_byte_cap(output: Any) -> None:
             if max_structured_raw_output_bytes is None:
@@ -1419,6 +1551,14 @@ class GenerationRuntime:
             return bound
 
         async def primary_call() -> Any:
+            if stream_json_output:
+                return await collect_streamed_structured_text(
+                    prompts.prompt_json_prompt,
+                    phase="primary",
+                    json_object=(
+                        plan.mode == StructuredOutputMode.JSON_OBJECT
+                    ),
+                )
             if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED:
                 return await adapter.generate_structured(
                     prompts.native_schema_prompt,
@@ -1458,6 +1598,12 @@ class GenerationRuntime:
                 raise
 
             async def fallback_call() -> Any:
+                if stream_json_output:
+                    return await collect_streamed_structured_text(
+                        prompts.prompt_json_prompt,
+                        phase="schema_fallback",
+                        json_object=False,
+                    )
                 return await adapter.generate_text(
                     prompts.prompt_json_prompt,
                     **request_kwargs,
@@ -1487,6 +1633,14 @@ class GenerationRuntime:
             )
 
             async def byte_budget_regeneration_call() -> Any:
+                if stream_json_output:
+                    return await collect_streamed_structured_text(
+                        byte_budget_regeneration_prompt,
+                        phase=STRUCTURED_BYTE_BUDGET_REGENERATION_PHASE,
+                        json_object=(
+                            plan.mode == StructuredOutputMode.JSON_OBJECT
+                        ),
+                    )
                 if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED:
                     return await adapter.generate_structured(
                         byte_budget_regeneration_prompt,
@@ -1550,6 +1704,14 @@ class GenerationRuntime:
             )
 
             async def repair_call() -> Any:
+                if stream_json_output:
+                    return await collect_streamed_structured_text(
+                        repair_prompt,
+                        phase="repair",
+                        json_object=(
+                            plan.mode == StructuredOutputMode.JSON_OBJECT
+                        ),
+                    )
                 return await adapter.generate_text(
                     repair_prompt,
                     **request_kwargs,

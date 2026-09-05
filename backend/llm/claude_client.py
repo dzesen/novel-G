@@ -266,6 +266,7 @@ class ClaudeClient(BaseLLMClient):
         self,
         request: LLMRequest,
         usage_sink: Callable[[TokenUsage], None] | None = None,
+        activity_sink: Callable[[], Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         """流式调用 Claude Messages API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
@@ -281,6 +282,7 @@ class ClaudeClient(BaseLLMClient):
 
                 async def raw_chunks() -> AsyncGenerator[str, None]:
                     async for text in stream.text_stream:
+                        await self._report_stream_activity(activity_sink)
                         yield text
 
                 async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):

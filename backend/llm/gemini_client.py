@@ -257,6 +257,7 @@ class GeminiClient(BaseLLMClient):
         self,
         request: LLMRequest,
         usage_sink: Callable[[TokenUsage], None] | None = None,
+        activity_sink: Callable[[], Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         """流式调用 Gemini API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
@@ -279,6 +280,7 @@ class GeminiClient(BaseLLMClient):
             async def raw_chunks() -> AsyncGenerator[str, None]:
                 nonlocal latest_usage
                 async for chunk in stream:
+                    await self._report_stream_activity(activity_sink)
                     metadata = getattr(chunk, "usage_metadata", None)
                     if metadata is not None:
                         latest_usage = self._extract_usage(metadata)

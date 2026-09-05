@@ -719,6 +719,7 @@ class OutlineAdherenceCommand(_ChapterGenerationCommand):
     attempt_scope: Any | None = None
     prose_candidate: ProseCandidateSource | None = None
     generation_plan: GenerationPlan | None = None
+    stream_progress: Callable[[Any], Any] | None = None
 
 
 class StateGenerationCommand(_ChapterGenerationCommand):
@@ -1959,6 +1960,7 @@ class ChapterGenerationApplicationService:
             ).review(
                 prepared.independent_snapshot,
                 prepared.independent_plan,
+                stream_progress=prepared.command.stream_progress,
             )
             usage = reviewed.usage.model_dump()
             attempts = _serialize_attempts(prepared.runtime)

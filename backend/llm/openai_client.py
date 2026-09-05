@@ -341,6 +341,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         self,
         request: LLMRequest,
         usage_sink: Callable[[TokenUsage], None] | None = None,
+        activity_sink: Callable[[], Any] | None = None,
     ) -> AsyncGenerator[str, None]:
         """流式调用 Chat Completions API，逐块 yield 生成文本。"""
         # 流式入口统一标记请求语义，保证调试日志与实际 SDK 调用保持一致。
@@ -365,6 +366,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             async def raw_chunks() -> AsyncGenerator[str, None]:
                 nonlocal latest_usage
                 async for chunk in stream:
+                    await self._report_stream_activity(activity_sink)
                     # 用量块的 choices 为空，与正文块互斥，必须先于 choices 判断取用。
                     if getattr(chunk, "usage", None) is not None:
                         latest_usage = self._extract_usage(chunk.usage)
@@ -378,11 +380,17 @@ class OpenAICompatibleClient(BaseLLMClient):
                         if content:
                             yield content
 
-            async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
-                yield clean_chunk
+            try:
+                async for clean_chunk in self._sanitize_stream_chunks(raw_chunks()):
+                    yield clean_chunk
 
-            if usage_sink is not None and latest_usage is not None:
-                usage_sink(latest_usage)
+                if usage_sink is not None and latest_usage is not None:
+                    usage_sink(latest_usage)
+            finally:
+                # The structured collector intentionally stops early on its
+                # byte/deadline guard. Explicitly close the underlying HTTP
+                # response so the remote stream is not left running locally.
+                await self._close_provider_stream(stream)
         except Exception as exc:
             mapped = self._map_error(exc, model)
             log_llm_error(mapped, provider=self.provider_name, model=model)

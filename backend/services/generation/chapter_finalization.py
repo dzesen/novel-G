@@ -67,7 +67,11 @@ from backend.services.generation.outline_adherence import (
     revalidate_current_outline_adherence_evidence,
     validate_complete_outline_adherence,
 )
-from backend.services.generation.prose_runs import ProseRunModule, prose_run_module
+from backend.services.generation.prose_runs import (
+    ProseRunModule,
+    prose_revision,
+    prose_run_module,
+)
 from backend.services.generation.prose_completion_contract import (
     completion_allows_formal_write,
 )
@@ -91,6 +95,12 @@ FINALIZE_CHAPTER_GENERATION_COMMAND_VERSION = 2
 FINALIZATION_CHANGE_CLASSES = ("chapter_prose", "chapter_state")
 DEFAULT_FINALIZATION_REPAIR_CYCLES = 2
 MAX_FINALIZATION_REPAIR_CYCLES = MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
+
+
+def _chapter_outline_contract_digest(outline: Mapping[str, Any]) -> str:
+    """Hash persisted outlines after normalizing BSON identifiers to strings."""
+
+    return prose_revision(dict(outline))
 
 
 class ChapterFinalizationDenied(ValueError):
@@ -1150,8 +1160,8 @@ class ChapterFinalizationService:
         outline_contract_digest = (
             str(raw_contract_digest)
             if _is_completion_digest(raw_contract_digest)
-            else canonical_completion_digest(
-                context.chapter.get("outline") or {}
+            else _chapter_outline_contract_digest(
+                dict(context.chapter.get("outline") or {})
             )
         )
         candidate_snapshot = self._candidate_snapshot(

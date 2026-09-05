@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from bson import ObjectId
 from pydantic import (
@@ -41,6 +41,7 @@ from backend.services.generation.chapter_candidate_authorization import (
 )
 from backend.services.generation.chapter_completion_certificate import (
     ChapterCompletionFailureFact,
+    FailureFactReason,
     canonical_completion_digest,
     failure_fact_from_outline_adherence_decision,
 )
@@ -57,6 +58,7 @@ from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
     AcceptanceTiming,
     ChapterGenerationApplicationService,
+    IndependentOutlineReviewWorkflowFailed,
     OUTLINE_ADHERENCE_STEP,
     PROSE_REMEDIATION_WORKFLOW,
     STATE_STEP,
@@ -90,6 +92,7 @@ from backend.services.generation.provider_budget import (
 )
 from backend.services.llm.generation_runtime import (
     GenerationPlan,
+    StructuredStreamProgress,
     WorkflowStepTarget,
     create_generation_runtime,
 )
@@ -123,6 +126,9 @@ INTERACTIVE_COMPLETION_RECOVERY_REPLAY_LIMIT = 1
 INTERACTIVE_COMPLETION_EXECUTION_SCHEMA = (
     "interactive_chapter_completion_execution.v1"
 )
+INTERACTIVE_COMPLETION_PROGRESS_SCHEMA = (
+    "interactive_completion_progress.v1"
+)
 INTERACTIVE_COMPLETION_EXECUTION_MARGIN_SECONDS = 300
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -131,6 +137,47 @@ _OBJECT_ID_PATTERN = r"^[0-9a-f]{24}$"
 Digest = Annotated[str, Field(pattern=_DIGEST_PATTERN)]
 ObjectIdText = Annotated[str, Field(pattern=_OBJECT_ID_PATTERN)]
 DecimalText = Annotated[str, Field(pattern=r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")]
+
+InteractiveCompletionFailureCode = Literal[
+    "review_uncertain",
+    "review_plan_stale",
+    "review_not_natural_end",
+    "review_evidence_invalid",
+    "review_response_limit",
+    "review_budget_exhausted",
+    "review_accounting_invalid",
+    "review_generation_failed",
+    "review_dispatch_rejected",
+    "review_result_missing_after_settlement",
+]
+
+_INDEPENDENT_REVIEW_FAILURE_CODES = frozenset({
+    "review_uncertain",
+    "review_plan_stale",
+    "review_not_natural_end",
+    "review_evidence_invalid",
+    "review_response_limit",
+    "review_budget_exhausted",
+    "review_accounting_invalid",
+    "review_generation_failed",
+    "review_dispatch_rejected",
+})
+
+_INDEPENDENT_REVIEW_FAILURE_FACTS: dict[
+    InteractiveCompletionFailureCode,
+    FailureFactReason,
+] = {
+    "review_uncertain": "paid_attempt_unresolved",
+    "review_plan_stale": "authorization_binding_stale",
+    "review_not_natural_end": "evidence_invalid",
+    "review_evidence_invalid": "evidence_invalid",
+    "review_response_limit": "evidence_invalid",
+    "review_budget_exhausted": "semantic_unknown",
+    "review_accounting_invalid": "paid_attempt_unresolved",
+    "review_generation_failed": "semantic_unknown",
+    "review_dispatch_rejected": "semantic_unknown",
+    "review_result_missing_after_settlement": "evidence_invalid",
+}
 
 
 class InteractiveCompletionBlocked(ValueError):
@@ -245,6 +292,44 @@ class InteractiveCompletionExecutionClaim(_ClosedModel):
             raise ValueError("interactive execution timestamps must be aware")
         if self.expires_at.astimezone(UTC) <= self.claimed_at.astimezone(UTC):
             raise ValueError("interactive execution expiry must follow claim")
+        return self
+
+
+class InteractiveCompletionProgress(_ClosedModel):
+    """Safe live status; never contains manuscript or private reasoning."""
+
+    schema_version: Literal[
+        "interactive_completion_progress.v1"
+    ] = INTERACTIVE_COMPLETION_PROGRESS_SCHEMA
+    stage: Literal[
+        "outline_adherence",
+        "state_generation",
+        "finalization",
+        "completed",
+    ]
+    stage_status: Literal["running", "completed", "failed"]
+    started_at: datetime
+    updated_at: datetime
+    provider_alias: str | None = None
+    provider_model: str | None = None
+    stream_phase: str | None = None
+    failure_code: InteractiveCompletionFailureCode | None = None
+    provider_activity_count: int = Field(ge=0)
+    content_chunks: int = Field(ge=0)
+    content_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_timestamps(self) -> "InteractiveCompletionProgress":
+        if self.started_at.tzinfo is None or self.updated_at.tzinfo is None:
+            raise ValueError("interactive progress timestamps must be aware")
+        if self.updated_at.astimezone(UTC) < self.started_at.astimezone(UTC):
+            raise ValueError("interactive progress update precedes its start")
+        if self.stage_status == "failed" and self.failure_code is None:
+            raise ValueError("failed interactive progress requires a failure code")
+        if self.stage_status != "failed" and self.failure_code is not None:
+            raise ValueError(
+                "non-failed interactive progress cannot contain a failure code"
+            )
         return self
 
 
@@ -572,6 +657,7 @@ class InteractiveChapterCompletionDeps:
             candidate: ProseCandidateSource,
             attempt_scope: Any,
             generation_plan: GenerationPlan,
+            stream_progress: Callable[[StructuredStreamProgress], Any] | None = None,
         ) -> Mapping[str, Any]:
             result = await application.collect(OutlineAdherenceCommand(
                 novel_id=novel_id,
@@ -579,6 +665,7 @@ class InteractiveChapterCompletionDeps:
                 prose_candidate=candidate,
                 attempt_scope=attempt_scope,
                 generation_plan=generation_plan,
+                stream_progress=stream_progress,
             ))
             if not isinstance(result.value, Mapping):
                 raise ValueError("interactive adherence result is invalid")
@@ -978,6 +1065,7 @@ def _job_document(
         "uncertain_attempt_ids": [],
         "has_uncertain_attempts": False,
         "interactive_completion_evidence": {},
+        "interactive_completion_progress": None,
         "readiness": readiness.model_dump(mode="json"),
         "authorization_revision": readiness.authorization_revision,
         "created_at": now,
@@ -1172,6 +1260,39 @@ class InteractiveChapterCompletionService:
             run_revision=run_revision,
         )
         return inspection.readiness
+
+    async def inspect_progress(
+        self,
+        *,
+        request: InteractiveCompletionRequestBinding,
+    ) -> dict[str, Any]:
+        """Return content-free live progress for one bound authorization."""
+        try:
+            job = await self._deps.job_repo.get_job(request.authorization_id)
+        except (NotFoundError, KeyError) as exc:
+            raise NotFoundError(
+                "interactive completion authorization not found"
+            ) from exc
+        _bound_readiness(job, request)
+        try:
+            progress = InteractiveCompletionProgress.model_validate(
+                job.get("interactive_completion_progress")
+            )
+        except ValidationError as exc:
+            raise InteractiveCompletionBlocked(
+                "interactive completion progress is unavailable",
+                code="interactive_progress_unavailable",
+            ) from exc
+        return {
+            **progress.model_dump(mode="python"),
+            "authorization_id": request.authorization_id,
+            "status": str(job.get("status") or ""),
+            "pause_reason": (
+                str(job.get("pause_reason"))
+                if job.get("pause_reason") is not None
+                else None
+            ),
+        }
 
     async def inspect_with_notices(
         self,
@@ -1449,6 +1570,7 @@ class InteractiveChapterCompletionService:
         failure_fact: ChapterCompletionFailureFact,
         pause_reason: str,
         state_proposal_id: str | None = None,
+        progress: InteractiveCompletionProgress | None = None,
     ) -> None:
         await self._deps.finalizer.record_failure(
             owner_id=source.owner_id,
@@ -1463,15 +1585,133 @@ class InteractiveChapterCompletionService:
             failure_fact=failure_fact,
             state_proposal_id=state_proposal_id,
         )
+        updates: dict[str, Any] = {
+            "status": INTERACTIVE_COMPLETION_MANUAL_REVIEW,
+            "pause_reason": pause_reason,
+            "interactive_execution_claim": None,
+            "updated_at": get_utc_now(),
+        }
+        if progress is not None:
+            updates["interactive_completion_progress"] = progress.model_dump(
+                mode="python"
+            )
         await self._update_job(
             readiness.authorization_id,
-            {
-                "status": INTERACTIVE_COMPLETION_MANUAL_REVIEW,
-                "pause_reason": pause_reason,
-                "interactive_execution_claim": None,
-                "updated_at": get_utc_now(),
-            },
+            updates,
             expected=self._execution_expected(execution.token),
+        )
+
+    @staticmethod
+    def _independent_review_failure_code(
+        exc: IndependentOutlineReviewWorkflowFailed,
+    ) -> InteractiveCompletionFailureCode:
+        code = str(getattr(exc, "diagnostic_code", "") or "")
+        if code in _INDEPENDENT_REVIEW_FAILURE_CODES:
+            return cast(InteractiveCompletionFailureCode, code)
+        return "review_generation_failed"
+
+    @staticmethod
+    def _independent_review_failure_fact(
+        failure_code: InteractiveCompletionFailureCode,
+    ) -> ChapterCompletionFailureFact:
+        return ChapterCompletionFailureFact(
+            reason=_INDEPENDENT_REVIEW_FAILURE_FACTS[failure_code],
+            observed_at="outline_adherence",
+        )
+
+    @staticmethod
+    def _is_orphaned_settled_outline_review(job: Mapping[str, Any]) -> bool:
+        if job.get("status") != INTERACTIVE_COMPLETION_RUNNING:
+            return False
+        if job.get("interactive_execution_claim") is not None:
+            return False
+        if InteractiveChapterCompletionService._has_live_attempts(job):
+            return False
+        evidence = job.get("interactive_completion_evidence")
+        if isinstance(evidence, Mapping) and (
+            "outline_adherence" in evidence or "state_proposal" in evidence
+        ):
+            return False
+        try:
+            progress = InteractiveCompletionProgress.model_validate(
+                job.get("interactive_completion_progress")
+            )
+        except ValidationError:
+            return False
+        if (
+            progress.stage != "outline_adherence"
+            or progress.stage_status != "running"
+        ):
+            return False
+        slots = job.get("attempt_slots")
+        return isinstance(slots, list) and any(
+            isinstance(slot, Mapping)
+            and slot.get("step_id") == "interactive-adherence"
+            and slot.get("state") == "accounted"
+            for slot in slots
+        )
+
+    @staticmethod
+    def _failed_outline_review_progress(
+        *,
+        failure_code: InteractiveCompletionFailureCode,
+        execution: InteractiveCompletionExecutionClaim,
+        provider_plan: CandidateJobGenerationPlan,
+        previous: Mapping[str, Any] | None = None,
+        stream_phase: str | None = None,
+        provider_activity_count: int = 0,
+        content_chunks: int = 0,
+        content_bytes: int = 0,
+    ) -> InteractiveCompletionProgress:
+        persisted: InteractiveCompletionProgress | None = None
+        if previous is not None:
+            try:
+                persisted = InteractiveCompletionProgress.model_validate(
+                    previous
+                )
+            except ValidationError:
+                persisted = None
+        now = get_utc_now()
+        return InteractiveCompletionProgress(
+            stage="outline_adherence",
+            stage_status="failed",
+            started_at=(
+                persisted.started_at
+                if persisted is not None
+                else execution.claimed_at
+            ),
+            updated_at=now,
+            provider_alias=(
+                persisted.provider_alias
+                if persisted is not None
+                else provider_plan.provider_alias
+            ),
+            provider_model=(
+                persisted.provider_model
+                if persisted is not None
+                else provider_plan.provider_model
+            ),
+            stream_phase=(
+                persisted.stream_phase
+                if persisted is not None
+                else stream_phase
+            ),
+            failure_code=failure_code,
+            provider_activity_count=(
+                persisted.provider_activity_count
+                if persisted is not None
+                else provider_activity_count
+            ),
+            content_chunks=(
+                persisted.content_chunks
+                if persisted is not None
+                else content_chunks
+            ),
+            content_bytes=(
+                persisted.content_bytes
+                if persisted is not None
+                else content_bytes
+            ),
         )
 
     async def _claim_execution(
@@ -1530,11 +1770,26 @@ class InteractiveChapterCompletionService:
                 seconds=_execution_window_seconds(readiness)
             ),
         )
+        adherence_plan = readiness.generation_plans.adherence
+        progress = InteractiveCompletionProgress(
+            stage="outline_adherence",
+            stage_status="running",
+            started_at=now,
+            updated_at=now,
+            provider_alias=adherence_plan.provider_alias,
+            provider_model=adherence_plan.provider_model,
+            provider_activity_count=0,
+            content_chunks=0,
+            content_bytes=0,
+        )
         await self._update_job(
             readiness.authorization_id,
             {
                 "interactive_execution_claim": claim.model_dump(mode="python"),
                 "interactive_execution_uncertain": False,
+                "interactive_completion_progress": progress.model_dump(
+                    mode="python"
+                ),
                 "updated_at": now,
             },
             expected={
@@ -1632,6 +1887,82 @@ class InteractiveChapterCompletionService:
         plans = readiness.generation_plans
         candidate_source = _candidate_source(candidate)
         evidence = dict(job.get("interactive_completion_evidence") or {})
+        provider_activity_count = 0
+        content_chunks = 0
+        content_bytes = 0
+        stream_phase: str | None = None
+        last_progress_write = execution.claimed_at
+
+        async def persist_progress(
+            *,
+            stage: Literal[
+                "outline_adherence",
+                "state_generation",
+                "finalization",
+                "completed",
+            ],
+            stage_status: Literal["running", "completed", "failed"],
+            provider_plan: CandidateJobGenerationPlan | None,
+            force: bool = True,
+        ) -> None:
+            nonlocal last_progress_write
+            now = get_utc_now()
+            if (
+                not force
+                and (now - last_progress_write).total_seconds() < 2
+            ):
+                return
+            progress = InteractiveCompletionProgress(
+                stage=stage,
+                stage_status=stage_status,
+                started_at=execution.claimed_at,
+                updated_at=now,
+                provider_alias=(
+                    provider_plan.provider_alias
+                    if provider_plan is not None
+                    else None
+                ),
+                provider_model=(
+                    provider_plan.provider_model
+                    if provider_plan is not None
+                    else None
+                ),
+                stream_phase=stream_phase,
+                provider_activity_count=provider_activity_count,
+                content_chunks=content_chunks,
+                content_bytes=content_bytes,
+            )
+            await self._update_job(
+                readiness.authorization_id,
+                {
+                    "interactive_completion_progress": progress.model_dump(
+                        mode="python"
+                    ),
+                    "updated_at": now,
+                },
+                expected=self._execution_expected(execution.token),
+            )
+            last_progress_write = now
+
+        async def report_review_progress(
+            update: StructuredStreamProgress,
+        ) -> None:
+            nonlocal provider_activity_count, content_chunks, content_bytes
+            nonlocal stream_phase
+            provider_activity_count = update.provider_activity_count
+            content_chunks = update.content_chunks
+            content_bytes = update.content_bytes
+            stream_phase = update.phase
+            await persist_progress(
+                stage="outline_adherence",
+                stage_status="running",
+                provider_plan=plans.adherence,
+                force=update.state in {
+                    "request_started",
+                    "response_complete",
+                },
+            )
+
         adherence = evidence.get("outline_adherence")
         if not isinstance(adherence, Mapping):
             attempts = await self._deps.job_repo.list_attempt_slots(
@@ -1655,7 +1986,39 @@ class InteractiveChapterCompletionService:
                     generation_plan=generation_plan_from_candidate_snapshot(
                         plans.adherence
                     ),
+                    stream_progress=report_review_progress,
                 ))
+            except IndependentOutlineReviewWorkflowFailed as exc:
+                await self._pause_if_provider_outcome_is_uncertain(
+                    job_id=readiness.authorization_id,
+                    execution_token=execution.token,
+                    cause=exc,
+                )
+                failure_code = self._independent_review_failure_code(exc)
+                failed_progress = self._failed_outline_review_progress(
+                    failure_code=failure_code,
+                    execution=execution,
+                    provider_plan=plans.adherence,
+                    stream_phase=stream_phase,
+                    provider_activity_count=provider_activity_count,
+                    content_chunks=content_chunks,
+                    content_bytes=content_bytes,
+                )
+                await self._record_failure_and_pause(
+                    readiness=readiness,
+                    execution=execution,
+                    source=source,
+                    adherence=None,
+                    failure_fact=self._independent_review_failure_fact(
+                        failure_code
+                    ),
+                    pause_reason="outline_adherence_manual_review",
+                    progress=failed_progress,
+                )
+                raise InteractiveCompletionBlocked(
+                    str(exc),
+                    code=failure_code,
+                ) from exc
             except (Exception, asyncio.CancelledError) as exc:
                 await self._pause_if_provider_outcome_is_uncertain(
                     job_id=readiness.authorization_id,
@@ -1712,6 +2075,13 @@ class InteractiveChapterCompletionService:
                 str(exc),
                 code="interactive_adherence_manual_review",
             ) from exc
+
+        stream_phase = None
+        await persist_progress(
+            stage="state_generation",
+            stage_status="running",
+            provider_plan=plans.state,
+        )
 
         state_checkpoint = evidence.get("state_proposal")
         state: Mapping[str, Any] | None = None
@@ -1857,6 +2227,11 @@ class InteractiveChapterCompletionService:
                 "interactive state proposal receipt is invalid",
                 code="interactive_state_invalid",
             )
+        await persist_progress(
+            stage="finalization",
+            stage_status="running",
+            provider_plan=None,
+        )
         try:
             result = dict(await self._deps.finalizer.commit(
                 owner_id=source.owner_id,
@@ -1914,6 +2289,17 @@ class InteractiveChapterCompletionService:
                         certificate.get("certificate_digest") or ""
                     ),
                 },
+                "interactive_completion_progress": (
+                    InteractiveCompletionProgress(
+                        stage="completed",
+                        stage_status="completed",
+                        started_at=execution.claimed_at,
+                        updated_at=get_utc_now(),
+                        provider_activity_count=provider_activity_count,
+                        content_chunks=content_chunks,
+                        content_bytes=content_bytes,
+                    ).model_dump(mode="python")
+                ),
                 "updated_at": get_utc_now(),
             },
             expected=self._execution_expected(execution.token),
@@ -2160,6 +2546,38 @@ class InteractiveChapterCompletionService:
         job = await self._ensure_job(readiness)
         execution = await self._claim_execution(readiness)
         try:
+            if self._is_orphaned_settled_outline_review(job):
+                failure_code: InteractiveCompletionFailureCode = (
+                    "review_result_missing_after_settlement"
+                )
+                await self._record_failure_and_pause(
+                    readiness=readiness,
+                    execution=execution,
+                    source=source,
+                    adherence=None,
+                    failure_fact=self._independent_review_failure_fact(
+                        failure_code
+                    ),
+                    pause_reason="outline_adherence_manual_review",
+                    progress=self._failed_outline_review_progress(
+                        failure_code=failure_code,
+                        execution=execution,
+                        provider_plan=readiness.generation_plans.adherence,
+                        previous=(
+                            job.get("interactive_completion_progress")
+                            if isinstance(
+                                job.get("interactive_completion_progress"),
+                                Mapping,
+                            )
+                            else None
+                        ),
+                    ),
+                )
+                raise InteractiveCompletionBlocked(
+                    "独立审查请求已结算，但验收结果未完整保存；"
+                    "系统已停止本次验收，且没有再次调用模型",
+                    code=failure_code,
+                )
             return await self._execute_claimed_completion(
                 readiness=readiness,
                 execution=execution,

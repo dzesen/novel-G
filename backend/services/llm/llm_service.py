@@ -209,12 +209,18 @@ class LLMService:
         中途 break 或 provider 不报用量时，它保持零值。
         """
         self._begin_request()
+        activity_sink = kwargs.pop("activity_sink", None)
         request = self._make_request(prompt, system_prompt, **kwargs)
         try:
             async with _provider_request_slot(self._provider_name, self._max_concurrency):
+                stream_kwargs: dict[str, Any] = {
+                    "usage_sink": self._record_usage,
+                }
+                if activity_sink is not None:
+                    stream_kwargs["activity_sink"] = activity_sink
                 async for chunk in self._client.stream_text(
                     request,
-                    usage_sink=self._record_usage,
+                    **stream_kwargs,
                 ):
                     yield chunk
         except asyncio.CancelledError:

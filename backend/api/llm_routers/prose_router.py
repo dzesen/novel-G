@@ -540,6 +540,33 @@ async def complete_interactive_prose_run(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.post("/prose-runs/{run_id}/complete/status")
+async def inspect_interactive_completion_progress(
+    run_id: str,
+    req: InteractiveCompletionAuthorityRequest,
+    request: Request,
+):
+    """Read content-free progress for one bound completion authorization."""
+
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await interactive_chapter_completion_service.inspect_progress(
+            request=_interactive_completion_request_binding(
+                owner_id=str(actor.id),
+                run_id=run_id,
+                request=req,
+            ),
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InteractiveCompletionBlocked as exc:
+        raise _interactive_completion_conflict(exc) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.post("/prose-runs/{run_id}/complete/uncertain-resolution")
 async def resolve_interactive_completion_uncertainty(
     run_id: str,

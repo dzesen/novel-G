@@ -197,6 +197,20 @@ export function buildInteractiveCompletionPayload({
   };
 }
 
+export function buildInteractiveCompletionStatusPayload(
+  input: InteractiveCompletionPayloadInput,
+) {
+  const payload = buildInteractiveCompletionPayload(input);
+  return {
+    novel_id: payload.novel_id,
+    chapter_id: payload.chapter_id,
+    expected_run_revision: payload.expected_run_revision,
+    authorization_id: payload.authorization_id,
+    authorization_revision: payload.authorization_revision,
+    completion_readiness_digest: payload.completion_readiness_digest,
+  };
+}
+
 export function buildInteractiveCompletionResolutionPayload({
   novelId,
   chapterId,
