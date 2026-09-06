@@ -2974,6 +2974,24 @@
       }
     },
     "generationRuns": {
+      "loadedHistoryHint": "{count} root tasks loaded. Filters apply to loaded records; load earlier history for more. Stage runs stay under their root task.",
+      "loadMoreHistory": "Load earlier records",
+      "stageHistory": "Stage history",
+      "stageHistoryEmpty": "This task has no separate stage runs.",
+      "currentStage": "Current stage: {stage}",
+      "stageChildHint": "This is a {stage} record within a root task. Return to the root task for controls.",
+      "openRootJob": "Return to root task",
+      "openStageDetail": "View stage details",
+      "stageProgress": "Records cover {count} chapters",
+      "stages": {
+        "review": "prose review",
+        "state": "state writeback",
+        "finalization": "chapter finalization",
+        "book_audit": "book audit",
+        "completed": "completed",
+        "blocked": "awaiting action",
+        "unknown": "execution stage"
+      },
       "title": "Generation runs",
       "description": "Inspect batch jobs and single-chapter prose runs. Records expose operational metadata only; prose and prompts stay private.",
       "backToEditor": "Back to auto-book",

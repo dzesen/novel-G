@@ -2974,6 +2974,24 @@
       }
     },
     "generationRuns": {
+      "loadedHistoryHint": "已载入 {count} 条主任务记录；筛选作用于已载入记录，可继续载入更早历史。子阶段归在主任务内。",
+      "loadMoreHistory": "载入更早记录",
+      "stageHistory": "阶段记录",
+      "stageHistoryEmpty": "此任务暂无独立阶段记录。",
+      "currentStage": "当前阶段：{stage}",
+      "stageChildHint": "这是主任务中的{stage}记录，任务操作请返回主任务。",
+      "openRootJob": "返回主任务",
+      "openStageDetail": "查看阶段详情",
+      "stageProgress": "记录覆盖 {count} 章",
+      "stages": {
+        "review": "正文复核",
+        "state": "状态回写",
+        "finalization": "章节收尾",
+        "book_audit": "全书验收",
+        "completed": "完成",
+        "blocked": "等待处理",
+        "unknown": "执行阶段"
+      },
       "title": "生成记录",
       "description": "集中查看批量作业与单章正文运行。这里只展示运行元数据，正文和提示词保持私密。",
       "backToEditor": "返回自动成书",

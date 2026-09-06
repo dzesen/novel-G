@@ -57,7 +57,9 @@ class NovelAccessService:
         if collection_name is None:
             raise ValueError(f"Unsupported resource kind: {resource_kind}")
         object_id = to_object_id(resource_id)
-        resource = await self.db[collection_name].find_one({"_id": object_id})
+        resource = await self.db[collection_name].find_one(
+            {"_id": object_id}, {"novel_id": 1},
+        )
         if not resource or resource.get("novel_id") is None:
             raise NotFoundError(f"{resource_kind} with id {resource_id} not found")
         return await self.require_owned_novel(

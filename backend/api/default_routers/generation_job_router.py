@@ -1,7 +1,6 @@
 """批量生成作业的 HTTP 端点（轮询式，无 SSE）。设计 §9.2。"""
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,16 +9,18 @@ from pydantic import BaseModel, Field
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.generation_job_repository import generation_job_repo
 from backend.db.utils import get_utc_now
-from backend.scene_contract_versions import (
-    current_outline_adherence_decision,
+from backend.services.generation.job_public_views import (
+    PublicGenerationJob,
+    PublicJobPage,
+    PublicJobSummary,
+    project_job as _serialize_job,
 )
-from backend.services.generation.failure_diagnostics import infer_job_diagnostics
+from backend.services.generation.job_read_service import GenerationJobReadService
 from backend.services.generation.book_structure_initialization import (
     BookStructureBudgetBoundary,
     BookStructureInitializationFailed,
     BookStructureInitializationStale,
 )
-from backend.services.generation.job_relations import related_prose_run_ids
 from backend.services.generation.job_service import (
     ConflictError,
     GenerationJobService,
@@ -48,165 +49,6 @@ router = APIRouter(
     dependencies=[Depends(require_owned_path_resource)],
 )
 
-_ID_FIELDS = ("_id", "novel_id", "volume_id", "current_chapter_id")
-_OUTLINE_ADHERENCE_VERDICTS = frozenset(("pass", "warn", "fail"))
-_AUTO_CREATION_OUTCOMES = frozenset((
-    "manual_review_required",
-    "auto_created",
-    "not_applicable",
-    "repair_exhausted",
-))
-
-
-def _safe_error_text(value: Any, *, limit: int = 160) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    return text[:limit] if text else None
-
-
-def _safe_error_text_list(
-    value: Any,
-    *,
-    item_limit: int = 160,
-    count_limit: int = 100,
-) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    result: list[str] = []
-    for item in value[:count_limit]:
-        text = _safe_error_text(item, limit=item_limit)
-        if text is not None:
-            result.append(text)
-    return result
-
-
-def _serialize_auto_creation(value: Any) -> Dict[str, Any] | None:
-    if not isinstance(value, Mapping):
-        return None
-    outcome = _safe_error_text(value.get("outcome"), limit=40)
-    if outcome not in _AUTO_CREATION_OUTCOMES:
-        return None
-    created_count = value.get("created_count")
-    if isinstance(created_count, bool) or not isinstance(created_count, int):
-        created_count = 0
-    result: Dict[str, Any] = {
-        "outcome": outcome,
-        "created_count": max(0, created_count),
-        "deny_reasons": _safe_error_text_list(
-            value.get("deny_reasons"),
-            item_limit=80,
-            count_limit=50,
-        ),
-    }
-    pause_reason = _safe_error_text(value.get("pause_reason"), limit=80)
-    if pause_reason is not None:
-        result["pause_reason"] = pause_reason
-    denials: list[Dict[str, str]] = []
-    raw_denials = value.get("denials")
-    if isinstance(raw_denials, list):
-        for raw_denial in raw_denials[:100]:
-            if not isinstance(raw_denial, Mapping):
-                continue
-            reason = _safe_error_text(raw_denial.get("reason"), limit=80)
-            if reason is None:
-                continue
-            denial = {"reason": reason}
-            candidate_id = _safe_error_text(
-                raw_denial.get("candidate_id"),
-                limit=100,
-            )
-            if candidate_id is not None:
-                denial["candidate_id"] = candidate_id
-            denials.append(denial)
-    result["denials"] = denials
-    return result
-
-
-def _serialize_job_error(value: Any) -> Dict[str, Any] | None:
-    """Project recovery metadata without returning raw exception/provider text."""
-    if not isinstance(value, Mapping):
-        return None
-    result: Dict[str, Any] = {}
-    for field, limit in (
-        ("step", 80),
-        ("chapter_id", 100),
-        ("audit_digest", 128),
-    ):
-        text = _safe_error_text(value.get(field), limit=limit)
-        if text is not None:
-            result[field] = text
-    for field, item_limit, count_limit in (
-        ("candidate_ids", 100, 100),
-        ("candidate_names", 160, 100),
-        ("reason_codes", 100, 50),
-        ("blocking_issue_codes", 100, 100),
-    ):
-        items = _safe_error_text_list(
-            value.get(field),
-            item_limit=item_limit,
-            count_limit=count_limit,
-        )
-        if items:
-            result[field] = items
-    auto_creation = _serialize_auto_creation(value.get("auto_creation"))
-    if auto_creation is not None:
-        result["auto_creation"] = auto_creation
-    return result or None
-
-
-def _serialize_outline_adherence(value: Any) -> Optional[Dict[str, Any]]:
-    """Return only a usable historical adherence review for API consumers."""
-    if not isinstance(value, dict):
-        return None
-    decision = current_outline_adherence_decision(value)
-    if decision is not None:
-        review = dict(value)
-        if not isinstance(review.get("local_issues"), list):
-            review["local_issues"] = []
-        return review
-    verdict = value.get("verdict")
-    if not isinstance(verdict, str) or verdict not in _OUTLINE_ADHERENCE_VERDICTS:
-        return None
-    review = dict(value)
-    if not isinstance(review.get("issues"), list):
-        review["issues"] = []
-    return review
-
-
-def _serialize_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if job is None:
-        return None
-    out = dict(job)
-    out.pop("batch_authorization_contract", None)
-    raw_generation_params = out.get("generation_params")
-    if isinstance(raw_generation_params, Mapping):
-        safe_generation_params = dict(raw_generation_params)
-        safe_generation_params.pop("system_prompt", None)
-        out["generation_params"] = safe_generation_params
-    else:
-        out["generation_params"] = {}
-    for f in _ID_FIELDS:
-        if out.get(f) is not None:
-            out[f] = str(out[f])
-    progress: list[Dict[str, Any]] = []
-    for raw_entry in out.get("progress", []):
-        if not isinstance(raw_entry, dict):
-            continue
-        entry = dict(raw_entry)
-        if entry.get("chapter_id") is not None:
-            entry["chapter_id"] = str(entry["chapter_id"])
-        review = _serialize_outline_adherence(entry.get("outline_adherence"))
-        if review is None:
-            entry.pop("outline_adherence", None)
-        else:
-            entry["outline_adherence"] = review
-        progress.append(entry)
-    out["progress"] = progress
-    out["diagnostics"] = infer_job_diagnostics(out)
-    out["related_prose_run_ids"] = list(related_prose_run_ids(out))
-    out["error"] = _serialize_job_error(out.get("error"))
-    return out
 
 
 class ProtectedBatchGenerationParamsMixin(GenerationParamsMixin):
@@ -510,7 +352,47 @@ async def inspect_resume_readiness(job_id: str, req: ResumeReadinessRequest):
         raise _handle(exc) from exc
 
 
-@router.get("/{job_id}")
+@router.get("/novel/{novel_id}/current", response_model=PublicJobSummary | None)
+async def get_current_root_job(novel_id: str):
+    try:
+        return await GenerationJobReadService.current(novel_id)
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/novel/{novel_id}/history", response_model=PublicJobPage)
+async def get_job_history(
+    novel_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=300),
+):
+    try:
+        return await GenerationJobReadService.history(novel_id, limit=limit, cursor=cursor)
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/{job_id}/summary", response_model=PublicJobSummary)
+async def get_job_summary(job_id: str):
+    try:
+        return await GenerationJobReadService.summary(job_id)
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/{job_id}/children", response_model=PublicJobPage)
+async def get_child_stages(
+    job_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=300),
+):
+    try:
+        return await GenerationJobReadService.children(job_id, limit=limit, cursor=cursor)
+    except Exception as exc:
+        raise _handle(exc) from exc
+
+
+@router.get("/{job_id}", response_model=PublicGenerationJob, response_model_exclude_unset=True)
 async def get_job(job_id: str):
     try:
         return _serialize_job(await GenerationJobService.get_job(job_id))
@@ -518,10 +400,10 @@ async def get_job(job_id: str):
         raise _handle(exc) from exc
 
 
-@router.get("/novel/{novel_id}")
-async def list_jobs(novel_id: str):
+@router.get("/novel/{novel_id}", response_model=list[PublicGenerationJob], response_model_exclude_unset=True)
+async def list_jobs(novel_id: str, limit: int = Query(default=20, ge=1, le=100)):
     try:
-        return [_serialize_job(j) for j in await GenerationJobService.list_jobs(novel_id)]
+        return [_serialize_job(j) for j in await GenerationJobService.list_jobs(novel_id, limit=limit)]
     except Exception as exc:
         raise _handle(exc) from exc
 

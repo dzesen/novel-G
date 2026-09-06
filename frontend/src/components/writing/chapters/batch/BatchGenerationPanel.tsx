@@ -8,6 +8,7 @@ import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
   type BookCompletionAudit,
   type GenerationJob,
+  type GenerationJobSummary,
   type GenerationRunsNavigationTarget,
   type LeftoverProseRun,
   isActive,
@@ -23,14 +24,15 @@ import LeftoverProseRuns from "./LeftoverProseRuns";
 import type { ReferenceCardType } from "./referenceCardAutoCreation";
 import ReferenceCardAutomationAuditPanel from "./ReferenceCardAutomationAuditPanel";
 import BookCompletionAuditPanel from "./BookCompletionAuditPanel";
+import GenerationJobStages from "./GenerationJobStages";
 import {
   bookCompletionAuditMatchesJob,
   bookCompletionResult,
 } from "./bookCompletionPresentation";
 import {
   currentJobStatusByProseRun,
+  isRootGenerationJob,
   requiresResumeReadinessReview,
-  selectCurrentGenerationJob,
 } from "./generationRunsPresentation";
 
 const ABORT_DIALOG_FOCUSABLE_SELECTOR = [
@@ -133,32 +135,47 @@ export default function BatchGenerationPanel({
 
   // 精确 job 深链优先；URL 未指定 job 时只检查最新作业，避免越过已结束作业复活旧任务。
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    const options = { signal: controller.signal };
     setJob(null);
     setDismissed(null);
     setJobLookupError("");
     if (surface === "start") {
-      return () => { cancelled = true; };
+      return () => controller.abort();
     }
     void (async () => {
       try {
         if (initialJobId) {
           const requested = await apiGet<GenerationJob>(
             `/api/generation-jobs/${encodeURIComponent(initialJobId)}`,
+            options,
           );
-          if (cancelled) return;
+          if (controller.signal.aborted) return;
           const valid = requested._id === initialJobId
-            && requested.novel_id === novelId;
+            && requested.novel_id === novelId
+            && (requested.scope === "book" || requested.scope === "volume");
           onJobTargetValidation(initialJobId, valid);
-          if (valid) setJob(requested);
+          if (!valid) return;
+          if (isRootGenerationJob(requested)) {
+            setJob(requested);
+          } else {
+            const rootId = requested.root_job_id ?? requested.parent_job_id
+              ?? requested.required_book_successor_parent_job_id;
+            if (!rootId) return;
+            const root = await apiGet<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(rootId)}`, options);
+            if (!controller.signal.aborted && root._id === rootId && root.novel_id === novelId
+              && isRootGenerationJob(root)) setJob(root);
+          }
           return;
         }
-        const jobs = await apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`);
-        if (cancelled) return;
-        const current = selectCurrentGenerationJob(jobs);
-        if (current) setJob(current);
+        const summary = await apiGet<GenerationJobSummary | null>(`/api/generation-jobs/novel/${novelId}/current`, options);
+        if (controller.signal.aborted || !summary || summary.novel_id !== novelId
+          || !isRootGenerationJob(summary)) return;
+        const current = await apiGet<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(summary._id)}`, options);
+        if (!controller.signal.aborted && current._id === summary._id
+          && current.novel_id === novelId && isRootGenerationJob(current)) setJob(current);
       } catch (reason) {
-        if (cancelled) return;
+        if (controller.signal.aborted) return;
         if (
           initialJobId
           && reason instanceof ApiError
@@ -172,7 +189,7 @@ export default function BatchGenerationPanel({
         }
       }
     })();
-    return () => { cancelled = true; };
+    return () => controller.abort();
   }, [
     initialJobId,
     jobLookupRevision,
@@ -313,6 +330,7 @@ export default function BatchGenerationPanel({
     const intent = abortIntent;
     const abortedJobId = job._id;
     const successorScope = job.scope;
+    if (successorScope !== "book" && successorScope !== "volume") return;
     const successorVolumeId = job.volume_id ?? undefined;
     void control("abort").then((succeeded) => {
       if (!succeeded) return;
@@ -498,6 +516,8 @@ export default function BatchGenerationPanel({
       {jobLookupAlert}
       {leftoverPanel}
       {!isResumable(job.status) && generationRunsEntry}
+      <GenerationJobStages key={job._id} job={job}
+        onOpenJob={(jobId) => onOpenGenerationRuns({ jobId })} />
 
       <div className="shrink-0 border-b border-border">
         {job.scope === "book"

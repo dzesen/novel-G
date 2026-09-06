@@ -3,6 +3,7 @@ import {
   type ChapterProgress,
   type GenerationDiagnostic,
   type GenerationJob,
+  type GenerationJobSummary,
   type JobStatus,
 } from "./batchTypes.ts";
 
@@ -101,10 +102,12 @@ export function newestDiagnostics(
     ));
 }
 
-export function currentJobReasonCode(job: GenerationJob): string | null {
+export function currentJobReasonCode(job: GenerationJob | GenerationJobSummary): string | null {
   if (job.pause_reason) return job.pause_reason;
   if (job.status !== "failed" && job.status !== "interrupted") return null;
-  return newestDiagnostics(job.diagnostics)[0]?.event.code ?? null;
+  return ("latest_diagnostic" in job
+    ? job.latest_diagnostic?.code
+    : newestDiagnostics(job.diagnostics)[0]?.event.code) ?? null;
 }
 
 export function requiresSuccessorJob(job: GenerationJob): boolean {
@@ -154,6 +157,13 @@ export function diagnosticHistoryState(
 
 const TERMINAL_STATUSES = new Set<JobStatus>(["completed", "aborted"]);
 
+export function isRootGenerationJob(job: Pick<GenerationJob,
+  "_id" | "root_job_id" | "parent_job_id" | "required_book_successor_parent_job_id"
+>): boolean {
+  return !job.parent_job_id && !job.required_book_successor_parent_job_id
+    && (!job.root_job_id || job.root_job_id === job._id);
+}
+
 /**
  * Choose the only job that may occupy the current-task surface.
  *
@@ -164,8 +174,10 @@ const TERMINAL_STATUSES = new Set<JobStatus>(["completed", "aborted"]);
 export function selectCurrentGenerationJob(
   jobs: GenerationJob[],
 ): GenerationJob | null {
-  const latest = [...jobs].sort((left, right) => (
+  const latest = jobs.filter((job) => isRootGenerationJob(job)
+    && (job.scope === "volume" || job.scope === "book")).sort((left, right) => (
     compareNewestFirst(left.created_at, right.created_at)
+    || right._id.localeCompare(left._id)
   ))[0];
   return latest && !TERMINAL_STATUSES.has(latest.status) ? latest : null;
 }

@@ -4928,8 +4928,8 @@ class GenerationJobService:
         return await _with_recovery_capabilities(str(job_id), job)
 
     @staticmethod
-    async def list_jobs(novel_id: str) -> List[Dict[str, Any]]:
-        jobs = await generation_job_repo.list_jobs_by_novel(novel_id)
+    async def list_jobs(novel_id: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+        jobs = await generation_job_repo.list_jobs_by_novel(novel_id, limit=limit)
         return list(await asyncio.gather(*(
             _with_recovery_capabilities(str(job["_id"]), job)
             for job in jobs

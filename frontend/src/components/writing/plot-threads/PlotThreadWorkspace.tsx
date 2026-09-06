@@ -8,8 +8,8 @@ import type { PlotThread, ThreadStatus, ThreadImportance } from "../chapters/out
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
   checkpointWindow,
-  isTerminal,
   type GenerationJob,
+  type GenerationJobSummary,
 } from "../chapters/batch/batchTypes";
 import {
   summarizePlotThreadReferenceCleanup,
@@ -55,18 +55,16 @@ export default function PlotThreadWorkspace({
     setLoaded(false);
     setUnmatchedReferenceReview(null);
     try {
-      const [res, chapterRes, volumeRes, jobs] = await Promise.all([
+      const [res, chapterRes, volumeRes, currentJob] = await Promise.all([
         apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}?with_reference_audit=true`),
         apiGet<{ data: ChapterSummary[] }>(`/api/chapters/novel/${novelId}`),
         apiGet<{ data: VolumeSummary[] }>(`/api/volumes/novel/${novelId}`),
-        apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`).catch(
-          () => [] as GenerationJob[],
-        ),
+        apiGet<GenerationJobSummary | null>(`/api/generation-jobs/novel/${novelId}/current`)
+          .then((summary) => summary && summary.novel_id === novelId
+            ? apiGet<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(summary._id)}`)
+            : null).catch(() => null),
       ]);
       setThreads(res.data);
-      const currentJob = jobs
-        .filter((job) => !isTerminal(job.status))
-        .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
       setUnmatchedReferenceReview(
         currentJob
           ? summarizePlotThreadReferenceCleanup(

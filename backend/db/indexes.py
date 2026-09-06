@@ -728,6 +728,16 @@ async def init_generation_job_indexes():
             pymongo.IndexModel([("updated_at", pymongo.DESCENDING)]),
             pymongo.IndexModel(
                 [
+                    ("novel_id", pymongo.ASCENDING),
+                    ("is_deleted", pymongo.ASCENDING),
+                    ("required_book_successor_parent_job_id", pymongo.ASCENDING),
+                    ("created_at", pymongo.DESCENDING),
+                    ("_id", pymongo.DESCENDING),
+                ],
+                name="generation_root_history_cursor",
+            ),
+            pymongo.IndexModel(
+                [
                     ("owner_id", pymongo.ASCENDING),
                     ("novel_id", pymongo.ASCENDING),
                     ("job_kind", pymongo.ASCENDING),

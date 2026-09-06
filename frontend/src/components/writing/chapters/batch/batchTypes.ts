@@ -535,7 +535,15 @@ export interface GenerationDiagnosticsSummary {
 export interface GenerationJob {
   _id: string;
   novel_id: string;
-  scope: "volume" | "book";
+  root_job_id?: string;
+  parent_job_id?: string | null;
+  required_book_successor_parent_job_id?: string | null;
+  job_kind?: string | null;
+  current_stage?: string | null;
+  detail_version?: string;
+  progress_count?: number;
+  progress_chapter_count?: number;
+  scope: "volume" | "book" | "interactive_completion";
   volume_id: string | null;
   status: JobStatus;
   pause_reason: PauseReason;
@@ -563,6 +571,29 @@ export interface GenerationJob {
   resume_original_writeback_available?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** Bounded read view. It never contains chapter candidates or execution inputs. */
+export interface GenerationJobSummary extends Pick<GenerationJob,
+  "_id" | "novel_id" | "root_job_id" | "parent_job_id" | "job_kind"
+  | "scope" | "volume_id" | "status" | "pause_reason" | "token_budget"
+  | "tokens_used" | "tokens_reserved" | "current_chapter_id"
+  | "usage_attempt_capacity" | "usage_attempt_claimed" | "has_uncertain_attempts"
+  | "current_stage" | "created_at" | "updated_at" | "related_prose_run_ids"
+> {
+  detail_version: string;
+  progress_count: number;
+  progress_chapter_count: number;
+  diagnostics_count: number;
+  latest_diagnostic: GenerationDiagnostic | null;
+  provider_aliases: string[];
+  provider_models: string[];
+  reason_codes: string[];
+}
+
+export interface GenerationJobPage {
+  items: GenerationJobSummary[];
+  next_cursor: string | null;
 }
 
 export interface LeftoverProseRun extends ProseRunSnapshot {
@@ -603,5 +634,6 @@ export function checkpointWindow(job: GenerationJob): ChapterProgress[] {
 
 /** 作业覆盖的章集合：整本=全书章；整卷=按 volume_id 过滤（设计 §5.1）。进度分母统一走它。 */
 export function jobChapters(job: GenerationJob, chapters: ChapterSummary[]): ChapterSummary[] {
+  if (job.scope === "interactive_completion") return chapters.filter((c) => c._id === job.current_chapter_id);
   return job.scope === "book" ? chapters : chapters.filter((c) => c.volume_id === job.volume_id);
 }

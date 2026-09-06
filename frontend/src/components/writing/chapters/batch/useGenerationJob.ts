@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet } from "@/lib/api";
-import { type GenerationJob, isActive } from "./batchTypes";
+import { type GenerationJob, type GenerationJobSummary, isActive } from "./batchTypes";
 
 interface UseGenerationJobArgs {
   onProgress?: (job: GenerationJob) => void;
@@ -22,6 +22,7 @@ export function useGenerationJob({ onProgress }: UseGenerationJobArgs = {}): Use
   const [error, setError] = useState<string | null>(null);
 
   const jobIdRef = useRef<string | null>(null);
+  const jobRef = useRef<GenerationJob | null>(null);
   const requestGenerationRef = useRef(0);
   const inFlightRef = useRef<{
     controller: AbortController;
@@ -43,12 +44,14 @@ export function useGenerationJob({ onProgress }: UseGenerationJobArgs = {}): Use
   useEffect(() => () => {
     invalidateRequest();
     jobIdRef.current = null;
+    jobRef.current = null;
   }, [invalidateRequest]);
 
   // Discovery and control responses supersede polls even for the same job ID.
   const setJob = useCallback((next: GenerationJob | null) => {
     invalidateRequest();
     jobIdRef.current = next?._id ?? null;
+    jobRef.current = next;
     progressLenRef.current = next?.progress.length ?? 0;
     setError(null);
     setJobState(next);
@@ -67,16 +70,28 @@ export function useGenerationJob({ onProgress }: UseGenerationJobArgs = {}): Use
       && requestGenerationRef.current === generation;
     request.promise = (async () => {
       try {
-        const next = await apiGet<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(id)}`, {
+        const path = `/api/generation-jobs/${encodeURIComponent(id)}`;
+        const summary = await apiGet<GenerationJobSummary>(`${path}/summary`, {
           signal: controller.signal,
         });
-        if (!isCurrent() || next._id !== id) return;
+        if (!isCurrent() || summary._id !== id || summary.novel_id !== jobRef.current?.novel_id) return;
+        if (summary.detail_version && summary.detail_version === jobRef.current?.detail_version) {
+          setError(null);
+          return;
+        }
+        const next = await apiGet<GenerationJob>(path, {
+          signal: controller.signal,
+        });
+        if (!isCurrent() || next._id !== id || next.novel_id !== jobRef.current?.novel_id) return;
         setError(null);
         if (next.progress.length > progressLenRef.current) {
           progressLenRef.current = next.progress.length;
           onProgressRef.current?.(next);
         }
-        if (isCurrent()) setJobState(next);
+        if (isCurrent()) {
+          jobRef.current = next;
+          setJobState(next);
+        }
       } catch (err) {
         // Retain the panel, but never attach an obsolete request's error to it.
         if (isCurrent()) setError(err instanceof Error ? err.message : String(err));

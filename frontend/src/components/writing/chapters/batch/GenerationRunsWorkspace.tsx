@@ -9,6 +9,8 @@ import {
   chapterProgressEntries,
   type GenerationDiagnostic,
   type GenerationJob,
+  type GenerationJobPage,
+  type GenerationJobSummary,
   type GenerationRunsNavigationTarget,
   isActive,
   isResumable,
@@ -32,7 +34,9 @@ import {
   currentJobReasonCode,
   diagnosticHistoryState,
   newestDiagnostics,
+  isRootGenerationJob,
 } from "./generationRunsPresentation";
+import GenerationJobStages from "./GenerationJobStages";
 
 interface ProseRunTelemetry {
   run_id: string;
@@ -117,6 +121,7 @@ interface GenerationRunsWorkspaceProps {
     valid: boolean,
   ) => void;
   onNavigate: (target: GenerationRunsNavigationTarget) => void;
+  onOpenRootJob: (jobId: string) => void;
   onClose: () => void;
   onOpenReadiness: (job: GenerationJob) => void;
   onJumpToChapter: (chapterId: string, runId?: string) => void;
@@ -155,7 +160,10 @@ function dateWithin(value: string, range: TimeFilter): boolean {
   return parsed >= now - duration;
 }
 
-function providerValues(job: GenerationJob): string[] {
+type JobListEntry = GenerationJob | GenerationJobSummary;
+
+function providerValues(job: JobListEntry): string[] {
+  if ("provider_aliases" in job) return job.provider_aliases;
   return Array.from(new Set([
     ...(job.diagnostics ?? []).flatMap(
       (event) => event.details.provider_aliases ?? [],
@@ -164,7 +172,8 @@ function providerValues(job: GenerationJob): string[] {
   ].filter((value): value is string => Boolean(value))));
 }
 
-function modelValues(job: GenerationJob): string[] {
+function modelValues(job: JobListEntry): string[] {
+  if ("provider_models" in job) return job.provider_models;
   return Array.from(new Set([
     ...(job.diagnostics ?? []).flatMap(
       (event) => event.details.provider_models ?? [],
@@ -188,10 +197,12 @@ function telemetryMatchesScope(scope: ScopeFilter): boolean {
   return scope === "all" || scope === "chapter";
 }
 
-function reasonValues(job: GenerationJob): string[] {
+function reasonValues(job: JobListEntry): string[] {
   return Array.from(new Set(
     [
-      ...(job.diagnostics ?? []).map((event) => event.code),
+      ...("reason_codes" in job
+        ? [...job.reason_codes, job.latest_diagnostic?.code]
+        : (job.diagnostics ?? []).map((event) => event.code)),
       job.pause_reason,
     ].filter((reason): reason is string => Boolean(reason)),
   ));
@@ -213,11 +224,12 @@ function statusLabel(
 }
 
 function scopeLabel(
-  job: GenerationJob,
+  job: JobListEntry,
   volumes: VolumeSummary[],
   t: ReturnType<typeof useTranslations>,
 ): string {
   if (job.scope === "book") return t("scopeBook");
+  if (job.scope !== "volume") return t("scopeChapter");
   return t("scopeVolume", {
     title: volumes.find((volume) => volume._id === job.volume_id)?.title ?? t("unknown"),
   });
@@ -329,6 +341,7 @@ export default function GenerationRunsWorkspace({
   proseRunsRevision,
   onTargetValidation,
   onNavigate,
+  onOpenRootJob,
   onClose,
   onOpenReadiness,
   onJumpToChapter,
@@ -340,7 +353,16 @@ export default function GenerationRunsWorkspace({
   const locale = useLocale();
   const headingRef = useRef<HTMLHeadingElement>(null);
   const loadRequestRef = useRef(0);
-  const [jobs, setJobs] = useState<GenerationJob[]>([]);
+  const loadControllerRef = useRef<AbortController | null>(null);
+  const historyNovelRef = useRef<string | null>(null);
+  const pageControllerRef = useRef<AbortController | null>(null);
+  const selectedTargetRef = useRef<string | undefined>(undefined);
+  const [jobs, setJobs] = useState<JobListEntry[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [exactJob, setExactJob] = useState<GenerationJob | null>(null);
+  const [settledJobId, setSettledJobId] = useState<string | undefined>(undefined);
   const [proseRuns, setProseRuns] = useState<ProseRunTelemetry[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -383,6 +405,18 @@ export default function GenerationRunsWorkspace({
 
   const load = useCallback(async (initial = false) => {
     const requestId = ++loadRequestRef.current;
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
+    selectedTargetRef.current = target.jobId;
+    const options = { signal: controller.signal };
+    const fetchHistory = !initial || historyNovelRef.current !== novelId;
+    if (fetchHistory) {
+      pageControllerRef.current?.abort();
+      pageControllerRef.current = null;
+      setLoadingMore(false);
+      setPageError(null);
+    }
     if (initial) setLoading(true);
     else setRefreshing(true);
     setLoadError(null);
@@ -390,16 +424,35 @@ export default function GenerationRunsWorkspace({
 
     const telemetryParams = new URLSearchParams({ limit: "100" });
     if (target.jobId) telemetryParams.set("job_id", target.jobId);
-    const [jobsResult, telemetryResult] = await Promise.allSettled([
-      apiGet<GenerationJob[]>(`/api/generation-jobs/novel/${novelId}`),
+    const [jobsResult, telemetryResult, detailResult] = await Promise.allSettled([
+      fetchHistory
+        ? apiGet<GenerationJobPage>(`/api/generation-jobs/novel/${novelId}/history?limit=20`, options)
+        : Promise.resolve(null),
       apiGet<ProseRunTelemetry[]>(
         `/api/llm/prose-runs/novel/${novelId}/telemetry?${telemetryParams}`,
+        options,
       ),
+      target.jobId ? apiGet<GenerationJob>(`/api/generation-jobs/${encodeURIComponent(target.jobId)}`, options)
+        .catch((error: unknown) => {
+          if (error instanceof ApiError && [400, 404].includes(error.status)) return null;
+          throw error;
+        }) : Promise.resolve(null),
     ]);
-    if (requestId !== loadRequestRef.current) return;
+    if (controller.signal.aborted || requestId !== loadRequestRef.current) return;
 
     if (jobsResult.status === "fulfilled") {
-      setJobs(jobsResult.value);
+      if (jobsResult.value) {
+        setJobs(jobsResult.value.items.filter((item) => item.novel_id === novelId && isRootGenerationJob(item)));
+        setNextCursor(jobsResult.value.next_cursor);
+        historyNovelRef.current = novelId;
+      }
+    } else {
+      setLoadError(t("loadError"));
+    }
+    if (detailResult.status === "fulfilled") {
+      const detail = detailResult.value;
+      setExactJob(detail?._id === target.jobId && detail?.novel_id === novelId ? detail : null);
+      setSettledJobId(target.jobId);
     } else {
       setLoadError(t("loadError"));
     }
@@ -416,6 +469,39 @@ export default function GenerationRunsWorkspace({
     void load(true);
   }, [load, proseRunsRevision]);
 
+  useEffect(() => () => {
+    loadRequestRef.current += 1;
+    loadControllerRef.current?.abort();
+    pageControllerRef.current?.abort();
+    selectedTargetRef.current = undefined;
+  }, []);
+
+  const loadMore = useCallback(async () => {
+    if (!nextCursor || pageControllerRef.current) return;
+    const controller = new AbortController();
+    pageControllerRef.current = controller;
+    setLoadingMore(true);
+    setPageError(null);
+    try {
+      const params = new URLSearchParams({ limit: "20", cursor: nextCursor });
+      const page = await apiGet<GenerationJobPage>(`/api/generation-jobs/novel/${novelId}/history?${params}`, { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      setJobs((current) => {
+        const ids = new Set(current.map((item) => item._id));
+        return [...current, ...page.items.filter((item) => item.novel_id === novelId
+          && isRootGenerationJob(item) && !ids.has(item._id))];
+      });
+      setNextCursor(page.next_cursor);
+    } catch {
+      if (!controller.signal.aborted) setPageError(t("loadError"));
+    } finally {
+      if (pageControllerRef.current === controller) {
+        pageControllerRef.current = null;
+        setLoadingMore(false);
+      }
+    }
+  }, [nextCursor, novelId, t]);
+
   useEffect(() => {
     const runId = target.runId;
     if (!runId) {
@@ -425,6 +511,12 @@ export default function GenerationRunsWorkspace({
         loading: false,
         error: null,
       });
+      return;
+    }
+    // Exact run ownership may depend on a root's persisted stage relationships.
+    // Do not reject a deep link before its Job detail has arrived.
+    if (target.jobId && exactJob?._id !== target.jobId) {
+      setExactRunLookup({ requestedId: runId, run: null, loading: true, error: null });
       return;
     }
 
@@ -440,7 +532,7 @@ export default function GenerationRunsWorkspace({
     ).then((run) => {
       if (cancelled) return;
       const relatedRunIds = target.jobId
-        ? jobs.find((job) => job._id === target.jobId)?.related_prose_run_ids ?? []
+        ? (exactJob?._id === target.jobId ? exactJob.related_prose_run_ids : undefined) ?? []
         : [];
       const valid = run.run_id === runId
         && run.novel_id === novelId
@@ -479,7 +571,7 @@ export default function GenerationRunsWorkspace({
     return () => { cancelled = true; };
   }, [
     exactRunLookupRevision,
-    jobs,
+    exactJob,
     novelId,
     onTargetValidation,
     t,
@@ -541,7 +633,7 @@ export default function GenerationRunsWorkspace({
     timeFilter,
   ]);
   const selectedJob = target.jobId
-    ? jobs.find((job) => job._id === target.jobId) ?? null
+    ? exactJob?._id === target.jobId && exactJob.novel_id === novelId ? exactJob : null
     : null;
   const selectedChapterProgress = useMemo(
     () => aggregateChapterProgress(
@@ -607,14 +699,15 @@ export default function GenerationRunsWorkspace({
     ? currentBlocker.details.prose_run_id
     : null;
   const missingJob = Boolean(target.jobId)
+    && settledJobId === target.jobId
     && !loading
     && !loadError
     && selectedJob === null;
 
   useEffect(() => {
-    if (!target.jobId || loading || loadError) return;
+    if (!target.jobId || settledJobId !== target.jobId || loading || loadError) return;
     onTargetValidation("job", target.jobId, selectedJob !== null);
-  }, [loadError, loading, onTargetValidation, selectedJob, target.jobId]);
+  }, [loadError, loading, onTargetValidation, selectedJob, settledJobId, target.jobId]);
 
   useEffect(() => {
     if (!target.chapterId || chaptersLoading || chaptersError) return;
@@ -651,12 +744,17 @@ export default function GenerationRunsWorkspace({
         `/api/generation-jobs/${job._id}/${action}`,
         body,
       );
+      if (selectedTargetRef.current !== job._id || next._id !== job._id || next.novel_id !== novelId) return;
+      loadRequestRef.current += 1;
+      loadControllerRef.current?.abort();
+      setExactJob(next);
       setJobs((current) => current.map((item) => (
         item._id === next._id ? next : item
       )));
       setAbortArmed(null);
       void load();
     } catch (error) {
+      if (selectedTargetRef.current !== job._id) return;
       if (action === "resume" && isResumeReadinessRequired(error)) {
         setResumeReviewJob(job);
         return;
@@ -669,7 +767,7 @@ export default function GenerationRunsWorkspace({
     } finally {
       setActionJobId(null);
     }
-  }, [load, t]);
+  }, [load, novelId, t]);
 
   const requestResume = useCallback((job: GenerationJob) => {
     if (
@@ -714,6 +812,8 @@ export default function GenerationRunsWorkspace({
           job={resumeReviewJob}
           onClose={() => setResumeReviewJob(null)}
           onSubmitted={(resumed) => {
+            if (selectedTargetRef.current !== resumed._id || resumed.novel_id !== novelId) return;
+            setExactJob(resumed);
             setJobs((current) => current.map((item) => (
               item._id === resumed._id ? resumed : item
             )));
@@ -788,6 +888,7 @@ export default function GenerationRunsWorkspace({
           <h3 id="generation-run-filters-title" className="text-sm font-semibold text-foreground">
             {t("filtersTitle")}
           </h3>
+          <p className="mt-1 text-xs leading-5 text-muted">{t("loadedHistoryHint", { count: jobs.length })}</p>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <label className="grid gap-1 text-xs text-muted">
               <span>{t("filterScope")}</span>
@@ -919,6 +1020,14 @@ export default function GenerationRunsWorkspace({
                 );
               })}
             </div>
+            {pageError && <p role="alert" className="px-3 py-2 text-xs text-red-700 dark:text-red-300">{pageError}</p>}
+            {nextCursor && (
+              <button type="button" disabled={loading || refreshing || loadingMore}
+                onClick={() => void loadMore()}
+                className="min-h-10 w-full border-t border-border px-3 py-2 text-sm text-foreground hover:bg-surface disabled:opacity-60">
+                {loadingMore ? t("loading") : t("loadMoreHistory")}
+              </button>
+            )}
           </section>
 
           <section aria-labelledby="generation-run-detail-title" className="min-w-0 rounded-md border border-border bg-background">
@@ -927,7 +1036,7 @@ export default function GenerationRunsWorkspace({
                 <h3 id="generation-run-detail-title" className="font-semibold text-foreground">
                   {t("detailTitle")}
                 </h3>
-                <p className="mt-2">{t("detailSelect")}</p>
+                <p className="mt-2">{t(target.jobId && (loading || settledJobId !== target.jobId) ? "loading" : "detailSelect")}</p>
               </div>
             )}
             {selectedJob && (
@@ -941,7 +1050,7 @@ export default function GenerationRunsWorkspace({
                       {t("detailStatus", { status: statusLabel(selectedJob.status, t) })}
                     </p>
                   </div>
-                  {!readOnly && (
+                  {!readOnly && isRootGenerationJob(selectedJob) && (
                     <JobActionButtons
                       job={selectedJob}
                       busy={actionJobId === selectedJob._id}
@@ -955,6 +1064,9 @@ export default function GenerationRunsWorkspace({
                     />
                   )}
                 </div>
+
+                <GenerationJobStages key={selectedJob._id} job={selectedJob}
+                  onOpenJob={(jobId) => onNavigate({ jobId })} onOpenRootJob={onOpenRootJob} />
 
                 {actionError && (
                   <p role="alert" className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-xs leading-5 text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
@@ -1015,7 +1127,7 @@ export default function GenerationRunsWorkspace({
                           {t("resolveInspectRun")}
                         </button>
                       )}
-                      {(currentBlocker.action_codes?.includes("resume_generation_job")
+                      {!readOnly && isRootGenerationJob(selectedJob) && (currentBlocker.action_codes?.includes("resume_generation_job")
                         || selectedJob.resume_original_writeback_available)
                         && isResumable(selectedJob.status)
                         && !selectedJob.has_uncertain_attempts && (
@@ -1028,7 +1140,7 @@ export default function GenerationRunsWorkspace({
                           {t("resolveResumeJob")}
                         </button>
                       )}
-                      {currentBlocker.action_codes?.includes("restart_generation_job") && (
+                      {isRootGenerationJob(selectedJob) && currentBlocker.action_codes?.includes("restart_generation_job") && (
                         <button
                           type="button"
                           onClick={() => onOpenReadiness(selectedJob)}

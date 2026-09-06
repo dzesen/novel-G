@@ -292,6 +292,7 @@ export default function AutoBookWorkspace({
               )
             }
             onClose={() => onNavigateView("runs", {}, true)}
+            onOpenRootJob={(jobId) => onNavigateView("runs", { job: jobId }, true)}
             onOpenReadiness={(job) => onNavigateView(
               "readiness",
               job.scope === "volume" && job.volume_id
