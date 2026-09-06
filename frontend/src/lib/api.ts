@@ -110,13 +110,17 @@ export function getImageUrl(url: string | null | undefined): string {
   return `${getApiBase()}${url}`;
 }
 
-export async function apiGet<T = unknown>(path: string): Promise<T> {
+export async function apiGet<T = unknown>(
+  path: string,
+  options: Pick<RequestInit, "signal"> = {},
+): Promise<T> {
   return apiRequest<T>(path, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
     // 批量生成会在服务端改写章节内容，客户端若命中浏览器缓存会读到旧副本
     // （检查点复核里"点击跳转查看"会显示空章）——API 数据始终要最新。
     cache: "no-store",
+    signal: options.signal,
   });
 }
 
@@ -144,12 +148,14 @@ export async function apiPatch<T = unknown>(
 
 export async function apiPost<T = unknown>(
   path: string,
-  data: unknown
+  data: unknown,
+  options: Pick<RequestInit, "signal"> = {},
 ): Promise<T> {
   return apiRequest<T>(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
+    signal: options.signal,
   });
 }
 
@@ -217,18 +223,37 @@ export async function apiDownload(path: string, fallbackFilename = "download"): 
   URL.revokeObjectURL(url);
 }
 
-/**
- * SSE POST 请求：发送 JSON body 并逐条回调 SSE 事件。
- */
+export type SSEErrorCode = "interrupted" | "invalidEvent";
+
+export class SSEError extends Error {
+  readonly code: SSEErrorCode;
+
+  constructor(code: SSEErrorCode, cause?: unknown) {
+    super(code === "interrupted"
+      ? "The stream ended before a complete result arrived."
+      : "The stream returned an invalid event.", { cause });
+    this.name = "SSEError";
+    this.code = code;
+  }
+}
+
+export interface SSECompletionContract {
+  terminalEvent: string;
+  validateTerminal: (data: Record<string, unknown>) => boolean;
+}
+
+/** Each business stream declares which event proves that its result arrived. */
 export async function apiPostSSE(
   path: string,
   data: unknown,
   onEvent: (event: string, data: Record<string, unknown>) => void,
-  signal?: AbortSignal
+  options: SSECompletionContract & { signal?: AbortSignal },
 ): Promise<void> {
+  const { signal, terminalEvent, validateTerminal } = options;
+  signal?.throwIfAborted();
   const res = await authorizedFetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
     body: JSON.stringify(data),
     signal,
   });
@@ -236,36 +261,75 @@ export async function apiPostSSE(
     throw await responseError(res);
   }
   const reader = res.body?.getReader();
-  if (!reader) throw new Error("No response body");
+  if (!reader) throw new SSEError("interrupted");
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let eventType = "message";
+  let dataLines: string[] = [];
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-
-    for (const part of parts) {
-      let eventType = "message";
-      let eventData = "";
-      for (const line of part.split("\n")) {
-        if (line.startsWith("event: ")) {
-          eventType = line.slice(7);
-        } else if (line.startsWith("data: ")) {
-          eventData = line.slice(6);
-        }
+  const acceptLine = (line: string): boolean => {
+    if (line === "") {
+      const type = eventType || "message";
+      const parts = dataLines;
+      eventType = "message";
+      dataLines = [];
+      if (parts.length === 0) return false;
+      let value: unknown;
+      try {
+        value = JSON.parse(parts.join("\n"));
+      } catch (cause) {
+        throw new SSEError("invalidEvent", cause);
       }
-      if (eventData) {
-        try {
-          onEvent(eventType, JSON.parse(eventData));
-        } catch {
-          // 忽略格式错误的事件数据
-        }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new SSEError("invalidEvent");
       }
+      const payload = value as Record<string, unknown>;
+      const terminal = type === terminalEvent;
+      if (terminal && !validateTerminal(payload)) throw new SSEError("invalidEvent");
+      signal?.throwIfAborted();
+      // Consumer failures must propagate; they are not JSON decoding failures.
+      onEvent(type, payload);
+      return terminal;
     }
+    if (line.startsWith(":")) return false;
+    const separator = line.indexOf(":");
+    const field = separator < 0 ? line : line.slice(0, separator);
+    let value = separator < 0 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") eventType = value;
+    if (field === "data") dataLines.push(value);
+    return false;
+  };
+
+  const abortReader = () => { void reader.cancel(signal?.reason).catch(() => {}); };
+  signal?.addEventListener("abort", abortReader, { once: true });
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read().catch((cause) => {
+        signal?.throwIfAborted();
+        throw new SSEError("interrupted", cause);
+      });
+      signal?.throwIfAborted();
+      buffer += decoder.decode(value, { stream: !done });
+      while (true) {
+        const boundary = buffer.search(/[\r\n]/);
+        if (boundary < 0) break;
+        // A CR at the end of a chunk may be the first half of a CRLF.
+        if (buffer[boundary] === "\r" && boundary === buffer.length - 1 && !done) break;
+        const width = buffer.slice(boundary, boundary + 2) === "\r\n" ? 2 : 1;
+        const line = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + width);
+        signal?.throwIfAborted();
+        if (acceptLine(line)) return;
+      }
+      // SSE dispatch requires a blank line. A partial last frame is not a result.
+      if (done) throw new SSEError("interrupted");
+    }
+  } finally {
+    signal?.removeEventListener("abort", abortReader);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
 }

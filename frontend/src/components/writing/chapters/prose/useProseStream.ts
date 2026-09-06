@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiPostSSE } from "@/lib/api";
+import { useTranslations } from "next-intl";
+import { apiPostSSE, SSEError } from "@/lib/api";
+import { proseGenerationStream } from "@/lib/generationStreamContracts";
 import type { ContextReport } from "../outline/outlineTypes";
 import { proseRunHasUncertainAttempt } from "./prosePresentation";
 
@@ -74,6 +76,7 @@ export interface ProseExecutionPlanInfo {
  * 会在稍后 reject 并把新一轮的状态写坏。
  */
 export function useProseStream() {
+  const tStream = useTranslations("streamErrors");
   const [status, setStatus] = useState<ProseStreamStatus>("idle");
   const [text, setText] = useState("");
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
@@ -267,7 +270,7 @@ export function useProseStream() {
               }
             }
           },
-          controller.signal
+          { ...proseGenerationStream, signal: controller.signal },
         );
       } catch (err) {
         if (runIdRef.current !== runId) return;
@@ -277,13 +280,14 @@ export function useProseStream() {
           setStatus("cancelled");
           return;
         }
-        setError(err instanceof Error ? err.message : String(err));
+        setError(err instanceof SSEError ? tStream(err.code)
+          : err instanceof Error ? err.message : String(err));
         setStatus("error");
       } finally {
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [cancel]
+    [cancel, tStream]
   );
 
   return {

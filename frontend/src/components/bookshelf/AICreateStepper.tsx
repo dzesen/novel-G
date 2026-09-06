@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Switch } from "@heroui/react";
-import { apiGet, apiPost, apiPostSSE } from "@/lib/api";
+import { apiGet, apiPost, apiPostSSE, SSEError } from "@/lib/api";
+import { blueprintGenerationStream } from "@/lib/generationStreamContracts";
 import {
   MAX_WORDS_PER_CHAPTER,
   MIN_WORDS_PER_CHAPTER,
@@ -114,6 +115,7 @@ export default function AICreateStepper({
   initialIdea = "",
 }: AICreateStepperProps) {
   const t = useTranslations("create");
+  const tStream = useTranslations("streamErrors");
   const [initialCache] = useState(() =>
     cardImports.length > 0 ? null : loadAICreateCache(),
   );
@@ -162,6 +164,19 @@ export default function AICreateStepper({
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<AICreateResponse | null>(null);
   const cachedStepsRef = useRef<AICreateCachedSteps>(initialSteps);
+  const generationRequestRef = useRef<AbortController | null>(null);
+  const generationEpochRef = useRef(0);
+  const directorRequestRef = useRef<AbortController | null>(null);
+  const directorEpochRef = useRef(0);
+
+  useEffect(() => () => {
+    generationEpochRef.current += 1;
+    directorEpochRef.current += 1;
+    generationRequestRef.current?.abort();
+    directorRequestRef.current?.abort();
+    generationRequestRef.current = null;
+    directorRequestRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (!directorEnabled || directorAgents.length > 0) return;
@@ -221,6 +236,10 @@ export default function AICreateStepper({
   };
 
   const resetGenerationState = () => {
+    generationEpochRef.current += 1;
+    generationRequestRef.current?.abort();
+    generationRequestRef.current = null;
+    setIsRunning(false);
     clearAICreateCache();
     setResult(null);
     setCachedStepsState({});
@@ -228,6 +247,10 @@ export default function AICreateStepper({
   };
 
   const resetDirectorPreview = () => {
+    directorEpochRef.current += 1;
+    directorRequestRef.current?.abort();
+    directorRequestRef.current = null;
+    setIsDirecting(false);
     setDirectorPreview(null);
     setSelectedDirectionIndex(null);
     setConfirmedDirection(null);
@@ -284,9 +307,15 @@ export default function AICreateStepper({
 
   const startCreativeDirector = async () => {
     const originalIdea = idea.trim();
-    if ((!originalIdea && cardImports.length === 0) || !selectedDirectorId) {
+    if (directorRequestRef.current || (!originalIdea && cardImports.length === 0) || !selectedDirectorId) {
       return;
     }
+
+    const controller = new AbortController();
+    directorRequestRef.current = controller;
+    const epoch = ++directorEpochRef.current;
+    const isCurrent = () => directorRequestRef.current === controller
+      && directorEpochRef.current === epoch && !controller.signal.aborted;
 
     setDirectorError("");
     setIsDirecting(true);
@@ -310,18 +339,24 @@ export default function AICreateStepper({
           ...(systemPrompt != null && { system_prompt: systemPrompt }),
           allow_failure_retry: allowFailureRetry,
         },
+        { signal: controller.signal },
       );
+      if (!isCurrent()) return;
       resetGenerationState();
       setDirectorPreview(response);
       setSelectedDirectionIndex(null);
       setConfirmedDirection(null);
       setDirectorAdjustments("");
     } catch (error) {
+      if (!isCurrent()) return;
       setDirectorError(
         error instanceof Error ? error.message : t("director.generateFailed"),
       );
     } finally {
-      setIsDirecting(false);
+      if (directorRequestRef.current === controller) {
+        directorRequestRef.current = null;
+        setIsDirecting(false);
+      }
     }
   };
 
@@ -368,9 +403,15 @@ export default function AICreateStepper({
 
   const startGeneration = async () => {
     const input = getCurrentInput();
-    if (!input.user_idea || (directorEnabled && !input.creative_direction)) {
+    if (generationRequestRef.current || !input.user_idea || (directorEnabled && !input.creative_direction)) {
       return;
     }
+
+    const controller = new AbortController();
+    generationRequestRef.current = controller;
+    const epoch = ++generationEpochRef.current;
+    const isCurrent = () => generationRequestRef.current === controller
+      && generationEpochRef.current === epoch && !controller.signal.aborted;
 
     const storedCache = loadAICreateCache();
     const reusableCachedSteps = storedCache && isSameAICreateInput(storedCache, input)
@@ -405,6 +446,7 @@ export default function AICreateStepper({
         "/api/llm/create-novel-by-ai",
         payload,
         (event, data) => {
+          if (!isCurrent()) return;
           if (event === "step") {
             const stepName = data.step;
             const status = data.status as StepStatus;
@@ -450,8 +492,10 @@ export default function AICreateStepper({
             }
           }
         },
+        { ...blueprintGenerationStream, signal: controller.signal },
       );
     } catch (err) {
+      if (!isCurrent()) return;
       // 网络或浏览器层异常没有后端 step 事件，只能标记当前第一个未完成步骤。
       setSteps((prev) => {
         const firstPending = prev.findIndex(
@@ -462,12 +506,16 @@ export default function AICreateStepper({
         saveAICreateCache(input, cachedStepsRef.current, failedStep);
         return prev.map((step, index) =>
           index === firstPending
-            ? { ...step, status: "error", error: err instanceof Error ? err.message : String(err) }
+            ? { ...step, status: "error", error: err instanceof SSEError
+              ? tStream(err.code) : err instanceof Error ? err.message : String(err) }
             : step,
         );
       });
     } finally {
-      setIsRunning(false);
+      if (generationRequestRef.current === controller) {
+        generationRequestRef.current = null;
+        setIsRunning(false);
+      }
     }
   };
 

@@ -1,4 +1,8 @@
 {
+  "streamErrors": {
+    "interrupted": "The connection ended before the full result arrived. Received content is retained; check the draft or run record before resuming.",
+    "invalidEvent": "The generation response was incomplete or invalid, so completion could not be confirmed. Check the retained draft or run record."
+  },
   "nav": {
     "title": "AI Novel Generator",
     "settings": "Settings",

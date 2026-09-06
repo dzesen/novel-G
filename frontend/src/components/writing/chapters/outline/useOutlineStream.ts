@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiPostSSE } from "@/lib/api";
+import { useTranslations } from "next-intl";
+import { apiPostSSE, SSEError } from "@/lib/api";
+import { structuredGenerationStream } from "@/lib/generationStreamContracts";
 import type { ContextReport, DroppedIds, RemappedReference } from "./outlineTypes";
 
 export type OutlineStreamStatus = "idle" | "running" | "done" | "error";
@@ -20,6 +22,7 @@ interface UseOutlineStreamOptions {
  * id_remapping / id_validation。keepalive 注释帧由 apiPostSSE 自动忽略（无 data: 行）。
  */
 export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) {
+  const tStream = useTranslations("streamErrors");
   const [status, setStatus] = useState<OutlineStreamStatus>("idle");
   const [result, setResult] = useState<T | null>(null);
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
@@ -137,7 +140,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
               }
             }
           },
-          controller.signal
+          { ...structuredGenerationStream([stepKey]), signal: controller.signal },
         );
       } catch (err) {
         // abort() 不会同步中断挂起的 await：旧一轮的 reader.read() 会在
@@ -158,13 +161,14 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
           setStatus("idle");
           return;
         }
-        setError(err instanceof Error ? err.message : String(err));
+        setError(err instanceof SSEError ? tStream(err.code)
+          : err instanceof Error ? err.message : String(err));
         setStatus("error");
       } finally {
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [acceptStreamResult, cancel, path, stepKey]
+    [acceptStreamResult, cancel, path, stepKey, tStream]
   );
 
   return {

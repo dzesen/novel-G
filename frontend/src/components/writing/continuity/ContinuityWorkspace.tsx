@@ -149,7 +149,8 @@ export default function ContinuityWorkspace({
   const runTarget = useOwnedTarget<AgentRun, { run: AgentRun }>({
     novelId,
     targetKey: "run",
-    targetId: view === "review-history" ? targets.run : undefined,
+    // Historical fact/thread links retain their read-only generation provenance.
+    targetId: ["review-history", "facts", "threads"].includes(view) ? targets.run : undefined,
     path: runPath,
     selectRecord: selectAgentRun,
     onTargetValidation,

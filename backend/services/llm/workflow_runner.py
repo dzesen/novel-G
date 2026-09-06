@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator
 
@@ -240,7 +241,7 @@ async def _drive_with_keepalive(
         SSE 心跳注释帧。
 
     Raises:
-        ClientDisconnected: 客户端断开时抛出，task 已被取消。
+        ClientDisconnected: 客户端断开时抛出，由创建 task 的工作流清理。
     """
     while True:
         done, _pending = await asyncio.wait({task}, timeout=keepalive_seconds)
@@ -248,12 +249,6 @@ async def _drive_with_keepalive(
             return
 
         if is_disconnected is not None and await is_disconnected():
-            # 用户关了页面，正在烧的 LLM 调用必须立刻掐掉，否则断开也照样计费。
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
             raise ClientDisconnected()
 
         yield sse_comment("keepalive")
@@ -409,9 +404,17 @@ async def run_workflow(
             )
 
             task = asyncio.ensure_future(coro)
-            async for frame in _drive_with_keepalive(task, is_disconnected, interval):
-                yield frame
-            generated = await task
+            try:
+                async for frame in _drive_with_keepalive(task, is_disconnected, interval):
+                    yield frame
+                generated = await task
+            finally:
+                # This generator owns the Provider task, including when its
+                # consumer is cancelled or closes it while a heartbeat is yielded.
+                if not task.done():
+                    task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
             produced = generated.value
             step_usage = generated.usage
 

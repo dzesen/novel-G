@@ -8,7 +8,8 @@ import {
 } from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
-import { apiPost, apiPostSSE } from "@/lib/api";
+import { apiPost, apiPostSSE, SSEError } from "@/lib/api";
+import { blueprintGenerationStream } from "@/lib/generationStreamContracts";
 import {
   buildBlueprintRegenerationReadinessRequest,
   buildBlueprintRegenerationStartRequest,
@@ -75,6 +76,7 @@ export default function BlueprintRegenerationPanel({
   onAccept,
 }: BlueprintRegenerationPanelProps) {
   const t = useTranslations("writing.novelInfo.regeneration");
+  const tStream = useTranslations("streamErrors");
   const inspection = inspectBlueprintRegeneration(draft);
   const originSupportsRegeneration =
     draft._creationOrigin === "ai_idea" ||
@@ -221,7 +223,6 @@ export default function BlueprintRegenerationPanel({
       core_seed: "pending",
       novel_meta: "pending",
     });
-    let receivedTerminalEvent = false;
 
     try {
       await apiPostSSE(
@@ -249,7 +250,6 @@ export default function BlueprintRegenerationPanel({
             return;
           }
           if (event !== "done") return;
-          receivedTerminalEvent = true;
           if (data.success && data.result) {
             setCandidate(data.result as AICreateResponse);
             setStage("review");
@@ -263,16 +263,13 @@ export default function BlueprintRegenerationPanel({
               : t("failed"),
           );
         },
+        blueprintGenerationStream,
       );
-      if (!receivedTerminalEvent) {
-        setStage("confirm");
-        setReadiness(null);
-        setError(t("connectionEnded"));
-      }
     } catch (cause) {
       setStage("confirm");
       setReadiness(null);
-      setError(cause instanceof Error ? cause.message : t("failed"));
+      setError(cause instanceof SSEError ? tStream(cause.code)
+        : cause instanceof Error ? cause.message : t("failed"));
     }
   };
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { Button, Card } from "@heroui/react";
@@ -36,6 +36,7 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
   const pathname = usePathname();
   const locale = pathname.startsWith("/en") ? "en" : "zh";
   const [method, setMethod] = useState<CreationMethod>("choose");
+  const methodRef = useRef<CreationMethod>("choose");
   const [recoverableDraft, setRecoverableDraft] =
     useState<StoredWritingDraft | null>(null);
   const [redirecting, setRedirecting] = useState(false);
@@ -44,10 +45,20 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
     const timer = window.setTimeout(() => {
       setRecoverableDraft(loadCurrentWritingDraft());
     }, 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      methodRef.current = "choose";
+      window.clearTimeout(timer);
+    };
   }, []);
 
+  const chooseMethod = (next: CreationMethod) => {
+    // Change the callback's authority immediately, before passive cleanup runs.
+    methodRef.current = next;
+    setMethod(next);
+  };
+
   const openDraft = (draftId: string) => {
+    methodRef.current = "choose";
     setRedirecting(true);
     router.push(`/${locale}/writing/new?draft=${encodeURIComponent(draftId)}`);
   };
@@ -61,6 +72,7 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
     result: AICreateResponse,
     generationSource: BlueprintGenerationSource,
   ) => {
+    if (methodRef.current !== "ai") return;
     const draft = createGeneratedWritingDraft({
       result,
       generationSource,
@@ -82,7 +94,7 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
   };
 
   if (method === "cards") {
-    return <CardDrivenCreatePanel onCancel={() => setMethod("choose")} />;
+    return <CardDrivenCreatePanel onCancel={() => chooseMethod("choose")} />;
   }
 
   return (
@@ -102,7 +114,7 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
               variant="ghost"
               size="sm"
               className="shrink-0"
-              onPress={method === "ai" ? () => setMethod("choose") : onCancel}
+              onPress={method === "ai" ? () => chooseMethod("choose") : onCancel}
             >
               {method === "ai" ? t("entry.backToMethods") : t("back")}
             </Button>
@@ -166,13 +178,13 @@ export default function NewNovelPanel({ onCancel }: NewNovelPanelProps) {
                   eyebrow={t("entry.method.ai.eyebrow")}
                   title={t("entry.method.ai.title")}
                   description={t("entry.method.ai.description")}
-                  onPress={() => setMethod("ai")}
+                  onPress={() => chooseMethod("ai")}
                 />
                 <CreationMethodCard
                   eyebrow={t("entry.method.cards.eyebrow")}
                   title={t("entry.method.cards.title")}
                   description={t("entry.method.cards.description")}
-                  onPress={() => setMethod("cards")}
+                  onPress={() => chooseMethod("cards")}
                 />
               </div>
             </div>
