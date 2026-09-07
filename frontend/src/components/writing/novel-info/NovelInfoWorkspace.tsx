@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  Fragment,
   useState,
   useEffect,
   useCallback,
@@ -63,6 +62,8 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
   const [editingSection, setEditingSection] = useState<SectionKey | null>(null);
   const [creating, setCreating] = useState(false);
   const [hasChapters, setHasChapters] = useState(false);
+  const [coverExpanded, setCoverExpanded] = useState(false);
+  const [coverOpened, setCoverOpened] = useState(false);
 
   /* danger confirm */
   const [showDangerModal, setShowDangerModal] = useState(false);
@@ -373,8 +374,8 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       {/* Sections */}
       <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
         {SECTIONS.map((sk) => (
-          <Fragment key={sk}>
             <NovelInfoSection
+              key={sk}
               sectionKey={sk}
               data={data}
               novelId={novelId}
@@ -390,7 +391,31 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
               hasChapters={hasChapters}
               onDangerConfirm={requestDangerConfirm}
             />
-            {sk === "basic" && mode === "edit" && novelId && (
+        ))}
+        {mode === "edit" && novelId && (
+          <section id="novel-cover-tools" className="border-t border-border pt-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-foreground">{tw("cover.toolsTitle")}</h3>
+                <p className="mt-1 text-xs text-muted">
+                  {tw(data.cover_asset_id || data.cover_image ? "cover.summaryPresent" : "cover.summaryEmpty")}
+                </p>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-expanded={coverExpanded}
+                aria-controls="novel-cover-panel"
+                onPress={() => {
+                  setCoverOpened(true);
+                  setCoverExpanded((expanded) => !expanded);
+                }}
+              >
+                {tw(coverExpanded ? "cover.collapseTools" : "cover.expandTools")}
+              </Button>
+            </div>
+            <div id="novel-cover-panel" hidden={!coverExpanded} className="mt-4">
+              {coverOpened && (
               <NovelCoverPanel
                 novelId={novelId}
                 novelTitle={String(data.title || "")}
@@ -405,9 +430,10 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
                 hasUnsavedChanges={editingSection !== null}
                 onCoverChanged={loadNovel}
               />
-            )}
-          </Fragment>
-        ))}
+              )}
+            </div>
+          </section>
+        )}
         {mode === "create" && (
           <BlueprintRegenerationPanel
             draft={data as unknown as WritingDraft}

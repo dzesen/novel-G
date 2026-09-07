@@ -398,14 +398,16 @@ export default function NovelInfoSection({
     if (f.type === "number") {
       return (
         <div key={f.key} className="space-y-2">
-          <label className="text-sm font-medium text-foreground">{label}</label>
+          <label htmlFor={`novel-${f.key}`} className="text-sm font-medium text-foreground">{label}</label>
           <input
+            id={`novel-${f.key}`}
             type="number"
             className="w-full rounded-lg border border-border bg-background px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
             value={val != null ? Number(val) : ""}
             onChange={(e) => updateField(f.key, e.target.value ? Number(e.target.value) : undefined)}
             min={f.min}
             max={f.max}
+            step={1}
           />
         </div>
       );

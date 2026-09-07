@@ -6,6 +6,8 @@ import { Button, Switch } from "@heroui/react";
 import { apiGet, apiPost, apiPostSSE, SSEError } from "@/lib/api";
 import { blueprintGenerationStream } from "@/lib/generationStreamContracts";
 import {
+  MAX_CHAPTERS,
+  MIN_CHAPTERS,
   MAX_WORDS_PER_CHAPTER,
   MIN_WORDS_PER_CHAPTER,
 } from "@/lib/novelCreationLimits";
@@ -168,6 +170,7 @@ export default function AICreateStepper({
   const generationEpochRef = useRef(0);
   const directorRequestRef = useRef<AbortController | null>(null);
   const directorEpochRef = useRef(0);
+  const inputFormRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => () => {
     generationEpochRef.current += 1;
@@ -306,6 +309,7 @@ export default function AICreateStepper({
   };
 
   const startCreativeDirector = async () => {
+    if (!inputFormRef.current?.reportValidity()) return;
     const originalIdea = idea.trim();
     if (directorRequestRef.current || (!originalIdea && cardImports.length === 0) || !selectedDirectorId) {
       return;
@@ -402,6 +406,7 @@ export default function AICreateStepper({
   };
 
   const startGeneration = async () => {
+    if (!inputFormRef.current?.reportValidity()) return;
     const input = getCurrentInput();
     if (generationRequestRef.current || !input.user_idea || (directorEnabled && !input.creative_direction)) {
       return;
@@ -534,12 +539,15 @@ export default function AICreateStepper({
 
   return (
     <div className="space-y-6 p-1">
+      <form ref={inputFormRef} className="space-y-6" onSubmit={(event) => event.preventDefault()}>
       {/* Idea Input */}
       <div>
-        <label className="block text-sm font-medium text-foreground mb-2">
+        <label htmlFor="ai-idea" className="block text-sm font-medium text-foreground mb-2">
           {t("ideaLabel")}
         </label>
         <textarea
+          id="ai-idea"
+          required={cardImports.length === 0}
           className="w-full rounded-lg border border-border bg-background p-3 text-sm text-foreground resize-y min-h-[120px] focus:outline-none focus:ring-2 focus:ring-primary"
           placeholder={t("ideaPlaceholder")}
           value={idea}
@@ -551,18 +559,25 @@ export default function AICreateStepper({
       {/* Chapter / Words Config */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div>
-          <label className="block text-sm font-medium text-foreground mb-1">
+          <label htmlFor="ai-chapters" className="block text-sm font-medium text-foreground mb-1">
             {t("chaptersLabel")}
           </label>
           <input
+            id="ai-chapters"
             type="number"
             className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
             value={chapters}
-            onChange={(e) => handleChaptersChange(Number(e.target.value) || 1)}
-            min={1}
-            max={1000}
+            onChange={(e) => handleChaptersChange(Number(e.target.value))}
+            min={MIN_CHAPTERS}
+            max={MAX_CHAPTERS}
+            step={1}
+            required
+            aria-describedby="ai-chapters-range"
             disabled={directorLocked}
           />
+          <p id="ai-chapters-range" className="mt-1 text-xs text-muted">
+            {t("chaptersRange", { min: MIN_CHAPTERS, max: MAX_CHAPTERS })}
+          </p>
         </div>
         <div>
           <label
@@ -576,13 +591,20 @@ export default function AICreateStepper({
             type="number"
             className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
             value={wordsPerChapter}
-            onChange={(e) => handleWordsPerChapterChange(Number(e.target.value) || 1000)}
+            onChange={(e) => handleWordsPerChapterChange(Number(e.target.value))}
             min={MIN_WORDS_PER_CHAPTER}
             max={MAX_WORDS_PER_CHAPTER}
+            step={1}
+            required
+            aria-describedby="ai-words-range"
             disabled={directorLocked}
           />
+          <p id="ai-words-range" className="mt-1 text-xs text-muted">
+            {t("wordsRange", { min: MIN_WORDS_PER_CHAPTER, max: MAX_WORDS_PER_CHAPTER })}
+          </p>
         </div>
       </div>
+      </form>
 
       {/* Optional pre-creation Creative Director */}
       <section className="rounded-xl border border-border bg-surface-secondary/20 p-4">

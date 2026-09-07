@@ -1,4 +1,6 @@
 import {
+  MAX_CHAPTERS,
+  MIN_CHAPTERS,
   MAX_WORDS_PER_CHAPTER,
   MIN_WORDS_PER_CHAPTER,
 } from "@/lib/novelCreationLimits";
@@ -42,7 +44,7 @@ export const SECTION_FIELDS: Record<SectionKey, NovelInfoFieldDef[]> = {
     { key: "target_audience", type: "text" },
   ],
   scale: [
-    { key: "number_of_chapters", type: "number", min: 1, max: 10000 },
+    { key: "number_of_chapters", type: "number", min: MIN_CHAPTERS, max: MAX_CHAPTERS },
     {
       key: "words_per_chapter",
       type: "number",

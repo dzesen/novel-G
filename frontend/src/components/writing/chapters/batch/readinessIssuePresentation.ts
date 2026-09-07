@@ -14,6 +14,11 @@ export function readinessIssueCopy(
   continuationCount: number,
 ) {
   switch (issue.code) {
+    case "novel_scale_invalid":
+      return {
+        title: t("readinessIssueScaleInvalidTitle"),
+        body: t("readinessIssueScaleInvalidBody"),
+      };
     case "book_structure_initialization_required":
       return {
         title: t("readinessIssueStructureRequiredTitle"),

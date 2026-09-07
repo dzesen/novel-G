@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing import Dict, List, Literal, Optional
+from backend.novel_scale import ChapterCount, WordsPerChapter
 
 from backend.db.repositories.novel_repository import novel_repo
 from backend.services.novel.novel_service import NovelService
@@ -70,8 +71,8 @@ class CreateNovelRequest(BaseModel):
     tone: Optional[str] = None
     target_audience: Optional[str] = None
     core_idea: Optional[str] = None
-    number_of_chapters: Optional[int] = None
-    words_per_chapter: Optional[int] = None
+    number_of_chapters: ChapterCount | None = None
+    words_per_chapter: WordsPerChapter | None = None
     style_controls: StyleControlsSchema | None = None
     creation_mode: Literal["manual", "ai"] = "manual"
     creative_direction: CreativeDirectionSelection | None = None
@@ -129,8 +130,8 @@ class UpdateNovelRequest(BaseModel):
     tone: Optional[str] = None
     target_audience: Optional[str] = None
     core_idea: Optional[str] = None
-    number_of_chapters: Optional[int] = None
-    words_per_chapter: Optional[int] = None
+    number_of_chapters: ChapterCount | None = None
+    words_per_chapter: WordsPerChapter | None = None
     style_controls: StyleControlsSchema | None = None
 
 

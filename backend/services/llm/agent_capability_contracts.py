@@ -7,6 +7,7 @@ from typing import Any, Generic, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.llm.models import TokenUsage
+from backend.novel_scale import ChapterCount, WordsPerChapter
 from backend.services.interop.card_import_proposal_service import (
     DIRECTION_CONTEXT_MAX_PROPOSALS,
 )
@@ -56,8 +57,8 @@ class CreativeDirectorRequest(GenerationParamsMixin):
     model_config = ConfigDict(extra="forbid")
 
     user_idea: str = Field(default="", max_length=8000)
-    number_of_chapters: int = Field(default=100, ge=1, le=1000)
-    words_per_chapter: int = Field(default=3000, ge=500, le=50000)
+    number_of_chapters: ChapterCount = 100
+    words_per_chapter: WordsPerChapter = 3000
     agent_id: str = Field(min_length=1, max_length=120)
     instruction: str = Field(default="", max_length=2000)
     direction_count: int = Field(default=3, ge=2, le=4)

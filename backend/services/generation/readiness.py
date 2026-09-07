@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Mapping
+from backend.novel_scale import InvalidNovelScale, invalid_novel_scale_fields
 
 from backend.services.generation.job_planner import (
     REUSABLE_STATE_COMPLETION_STATUSES,
@@ -475,6 +476,13 @@ class GenerationReadinessModule:
         resources = await self._deps.load_resource_counts(novel_id)
         proposal = await self._deps.inspect_active_proposal(novel_id)
         issues: list[dict[str, Any]] = []
+        scale = resources.get("novel_scale")
+        invalid_scale = invalid_novel_scale_fields(scale) if isinstance(scale, Mapping) else []
+        if invalid_scale:
+            issues.append(_issue(
+                "novel_scale_invalid", "blocked", details={"fields": invalid_scale},
+                action_codes=["review_novel_blueprint"],
+            ))
 
         has_chapter_work = any(
             counts["generate"] > 0 for counts in work["steps"].values()
@@ -739,6 +747,8 @@ class GenerationReadinessModule:
 
         effective_token_budget = token_budget
         try:
+            if invalid_scale:
+                raise InvalidNovelScale("Novel scale must be corrected before generation")
             planning_generation_params = generation_params
             needs_prose = work["steps"]["prose"]["generate"] > 0
             if needs_prose and self._deps.prepare_generation_params is not None:
@@ -1135,6 +1145,8 @@ class GenerationReadinessModule:
                             action_codes=["review_token_budget"],
                         )
                     )
+        except InvalidNovelScale:
+            planning = {"attempt_capacity": 0, "providers": [], "config_revision": "", "capability_snapshot": ""}
         except ContextBudgetError as exc:
             planning = {
                 "attempt_capacity": 0,
@@ -1252,7 +1264,7 @@ class GenerationReadinessModule:
                 auto_creation_policy.model_dump(mode="json")
             ),
         }
-        if auto_creation_policy.enabled and has_chapter_work:
+        if auto_creation_policy.enabled and has_chapter_work and not invalid_scale:
             raw_reference_repair = planning.get(
                 "reference_card_repair_plan_authorization"
             )
@@ -1402,6 +1414,9 @@ class GenerationReadinessModule:
                     resources.get("narrative_revision") or 0
                 ),
                 "world_baseline_state": world_baseline_state,
+                "novel_scale": {key: value if type(value) is int else None
+                                for key, value in (scale.items() if isinstance(scale, Mapping) else [])
+                                if key in {"number_of_chapters", "words_per_chapter"}},
             },
             "active_proposal": (
                 {
@@ -1606,6 +1621,7 @@ async def _load_resource_counts(novel_id: str) -> dict[str, Any]:
     material_counts = dict(world_baseline.get("counts") or {})
     result = {
         "owner_id": str(novel.get("owner_id") or ""),
+        "novel_scale": {key: novel.get(key) for key in ("number_of_chapters", "words_per_chapter")},
         **{
             key: int(material_counts.get(key) or 0)
             for key in (

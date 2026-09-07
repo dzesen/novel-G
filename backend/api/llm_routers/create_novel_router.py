@@ -12,6 +12,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from backend.novel_scale import ChapterCount, CreationIdea, WordsPerChapter
 
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
@@ -187,9 +188,9 @@ def _get_contiguous_cached_steps(cached_steps: AICreateCachedSteps | None) -> di
 
 
 class AICreateNovelRequest(GenerationParamsMixin):
-    user_idea: str
-    number_of_chapters: int = 100
-    words_per_chapter: int = Field(default=3000, ge=500, le=50000)
+    user_idea: CreationIdea
+    number_of_chapters: ChapterCount = 100
+    words_per_chapter: WordsPerChapter = 3000
     creative_direction: CreativeDirectionSelection | None = None
     cached_steps: AICreateCachedSteps | None = None
 

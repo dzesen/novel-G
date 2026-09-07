@@ -14,6 +14,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
+from backend.novel_scale import MIN_CHAPTERS, MAX_CHAPTERS
 
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -324,7 +325,7 @@ async def inspect_book_structure_initialization(
             structure=structure,
             target_chapter_count=target,
         )
-    if target <= 0:
+    if not MIN_CHAPTERS <= target <= MAX_CHAPTERS:
         return _base_snapshot(
             state="invalid_target",
             structure=structure,

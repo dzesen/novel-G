@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
+from backend.novel_scale import InvalidNovelScale, invalid_novel_scale_fields
 from backend.services.llm.workflow_runner import WorkflowStep
 
 
@@ -35,8 +36,11 @@ def _safe_novel_text(
 def volume_outline_params(novel: Mapping[str, Any]) -> dict[str, Any]:
     """Return the exact prompt parameters shared by preview and execution."""
 
+    if invalid_novel_scale_fields(novel):
+        raise InvalidNovelScale("请先在蓝图中修正规模参数：章数须为 1～10,000 的整数，每章字数须为 500～50,000 的整数。")
+    chapter_count = novel.get("number_of_chapters")
     return {
-        "number_of_chapters": int(novel.get("number_of_chapters") or 100),
+        "number_of_chapters": 100 if chapter_count is None else chapter_count,
         "title": _safe_novel_text(novel, "title"),
         "genre": _safe_novel_text(novel, "genre", "未分类"),
         "tone": _safe_novel_text(novel, "tone"),

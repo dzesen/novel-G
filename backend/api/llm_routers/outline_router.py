@@ -23,6 +23,7 @@ from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.repositories.novel_repository import novel_repo
 from backend.llm.config import get_llm_config
+from backend.novel_scale import InvalidNovelScale
 from backend.llm.prompts.prompt_selector import (
     VOLUME_OUTLINE_PROMPT_NAME,
     load_prompt_config,
@@ -125,7 +126,10 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
     except InvalidIdError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    params = volume_outline_params(novel)
+    try:
+        params = volume_outline_params(novel)
+    except InvalidNovelScale as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     async def event_stream() -> AsyncGenerator[str, None]:
         deps = WorkflowDeps(
