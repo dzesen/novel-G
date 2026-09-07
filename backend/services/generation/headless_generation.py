@@ -508,7 +508,7 @@ async def build_batch_prose_prompt_input_bounds(
         chapter_id = str(chapter.get("_id") or "")
         if not chapter_id:
             raise ValueError("readiness cannot measure a chapter without an id")
-        context_inputs = await fetch_context_inputs(novel_id, chapter_id)
+        context_inputs = await fetch_context_inputs(novel_id, chapter_id, purpose="prose")
         actual_outline = dict((context_inputs.get("chapter") or {}).get("outline") or {})
         if actual_outline:
             outline_for_context = actual_outline

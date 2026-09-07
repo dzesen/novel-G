@@ -15,7 +15,7 @@ import logging
 import math
 import unicodedata
 from time import perf_counter
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
@@ -1161,16 +1161,28 @@ def normalize_outline_references(raw_outline: dict | None) -> dict | None:
     return outline
 
 
-async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
+async def fetch_context_inputs(
+    novel_id: str,
+    chapter_id: str,
+    *,
+    purpose: Literal["complete", "outline", "prose"] = "complete",
+) -> dict:
     """取出装配上下文所需的全部数据。唯一碰数据库的一层，不含逻辑。
 
     Args:
         novel_id: 小说 ObjectId 字符串。
         chapter_id: 目标章节 ObjectId 字符串。
 
+    ``outline`` reads the full selectable catalog, while ``prose`` reads
+    declared card bodies and identities required by permanent-fact guards.
+    ``complete`` preserves the shared catalog needed by state acceptance and
+    legacy consumers. Neither timing nor read mode changes prompt authority.
+
     Returns:
         供 assemble_context 消费的普通 dict，形状见本模块文档。
     """
+    if purpose not in {"complete", "outline", "prose"}:
+        raise ValueError("context_read_purpose_invalid")
     started = perf_counter()
     novel = await novel_repo.get_novel_by_id(novel_id)
     from backend.services.generation.author_brief import novel_author_brief
@@ -1214,7 +1226,19 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     ]
 
     directory_loaded = perf_counter()
-    card_docs = await character_repo.list_cards(novel_id, "character")
+    # Stored outline references may be BSON IDs. Normalize before selecting any
+    # card body, retaining the same IDs for subsequent pure prompt assembly.
+    outline = normalize_outline_references(chapter.get("outline"))
+    declared = outline or {}
+    card_docs = (
+        await character_repo.list_cards(novel_id, "character")
+        if purpose == "complete"
+        else await character_repo.list_context_cards(
+            novel_id, "character", purpose=purpose,
+            declared_card_ids=declared.get("present_character_card_ids") or (),
+            mentioned_card_ids=declared.get("mentioned_character_card_ids") or (),
+        )
+    )
     cards = {
         str(card["_id"]): {
             "name": card.get("name", ""),
@@ -1229,7 +1253,15 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
 
     worldbook_cards: dict = {}
     for card_type in worldbook_repo.supported_types:
-        for card in await worldbook_repo.list_cards(novel_id, card_type):
+        world_docs = (
+            await worldbook_repo.list_cards(novel_id, card_type)
+            if purpose == "complete"
+            else await worldbook_repo.list_context_cards(
+                novel_id, card_type, purpose=purpose,
+                declared_card_ids=declared.get("referenced_worldbook_card_ids") or (),
+            )
+        )
+        for card in world_docs:
             worldbook_cards[str(card["_id"])] = {
                 "name": card.get("name", ""),
                 "description": card.get("description", ""),
@@ -1348,17 +1380,6 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         for t in thread_docs
     ]
 
-    # outline 子文档里的 id 字段是真实 BSON ObjectId（设计 §4.1），而
-    # assemble_context 拿它们去匹配上面已 str() 化的 cards/threads 主键——
-    # ObjectId 与 str 用 == 恒不相等，不转换的话 present_cards、
-    # threads_to_resolve（后者还是永不截断档）会静默地永远装不进内容。
-    # 阶段 2 之前没有代码会写 chapter.outline，所以这里必须兜住 None；
-    # 复制成新 dict 再改，不动 chapter 里读出来的原始子文档。
-    raw_outline = chapter.get("outline")
-    outline = normalize_outline_references(raw_outline)
-    # threads_planted also feeds the state-update roster. It must be normalized
-    # before prompt assembly so BSON ObjectId values never leak into matching.
-
     # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
     # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。
     # 形状由 build_roster 统一定义，accept 侧的 fetch_roster 用同一个函数。
@@ -1432,7 +1453,7 @@ async def build_context(
     Returns:
         装配好的 ChapterContext。
     """
-    return assemble_context(await fetch_context_inputs(novel_id, chapter_id), budget=budget)
+    return assemble_context(await fetch_context_inputs(novel_id, chapter_id, purpose="prose"), budget=budget)
 
 
 async def build_outline_context(
@@ -1441,4 +1462,4 @@ async def build_outline_context(
     budget: int = CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET,
 ) -> ChapterContext:
     """细纲模式的取数 + 装配组合入口。"""
-    return assemble_outline_context(await fetch_context_inputs(novel_id, chapter_id), budget=budget)
+    return assemble_outline_context(await fetch_context_inputs(novel_id, chapter_id, purpose="outline"), budget=budget)

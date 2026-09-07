@@ -71,7 +71,7 @@ async def _candidate(binding, entry, agent_run_id: str) -> RequiredReviewCandida
         expected_revision=entry.origin.request.source_revision + 1,
         allow_unverified_remediation=True, required_origin=entry.origin,
     )
-    context = assemble_context(await fetch_context_inputs(binding.novel_id, binding.chapter_id))
+    context = assemble_context(await fetch_context_inputs(binding.novel_id, binding.chapter_id, purpose="prose"))
     result = RequiredReviewCandidate.create(
         source_run_id=entry.origin.request.source_run_id, source_run_revision=int(run["revision"]),
         source_content_digest=chapter_content_digest(text), prose=text, outline=chapter["outline"],

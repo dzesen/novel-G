@@ -214,6 +214,7 @@ class AgentCapabilityApplication:
             inputs = await fetch_context_inputs(
                 request.novel_id,
                 request.chapter_id,
+                purpose="prose",
             )
             evidence = SceneRewriteContext(
                 chapter=chapter,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Sequence
 
 from bson import ObjectId
 from pymongo.asynchronous.client_session import AsyncClientSession
@@ -104,6 +104,68 @@ class ReferenceCardRepository(BaseRepository):
         cursor = self.collection.find(query, session=session).sort(
             [("sort_order", 1), ("updated_at", -1)]
         )
+        return await cursor.to_list(length=None)
+
+    async def list_context_cards(
+        self,
+        novel_id: str,
+        card_type: str,
+        *,
+        purpose: Literal["outline", "prose"],
+        declared_card_ids: Sequence[str] = (),
+        mentioned_card_ids: Sequence[str] = (),
+        session: AsyncClientSession | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Read a catalog or declared bodies through a database-side projection.
+
+        Prose also needs the names of mentioned and major characters for the
+        permanent-fact guard; only explicitly present characters have bodies.
+        Invalid, absent and external names cannot become internal ObjectIds.
+        """
+        self._validate_type(card_type)
+        if purpose not in {"outline", "prose"}:
+            raise ValueError("context_read_purpose_invalid")
+
+        def object_ids(values: Sequence[str]) -> list[ObjectId]:
+            return [
+                ObjectId(str(value)) for value in values
+                if isinstance(value, (str, ObjectId)) and ObjectId.is_valid(value)
+            ]
+
+        declared = object_ids(declared_card_ids)
+        query: dict[str, Any] = {
+            "novel_id": to_object_id(novel_id),
+            "card_type": card_type,
+            "is_deleted": False,
+        }
+        projection: dict[str, Any] = {
+            "name": 1, "importance": 1, "card_type": 1,
+            "sort_order": 1, "description": 1,
+        }
+        if purpose == "outline":
+            if card_type == "character":
+                projection["character_profile.aliases"] = 1
+            else:
+                for key in ("keys", "constant", "insertion_order", "regex_fields", "preview_notices"):
+                    projection[f"interop.display_metadata.{key}"] = 1
+        elif card_type == "character":
+            query["$or"] = [
+                {"_id": {"$in": declared + object_ids(mentioned_card_ids)}},
+                {"importance": "main"},
+            ]
+            for field in ("description", "details", "character_profile"):
+                projection[field] = {
+                    "$cond": [{"$in": ["$_id", declared]}, f"${field}", "$$REMOVE"],
+                }
+        else:
+            if not declared:
+                return []
+            query["_id"] = {"$in": declared}
+        cursor = await self.collection.aggregate([
+            {"$match": query},
+            {"$sort": {"sort_order": 1, "updated_at": -1}},
+            {"$project": projection},
+        ], session=session)
         return await cursor.to_list(length=None)
 
     async def get_card(

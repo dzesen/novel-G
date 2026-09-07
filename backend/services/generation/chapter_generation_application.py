@@ -769,7 +769,7 @@ class ChapterGenerationEvent(BaseModel):
 class ChapterGenerationApplicationDeps:
     novel_repo: Any
     chapter_repo: Any
-    fetch_context_inputs: Callable[[str, str], Awaitable[dict[str, Any]]]
+    fetch_context_inputs: Callable[..., Awaitable[dict[str, Any]]]
     assemble_outline_context: Callable[[dict[str, Any]], Any]
     create_runtime: Callable[..., Any]
     run_workflow: Callable[..., AsyncIterator[str]]
@@ -1189,6 +1189,7 @@ class ChapterGenerationApplicationService:
         inputs = await self._deps.fetch_context_inputs(
             command.novel_id,
             command.chapter_id,
+            purpose="outline",
         )
         context = self._deps.assemble_outline_context(inputs)
         roster = outline_selection_roster(
@@ -1774,6 +1775,7 @@ class ChapterGenerationApplicationService:
         inputs = await self._deps.fetch_context_inputs(
             command.novel_id,
             command.chapter_id,
+            purpose="prose",
         )
         context = self._deps.assemble_context(inputs)
         prompts = self._deps.load_prompts().get(
@@ -2146,6 +2148,7 @@ class ChapterGenerationApplicationService:
         inputs = await self._deps.fetch_context_inputs(
             command.novel_id,
             command.chapter_id,
+            purpose="prose",
         )
         context = self._deps.assemble_context(inputs)
         words_per_chapter = int(

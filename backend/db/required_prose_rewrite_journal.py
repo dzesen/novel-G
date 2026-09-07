@@ -480,7 +480,7 @@ class JobRequiredProseRewriteJournal:
 
         try:
             source, chapter = await _source(self.binding, request)
-            context = assemble_context(await fetch_context_inputs(self.binding.novel_id, self.binding.chapter_id))
+            context = assemble_context(await fetch_context_inputs(self.binding.novel_id, self.binding.chapter_id, purpose="prose"))
             candidate = RequiredReviewCandidate.create(
                 source_run_id=request.source_run_id, source_run_revision=request.source_revision,
                 source_content_digest=request.source_content_digest, prose=source["assembled_text"],

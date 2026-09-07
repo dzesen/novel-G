@@ -336,7 +336,7 @@ async def _prepare_prose_inputs(req: ProseRequest) -> _PreparedProseInputs:
     if not chapter.get("outline"):
         raise ValueError("本章还没有已接受的细纲，请先生成并接受章节细纲")
     context = assemble_context(
-        await fetch_context_inputs(req.novel_id, req.chapter_id)
+        await fetch_context_inputs(req.novel_id, req.chapter_id, purpose="prose")
     )
     words_per_chapter = int(
         (chapter.get("outline") or {}).get("target_word_count")
@@ -438,7 +438,7 @@ async def list_leftover_prose_runs(novel_id: str, request: Request):
 async def inspect_active_prose_run(chapter_id: str, request: Request):
     try:
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-        inputs = await fetch_context_inputs(str(chapter["novel_id"]), chapter_id)
+        inputs = await fetch_context_inputs(str(chapter["novel_id"]), chapter_id, purpose="prose")
         context = assemble_context(inputs)
         actor = getattr(request.state, "actor", None)
         if actor is None:
