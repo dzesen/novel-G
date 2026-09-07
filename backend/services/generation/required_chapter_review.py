@@ -121,6 +121,7 @@ class RequiredChapterReviewLoop:
         application: ChapterGenerationApplicationService | None = None,
         config_supplier=None,
         adapter_factory=None,
+        review_records=None,
     ):
         if (config_supplier is None) != (adapter_factory is None):
             raise ValueError("external generation dependencies must be supplied together")
@@ -129,6 +130,9 @@ class RequiredChapterReviewLoop:
         self.application = application or ChapterGenerationApplicationService()
         self._config_supplier = config_supplier
         self._adapter_factory = adapter_factory
+        from backend.services.generation.judge_review_records import judge_review_records
+
+        self._review_records = review_records if review_records is not None else (judge_review_records if config_supplier is None else None)
 
     def _runtime(self, scope):
         if self._config_supplier is None:
@@ -378,7 +382,12 @@ class RequiredChapterReviewLoop:
             journal.attempt_step_id,
             repo=generation_job_repo,
         )
-        reviewer = IndependentOutlineReviewer(self._runtime(review_scope))
+        recording = self._review_records.recording(
+            owner_id=self.binding.owner_id, novel_id=self.binding.novel_id,
+            chapter_id=self.binding.chapter_id, job_id=self.binding.job_id,
+            step_id=journal.attempt_step_id,
+        ) if self._review_records is not None else None
+        reviewer = IndependentOutlineReviewer(self._runtime(review_scope), recording=recording)
         checkpoint = await RequiredAdherenceHandoff(
             journal,
             reviewer,

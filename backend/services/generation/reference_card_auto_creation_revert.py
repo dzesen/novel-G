@@ -83,6 +83,10 @@ REFERENCE_DEPENDENCY_SCANNERS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "review_evidence",
+        (collections.JUDGE_REVIEW_RECORDS,),
+    ),
+    (
         "agent_basis",
         (
             collections.AGENT_RUNS,
@@ -416,6 +420,16 @@ class AutoReferenceCardRevertService:
                         ):
                             continue
                     document = raw_document
+                    if collection_name == collections.JUDGE_REVIEW_RECORDS:
+                        # Only the locally validated conclusion can preserve a
+                        # reference dependency. Untrusted response text and
+                        # protocol diagnostics cannot block a card mutation.
+                        document = (
+                            raw_document.get("evidence") or {}
+                            if raw_document.get("status")
+                            in {"pass", "findings", "needs_review"}
+                            else {}
+                        )
                     if (
                         collection_name == collections.GENERATION_JOBS
                         and document_id == source_job_id

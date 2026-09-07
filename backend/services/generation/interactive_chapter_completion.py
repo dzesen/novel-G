@@ -153,6 +153,7 @@ InteractiveCompletionFailureCode = Literal[
     "review_generation_failed",
     "review_dispatch_rejected",
     "review_result_missing_after_settlement",
+    "review_record_unavailable",
     "state_evidence_invalid",
     "state_generation_failed",
     "state_result_missing_after_settlement",
@@ -171,6 +172,7 @@ _STATE_FAILURE_CONTRACT: dict[str, tuple[FailureFactReason, str]] = {
 }
 
 _INDEPENDENT_REVIEW_FAILURE_CODES = frozenset({
+    "review_record_unavailable",
     "review_uncertain",
     "review_plan_stale",
     "review_not_natural_end",
@@ -186,6 +188,7 @@ _INDEPENDENT_REVIEW_FAILURE_FACTS: dict[
     InteractiveCompletionFailureCode,
     FailureFactReason,
 ] = {
+    "review_record_unavailable": "semantic_unknown",
     "review_uncertain": "paid_attempt_unresolved",
     "review_plan_stale": "authorization_binding_stale",
     "review_not_natural_end": "evidence_invalid",

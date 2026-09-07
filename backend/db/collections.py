@@ -33,6 +33,7 @@ AGENT_RUNTIME_EVENTS = "agent_runtime_events"
 # generation_jobs_deleted，勿沿用 generation_tasks 那条不规则的 tasks_deleted。
 GENERATION_JOBS = "generation_jobs"
 PROSE_RUNS = "prose_runs"
+JUDGE_REVIEW_RECORDS = "judge_review_records"
 BLUEPRINT_RUNS = "blueprint_runs"
 PROSE_REMEDIATION_RECEIPTS = "prose_remediation_receipts"
 STATE_CANDIDATE_REPAIR_RECEIPTS = "state_candidate_repair_receipts"
@@ -73,6 +74,7 @@ ACTIVE_COLLECTIONS = frozenset({
     AGENT_RUNTIME_EVENTS,
     GENERATION_JOBS,
     PROSE_RUNS,
+    JUDGE_REVIEW_RECORDS,
     BLUEPRINT_RUNS,
     PROSE_REMEDIATION_RECEIPTS,
     STATE_CANDIDATE_REPAIR_RECEIPTS,

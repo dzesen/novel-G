@@ -9,6 +9,7 @@ import {
 } from "react";
 import { useTranslations } from "next-intl";
 import ReviewValidationDetails from "./ReviewValidationDetails";
+import JudgeReviewRecords from "./JudgeReviewRecords";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
 import {
@@ -872,6 +873,7 @@ export default function ProsePanel({
               )}
             </section>
           )}
+          <JudgeReviewRecords key={chapterId} chapterId={chapterId} refreshKey={completionProgress?.stage_status === "failed" || completionProgress?.stage === "completed" ? `${completionProgress.authorization_id}:${completionProgress.stage_status}` : ""} />
           <div className="mb-4 grid gap-3">
             <ProseContinuationControls
               idPrefix="single-prose"

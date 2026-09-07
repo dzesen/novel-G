@@ -7,6 +7,7 @@ import { IconButton } from "@/components/ui/IconButton";
 import { useDismissableLayer } from "@/components/ui/useDismissableLayer";
 import type { ChapterDraft } from "@/types/novel";
 import type { ChapterWorkspaceLayoutControls } from "./ChapterWorkspaceLayout";
+import JudgeReviewRecords from "./prose/JudgeReviewRecords";
 
 export type ChapterSaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
@@ -363,6 +364,7 @@ export default function ChapterEditorPane({
 
       <div className="min-h-0 flex-1 overflow-y-auto bg-background/35">
         <div className="mx-auto flex min-h-full w-full max-w-[72ch] flex-col px-5 py-6 sm:px-8 sm:py-9">
+          <JudgeReviewRecords key={chapterId} chapterId={chapterId} />
           <textarea
             value={draft.content}
             onChange={(event) => onChange({ content: event.target.value })}

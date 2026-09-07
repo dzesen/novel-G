@@ -308,6 +308,9 @@ _INDEPENDENT_REVIEW_FAILURE_CONTRACT: dict[
         "confirmed",
         "独立审查生成调用失败",
     ),
+    "review_record_unavailable": (
+        "validation_logic", "confirmed", "审查记录保存失败，正文候选已保留",
+    ),
 }
 
 
@@ -792,6 +795,7 @@ class ChapterGenerationApplicationDeps:
     load_prompts: Callable[[], dict[str, Any]]
     accept_outline: Callable[[str, dict[str, Any]], Awaitable[Any]]
     log_partial_on_disconnect: bool = False
+    review_records: Any = None
     assemble_context: Callable[[dict[str, Any]], Any] = assemble_context
     get_legacy_service: Callable[[str, str], Any] = get_llm_service_for_step
     stream_prose: Callable[..., AsyncIterator[str]] = stream_prose
@@ -810,7 +814,10 @@ class ChapterGenerationApplicationDeps:
 
     @classmethod
     def production(cls) -> "ChapterGenerationApplicationDeps":
+        from backend.services.generation.judge_review_records import judge_review_records
+
         return cls(
+            review_records=judge_review_records,
             novel_repo=novel_repo,
             chapter_repo=chapter_repo,
             fetch_context_inputs=fetch_context_inputs,
@@ -1977,8 +1984,17 @@ class ChapterGenerationApplicationService:
         if prepared.independent_plan is not None:
             if prepared.independent_snapshot is None:
                 raise RuntimeError("独立审查缺少冻结的正文快照")
+            recording = None
+            if self._deps.review_records is not None:
+                novel = await self._deps.novel_repo.get_novel_by_id(prepared.command.novel_id)
+                scope = prepared.command.attempt_scope
+                recording = self._deps.review_records.recording(
+                    owner_id=novel.get("owner_id"), novel_id=prepared.command.novel_id,
+                    chapter_id=prepared.command.chapter_id,
+                    job_id=getattr(scope, "job_id", None), step_id=getattr(scope, "step_id", None),
+                )
             reviewed = await IndependentOutlineReviewer(
-                prepared.runtime
+                prepared.runtime, recording=recording,
             ).review(
                 prepared.independent_snapshot,
                 prepared.independent_plan,

@@ -1429,6 +1429,11 @@ async def init_all_indexes():
     await init_character_state_indexes()
     await init_generation_job_indexes()
     await init_prose_run_indexes()
+    await get_database()[collections.JUDGE_REVIEW_RECORDS].create_indexes([
+        pymongo.IndexModel([("owner_id", 1), ("chapter_id", 1), ("is_deleted", 1), ("_id", -1)], name="judge_chapter_history"),
+        pymongo.IndexModel([("novel_id", 1)], name="judge_novel_delete"),
+        pymongo.IndexModel([("job_id", 1)], name="judge_job_history"),
+    ])
     await init_blueprint_run_indexes()
     await init_prose_remediation_receipt_indexes()
     await init_state_candidate_repair_receipt_indexes()

@@ -55,6 +55,7 @@ from backend.services.generation.prose_readiness import (
     validate_prose_readiness,
 )
 from backend.services.generation.prose_run_attempt_scope import ProseRunAttemptScope
+from backend.services.generation.judge_review_records import judge_review_records
 from backend.services.generation.prose_runs import (
     prose_run_module,
     serialize_prose_run,
@@ -459,6 +460,30 @@ async def inspect_active_prose_run(chapter_id: str, request: Request):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (InvalidIdError, ContextBudgetError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/prose-runs/chapter/{chapter_id}/judge-reviews", dependencies=[Depends(require_owned_path_resource)])
+async def list_judge_review_records(chapter_id: str, request: Request, before: str | None = Query(default=None, max_length=24)):
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await judge_review_records.list_chapter(owner_id=str(actor.id), chapter_id=chapter_id, before=before)
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="审查记录分页标识无效") from exc
+
+
+@router.get("/prose-runs/chapter/{chapter_id}/judge-reviews/{record_id}", dependencies=[Depends(require_owned_path_resource)])
+async def inspect_judge_review_record(chapter_id: str, record_id: str, request: Request):
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await judge_review_records.detail(owner_id=str(actor.id), chapter_id=chapter_id, record_id=record_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail="审查记录不存在") from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="审查记录标识无效") from exc
 
 
 @router.post("/prose-runs/{run_id}/accept")

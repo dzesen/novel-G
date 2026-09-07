@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 from inspect import isawaitable
 import json
 import re
+from time import perf_counter
 from typing import Any, Callable, Literal, Mapping, Protocol, Union
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -613,6 +615,32 @@ class StructuredStreamProgress:
     provider_activity_count: int
     content_chunks: int
     content_bytes: int
+
+
+class StructuredResponseObservationError(RuntimeError):
+    """Durable response recording failed after the paid attempt settled."""
+
+
+@dataclass(frozen=True)
+class StructuredVisibleResponse:
+    """Visible adapter text only; never a raw Provider envelope or exception."""
+
+    phase: str
+    provider_alias: str
+    model: str | None
+    attempt_id: str | None
+    started_at: str
+    finished_at: str
+    duration_ms: int
+    visible_text: str
+    representation: str
+    truncated: bool
+    response_complete: bool
+    accounting_state: str
+    usage: dict[str, Any] | None
+    finish_reason: str
+    local_validation: str
+    validation_issues: dict[str, Any] | None
 
 
 def _positive_int(value: Any) -> int | None:
@@ -1340,6 +1368,7 @@ class GenerationRuntime:
         require_settled_attempts: bool = False,
         stream_json_output: bool = False,
         stream_progress: Callable[[StructuredStreamProgress], Any] | None = None,
+        structured_response_observer: Callable[[StructuredVisibleResponse], Any] | None = None,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         # Reject stale plans before even constructing an adapter.  Every
@@ -1351,6 +1380,8 @@ class GenerationRuntime:
             raise ValueError("structured streaming flag must be a boolean")
         if stream_progress is not None and not callable(stream_progress):
             raise ValueError("structured stream progress callback is invalid")
+        if structured_response_observer is not None and not callable(structured_response_observer):
+            raise ValueError("structured response observer is invalid")
         if (
             stream_json_output
             and plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
@@ -1420,6 +1451,98 @@ class GenerationRuntime:
         provider_activity_count = 0
         content_chunks = 0
         progress_observer_disabled = False
+        visible_parts: list[str] = []
+        visible_bytes = 0
+        visible_truncated = False
+        visible_cap = min(max_structured_raw_output_bytes or 65_536, 65_536)
+
+        def capture_visible(text: str) -> None:
+            nonlocal visible_bytes, visible_truncated
+            if structured_response_observer is None or visible_truncated:
+                return
+            encoded = text.encode("utf-8")
+            remaining = max(0, visible_cap - visible_bytes)
+            visible_truncated |= len(encoded) > remaining
+            clipped = encoded[:remaining].decode("utf-8", errors="ignore")
+            visible_parts.append(clipped)
+            visible_bytes += len(clipped.encode("utf-8"))
+
+        async def observed_paid_call(
+            current_plan, alias, phase, current_adapter, call, conservative_tokens,
+        ) -> Any:
+            nonlocal visible_bytes, visible_truncated
+            visible_parts.clear()
+            visible_bytes = 0
+            visible_truncated = False
+            offset = len(self.attempts)
+            claimed_before = set(getattr(self._attempt_scope, "claimed_attempt_ids", ()))
+            started = datetime.now(timezone.utc).isoformat()
+            start_clock = perf_counter()
+            dispatched = False
+            response_complete = False
+            representation = "visible_text"
+            error = None
+
+            async def tracked_call():
+                nonlocal dispatched, response_complete, representation
+                dispatched = True
+                output = await call()
+                response_complete = True
+                if not stream_json_output or phase == "reviewer":
+                    if isinstance(output, BaseModel):
+                        representation = "normalized_json"
+                        capture_visible(output.model_dump_json())
+                    else:
+                        capture_visible(str(output))
+                return output
+
+            try:
+                return await self._paid_call(
+                    current_plan, alias, phase, current_adapter, tracked_call, conservative_tokens,
+                )
+            except BaseException as exc:
+                error = exc
+                if isinstance(exc, LLMStructuredValidationError):
+                    response_complete = True
+                    capture_visible(str(exc.raw_output))
+                raise
+            finally:
+                # Outside _paid_call's accounting boundary: archive failures
+                # stop correction without changing settled billing evidence.
+                if structured_response_observer is not None and dispatched:
+                    attempts = self.attempts[offset:]
+                    attempt = attempts[-1] if attempts else None
+                    new_claims = set(getattr(self._attempt_scope, "claimed_attempt_ids", ())) - claimed_before
+                    local_validation = "not_checked"
+                    validation_issues = None
+                    if response_complete and not visible_truncated:
+                        try:
+                            _parse_structured_text("".join(visible_parts), schema)
+                            local_validation = "valid"
+                        except (ValidationError, ValueError) as validation_error:
+                            local_validation = "invalid"
+                            validation_issues = project_structured_validation_issues(validation_error, schema=schema)
+                    response = StructuredVisibleResponse(
+                        phase=phase, provider_alias=alias,
+                        model=plan.provider_model if alias == plan.provider_alias else None,
+                        attempt_id=attempt.attempt_id if attempt else (next(iter(new_claims)) if len(new_claims) == 1 else None),
+                        started_at=started, finished_at=datetime.now(timezone.utc).isoformat(),
+                        duration_ms=max(0, round((perf_counter() - start_clock) * 1000)),
+                        visible_text="".join(visible_parts), representation=representation,
+                        truncated=visible_truncated, response_complete=response_complete,
+                        accounting_state=attempt.state if attempt else "unsettled",
+                        usage=attempt.usage.model_dump() if attempt else None,
+                        finish_reason=normalize_finish_reason(getattr(current_adapter, "last_finish_reason", None)) if response_complete else "unreported",
+                        local_validation=local_validation, validation_issues=validation_issues,
+                    )
+                    try:
+                        observed = structured_response_observer(response)
+                        if isawaitable(observed):
+                            async with asyncio.timeout(5):
+                                await observed
+                    except Exception:
+                        if not isinstance(error, asyncio.CancelledError):
+                            raise StructuredResponseObservationError("visible response record unavailable") from None
 
         async def emit_stream_progress(
             *,
@@ -1490,6 +1613,7 @@ class GenerationRuntime:
                 ):
                     async for chunk in stream:
                         rendered = str(chunk)
+                        capture_visible(rendered)
                         next_bytes = response_bytes + len(
                             rendered.encode("utf-8")
                         )
@@ -1620,7 +1744,7 @@ class GenerationRuntime:
                 if plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
                 else prompts.prompt_json_prompt
             )
-            produced = await self._paid_call(
+            produced = await observed_paid_call(
                 plan, plan.provider_alias, "primary", adapter, primary_call,
                 bounded_reservation(
                     primary_prompt,
@@ -1648,7 +1772,7 @@ class GenerationRuntime:
                     **request_kwargs,
                 )
 
-            produced = await self._paid_call(
+            produced = await observed_paid_call(
                 plan,
                 plan.provider_alias,
                 "schema_fallback",
@@ -1699,7 +1823,7 @@ class GenerationRuntime:
                     **request_kwargs,
                 )
 
-            produced = await self._paid_call(
+            produced = await observed_paid_call(
                 plan,
                 plan.provider_alias,
                 STRUCTURED_BYTE_BUDGET_REGENERATION_PHASE,
@@ -1756,7 +1880,7 @@ class GenerationRuntime:
                     **request_kwargs,
                 )
 
-            repaired = await self._paid_call(
+            repaired = await observed_paid_call(
                 plan, plan.provider_alias, "repair", adapter, repair_call,
                 bounded_reservation(repair_prompt),
             )
@@ -1793,7 +1917,7 @@ class GenerationRuntime:
                         **reviewer_request_kwargs,
                     )
 
-                value = await self._paid_call(
+                value = await observed_paid_call(
                     plan, plan.reviewer_alias, "reviewer", reviewer, review_call,
                     bounded_reservation(
                         repair_prompt,

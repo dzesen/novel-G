@@ -6,11 +6,12 @@ candidate unlock, state mutation, or completion certificate.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from base64 import urlsafe_b64encode
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -42,6 +43,7 @@ from backend.services.llm.generation_runtime import (
     StructuredOutputMode,
     StructuredOutputByteBudgetExceeded,
     StructuredStreamProgress,
+    StructuredResponseObservationError,
     project_structured_validation_issues,
     safe_structured_repair_failure_diagnostics,
     safe_structured_validation_issues,
@@ -399,6 +401,7 @@ IndependentReviewFailureCode = Literal[
     "review_uncertain", "review_plan_stale", "review_not_natural_end",
     "review_evidence_invalid", "review_response_limit", "review_budget_exhausted",
     "review_accounting_invalid", "review_generation_failed", "review_dispatch_rejected",
+    "review_record_unavailable",
 ]
 
 
@@ -540,8 +543,9 @@ def _assess_anchored(
 
 
 class IndependentOutlineReviewer:
-    def __init__(self, runtime: GenerationRuntime) -> None:
+    def __init__(self, runtime: GenerationRuntime, *, recording=None) -> None:
         self._runtime = runtime
+        self._recording = recording
 
     def matches_plan(self, plan: IndependentReviewPlan) -> bool:
         """Local configuration check for both dispatch and no-call replay."""
@@ -551,6 +555,33 @@ class IndependentOutlineReviewer:
             return False
 
     async def review(
+        self,
+        snapshot: OutlineReviewSnapshot,
+        plan: IndependentReviewPlan,
+        *,
+        stream_progress: Callable[[StructuredStreamProgress], Any] | None = None,
+    ) -> IndependentReviewResult:
+        if self._recording is None:
+            return await self._review(snapshot, plan, stream_progress=stream_progress)
+        try:
+            await self._recording.begin(snapshot, plan)
+        except Exception:
+            return IndependentReviewResult(None, "review_record_unavailable", TokenUsage(), ())
+        try:
+            result = await self._review(snapshot, plan, stream_progress=stream_progress)
+        except BaseException as exc:
+            try:
+                await self._recording.finish(failure_code="review_cancelled" if isinstance(exc, asyncio.CancelledError) else "review_internal_error")
+            except Exception:
+                pass  # Preserve cancellation/programming errors; prior rounds survive.
+            raise
+        try:
+            await self._recording.finish(result)
+        except Exception:
+            return replace(result, evidence=None, failure_code="review_record_unavailable")
+        return result
+
+    async def _review(
         self,
         snapshot: OutlineReviewSnapshot,
         plan: IndependentReviewPlan,
@@ -606,6 +637,7 @@ class IndependentOutlineReviewer:
                 require_settled_attempts=True,
                 stream_json_output=True,
                 stream_progress=stream_progress,
+                **({"structured_response_observer": self._recording.observe} if self._recording is not None else {}),
             )
             if not self.matches_plan(plan):
                 return IndependentReviewResult(
@@ -626,6 +658,8 @@ class IndependentOutlineReviewer:
                 failure = "review_uncertain"
             elif isinstance(exc, UnsettledGenerationAttempts):
                 failure = "review_accounting_invalid"
+            elif isinstance(exc, StructuredResponseObservationError):
+                failure = "review_record_unavailable"
             elif isinstance(exc, StaleGenerationPlan):
                 failure = "review_plan_stale"
             elif isinstance(exc, StructuredOutputByteBudgetExceeded):
@@ -639,7 +673,7 @@ class IndependentOutlineReviewer:
                     if isinstance(exc, LLMStructuredRepairError)
                     else project_structured_validation_issues(exc, schema=schema)
                 )
-            elif isinstance(exc, LLMError):
+            elif isinstance(exc, (LLMError, TimeoutError)):
                 failure = "review_generation_failed"
             elif getattr(exc, "provider_request_not_dispatched", False) is True:
                 failure = "review_dispatch_rejected"
