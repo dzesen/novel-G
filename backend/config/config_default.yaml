@@ -152,8 +152,9 @@ llm:
       supports_stream_usage: false
     # 独立证据审查候选。默认关闭、无密钥、不会自动接管任何工作流；
     # 启用后仍须单独生成并授权 capability probe readiness。
-    # K2.6 Judge successor 默认启用思考并使用官方默认的 32k 完成上限；
-    # 审查通过流式传输收集，私有思考正文不进入业务输出或持久化证据。
+    # 常规完成审查使用非思考模式与 8k 输出容量，避免沿用长推理预算。
+    # 一分钟是待实测的延迟目标；截断或无效证据仍失败，不能据此放行。
+    # 切换已有 Judge 配置需要重新预检；旧作业保持其冻结的模式与预算。
     # 不要配置 temperature / top_p / penalty。
     kimi_judge:
       type: openai
@@ -167,11 +168,11 @@ llm:
       use_system_proxy: false
       supports_streaming: true
       structured_output: json_object
-      thinking_mode: enabled
+      thinking_mode: disabled
       max_context_tokens: 256000
       supports_function_calling: false
       supports_stream_usage: false
-      max_tokens: 32768
+      max_tokens: 8192
     gemini_flash:
       type: gemini
       base_url: ""

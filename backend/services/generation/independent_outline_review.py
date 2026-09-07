@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from base64 import urlsafe_b64encode
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -46,9 +47,11 @@ from backend.services.llm.generation_runtime import (
 )
 
 
-ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v3"
-REVIEW_PROTOCOL = "independent_outline_review.v3"
-ANCHOR_WIDTH = 512
+ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v5"
+REVIEW_PROTOCOL = "independent_outline_review.v6"
+ANCHOR_WIDTH = 120
+ANCHOR_BREAKS = frozenset("。！？!?；;\n")
+ANCHOR_CLOSERS = frozenset("”’\"」』）)\n\r")
 MAX_QUOTE_LENGTH = 500
 MAX_PROSE_CODEPOINTS = 100_000
 REVIEW_TASK = (
@@ -56,10 +59,24 @@ REVIEW_TASK = (
     "按章纲顺序覆盖所有 beat，检查必要事件、进入与结束状态、禁止条件及重复规则。"
     "本次只审查完成证据，不生成质量画像或质量维度报告；quality_dimensions 保持空数组。"
     "每个锚点都绑定唯一 scene_id；beat 证据只能引用同场锚点。"
-    "引用须逐字复制，返回锚点 ID 和 quote，不计算字符位置。"
+    "引用默认只返回 anchor_id，服务器把该片段原文还原为精确引文；不要抄写或概述原文。"
     "锚点按原文顺序排列，文本不重叠；依次拼接同场锚点就是该场完整原文。"
-    "引文可跨相邻同场锚点，anchor_id 必须指向引文首字所在锚点，quote 最多 500 字符。"
-    "同一锚点内起点范围中必须唯一匹配；有歧义时使用更完整的原文引文。"
+    "需要连续多个片段时加 through_anchor_id，表示到该片段末尾的完整连续原文；必须同场、正序且总长最多 500 字符。"
+    "例如 spans=[{\"anchor_id\":\"输入中的实际片段ID\"}]；不要输出示例占位符，不计算字符位置。"
+    "选择足以证明具体状态变化的最小片段或范围，不能因为附近提到人物或事件就标为 satisfied。"
+    "仅在必须精确裁剪片段内部时提供可选 quote，须为连续逐字原文，不能加省略号、改字或拼接；此时省略 through_anchor_id。"
+    "可选 quote 最多 500 字符，首字须位于 anchor_id 的片段内，同场跨片段引用仍须唯一匹配。"
+    "保持输出简洁：summary 用一句话，每项 explanation 只写支撑判断的具体变化，通常不超过 30 字。"
+    "不复述整段情节，不重复解释同一结论，不省略必要 beat、实际偏离或语义不确定。"
+    "findings 是偏离问题清单，只收录确实违反章纲或无法确定是否违反的事项；正常兑现只在 beat_evidence 中记录。"
+    "没有问题时 findings=[]，不要为每个检查类别填写一条正常观察。"
+    "finding.status=violation 表示确实观察到偏离，不表示观察到了正常事件；无法确定时使用 unknown。"
+    "例如顺序正确、冲突已兑现、悬念成立、未触犯禁止条件、事件仅发生一次且未重复，都不得写成 finding。"
+    "字段组合规则：satisfied、mentioned、contradicted 的 beat 必须有 spans；missing 的 spans 必须为空。"
+    "finding 的 status=violation 必须至少有一处证明偏离的原文 spans；无法提供证据时保留 unknown，不编造引文。"
+    "forbidden_condition 必须给出 scene_id 和该场章纲已有的非空 condition_ids，event_key 留空。"
+    "event_repetition 必须给出 scene_id 和章纲已有的 event_key，condition_ids 保持空数组。"
+    "其余 finding 类别不得携带 condition_ids 或 event_key；可省略这两个无关字段。"
     "修正只限格式或证据定位；有效的语义问题不得改成通过。"
 )
 _EVIDENCE_SPAN_FIELDS = (
@@ -105,8 +122,36 @@ def _digest(value: str) -> str:
 class AnchoredProseSpan(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    anchor_id: str = Field(pattern=r"^[0-9a-f]{64}:[0-9]{1,3}$")
-    quote: str = Field(min_length=1, max_length=MAX_QUOTE_LENGTH)
+    anchor_id: str = Field(pattern=r"^[A-Za-z0-9_-]{22}:[0-9]{1,6}$")
+    through_anchor_id: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9_-]{22}:[0-9]{1,6}$",
+        description="仅跨连续片段时填写末片段 ID；通常省略。",
+    )
+    quote: str | None = Field(
+        default=None, min_length=1, max_length=MAX_QUOTE_LENGTH,
+        description="通常省略。仅精确裁剪片段内部时逐字复制原文，禁止省略或拼接。",
+    )
+
+    @model_validator(mode="after")
+    def validate_reference_mode(self) -> "AnchoredProseSpan":
+        if self.quote is not None and self.through_anchor_id is not None:
+            raise ValueError("quote and through_anchor_id are mutually exclusive")
+        return self
+
+
+class AnchoredContractFinding(OutlineContractFindingV3Schema):
+    """Transport names an actual deviation; local policy keeps its V5 vocabulary."""
+
+    status: Literal["violation", "unknown"] = Field(
+        description="violation=确实违反章纲；unknown=无法判定是否违反。正常兑现不进入 findings。",
+    )
+    spans: list[AnchoredProseSpan] = deepcopy(OutlineContractFindingV3Schema.model_fields["spans"])
+
+    @model_validator(mode="after")
+    def validate_violation_evidence(self) -> "AnchoredContractFinding":
+        if self.status == "violation" and not self.spans:
+            raise ValueError("a violation finding requires at least one evidence span")
+        return self
 
 
 def _anchor_transport_schema() -> type[BaseModel]:
@@ -114,25 +159,25 @@ def _anchor_transport_schema() -> type[BaseModel]:
     # transport of spans. Copy FieldInfo so its min/max/defaults cannot drift.
     replacements = {}
     for field, base, span_field in _EVIDENCE_SPAN_FIELDS:
-        anchored_item = create_model(
+        anchored_item = AnchoredContractFinding if field == "findings" else create_model(
             f"Anchored{base.__name__}",
             __base__=base,
             **{span_field: (list[AnchoredProseSpan], deepcopy(base.model_fields[span_field]))},
         )
-        replacements[field] = (
-            list[anchored_item],
-            deepcopy(ChapterOutlineAdherenceEvidenceV5Schema.model_fields[field]),
-        )
+        field_info = deepcopy(ChapterOutlineAdherenceEvidenceV5Schema.model_fields[field])
+        if field == "findings":
+            field_info.description = "只列实际偏离或语义不确定；正常完成不得写入，无问题时为空数组。"
+        replacements[field] = (list[anchored_item], field_info)
     return create_model(
-        "AnchoredOutlineAdherenceEvidenceV2",
+        "AnchoredOutlineAdherenceEvidenceV5",
         __base__=ChapterOutlineAdherenceEvidenceV5Schema,
-        schema_version=(Literal["anchored_outline_adherence_evidence.v2"], Field()),
+        schema_version=(Literal["anchored_outline_adherence_evidence.v5"], Field()),
         view_digest=(str, Field(pattern=r"^[0-9a-f]{64}$")),
         **replacements,
     )
 
 
-AnchoredOutlineAdherenceEvidenceV2 = _anchor_transport_schema()
+AnchoredOutlineAdherenceEvidenceV5 = _anchor_transport_schema()
 
 
 @dataclass(frozen=True)
@@ -274,7 +319,7 @@ class IndependentReviewPlan:
     writer_model: str
     input_token_bound: int
     max_response_bytes: int
-    protocol: Literal["independent_outline_review.v3"] = REVIEW_PROTOCOL
+    protocol: Literal["independent_outline_review.v6"] = REVIEW_PROTOCOL
 
     def __post_init__(self) -> None:
         if (
@@ -333,11 +378,13 @@ def independent_review_semantic_protocol_digest() -> str:
         "protocol": REVIEW_PROTOCOL,
         "anchor_protocol": ANCHOR_PROTOCOL,
         "anchor_width": ANCHOR_WIDTH,
+        "anchor_breaks": sorted(ANCHOR_BREAKS),
+        "anchor_closers": sorted(ANCHOR_CLOSERS),
         "max_quote_length": MAX_QUOTE_LENGTH,
         "max_prose_codepoints": MAX_PROSE_CODEPOINTS,
         "task": REVIEW_TASK,
         "system_prompt": OUTLINE_ADHERENCE_SYSTEM_PROMPT,
-        "schema": AnchoredOutlineAdherenceEvidenceV2.model_json_schema(),
+        "schema": AnchoredOutlineAdherenceEvidenceV5.model_json_schema(),
         "structured_correction_revision": STRUCTURED_REPAIR_PROMPT_REVISION,
         "embedded_schema_correction_revision": EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
         "require_settled_attempts": True,
@@ -370,21 +417,34 @@ class _ProseAnchor:
 def _anchors(snapshot: OutlineReviewSnapshot) -> dict[str, _ProseAnchor]:
     result = {}
     ordinal = 0
+    # A short source tag avoids echoing the full SHA-256 for every quote.
+    # The complete view digest remains mandatory and is checked separately;
+    # this 128-bit tag is a locator, never the source's authorization identity.
+    view_tag = urlsafe_b64encode(bytes.fromhex(snapshot.view_digest)[:16]).decode("ascii").rstrip("=")
     for scene_range in snapshot.scene_ranges:
-        for start in range(scene_range.start, scene_range.end, ANCHOR_WIDTH):
-            primary_end = min(start + ANCHOR_WIDTH, scene_range.end)
+        start = scene_range.start
+        while start < scene_range.end:
+            limit = min(start + ANCHOR_WIDTH, scene_range.end)
+            primary_end = limit
+            for index in range(start, limit):
+                if snapshot.prose[index] in ANCHOR_BREAKS and snapshot.prose[start:index + 1].strip():
+                    primary_end = index + 1
+                    while primary_end < limit and snapshot.prose[primary_end] in ANCHOR_CLOSERS:
+                        primary_end += 1
+                    break
             # Quotes may overlap anchor chunks, but never cross a semantic
             # scene boundary. That boundary is part of the signed view.
             text = snapshot.prose[
                 start:min(primary_end + MAX_QUOTE_LENGTH - 1, scene_range.end)
             ]
-            result[f"{snapshot.view_digest}:{ordinal}"] = _ProseAnchor(
+            result[f"{view_tag}:{ordinal}"] = _ProseAnchor(
                 scene_id=scene_range.scene_id,
                 start=start,
                 primary_end=primary_end,
                 text=text,
             )
             ordinal += 1
+            start = primary_end
     return result
 
 
@@ -399,11 +459,15 @@ def _assess_anchored(
     payload["schema_version"] = "chapter_outline_adherence_evidence.v5"
     for field, _base, span_field in _EVIDENCE_SPAN_FIELDS:
         for item_index, item in enumerate(payload[field]):
+            if field == "findings" and item["status"] == "violation":
+                # A typed transport conversion, never inference from prose or
+                # explanation text. Unknown remains unknown under local policy.
+                item["status"] = "observed"
             located = []
             for span_index, span in enumerate(item[span_field]):
                 def invalid_quote(code: str) -> ValidationError:
                     return ValidationError.from_exception_data(
-                        "AnchoredOutlineAdherenceEvidenceV2",
+                        "AnchoredOutlineAdherenceEvidenceV5",
                         [{
                             "type": PydanticCustomError(code, "exact quote location failed"),
                             "loc": (field, item_index, span_field, span_index),
@@ -418,6 +482,23 @@ def _assess_anchored(
                     and anchor.scene_id != item.get("scene_id")
                 ):
                     raise invalid_quote("review_quote_scene_mismatch")
+                if span["quote"] is None:
+                    ending = anchors.get(span["through_anchor_id"] or span["anchor_id"])
+                    if ending is None:
+                        raise invalid_quote("review_anchor_unknown")
+                    if ending.scene_id != anchor.scene_id:
+                        raise invalid_quote("review_quote_scene_mismatch")
+                    if ending.start < anchor.start:
+                        raise invalid_quote("review_anchor_range_reversed")
+                    if ending.primary_end - anchor.start > MAX_QUOTE_LENGTH:
+                        raise invalid_quote("review_anchor_range_too_long")
+                    # Materialize only the selected, immutable original range.
+                    # No search, normalization, omitted text or model-written quote.
+                    located.append({
+                        "start": anchor.start, "end": ending.primary_end,
+                        "quote": snapshot.prose[anchor.start:ending.primary_end],
+                    })
+                    continue
                 start, primary_end, text = (
                     anchor.start, anchor.primary_end, anchor.text
                 )
@@ -473,7 +554,7 @@ class IndependentOutlineReviewer:
 
         schema = create_model(
             "SnapshotBoundIndependentReview",
-            __base__=AnchoredOutlineAdherenceEvidenceV2,
+            __base__=AnchoredOutlineAdherenceEvidenceV5,
             __validators__={"validate_current_evidence": model_validator(mode="after")(validate_current_evidence)},
         )
         prompt = _json({

@@ -977,9 +977,9 @@ class GenerationRuntime:
                 and target.step_name == "outline_adherence"
             ):
                 # Freeze the execution contract as well as Provider settings:
-                # old interactive readiness cannot dispatch the lean review.
+                # old interactive readiness cannot dispatch a new review protocol.
                 payload["adherence_execution_contract"] = {
-                    "review_protocol": "independent_outline_review.v3",
+                    "review_protocol": "independent_outline_review.v6",
                     "evidence_version": "chapter_outline_adherence_evidence.v5",
                     "embedded_schema_correction": EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
                 }
