@@ -9,6 +9,7 @@ from typing import Any
 
 from backend.db.repositories.chapter_repository import chapter_repo
 from backend.db.utils import to_object_id
+from backend.services.generation.author_brief import AuthorConstraints
 from backend.services.interop.card_import_proposal_service import (
     card_import_proposal_service,
 )
@@ -347,6 +348,7 @@ class AgentCapabilityApplication:
             schema=CreativeDirectionResult,
             prompts=creative_direction_prompt_plan(
                 user_idea=request.user_idea,
+                author_constraints=request.author_constraints,
                 number_of_chapters=request.number_of_chapters,
                 words_per_chapter=request.words_per_chapter,
                 instruction=request.instruction,
@@ -853,11 +855,15 @@ def creative_direction_prompt_plan(
     instruction: str,
     direction_count: int,
     card_context: str,
+    author_constraints: AuthorConstraints | None = None,
 ) -> PromptPlan:
     """Build the exact production prompt pair for card-driven direction work."""
 
     values = {
-        "user_idea": user_idea,
+        "user_idea": user_idea + (
+            "\n\n【作者明确的创作要求】\n" + author_constraints.model_dump_json()
+            if author_constraints and any(author_constraints.model_dump().values()) else ""
+        ),
         "number_of_chapters": number_of_chapters,
         "words_per_chapter": words_per_chapter,
         "instruction": instruction,

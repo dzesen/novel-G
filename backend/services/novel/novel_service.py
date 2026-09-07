@@ -21,6 +21,9 @@ class NovelService:
             "tone",
             "era_background",
             "style_controls",
+            "author_input",
+            "number_of_chapters",
+            "words_per_chapter",
         }
     )
 

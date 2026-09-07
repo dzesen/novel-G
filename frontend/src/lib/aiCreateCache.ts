@@ -1,6 +1,7 @@
 import type { AICreateCachedSteps, AICreateStepKey } from "@/types/novel";
 import type { CreativeDirectionSelection } from "@/types/agent";
 import { buildUserStorageKey } from "@/lib/userStorage";
+import { normalizeAuthorConstraints } from "@/lib/authorInput";
 import {
   isSameAICreateInput,
   type AICreateCacheInput,
@@ -112,6 +113,8 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   }
 
   const userIdea = value.user_idea;
+  const constraints = normalizeAuthorConstraints(value.author_constraints);
+  if (constraints === null) return null;
   const chapters = value.number_of_chapters;
   const wordsPerChapter = value.words_per_chapter;
   if (!isString(userIdea) || typeof chapters !== "number" || typeof wordsPerChapter !== "number") {
@@ -162,6 +165,7 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
     words_per_chapter: wordsPerChapter,
     creative_direction: normalizedCreativeDirection,
     card_imports: cardImports,
+    ...(value.author_constraints !== undefined && { author_constraints: constraints }),
   };
 }
 

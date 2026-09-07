@@ -1,4 +1,17 @@
 {
+  "authorInput": {
+    "title": "Creative requirements",
+    "optionalTitle": "Add creative requirements (optional)",
+    "description": "The original idea and these requirements are used directly in later planning. After you save changes, future generation uses the new version.",
+    "originalIdea": "Original idea",
+    "confirmedDirection": "Confirmed direction and requirements",
+    "must_keep": "Must keep",
+    "do_not_change": "Do not change",
+    "style_boundaries": "Style boundaries",
+    "constraintsHint": "One requirement per line, up to 20 per category and 500 characters per requirement. All are optional.",
+    "constraintsInvalid": "Use up to 20 requirements per category, with no more than 500 characters each.",
+    "none": "No additional requirement"
+  },
   "streamErrors": {
     "interrupted": "The connection ended before the full result arrived. Received content is retained; check the draft or run record before resuming.",
     "invalidEvent": "The generation response was incomplete or invalid, so completion could not be confirmed. Check the retained draft or run record."

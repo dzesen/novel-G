@@ -4,6 +4,7 @@ import type {
   CardImportCreationSelection,
   WritingDraft,
 } from "@/types/novel";
+import { normalizeAuthorConstraints } from "./authorInput.ts";
 
 export const WRITING_DRAFT_SCHEMA_VERSION = 1 as const;
 
@@ -42,6 +43,8 @@ export function createGeneratedWritingDraft({
 }: GeneratedDraftOptions): WritingDraft {
   const meta = result.novel_meta;
   const plot = result.expand_idea?.plot ?? result.extract_idea.plot ?? "";
+  const constraints = normalizeAuthorConstraints(generationSource.author_constraints);
+  if (constraints === null) throw new Error("Invalid author constraints");
 
   return {
     _fromAI: true,
@@ -65,6 +68,11 @@ export function createGeneratedWritingDraft({
     number_of_chapters: generationSource.number_of_chapters,
     words_per_chapter: generationSource.words_per_chapter,
     creation_mode: "ai",
+    author_input: {
+      original_idea: generationSource.user_idea,
+      creative_direction: generationSource.creative_direction,
+      constraints,
+    },
     _generationSource: generationSource,
     ...(generationSource.creative_direction && {
       creative_direction: generationSource.creative_direction,

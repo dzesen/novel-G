@@ -19,6 +19,8 @@ import {
   isPermanentCardAvatarTransferFailure,
 } from "@/lib/cardAvatarTransfer";
 import { createBlankWritingDraft } from "@/lib/novelCreationDraft";
+import { normalizeAuthorConstraints } from "@/lib/authorInput";
+import { reportFormValidity } from "@/lib/formValidity";
 import { applyRegeneratedBlueprint } from "@/lib/blueprintGeneration";
 import type {
   AICreateResponse,
@@ -53,6 +55,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
   const locale = pathname.startsWith("/en") ? "en" : "zh";
   const draftId = searchParams.get("draft") || undefined;
   const didLoadDraftRef = useRef(false);
+  const sectionsRef = useRef<HTMLDivElement>(null);
 
   /* state */
   const [data, setData] = useState<Record<string, unknown>>({});
@@ -137,11 +140,18 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
 
   /* create novel */
   const handleCreate = async () => {
+    for (const form of sectionsRef.current?.querySelectorAll("form") ?? []) {
+      if (!reportFormValidity(form)) return;
+    }
     let createdNovelId: string | null = null;
     try {
       setCreating(true);
       const sourceDraft = data as Partial<WritingDraft>;
       const payload: CreateNovelRequest = {
+        author_input: sourceDraft.author_input ? {
+          ...sourceDraft.author_input,
+          constraints: normalizeAuthorConstraints(sourceDraft.author_input.constraints) ?? sourceDraft.author_input.constraints,
+        } : undefined,
         title: String(data.title || "").trim(),
         subtitle: data.subtitle ? String(data.subtitle) : undefined,
         genre: data.genre ? String(data.genre) : undefined,
@@ -372,7 +382,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
       </div>
 
       {/* Sections */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+      <div ref={sectionsRef} className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
         {SECTIONS.map((sk) => (
             <NovelInfoSection
               key={sk}

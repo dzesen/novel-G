@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.llm.models import TokenUsage
 from backend.novel_scale import ChapterCount, WordsPerChapter
+from backend.services.generation.author_brief import AuthorConstraints
 from backend.services.interop.card_import_proposal_service import (
     DIRECTION_CONTEXT_MAX_PROPOSALS,
 )
@@ -57,6 +58,7 @@ class CreativeDirectorRequest(GenerationParamsMixin):
     model_config = ConfigDict(extra="forbid")
 
     user_idea: str = Field(default="", max_length=8000)
+    author_constraints: AuthorConstraints = Field(default_factory=AuthorConstraints)
     number_of_chapters: ChapterCount = 100
     words_per_chapter: WordsPerChapter = 3000
     agent_id: str = Field(min_length=1, max_length=120)

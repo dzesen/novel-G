@@ -1,4 +1,5 @@
 import type { CreativeDirectionSelection } from "@/types/agent";
+import { normalizeAuthorConstraints } from "./authorInput.ts";
 import type {
   AICreateRequest,
   AICreateResponse,
@@ -121,6 +122,8 @@ export function normalizeBlueprintGenerationSource(
     value.creative_direction,
   );
   const cardImports = normalizeCardImports(value.card_imports);
+  const constraints = normalizeAuthorConstraints(value.author_constraints);
+  if (constraints === null) return null;
   if (creativeDirection === undefined || cardImports === null) return null;
   return {
     schema_version: "blueprint_generation_source.v1",
@@ -129,6 +132,7 @@ export function normalizeBlueprintGenerationSource(
     words_per_chapter: value.words_per_chapter,
     creative_direction: creativeDirection,
     card_imports: cardImports,
+    ...(value.author_constraints !== undefined && { author_constraints: constraints }),
   };
 }
 
@@ -157,7 +161,7 @@ export function inspectBlueprintRegeneration(
       blocked_code: "blueprint_regeneration_not_available",
     };
   }
-  const source = normalizeBlueprintGenerationSource(
+  let source = normalizeBlueprintGenerationSource(
     draft._generationSource,
   );
   if (!source) {
@@ -166,6 +170,22 @@ export function inspectBlueprintRegeneration(
       source: null,
       blocked_code: "blueprint_source_binding_stale",
     };
+  }
+  // Explicitly edited requirements are authoritative input for a new preview.
+  // Generated summary/plot edits never reconstruct or replace that input.
+  if (draft.author_input) {
+    const updated = normalizeBlueprintGenerationSource({
+      ...source,
+      user_idea: draft.author_input.original_idea,
+      creative_direction: draft.author_input.creative_direction,
+      author_constraints: draft.author_input.constraints,
+      number_of_chapters: draft.number_of_chapters ?? source.number_of_chapters,
+      words_per_chapter: draft.words_per_chapter ?? source.words_per_chapter,
+    });
+    if (!updated || draft.author_input.original_idea.length > 8000 || JSON.stringify(draft.author_input).length > 24000) {
+      return { allowed: false, source: null, blocked_code: "blueprint_source_binding_stale" };
+    }
+    source = updated;
   }
   if (draft._creationOrigin === "tavern_cards") {
     const expected = source.card_imports.map(({ proposal_id, digest }) => ({
@@ -189,7 +209,7 @@ export function inspectBlueprintRegeneration(
   return { allowed: true, source, blocked_code: null };
 }
 
-/** 整版重跑不携带旧步骤缓存，也不从当前编辑后的字段反推输入。 */
+/** 整版重跑使用明确的创作输入，不携带旧步骤或从派生剧情反推约束。 */
 export function buildBlueprintRegenerationRequest(
   source: BlueprintGenerationSource,
 ): AICreateRequest {
@@ -197,6 +217,7 @@ export function buildBlueprintRegenerationRequest(
     user_idea: source.user_idea,
     number_of_chapters: source.number_of_chapters,
     words_per_chapter: source.words_per_chapter,
+    ...(source.author_constraints && { author_constraints: source.author_constraints }),
     ...(source.creative_direction && {
       creative_direction: source.creative_direction,
     }),

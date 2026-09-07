@@ -1,6 +1,18 @@
 import type { StoredChapterOutline } from "@/components/writing/chapters/outline/outlineTypes";
 import type { CreativeDirectionSelection } from "@/types/agent";
 
+export interface AuthorConstraints {
+  must_keep: string[];
+  do_not_change: string[];
+  style_boundaries: string[];
+}
+
+export interface AuthorInput {
+  original_idea: string;
+  creative_direction: CreativeDirectionSelection | null;
+  constraints: AuthorConstraints;
+}
+
 export interface StyleControls {
   narrative_person?: "first" | "third";
   narrative_distance?: "close" | "medium" | "omniscient";
@@ -29,6 +41,7 @@ export interface NovelSummary {
 }
 
 export interface NovelDetail extends NovelSummary {
+  author_input?: AuthorInput | null;
   introduction?: string;
   summary?: string;
   core_seed?: string;
@@ -50,6 +63,7 @@ export interface NovelDetail extends NovelSummary {
 }
 
 export interface CreateNovelRequest {
+  author_input?: AuthorInput | null;
   title: string;
   subtitle?: string;
   genre?: string;
@@ -583,6 +597,7 @@ export interface BulkCreateCoreFactionsResponse {
 }
 
 export interface AICreateRequest {
+  author_constraints?: AuthorConstraints;
   user_idea: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
@@ -641,6 +656,7 @@ export type AICreateCachedSteps = Partial<{
 
 /** 冻结整份蓝图重新生成所需的原始来源；不得从作者后续编辑反推。 */
 export interface BlueprintGenerationSource {
+  author_constraints?: AuthorConstraints;
   schema_version: "blueprint_generation_source.v1";
   user_idea: string;
   number_of_chapters: number;

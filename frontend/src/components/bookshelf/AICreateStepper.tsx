@@ -5,6 +5,9 @@ import { useTranslations } from "next-intl";
 import { Button, Switch } from "@heroui/react";
 import { apiGet, apiPost, apiPostSSE, SSEError } from "@/lib/api";
 import { blueprintGenerationStream } from "@/lib/generationStreamContracts";
+import { normalizeAuthorConstraints } from "@/lib/authorInput";
+import { reportFormValidity } from "@/lib/formValidity";
+import AuthorConstraintsFields from "@/components/shared/AuthorConstraintsFields";
 import {
   MAX_CHAPTERS,
   MIN_CHAPTERS,
@@ -31,6 +34,7 @@ import type {
   AICreateRequest,
   AICreateResponse,
   AICreateStepKey,
+  AuthorConstraints,
   BlueprintGenerationSource,
   CardImportDirectionReference,
 } from "@/types/novel";
@@ -118,6 +122,7 @@ export default function AICreateStepper({
 }: AICreateStepperProps) {
   const t = useTranslations("create");
   const tStream = useTranslations("streamErrors");
+  const tAuthor = useTranslations("authorInput");
   const [initialCache] = useState(() =>
     cardImports.length > 0 ? null : loadAICreateCache(),
   );
@@ -126,6 +131,9 @@ export default function AICreateStepper({
     initialCache?.input.creative_direction ?? null;
   const [idea, setIdea] = useState(
     initialCache?.input.user_idea ?? initialIdea,
+  );
+  const [authorConstraints, setAuthorConstraints] = useState<AuthorConstraints>(
+    initialCache?.input.author_constraints ?? { must_keep: [], do_not_change: [], style_boundaries: [] },
   );
   const [chapters, setChapters] = useState(initialCache?.input.number_of_chapters ?? 600);
   const [wordsPerChapter, setWordsPerChapter] = useState(initialCache?.input.words_per_chapter ?? 3000);
@@ -231,6 +239,7 @@ export default function AICreateStepper({
     words_per_chapter: nextWordsPerChapter,
     creative_direction: nextCreativeDirection,
     card_imports: cardImports,
+    author_constraints: normalizeAuthorConstraints(authorConstraints) ?? authorConstraints,
   });
 
   const setCachedStepsState = (nextSteps: AICreateCachedSteps) => {
@@ -309,7 +318,7 @@ export default function AICreateStepper({
   };
 
   const startCreativeDirector = async () => {
-    if (!inputFormRef.current?.reportValidity()) return;
+    if (!reportFormValidity(inputFormRef.current)) return;
     const originalIdea = idea.trim();
     if (directorRequestRef.current || (!originalIdea && cardImports.length === 0) || !selectedDirectorId) {
       return;
@@ -329,6 +338,7 @@ export default function AICreateStepper({
         "/api/llm/creative-director",
         {
           user_idea: originalIdea,
+          author_constraints: normalizeAuthorConstraints(authorConstraints),
           number_of_chapters: chapters,
           words_per_chapter: wordsPerChapter,
           agent_id: selectedDirectorId,
@@ -406,7 +416,7 @@ export default function AICreateStepper({
   };
 
   const startGeneration = async () => {
-    if (!inputFormRef.current?.reportValidity()) return;
+    if (!reportFormValidity(inputFormRef.current)) return;
     const input = getCurrentInput();
     if (generationRequestRef.current || !input.user_idea || (directorEnabled && !input.creative_direction)) {
       return;
@@ -431,6 +441,7 @@ export default function AICreateStepper({
 
     const payload: AICreateRequest = {
       user_idea: input.user_idea,
+      author_constraints: input.author_constraints,
       number_of_chapters: input.number_of_chapters,
       words_per_chapter: input.words_per_chapter,
       ...(input.creative_direction && {
@@ -548,6 +559,7 @@ export default function AICreateStepper({
         <textarea
           id="ai-idea"
           required={cardImports.length === 0}
+          maxLength={8000}
           className="w-full rounded-lg border border-border bg-background p-3 text-sm text-foreground resize-y min-h-[120px] focus:outline-none focus:ring-2 focus:ring-primary"
           placeholder={t("ideaPlaceholder")}
           value={idea}
@@ -604,6 +616,16 @@ export default function AICreateStepper({
           </p>
         </div>
       </div>
+      <details className="border-t border-border pt-4">
+        <summary className="cursor-pointer text-sm font-medium text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-primary">{tAuthor("optionalTitle")}</summary>
+        <div className="mt-3">
+          <AuthorConstraintsFields idPrefix="ai-author" value={authorConstraints} disabled={directorLocked} onChange={(value) => {
+            resetGenerationState();
+            resetDirectorPreview();
+            setAuthorConstraints(value);
+          }} />
+        </div>
+      </details>
       </form>
 
       {/* Optional pre-creation Creative Director */}

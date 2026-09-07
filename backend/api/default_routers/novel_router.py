@@ -26,6 +26,7 @@ from backend.services.interop.card_import_proposal_service import (
     StaleCardImportProposal,
 )
 from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
+from backend.services.generation.author_brief import AuthorInput
 from backend.services.novel.card_driven_creation_service import (
     CardDrivenCreationConflict,
     card_driven_creation_service,
@@ -55,6 +56,7 @@ class CardImportCreationSelection(BaseModel):
 
 
 class CreateNovelRequest(BaseModel):
+    author_input: AuthorInput | None = None
     title: str
     subtitle: Optional[str] = None
     genre: Optional[str] = "unclassified"
@@ -114,6 +116,7 @@ class CreateNovelRequest(BaseModel):
 
 
 class UpdateNovelRequest(BaseModel):
+    author_input: AuthorInput | None = None
     title: Optional[str] = None
     subtitle: Optional[str] = None
     genre: Optional[str] = None

@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from backend.novel_scale import ChapterCount, CreationIdea, WordsPerChapter
 
 from backend.api.llm_routers._common import (
@@ -40,6 +40,9 @@ from backend.services.llm.generation_runtime import (
 from backend.services.llm.llm_service import LLMService
 from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
 from backend.services.novel.faction_service import FactionService
+from backend.services.generation.author_brief import (
+    AuthorConstraints, creation_author_brief, novel_author_brief, render_author_brief_record,
+)
 from backend.llm.prompts.prompt_selector import (
     CORE_FACTIONS_PROMPT_NAME,
     load_prompt_config,
@@ -107,16 +110,19 @@ AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
         # 唯一一个两套词汇不同名的步骤：另外三步恰好同名，这个区别极易被忽略。
         config_key="expand_idea_to_full_novel_story",
         schema=ExpandIdeaSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
         prompt_args=lambda ctx: {"user_idea": ctx.params["user_idea"]},
     ),
     WorkflowStep(
         key="extract_idea",
         schema=ExtractIdeaSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
         prompt_args=lambda ctx: {"plot": ctx.results["expand_idea"].plot},
     ),
     WorkflowStep(
         key="core_seed",
         schema=CoreSeedSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
         prompt_args=lambda ctx: {
             "plot": ctx.results["expand_idea"].plot,
             "genre": ctx.results["extract_idea"].genre,
@@ -130,6 +136,7 @@ AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key="novel_meta",
         schema=NovelMetaSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
         prompt_args=lambda ctx: {
             "plot": ctx.results["expand_idea"].plot,
             "genre": ctx.results["extract_idea"].genre,
@@ -192,7 +199,13 @@ class AICreateNovelRequest(GenerationParamsMixin):
     number_of_chapters: ChapterCount = 100
     words_per_chapter: WordsPerChapter = 3000
     creative_direction: CreativeDirectionSelection | None = None
+    author_constraints: AuthorConstraints = Field(default_factory=AuthorConstraints)
     cached_steps: AICreateCachedSteps | None = None
+
+    @model_validator(mode="after")
+    def validate_author_input(self):
+        creation_author_brief(self)
+        return self
 
 
 class BlueprintRegenerationRequest(AICreateNovelRequest):
@@ -373,6 +386,7 @@ def _blueprint_regeneration_snapshot(
         else req.token_budget
     )
     source = {
+        "author_brief": creation_author_brief(req).to_record(),
         "user_idea": req.user_idea,
         "number_of_chapters": req.number_of_chapters,
         "words_per_chapter": req.words_per_chapter,
@@ -500,7 +514,8 @@ def _build_core_factions_prompt(novel: dict[str, Any], *, use_json_schema: bool)
         era_background=safe_novel_text(novel, "era_background"),
         tags_json=json.dumps(tags, ensure_ascii=False),
     )
-    return f"{prompt_base}\n{prompts[suffix_key]}".strip()
+    brief = novel_author_brief(novel)
+    return f"{brief.to_prompt_text() if brief else ''}\n{prompt_base}\n{prompts[suffix_key]}".strip()
 
 
 @router.post("/generate-core-factions")
@@ -674,10 +689,8 @@ async def regenerate_blueprint(
             steps=AI_CREATE_STEPS,
             prompts=frozen_prompts,
             params={
-                "user_idea": _build_creation_idea(
-                    req.user_idea,
-                    req.creative_direction,
-                ),
+                "author_brief": creation_author_brief(req).to_record(),
+                "user_idea": req.user_idea,
                 "number_of_chapters": req.number_of_chapters,
                 "words_per_chapter": req.words_per_chapter,
             },
@@ -723,10 +736,8 @@ async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
             steps=AI_CREATE_STEPS,
             prompts=_load_prompts().get(WORKFLOW_NAME, {}),
             params={
-                "user_idea": _build_creation_idea(
-                    req.user_idea,
-                    req.creative_direction,
-                ),
+                "author_brief": creation_author_brief(req).to_record(),
+                "user_idea": req.user_idea,
                 "number_of_chapters": req.number_of_chapters,
                 "words_per_chapter": req.words_per_chapter,
             },

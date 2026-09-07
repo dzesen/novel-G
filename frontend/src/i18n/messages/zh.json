@@ -1,4 +1,17 @@
 {
+  "authorInput": {
+    "title": "创作要求",
+    "optionalTitle": "补充创作要求（可选）",
+    "description": "原始创意和这些要求会直接用于后续规划。修改并保存后，后续生成会使用新版本。",
+    "originalIdea": "原始创意",
+    "confirmedDirection": "已确认方向与要求",
+    "must_keep": "必须保留",
+    "do_not_change": "禁止改动",
+    "style_boundaries": "风格边界",
+    "constraintsHint": "每行一条，每类最多 20 条，每条最多 500 字。可留空。",
+    "constraintsInvalid": "请控制在每类 20 条以内，每条不超过 500 字。",
+    "none": "未额外指定"
+  },
   "streamErrors": {
     "interrupted": "连接在结果完整返回前中断。已收到的内容已保留，请检查当前草稿或运行记录后恢复。",
     "invalidEvent": "生成响应不完整或格式有误，无法确认本次完成。请检查已保留的草稿或运行记录。"

@@ -161,6 +161,9 @@ def _core_settings_section(novel: dict) -> "ContextSection":
         f"基调：{novel.get('tone', '')}",
         f"时代背景：{novel.get('era_background', '')}",
     ]
+    if novel.get("author_brief") is not None:
+        from backend.services.generation.author_brief import render_author_brief_record
+        core_lines.append(render_author_brief_record(novel["author_brief"]))
     return _blob("core_settings", "\n".join(core_lines))
 
 
@@ -1168,6 +1171,8 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         供 assemble_context 消费的普通 dict，形状见本模块文档。
     """
     novel = await novel_repo.get_novel_by_id(novel_id)
+    from backend.services.generation.author_brief import novel_author_brief
+    author_brief = novel_author_brief(novel)
     chapter = await chapter_repo.get_chapter_by_id(chapter_id)
     volume = await volume_repo.get_volume_by_id(str(chapter["volume_id"]))
 
@@ -1355,6 +1360,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
 
     return {
         "novel": {
+            "author_brief": author_brief.to_record() if author_brief else None,
             "core_seed": novel.get("core_seed", ""),
             "worldview": novel.get("worldview", ""),
             "writing_style": novel.get("writing_style", ""),

@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
 from backend.novel_scale import InvalidNovelScale, invalid_novel_scale_fields
 from backend.services.llm.workflow_runner import WorkflowStep
+from backend.services.generation.author_brief import novel_author_brief, render_author_brief_record
 
 
 VOLUME_OUTLINE_WORKFLOW = "create_volume_outline_by_ai"
@@ -39,7 +40,9 @@ def volume_outline_params(novel: Mapping[str, Any]) -> dict[str, Any]:
     if invalid_novel_scale_fields(novel):
         raise InvalidNovelScale("请先在蓝图中修正规模参数：章数须为 1～10,000 的整数，每章字数须为 500～50,000 的整数。")
     chapter_count = novel.get("number_of_chapters")
+    brief = novel_author_brief(novel)
     return {
+        "author_brief": brief.to_record() if brief else None,
         "number_of_chapters": 100 if chapter_count is None else chapter_count,
         "title": _safe_novel_text(novel, "title"),
         "genre": _safe_novel_text(novel, "genre", "未分类"),
@@ -56,6 +59,7 @@ VOLUME_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key=VOLUME_OUTLINE_STEP,
         schema=VolumeOutlineResultSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params.get("author_brief")),
         prompt_args=lambda ctx: {
             "number_of_chapters": ctx.params["number_of_chapters"],
             "title": ctx.params["title"],

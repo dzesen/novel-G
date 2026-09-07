@@ -152,6 +152,7 @@ class WorkflowStep:
     max_structured_raw_output_bytes: int | None = None
     retry_oversized_structured_output_without_source: bool = False
     structured_output_byte_budget_reason_code: str | None = None
+    prompt_context: Callable[[StepContext], str] | None = None
 
     @property
     def resolved_config_key(self) -> str:
@@ -378,6 +379,10 @@ async def run_workflow(
             prompt_base = prompts[f"{config_key}_prompt_base"].format(
                 **step.prompt_args(StepContext(results=results, params=params))
             )
+            if step.prompt_context is not None:
+                context = step.prompt_context(StepContext(results=results, params=params))
+                if context:
+                    prompt_base = context + "\n\n" + prompt_base
             native_prompt = prompt_base + "\n" + prompts[f"{config_key}_prompt_with_schema_suffix"]
             prompt_json = prompt_base + "\n" + prompts[f"{config_key}_prompt_without_schema_suffix"]
             if step.agent_id:

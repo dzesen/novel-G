@@ -1,10 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Chip } from "@heroui/react";
 import AutoResizeTextarea from "./AutoResizeTextarea";
 import BoundedStyleControls from "./BoundedStyleControls";
+import AuthorInputFields from "./AuthorInputFields";
+import { normalizeAuthorConstraints } from "@/lib/authorInput";
+import { reportFormValidity } from "@/lib/formValidity";
+import type { AuthorInput } from "@/types/novel";
 import CollapsibleField from "./CollapsibleField";
 import { ApiError, apiPut, apiPostForm, getImageUrl } from "@/lib/api";
 import {
@@ -51,6 +55,7 @@ export default function NovelInfoSection({
   const t = useTranslations("novel");
   const tw = useTranslations("writing.novelInfo");
   const fields = SECTION_FIELDS[sectionKey];
+  const formRef = useRef<HTMLFormElement>(null);
 
   const [editData, setEditData] = useState<Record<string, unknown>>({});
   const [saving, setSaving] = useState(false);
@@ -72,6 +77,7 @@ export default function NovelInfoSection({
     if (sectionKey === "style") {
       snapshot.style_controls = normalizeStyleControls(data.style_controls);
     }
+    if (sectionKey === "creative" && data.author_input) snapshot.author_input = data.author_input;
     setClearManagedCoverOnSave(false);
     setSaveError("");
     setEditData(snapshot);
@@ -88,6 +94,7 @@ export default function NovelInfoSection({
 
   const hasDangerousChanges = (): boolean => {
     if (!hasChapters) return false;
+    if (sectionKey === "creative" && JSON.stringify(data.author_input) !== JSON.stringify(editData.author_input)) return true;
     if (
       sectionKey === "style" &&
       JSON.stringify(normalizeStyleControls(data.style_controls)) !==
@@ -104,6 +111,7 @@ export default function NovelInfoSection({
   };
 
   const saveSection = async () => {
+    if (!reportFormValidity(formRef.current)) return;
     if (!isCreateMode && novelId) {
       if (hasDangerousChanges() && onDangerConfirm) {
         const confirmed = await onDangerConfirm();
@@ -112,7 +120,12 @@ export default function NovelInfoSection({
       try {
         setSaving(true);
         setSaveError("");
-        await apiPut(`/api/novels/${novelId}`, editData);
+        const payload = { ...editData };
+        if (payload.author_input) {
+          const source = payload.author_input as AuthorInput;
+          payload.author_input = { ...source, constraints: normalizeAuthorConstraints(source.constraints) ?? source.constraints };
+        }
+        await apiPut(`/api/novels/${novelId}`, payload);
         if (
           sectionKey === "basic" &&
           clearManagedCoverOnSave &&
@@ -479,7 +492,7 @@ export default function NovelInfoSection({
       </div>
 
       {/* section body */}
-      <div className="px-5 py-4 space-y-3">
+      <form ref={formRef} className="px-5 py-4 space-y-3" onSubmit={(event) => event.preventDefault()}>
         {(isEditing || isCreateMode)
           ? fields.map(renderEditField)
           : fields.map(renderReadField)}
@@ -490,12 +503,19 @@ export default function NovelInfoSection({
             onChange={(value) => updateField("style_controls", value)}
           />
         ) : null}
+        {sectionKey === "creative" && (
+          <AuthorInputFields
+            value={getValue("author_input") as AuthorInput | undefined}
+            isEditing={isEditing || isCreateMode}
+            onChange={(value) => updateField("author_input", value)}
+          />
+        )}
         {saveError ? (
           <p role="alert" className="text-sm text-red-600 dark:text-red-400">
             {saveError}
           </p>
         ) : null}
-      </div>
+      </form>
     </div>
   );
 }
