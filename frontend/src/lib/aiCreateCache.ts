@@ -1,5 +1,5 @@
-import { normalizeBlueprintExecution, normalizeBlueprintParams } from "@/lib/blueprintRunClient";
-import type { AICreateCachedSteps, AICreateStepKey } from "@/types/novel";
+import { blueprintStepOrder, isBlueprintStrategy, normalizeBlueprintExecution, normalizeBlueprintParams } from "@/lib/blueprintRunClient";
+import type { AICreateCachedSteps, AICreateStepKey, BlueprintStrategy } from "@/types/novel";
 import type { CreativeDirectionSelection } from "@/types/agent";
 import { buildUserStorageKey } from "@/lib/userStorage";
 import { normalizeAuthorConstraints } from "@/lib/authorInput";
@@ -17,8 +17,6 @@ export interface AICreateCacheRecord {
   failed_step?: AICreateStepKey;
   updated_at: string;
 }
-
-const STEP_ORDER: AICreateStepKey[] = ["expand_idea", "extract_idea", "core_seed", "novel_meta"];
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -114,6 +112,7 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   }
 
   const userIdea = value.user_idea;
+  if (value.strategy !== undefined && !isBlueprintStrategy(value.strategy)) return null;
   if (value.generation_params !== undefined && !normalizeBlueprintParams(value.generation_params)) return null;
   const constraints = normalizeAuthorConstraints(value.author_constraints);
   if (constraints === null) return null;
@@ -162,6 +161,7 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   }
 
   return {
+    ...(isBlueprintStrategy(value.strategy) && { strategy: value.strategy }),
     ...(normalizeBlueprintExecution(value.execution) && { execution: normalizeBlueprintExecution(value.execution) }),
     ...(normalizeBlueprintParams(value.generation_params) && { generation_params: normalizeBlueprintParams(value.generation_params) }),
     user_idea: userIdea,
@@ -173,7 +173,7 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   };
 }
 
-function normalizeSteps(value: unknown): AICreateCachedSteps {
+function normalizeSteps(value: unknown, strategy: BlueprintStrategy = "four_step"): AICreateCachedSteps {
   if (!isObject(value)) {
     return {};
   }
@@ -232,7 +232,13 @@ function normalizeSteps(value: unknown): AICreateCachedSteps {
     };
   }
 
-  return trimCachedStepsToPrefix(steps);
+  if (strategy === "two_step" && isObject(value.blueprint)) {
+    const combined = normalizeSteps({ ...value.blueprint, expand_idea: steps.expand_idea });
+    if (combined.extract_idea && combined.core_seed && combined.novel_meta) {
+      steps.blueprint = { extract_idea: combined.extract_idea, core_seed: combined.core_seed, novel_meta: combined.novel_meta };
+    }
+  }
+  return trimCachedStepsToPrefix(steps, strategy);
 }
 
 /**
@@ -267,8 +273,8 @@ export function loadAICreateCache(): AICreateCacheRecord | null {
       return null;
     }
 
-    const steps = normalizeSteps(parsed.steps);
-    const failedStep = STEP_ORDER.includes(parsed.failed_step as AICreateStepKey)
+    const steps = normalizeSteps(parsed.steps, input.strategy);
+    const failedStep = blueprintStepOrder(input.strategy).includes(parsed.failed_step as AICreateStepKey)
       ? (parsed.failed_step as AICreateStepKey)
       : undefined;
     return {
@@ -304,7 +310,7 @@ export function saveAICreateCache(
 
   const record: AICreateCacheRecord = {
     input,
-    steps: trimCachedStepsToPrefix(steps),
+    steps: trimCachedStepsToPrefix(steps, input.strategy),
     failed_step: failedStep,
     updated_at: new Date().toISOString(),
   };
@@ -359,9 +365,9 @@ export function clearAICreateCache(): void {
  * Returns:
  *   连续步骤前缀，断档后的步骤会被丢弃。
  */
-export function trimCachedStepsToPrefix(steps: AICreateCachedSteps): AICreateCachedSteps {
+export function trimCachedStepsToPrefix(steps: AICreateCachedSteps, strategy: BlueprintStrategy = "four_step"): AICreateCachedSteps {
   const trimmed: AICreateCachedSteps = {};
-  for (const step of STEP_ORDER) {
+  for (const step of blueprintStepOrder(strategy)) {
     if (!steps[step]) {
       break;
     }
@@ -381,5 +387,5 @@ export function trimCachedStepsToPrefix(steps: AICreateCachedSteps): AICreateCac
  *   任意步骤存在时返回 true。
  */
 export function hasAICreateCachedSteps(steps: AICreateCachedSteps): boolean {
-  return STEP_ORDER.some((step) => Boolean(steps[step]));
+  return Boolean(steps.expand_idea);
 }

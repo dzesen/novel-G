@@ -28,6 +28,7 @@ PROMPT_DIR = Path(__file__).resolve().parent
 CUSTOM_PROMPT_FILENAME = "prompt.yaml"
 DEFAULT_PROMPT_FILENAME = "prompt_default.yaml"
 WORKFLOW_NAME = "create_novel_by_ai"
+TWO_STEP_BLUEPRINT_PROMPT_NAME = "create_blueprint_two_step"
 CORE_FACTIONS_PROMPT_NAME = "create_factions_by_ai"
 REFERENCE_CARDS_PROMPT_NAME = "create_reference_cards_by_ai"
 VOLUME_OUTLINE_PROMPT_NAME = "create_volume_outline_by_ai"
@@ -113,6 +114,10 @@ REQUIRED_LLM_PROVIDER_TEST_PROMPT_KEYS: tuple[str, ...] = (
 
 REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
     WORKFLOW_NAME: REQUIRED_CREATE_NOVEL_PROMPT_KEYS,
+    TWO_STEP_BLUEPRINT_PROMPT_NAME: tuple(
+        f"{step}_{suffix}" for step in ("story_plan", "blueprint")
+        for suffix in ("prompt_base", "prompt_with_schema_suffix", "prompt_without_schema_suffix")
+    ),
     CORE_FACTIONS_PROMPT_NAME: REQUIRED_CORE_FACTIONS_PROMPT_KEYS,
     REFERENCE_CARDS_PROMPT_NAME: REQUIRED_REFERENCE_CARDS_PROMPT_KEYS,
     VOLUME_OUTLINE_PROMPT_NAME: REQUIRED_VOLUME_OUTLINE_PROMPT_KEYS,
@@ -123,6 +128,8 @@ REQUIRED_PROMPT_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
+    "story_plan_prompt_base": {"user_idea"},
+    "blueprint_prompt_base": {"plot", "number_of_chapters", "words_per_chapter"},
     "expand_idea_to_full_novel_story_prompt_base": {"user_idea"},
     "extract_idea_prompt_base": {"plot"},
     "core_seed_prompt_base": {
@@ -485,6 +492,7 @@ def resolve_prompt_selection(prompt_dir: Path | None = None, *, emit_warning: bo
         # compatible sections so upgrading does not discard established custom
         # prompts. A present-but-invalid section still fails validation.
         for backfilled_section in (
+            TWO_STEP_BLUEPRINT_PROMPT_NAME,
             REFERENCE_CARDS_PROMPT_NAME,
             OUTLINE_ADHERENCE_PROMPT_NAME,
         ):

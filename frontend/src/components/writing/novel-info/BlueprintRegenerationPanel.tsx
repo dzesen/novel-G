@@ -9,7 +9,7 @@ import {
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
 import BlueprintRunControls from "@/components/shared/BlueprintRunControls";
-import { blueprintGenerationParams, normalizeBlueprintExecution } from "@/lib/blueprintRunClient";
+import { blueprintStepOrder, blueprintGenerationParams, normalizeBlueprintExecution } from "@/lib/blueprintRunClient";
 import {
   buildBlueprintRegenerationRequest,
   inspectBlueprintRegeneration,
@@ -45,6 +45,7 @@ const STEP_KEYS: AICreateStepKey[] = [
   "extract_idea",
   "core_seed",
   "novel_meta",
+  "blueprint",
 ];
 
 function isStepKey(value: unknown): value is AICreateStepKey {
@@ -79,6 +80,7 @@ export default function BlueprintRegenerationPanel({
     extract_idea: "pending",
     core_seed: "pending",
     novel_meta: "pending",
+    blueprint: "pending",
   }));
 
   useEffect(() => {
@@ -98,6 +100,7 @@ export default function BlueprintRegenerationPanel({
       extract_idea: "pending",
       core_seed: "pending",
       novel_meta: "pending",
+      blueprint: "pending",
     });
     setOpen(true);
   };
@@ -225,6 +228,7 @@ export default function BlueprintRegenerationPanel({
                   extract_idea: run.completed_steps.includes("extract_idea") ? "done" : "pending",
                   core_seed: run.completed_steps.includes("core_seed") ? "done" : "pending",
                   novel_meta: run.completed_steps.includes("novel_meta") ? "done" : "pending",
+                  blueprint: run.completed_steps.includes("blueprint") ? "done" : "pending",
                 })}
                 onEvent={(event, data) => {
                   if (event !== "step" || !isStepKey(data.step)) return;
@@ -236,6 +240,7 @@ export default function BlueprintRegenerationPanel({
                   setCandidate(result);
                   setCandidateSource({
                     ...inspection.source,
+                    strategy: request.strategy,
                     generation_params: blueprintGenerationParams(request), execution,
                   });
                   setStage("review");
@@ -274,7 +279,7 @@ export default function BlueprintRegenerationPanel({
                     {t("runningDescription")}
                   </p>
                   <ol className="grid gap-2">
-                    {STEP_KEYS.map((key, index) => (
+                    {blueprintStepOrder(inspection.source.strategy).map((key, index) => (
                       <li
                         key={key}
                         className="flex items-center gap-3 rounded-lg border border-border px-3 py-3"

@@ -19,8 +19,8 @@ from backend.services.generation.blueprint_authorization import (
     plan_from_record, plan_record, prepare_blueprint_authorization, request_record,
 )
 from backend.services.generation.blueprint_workflow import (
-    AI_CREATE_STEPS, BLUEPRINT_WORKFLOW_PROTOCOL, WORKFLOW_NAME,
-    BlueprintGenerationRequest, BlueprintGenerationStartRequest, workflow_params,
+    BLUEPRINT_WORKFLOW_PROTOCOL, BlueprintGenerationRequest, BlueprintGenerationStartRequest,
+    blueprint_result, blueprint_workflow, workflow_params,
 )
 from backend.services.llm.workflow_runner import WorkflowDeps, run_workflow, sse_event
 
@@ -44,8 +44,14 @@ class BlueprintRunService:
                 or content_digest(authorization) != run["authorization_digest"]):
             raise BlueprintRunConflict("blueprint_readiness_stale")
         brief = AuthorBrief.from_record(authorization["author_brief"])
+        request = BlueprintGenerationRequest.model_validate(authorization["request"])
+        workflow_name, steps = blueprint_workflow(request.strategy)
+        if (authorization["strategy"] != request.strategy
+                or authorization["workflow_name"] != workflow_name
+                or authorization["step_order"] != [step.key for step in steps]):
+            raise BlueprintRunConflict("blueprint_readiness_stale")
         values = {}
-        for step in AI_CREATE_STEPS:
+        for step in steps:
             candidate = run["candidates"].get(step.key)
             if candidate is None:
                 break
@@ -100,7 +106,7 @@ class BlueprintRunService:
     def _validate_pending_plans(self, run: dict, *, check_current_prompts: bool):
         runtime = self.runtime_factory(max_provider_retries=0)
         authorization = run["authorization"]
-        if check_current_prompts and content_digest(self.prompt_supplier()[WORKFLOW_NAME]) != authorization["prompt_revision"]:
+        if check_current_prompts and content_digest(self.prompt_supplier()[authorization["workflow_name"]]) != authorization["prompt_revision"]:
             raise BlueprintRunConflict("blueprint_readiness_stale")
         for step, record in authorization["plans"].items():
             if step not in run["candidates"]:
@@ -153,7 +159,7 @@ class BlueprintRunService:
             view.update({
                 "request": authorization["request"], "readiness": run["readiness"],
                 "cached_steps": {key: value.model_dump(mode="json") for key, value in values.items()},
-                "result": {key: value.model_dump(mode="json") for key, value in values.items()} if run["status"] == "completed" else None,
+                "result": blueprint_result(authorization["strategy"], values) if run["status"] == "completed" else None,
                 "attempts": [{
                     "attempt_id": key, "step": item["step"], "provider_alias": item["provider_alias"],
                     "phase": item["phase"], "state": item["state"], "usage": item["usage"],
@@ -210,8 +216,9 @@ class BlueprintRunService:
             scope = BlueprintAttemptScope(self.repo, run)
             execution = self.runtime_factory(attempt_scope=scope, max_provider_retries=0)
             authorization = run["authorization"]
+            workflow_name, steps = blueprint_workflow(authorization["strategy"])
             frames = run_workflow(
-                workflow_name=WORKFLOW_NAME, steps=AI_CREATE_STEPS, prompts=authorization["prompts"],
+                workflow_name=workflow_name, steps=steps, prompts=authorization["prompts"],
                 params=workflow_params(BlueprintGenerationRequest.model_validate(authorization["request"])),
                 gen_kwargs=authorization["generation_params"], cached=self._validate(run),
                 deps=WorkflowDeps(runtime=execution,
@@ -231,6 +238,8 @@ class BlueprintRunService:
                     payload["run_status"] = current["status"]
                     if payload.get("success") and current["status"] != "completed":
                         raise BlueprintRunConflict("blueprint_checkpoints_incomplete")
+                    if payload.get("success"):
+                        payload["result"] = blueprint_result(authorization["strategy"], self._validate(current))
                     yield sse_event("done", payload)
                 else:
                     yield frame

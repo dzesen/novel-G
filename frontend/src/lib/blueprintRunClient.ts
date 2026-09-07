@@ -1,4 +1,4 @@
-import type { AICreateRequest, AICreateResponse, AICreateCachedSteps, BlueprintExecutionRef, BlueprintGenerationParams } from "@/types/novel";
+import type { AICreateRequest, AICreateResponse, AICreateCachedSteps, AICreateStepKey, BlueprintStrategy, BlueprintExecutionRef, BlueprintGenerationParams } from "@/types/novel";
 import { normalizeAuthorConstraints } from "./authorInput.ts";
 
 export interface BlueprintRunRequest extends Omit<AICreateRequest, "cached_steps" | "creative_direction"> {
@@ -6,7 +6,7 @@ export interface BlueprintRunRequest extends Omit<AICreateRequest, "cached_steps
   card_imports?: Array<{ proposal_id: string; digest: string }>;
   draft_id?: string | null;
   reuse_run_id?: string | null;
-  strategy?: "four_step";
+  strategy?: BlueprintStrategy;
   token_budget?: number | null;
 }
 export interface BlueprintReadiness {
@@ -16,7 +16,7 @@ export interface BlueprintReadiness {
   digest: string;
   author_brief_revision: string;
   prompt_revision: string;
-  strategy: "four_step";
+  strategy: BlueprintStrategy;
   status: "ready" | "warning_requires_ack" | "blocked";
   token_budget: number | null;
   uses_system_token_budget: boolean;
@@ -50,6 +50,13 @@ export interface BlueprintRun extends BlueprintRunSummary {
 }
 
 const PARAMS = ["temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty", "system_prompt"] as const;
+export function blueprintStepOrder(strategy: BlueprintStrategy = "four_step"): AICreateStepKey[] {
+  return strategy === "two_step" ? ["expand_idea", "blueprint"] : ["expand_idea", "extract_idea", "core_seed", "novel_meta"];
+}
+
+export function isBlueprintStrategy(value: unknown): value is BlueprintStrategy {
+  return value === "four_step" || value === "two_step";
+}
 export function blueprintGenerationParams(request: AICreateRequest): BlueprintGenerationParams {
   return Object.fromEntries(PARAMS.filter((key) => (request[key] != null || (key === "max_tokens" && request[key] === null))).map((key) => [key, request[key]]));
 }

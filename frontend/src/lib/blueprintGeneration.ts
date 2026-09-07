@@ -1,4 +1,4 @@
-import { normalizeBlueprintExecution, normalizeBlueprintParams } from "./blueprintRunClient.ts";
+import { isBlueprintStrategy, normalizeBlueprintExecution, normalizeBlueprintParams } from "./blueprintRunClient.ts";
 import type { CreativeDirectionSelection } from "@/types/agent";
 import { normalizeAuthorConstraints } from "./authorInput.ts";
 import type {
@@ -123,12 +123,14 @@ export function normalizeBlueprintGenerationSource(
     value.creative_direction,
   );
   const cardImports = normalizeCardImports(value.card_imports);
+  if (value.strategy !== undefined && !isBlueprintStrategy(value.strategy)) return null;
   if (value.generation_params !== undefined && !normalizeBlueprintParams(value.generation_params)) return null;
   const constraints = normalizeAuthorConstraints(value.author_constraints);
   if (constraints === null) return null;
   if (creativeDirection === undefined || cardImports === null) return null;
   return {
     schema_version: "blueprint_generation_source.v1",
+    ...(isBlueprintStrategy(value.strategy) && { strategy: value.strategy }),
     ...(normalizeBlueprintExecution(value.execution) && { execution: normalizeBlueprintExecution(value.execution) }),
     ...(normalizeBlueprintParams(value.generation_params) && { generation_params: normalizeBlueprintParams(value.generation_params) }),
     user_idea: value.user_idea.trim(),
@@ -219,6 +221,7 @@ export function buildBlueprintRegenerationRequest(
 ): AICreateRequest {
   return {
     ...source.generation_params,
+    ...(source.strategy && { strategy: source.strategy }),
     user_idea: source.user_idea,
     number_of_chapters: source.number_of_chapters,
     words_per_chapter: source.words_per_chapter,

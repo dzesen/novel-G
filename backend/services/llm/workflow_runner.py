@@ -336,11 +336,16 @@ async def run_workflow(
                 generation_plan = deps.runtime.plan_structured(target)
             elif (
                 not isinstance(generation_plan, GenerationPlan)
-                or generation_plan.target != target
+                or not isinstance(generation_plan.target, WorkflowStepTarget)
+                or generation_plan.target.workflow_name != target.workflow_name
+                or generation_plan.target.step_name != target.step_name
             ):
                 raise ValueError(
                     "frozen structured plan does not match the workflow step"
                 )
+            # A Provider override may already be frozen in the supplied plan.
+            # Keep that exact target; GenerationRuntime revalidates it and the
+            # caller's attempt scope checks the sealed Provider whitelist.
             provider = generation_plan.provider_alias
             timeout_seconds = generation_plan.timeout_seconds
             use_schema = generation_plan.mode == StructuredOutputMode.SCHEMA_ENFORCED

@@ -13,6 +13,8 @@ from backend.services.generation.author_brief import AuthorConstraints, creation
 
 BLUEPRINT_WORKFLOW_PROTOCOL = "blueprint_workflow.v1"
 WORKFLOW_NAME = "create_novel_by_ai"
+TWO_STEP_WORKFLOW_NAME = "create_blueprint_two_step"
+BlueprintStrategy = Literal["four_step", "two_step"]
 
 AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
@@ -61,6 +63,52 @@ AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
 )
 
 AI_CREATE_STEP_ORDER: tuple[str, ...] = tuple(step.key for step in AI_CREATE_STEPS)
+
+
+class UnifiedBlueprintSchema(BaseModel):
+    """Combine the three dependent planning responsibilities with their existing bounds."""
+    model_config = ConfigDict(extra="forbid")
+
+    extract_idea: ExtractIdeaSchema
+    core_seed: CoreSeedSchema
+    novel_meta: NovelMetaSchema
+
+
+TWO_STEP_BLUEPRINT_STEPS: tuple[WorkflowStep, ...] = (
+    WorkflowStep(
+        key="expand_idea", config_key="story_plan", schema=ExpandIdeaSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
+        prompt_args=lambda ctx: {"user_idea": ctx.params["user_idea"]},
+    ),
+    WorkflowStep(
+        key="blueprint", schema=UnifiedBlueprintSchema,
+        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
+        prompt_args=lambda ctx: {
+            "plot": ctx.results["expand_idea"].plot,
+            "number_of_chapters": ctx.params["number_of_chapters"],
+            "words_per_chapter": ctx.params["words_per_chapter"],
+        },
+    ),
+)
+
+
+def blueprint_workflow(strategy: BlueprintStrategy) -> tuple[str, tuple[WorkflowStep, ...]]:
+    if strategy == "four_step":
+        return WORKFLOW_NAME, AI_CREATE_STEPS
+    if strategy == "two_step":
+        return TWO_STEP_WORKFLOW_NAME, TWO_STEP_BLUEPRINT_STEPS
+    raise ValueError("Unknown blueprint strategy")
+
+
+def blueprint_result(strategy: BlueprintStrategy, values: dict[str, BaseModel]) -> dict:
+    """Keep the author-facing result identical across strategies; never invent partial fields."""
+    _, steps = blueprint_workflow(strategy)
+    if set(values) != {step.key for step in steps}:
+        raise ValueError("Incomplete blueprint result")
+    serialized = {key: value.model_dump(mode="json") for key, value in values.items()}
+    if strategy == "two_step":
+        return {"expand_idea": serialized["expand_idea"], **serialized["blueprint"]}
+    return serialized
 
 
 class AICreateCachedSteps(BaseModel):
@@ -124,7 +172,7 @@ class BlueprintGenerationRequest(AICreateNovelRequest):
     draft_id: str | None = Field(default=None, min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
     reuse_run_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{24}$")
     card_imports: list[CardImportDirectionReference] = Field(default_factory=list, max_length=100)
-    strategy: Literal["four_step"] = "four_step"
+    strategy: BlueprintStrategy = "four_step"
     max_tokens: int | None = Field(default=16_384, ge=1, le=200_000)
     system_prompt: str | None = Field(default=None, max_length=20_000)
     token_budget: int | None = Field(default=None, ge=1, le=2**63 - 1, strict=True)

@@ -16,7 +16,7 @@ llm_provider_test:
 # 从AI创建小说 Prompt 配置
 create_novel_by_ai:
   #扩展故事
-  expand_idea_to_full_novel_story_prompt_base: |
+  expand_idea_to_full_novel_story_prompt_base: &blueprint_story_plan_base |
     你是一名资深小说策划编辑兼小说作者，擅长将一个零散创意，扩写为“一整部长篇小说的完整故事雏形”。
 
     我会给你一个“小说创意”，请你基于这个创意进行合理联想与深化，把它写成一篇约3000字的完整故事。
@@ -88,7 +88,7 @@ create_novel_by_ai:
 
     我的创意如下：
     {user_idea}
-  expand_idea_to_full_novel_story_prompt_with_schema_suffix: |
+  expand_idea_to_full_novel_story_prompt_with_schema_suffix: &blueprint_story_plan_schema |
     在正式写作前，请先确保你写的是：
     - 一整本长篇小说的完整故事，这篇内容必须覆盖“整本书”的完整主线，而不是某一个阶段。
     - 要有明显的时间推进、冲突升级、人物成长与最终结局。
@@ -98,7 +98,7 @@ create_novel_by_ai:
     - 不可只埋伏笔不回收，必须完成主线回收与结局落点。
 
     现在请直接开始创作正文。
-  expand_idea_to_full_novel_story_prompt_without_schema_suffix: |
+  expand_idea_to_full_novel_story_prompt_without_schema_suffix: &blueprint_story_plan_json |
     请按照以下 JSON 结构返回，不要输出额外内容，字数不得超过4000字：
     {"plot": "完整的3000字长篇压缩故事正文"}
   
@@ -223,6 +223,28 @@ create_novel_by_ai:
     }
 
 # 阵营 Prompt 配置
+# 对照路径沿用相同故事方案提示词，仅合并有依赖的后三步职责。
+create_blueprint_two_step:
+  story_plan_prompt_base: *blueprint_story_plan_base
+  story_plan_prompt_with_schema_suffix: *blueprint_story_plan_schema
+  story_plan_prompt_without_schema_suffix: *blueprint_story_plan_json
+  blueprint_prompt_base: |
+    你是一名长篇小说策划编辑。依据同一份作者原始要求与下列完整故事方案，一次产出一致的小说蓝图。
+    计划规模为 {number_of_chapters} 章，每章 {words_per_chapter} 字。
+    故事方案如下：
+    {plot}
+
+    先在内部确认主线因果、主要人物驱动力和最终结局，再同时完成三个部分。
+    extract_idea 提炼类型、基调、目标读者与核心设想；core_seed 用一段文字写出主角、驱动力、显性冲突、潜在危机与世界关键矛盾；novel_meta 给出书名、副标题、引言、简介、世界设定、风格、视角、时代和标签。
+    三部分必须互相一致，并与故事方案及作者的必须保留、禁止改动、风格边界一致。
+    不增加与原始要求冲突的新主线，不用宣传文案替代核心冲突，不改变故事结局。
+    严格遵循字段长度和视角枚举约束，只返回完整蓝图对象。
+  blueprint_prompt_with_schema_suffix: |
+    按给定结构返回 extract_idea、core_seed、novel_meta 三个完整对象，不输出分析或额外字段。
+  blueprint_prompt_without_schema_suffix: |
+    只返回 JSON，结构为 {"extract_idea":{"genre":"类型","tone":"基调","target_audience":"读者","core_idea":"10至300字核心设想"},"core_seed":{"core_seed":"30至150字核心冲突公式"},"novel_meta":{"title":"书名","subtitle":"副标题","introduction":"100至300字引言","summary":"100至500字简介","worldview":"100至800字世界设定","writing_style":"风格","narrative_pov":"第三人称有限视角","era_background":"时代","tags":["标签"]}}。
+    narrative_pov 仅允许第一人称、第三人称有限视角、全知视角，不得省略任何必需字段。
+
 create_factions_by_ai:
   create_core_factions_prompt_base: |
     你是一名资深中文长篇小说世界观策划，正在为一部已保存的小说创建“全书级核心阵营”和“阵营之间的核心关系”。

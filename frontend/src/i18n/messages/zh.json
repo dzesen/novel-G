@@ -604,6 +604,7 @@
       "providerEnabled": "Provider 已启用",
       "providerDisabledShort": "Provider 未启用",
       "catalog": {
+        "create_blueprint_two_step": "两步蓝图（对照）",
         "create_novel_by_ai": "创建小说",
         "create_factions_by_ai": "生成核心阵营",
         "create_reference_cards_by_ai": "生成资料卡",
@@ -621,6 +622,8 @@
         "volume_retrospective_by_agent": "生成角色 · 卷级复盘"
       },
       "steps": {
+        "story_plan": "生成完整故事方案",
+        "blueprint": "统一提炼核心与书籍设定",
         "expand_idea_to_full_novel_story": "先把用户创意扩写成完整长篇剧情压缩稿",
         "extract_idea": "根据用户创意提取故事核心要素",
         "core_seed": "基于故事要素生成故事核心种子",
@@ -743,6 +746,7 @@
     "continueAI": "继续生成",
     "retryFailedStep": "重试失败步骤",
     "generating": "AI 生成中...",
+    "stepBlueprint": "生成统一蓝图",
     "stepExpandIdea": "扩写完整剧情",
     "stepExtractIdea": "提炼创意",
     "stepCoreSeed": "生成故事核心",
@@ -1490,7 +1494,7 @@
         "automaticBudgetConfirmationRequired": "请先确认系统计算的 Token 上限。",
         "confirmPaidCall": "确认并调用 AI",
         "keepCurrent": "保留当前蓝图",
-        "runningDescription": "四个步骤会从头执行，不复用上一次结果。请保持页面打开，完成后再对比候选。",
+        "runningDescription": "正在执行本次已授权的生成步骤，完成后可对比新候选。中断后可从运行记录找回进度。",
         "runningHint": "生成进行中，完成前不会改动当前蓝图。",
         "reviewDescription": "这里先展示标题、简介和主线剧情。采用候选时，所有 AI 生成的蓝图字段会作为一个整体更新。",
         "current": "当前蓝图",
@@ -1502,6 +1506,7 @@
           "expand_idea": "扩写完整故事",
           "extract_idea": "提炼创意方向",
           "core_seed": "生成故事核心",
+          "blueprint": "生成统一蓝图",
           "novel_meta": "生成书籍设定"
         },
         "blocked": {

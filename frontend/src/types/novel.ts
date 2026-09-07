@@ -608,6 +608,7 @@ export interface BlueprintExecutionRef {
 }
 
 export interface AICreateRequest {
+  strategy?: BlueprintStrategy;
   author_constraints?: AuthorConstraints;
   user_idea: string;
   number_of_chapters?: number;
@@ -656,17 +657,20 @@ export interface AICreateResponse {
   };
 }
 
-export type AICreateStepKey = "expand_idea" | "extract_idea" | "core_seed" | "novel_meta";
+export type BlueprintStrategy = "four_step" | "two_step";
+export type AICreateStepKey = "expand_idea" | "extract_idea" | "core_seed" | "novel_meta" | "blueprint";
 
 export type AICreateCachedSteps = Partial<{
   expand_idea: NonNullable<AICreateResponse["expand_idea"]>;
   extract_idea: AICreateResponse["extract_idea"];
   core_seed: AICreateResponse["core_seed"];
   novel_meta: AICreateResponse["novel_meta"];
+  blueprint: Omit<AICreateResponse, "expand_idea">;
 }>;
 
 /** 冻结整份蓝图重新生成所需的原始来源；不得从作者后续编辑反推。 */
 export interface BlueprintGenerationSource {
+  strategy?: BlueprintStrategy;
   generation_params?: BlueprintGenerationParams;
   execution?: BlueprintExecutionRef;
   author_constraints?: AuthorConstraints;

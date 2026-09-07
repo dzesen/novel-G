@@ -28,6 +28,14 @@ class WorkflowDefinition(BaseModel):
 
 _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
     WorkflowDefinition(
+        name="create_blueprint_two_step",
+        label_key="settings.workflow.catalog.create_blueprint_two_step",
+        steps=tuple(
+            WorkflowStepDefinition(name=name, label_key=f"settings.workflow.steps.{name}")
+            for name in ("story_plan", "blueprint")
+        ),
+    ),
+    WorkflowDefinition(
         name="create_novel_by_ai",
         label_key="settings.workflow.catalog.create_novel_by_ai",
         steps=tuple(

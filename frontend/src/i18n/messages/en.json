@@ -604,6 +604,7 @@
       "providerEnabled": "Provider enabled",
       "providerDisabledShort": "Provider disabled",
       "catalog": {
+        "create_blueprint_two_step": "Two-step blueprint (comparison)",
         "create_novel_by_ai": "Create Novel",
         "create_factions_by_ai": "Generate Core Factions",
         "create_reference_cards_by_ai": "Generate Reference Cards",
@@ -621,6 +622,8 @@
         "volume_retrospective_by_agent": "Generation role · Volume retrospective"
       },
       "steps": {
+        "story_plan": "Create the complete story plan",
+        "blueprint": "Compose the core and book settings together",
         "expand_idea_to_full_novel_story": "Expand the user idea into a full compressed long-form plot",
         "extract_idea": "Extract core story elements from user idea",
         "core_seed": "Generate story core seed from elements",
@@ -743,6 +746,7 @@
     "continueAI": "Continue Generation",
     "retryFailedStep": "Retry Failed Step",
     "generating": "AI Generating...",
+    "stepBlueprint": "Generate the unified blueprint",
     "stepExpandIdea": "Expand Full Plot",
     "stepExtractIdea": "Extract Idea",
     "stepCoreSeed": "Generate Core Seed",
@@ -1490,7 +1494,7 @@
         "automaticBudgetConfirmationRequired": "Confirm the system-calculated token cap first.",
         "confirmPaidCall": "Confirm and call AI",
         "keepCurrent": "Keep current blueprint",
-        "runningDescription": "All four steps run from the beginning without reusing the previous result. Keep this page open, then compare the candidate when it finishes.",
+        "runningDescription": "The authorized generation steps are running. Compare the new candidate when it finishes; if interrupted, recover progress from the run history.",
         "runningHint": "Generation is in progress. The current blueprint will not change.",
         "reviewDescription": "This preview shows the title, summary, and main plot. Accepting the candidate updates every AI-generated blueprint field as one version.",
         "current": "Current blueprint",
@@ -1502,6 +1506,7 @@
           "expand_idea": "Expand the complete story",
           "extract_idea": "Extract the creative direction",
           "core_seed": "Generate the story core",
+          "blueprint": "Generate the unified blueprint",
           "novel_meta": "Generate book settings"
         },
         "blocked": {

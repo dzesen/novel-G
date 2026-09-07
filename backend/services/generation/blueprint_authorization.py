@@ -7,8 +7,7 @@ from typing import Any
 
 from backend.db.repositories.blueprint_run_repository import content_digest
 from backend.services.generation.blueprint_workflow import (
-    AI_CREATE_STEPS, BLUEPRINT_WORKFLOW_PROTOCOL, WORKFLOW_NAME,
-    BlueprintGenerationRequest, workflow_params,
+    BLUEPRINT_WORKFLOW_PROTOCOL, BlueprintGenerationRequest, blueprint_workflow, workflow_params,
 )
 from backend.services.llm.generation_params import build_gen_kwargs
 from backend.services.llm.generation_runtime import (
@@ -42,20 +41,21 @@ def prepare_blueprint_authorization(
     runtime: Any, all_prompts: dict, candidates: dict, source_summary: dict | None,
 ) -> tuple[dict, dict]:
     """Return an immutable authorization and its content-free cost summary."""
-    prompts = deepcopy(all_prompts[WORKFLOW_NAME])
+    workflow_name, steps = blueprint_workflow(request.strategy)
+    prompts = deepcopy(all_prompts[workflow_name])
     plans: dict[str, dict] = {}
     providers = []
     maximum_tokens = 0
     token_bound_known = True
     max_attempts_by_step = {}
     providers_by_step = {}
-    for step in AI_CREATE_STEPS:
+    for step in steps:
         if step.key in candidates:
             continue
         for suffix in ("prompt_base", "prompt_with_schema_suffix", "prompt_without_schema_suffix"):
             if not isinstance(prompts.get(f"{step.resolved_config_key}_{suffix}"), str):
                 raise ValueError("Incomplete blueprint prompt definition")
-        plan = runtime.plan_structured(WorkflowStepTarget(WORKFLOW_NAME, step.resolved_config_key))
+        plan = runtime.plan_structured(WorkflowStepTarget(workflow_name, step.resolved_config_key))
         plans[step.key] = plan_record(plan)
         attempts = int(plan.max_semantic_attempts)
         if attempts < 1 or attempts > 16:
@@ -86,8 +86,8 @@ def prepare_blueprint_authorization(
         "schema_version": "blueprint_authorization.v1", "workflow_protocol": BLUEPRINT_WORKFLOW_PROTOCOL,
         "owner_id": owner_id, "draft_id": request.draft_id, "run_id": run_id,
         "request": request_record(request), "author_brief": workflow_params(request)["author_brief"],
-        "workflow_name": WORKFLOW_NAME, "strategy": request.strategy,
-        "step_order": [step.key for step in AI_CREATE_STEPS],
+        "workflow_name": workflow_name, "strategy": request.strategy,
+        "step_order": [step.key for step in steps],
         "generation_params": build_gen_kwargs(request), "transport_retries": 0,
         "plans": plans, "prompts": prompts, "prompt_revision": content_digest(prompts),
         "limits": {"maximum_provider_attempts": maximum_attempts,

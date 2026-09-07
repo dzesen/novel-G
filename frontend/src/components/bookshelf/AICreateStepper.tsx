@@ -5,7 +5,7 @@ import { useTranslations } from "next-intl";
 import { Button, Switch } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
 import BlueprintRunControls from "@/components/shared/BlueprintRunControls";
-import { blueprintGenerationParams, blueprintInputIdentity, type BlueprintRunRequest } from "@/lib/blueprintRunClient";
+import { blueprintStepOrder, blueprintGenerationParams, blueprintInputIdentity, type BlueprintRunRequest } from "@/lib/blueprintRunClient";
 import { normalizeAuthorConstraints } from "@/lib/authorInput";
 import { reportFormValidity } from "@/lib/formValidity";
 import AuthorConstraintsFields from "@/components/shared/AuthorConstraintsFields";
@@ -36,6 +36,7 @@ import type {
   AICreateStepKey,
   AuthorConstraints,
   BlueprintGenerationSource,
+  BlueprintStrategy,
   BlueprintExecutionRef,
   CardImportDirectionReference,
 } from "@/types/novel";
@@ -65,14 +66,14 @@ interface StepState {
   error?: string;
 }
 
-const STEPS: AICreateStepKey[] = ["expand_idea", "extract_idea", "core_seed", "novel_meta"];
+const STEPS: AICreateStepKey[] = [...blueprintStepOrder(), "blueprint"];
 
 function isStepKey(value: unknown): value is AICreateStepKey {
   return typeof value === "string" && STEPS.includes(value as AICreateStepKey);
 }
 
-function buildStepStates(cachedSteps: AICreateCachedSteps, failedStep?: AICreateStepKey): StepState[] {
-  return STEPS.map((key) => {
+function buildStepStates(cachedSteps: AICreateCachedSteps, failedStep?: AICreateStepKey, strategy: BlueprintStrategy = "four_step"): StepState[] {
+  return blueprintStepOrder(strategy).map((key) => {
     if (cachedSteps[key]) {
       return { key, status: "done", cached: true };
     }
@@ -87,6 +88,7 @@ function mergeStepData(
   current: AICreateCachedSteps,
   step: AICreateStepKey,
   data: unknown,
+  strategy: BlueprintStrategy,
 ): AICreateCachedSteps {
   const next: AICreateCachedSteps = { ...current };
 
@@ -99,12 +101,14 @@ function mergeStepData(
     next.core_seed = data as AICreateCachedSteps["core_seed"];
   } else if (step === "novel_meta") {
     next.novel_meta = data as AICreateCachedSteps["novel_meta"];
+  } else if (step === "blueprint") {
+    next.blueprint = data as AICreateCachedSteps["blueprint"];
   }
 
-  return trimCachedStepsToPrefix(next);
+  return trimCachedStepsToPrefix(next, strategy);
 }
 
-function mergePartialResult(current: AICreateCachedSteps, data: unknown): AICreateCachedSteps {
+function mergePartialResult(current: AICreateCachedSteps, data: unknown, strategy: BlueprintStrategy): AICreateCachedSteps {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return current;
   }
@@ -112,7 +116,7 @@ function mergePartialResult(current: AICreateCachedSteps, data: unknown): AICrea
   return trimCachedStepsToPrefix({
     ...current,
     ...(data as AICreateCachedSteps),
-  });
+  }, strategy);
 }
 
 export default function AICreateStepper({
@@ -127,6 +131,7 @@ export default function AICreateStepper({
     cardImports.length > 0 ? null : loadAICreateCache(),
   );
   const initialSteps = initialCache?.steps ?? {};
+  const [strategy, setStrategy] = useState<BlueprintStrategy>(initialCache?.input.strategy ?? "four_step");
   const initialCreativeDirection =
     initialCache?.input.creative_direction ?? null;
   const [idea, setIdea] = useState(
@@ -169,7 +174,7 @@ export default function AICreateStepper({
   const [allowFailureRetry, setAllowFailureRetry] = useState(false);
   const [cachedSteps, setCachedSteps] = useState<AICreateCachedSteps>(initialSteps);
   const [steps, setSteps] = useState<StepState[]>(
-    buildStepStates(initialSteps, initialCache?.failed_step),
+    buildStepStates(initialSteps, initialCache?.failed_step, strategy),
   );
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<AICreateResponse | null>(null);
@@ -220,6 +225,7 @@ export default function AICreateStepper({
     extract_idea: t("stepExtractIdea"),
     core_seed: t("stepCoreSeed"),
     novel_meta: t("stepNovelMeta"),
+    blueprint: t("stepBlueprint"),
   };
 
   const hasCachedSteps = hasAICreateCachedSteps(cachedSteps);
@@ -230,6 +236,7 @@ export default function AICreateStepper({
     nextWordsPerChapter = wordsPerChapter,
     nextCreativeDirection = directorEnabled ? confirmedDirection : null,
   ): AICreateCacheInput => ({
+    ...(strategy === "two_step" && { strategy }),
     user_idea: nextIdea.trim(),
     number_of_chapters: nextChapters,
     words_per_chapter: nextWordsPerChapter,
@@ -252,7 +259,7 @@ export default function AICreateStepper({
     boundInput.current = null;
     setResult(null);
     setCachedStepsState({});
-    setSteps(buildStepStates({}));
+    setSteps(buildStepStates({}, undefined, strategy));
   };
 
   const resetDirectorPreview = () => {
@@ -413,6 +420,7 @@ export default function AICreateStepper({
   };
 
   const sourceFromRun = (request: BlueprintRunRequest, ref: BlueprintExecutionRef): AICreateCacheInput => ({
+    ...(request.strategy && { strategy: request.strategy }),
     user_idea: request.user_idea,
     number_of_chapters: request.number_of_chapters ?? 100,
     words_per_chapter: request.words_per_chapter ?? 3000,
@@ -424,6 +432,7 @@ export default function AICreateStepper({
   });
   const currentInput = getCurrentInput();
   const generationRequest: BlueprintRunRequest = {
+    strategy,
     user_idea: currentInput.user_idea,
     number_of_chapters: chapters, words_per_chapter: wordsPerChapter,
     author_constraints: currentInput.author_constraints,
@@ -438,7 +447,7 @@ export default function AICreateStepper({
       const status = data.status as StepStatus;
       if (!["pending", "running", "done", "error"].includes(status)) return;
       if (status === "done" && data.data) {
-        const next = mergeStepData(cachedStepsRef.current, stepName, data.data);
+        const next = mergeStepData(cachedStepsRef.current, stepName, data.data, strategy);
         setCachedStepsState(next);
         saveAICreateCache(boundInput.current ?? getCurrentInput(), next);
       }
@@ -446,7 +455,7 @@ export default function AICreateStepper({
         ...step, status, cached: status === "done", error: typeof data.error === "string" ? data.error : undefined,
       } : step));
     } else if (event === "done" && data.partial_result) {
-      const next = mergePartialResult(cachedStepsRef.current, data.partial_result);
+      const next = mergePartialResult(cachedStepsRef.current, data.partial_result, strategy);
       setCachedStepsState(next);
       saveAICreateCache(boundInput.current ?? getCurrentInput(), next);
     }
@@ -949,10 +958,11 @@ export default function AICreateStepper({
         onRead={(run) => {
           if (blueprintInputIdentity(run.request) !== blueprintInputIdentity(generationRequest)) return;
           setCachedStepsState(run.cached_steps);
-          setSteps(buildStepStates(run.cached_steps));
+          setSteps(buildStepStates(run.cached_steps, undefined, run.request.strategy));
         }}
         onRestoreInput={(run) => {
           const input = sourceFromRun(run.request, run);
+          setStrategy(input.strategy ?? "four_step");
           setIdea(input.user_idea); setChapters(input.number_of_chapters); setWordsPerChapter(input.words_per_chapter);
           setAuthorConstraints(input.author_constraints ?? { must_keep: [], do_not_change: [], style_boundaries: [] });
           setConfirmedDirection(input.creative_direction); setDirectorEnabled(requireDirector || !!input.creative_direction);
@@ -962,7 +972,7 @@ export default function AICreateStepper({
           const params = input.generation_params;
           setTemperature(params?.temperature ?? null); setTopP(params?.top_p ?? null); setMaxTokens(params?.max_tokens ?? null);
           setPresencePenalty(params?.presence_penalty ?? null); setFrequencyPenalty(params?.frequency_penalty ?? null); setSystemPrompt(params?.system_prompt ?? null);
-          setCachedStepsState(run.cached_steps); setSteps(buildStepStates(run.cached_steps));
+          setCachedStepsState(run.cached_steps); setSteps(buildStepStates(run.cached_steps, undefined, input.strategy));
         }}
         onEvent={handleGenerationEvent}
         onComplete={(res, request, ref) => {
