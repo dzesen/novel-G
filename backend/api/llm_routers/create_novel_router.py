@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import json
 import logging
-from typing import Any, AsyncGenerator, Literal, Mapping
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
-from backend.novel_scale import ChapterCount, CreationIdea, WordsPerChapter
+from pydantic import Field
 
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
@@ -22,40 +19,32 @@ from backend.api.llm_routers._common import (
 )
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.db.repositories.novel_repository import novel_repo
-from backend.llm.config import get_llm_config
-from backend.llm.models import TokenUsage
-from backend.services.llm.workflow_runner import (
-    WorkflowDeps,
-    WorkflowStep,
-    run_workflow,
-)
 from backend.services.llm.generation_runtime import (
     PromptPlan,
-    AttemptUsage,
-    GenerationPlan,
     WorkflowStepTarget,
     create_generation_runtime,
     create_workflow_runtime,
 )
-from backend.services.llm.llm_service import LLMService
 from backend.services.llm.agent_orchestrator import CreativeDirectionSelection
 from backend.services.novel.faction_service import FactionService
 from backend.services.generation.author_brief import (
-    AuthorConstraints, creation_author_brief, novel_author_brief, render_author_brief_record,
+    novel_author_brief,
 )
 from backend.llm.prompts.prompt_selector import (
     CORE_FACTIONS_PROMPT_NAME,
     load_prompt_config,
 )
 from backend.llm.schemas.novel_pydantic import (
-    ExpandIdeaSchema,
-    ExtractIdeaSchema,
-    CoreSeedSchema,
     CoreFactionsResultSchema,
-    NovelMetaSchema,
 )
 
 from backend.api.default_routers.auth_router import require_owned_body_resource
+from backend.db.repositories.blueprint_run_repository import BlueprintRunConflict
+from backend.services.generation.blueprint_runs import BlueprintRunService
+from backend.services.generation.blueprint_workflow import (
+    AI_CREATE_STEPS, AICreateNovelRequest, BlueprintGenerationRequest,
+    BlueprintGenerationStartRequest, BlueprintResumeRequest,
+)
 
 router = APIRouter(
     prefix="/api/llm",
@@ -102,376 +91,6 @@ def _build_creation_idea(
 
 执行约束：不得在扩写、提炼、核心种子或小说设定步骤中擅自改换上述方向；
 如细节存在空白，应在不违背原始创意和已确认方向的前提下补全。""".strip()
-
-
-AI_CREATE_STEPS: tuple[WorkflowStep, ...] = (
-    WorkflowStep(
-        key="expand_idea",
-        # 唯一一个两套词汇不同名的步骤：另外三步恰好同名，这个区别极易被忽略。
-        config_key="expand_idea_to_full_novel_story",
-        schema=ExpandIdeaSchema,
-        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
-        prompt_args=lambda ctx: {"user_idea": ctx.params["user_idea"]},
-    ),
-    WorkflowStep(
-        key="extract_idea",
-        schema=ExtractIdeaSchema,
-        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
-        prompt_args=lambda ctx: {"plot": ctx.results["expand_idea"].plot},
-    ),
-    WorkflowStep(
-        key="core_seed",
-        schema=CoreSeedSchema,
-        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
-        prompt_args=lambda ctx: {
-            "plot": ctx.results["expand_idea"].plot,
-            "genre": ctx.results["extract_idea"].genre,
-            "tone": ctx.results["extract_idea"].tone,
-            "target_audience": ctx.results["extract_idea"].target_audience,
-            "core_idea": ctx.results["extract_idea"].core_idea,
-            "number_of_chapters": ctx.params["number_of_chapters"],
-            "words_per_chapter": ctx.params["words_per_chapter"],
-        },
-    ),
-    WorkflowStep(
-        key="novel_meta",
-        schema=NovelMetaSchema,
-        prompt_context=lambda ctx: render_author_brief_record(ctx.params["author_brief"]),
-        prompt_args=lambda ctx: {
-            "plot": ctx.results["expand_idea"].plot,
-            "genre": ctx.results["extract_idea"].genre,
-            "tone": ctx.results["extract_idea"].tone,
-            "target_audience": ctx.results["extract_idea"].target_audience,
-            "core_idea": ctx.results["extract_idea"].core_idea,
-            "number_of_chapters": ctx.params["number_of_chapters"],
-            "words_per_chapter": ctx.params["words_per_chapter"],
-            "core_seed": ctx.results["core_seed"].core_seed,
-        },
-    ),
-)
-
-AI_CREATE_STEP_ORDER: tuple[str, ...] = tuple(step.key for step in AI_CREATE_STEPS)
-
-
-class AICreateCachedSteps(BaseModel):
-    """AI 创建小说流程的可复用步骤缓存。
-
-    Args:
-        expand_idea: 已完成的扩写完整剧情结果。
-        extract_idea: 已完成的提炼创意结果。
-        core_seed: 已完成的故事核心结果。
-        novel_meta: 已完成的小说设定结果。
-
-    Returns:
-        请求体中的缓存步骤会被 Pydantic 校验为对应 schema 实例。
-    """
-
-    expand_idea: ExpandIdeaSchema | None = None
-    extract_idea: ExtractIdeaSchema | None = None
-    core_seed: CoreSeedSchema | None = None
-    novel_meta: NovelMetaSchema | None = None
-
-
-def _get_contiguous_cached_steps(cached_steps: AICreateCachedSteps | None) -> dict[str, BaseModel]:
-    """读取从第一步开始连续存在的缓存步骤。
-
-    Args:
-        cached_steps: 前端传入的可选缓存步骤。
-
-    Returns:
-        只包含连续前缀的缓存字典；中间断档后的缓存会被忽略，避免错误续跑。
-    """
-    if cached_steps is None:
-        return {}
-
-    prefix: dict[str, BaseModel] = {}
-    for step_name in AI_CREATE_STEP_ORDER:
-        cached_value = getattr(cached_steps, step_name)
-        if cached_value is None:
-            break
-        # 只信任连续前缀，后续步骤即使传入也会从断点重新生成。
-        prefix[step_name] = cached_value
-    return prefix
-
-
-class AICreateNovelRequest(GenerationParamsMixin):
-    user_idea: CreationIdea
-    number_of_chapters: ChapterCount = 100
-    words_per_chapter: WordsPerChapter = 3000
-    creative_direction: CreativeDirectionSelection | None = None
-    author_constraints: AuthorConstraints = Field(default_factory=AuthorConstraints)
-    cached_steps: AICreateCachedSteps | None = None
-
-    @model_validator(mode="after")
-    def validate_author_input(self):
-        creation_author_brief(self)
-        return self
-
-
-class BlueprintRegenerationRequest(AICreateNovelRequest):
-    """Whole-blueprint rerun with a fixed, explicitly budgeted authority."""
-
-    cached_steps: None = Field(default=None)
-    system_prompt: None = Field(default=None)
-    allow_failure_retry: Literal[False] = False
-    max_tokens: int = Field(default=16_384, ge=1, le=200_000)
-    token_budget: int | None = Field(default=None, ge=1, le=2**63 - 1)
-
-
-class BlueprintRegenerationStartRequest(BlueprintRegenerationRequest):
-    readiness_digest: str = Field(min_length=64, max_length=64)
-    acknowledge_automatic_token_budget: bool = False
-
-
-class _BlueprintBudgetBoundary(ValueError):
-    provider_request_not_dispatched = True
-
-
-class _BlueprintAttemptScope:
-    """Atomically reserve every Provider request inside one fixed workflow."""
-
-    def __init__(self, *, maximum_attempts: int, token_budget: int) -> None:
-        self.maximum_attempts = int(maximum_attempts)
-        self.token_budget = int(token_budget)
-        self._lock = asyncio.Lock()
-        self._claims: dict[str, tuple[str, str]] = {}
-        self._reservations: dict[str, int] = {}
-        self._attempts: dict[str, AttemptUsage] = {}
-        self._uncertain: set[str] = set()
-        self._consumed_tokens = 0
-
-    @property
-    def attempts(self) -> tuple[AttemptUsage, ...]:
-        return tuple(self._attempts.values())
-
-    @property
-    def claimed_attempt_ids(self) -> tuple[str, ...]:
-        return tuple(self._claims)
-
-    @property
-    def uncertain_attempt_ids(self) -> tuple[str, ...]:
-        return tuple(self._uncertain)
-
-    async def claim(self, provider_alias: str, phase: str) -> str:
-        return await self.claim_with_budget(provider_alias, phase, None)
-
-    async def claim_with_budget(
-        self,
-        provider_alias: str,
-        phase: str,
-        conservative_tokens: int | None,
-    ) -> str:
-        if (
-            conservative_tokens is None
-            or isinstance(conservative_tokens, bool)
-            or int(conservative_tokens) <= 0
-        ):
-            raise _BlueprintBudgetBoundary(
-                "blueprint generation has no conservative token bound"
-            )
-        bound = int(conservative_tokens)
-        async with self._lock:
-            if len(self._claims) >= self.maximum_attempts:
-                raise _BlueprintBudgetBoundary(
-                    "blueprint generation attempt capacity exhausted"
-                )
-            reserved = sum(self._reservations.values())
-            if self._consumed_tokens + reserved + bound > self.token_budget:
-                raise _BlueprintBudgetBoundary(
-                    "blueprint generation token budget exhausted before dispatch"
-                )
-            attempt_id = uuid4().hex
-            self._claims[attempt_id] = (str(provider_alias), str(phase))
-            self._reservations[attempt_id] = bound
-            return attempt_id
-
-    async def account(self, attempt_id: str, usage: TokenUsage) -> None:
-        async with self._lock:
-            if attempt_id in self._attempts:
-                return
-            provider_alias, phase = self._claims[attempt_id]
-            reserved = self._reservations.pop(attempt_id, 0)
-            actual = max(
-                int(usage.total_tokens or 0),
-                int(usage.input_tokens or 0) + int(usage.output_tokens or 0),
-            )
-            accounted = actual if actual > 0 else reserved
-            self._consumed_tokens += accounted
-            self._attempts[attempt_id] = AttemptUsage(
-                attempt_id=attempt_id,
-                provider_alias=provider_alias,
-                phase=phase,
-                usage=TokenUsage(
-                    input_tokens=max(0, int(usage.input_tokens or 0)),
-                    output_tokens=max(0, int(usage.output_tokens or 0)),
-                    total_tokens=accounted,
-                ),
-            )
-
-    async def mark_uncertain(self, attempt_id: str, reason: str) -> None:
-        del reason
-        async with self._lock:
-            if attempt_id in self._uncertain:
-                return
-            provider_alias, phase = self._claims[attempt_id]
-            reserved = self._reservations.pop(attempt_id, 0)
-            self._consumed_tokens += reserved
-            self._uncertain.add(attempt_id)
-            self._attempts[attempt_id] = AttemptUsage(
-                attempt_id=attempt_id,
-                provider_alias=provider_alias,
-                phase=phase,
-                usage=TokenUsage(total_tokens=reserved),
-                state="uncertain",
-            )
-
-    async def release_pre_dispatch(self, attempt_id: str, reason: str) -> None:
-        del reason
-        async with self._lock:
-            self._reservations.pop(attempt_id, None)
-            self._claims.pop(attempt_id, None)
-
-
-def _blueprint_regeneration_snapshot(
-    req: BlueprintRegenerationRequest,
-    *,
-    runtime,
-) -> tuple[
-    dict[str, Any],
-    dict[str, GenerationPlan],
-    dict[str, Any],
-]:
-    plans = {
-        step.key: runtime.plan_structured(
-            WorkflowStepTarget(WORKFLOW_NAME, step.resolved_config_key)
-        )
-        for step in AI_CREATE_STEPS
-    }
-    plan_items: list[dict[str, Any]] = []
-    maximum_provider_attempts = 0
-    maximum_tokens_total = 0
-    token_bound_known = True
-    for step in AI_CREATE_STEPS:
-        plan = plans[step.key]
-        output_bound = req.max_tokens or plan.max_output_tokens
-        context_bound = plan.max_context_tokens
-        attempts = int(plan.max_semantic_attempts)
-        maximum_provider_attempts += attempts
-        if output_bound is None or context_bound is None:
-            token_bound_known = False
-        else:
-            maximum_tokens_total += attempts * (
-                int(output_bound) + int(context_bound)
-            )
-        plan_items.append({
-            "step": step.key,
-            "provider_alias": plan.provider_alias,
-            "provider_model": plan.provider_model,
-            "mode": plan.mode.value,
-            "reviewer_alias": plan.reviewer_alias,
-            "config_revision": plan.config_revision,
-            "capability_snapshot": plan.capability_snapshot,
-            "maximum_attempts": attempts,
-            "max_output_tokens": output_bound,
-            "max_context_tokens": context_bound,
-        })
-    uses_system_token_budget = bool(
-        req.token_budget is None
-        and token_bound_known
-        and maximum_tokens_total > 0
-    )
-    effective_token_budget = (
-        maximum_tokens_total
-        if uses_system_token_budget
-        else req.token_budget
-    )
-    source = {
-        "author_brief": creation_author_brief(req).to_record(),
-        "user_idea": req.user_idea,
-        "number_of_chapters": req.number_of_chapters,
-        "words_per_chapter": req.words_per_chapter,
-        "creative_direction": (
-            req.creative_direction.model_dump(mode="json")
-            if req.creative_direction is not None
-            else None
-        ),
-    }
-    prompts = dict(_load_prompts().get(WORKFLOW_NAME, {}))
-    authorization_snapshot = {
-        "version": 2,
-        "workflow": "blueprint_regeneration",
-        "source": source,
-        "token_budget": effective_token_budget,
-        "uses_system_token_budget": uses_system_token_budget,
-        "generation_params": {
-            **build_gen_kwargs(req),
-            "allow_failure_retry": False,
-        },
-        "maximum_provider_attempts": maximum_provider_attempts,
-        "maximum_tokens_total": maximum_tokens_total,
-        "token_bound_known": token_bound_known,
-        "plans": plan_items,
-        "prompt_revision": hashlib.sha256(
-            json.dumps(
-                prompts,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest(),
-    }
-    digest = hashlib.sha256(
-        json.dumps(
-            authorization_snapshot,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    report = {
-        "version": 2,
-        "status": (
-            "blocked"
-            if not token_bound_known
-            else "warning_requires_ack"
-            if uses_system_token_budget
-            else "ready"
-        ),
-        "digest": digest,
-        "token_budget": effective_token_budget,
-        "uses_system_token_budget": uses_system_token_budget,
-        "maximum_provider_attempts": maximum_provider_attempts,
-        "maximum_tokens_total": maximum_tokens_total,
-        "token_bound_known": token_bound_known,
-        "budget_covers_conservative_maximum": bool(
-            token_bound_known
-            and effective_token_budget is not None
-            and effective_token_budget >= maximum_tokens_total
-        ),
-        "providers": [
-            {
-                "step": item["step"],
-                "provider_alias": item["provider_alias"],
-                "provider_model": item["provider_model"],
-                "maximum_attempts": item["maximum_attempts"],
-            }
-            for item in plan_items
-        ],
-        "issues": (
-            [{
-                "code": "blueprint_token_bound_unproven",
-                "level": "blocked",
-            }]
-            if not token_bound_known
-            else [{
-                "code": "automatic_token_budget_requires_confirmation",
-                "level": "warning_requires_ack",
-            }]
-            if uses_system_token_budget
-            else []
-        ),
-    }
-    return report, plans, prompts
 
 
 class GenerateCoreFactionsRequest(GenerationParamsMixin):
@@ -600,158 +219,90 @@ async def rewrite_novel_field(req: dict[str, Any]):
     )
 
 
+def _blueprint_service() -> BlueprintRunService:
+    return BlueprintRunService(runtime_factory=create_workflow_runtime, prompt_supplier=_load_prompts)
+
+
+def _blueprint_http_error(error: Exception) -> HTTPException:
+    if isinstance(error, InvalidIdError):
+        return HTTPException(status_code=400, detail={"code": "blueprint_identity_invalid", "message": "蓝图运行 ID 无效。"})
+    if isinstance(error, NotFoundError):
+        return HTTPException(status_code=404, detail={"code": "blueprint_run_not_found", "message": "蓝图运行不存在。"})
+    code = getattr(error, "code", "blueprint_plan_invalid")
+    messages = {
+        "blueprint_readiness_stale": "输入、Provider 或工作流计划已变化，请重新预检。",
+        "blueprint_result_uncertain": "前次请求结果未能确认，已保留完成步骤。请核查运行记录后决定是否重新生成。",
+        "blueprint_legacy_cache_not_authorized": "旧浏览器缓存没有绑定运行授权。请保留草稿并重新预检。",
+        "blueprint_run_already_running": "这个蓝图运行正在执行，请回到原运行。",
+        "blueprint_resume_required": "这个运行已经启动，请使用继续原运行。",
+        "blueprint_new_readiness_required": "前次运行已结束，请基于保留的步骤重新预检。",
+        "blueprint_source_run_must_stop": "请先停止来源运行，再使用它已完成的步骤。",
+        "blueprint_source_input_changed": "原始要求或草稿归属已变化，不能复用该运行的步骤。",
+        "automatic_token_budget_confirmation_required": "请先确认系统计算的 Token 消耗上界。",
+        "blueprint_uncertain_source_confirmation_required": "请先确认前次未知请求可能已经产生费用。",
+        "blueprint_token_bound_unproven": "当前 Provider 缺少可证明的 Token 上界。",
+    }
+    return HTTPException(status_code=409 if isinstance(error, BlueprintRunConflict) else 400,
+        detail={"code": code, "message": messages.get(code, "蓝图预检或运行暂不可用，请检查运行记录后重试。")})
+
+
+@router.post("/create-novel-by-ai/readiness")
 @router.post("/regenerate-blueprint/readiness")
-async def inspect_blueprint_regeneration_readiness(
-    req: BlueprintRegenerationRequest,
-) -> dict[str, Any]:
-    """Plan the fixed four-step rerun without dispatching a Provider request."""
+async def inspect_blueprint_regeneration_readiness(req: BlueprintGenerationRequest, request: Request) -> dict[str, Any]:
+    """Both creation entries share zero-paid, owner/draft-scoped planning."""
     try:
-        runtime = create_workflow_runtime(max_provider_retries=0)
-        report, _plans, _prompts = _blueprint_regeneration_snapshot(
-            req,
-            runtime=runtime,
-        )
-        return report
-    except Exception as exc:
-        logger.warning(
-            "[blueprint_regeneration] readiness planning failed type=%s",
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "blueprint_regeneration_plan_invalid",
-                "message": "当前 Provider 或工作流计划无法完成蓝图预检。",
-            },
-        ) from exc
+        return await _blueprint_service().inspect(req, request.state.actor.id)
+    except (ValueError, NotFoundError, InvalidIdError) as exc:
+        raise _blueprint_http_error(exc) from exc
+
+
+def _blueprint_stream(service: BlueprintRunService, run: dict, request: Request):
+    return StreamingResponse(service.stream(run, is_disconnected=request.is_disconnected),
+        media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @router.post("/regenerate-blueprint")
-async def regenerate_blueprint(
-    req: BlueprintRegenerationStartRequest,
-    request: Request,
-):
-    """Execute the exact zero-cost preview inside hard attempt/token ceilings."""
-    planning_runtime = create_workflow_runtime(max_provider_retries=0)
-    try:
-        report, plans, frozen_prompts = _blueprint_regeneration_snapshot(
-            req,
-            runtime=planning_runtime,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "blueprint_regeneration_readiness_stale",
-                "message": "Provider 或工作流计划已变化，请重新预检。",
-            },
-        ) from exc
-    if report["status"] == "blocked":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "blueprint_regeneration_token_bound_unproven",
-                "message": "当前 Provider 缺少可证明的 token 上界。",
-            },
-        )
-    if (
-        report["uses_system_token_budget"]
-        and not req.acknowledge_automatic_token_budget
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "automatic_token_budget_confirmation_required",
-                "message": "请先确认系统计算的 Token 消耗上界。",
-            },
-        )
-    if req.readiness_digest != report["digest"]:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "blueprint_regeneration_readiness_stale",
-                "message": "蓝图重新生成预检已过期，请重新检查后再启动。",
-            },
-        )
-
-    scope = _BlueprintAttemptScope(
-        maximum_attempts=int(report["maximum_provider_attempts"]),
-        token_budget=int(report["token_budget"]),
-    )
-    execution_runtime = create_workflow_runtime(
-        attempt_scope=scope,
-        max_provider_retries=0,
-    )
-
-    async def event_stream() -> AsyncGenerator[str, None]:
-        async for frame in run_workflow(
-            workflow_name=WORKFLOW_NAME,
-            steps=AI_CREATE_STEPS,
-            prompts=frozen_prompts,
-            params={
-                "author_brief": creation_author_brief(req).to_record(),
-                "user_idea": req.user_idea,
-                "number_of_chapters": req.number_of_chapters,
-                "words_per_chapter": req.words_per_chapter,
-            },
-            gen_kwargs=build_gen_kwargs(req),
-            cached={},
-            deps=WorkflowDeps(
-                runtime=execution_runtime,
-                structured_plans=plans,
-            ),
-            request_id=uuid4().hex[:8],
-            is_disconnected=request.is_disconnected,
-            log_partial_on_disconnect=False,
-        ):
-            yield frame
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
 @router.post("/create-novel-by-ai")
-async def create_novel_by_ai(req: AICreateNovelRequest, request: Request):
-    """4 步 LLM 管道（SSE 流式）：expand_idea → extract_idea → core_seed → novel_meta。
+async def create_novel_by_ai(req: BlueprintGenerationStartRequest, request: Request):
+    """Execute only the plan sealed by this owner/draft readiness."""
+    service = _blueprint_service()
+    try:
+        run = await service.start(req, request.state.actor.id)
+    except (ValueError, NotFoundError, InvalidIdError) as exc:
+        raise _blueprint_http_error(exc) from exc
+    return _blueprint_stream(service, run, request)
 
-    Args:
-        req: AI 创建小说请求，允许携带从第一步开始连续完成的 cached_steps。
-        request: 用于检测客户端断开，断开时会取消正在跑的 LLM 调用。
 
-    Returns:
-        SSE 响应；每一步通过 step 事件推送，结束时通过 done 事件返回结果或部分结果。
-    """
+@router.get("/blueprint-runs")
+async def list_blueprint_runs(request: Request, draft_id: str | None = None):
+    service = _blueprint_service()
+    runs = await service.repo.list_runs(request.state.actor.id, draft_id)
+    return {"data": [service.public_view(run, summary=True) for run in runs]}
 
-    async def event_stream() -> AsyncGenerator[str, None]:
-        # 依赖在此处装配而非模块级：这些名字在测试中会被 monkeypatch 到本模块上，
-        # 调用时再取才能拿到替身。
-        deps = WorkflowDeps(
-            runtime=create_workflow_runtime(**build_runtime_kwargs(req)),
-        )
-        async for frame in run_workflow(
-            workflow_name=WORKFLOW_NAME,
-            steps=AI_CREATE_STEPS,
-            prompts=_load_prompts().get(WORKFLOW_NAME, {}),
-            params={
-                "author_brief": creation_author_brief(req).to_record(),
-                "user_idea": req.user_idea,
-                "number_of_chapters": req.number_of_chapters,
-                "words_per_chapter": req.words_per_chapter,
-            },
-            gen_kwargs=build_gen_kwargs(req),
-            cached=_get_contiguous_cached_steps(req.cached_steps),
-            deps=deps,
-            request_id=uuid4().hex[:8],
-            is_disconnected=request.is_disconnected,
-            log_partial_on_disconnect=get_llm_config().log_partial_result_on_disconnect,
-        ):
-            yield frame
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+@router.get("/blueprint-runs/{run_id}")
+async def get_blueprint_run(run_id: str, request: Request):
+    service = _blueprint_service()
+    try:
+        return service.public_view(await service.repo.get_run(run_id, request.state.actor.id))
+    except (ValueError, NotFoundError, InvalidIdError) as exc:
+        raise _blueprint_http_error(exc) from exc
+
+
+@router.post("/blueprint-runs/{run_id}/resume")
+async def resume_blueprint_run(run_id: str, req: BlueprintResumeRequest, request: Request):
+    service = _blueprint_service()
+    try:
+        run = await service.resume(run_id, request.state.actor.id, req.readiness_digest)
+    except (ValueError, NotFoundError, InvalidIdError) as exc:
+        raise _blueprint_http_error(exc) from exc
+    return _blueprint_stream(service, run, request)
+
+
+@router.post("/blueprint-runs/{run_id}/pause")
+async def pause_blueprint_run(run_id: str, request: Request):
+    service = _blueprint_service()
+    try:
+        return service.public_view(await service.repo.request_pause(run_id, request.state.actor.id))
+    except (ValueError, NotFoundError, InvalidIdError) as exc:
+        raise _blueprint_http_error(exc) from exc

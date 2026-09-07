@@ -1397,6 +1397,19 @@ async def init_state_timeline_indexes():
         logger.error("初始化状态时间线索引失败：%s", exc)
 
 
+async def init_blueprint_run_indexes():
+    await get_database()[collections.BLUEPRINT_RUNS].create_indexes([
+        pymongo.IndexModel(
+            [("owner_id", 1), ("draft_id", 1), ("is_deleted", 1), ("created_at", -1), ("_id", -1)],
+            name="blueprint_owner_draft_history",
+        ),
+        pymongo.IndexModel(
+            [("owner_id", 1), ("is_deleted", 1), ("created_at", -1), ("_id", -1)],
+            name="blueprint_owner_history",
+        ),
+    ])
+
+
 async def init_all_indexes():
     """初始化所有数据库索引。"""
     await init_identity_indexes()
@@ -1416,6 +1429,7 @@ async def init_all_indexes():
     await init_character_state_indexes()
     await init_generation_job_indexes()
     await init_prose_run_indexes()
+    await init_blueprint_run_indexes()
     await init_prose_remediation_receipt_indexes()
     await init_state_candidate_repair_receipt_indexes()
     await init_reference_card_repair_receipt_indexes()

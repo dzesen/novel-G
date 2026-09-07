@@ -1,3 +1,4 @@
+import { normalizeBlueprintExecution, normalizeBlueprintParams } from "./blueprintRunClient.ts";
 import type { CreativeDirectionSelection } from "@/types/agent";
 import { normalizeAuthorConstraints } from "./authorInput.ts";
 import type {
@@ -122,11 +123,14 @@ export function normalizeBlueprintGenerationSource(
     value.creative_direction,
   );
   const cardImports = normalizeCardImports(value.card_imports);
+  if (value.generation_params !== undefined && !normalizeBlueprintParams(value.generation_params)) return null;
   const constraints = normalizeAuthorConstraints(value.author_constraints);
   if (constraints === null) return null;
   if (creativeDirection === undefined || cardImports === null) return null;
   return {
     schema_version: "blueprint_generation_source.v1",
+    ...(normalizeBlueprintExecution(value.execution) && { execution: normalizeBlueprintExecution(value.execution) }),
+    ...(normalizeBlueprintParams(value.generation_params) && { generation_params: normalizeBlueprintParams(value.generation_params) }),
     user_idea: value.user_idea.trim(),
     number_of_chapters: value.number_of_chapters,
     words_per_chapter: value.words_per_chapter,
@@ -214,6 +218,7 @@ export function buildBlueprintRegenerationRequest(
   source: BlueprintGenerationSource,
 ): AICreateRequest {
   return {
+    ...source.generation_params,
     user_idea: source.user_idea,
     number_of_chapters: source.number_of_chapters,
     words_per_chapter: source.words_per_chapter,
@@ -224,40 +229,16 @@ export function buildBlueprintRegenerationRequest(
   };
 }
 
-export function buildBlueprintRegenerationReadinessRequest(
-  source: BlueprintGenerationSource,
-  tokenBudget: number | null,
-) {
-  return {
-    ...buildBlueprintRegenerationRequest(source),
-    token_budget: tokenBudget,
-    allow_failure_retry: false,
-  };
-}
-
-export function buildBlueprintRegenerationStartRequest(
-  source: BlueprintGenerationSource,
-  tokenBudget: number | null,
-  readinessDigest: string,
-  acknowledgeAutomaticTokenBudget = false,
-) {
-  return {
-    ...buildBlueprintRegenerationRequest(source),
-    token_budget: tokenBudget,
-    readiness_digest: readinessDigest,
-    acknowledge_automatic_token_budget: acknowledgeAutomaticTokenBudget,
-    allow_failure_retry: false,
-  };
-}
-
 /** 把已确认的新候选作为一个整体写回，同时保留来源绑定与非生成设置。 */
 export function applyRegeneratedBlueprint(
   draft: WritingDraft,
   result: AICreateResponse,
+  source?: BlueprintGenerationSource,
 ): WritingDraft {
   const meta = result.novel_meta;
   return {
     ...draft,
+    ...(source && { _generationSource: source }),
     _fromAI: true,
     title: meta.title,
     subtitle: meta.subtitle,

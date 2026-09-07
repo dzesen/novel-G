@@ -4138,5 +4138,33 @@
       "degraded_job_reference_drop_evidence": "Historical job dropped character references",
       "unknown_legacy": "Legacy evidence is insufficient"
     }
+  },
+  "blueprintRun": {
+    "title": "Generation authorization and recovery",
+    "description": "Preflight makes no model calls. Confirm a bounded run; completed steps and usage are saved on the server.",
+    "failed": "The blueprint did not finish. Read its run status.",
+    "statusLabel": "{status} · {count} steps saved",
+    "spent": "Cumulative: {calls} calls, {tokens} tokens accounted, and {reserved} tokens still reserved.",
+    "uncertain": "The previous request may have incurred a charge, but its result is unconfirmed. Review it before a new preflight; it will not be sent again automatically.",
+    "differentInput": "This run used different author inputs or generation parameters.",
+    "refresh": "Read latest status",
+    "restoreInput": "Restore this run’s inputs",
+    "openResult": "View completed blueprint",
+    "resume": "Resume original run",
+    "pause": "Request pause",
+    "reuse": "Reuse this run’s completed steps in the next preflight. Uncheck to generate from the beginning.",
+    "sourceCost": "Reusing {steps} steps; prior totals of {calls} calls and {tokens} tokens remain recorded.",
+    "ackUnknown": "I reviewed the unconfirmed result and understand that a new run may incur additional charges.",
+    "history": "Find saved runs",
+    "emptyHistory": "No saved runs.",
+    "inspectRun": "Inspect run",
+    "status": {
+      "ready": "Awaiting authorization",
+      "running": "Running",
+      "paused": "Paused",
+      "completed": "Completed",
+      "failed": "Failed",
+      "uncertain": "Needs review"
+    }
   }
 }

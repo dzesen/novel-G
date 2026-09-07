@@ -1,3 +1,4 @@
+import { normalizeBlueprintExecution, normalizeBlueprintParams } from "@/lib/blueprintRunClient";
 import type { AICreateCachedSteps, AICreateStepKey } from "@/types/novel";
 import type { CreativeDirectionSelection } from "@/types/agent";
 import { buildUserStorageKey } from "@/lib/userStorage";
@@ -113,6 +114,7 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   }
 
   const userIdea = value.user_idea;
+  if (value.generation_params !== undefined && !normalizeBlueprintParams(value.generation_params)) return null;
   const constraints = normalizeAuthorConstraints(value.author_constraints);
   if (constraints === null) return null;
   const chapters = value.number_of_chapters;
@@ -160,6 +162,8 @@ function normalizeInput(value: unknown): AICreateCacheInput | null {
   }
 
   return {
+    ...(normalizeBlueprintExecution(value.execution) && { execution: normalizeBlueprintExecution(value.execution) }),
+    ...(normalizeBlueprintParams(value.generation_params) && { generation_params: normalizeBlueprintParams(value.generation_params) }),
     user_idea: userIdea,
     number_of_chapters: chapters,
     words_per_chapter: wordsPerChapter,

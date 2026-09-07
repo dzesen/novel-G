@@ -4138,5 +4138,33 @@
       "degraded_job_reference_drop_evidence": "历史作业显示人物引用被清理",
       "unknown_legacy": "旧数据证据不足"
     }
+  },
+  "blueprintRun": {
+    "title": "生成授权与恢复",
+    "description": "预检不会调用模型。确认后按本次上界执行，已完成步骤和调用记录会保存在服务端。",
+    "failed": "蓝图生成未完成，请读取运行状态。",
+    "statusLabel": "{status} · 已保存 {count} 个步骤",
+    "spent": "累计调用 {calls} 次，已记账 {tokens} Token，另有 {reserved} Token 仍在预留。",
+    "uncertain": "前次请求可能已产生费用，结果尚未确认。请核查后重新预检，不会自动重复请求。",
+    "differentInput": "这条运行使用的输入或生成参数与当前表单不同。",
+    "refresh": "读取最新状态",
+    "restoreInput": "恢复这次运行的输入",
+    "openResult": "查看已完成蓝图",
+    "resume": "继续原运行",
+    "pause": "请求暂停",
+    "reuse": "重新预检时复用这条运行已完成的步骤；取消勾选则从头生成。",
+    "sourceCost": "复用 {steps} 个步骤；此前累计调用 {calls} 次、{tokens} Token 将继续保留。",
+    "ackUnknown": "我已核查前次未知结果，并确认新运行可能产生额外费用。",
+    "history": "找回运行记录",
+    "emptyHistory": "暂无运行记录。",
+    "inspectRun": "查看运行",
+    "status": {
+      "ready": "待授权",
+      "running": "执行中",
+      "paused": "已暂停",
+      "completed": "已完成",
+      "failed": "已失败",
+      "uncertain": "结果待核查"
+    }
   }
 }

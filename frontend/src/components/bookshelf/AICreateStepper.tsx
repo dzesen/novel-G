@@ -3,8 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button, Switch } from "@heroui/react";
-import { apiGet, apiPost, apiPostSSE, SSEError } from "@/lib/api";
-import { blueprintGenerationStream } from "@/lib/generationStreamContracts";
+import { apiGet, apiPost } from "@/lib/api";
+import BlueprintRunControls from "@/components/shared/BlueprintRunControls";
+import { blueprintGenerationParams, blueprintInputIdentity, type BlueprintRunRequest } from "@/lib/blueprintRunClient";
 import { normalizeAuthorConstraints } from "@/lib/authorInput";
 import { reportFormValidity } from "@/lib/formValidity";
 import AuthorConstraintsFields from "@/components/shared/AuthorConstraintsFields";
@@ -17,7 +18,6 @@ import {
 import {
   clearAICreateCache,
   hasAICreateCachedSteps,
-  isSameAICreateInput,
   loadAICreateCache,
   saveAICreateCache,
   trimCachedStepsToPrefix,
@@ -36,6 +36,7 @@ import type {
   AICreateStepKey,
   AuthorConstraints,
   BlueprintGenerationSource,
+  BlueprintExecutionRef,
   CardImportDirectionReference,
 } from "@/types/novel";
 import type {
@@ -121,7 +122,6 @@ export default function AICreateStepper({
   initialIdea = "",
 }: AICreateStepperProps) {
   const t = useTranslations("create");
-  const tStream = useTranslations("streamErrors");
   const tAuthor = useTranslations("authorInput");
   const [initialCache] = useState(() =>
     cardImports.length > 0 ? null : loadAICreateCache(),
@@ -160,13 +160,13 @@ export default function AICreateStepper({
   const [directorAgentError, setDirectorAgentError] = useState("");
   const [directorError, setDirectorError] = useState("");
   const [showGenParams, setShowGenParams] = useState(false);
-  const [temperature, setTemperature] = useState<number | null>(null);
-  const [topP, setTopP] = useState<number | null>(null);
-  const [maxTokens, setMaxTokens] = useState<number | null>(null);
-  const [presencePenalty, setPresencePenalty] = useState<number | null>(null);
-  const [frequencyPenalty, setFrequencyPenalty] = useState<number | null>(null);
-  const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
-  const [allowFailureRetry, setAllowFailureRetry] = useState(true);
+  const [temperature, setTemperature] = useState<number | null>(initialCache?.input.generation_params?.temperature ?? null);
+  const [topP, setTopP] = useState<number | null>(initialCache?.input.generation_params?.top_p ?? null);
+  const [maxTokens, setMaxTokens] = useState<number | null>(initialCache?.input.generation_params?.max_tokens ?? null);
+  const [presencePenalty, setPresencePenalty] = useState<number | null>(initialCache?.input.generation_params?.presence_penalty ?? null);
+  const [frequencyPenalty, setFrequencyPenalty] = useState<number | null>(initialCache?.input.generation_params?.frequency_penalty ?? null);
+  const [systemPrompt, setSystemPrompt] = useState<string | null>(initialCache?.input.generation_params?.system_prompt ?? null);
+  const [allowFailureRetry, setAllowFailureRetry] = useState(false);
   const [cachedSteps, setCachedSteps] = useState<AICreateCachedSteps>(initialSteps);
   const [steps, setSteps] = useState<StepState[]>(
     buildStepStates(initialSteps, initialCache?.failed_step),
@@ -174,18 +174,15 @@ export default function AICreateStepper({
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<AICreateResponse | null>(null);
   const cachedStepsRef = useRef<AICreateCachedSteps>(initialSteps);
-  const generationRequestRef = useRef<AbortController | null>(null);
-  const generationEpochRef = useRef(0);
+  const [execution, setExecution] = useState<BlueprintExecutionRef | undefined>(initialCache?.input.execution);
+  const boundInput = useRef<AICreateCacheInput | null>(initialCache?.input ?? null);
   const directorRequestRef = useRef<AbortController | null>(null);
   const directorEpochRef = useRef(0);
   const inputFormRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => () => {
-    generationEpochRef.current += 1;
     directorEpochRef.current += 1;
-    generationRequestRef.current?.abort();
     directorRequestRef.current?.abort();
-    generationRequestRef.current = null;
     directorRequestRef.current = null;
   }, []);
 
@@ -225,7 +222,6 @@ export default function AICreateStepper({
     novel_meta: t("stepNovelMeta"),
   };
 
-  const hasFailedStep = steps.some((step) => step.status === "error");
   const hasCachedSteps = hasAICreateCachedSteps(cachedSteps);
 
   const getCurrentInput = (
@@ -239,6 +235,8 @@ export default function AICreateStepper({
     words_per_chapter: nextWordsPerChapter,
     creative_direction: nextCreativeDirection,
     card_imports: cardImports,
+    generation_params: blueprintGenerationParams({ user_idea: nextIdea, temperature, top_p: topP, max_tokens: maxTokens, presence_penalty: presencePenalty, frequency_penalty: frequencyPenalty, system_prompt: systemPrompt }),
+    ...(execution && { execution }),
     author_constraints: normalizeAuthorConstraints(authorConstraints) ?? authorConstraints,
   });
 
@@ -248,11 +246,10 @@ export default function AICreateStepper({
   };
 
   const resetGenerationState = () => {
-    generationEpochRef.current += 1;
-    generationRequestRef.current?.abort();
-    generationRequestRef.current = null;
     setIsRunning(false);
     clearAICreateCache();
+    setExecution(undefined);
+    boundInput.current = null;
     setResult(null);
     setCachedStepsState({});
     setSteps(buildStepStates({}));
@@ -415,133 +412,45 @@ export default function AICreateStepper({
     );
   };
 
-  const startGeneration = async () => {
-    if (!reportFormValidity(inputFormRef.current)) return;
-    const input = getCurrentInput();
-    if (generationRequestRef.current || !input.user_idea || (directorEnabled && !input.creative_direction)) {
-      return;
-    }
-
-    const controller = new AbortController();
-    generationRequestRef.current = controller;
-    const epoch = ++generationEpochRef.current;
-    const isCurrent = () => generationRequestRef.current === controller
-      && generationEpochRef.current === epoch && !controller.signal.aborted;
-
-    const storedCache = loadAICreateCache();
-    const reusableCachedSteps = storedCache && isSameAICreateInput(storedCache, input)
-      ? storedCache.steps
-      : cachedStepsRef.current;
-    const normalizedCachedSteps = trimCachedStepsToPrefix(reusableCachedSteps);
-
-    setIsRunning(true);
-    setResult(null);
-    setCachedStepsState(normalizedCachedSteps);
-    setSteps(buildStepStates(normalizedCachedSteps));
-
-    const payload: AICreateRequest = {
-      user_idea: input.user_idea,
-      author_constraints: input.author_constraints,
-      number_of_chapters: input.number_of_chapters,
-      words_per_chapter: input.words_per_chapter,
-      ...(input.creative_direction && {
-        creative_direction: input.creative_direction,
-      }),
-      ...(hasAICreateCachedSteps(normalizedCachedSteps) && { cached_steps: normalizedCachedSteps }),
-      ...(temperature != null && { temperature }),
-      ...(topP != null && { top_p: topP }),
-      ...(maxTokens != null && { max_tokens: maxTokens }),
-      ...(presencePenalty != null && { presence_penalty: presencePenalty }),
-      ...(frequencyPenalty != null && { frequency_penalty: frequencyPenalty }),
-      ...(systemPrompt != null && { system_prompt: systemPrompt }),
-      allow_failure_retry: allowFailureRetry,
-    };
-
-    try {
-      await apiPostSSE(
-        "/api/llm/create-novel-by-ai",
-        payload,
-        (event, data) => {
-          if (!isCurrent()) return;
-          if (event === "step") {
-            const stepName = data.step;
-            const status = data.status as StepStatus;
-            if (!isStepKey(stepName)) {
-              return;
-            }
-
-            if (status === "done" && data.data) {
-              const nextCachedSteps = mergeStepData(cachedStepsRef.current, stepName, data.data);
-              setCachedStepsState(nextCachedSteps);
-              saveAICreateCache(input, nextCachedSteps);
-            } else if (status === "error") {
-              saveAICreateCache(input, cachedStepsRef.current, stepName);
-            }
-
-            setSteps((prev) =>
-              prev.map((step) =>
-                step.key === stepName
-                  ? {
-                      ...step,
-                      status,
-                      cached: status === "done" ? true : step.cached && status !== "running",
-                      error: typeof data.error === "string" ? data.error : undefined,
-                    }
-                  : step,
-              ),
-            );
-          } else if (event === "done") {
-            const failedStep = isStepKey(data.failed_step) ? data.failed_step : undefined;
-            if (data.partial_result) {
-              const nextCachedSteps = mergePartialResult(cachedStepsRef.current, data.partial_result);
-              setCachedStepsState(nextCachedSteps);
-              saveAICreateCache(input, nextCachedSteps, failedStep);
-            }
-
-            if (data.success && data.result) {
-              const res = data.result as AICreateResponse;
-              setResult(res);
-              onComplete(res, {
-                schema_version: "blueprint_generation_source.v1",
-                ...input,
-              });
-            }
-          }
-        },
-        { ...blueprintGenerationStream, signal: controller.signal },
-      );
-    } catch (err) {
-      if (!isCurrent()) return;
-      // 网络或浏览器层异常没有后端 step 事件，只能标记当前第一个未完成步骤。
-      setSteps((prev) => {
-        const firstPending = prev.findIndex(
-          (step) => step.status === "pending" || step.status === "running",
-        );
-        if (firstPending < 0) return prev;
-        const failedStep = prev[firstPending].key;
-        saveAICreateCache(input, cachedStepsRef.current, failedStep);
-        return prev.map((step, index) =>
-          index === firstPending
-            ? { ...step, status: "error", error: err instanceof SSEError
-              ? tStream(err.code) : err instanceof Error ? err.message : String(err) }
-            : step,
-        );
-      });
-    } finally {
-      if (generationRequestRef.current === controller) {
-        generationRequestRef.current = null;
-        setIsRunning(false);
+  const sourceFromRun = (request: BlueprintRunRequest, ref: BlueprintExecutionRef): AICreateCacheInput => ({
+    user_idea: request.user_idea,
+    number_of_chapters: request.number_of_chapters ?? 100,
+    words_per_chapter: request.words_per_chapter ?? 3000,
+    author_constraints: request.author_constraints,
+    creative_direction: request.creative_direction ?? null,
+    card_imports: request.card_imports ?? [],
+    generation_params: blueprintGenerationParams(request as AICreateRequest),
+    execution: ref,
+  });
+  const currentInput = getCurrentInput();
+  const generationRequest: BlueprintRunRequest = {
+    user_idea: currentInput.user_idea,
+    number_of_chapters: chapters, words_per_chapter: wordsPerChapter,
+    author_constraints: currentInput.author_constraints,
+    creative_direction: currentInput.creative_direction,
+    card_imports: cardImports,
+    ...currentInput.generation_params,
+    ...(execution && { draft_id: execution.draft_id }),
+  };
+  const handleGenerationEvent = (event: string, data: Record<string, unknown>) => {
+    if (event === "step" && isStepKey(data.step)) {
+      const stepName = data.step;
+      const status = data.status as StepStatus;
+      if (!["pending", "running", "done", "error"].includes(status)) return;
+      if (status === "done" && data.data) {
+        const next = mergeStepData(cachedStepsRef.current, stepName, data.data);
+        setCachedStepsState(next);
+        saveAICreateCache(boundInput.current ?? getCurrentInput(), next);
       }
+      setSteps((previous) => previous.map((step) => step.key === stepName ? {
+        ...step, status, cached: status === "done", error: typeof data.error === "string" ? data.error : undefined,
+      } : step));
+    } else if (event === "done" && data.partial_result) {
+      const next = mergePartialResult(cachedStepsRef.current, data.partial_result);
+      setCachedStepsState(next);
+      saveAICreateCache(boundInput.current ?? getCurrentInput(), next);
     }
   };
-
-  const buttonLabel = isRunning
-    ? t("generating")
-    : hasFailedStep
-      ? t("retryFailedStep")
-      : hasCachedSteps
-        ? t("continueAI")
-        : t("startAI");
 
   const displayedDirections = directorPreview?.result.directions ??
     (confirmedDirection ? [confirmedDirection.direction] : []);
@@ -911,7 +820,7 @@ export default function AICreateStepper({
           {t("genParams.title")}
         </button>
         {showGenParams && (
-          <div className="border border-border rounded-lg p-4 mt-1 space-y-3 bg-surface-secondary/30">
+          <fieldset disabled={isRunning || isDirecting} className="border border-border rounded-lg p-4 mt-1 space-y-3 bg-surface-secondary/30">
             <p className="text-xs text-muted">{t("genParams.hint")}</p>
 
             <OptionalSliderParam
@@ -933,14 +842,14 @@ export default function AICreateStepper({
               value={maxTokens}
               onToggle={(on) => setMaxTokens(on ? 4096 : null)}
               onValueChange={setMaxTokens}
-              min={256} max={1000000} step={256}
+              min={1} max={200000} step={1}
             />
-            <SwitchParam
+            {directorEnabled && <SwitchParam
               label={t("genParams.allowFailureRetry")}
               description={t("genParams.allowFailureRetryHint")}
               value={allowFailureRetry}
               onChange={setAllowFailureRetry}
-            />
+            />}
             <OptionalSliderParam
               label={t("genParams.presencePenalty")}
               value={presencePenalty}
@@ -962,7 +871,7 @@ export default function AICreateStepper({
               onValueChange={setSystemPrompt}
               placeholder={t("genParams.systemPromptPlaceholder")}
             />
-          </div>
+          </fieldset>
         )}
       </div>
 
@@ -1023,15 +932,44 @@ export default function AICreateStepper({
         </div>
       )}
 
-      {/* Start Button */}
-      <Button
-        variant="primary"
-        className="w-full"
-        isDisabled={directorLocked || !idea.trim() || requiresDirection}
-        onPress={startGeneration}
-      >
-        {requiresDirection ? t("director.confirmFirst") : buttonLabel}
-      </Button>
+      {requiresDirection && <p className="text-xs text-muted">{t("director.confirmFirst")}</p>}
+      <BlueprintRunControls
+        entry="create-novel-by-ai"
+        request={generationRequest}
+        initialRunId={execution?.run_id}
+        disabled={isDirecting || !idea.trim() || requiresDirection}
+        validateInput={() => reportFormValidity(inputFormRef.current)}
+        onBusyChange={setIsRunning}
+        onBound={(ref, request) => {
+          setExecution(ref);
+          const input = sourceFromRun(request, ref);
+          boundInput.current = input;
+          saveAICreateCache(input, cachedStepsRef.current);
+        }}
+        onRead={(run) => {
+          if (blueprintInputIdentity(run.request) !== blueprintInputIdentity(generationRequest)) return;
+          setCachedStepsState(run.cached_steps);
+          setSteps(buildStepStates(run.cached_steps));
+        }}
+        onRestoreInput={(run) => {
+          const input = sourceFromRun(run.request, run);
+          setIdea(input.user_idea); setChapters(input.number_of_chapters); setWordsPerChapter(input.words_per_chapter);
+          setAuthorConstraints(input.author_constraints ?? { must_keep: [], do_not_change: [], style_boundaries: [] });
+          setConfirmedDirection(input.creative_direction); setDirectorEnabled(requireDirector || !!input.creative_direction);
+          setSelectedDirectorId(input.creative_direction?.agent_id ?? "creative_director");
+          setDirectorPreview(null); setSelectedDirectionIndex(input.creative_direction ? 0 : null);
+          setDirectorAdjustments(input.creative_direction?.user_adjustments ?? "");
+          const params = input.generation_params;
+          setTemperature(params?.temperature ?? null); setTopP(params?.top_p ?? null); setMaxTokens(params?.max_tokens ?? null);
+          setPresencePenalty(params?.presence_penalty ?? null); setFrequencyPenalty(params?.frequency_penalty ?? null); setSystemPrompt(params?.system_prompt ?? null);
+          setCachedStepsState(run.cached_steps); setSteps(buildStepStates(run.cached_steps));
+        }}
+        onEvent={handleGenerationEvent}
+        onComplete={(res, request, ref) => {
+          setResult(res);
+          onComplete(res, { schema_version: "blueprint_generation_source.v1", ...sourceFromRun(request, ref) });
+        }}
+      />
     </div>
   );
 }

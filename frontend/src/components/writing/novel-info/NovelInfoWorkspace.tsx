@@ -24,6 +24,7 @@ import { reportFormValidity } from "@/lib/formValidity";
 import { applyRegeneratedBlueprint } from "@/lib/blueprintGeneration";
 import type {
   AICreateResponse,
+  BlueprintGenerationSource,
   CreateNovelRequest,
   NovelDetail,
   WritingDraft,
@@ -256,11 +257,12 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
     updateCreateData((prev) => ({ ...prev, [field]: value }));
   };
 
-  const handleAcceptRegeneratedBlueprint = (candidate: AICreateResponse) => {
+  const handleAcceptRegeneratedBlueprint = (candidate: AICreateResponse, source: BlueprintGenerationSource) => {
     updateCreateData((prev) =>
       applyRegeneratedBlueprint(
         prev as unknown as WritingDraft,
         candidate,
+        source,
       ) as unknown as Record<string, unknown>,
     );
   };
@@ -448,6 +450,7 @@ export default function NovelInfoWorkspace({ mode, novelId }: NovelInfoWorkspace
           <BlueprintRegenerationPanel
             draft={data as unknown as WritingDraft}
             onAccept={handleAcceptRegeneratedBlueprint}
+            onBound={(execution) => updateCreateData((prev) => ({ ...prev, _blueprintRun: execution }))}
           />
         )}
       </div>

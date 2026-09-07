@@ -1,3 +1,4 @@
+import { blueprintInputIdentity } from "./blueprintRunClient.ts";
 import type { BlueprintGenerationSource } from "@/types/novel";
 import { normalizeAuthorConstraints } from "./authorInput.ts";
 
@@ -17,6 +18,7 @@ export function isSameAICreateInput(
 ): boolean {
   return (
     record?.input.user_idea === input.user_idea &&
+    blueprintInputIdentity({ ...record.input, ...record.input.generation_params }) === blueprintInputIdentity({ ...input, ...input.generation_params }) &&
     record.input.number_of_chapters === input.number_of_chapters &&
     record.input.words_per_chapter === input.words_per_chapter &&
     normalizeAuthorConstraints(record.input.author_constraints) !== null &&

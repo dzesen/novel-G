@@ -8,45 +8,28 @@ import {
 } from "react";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
-import { apiPost, apiPostSSE, SSEError } from "@/lib/api";
-import { blueprintGenerationStream } from "@/lib/generationStreamContracts";
+import BlueprintRunControls from "@/components/shared/BlueprintRunControls";
+import { blueprintGenerationParams, normalizeBlueprintExecution } from "@/lib/blueprintRunClient";
 import {
-  buildBlueprintRegenerationReadinessRequest,
-  buildBlueprintRegenerationStartRequest,
+  buildBlueprintRegenerationRequest,
   inspectBlueprintRegeneration,
 } from "@/lib/blueprintGeneration";
 import type {
   AICreateResponse,
   AICreateStepKey,
   WritingDraft,
+  BlueprintGenerationSource,
+  BlueprintExecutionRef,
 } from "@/types/novel";
 
 interface BlueprintRegenerationPanelProps {
   draft: WritingDraft;
-  onAccept: (candidate: AICreateResponse) => void;
+  onAccept: (candidate: AICreateResponse, source: BlueprintGenerationSource) => void;
+  onBound: (execution: BlueprintExecutionRef) => void;
 }
 
 type DialogStage = "confirm" | "running" | "review";
 type StepStatus = "pending" | "running" | "done" | "error";
-
-interface BlueprintRegenerationReadiness {
-  version: 2;
-  status: "ready" | "warning_requires_ack" | "blocked";
-  digest: string;
-  token_budget: number | null;
-  uses_system_token_budget: boolean;
-  maximum_provider_attempts: number;
-  maximum_tokens_total: number;
-  token_bound_known: boolean;
-  budget_covers_conservative_maximum: boolean;
-  providers: Array<{
-    step: AICreateStepKey;
-    provider_alias: string;
-    provider_model: string;
-    maximum_attempts: number;
-  }>;
-  issues: Array<{ code: string; level: string }>;
-}
 
 const FOCUSABLE_SELECTOR = [
   "button:not([disabled])",
@@ -74,9 +57,9 @@ function isStepKey(value: unknown): value is AICreateStepKey {
 export default function BlueprintRegenerationPanel({
   draft,
   onAccept,
+  onBound,
 }: BlueprintRegenerationPanelProps) {
   const t = useTranslations("writing.novelInfo.regeneration");
-  const tStream = useTranslations("streamErrors");
   const inspection = inspectBlueprintRegeneration(draft);
   const originSupportsRegeneration =
     draft._creationOrigin === "ai_idea" ||
@@ -87,14 +70,8 @@ export default function BlueprintRegenerationPanel({
   const headingRef = useRef<HTMLHeadingElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const [stage, setStage] = useState<DialogStage>("confirm");
-  const [tokenBudget, setTokenBudget] = useState("");
-  const [readiness, setReadiness] =
-    useState<BlueprintRegenerationReadiness | null>(null);
-  const [readinessLoading, setReadinessLoading] = useState(false);
-  const [automaticBudgetConfirmed, setAutomaticBudgetConfirmed] =
-    useState(false);
   const [candidate, setCandidate] = useState<AICreateResponse | null>(null);
-  const [error, setError] = useState("");
+  const [candidateSource, setCandidateSource] = useState<BlueprintGenerationSource | null>(null);
   const [stepStatuses, setStepStatuses] = useState<
     Record<AICreateStepKey, StepStatus>
   >(() => ({
@@ -103,15 +80,6 @@ export default function BlueprintRegenerationPanel({
     core_seed: "pending",
     novel_meta: "pending",
   }));
-
-  const parsedTokenBudget = tokenBudget === ""
-    ? null
-    : /^\d+$/.test(tokenBudget)
-      ? Number(tokenBudget)
-      : Number.NaN;
-  const validTokenBudget = parsedTokenBudget === null || (
-    Number.isSafeInteger(parsedTokenBudget) && parsedTokenBudget > 0
-  );
 
   useEffect(() => {
     if (!open) return;
@@ -123,12 +91,8 @@ export default function BlueprintRegenerationPanel({
   const openDialog = () => {
     returnFocusRef.current = document.activeElement as HTMLElement | null;
     setStage("confirm");
-    setTokenBudget("");
-    setReadiness(null);
-    setReadinessLoading(false);
-    setAutomaticBudgetConfirmed(false);
     setCandidate(null);
-    setError("");
+    setCandidateSource(null);
     setStepStatuses({
       expand_idea: "pending",
       extract_idea: "pending",
@@ -173,109 +137,9 @@ export default function BlueprintRegenerationPanel({
     }
   };
 
-  const inspectReadiness = async () => {
-    const currentInspection = inspectBlueprintRegeneration(draft);
-    if (!currentInspection.allowed || !validTokenBudget) return;
-    setReadinessLoading(true);
-    setReadiness(null);
-    setError("");
-    try {
-      const report = await apiPost<BlueprintRegenerationReadiness>(
-        "/api/llm/regenerate-blueprint/readiness",
-        buildBlueprintRegenerationReadinessRequest(
-          currentInspection.source,
-          parsedTokenBudget,
-        ),
-      );
-      setReadiness(report);
-      setAutomaticBudgetConfirmed(false);
-      if (report.status === "blocked") {
-        setError(t("readinessBlocked"));
-      }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : t("readinessFailed"));
-    } finally {
-      setReadinessLoading(false);
-    }
-  };
-
-  const startRegeneration = async () => {
-    const currentInspection = inspectBlueprintRegeneration(draft);
-    if (!currentInspection.allowed) {
-      setError(t(`blocked.${currentInspection.blocked_code}`));
-      return;
-    }
-    if (!readiness || readiness.status === "blocked" || !validTokenBudget) {
-      setError(t("readinessRequired"));
-      return;
-    }
-    if (readiness.uses_system_token_budget && !automaticBudgetConfirmed) {
-      setError(t("automaticBudgetConfirmationRequired"));
-      return;
-    }
-
-    setError("");
-    setCandidate(null);
-    setStage("running");
-    setStepStatuses({
-      expand_idea: "pending",
-      extract_idea: "pending",
-      core_seed: "pending",
-      novel_meta: "pending",
-    });
-
-    try {
-      await apiPostSSE(
-        "/api/llm/regenerate-blueprint",
-        buildBlueprintRegenerationStartRequest(
-          currentInspection.source,
-          parsedTokenBudget,
-          readiness.digest,
-          automaticBudgetConfirmed,
-        ),
-        (event, data) => {
-          if (event === "step" && isStepKey(data.step)) {
-            const status = data.status;
-            if (
-              status === "pending" ||
-              status === "running" ||
-              status === "done" ||
-              status === "error"
-            ) {
-              setStepStatuses((current) => ({
-                ...current,
-                [data.step as AICreateStepKey]: status,
-              }));
-            }
-            return;
-          }
-          if (event !== "done") return;
-          if (data.success && data.result) {
-            setCandidate(data.result as AICreateResponse);
-            setStage("review");
-            return;
-          }
-          setStage("confirm");
-          setReadiness(null);
-          setError(
-            typeof data.error === "string" && data.error.trim()
-              ? data.error
-              : t("failed"),
-          );
-        },
-        blueprintGenerationStream,
-      );
-    } catch (cause) {
-      setStage("confirm");
-      setReadiness(null);
-      setError(cause instanceof SSEError ? tStream(cause.code)
-        : cause instanceof Error ? cause.message : t("failed"));
-    }
-  };
-
   const acceptCandidate = () => {
-    if (!candidate) return;
-    onAccept(candidate);
+    if (!candidate || !candidateSource) return;
+    onAccept(candidate, candidateSource);
     setOpen(false);
     queueMicrotask(() => (returnFocusRef.current ?? triggerRef.current)?.focus());
   };
@@ -346,6 +210,38 @@ export default function BlueprintRegenerationPanel({
             </header>
 
             <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+              <BlueprintRunControls
+                entry="regenerate-blueprint"
+                request={{
+                  ...buildBlueprintRegenerationRequest(inspection.source),
+                  card_imports: inspection.source.card_imports,
+                  draft_id: normalizeBlueprintExecution(draft._blueprintRun)?.draft_id ?? inspection.source.execution?.draft_id,
+                }}
+                initialRunId={normalizeBlueprintExecution(draft._blueprintRun)?.run_id}
+                onBound={(ref) => onBound(ref)}
+                onBusyChange={(busy) => setStage(busy ? "running" : "confirm")}
+                onRead={(run) => setStepStatuses({
+                  expand_idea: run.completed_steps.includes("expand_idea") ? "done" : "pending",
+                  extract_idea: run.completed_steps.includes("extract_idea") ? "done" : "pending",
+                  core_seed: run.completed_steps.includes("core_seed") ? "done" : "pending",
+                  novel_meta: run.completed_steps.includes("novel_meta") ? "done" : "pending",
+                })}
+                onEvent={(event, data) => {
+                  if (event !== "step" || !isStepKey(data.step)) return;
+                  const status = data.status;
+                  if (status === "running" || status === "done" || status === "error" || status === "pending")
+                    setStepStatuses((previous) => ({ ...previous, [data.step as AICreateStepKey]: status }));
+                }}
+                onComplete={(result, request, execution) => {
+                  setCandidate(result);
+                  setCandidateSource({
+                    ...inspection.source,
+                    generation_params: blueprintGenerationParams(request), execution,
+                  });
+                  setStage("review");
+                }}
+              />
+
               {stage === "confirm" && (
                 <div className="space-y-5">
                   <p className="text-sm leading-6 text-foreground">
@@ -368,102 +264,7 @@ export default function BlueprintRegenerationPanel({
                   <div className="rounded-xl border border-warning/40 bg-warning/5 p-4 text-sm leading-6 text-foreground">
                     {t("replacementWarning")}
                   </div>
-                  <section className="rounded-xl border border-accent/35 bg-accent/[0.04] p-4">
-                    <h3 className="text-sm font-semibold text-foreground">
-                      {t("authorizationTitle")}
-                    </h3>
-                    <p className="mt-1 text-xs leading-5 text-muted">
-                      {t("authorizationDescription")}
-                    </p>
-                    <label
-                      htmlFor="blueprint-regeneration-token-budget"
-                      className="mt-4 block text-xs font-medium text-foreground"
-                    >
-                      {t("tokenBudgetLabel")}
-                    </label>
-                    <input
-                      id="blueprint-regeneration-token-budget"
-                      type="number"
-                      min={1}
-                      value={tokenBudget}
-                      onChange={(event) => {
-                        setTokenBudget(event.target.value);
-                        setReadiness(null);
-                        setAutomaticBudgetConfirmed(false);
-                        setError("");
-                      }}
-                      aria-invalid={tokenBudget !== "" && !validTokenBudget}
-                      aria-describedby="blueprint-regeneration-token-budget-hint"
-                      className="mt-1 min-h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-base text-foreground outline-none focus:border-accent sm:text-sm"
-                    />
-                    <p
-                      id="blueprint-regeneration-token-budget-hint"
-                      className="mt-1 text-xs leading-5 text-muted"
-                    >
-                      {t("tokenBudgetHint")}
-                    </p>
-                    {tokenBudget !== "" && !validTokenBudget && (
-                      <p role="note" className="mt-2 text-xs text-danger">
-                        {t("tokenBudgetInvalid")}
-                      </p>
-                    )}
-                    {readiness && (
-                      <dl className="mt-4 grid gap-2 border-t border-border pt-4 text-xs sm:grid-cols-3">
-                        <div>
-                          <dt className="text-muted">{t("maximumCalls")}</dt>
-                          <dd className="mt-1 font-semibold tabular-nums text-foreground">
-                            {readiness.maximum_provider_attempts}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-muted">{t("providerCount")}</dt>
-                          <dd className="mt-1 font-semibold tabular-nums text-foreground">
-                            {new Set(readiness.providers.map((item) => item.provider_alias)).size}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-muted">{t("conservativeMaximum")}</dt>
-                          <dd className="mt-1 font-semibold tabular-nums text-foreground">
-                            {readiness.maximum_tokens_total.toLocaleString()}
-                          </dd>
-                        </div>
-                      </dl>
-                    )}
-                    {readiness && !readiness.budget_covers_conservative_maximum && (
-                      <p role="note" className="mt-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
-                        {t("budgetMayStop")}
-                      </p>
-                    )}
-                    {readiness?.uses_system_token_budget && readiness.token_budget != null && (
-                      <div className="mt-3 rounded-lg border border-warning/40 bg-warning/5 p-3">
-                        <p className="text-xs leading-5 text-foreground">
-                          {t("automaticBudgetNotice", {
-                            budget: readiness.token_budget.toLocaleString(),
-                          })}
-                        </p>
-                        <label className="mt-2 flex min-w-0 items-start gap-2 text-xs leading-5 text-foreground">
-                          <input
-                            type="checkbox"
-                            checked={automaticBudgetConfirmed}
-                            onChange={(event) => {
-                              setAutomaticBudgetConfirmed(event.target.checked);
-                              setError("");
-                            }}
-                            className="mt-1 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
-                          />
-                          <span>{t("automaticBudgetConfirm")}</span>
-                        </label>
-                      </div>
-                    )}
-                  </section>
-                  {error && (
-                    <p
-                      role="alert"
-                      className="rounded-xl border border-danger/30 bg-danger/5 px-4 py-3 text-sm text-danger"
-                    >
-                      {error}
-                    </p>
-                  )}
+
                 </div>
               )}
 
@@ -534,28 +335,7 @@ export default function BlueprintRegenerationPanel({
                   <Button variant="ghost" onPress={closeDialog}>
                     {t("keepCurrent")}
                   </Button>
-                  {readiness && readiness.status !== "blocked" ? (
-                    <Button
-                      variant="primary"
-                      className="bg-accent text-white hover:bg-accent-hover"
-                      isDisabled={
-                        readiness.uses_system_token_budget
-                        && !automaticBudgetConfirmed
-                      }
-                      onPress={() => void startRegeneration()}
-                    >
-                      {t("confirmPaidCall")}
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="primary"
-                      className="bg-accent text-white hover:bg-accent-hover"
-                      isDisabled={!validTokenBudget || readinessLoading}
-                      onPress={() => void inspectReadiness()}
-                    >
-                      {readinessLoading ? t("checkingReadiness") : t("checkReadiness")}
-                    </Button>
-                  )}
+
                 </>
               )}
               {stage === "running" && (

@@ -171,6 +171,9 @@ class WorkflowDeps:
     structured_plans: Mapping[str, GenerationPlan] = field(
         default_factory=dict
     )
+    on_step_started: Callable[[str], Awaitable[None]] | None = None
+    on_step_completed: Callable[[str, BaseModel, TokenUsage], Awaitable[None]] | None = None
+    on_step_failed: Callable[[str, BaseException], Awaitable[None]] | None = None
 
 
 class ClientDisconnected(Exception):
@@ -376,6 +379,8 @@ async def run_workflow(
         )
 
         try:
+            if deps.on_step_started is not None:
+                await deps.on_step_started(step.key)
             prompt_base = prompts[f"{config_key}_prompt_base"].format(
                 **step.prompt_args(StepContext(results=results, params=params))
             )
@@ -422,6 +427,8 @@ async def run_workflow(
                     await task
             produced = generated.value
             step_usage = generated.usage
+            if deps.on_step_completed is not None:
+                await deps.on_step_completed(step.key, produced, step_usage)
 
         except ClientDisconnected:
             _log(
@@ -434,6 +441,8 @@ async def run_workflow(
             return
 
         except Exception as exc:
+            if deps.on_step_failed is not None:
+                await deps.on_step_failed(step.key, exc)
             logger.exception(
                 "[%s] request_id=%s step=%s failed provider=%s",
                 workflow_name,

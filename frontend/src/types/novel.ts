@@ -84,7 +84,7 @@ export interface CreateNovelRequest {
   words_per_chapter?: number;
   style_controls?: StyleControls;
   creation_mode?: "manual" | "ai";
-  creative_direction?: CreativeDirectionSelection;
+  creative_direction?: CreativeDirectionSelection | null;
   card_creation_id?: string;
   card_imports?: CardImportCreationSelection[];
 }
@@ -596,12 +596,23 @@ export interface BulkCreateCoreFactionsResponse {
   faction_relations: FactionRelation[];
 }
 
+export type BlueprintGenerationParams = Pick<AICreateRequest,
+  "temperature" | "top_p" | "max_tokens" | "presence_penalty" | "frequency_penalty" | "system_prompt">;
+
+export interface BlueprintExecutionRef {
+  run_id: string;
+  draft_id: string;
+  authorization_digest: string;
+  author_brief_revision: string;
+  prompt_revision: string;
+}
+
 export interface AICreateRequest {
   author_constraints?: AuthorConstraints;
   user_idea: string;
   number_of_chapters?: number;
   words_per_chapter?: number;
-  creative_direction?: CreativeDirectionSelection;
+  creative_direction?: CreativeDirectionSelection | null;
   cached_steps?: AICreateCachedSteps;
   // 可选生成参数
   temperature?: number | null;
@@ -656,6 +667,8 @@ export type AICreateCachedSteps = Partial<{
 
 /** 冻结整份蓝图重新生成所需的原始来源；不得从作者后续编辑反推。 */
 export interface BlueprintGenerationSource {
+  generation_params?: BlueprintGenerationParams;
+  execution?: BlueprintExecutionRef;
   author_constraints?: AuthorConstraints;
   schema_version: "blueprint_generation_source.v1";
   user_idea: string;
@@ -667,6 +680,7 @@ export interface BlueprintGenerationSource {
 
 /** 统一建书草稿，用于三种入口向 Writing 蓝图确认页传递数据。 */
 export interface WritingDraft extends CreateNovelRequest {
+  _blueprintRun?: BlueprintExecutionRef;
   _fromAI?: boolean;
   _draftSchemaVersion?: 1;
   _creationOrigin?: "blank" | "ai_idea" | "tavern_cards";

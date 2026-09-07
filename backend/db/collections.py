@@ -33,6 +33,7 @@ AGENT_RUNTIME_EVENTS = "agent_runtime_events"
 # generation_jobs_deleted，勿沿用 generation_tasks 那条不规则的 tasks_deleted。
 GENERATION_JOBS = "generation_jobs"
 PROSE_RUNS = "prose_runs"
+BLUEPRINT_RUNS = "blueprint_runs"
 PROSE_REMEDIATION_RECEIPTS = "prose_remediation_receipts"
 STATE_CANDIDATE_REPAIR_RECEIPTS = "state_candidate_repair_receipts"
 REFERENCE_CARD_REPAIR_RECEIPTS = "reference_card_repair_receipts"
@@ -72,6 +73,7 @@ ACTIVE_COLLECTIONS = frozenset({
     AGENT_RUNTIME_EVENTS,
     GENERATION_JOBS,
     PROSE_RUNS,
+    BLUEPRINT_RUNS,
     PROSE_REMEDIATION_RECEIPTS,
     STATE_CANDIDATE_REPAIR_RECEIPTS,
     REFERENCE_CARD_REPAIR_RECEIPTS,
@@ -124,4 +126,5 @@ REGISTERED_COLLECTIONS = ALL_COLLECTIONS | EPHEMERAL_COLLECTIONS
 # 级联清理仍必须覆盖这里的每一个集合，包括上面三个遗留幽灵集合。
 # tests/test_novel_service.py 拿它核对级联的完整性，用法与
 # BACKUP_COLLECTIONS 的覆盖测试同源。
-NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS, USERS, AGENT_DEFINITIONS}
+# 蓝图运行以 owner/draft 定位，建书前不存在 novel_id；删除一本书不能删除作者的其他草稿运行。
+NOVEL_SCOPED_COLLECTIONS = ALL_COLLECTIONS - {NOVELS, USERS, AGENT_DEFINITIONS, BLUEPRINT_RUNS}
