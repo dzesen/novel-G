@@ -544,8 +544,12 @@ async def write_required_rewrite_claim(job, *, chapter_id, step_id, phase, provi
         ):
             raise ValueError("rewrite dispatch authority missing")
         bound = ledger.authorization.planner if kind == "planner" else ledger.authorization.rewrite
+        if bound is None:
+            raise ValueError("rewrite claim outside frozen contract")
         own = [slot for slot in job["attempt_slots"] if slot.get("step_id") == step_id]
         all_own = [slot for slot in job["attempt_slots"] if slot.get("step_id") in {entry.step_id("planner"), entry.step_id("rewrite")}]
+        if ledger.authorization.planner is None and any(slot["step_id"] == entry.step_id("planner") for slot in all_own):
+            raise ValueError("rewrite claim outside frozen contract")
         max_calls = 2 if kind == "planner" else 1
         if (
             provider_alias != bound.provider_alias or phase not in {"primary", "repair"}
@@ -656,6 +660,11 @@ def rewrite_accounting(job, entry, authorization):
         ("planner", authorization.planner, 2), ("rewrite", authorization.rewrite, 1),
     ):
         own = [slot for slot in job["attempt_slots"] if slot.get("step_id") == entry.step_id(kind)]
+        if bound is None:
+            if own:
+                raise RequiredProseRewriteError("rewrite_accounting_invalid")
+            usage[kind] = RuntimeCallUsage()
+            continue
         calls, in_call, previous = 0, 0, None
         input_tokens = output_tokens = 0
         for slot in own:

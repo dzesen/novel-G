@@ -8,6 +8,7 @@ an adapter, reads a repository, creates readiness, or grants execution rights.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from backend.services.generation.chapter_generation_application import (
     OUTLINE_ADHERENCE_STEP,
@@ -132,6 +133,7 @@ def build_required_book_successor_plan_bundle(
     state_provider_alias: str | None = None,
     review_input_token_bound: int | None = None,
     review_max_response_bytes: int,
+    rewrite_dispatch: Literal["fixed", "planner"] = "fixed",
 ) -> RequiredBookSuccessorPlanBundle:
     """Resolve explicit Provider routes without constructing an adapter.
 
@@ -143,6 +145,8 @@ def build_required_book_successor_plan_bundle(
 
     if not isinstance(runtime, GenerationRuntime):
         raise ValueError("required_book_successor_runtime_invalid")
+    if rewrite_dispatch not in {"fixed", "planner"}:
+        raise ValueError("required_book_successor_rewrite_dispatch_invalid")
     writer_alias = _provider_alias(writer_provider_alias, role="writer")
     judge_alias = _provider_alias(judge_provider_alias, role="judge")
     state_alias = _provider_alias(
@@ -192,7 +196,7 @@ def build_required_book_successor_plan_bundle(
             REMEDIATION_PLANNER_STEP,
             provider_alias=writer_alias,
         )
-    )
+    ) if rewrite_dispatch == "planner" else None
     rewrite = runtime.plan_structured(
         WorkflowStepTarget(
             PROSE_REMEDIATION_WORKFLOW,
@@ -220,7 +224,8 @@ def build_required_book_successor_plan_bundle(
         ("judge", judge),
         ("state", state),
     ):
-        _require_supported_structured_plan(plan, role=role)
+        if plan is not None:
+            _require_supported_structured_plan(plan, role=role)
 
     if initial.provider_model.strip() != rewrite.provider_model.strip():
         raise ValueError("required_book_successor_writer_model_changed")

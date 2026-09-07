@@ -10,7 +10,7 @@ import hashlib
 import json
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.services.agent_runtime.contracts import AgentRuntimeLimits, RuntimeToolReference
 from backend.services.generation.independent_outline_review import IndependentReviewPlan
@@ -75,10 +75,10 @@ class RequiredRewriteCallBound(ClosedRewriteModel):
 
 
 class RequiredRewriteAuthorization(ClosedRewriteModel):
-    schema_version: Literal["required_prose_rewrite_authorization.v1"]
-    protocol_revision: Literal["required-prose-rewrite-r1"]
+    schema_version: Literal["required_prose_rewrite_authorization.v1", "required_prose_rewrite_authorization.v2"]
+    protocol_revision: Literal["required-prose-rewrite-r1", "required-prose-rewrite-r2"]
     contract_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    planner: RequiredRewriteCallBound
+    planner: RequiredRewriteCallBound | None
     rewrite: RequiredRewriteCallBound
     review_capacity: RequiredAdherenceCapacity
     max_rewrites: Literal[2] = 2
@@ -87,17 +87,28 @@ class RequiredRewriteAuthorization(ClosedRewriteModel):
     max_tool_retries: Literal[0] = 0
     max_planner_repairs: Literal[0] = 0
 
+    @model_validator(mode="after")
+    def validate_dispatch_version(self) -> "RequiredRewriteAuthorization":
+        expected = (
+            ("required_prose_rewrite_authorization.v1", "required-prose-rewrite-r1")
+            if self.planner is not None else
+            ("required_prose_rewrite_authorization.v2", "required-prose-rewrite-r2")
+        )
+        if (self.schema_version, self.protocol_revision) != expected:
+            raise ValueError("rewrite_dispatch_version_mismatch")
+        return self
+
     @property
     def attempts(self) -> int:
-        return 2 * self.planner.max_attempts + self.rewrite.max_attempts
+        return (2 * self.planner.max_attempts if self.planner is not None else 0) + self.rewrite.max_attempts
 
     @property
     def tokens(self) -> int:
-        return 2 * self.planner.tokens + self.rewrite.tokens
+        return (2 * self.planner.tokens if self.planner is not None else 0) + self.rewrite.tokens
 
     @property
     def seconds(self) -> int:
-        return 2 * self.planner.seconds + self.rewrite.seconds
+        return (2 * self.planner.seconds if self.planner is not None else 0) + self.rewrite.seconds
 
     def runtime_limits(self) -> AgentRuntimeLimits:
         return AgentRuntimeLimits(
@@ -110,7 +121,7 @@ class RequiredRewriteAuthorization(ClosedRewriteModel):
 
 @dataclass(frozen=True)
 class RequiredProseRewritePlan:
-    planner: GenerationPlan
+    planner: GenerationPlan | None
     rewrite: GenerationPlan
     review: IndependentReviewPlan
 
@@ -118,6 +129,9 @@ class RequiredProseRewritePlan:
         # No hidden format reviewer/fallback route is part of this contract.
         calls = []
         for plan, input_bound in ((self.planner, PLANNER_INPUT_BOUND), (self.rewrite, REWRITE_INPUT_BOUND)):
+            if plan is None:
+                calls.append(None)
+                continue
             if (
                 plan.mode not in {"prompt_json", "json_object"}
                 or plan.reviewer_alias is not None
@@ -134,8 +148,8 @@ class RequiredProseRewritePlan:
         if self.review.writer_model != self.rewrite.provider_model:
             raise ValueError("rewrite_writer_model_mismatch")
         values = {
-            "schema_version": "required_prose_rewrite_authorization.v1",
-            "protocol_revision": "required-prose-rewrite-r1",
+            "schema_version": "required_prose_rewrite_authorization.v1" if self.planner is not None else "required_prose_rewrite_authorization.v2",
+            "protocol_revision": "required-prose-rewrite-r1" if self.planner is not None else "required-prose-rewrite-r2",
             "planner": calls[0], "rewrite": calls[1],
             "review_capacity": RequiredAdherenceCapacity.from_plan(self.review),
         }

@@ -292,7 +292,7 @@ class SuccessorOutlineStageAuthorization(_Closed):
 class SuccessorRootProjection(_Closed):
     """Identifier-free projection of the live root authority to be derived."""
 
-    schema_version: Literal["successor_root_projection.v1"] = (
+    schema_version: Literal["successor_root_projection.v1", "successor_root_projection.v2"] = (
         "successor_root_projection.v1"
     )
     projection_digest: str = Field(pattern=_SHA256)
@@ -306,7 +306,7 @@ class SuccessorRootProjection(_Closed):
     ]
     initial_prose: RequiredInitialProseAuthorization
     initial_generation: RequiredGenerationPlanSnapshot
-    rewrite_planner: RequiredGenerationPlanSnapshot
+    rewrite_planner: RequiredGenerationPlanSnapshot | None
     rewrite_generation: RequiredGenerationPlanSnapshot
     independent_review: RequiredGenerationPlanSnapshot
     state_generation: RequiredGenerationPlanSnapshot
@@ -335,6 +335,13 @@ class SuccessorRootProjection(_Closed):
 
     @model_validator(mode="after")
     def validate_projection(self) -> "SuccessorRootProjection":
+        expected = (
+            ("successor_root_projection.v1", "required_prose_rewrite_authorization.v1")
+            if self.rewrite_planner is not None else
+            ("successor_root_projection.v2", "required_prose_rewrite_authorization.v2")
+        )
+        if (self.schema_version, self.rewrite.schema_version) != expected:
+            raise ValueError("successor_acceptance_dispatch_version_changed")
         if (
             self.maximum_provider_attempts_total
             != sum(item.maximum_paid_attempts for item in self.provider_usage_bounds)
@@ -695,7 +702,7 @@ def _root_projection(
     usage = required_book_successor_provider_usage_bounds(authority)
     review = authority.review_template
     identity = {
-        "schema_version": "successor_root_projection.v1",
+        "schema_version": "successor_root_projection.v1" if review.rewrite_planner is not None else "successor_root_projection.v2",
         "root_protocol_revision": authority.protocol_revision,
         "chapter_count": CHAPTER_COUNT,
         "chapter_order_indexes": (1, 2, 3),
@@ -830,11 +837,12 @@ def _provider_models(
     pairs = [
         (outline.generation.provider_alias, outline.generation.provider_model),
         (root.initial_generation.provider_alias, root.initial_generation.provider_model),
-        (root.rewrite_planner.provider_alias, root.rewrite_planner.provider_model),
         (root.rewrite_generation.provider_alias, root.rewrite_generation.provider_model),
         (root.independent_review.provider_alias, root.independent_review.provider_model),
         (root.state_generation.provider_alias, root.state_generation.provider_model),
     ]
+    if root.rewrite_planner is not None:
+        pairs.append((root.rewrite_planner.provider_alias, root.rewrite_planner.provider_model))
     models: dict[str, str] = {}
     for alias, model in pairs:
         previous = models.setdefault(alias, model)
@@ -907,6 +915,7 @@ def build_required_book_successor_acceptance_authorization(
     created_at: datetime,
     deadline_at: datetime,
     review_input_token_bound: int | None = None,
+    rewrite_dispatch: Literal["fixed", "planner"] = "fixed",
 ) -> RequiredBookSuccessorAcceptanceAuthorization:
     """Build one complete, no-I/O authorization template for issue #20."""
 
@@ -925,6 +934,7 @@ def build_required_book_successor_acceptance_authorization(
         state_provider_alias=state_provider_alias,
         review_input_token_bound=review_input_token_bound,
         review_max_response_bytes=review_max_response_bytes,
+        rewrite_dispatch=rewrite_dispatch,
     )
     root = _root_projection(_synthetic_root_authority(bundle=bundle))
     evidence = validate_required_judge_probe_terminal_evidence(
@@ -1247,6 +1257,7 @@ def validate_current_required_book_successor_acceptance_authorization(
         authorization_revision=authorization.authorization_revision,
         created_at=authorization.created_at,
         deadline_at=authorization.deadline_at,
+        rewrite_dispatch="planner" if root.rewrite_planner is not None else "fixed",
     )
     if current != authorization:
         raise ValueError("successor_acceptance_authorization_stale")
@@ -1290,6 +1301,7 @@ def derive_required_book_successor_acceptance_root_readiness(
         state_provider_alias=str(root.state_generation.target_provider_alias),
         review_input_token_bound=root.review_input_token_bound,
         review_max_response_bytes=root.review_max_response_bytes,
+        rewrite_dispatch="planner" if root.rewrite_planner is not None else "fixed",
     )
     review = prepare_required_chapter_review_readiness(
         base_readiness,

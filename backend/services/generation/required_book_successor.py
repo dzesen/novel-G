@@ -354,13 +354,14 @@ def required_book_successor_provider_usage_bounds(
     planner_calls = (
         chapter_count * rewrite.max_rewrites * rewrite.max_planner_calls
     )
-    planner_attempts = planner_calls * rewrite.planner.max_attempts
-    add(
-        rewrite.planner.provider_alias,
-        attempts=planner_attempts,
-        input_tokens=planner_attempts * rewrite.planner.input_tokens,
-        output_tokens=planner_attempts * rewrite.planner.output_tokens,
-    )
+    if rewrite.planner is not None:
+        planner_attempts = planner_calls * rewrite.planner.max_attempts
+        add(
+            rewrite.planner.provider_alias,
+            attempts=planner_attempts,
+            input_tokens=planner_attempts * rewrite.planner.input_tokens,
+            output_tokens=planner_attempts * rewrite.planner.output_tokens,
+        )
     rewrite_calls = (
         chapter_count * rewrite.max_rewrites * rewrite.max_tool_calls
     )

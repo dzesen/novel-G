@@ -37,6 +37,7 @@ from backend.services.generation.required_prose_rewrite_contracts import (
     REQUIRED_REWRITE_FINISH, REQUIRED_REWRITE_RESULT, REQUIRED_REWRITE_SCOPE, REQUIRED_REWRITE_TOOL,
     ClosedRewriteModel, contract_digest,
 )
+from backend.services.generation.required_prose_rewrite_dispatch import FixedRequiredRewritePlanner
 from backend.services.llm.context_builder import fetch_context_inputs, assemble_context
 from backend.services.llm.generation_runtime import GenerationRuntime, create_generation_runtime
 from backend.services.novel.state_completion import chapter_content_digest
@@ -125,6 +126,9 @@ class RequiredProseRewriteProducer:
         self._journal = generation_job_repo.required_rewrite_journal(binding, authorization=plan.authorization(), review_plan=plan.review)
 
     def _call(self, entry, kind):
+        plan = self.plan.planner if kind == "planner" else self.plan.rewrite
+        if plan is None:
+            raise RequiredProseRewriteError("rewrite_planner_call_not_authorized")
         scope = JobAttemptScope(self.binding.job_id, self.binding.chapter_id, entry.step_id(kind), repo=generation_job_repo)
         runtime = (
             create_generation_runtime(attempt_scope=scope, max_provider_retries=0)
@@ -132,11 +136,15 @@ class RequiredProseRewriteProducer:
                 config_supplier=self._config_supplier, adapter_factory=self._adapter_factory, attempt_scope=scope,
             )
         )
-        return FrozenStructuredCall(runtime=runtime, plan=self.plan.planner if kind == "planner" else self.plan.rewrite)
+        return FrozenStructuredCall(runtime=runtime, plan=plan)
 
     def _runtime(self, entry):
-        planner_call, rewrite_call = self._call(entry, "planner"), self._call(entry, "rewrite")
-        planner = ProseRemediationPlanner(planner_call, required_origin=entry.origin)
+        rewrite_call = self._call(entry, "rewrite")
+        planner = (
+            FixedRequiredRewritePlanner(binding=self.binding, entry=entry)
+            if self.plan.planner is None else
+            ProseRemediationPlanner(self._call(entry, "planner"), required_origin=entry.origin)
+        )
         application = ProseRemediationToolApplication(
             rewrite_call=rewrite_call, adherence_call=None, required_origin=entry.origin,
         )

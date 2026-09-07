@@ -46,6 +46,7 @@ from backend.services.llm.generation_runtime import (
 
 
 REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION = "required-chapter-review-job-r1"
+REQUIRED_CHAPTER_REVIEW_FIXED_PIPELINE_REVISION = "required-chapter-review-job-r2"
 REQUIRED_CHAPTER_REVIEW_PLANNING_KEY = "required_chapter_review_authorization"
 REQUIRED_CHAPTER_REVIEW_REVISION_KEY = (
     "required_chapter_review_pipeline_revision"
@@ -259,10 +260,10 @@ class RequiredProviderBound(_Closed):
 
 
 class RequiredChapterReviewAuthorization(_Closed):
-    schema_version: Literal["required_chapter_review_job_authorization.v1"] = (
+    schema_version: Literal["required_chapter_review_job_authorization.v1", "required_chapter_review_job_authorization.v2"] = (
         "required_chapter_review_job_authorization.v1"
     )
-    protocol_revision: Literal["required-chapter-review-job-r1"] = (
+    protocol_revision: Literal["required-chapter-review-job-r1", "required-chapter-review-job-r2"] = (
         REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION
     )
     contract_digest: str = Field(pattern=_SHA256)
@@ -280,7 +281,7 @@ class RequiredChapterReviewAuthorization(_Closed):
         max_length=1000,
     )
     initial_generation: RequiredGenerationPlanSnapshot
-    rewrite_planner: RequiredGenerationPlanSnapshot
+    rewrite_planner: RequiredGenerationPlanSnapshot | None
     rewrite_generation: RequiredGenerationPlanSnapshot
     independent_review: RequiredGenerationPlanSnapshot
     review_writer_model: str = Field(min_length=1, max_length=240)
@@ -299,6 +300,15 @@ class RequiredChapterReviewAuthorization(_Closed):
 
     @model_validator(mode="after")
     def validate_aggregate_identity(self) -> "RequiredChapterReviewAuthorization":
+        expected = (
+            ("required_chapter_review_job_authorization.v1", REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION,
+             "required_prose_rewrite_authorization.v1")
+            if self.rewrite_planner is not None else
+            ("required_chapter_review_job_authorization.v2", REQUIRED_CHAPTER_REVIEW_FIXED_PIPELINE_REVISION,
+             "required_prose_rewrite_authorization.v2")
+        )
+        if (self.schema_version, self.protocol_revision, self.rewrite.schema_version) != expected:
+            raise ValueError("required_chapter_review_dispatch_version_mismatch")
         chapter_ids = [item.chapter_id for item in self.chapters]
         if (
             self.created_at.tzinfo is None
@@ -344,7 +354,7 @@ class RequiredChapterReviewAuthorization(_Closed):
         plan = RequiredChapterReviewPlan(
             initial_generation=self.initial_generation.thaw(),
             rewrite=RequiredProseRewritePlan(
-                planner=self.rewrite_planner.thaw(),
+                planner=self.rewrite_planner.thaw() if self.rewrite_planner is not None else None,
                 rewrite=self.rewrite_generation.thaw(),
                 review=review,
             ),
@@ -468,11 +478,12 @@ def _provider_bounds(
         plan.rewrite.authorization()
     )
     rewrite_count = count * rewrite.max_rewrites
-    add(
-        rewrite.planner.provider_alias,
-        rewrite_count * 2 * rewrite.planner.max_attempts,
-        rewrite_count * 2 * rewrite.planner.tokens,
-    )
+    if rewrite.planner is not None:
+        add(
+            rewrite.planner.provider_alias,
+            rewrite_count * 2 * rewrite.planner.max_attempts,
+            rewrite_count * 2 * rewrite.planner.tokens,
+        )
     add(
         rewrite.rewrite.provider_alias,
         rewrite_count * rewrite.rewrite.max_attempts,
@@ -572,7 +583,7 @@ def build_required_chapter_review_authorization(
         plan.rewrite.planner,
         call_kind="structured",
         target=_PLANNER_TARGET,
-    )
+    ) if plan.rewrite.planner is not None else None
     rewrite_snapshot = _plan_snapshot(
         plan.rewrite.rewrite,
         call_kind="structured",
@@ -601,8 +612,8 @@ def build_required_chapter_review_authorization(
         + rewrite.max_rewrites * rewrite.seconds
     )
     identity = {
-        "schema_version": "required_chapter_review_job_authorization.v1",
-        "protocol_revision": REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION,
+        "schema_version": "required_chapter_review_job_authorization.v1" if planner_snapshot is not None else "required_chapter_review_job_authorization.v2",
+        "protocol_revision": REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION if planner_snapshot is not None else REQUIRED_CHAPTER_REVIEW_FIXED_PIPELINE_REVISION,
         "novel_id": str(base_readiness.get("novel_id") or ""),
         "owner_id": str(resources.get("owner_id") or ""),
         "scope": str(base_readiness.get("scope") or ""),
@@ -674,7 +685,7 @@ def prepare_required_chapter_review_readiness(
     planning: dict[str, Any] = {}
     planning.update({
         REQUIRED_CHAPTER_REVIEW_REVISION_KEY: (
-            REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION
+            authorization.protocol_revision
         ),
         REQUIRED_CHAPTER_REVIEW_PLANNING_KEY: authorization.model_dump(
             mode="python"
@@ -791,7 +802,7 @@ def validate_required_chapter_review_readiness(
         raise ValueError("required_chapter_review_readiness_invalid")
     if (
         planning.get(REQUIRED_CHAPTER_REVIEW_REVISION_KEY)
-        != REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION
+        not in {REQUIRED_CHAPTER_REVIEW_PIPELINE_REVISION, REQUIRED_CHAPTER_REVIEW_FIXED_PIPELINE_REVISION}
         or REQUIRED_CHAPTER_REVIEW_PLANNING_KEY not in planning
         or any(key in planning for key in _LEGACY_CANDIDATE_KEYS)
         or any(key in planning for key in _FORMAL_AUTHORITY_KEYS)
@@ -806,6 +817,7 @@ def validate_required_chapter_review_readiness(
     coverage = planning.get("batch_generation_budget_coverage")
     if (
         readiness.get("version") != 2
+        or planning.get(REQUIRED_CHAPTER_REVIEW_REVISION_KEY) != authorization.protocol_revision
         or not isinstance(resources, Mapping)
         or not isinstance(raw_chapters, list)
         or readiness.get("novel_id") != authorization.novel_id
