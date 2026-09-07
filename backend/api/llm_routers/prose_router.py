@@ -211,9 +211,12 @@ def _interactive_completion_request_binding(
 def _interactive_completion_conflict(
     exc: InteractiveCompletionBlocked,
 ) -> HTTPException:
+    detail = {"code": exc.code, "message": str(exc)}
+    if exc.diagnostics is not None:
+        detail["diagnostics"] = exc.diagnostics
     return HTTPException(
         status_code=409,
-        detail={"code": exc.code, "message": str(exc)},
+        detail=detail,
     )
 
 

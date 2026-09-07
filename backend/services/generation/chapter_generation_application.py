@@ -102,6 +102,7 @@ from backend.services.generation.independent_outline_review import (
     IndependentReviewFailureCode,
     OutlineReviewSnapshot,
     REVIEW_PROTOCOL as INDEPENDENT_REVIEW_PROTOCOL,
+    safe_independent_review_diagnostics,
 )
 from backend.services.generation.prose_runs import prose_revision, prose_run_module
 from backend.services.generation.protected_generation_params import (
@@ -319,12 +320,19 @@ class IndependentOutlineReviewWorkflowFailed(WorkflowFailed):
         *,
         usage: dict[str, Any] | None = None,
         attempts: list[dict[str, Any]] | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         contract = _INDEPENDENT_REVIEW_FAILURE_CONTRACT.get(failure_code)
         if contract is None:  # defensive runtime guard for untyped callers
             raise ValueError("unknown independent review failure code")
         category, evidence, message = contract
-        super().__init__(message, usage=usage, attempts=attempts)
+        super().__init__(
+            message, usage=usage, attempts=attempts,
+            diagnostics=(
+                safe_independent_review_diagnostics(diagnostics)
+                if failure_code == "review_evidence_invalid" else None
+            ),
+        )
         self.reason_codes = (failure_code,)
         self.diagnostic_category = category
         self.diagnostic_code = failure_code
@@ -407,11 +415,12 @@ def _independent_review_failure_payload(
     *,
     usage: Mapping[str, Any],
     attempts: list[dict[str, Any]],
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract = _INDEPENDENT_REVIEW_FAILURE_CONTRACT.get(failure_code)
     if contract is None:  # defensive runtime guard for untyped callers
         raise ValueError("unknown independent review failure code")
-    return {
+    payload = {
         "success": False,
         "failed_step": OUTLINE_ADHERENCE_STEP,
         "error": contract[2],
@@ -420,6 +429,13 @@ def _independent_review_failure_payload(
         "reason_codes": [failure_code],
         "review_failure_code": failure_code,
     }
+    safe_diagnostics = (
+        safe_independent_review_diagnostics(diagnostics)
+        if failure_code == "review_evidence_invalid" else None
+    )
+    if safe_diagnostics is not None:
+        payload["diagnostics"] = safe_diagnostics
+    return payload
 
 
 def project_outline_adherence_generation_failure(
@@ -1135,6 +1151,7 @@ class ChapterGenerationApplicationService:
                             or failure.get("usage_so_far")
                         ),
                         attempts=failure.get("attempts"),
+                        diagnostics=failure.get("diagnostics"),
                     )
                 reason_code = _outline_adherence_failure_reason(
                     failure.get("reason_codes")
@@ -1974,6 +1991,7 @@ class ChapterGenerationApplicationService:
                     reviewed.failure_code,
                     usage=usage,
                     attempts=attempts,
+                    diagnostics=getattr(reviewed, "diagnostics", None),
                 )
                 yield ChapterGenerationEvent(name="done", data=failure)
                 return

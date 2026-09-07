@@ -73,6 +73,9 @@ from backend.services.generation.outline_adherence import (
     revalidate_current_outline_adherence_evidence,
     validate_complete_outline_adherence,
 )
+from backend.services.generation.independent_outline_review import (
+    safe_independent_review_diagnostics,
+)
 from backend.services.generation.prose_completion import (
     prose_execution_plan_from_snapshot,
 )
@@ -183,9 +186,15 @@ _INDEPENDENT_REVIEW_FAILURE_FACTS: dict[
 class InteractiveCompletionBlocked(ValueError):
     """The interactive candidate cannot consume this completion authority."""
 
-    def __init__(self, message: str, *, code: str) -> None:
+    def __init__(
+        self, message: str, *, code: str, diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.diagnostics = (
+            safe_independent_review_diagnostics(diagnostics)
+            if code == "review_evidence_invalid" else None
+        )
 
 
 class _ClosedModel(BaseModel):
@@ -314,9 +323,20 @@ class InteractiveCompletionProgress(_ClosedModel):
     provider_model: str | None = None
     stream_phase: str | None = None
     failure_code: InteractiveCompletionFailureCode | None = None
+    validation_diagnostics: dict[str, Any] | None = None
     provider_activity_count: int = Field(ge=0)
     content_chunks: int = Field(ge=0)
     content_bytes: int = Field(ge=0)
+
+    @field_validator("validation_diagnostics", mode="before")
+    @classmethod
+    def sanitize_validation_diagnostics(cls, value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        safe = safe_independent_review_diagnostics(value)
+        if safe is None:
+            raise ValueError("interactive validation diagnostics are invalid")
+        return safe
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "InteractiveCompletionProgress":
@@ -330,6 +350,10 @@ class InteractiveCompletionProgress(_ClosedModel):
             raise ValueError(
                 "non-failed interactive progress cannot contain a failure code"
             )
+        if self.validation_diagnostics is not None and (
+            self.stage_status != "failed" or self.failure_code != "review_evidence_invalid"
+        ):
+            raise ValueError("validation diagnostics require an invalid review result")
         return self
 
 
@@ -1662,6 +1686,7 @@ class InteractiveChapterCompletionService:
         provider_activity_count: int = 0,
         content_chunks: int = 0,
         content_bytes: int = 0,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> InteractiveCompletionProgress:
         persisted: InteractiveCompletionProgress | None = None
         if previous is not None:
@@ -1697,6 +1722,10 @@ class InteractiveChapterCompletionService:
                 else stream_phase
             ),
             failure_code=failure_code,
+            validation_diagnostics=(
+                safe_independent_review_diagnostics(diagnostics)
+                if failure_code == "review_evidence_invalid" else None
+            ),
             provider_activity_count=(
                 persisted.provider_activity_count
                 if persisted is not None
@@ -2003,6 +2032,7 @@ class InteractiveChapterCompletionService:
                     provider_activity_count=provider_activity_count,
                     content_chunks=content_chunks,
                     content_bytes=content_bytes,
+                    diagnostics=exc.diagnostics,
                 )
                 await self._record_failure_and_pause(
                     readiness=readiness,
@@ -2018,6 +2048,7 @@ class InteractiveChapterCompletionService:
                 raise InteractiveCompletionBlocked(
                     str(exc),
                     code=failure_code,
+                    diagnostics=exc.diagnostics,
                 ) from exc
             except (Exception, asyncio.CancelledError) as exc:
                 await self._pause_if_provider_outcome_is_uncertain(

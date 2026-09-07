@@ -42,6 +42,9 @@ from backend.services.llm.generation_runtime import (
     StructuredOutputMode,
     StructuredOutputByteBudgetExceeded,
     StructuredStreamProgress,
+    project_structured_validation_issues,
+    safe_structured_repair_failure_diagnostics,
+    safe_structured_validation_issues,
     STRUCTURED_REPAIR_PROMPT_REVISION,
     EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
     UnsettledGenerationAttempts,
@@ -405,6 +408,15 @@ class IndependentReviewResult:
     failure_code: IndependentReviewFailureCode | None
     usage: TokenUsage
     attempts: tuple[AttemptUsage, ...]
+    diagnostics: dict[str, Any] | None = None
+
+
+def safe_independent_review_diagnostics(value: Any) -> dict[str, Any] | None:
+    """Keep only Runtime's content-free single or two-attempt validation details."""
+    return (
+        safe_structured_repair_failure_diagnostics(value)
+        or safe_structured_validation_issues(value)
+    )
 
 
 @dataclass(frozen=True)
@@ -609,6 +621,7 @@ class IndependentOutlineReviewer:
             )
             return IndependentReviewResult(evidence, None, generated.usage, generated.attempts)
         except Exception as exc:
+            diagnostics = None
             if self._runtime.uncertain_attempt_count:
                 failure = "review_uncertain"
             elif isinstance(exc, UnsettledGenerationAttempts):
@@ -621,6 +634,11 @@ class IndependentOutlineReviewer:
                 failure = "review_budget_exhausted"
             elif isinstance(exc, (ValidationError, LLMStructuredRepairError)):
                 failure = "review_evidence_invalid"
+                diagnostics = safe_independent_review_diagnostics(
+                    exc.diagnostics
+                    if isinstance(exc, LLMStructuredRepairError)
+                    else project_structured_validation_issues(exc, schema=schema)
+                )
             elif isinstance(exc, LLMError):
                 failure = "review_generation_failed"
             elif getattr(exc, "provider_request_not_dispatched", False) is True:
@@ -635,4 +653,4 @@ class IndependentOutlineReviewer:
                 output_tokens=sum(item.usage.output_tokens for item in attempts),
                 total_tokens=sum(item.usage.total_tokens for item in attempts),
             )
-            return IndependentReviewResult(None, failure, usage, attempts)
+            return IndependentReviewResult(None, failure, usage, attempts, diagnostics)

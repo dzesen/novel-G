@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { useTranslations } from "next-intl";
+import ReviewValidationDetails from "./ReviewValidationDetails";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
 import {
@@ -95,6 +96,7 @@ interface InteractiveCompletionProgress {
   provider_model: string | null;
   stream_phase: string | null;
   failure_code: string | null;
+  validation_diagnostics?: unknown;
   provider_activity_count: number;
   content_chunks: number;
   content_bytes: number;
@@ -1162,9 +1164,15 @@ export default function ProsePanel({
                       "review_result_missing_after_settlement"
                     )
                       ? "completionProgressReviewResultMissing"
+                      : completionProgress.failure_code === "review_evidence_invalid"
+                        ? "completionProgressEvidenceInvalid"
                       : "completionProgressReviewFailed")}
                   </p>
                 )}
+                {completionProgress.stage_status === "failed"
+                  && completionProgress.failure_code === "review_evidence_invalid" && (
+                    <ReviewValidationDetails diagnostics={completionProgress.validation_diagnostics} />
+                  )}
               </section>
             </Notice>
           )}

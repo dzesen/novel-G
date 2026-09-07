@@ -307,6 +307,11 @@ def build_structured_repair_failure_diagnostics(
     }
 
 
+def safe_structured_validation_issues(value: Any) -> dict[str, Any] | None:
+    """Copy only bounded validation paths and error types, never source values."""
+    return _normalize_structured_validation_issues(value)
+
+
 def safe_structured_repair_failure_diagnostics(
     value: Any,
 ) -> dict[str, Any] | None:
