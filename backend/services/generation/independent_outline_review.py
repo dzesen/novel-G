@@ -30,6 +30,7 @@ from backend.services.generation.outline_adherence import (
     OUTLINE_ADHERENCE_SYSTEM_PROMPT,
     OutlineAdherenceValidationError,
     assess_outline_adherence_evidence,
+    serialize_outline_contract,
 )
 from backend.services.llm.generation_runtime import (
     AttemptUsage,
@@ -47,8 +48,8 @@ from backend.services.llm.generation_runtime import (
 )
 
 
-ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v5"
-REVIEW_PROTOCOL = "independent_outline_review.v6"
+ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v6"
+REVIEW_PROTOCOL = "independent_outline_review.v7"
 ANCHOR_WIDTH = 120
 ANCHOR_BREAKS = frozenset("。！？!?；;\n")
 ANCHOR_CLOSERS = frozenset("”’\"」』）)\n\r")
@@ -295,7 +296,7 @@ class OutlineReviewSnapshot:
             source_run_revision=source_run_revision,
             source_content_digest=source_content_digest,
             prose=prose,
-            outline_json=_json(outline_value),
+            outline_json=serialize_outline_contract(outline_value),
             authorized_context=authorized_context,
             scene_ranges=tuple(normalized_ranges),
         )
@@ -319,7 +320,7 @@ class IndependentReviewPlan:
     writer_model: str
     input_token_bound: int
     max_response_bytes: int
-    protocol: Literal["independent_outline_review.v6"] = REVIEW_PROTOCOL
+    protocol: Literal["independent_outline_review.v7"] = REVIEW_PROTOCOL
 
     def __post_init__(self) -> None:
         if (

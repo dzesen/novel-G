@@ -142,16 +142,19 @@ def safe_outline_adherence_validation_failure_diagnostics(
     }
 
 
+def serialize_outline_contract(outline: Mapping[str, Any]) -> str:
+    """Preserve the exact BSON representation used by persisted outline revisions."""
+    return json.dumps(
+        dict(outline),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
 def _outline_contract_digest(outline: Mapping[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            dict(outline),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(serialize_outline_contract(outline).encode("utf-8")).hexdigest()
 
 
 def _span_bounds(
