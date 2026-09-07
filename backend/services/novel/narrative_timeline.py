@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from pymongo.asynchronous.client_session import AsyncClientSession
@@ -24,6 +26,7 @@ from backend.db.repositories.volume_repository import volume_repo
 from backend.db.utils import get_utc_now, to_object_id
 from backend.services.novel.chapter_timeline import ChapterTimeline
 
+logger = logging.getLogger(__name__)
 
 _EVENT_PRIORITY = {
     "plot_thread_planted": 10,
@@ -132,10 +135,16 @@ class NarrativeTimeline:
         novel_id: str,
         *,
         session: AsyncClientSession | None = None,
+        _directory: ChapterTimeline | None = None,
     ) -> tuple[ChapterTimeline, list[NarrativeEvent], bool, bool]:
-        volumes = await volume_repo.get_volumes_by_novel(novel_id, session=session)
-        chapters = await chapter_repo.get_chapters_by_novel(novel_id, session=session)
-        timeline = ChapterTimeline(volumes, chapters)
+        if _directory is not None:
+            if session is not None or _directory.novel_id != novel_id:
+                raise ValueError("directory_scope_invalid")
+            timeline = _directory
+        else:
+            volumes = await volume_repo.get_volumes_by_novel(novel_id, session=session)
+            chapters = await chapter_repo.get_chapters_by_novel(novel_id, session=session)
+            timeline = ChapterTimeline(volumes, chapters)
         positions = {position.chapter_id: position for position in timeline.positions}
         database = get_database()
         novel_oid = to_object_id(novel_id)
@@ -328,6 +337,9 @@ class NarrativeTimeline:
         threads_tracked: bool,
     ) -> NarrativeProjection:
         states: dict[str, dict[str, Any]] = {}
+        # These indexes live only for this replay. Mutations still update the
+        # original ordered lists, preserving their exact persisted digest.
+        fact_indexes: dict[str, dict[str, dict[str, Any]]] = {}
         threads: dict[str, dict[str, Any]] = {}
         for event in events:
             if event.kind == "chapter_delta":
@@ -355,11 +367,14 @@ class NarrativeTimeline:
                         )
                         state["as_of_chapter_id"] = event.chapter_id
                         state.pop("as_of_chapter_order", None)
-                    known = {
-                        str(fact.get("id")): fact
-                        for fact in state["permanent_facts"]
-                        if fact.get("id") is not None
-                    }
+                    known = fact_indexes.get(card_id)
+                    if known is None:
+                        known = {
+                            str(fact.get("id")): fact
+                            for fact in state["permanent_facts"]
+                            if fact.get("id") is not None
+                        }
+                        fact_indexes[card_id] = known
                     for index, raw_fact in enumerate(
                         update.get("accepted_permanent_facts") or []
                     ):
@@ -474,6 +489,10 @@ class NarrativeTimeline:
                             continue
                         if correction_type == "permanent_fact_delete":
                             state["permanent_facts"].remove(fact)
+                            # A legacy baseline may contain duplicate IDs.
+                            # Rebuild lazily so deleting its first matching
+                            # fact still leaves later duplicates addressable.
+                            fact_indexes.pop(str(state["card_id"]), None)
                         else:
                             for key in ("fact", "kind"):
                                 if key in fields:
@@ -507,24 +526,33 @@ class NarrativeTimeline:
         )
 
     async def context_before(
-        self, novel_id: str, chapter_id: str
+        self, novel_id: str, chapter_id: str, *, _directory: ChapterTimeline | None = None,
     ) -> NarrativeProjection:
+        started = perf_counter()
         timeline, all_events, states_tracked, threads_tracked = await self._load(
-            novel_id
+            novel_id, _directory=_directory,
         )
+        loaded = perf_counter()
         target = timeline.position(chapter_id)
         events = tuple(
             event
             for event in all_events
             if event.book_ordinal < target.book_ordinal
         )
-        return self._project(
+        projection = self._project(
             novel_id,
             chapter_id,
             events,
             states_tracked=states_tracked,
             threads_tracked=threads_tracked,
         )
+        logger.info("narrative_projection_timing %s", {
+            "load_ms": (loaded - started) * 1000,
+            "project_ms": (perf_counter() - loaded) * 1000,
+            "event_count": len(all_events), "prior_event_count": len(events),
+            "directory_reused": _directory is not None,
+        })
+        return projection
 
     async def refresh(
         self,

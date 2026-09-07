@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import unicodedata
+from time import perf_counter
 from typing import Any, Dict, List, Mapping, Optional
 
 from pydantic import BaseModel, Field
@@ -1170,17 +1171,22 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     Returns:
         供 assemble_context 消费的普通 dict，形状见本模块文档。
     """
+    started = perf_counter()
     novel = await novel_repo.get_novel_by_id(novel_id)
     from backend.services.generation.author_brief import novel_author_brief
     author_brief = novel_author_brief(novel)
     chapter = await chapter_repo.get_chapter_by_id(chapter_id)
-    volume = await volume_repo.get_volume_by_id(str(chapter["volume_id"]))
+    if str(chapter.get("novel_id")) != novel_id:
+        raise ValueError("context_chapter_scope_invalid")
 
     order_index = int(chapter.get("order_index") or 0)
     all_chapters = await chapter_repo.get_chapters_by_novel(novel_id)
     volumes = await volume_repo.get_volumes_by_novel(novel_id)
-    timeline = ChapterTimeline(volumes, all_chapters)
+    timeline = ChapterTimeline(volumes, all_chapters, novel_id=novel_id)
     target_position = timeline.position(chapter_id)
+    volume = next((item for item in volumes if str(item["_id"]) == target_position.volume_id), None)
+    if volume is None or target_position.volume_id != str(chapter["volume_id"]):
+        raise ValueError("context_directory_changed")
     volume_positions = [
         position
         for position in timeline.positions
@@ -1207,6 +1213,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         for position in timeline.recent_before(chapter_id, RECENT_CHAPTER_COUNT)
     ]
 
+    directory_loaded = perf_counter()
     card_docs = await character_repo.list_cards(novel_id, "character")
     cards = {
         str(card["_id"]): {
@@ -1234,15 +1241,19 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
                 "interop": _world_entry_interop_projection(card),
             }
 
-    projection = await narrative_timeline.context_before(novel_id, chapter_id)
+    references_loaded = perf_counter()
+    projection = await narrative_timeline.context_before(novel_id, chapter_id, _directory=timeline)
+    history_loaded = perf_counter()
+    projected_states = projection.state_documents()
+    projected_threads = projection.active_threads
     context_lineage = {
         "schema_version": "narrative_context_lineage.v1",
         "projection_digest": projection.digest,
         "state_projection_digest": _context_evidence_digest(
-            projection.state_documents()
+            projected_states
         ),
         "thread_projection_digest": _context_evidence_digest(
-            projection.active_threads
+            projected_threads
         ),
         "target_book_ordinal": target_position.book_ordinal,
         "prior_state_deltas": [
@@ -1262,7 +1273,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         ],
     }
     state_docs = (
-        projection.state_documents()
+        projected_states
         if projection.states_tracked
         else await character_state_repo.list_states(novel_id)
     )
@@ -1302,7 +1313,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         }
 
     thread_docs = (
-        list(projection.active_threads)
+        projected_threads
         if projection.threads_tracked
         else await plot_thread_repo.list_threads(
             novel_id, statuses=ACTIVE_THREAD_STATUSES
@@ -1358,7 +1369,7 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
     )
     roster = build_roster(cards, worldbook_cards, threads, chapter_roster)
 
-    return {
+    result = {
         "novel": {
             "author_brief": author_brief.to_record() if author_brief else None,
             "core_seed": novel.get("core_seed", ""),
@@ -1394,6 +1405,16 @@ async def fetch_context_inputs(novel_id: str, chapter_id: str) -> dict:
         # beside the ProseRun.
         "context_lineage": context_lineage,
     }
+    logger.info("context_fetch_timing %s", {
+        "directory_ms": (directory_loaded - started) * 1000,
+        "reference_ms": (references_loaded - directory_loaded) * 1000,
+        "history_ms": (history_loaded - references_loaded) * 1000,
+        "finalize_ms": (perf_counter() - history_loaded) * 1000,
+        "total_ms": (perf_counter() - started) * 1000,
+        "chapter_count": len(all_chapters), "volume_count": len(volumes),
+        "character_count": len(cards), "worldbook_count": len(worldbook_cards),
+    })
+    return result
 
 
 async def build_context(

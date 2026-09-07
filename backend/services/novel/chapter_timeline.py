@@ -22,7 +22,12 @@ class ChapterPosition:
 class ChapterTimeline:
     """从当前卷/章顺序派生位置；身份始终由 chapter_id 保持稳定。"""
 
-    def __init__(self, volumes: Iterable[dict[str, Any]], chapters: Iterable[dict[str, Any]]) -> None:
+    def __init__(self, volumes: Iterable[dict[str, Any]], chapters: Iterable[dict[str, Any]], *, novel_id: str | None = None) -> None:
+        if novel_id is not None:
+            volumes, chapters = tuple(volumes), tuple(chapters)
+            if not novel_id or any(str(item.get("novel_id") or "") != novel_id for item in (*volumes, *chapters)):
+                raise ValueError("directory_scope_invalid")
+        self._novel_id = novel_id
         volume_order = {
             str(volume["_id"]): int(volume.get("order_index") or 0)
             for volume in volumes
@@ -58,6 +63,11 @@ class ChapterTimeline:
             )
         )
         self._by_id = {position.chapter_id: position for position in self._positions}
+
+    @property
+    def novel_id(self) -> str | None:
+        """Optional scope proof for reuse within one non-transactional read."""
+        return self._novel_id
 
     @property
     def positions(self) -> tuple[ChapterPosition, ...]:
