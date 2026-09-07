@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { useConfig } from "@/hooks/useConfig";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { DatabaseCard } from "@/components/settings/DatabaseCard";
 import { ProviderCard } from "@/components/settings/ProviderCard";
+import { JudgeProviderSettings } from "@/components/settings/JudgeProviderSettings";
 import { ImageProviderCard } from "@/components/settings/ImageProviderCard";
 import { WorkflowCard } from "@/components/settings/WorkflowCard";
 import { ThemeCard } from "@/components/settings/ThemeCard";
@@ -25,7 +26,7 @@ type SettingsSection =
   | "provider"
   | "workflow"
   | "generation-roles";
-type ProviderSettingsTab = "llm" | "image";
+type ProviderSettingsTab = "llm" | "image" | "judge";
 
 const NAV_ITEMS: { key: SettingsSection; icon: React.ReactNode }[] = [
   {
@@ -126,7 +127,10 @@ export default function SettingsContent({
     : isAdmin
       ? "theme"
       : "generation-roles";
-  const [providerSettingsTab, setProviderSettingsTab] = useState<ProviderSettingsTab>("llm");
+  const requestedProviderTab = searchParams.get("providerTab");
+  const providerSettingsTab: ProviderSettingsTab = requestedProviderTab === "image" || requestedProviderTab === "judge"
+    ? requestedProviderTab : "llm";
+  const requestedProviderAlias = searchParams.get("provider") || "";
   const showConfigActions = ["database", "provider", "workflow"].includes(activeSection);
   const {
     config,
@@ -155,6 +159,14 @@ export default function SettingsContent({
   const selectSection = (section: SettingsSection) => {
     const next = new URLSearchParams(searchParams.toString());
     next.set("section", section);
+    window.history.replaceState(null, "", `${pathname}?${next.toString()}`);
+  };
+
+  const selectProviderTab = (tab: ProviderSettingsTab, alias?: string) => {
+    const next = new URLSearchParams(searchParams.toString());
+    next.set("section", "provider");
+    next.set("providerTab", tab);
+    if (alias !== undefined) next.set("provider", alias);
     window.history.replaceState(null, "", `${pathname}?${next.toString()}`);
   };
 
@@ -296,27 +308,31 @@ export default function SettingsContent({
             <div
               role="tablist"
               aria-label={t("provider.title")}
-              className="flex max-w-full gap-1 overflow-x-auto rounded-lg border border-border bg-surface-secondary/40 p-1"
+              className="grid max-w-full grid-cols-3 gap-1 rounded-lg border border-border bg-surface-secondary/40 p-1"
             >
-              {(["llm", "image"] as const).map((tab) => (
+              {(["llm", "image", "judge"] as const).map((tab) => (
                 <button
                   key={tab}
                   type="button"
                   role="tab"
                   aria-selected={providerSettingsTab === tab}
-                  onClick={() => setProviderSettingsTab(tab)}
-                  className={`min-w-max flex-1 rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+                  onClick={() => selectProviderTab(tab)}
+                  className={`min-h-11 min-w-0 break-words rounded-md px-2 py-2 text-sm font-medium transition-colors sm:px-4 ${
                     providerSettingsTab === tab
                       ? "bg-surface text-accent shadow-sm"
                       : "text-muted hover:text-foreground"
                   }`}
                 >
-                  {tab === "llm" ? t("provider.title") : t("imageProvider.title")}
+                  {tab === "llm" ? t("provider.title") : tab === "image" ? t("imageProvider.title") : t("judge.title")}
                 </button>
               ))}
             </div>
-            {providerSettingsTab === "llm" ? (
+            {providerSettingsTab === "judge" ? (
+              <JudgeProviderSettings config={config} onChange={setConfig} onEditProvider={(alias) => selectProviderTab("llm", alias)} />
+            ) : providerSettingsTab === "llm" ? (
               <ProviderCard
+                key={requestedProviderAlias}
+                initialAlias={requestedProviderAlias}
                 config={config}
                 onChange={setConfig}
                 onProviderRename={(from, to) => queueProviderRename({
@@ -355,7 +371,12 @@ export default function SettingsContent({
           </div>
         );
       case "workflow":
-        return <WorkflowCard config={config} catalog={workflowCatalog} onChange={setConfig} />;
+        return (
+          <div className="grid gap-4">
+            <Button className="justify-self-start" variant="secondary" onPress={() => selectProviderTab("judge")}>{t("judge.openSettings")}</Button>
+            <WorkflowCard config={config} catalog={workflowCatalog} onChange={setConfig} />
+          </div>
+        );
     }
   };
 

@@ -100,6 +100,7 @@ from backend.services.llm.generation_runtime import (
     create_generation_runtime,
 )
 from backend.services.novel.state_proposal import state_proposal_module
+from backend.services.novel.state_fact_accounting import StateFactAccountingError
 from backend.scene_contract_versions import (
     SCENE_TRANSITION_CONTRACT_VERSION,
     require_known_scene_contract_version,
@@ -152,7 +153,22 @@ InteractiveCompletionFailureCode = Literal[
     "review_generation_failed",
     "review_dispatch_rejected",
     "review_result_missing_after_settlement",
+    "state_evidence_invalid",
+    "state_generation_failed",
+    "state_result_missing_after_settlement",
 ]
+
+_STATE_FAILURE_CONTRACT: dict[str, tuple[FailureFactReason, str]] = {
+    "state_evidence_invalid": (
+        "evidence_invalid", "状态事实证据未通过本地校验，验收已停止，未写入正式正文",
+    ),
+    "state_generation_failed": (
+        "semantic_unknown", "状态提取未成功完成，验收已停止，未写入正式正文",
+    ),
+    "state_result_missing_after_settlement": (
+        "evidence_invalid", "状态请求已结算，但没有可恢复的状态候选；验收已停止，未再次调用模型",
+    ),
+}
 
 _INDEPENDENT_REVIEW_FAILURE_CODES = frozenset({
     "review_uncertain",
@@ -324,6 +340,7 @@ class InteractiveCompletionProgress(_ClosedModel):
     stream_phase: str | None = None
     failure_code: InteractiveCompletionFailureCode | None = None
     validation_diagnostics: dict[str, Any] | None = None
+    provider_request_count: int = Field(default=0, ge=0)
     provider_activity_count: int = Field(ge=0)
     content_chunks: int = Field(ge=0)
     content_bytes: int = Field(ge=0)
@@ -1307,8 +1324,28 @@ class InteractiveChapterCompletionService:
                 "interactive completion progress is unavailable",
                 code="interactive_progress_unavailable",
             ) from exc
+        projected = progress.model_dump(mode="python")
+        if progress.stage == "state_generation":
+            attempts = self._state_attempts(job)
+            # This workflow awaits complete responses. Its old progress rows
+            # accidentally retained the preceding Judge's stream counters.
+            projected.update(
+                provider_activity_count=0, content_chunks=0, content_bytes=0,
+                provider_request_count=len(attempts),
+                stream_phase=(str(attempts[-1].get("phase") or "") if attempts else None),
+            )
+            if attempts and attempts[-1].get("provider_alias"):
+                current_alias = str(attempts[-1]["provider_alias"])
+                if current_alias != projected["provider_alias"]:
+                    projected.update(provider_alias=current_alias, provider_model=None)
+            if self._is_orphaned_settled_state_generation(job):
+                # A read must not dispatch or mutate a failed legacy job.
+                projected.update(
+                    stage_status="failed",
+                    failure_code="state_result_missing_after_settlement",
+                )
         return {
-            **progress.model_dump(mode="python"),
+            **projected,
             "authorization_id": request.authorization_id,
             "status": str(job.get("status") or ""),
             "pause_reason": (
@@ -1569,6 +1606,74 @@ class InteractiveChapterCompletionService:
             "status": INTERACTIVE_COMPLETION_RUNNING,
             "interactive_execution_claim.token": token,
         }
+
+    @staticmethod
+    def _state_attempts(job: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        slots = job.get("attempt_slots")
+        chapter_id = str(job.get("current_chapter_id") or "")
+        if not isinstance(slots, list) or not chapter_id:
+            return []
+        return [
+            slot for slot in slots
+            if isinstance(slot, Mapping)
+            and slot.get("step_id") == "interactive-state"
+            and str(slot.get("chapter_id") or "") == chapter_id
+        ]
+
+    @classmethod
+    def _is_orphaned_settled_state_generation(cls, job: Mapping[str, Any]) -> bool:
+        progress = job.get("interactive_completion_progress")
+        evidence = job.get("interactive_completion_evidence")
+        attempts = cls._state_attempts(job)
+        return bool(
+            job.get("status") == INTERACTIVE_COMPLETION_RUNNING
+            and job.get("interactive_execution_claim") is None
+            and not cls._has_live_attempts(job)
+            and isinstance(progress, Mapping)
+            and progress.get("stage") == "state_generation"
+            and progress.get("stage_status") == "running"
+            and isinstance(evidence, Mapping)
+            and isinstance(evidence.get("outline_adherence"), Mapping)
+            and "state_proposal" not in evidence
+            and attempts
+            and all(slot.get("state") == "accounted" for slot in attempts)
+        )
+
+    async def _pause_state_failure(
+        self,
+        *,
+        failure_code: InteractiveCompletionFailureCode,
+        readiness: InteractiveChapterCompletionReadiness,
+        execution: InteractiveCompletionExecutionClaim,
+        source: InteractiveCompletionSourceBinding,
+        adherence: Mapping[str, Any] | None,
+        previous_job: Mapping[str, Any],
+    ) -> None:
+        reason, _message = _STATE_FAILURE_CONTRACT[failure_code]
+        attempts = self._state_attempts(previous_job)
+        raw_previous = previous_job.get("interactive_completion_progress")
+        try:
+            previous = InteractiveCompletionProgress.model_validate(raw_previous)
+        except ValidationError:
+            previous = None
+        await self._record_failure_and_pause(
+            readiness=readiness,
+            execution=execution,
+            source=source,
+            adherence=adherence,
+            failure_fact=ChapterCompletionFailureFact(reason=reason, observed_at="state_proposal"),
+            pause_reason="state_generation_manual_review",
+            progress=InteractiveCompletionProgress(
+                stage="state_generation", stage_status="failed",
+                started_at=previous.started_at if previous is not None else execution.claimed_at,
+                updated_at=get_utc_now(),
+                provider_alias=readiness.generation_plans.state.provider_alias,
+                provider_model=readiness.generation_plans.state.provider_model,
+                stream_phase=str(attempts[-1].get("phase") or "") if attempts else None,
+                failure_code=failure_code, provider_request_count=len(attempts),
+                provider_activity_count=0, content_chunks=0, content_bytes=0,
+            ),
+        )
 
     @staticmethod
     def _finalization_authorization(
@@ -2108,6 +2213,9 @@ class InteractiveChapterCompletionService:
             ) from exc
 
         stream_phase = None
+        provider_activity_count = 0
+        content_chunks = 0
+        content_bytes = 0
         await persist_progress(
             stage="state_generation",
             stage_status="running",
@@ -2196,7 +2304,22 @@ class InteractiveChapterCompletionService:
                     execution_token=execution.token,
                     cause=exc,
                 )
-                raise
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                failure_code = (
+                    "state_evidence_invalid"
+                    if isinstance(exc, StateFactAccountingError)
+                    else "state_generation_failed"
+                )
+                current_job = await self._deps.job_repo.get_job(readiness.authorization_id)
+                await self._pause_state_failure(
+                    failure_code=failure_code,
+                    readiness=readiness, execution=execution, source=source,
+                    adherence=adherence, previous_job=current_job,
+                )
+                raise InteractiveCompletionBlocked(
+                    _STATE_FAILURE_CONTRACT[failure_code][1], code=failure_code,
+                ) from exc
             proposal_id = state.get("proposal_id")
             if not isinstance(proposal_id, str) or not ObjectId.is_valid(
                 proposal_id
@@ -2577,6 +2700,19 @@ class InteractiveChapterCompletionService:
         job = await self._ensure_job(readiness)
         execution = await self._claim_execution(readiness)
         try:
+            if self._is_orphaned_settled_state_generation(job):
+                state_failure_code: InteractiveCompletionFailureCode = (
+                    "state_result_missing_after_settlement"
+                )
+                await self._pause_state_failure(
+                    failure_code=state_failure_code,
+                    readiness=readiness, execution=execution, source=source,
+                    adherence=job["interactive_completion_evidence"]["outline_adherence"],
+                    previous_job=job,
+                )
+                raise InteractiveCompletionBlocked(
+                    _STATE_FAILURE_CONTRACT[state_failure_code][1], code=state_failure_code,
+                )
             if self._is_orphaned_settled_outline_review(job):
                 failure_code: InteractiveCompletionFailureCode = (
                     "review_result_missing_after_settlement"

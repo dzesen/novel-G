@@ -97,6 +97,7 @@ interface InteractiveCompletionProgress {
   stream_phase: string | null;
   failure_code: string | null;
   validation_diagnostics?: unknown;
+  provider_request_count?: number;
   provider_activity_count: number;
   content_chunks: number;
   content_bytes: number;
@@ -1151,16 +1152,41 @@ export default function ProsePanel({
                     stage: completionProgressStage,
                   })}
                 </p>
-                <p className="min-w-0 break-words">
+                {completionProgress.stage === "state_generation" ? (
+                  <p className="min-w-0 break-words">
+                    {t("completionProgressStateRequests", {
+                      provider: completionProgressProvider,
+                      count: completionProgress.provider_request_count ?? 0,
+                      phase: t(completionProgress.stream_phase === "repair"
+                        ? "completionProgressPhaseRepair"
+                        : completionProgress.stream_phase === "primary"
+                          ? "completionProgressPhasePrimary"
+                          : completionProgress.stream_phase === "reviewer"
+                            ? "completionProgressPhaseFormatReview"
+                            : completionProgress.stream_phase === "schema_fallback"
+                              ? "completionProgressPhaseSchemaFallback"
+                              : "completionProgressPhaseWaiting"),
+                    })}
+                  </p>
+                ) : <p className="min-w-0 break-words">
                   {t("completionProgressProviderActivity", {
                     provider: completionProgressProvider,
                     count: completionProgress.provider_activity_count,
                     bytes: completionProgress.content_bytes,
                   })}
-                </p>
+                </p>}
+                {completionProgress.stage === "state_generation" && completionProgress.stage_status === "running" && (
+                  <p>{t("completionProgressStateWaiting")}</p>
+                )}
                 {completionProgress.stage_status === "failed" && (
                   <p className="font-medium text-foreground">
-                    {t(completionProgress.failure_code === (
+                    {t(completionProgress.failure_code === "state_evidence_invalid"
+                      ? "completionProgressStateEvidenceInvalid"
+                      : completionProgress.failure_code === "state_result_missing_after_settlement"
+                        ? "completionProgressStateResultMissing"
+                        : completionProgress.stage === "state_generation"
+                          ? "completionProgressStateFailed"
+                          : completionProgress.failure_code === (
                       "review_result_missing_after_settlement"
                     )
                       ? "completionProgressReviewResultMissing"

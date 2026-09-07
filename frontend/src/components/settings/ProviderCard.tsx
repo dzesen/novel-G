@@ -40,6 +40,7 @@ import {
 
 interface Props {
   config: AppConfig;
+  initialAlias?: string;
   onChange: (config: AppConfig) => void;
   onProviderRename: (from: string, to: string) => void;
   onProviderDelete: (alias: string, replacementDefaultAlias?: string) => void;
@@ -106,7 +107,7 @@ const TEST_STEPS: { capability: ProviderTestCapability; labelKey: string }[] = [
 
 const ALIAS_REGEX = /^[a-zA-Z0-9_]+$/;
 
-export function ProviderCard({ config, onChange, onProviderRename, onProviderDelete }: Props) {
+export function ProviderCard({ config, initialAlias = "", onChange, onProviderRename, onProviderDelete }: Props) {
   const t = useTranslations("settings.provider");
   const [newAlias, setNewAlias] = useState("");
   const [aliasError, setAliasError] = useState("");
@@ -114,7 +115,7 @@ export function ProviderCard({ config, onChange, onProviderRename, onProviderDel
   const [renamingAlias, setRenamingAlias] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [renameError, setRenameError] = useState("");
-  const [selectedAlias, setSelectedAlias] = useState("");
+  const [selectedAlias, setSelectedAlias] = useState(initialAlias);
   const [filter, setFilter] = useState<ProviderFilter>("all");
   const [showKey, setShowKey] = useState(false);
   const [showGenParams, setShowGenParams] = useState(false);
