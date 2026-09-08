@@ -3,6 +3,7 @@
 import { useTranslations } from "next-intl";
 import {
   keyReviewChapterIds,
+  changeChapterReviewMode,
   toggleReviewChapter,
   type ChapterReviewSelection,
   type ReviewChapter,
@@ -30,22 +31,21 @@ export default function ChapterReviewControls({
       <select
         id="batch-chapter-review-mode"
         value={value.mode}
-        onChange={(event) => onChange({
-          ...value,
-          mode: event.target.value as ChapterReviewSelection["mode"],
-          selected_chapter_ids: event.target.value === "all_chapters" ? [] : value.selected_chapter_ids,
-        })}
+        onChange={(event) => onChange(changeChapterReviewMode(
+          value, event.target.value as ChapterReviewSelection["mode"],
+        ))}
         className="min-h-11 w-full min-w-0 rounded-md border border-border bg-surface px-3 py-2 text-base text-foreground focus-visible:outline-2 focus-visible:outline-accent sm:text-sm"
         aria-describedby="batch-chapter-review-hint"
       >
         <option value="key_chapters">{t("chapterReviewKey")}</option>
         <option value="selected_chapters">{t("chapterReviewSelected")}</option>
         <option value="all_chapters">{t("chapterReviewAll")}</option>
+        <option value="no_chapters">{t("chapterReviewNone")}</option>
       </select>
       <p id="batch-chapter-review-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">
-        {t("chapterReviewHint")}
+        {t(value.mode === "no_chapters" ? "chapterReviewNoneHint" : "chapterReviewHint")}
       </p>
-      {value.mode !== "all_chapters" && (
+      {(value.mode === "key_chapters" || value.mode === "selected_chapters") && (
         chapters.length === 0 ? (
           <p className="text-xs leading-5 text-warm-700 dark:text-muted">{t("chapterReviewLoadChapters")}</p>
         ) : (

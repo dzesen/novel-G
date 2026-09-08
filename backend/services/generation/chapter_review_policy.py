@@ -42,7 +42,7 @@ class _ClosedReviewModel(BaseModel):
 
 class ChapterReviewSelection(_ClosedReviewModel):
     schema_version: Literal["chapter_review_selection.v1"] = REVIEW_SELECTION_SCHEMA
-    mode: Literal["key_chapters", "selected_chapters", "all_chapters"] = "key_chapters"
+    mode: Literal["key_chapters", "selected_chapters", "all_chapters", "no_chapters"] = "key_chapters"
     selected_chapter_ids: tuple[ObjectIdText, ...] = Field(default=(), max_length=10_000)
     review_after_prose_repair: Literal[True] = True
 
@@ -50,8 +50,8 @@ class ChapterReviewSelection(_ClosedReviewModel):
     def validate_selection(self) -> "ChapterReviewSelection":
         if tuple(sorted(set(self.selected_chapter_ids))) != self.selected_chapter_ids:
             raise ValueError("review chapter IDs must be sorted and unique")
-        if self.mode == "all_chapters" and self.selected_chapter_ids:
-            raise ValueError("all-chapter review cannot carry a redundant selection")
+        if self.mode in {"all_chapters", "no_chapters"} and self.selected_chapter_ids:
+            raise ValueError("whole-scope review modes cannot carry selected chapter IDs")
         return self
 
 
@@ -73,6 +73,8 @@ class ChapterReviewAuthorization(_ClosedReviewModel):
             raise ValueError("author-selected chapters are missing from review")
         if self.selection.mode == "all_chapters" and self.chapter_ids != self.required_chapter_ids:
             raise ValueError("all-chapter review requirement is incomplete")
+        if self.selection.mode == "no_chapters" and self.required_chapter_ids:
+            raise ValueError("no-chapter review cannot require routine chapter review")
         if self.selection.mode == "selected_chapters" and (
             self.required_chapter_ids != self.selection.selected_chapter_ids
         ):

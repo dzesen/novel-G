@@ -1,6 +1,6 @@
 export interface ChapterReviewSelection {
   schema_version: "chapter_review_selection.v1";
-  mode: "key_chapters" | "selected_chapters" | "all_chapters";
+  mode: "key_chapters" | "selected_chapters" | "all_chapters" | "no_chapters";
   selected_chapter_ids: string[];
   review_after_prose_repair: true;
 }
@@ -39,6 +39,16 @@ export function keyReviewChapterIds(chapters: ReviewChapter[]): Set<string> {
     const ordered = [...entries].sort((a, b) => a.order_index - b.order_index);
     return [ordered[0].chapter_id, ordered[ordered.length - 1].chapter_id];
   }));
+}
+
+export function changeChapterReviewMode(
+  selection: ChapterReviewSelection, mode: ChapterReviewSelection["mode"],
+): ChapterReviewSelection {
+  return {
+    ...selection, mode,
+    selected_chapter_ids: mode === "all_chapters" || mode === "no_chapters"
+      ? [] : selection.selected_chapter_ids,
+  };
 }
 
 export function toggleReviewChapter(

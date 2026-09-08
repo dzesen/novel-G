@@ -2826,6 +2826,8 @@
       "chapterReviewKey": "Volume openings and endings + my selections",
       "chapterReviewSelected": "Only my selected chapters",
       "chapterReviewAll": "Review every chapter",
+      "chapterReviewNone": "Review no chapters",
+      "chapterReviewNoneHint": "Turn off routine Judge review for all chapters and mark them as not reviewed. Prose completeness and state checks still apply; automatically repaired prose is still reviewed within the original authorization.",
       "chapterReviewHint": "Other regular chapters are marked as not reviewed and still require prose completeness and state checks. Automatically repaired prose is reviewed within the original authorization; its allowance remains in the preview bounds.",
       "chapterReviewLoadChapters": "After the next preview, expand the chapter list to add selections.",
       "chapterReviewChoose": "Choose chapters ({count} selected by you)",

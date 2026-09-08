@@ -2826,6 +2826,8 @@
       "chapterReviewKey": "每卷首尾＋我勾选的章节",
       "chapterReviewSelected": "仅我勾选的章节",
       "chapterReviewAll": "每章都审查",
+      "chapterReviewNone": "全部不审查",
+      "chapterReviewNoneHint": "所有章节关闭常规 Judge 审查，并标记为未审查。正文完整性和状态回写仍检查；正文自动修复后仍会在原授权内复核。",
       "chapterReviewHint": "未选中的普通章记为未审查，仍须通过正文完整性和状态回写检查。正文自动修复后会在原授权内复核；预检上界包含这部分预留。",
       "chapterReviewLoadChapters": "进入下一步预检后，可以展开章节清单补选。",
       "chapterReviewChoose": "选择章节（已主动勾选 {count} 章）",
