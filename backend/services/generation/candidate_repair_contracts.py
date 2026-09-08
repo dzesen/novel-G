@@ -524,6 +524,13 @@ class AdherenceCandidateCheckpointV5(_CandidatePipelineCheckpointV5):
         return self
 
 
+class AdherenceAdvisoryCheckpointV7(AdherenceCandidateCheckpointV5):
+    """Preserve the semantic verdict while binding permission to continue."""
+
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v7"]
+    review_authorization_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class AdherenceNotReviewedCheckpointV6(_CandidatePipelineCheckpointV1):
     """A zero-call policy receipt, distinct from a passing semantic review."""
 
@@ -588,6 +595,7 @@ AdherenceCandidateCheckpoint = (
     | AdherenceCandidateCheckpointV4
     | AdherenceCandidateCheckpointV5
     | AdherenceNotReviewedCheckpointV6
+    | AdherenceAdvisoryCheckpointV7
 )
 StateCandidateCheckpoint = StateCandidateCheckpointV1 | StateCandidateCheckpointV3
 
@@ -599,6 +607,7 @@ CandidatePipelineCheckpointV1 = (
     | AdherenceCandidateCheckpointV4
     | AdherenceCandidateCheckpointV5
     | AdherenceNotReviewedCheckpointV6
+    | AdherenceAdvisoryCheckpointV7
     | StateCandidateCheckpointV1
     | StateCandidateCheckpointV3
 )
@@ -677,7 +686,7 @@ def candidate_checkpoint_review_requirement_satisfied(
 ) -> bool:
     # Live execution and finalization separately rebind this receipt to the
     # frozen server authorization; the reducer only validates ledger order.
-    if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6):
+    if isinstance(checkpoint, (AdherenceNotReviewedCheckpointV6, AdherenceAdvisoryCheckpointV7)):
         return type(expected_scene_count) is int and 1 <= expected_scene_count <= MAX_CANDIDATE_OUTLINE_SCENES
     return candidate_checkpoint_adherence_passed(checkpoint, expected_scene_count=expected_scene_count)
 
@@ -1073,6 +1082,7 @@ def parse_candidate_pipeline_checkpoint(
         "chapter_candidate_pipeline_checkpoint.v4",
         "chapter_candidate_pipeline_checkpoint.v5",
         "chapter_candidate_pipeline_checkpoint.v6",
+        "chapter_candidate_pipeline_checkpoint.v7",
     }:
         raise ValueError("candidate checkpoint schema_version is invalid")
     if (
@@ -1086,7 +1096,7 @@ def parse_candidate_pipeline_checkpoint(
     ):
         raise ValueError("candidate checkpoint v4 kind is invalid")
     if (
-        checkpoint_version in {"chapter_candidate_pipeline_checkpoint.v5", "chapter_candidate_pipeline_checkpoint.v6"}
+        checkpoint_version in {"chapter_candidate_pipeline_checkpoint.v5", "chapter_candidate_pipeline_checkpoint.v6", "chapter_candidate_pipeline_checkpoint.v7"}
         and value.get("kind") != "outline_adherence"
     ):
         raise ValueError("candidate checkpoint v5 kind is invalid")

@@ -43,6 +43,7 @@ from backend.services.generation.candidate_repair_contracts import (
 from backend.services.generation.chapter_completion_certificate import (
     CHAPTER_COMPLETION_POLICY_REVISION,
     SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION,
+    ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION,
     CHAPTER_COMPLETION_FAILURE_EVIDENCE_SCHEMA,
     ChapterBinding,
     ChapterCompletionCandidateSnapshot,
@@ -70,7 +71,7 @@ from backend.services.generation.chapter_repair_policy import (
 from backend.services.generation.chapter_review_policy import (
     NOT_REVIEWED_SCHEMA, ChapterNotReviewedReceipt, ChapterReviewCoverage,
     not_reviewed_completion_metadata, review_authorization_from_readiness,
-    validate_not_reviewed_receipt,
+    validate_not_reviewed_receipt, review_is_advisory,
 )
 from backend.services.generation.outline_adherence import (
     OutlineAdherenceValidationError,
@@ -1704,13 +1705,15 @@ class ChapterFinalizationService:
             )
             review_authorization = review_authorization_from_readiness(job.get("readiness") or {})
             not_reviewed = adherence_metadata.get("review_status") == "not_reviewed"
+            advisory = adherence_metadata.get("review_status") == "advisory"
             prose_repaired = _chapter_had_prose_repair(job, chapter_id)
             review_coverage = (
                 ChapterReviewCoverage(
-                    status="not_reviewed" if not_reviewed else "passed",
+                    status="not_reviewed" if not_reviewed else "advisory" if advisory else "passed",
                     required=review_authorization.requires_review(chapter_id, prose_repaired=prose_repaired),
                     authorization_digest=review_authorization.digest,
                     prose_repaired=prose_repaired,
+                    enforcement=review_authorization.selection.enforcement,
                 ) if review_authorization is not None else None
             )
             evidence_bundle = ChapterCompletionEvidenceBundle(
@@ -1763,13 +1766,13 @@ class ChapterFinalizationService:
                     adherence_metadata.get("quality_debt_sidecar_digest") or ""
                 ),
                 prose_integrity_passed=True,
-                scene_contract_passed=None if not_reviewed else True,
+                scene_contract_passed=None if not_reviewed or advisory else True,
                 state_fact_accounting_passed=True,
                 repair_convergence=repair_convergence,
                 blocking_issue_signatures=tuple(
                     item["issue_signature"]
                     for item in local_issue_set
-                    if item["severity"] in {"blocker", "major", "unknown"}
+                    if not advisory and item["severity"] in {"blocker", "major", "unknown"}
                 ),
                 failure_classes=(),
                 quality_debt_count=int(
@@ -1780,7 +1783,8 @@ class ChapterFinalizationService:
             completion_decision = completion_policy.assess(
                 candidate_snapshot,
                 evidence_bundle,
-                SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION if review_coverage is not None else CHAPTER_COMPLETION_POLICY_REVISION,
+                ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION if review_coverage is not None and review_coverage.enforcement is not None
+                else SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION if review_coverage is not None else CHAPTER_COMPLETION_POLICY_REVISION,
             )
             await self._persist_completion_decision(
                 authorization=authorization,
@@ -2435,6 +2439,7 @@ class ChapterFinalizationService:
                     outline=outline,
                     prose=prose_text,
                     require_current_evidence=True,
+                    enforce_semantics=not review_is_advisory(review_authorization_from_readiness(job.get("readiness") or {})),
                 )
             except OutlineAdherenceValidationError as exc:
                 raise _CompletionGateDenied(

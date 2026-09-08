@@ -19,6 +19,7 @@ REVIEW_AUTHORIZATION_SCHEMA = "chapter_review_authorization.v1"
 NOT_REVIEWED_SCHEMA = "chapter_not_reviewed.v1"
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ObjectIdText = Annotated[str, Field(pattern=r"^[0-9a-f]{24}$")]
+ReviewEnforcement = Literal["advisory", "strict"]
 
 
 def review_digest(value: Any) -> str:
@@ -45,6 +46,8 @@ class ChapterReviewSelection(_ClosedReviewModel):
     mode: Literal["key_chapters", "selected_chapters", "all_chapters", "no_chapters"] = "key_chapters"
     selected_chapter_ids: tuple[ObjectIdText, ...] = Field(default=(), max_length=10_000)
     review_after_prose_repair: Literal[True] = True
+    # Absence belongs to an older, strict authorization. Keep its digest exact.
+    enforcement: ReviewEnforcement | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def validate_selection(self) -> "ChapterReviewSelection":
@@ -87,6 +90,14 @@ class ChapterReviewAuthorization(_ClosedReviewModel):
         if chapter_id not in self.chapter_ids:
             raise ValueError("chapter is outside the review authorization")
         return chapter_id in self.required_chapter_ids or prose_repaired
+
+
+def default_chapter_review_selection() -> ChapterReviewSelection:
+    return ChapterReviewSelection(enforcement="advisory")
+
+
+def review_is_advisory(authorization: ChapterReviewAuthorization | None) -> bool:
+    return authorization is not None and authorization.selection.enforcement == "advisory"
 
 
 def build_chapter_review_authorization(
@@ -210,15 +221,18 @@ class ChapterReviewCoverage(_ClosedReviewModel):
     """Certificate projection; a policy omission is never a semantic pass."""
 
     schema_version: Literal["chapter_review_coverage.v1"] = "chapter_review_coverage.v1"
-    status: Literal["passed", "not_reviewed"]
+    status: Literal["passed", "not_reviewed", "advisory"]
     required: bool
     authorization_digest: Digest
     prose_repaired: bool = False
+    enforcement: ReviewEnforcement | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def validate_status(self) -> "ChapterReviewCoverage":
         if self.prose_repaired and not self.required:
             raise ValueError("repaired prose requires review")
-        if self.required != (self.status == "passed"):
+        if self.required != (self.status != "not_reviewed"):
             raise ValueError("review coverage does not satisfy its frozen requirement")
+        if self.status == "advisory" and self.enforcement != "advisory":
+            raise ValueError("semantic advice requires explicit advisory authorization")
         return self

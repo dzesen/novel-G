@@ -128,6 +128,7 @@ class BookCompletionSummary(_StrictModel):
     advisory_issue_count: int
     reviewed_chapter_count: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
     unreviewed_chapter_count: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
+    advisory_review_chapter_count: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
 
 
 class BookCompletionChapterAudit(_StrictModel):
@@ -141,7 +142,7 @@ class BookCompletionChapterAudit(_StrictModel):
     content_digest: str = Field(pattern=_HEX_64_PATTERN)
     actual_word_count: int
     target_word_count: int | None
-    independent_review_status: Literal["passed", "not_reviewed"] | None = Field(
+    independent_review_status: Literal["passed", "not_reviewed", "advisory"] | None = Field(
         default=None, exclude_if=lambda value: value is None,
     )
 
@@ -244,6 +245,7 @@ def _certificate_review_status(
         policy = review_authorization_from_readiness(readiness)
         if (
             policy is None or policy.digest != coverage.authorization_digest
+            or policy.selection.enforcement != coverage.enforcement
             or readiness.get("digest") != binding.readiness_digest
             or policy.requires_review(str(chapter.get("_id") or ""), prose_repaired=coverage.prose_repaired) != coverage.required
         ):
@@ -1141,6 +1143,11 @@ class BookCompletionAudit:
                         )
                     )
             review_status, review_error = _certificate_review_status(chapter, review_jobs_by_id)
+            if review_status == "advisory":
+                issues.append(BookCompletionIssue(
+                    code="semantic_review_advisory", category="semantic", level="advisory",
+                    chapter_id=chapter_id,
+                ))
             if review_error is not None:
                 issues.append(BookCompletionIssue(
                     code="chapter_review_authorization_unproven", category="semantic",
@@ -1469,6 +1476,10 @@ class BookCompletionAudit:
                     in {"repair", "manual_review"}
                     or review.get("verdict") in {"warn", "fail"}
                 )
+                and not any(
+                    item.chapter_id == chapter_id and item.independent_review_status == "advisory"
+                    for item in chapter_audits
+                )
             ]
             for semantic in sorted(
                 unresolved_semantics,
@@ -1735,6 +1746,7 @@ class BookCompletionAudit:
                 complete_chapter_count=complete_chapter_count,
                 reviewed_chapter_count=sum(item.independent_review_status == "passed" for item in chapter_audits),
                 unreviewed_chapter_count=sum(item.independent_review_status == "not_reviewed" for item in chapter_audits),
+                advisory_review_chapter_count=sum(item.independent_review_status == "advisory" for item in chapter_audits),
                 current_state_count=current_state_count,
                 blocking_reference_candidate_count=len(
                     blocking_candidates

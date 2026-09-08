@@ -57,7 +57,7 @@ from backend.services.generation.chapter_finalization import (
 from backend.services.generation.chapter_review_policy import (
     ChapterReviewAuthorization, ChapterReviewSelection,
     build_chapter_review_authorization, build_not_reviewed_receipt,
-    validate_not_reviewed_receipt,
+    validate_not_reviewed_receipt, review_is_advisory, ReviewEnforcement,
 )
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
@@ -1330,6 +1330,7 @@ class InteractiveChapterCompletionService:
         run_id: str,
         run_revision: int,
         review_requested: bool | None = None,
+        review_enforcement: ReviewEnforcement | None = None,
     ) -> InteractiveChapterCompletionReadiness:
         inspection = await self.inspect_with_notices(
             owner_id=owner_id,
@@ -1338,6 +1339,7 @@ class InteractiveChapterCompletionService:
             run_id=run_id,
             run_revision=run_revision,
             review_requested=review_requested,
+            review_enforcement=review_enforcement,
         )
         return inspection.readiness
 
@@ -1403,6 +1405,7 @@ class InteractiveChapterCompletionService:
         run_id: str,
         run_revision: int,
         review_requested: bool | None = None,
+        review_enforcement: ReviewEnforcement | None = None,
     ) -> InteractiveChapterCompletionInspection:
         candidate, _chapter, source = await self._snapshot(
             owner_id=owner_id,
@@ -1479,6 +1482,7 @@ class InteractiveChapterCompletionService:
                 [{"chapter_id": source.chapter_id, "volume_id": source.volume_id, "order_index": 0}],
                 ChapterReviewSelection(
                     mode="all_chapters" if review_requested else "selected_chapters",
+                    enforcement=review_enforcement,
                 ),
             )
         needs_review = review_authorization.requires_review(source.chapter_id) if review_authorization else True
@@ -2270,11 +2274,24 @@ class InteractiveChapterCompletionService:
                     expected=self._execution_expected(execution.token),
                 )
             try:
-                self._deps.validate_adherence(
-                    adherence=adherence,
-                    outline=dict(chapter["outline"]),
-                    prose=str(candidate["text"]),
-                )
+                # Advisory review still revalidates exact evidence; its semantic
+                # verdict is retained and cannot request a content mutation.
+                if review_is_advisory(readiness.planning.chapter_review_authorization):
+                    revalidate_current_outline_adherence_evidence(
+                        adherence, outline=dict(chapter["outline"]), prose=str(candidate["text"]),
+                        source_prose_run_id=run_id, source_prose_run_revision=run_revision,
+                        source_content_digest=source.content_digest,
+                    )
+                    validate_complete_outline_adherence(
+                        adherence, outline=dict(chapter["outline"]), prose=str(candidate["text"]),
+                        require_current_evidence=True, enforce_semantics=False,
+                    )
+                else:
+                    self._deps.validate_adherence(
+                        adherence=adherence,
+                        outline=dict(chapter["outline"]),
+                        prose=str(candidate["text"]),
+                    )
             except ValueError as exc:
                 try:
                     validated_failure_adherence = (
@@ -2757,6 +2774,7 @@ class InteractiveChapterCompletionService:
         request: InteractiveCompletionRequestBinding,
         confirmed: bool,
         review_requested: bool | None = None,
+        review_enforcement: ReviewEnforcement | None = None,
     ) -> dict[str, Any]:
         if confirmed is not True:
             raise InteractiveCompletionBlocked(
@@ -2775,6 +2793,7 @@ class InteractiveChapterCompletionService:
             run_id=request.run_id,
             run_revision=request.run_revision,
             review_requested=review_requested,
+            review_enforcement=review_enforcement,
         )
         if (
             request.authorization_id != readiness.authorization_id

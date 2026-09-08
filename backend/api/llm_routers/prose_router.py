@@ -18,6 +18,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import Field
+from backend.services.generation.chapter_review_policy import ReviewEnforcement
 
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
@@ -162,6 +163,7 @@ class InteractiveCompletionReadinessRequest(GenerationParamsMixin):
     chapter_id: str = Field(..., min_length=1)
     expected_run_revision: int = Field(ge=1)
     review_requested: bool = False
+    review_enforcement: ReviewEnforcement = "advisory"
 
 
 class InteractiveCompletionAuthorityRequest(
@@ -532,6 +534,7 @@ async def inspect_interactive_completion_readiness(
                 run_id=run_id,
                 run_revision=req.expected_run_revision,
                 review_requested=req.review_requested,
+                review_enforcement=req.review_enforcement,
             )
         )
         return inspection.model_dump(mode="json")
@@ -563,6 +566,7 @@ async def complete_interactive_prose_run(
             ),
             confirmed=req.completion_readiness_confirmed,
             review_requested=req.review_requested,
+            review_enforcement=req.review_enforcement,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -1154,6 +1154,7 @@ def validate_complete_outline_adherence(
     outline: Mapping[str, Any],
     prose: str | None = None,
     require_current_evidence: bool = False,
+    enforce_semantics: bool = True,
 ) -> dict[str, Any]:
     """Validate current local decisions and read legacy exact-pass reviews."""
 
@@ -1169,6 +1170,17 @@ def validate_complete_outline_adherence(
         isinstance(evidence_version, str)
         and evidence_version in CURRENT_OUTLINE_ADHERENCE_POLICIES
     )
+    if not enforce_semantics:
+        if not is_current_evidence or prose is None:
+            raise OutlineAdherenceValidationError("建议模式必须使用绑定当前正文的版本化证据")
+        result = revalidate_current_outline_adherence_evidence(
+            result,
+            outline=outline,
+            prose=prose,
+            source_prose_run_id=result.get("source_prose_run_id"),
+            source_prose_run_revision=result.get("source_prose_run_revision"),
+            source_content_digest=chapter_content_digest(prose),
+        )
     has_quality_sidecar = evidence_version == OUTLINE_ADHERENCE_EVIDENCE_VERSION
     is_legacy_local_evidence = (
         evidence_version == LEGACY_LOCAL_OUTLINE_ADHERENCE_EVIDENCE_VERSION
@@ -1180,11 +1192,11 @@ def validate_complete_outline_adherence(
         )
     if uses_local_policy:
         decision = result.get("decision")
-        if decision == "manual_review":
+        if enforce_semantics and decision == "manual_review":
             raise OutlineAdherenceValidationError(
                 "章纲符合度存在语义 unknown，必须转人工"
             )
-        if decision != "pass":
+        if enforce_semantics and decision != "pass":
             raise OutlineAdherenceValidationError(
                 "正文候选需要修复后才能通过章纲符合度"
             )
@@ -1330,7 +1342,7 @@ def validate_complete_outline_adherence(
             }:
                 raise OutlineAdherenceValidationError("beat 证据状态无效")
             actual_status_counts[status] = actual_status_counts.get(status, 0) + 1
-            if required and status != "satisfied":
+            if enforce_semantics and required and status != "satisfied":
                 raise OutlineAdherenceValidationError("必要 beat 尚未满足")
         if actual_beats != [
             (scene_id, beat_id)
@@ -1340,22 +1352,22 @@ def validate_complete_outline_adherence(
         if result.get("beat_status_counts") != actual_status_counts:
             raise OutlineAdherenceValidationError("beat 证据状态计数不一致")
         findings = result.get("findings")
-        if not isinstance(findings, list) or findings:
+        if not isinstance(findings, list) or (enforce_semantics and findings):
             raise OutlineAdherenceValidationError("章纲符合度仍包含合同偏离")
         quality_debt_count = 0
         quality_observation_count = 0
         if uses_local_policy:
             unknowns = result.get("unknowns")
-            if not isinstance(unknowns, list) or unknowns:
+            if not isinstance(unknowns, list) or (enforce_semantics and unknowns):
                 raise OutlineAdherenceValidationError(
                     "章纲符合度存在语义 unknown，必须转人工"
                 )
             local_issues = result.get("local_issues")
-            if not isinstance(local_issues, list) or any(
+            if not isinstance(local_issues, list) or (enforce_semantics and any(
                 item.get("severity") in {"blocker", "major", "unknown"}
                 for item in local_issues
                 if isinstance(item, Mapping)
-            ):
+            )):
                 raise OutlineAdherenceValidationError(
                     "章纲符合度仍包含本地硬问题"
                 )
@@ -1381,10 +1393,10 @@ def validate_complete_outline_adherence(
             "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
             "outline_contract_digest": outline_digest,
             "beat_count": len(expected_beats),
-            "finding_count": 0,
+            "finding_count": len(findings),
             **(
                 {
-                    "decision": "pass",
+                    "decision": result["decision"],
                     "issue_policy_version": result["issue_policy_version"],
                     "quality_debt_count": quality_debt_count,
                     "quality_observation_count": quality_observation_count,
@@ -1447,7 +1459,7 @@ def validate_complete_outline_adherence(
         if not isinstance(item, Mapping):
             raise OutlineAdherenceValidationError("章纲场景覆盖证据格式无效")
         scene_index = item.get("scene_index")
-        if type(scene_index) is not int or item.get("status") != "covered":
+        if type(scene_index) is not int or (enforce_semantics and item.get("status") != "covered"):
             raise OutlineAdherenceValidationError("章纲场景尚未全部落实")
         scene_indexes.append(scene_index)
     if scene_indexes != list(range(1, len(scenes) + 1)):
@@ -1470,7 +1482,7 @@ def validate_complete_outline_adherence(
         raise OutlineAdherenceValidationError("章纲符合度正文摘要无效")
 
     return {
-        **({"decision": "pass"} if is_current_evidence else {"verdict": "pass"}),
+        **({"decision": result["decision"]} if is_current_evidence else {"verdict": "pass"}),
         "scene_count": len(coverage),
         "issue_count": 0,
         "issue_categories": [],
@@ -1478,4 +1490,9 @@ def validate_complete_outline_adherence(
         "source_prose_run_revision": revision,
         "source_content_digest": digest,
         **evidence_metadata,
+        **({
+            "review_status": "passed" if result["decision"] == "pass" else "advisory",
+            "issue_count": len(result["local_issues"]),
+            "issue_categories": list(dict.fromkeys(item["category"] for item in result["local_issues"])),
+        } if not enforce_semantics else {}),
     }

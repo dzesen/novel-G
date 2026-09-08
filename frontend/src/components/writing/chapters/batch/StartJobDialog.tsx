@@ -1123,6 +1123,10 @@ export default function StartJobDialog({
                         count: readiness.planning.chapter_review_authorization.required_chapter_ids.length,
                         total: readiness.planning.chapter_review_authorization.chapter_ids.length,
                       })}
+                      <span className="mt-1 block font-medium">
+                        {t(readiness.planning.chapter_review_authorization.selection.enforcement === "advisory"
+                          ? "reviewEnforcementAdvisory" : "reviewEnforcementStrict")}
+                      </span>
                     </dd>
                   </div>
                 )}

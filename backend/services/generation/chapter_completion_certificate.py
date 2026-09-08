@@ -41,15 +41,18 @@ CHAPTER_COMPLETION_VERIFICATION_SCHEMA = (
 LEGACY_CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v2"
 CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v3"
 SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v4"
+ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v5"
 SUPPORTED_CHAPTER_COMPLETION_POLICY_REVISIONS = frozenset({
     LEGACY_CHAPTER_COMPLETION_POLICY_REVISION,
     CHAPTER_COMPLETION_POLICY_REVISION,
     SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION,
+    ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION,
 })
 ChapterCompletionPolicyRevision = Literal[
     "chapter_completion_policy.v2",
     "chapter_completion_policy.v3",
     "chapter_completion_policy.v4",
+    "chapter_completion_policy.v5",
 ]
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -504,7 +507,7 @@ class ChapterCompletionEvidenceBinding(_ClosedCompletionModel):
 
 class ChapterCompletionGateResults(_ClosedCompletionModel):
     prose_integrity: Literal["pass"]
-    scene_contract: Literal["pass", "not_reviewed"]
+    scene_contract: Literal["pass", "not_reviewed", "advisory"]
     state_fact_accounting: Literal["pass"]
     repair_convergence: Literal["pass", "not_required"]
     policy_result: Literal["pass"]
@@ -543,11 +546,15 @@ class ChapterCompletionCertificate(_ClosedCompletionModel):
     @model_validator(mode="after")
     def validate_certificate(self) -> "ChapterCompletionCertificate":
         coverage = self.evidence_binding.review_coverage
-        selective = self.policy_revision == SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION
+        selective = self.policy_revision in {SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION, ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION}
         if selective != (coverage is not None):
             raise ValueError("completion certificate review policy is inconsistent")
+        if (self.policy_revision == ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION) != (
+            coverage is not None and coverage.enforcement is not None
+        ):
+            raise ValueError("completion certificate review enforcement is inconsistent")
         expected_gate = (
-            "not_reviewed" if coverage is not None and coverage.status == "not_reviewed"
+            coverage.status if coverage is not None and coverage.status != "passed"
             else "pass"
         )
         if self.gate_results.scene_contract != expected_gate:
@@ -752,17 +759,26 @@ class ChapterCompletionPolicy:
         failures = set(evidence.failure_classes)
         if isinstance(evidence, ChapterCompletionEvidenceBundle):
             coverage = evidence.review_coverage
-            selective = policy_revision == SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION
+            if coverage is not None:
+                try:
+                    coverage = ChapterReviewCoverage.model_validate(coverage)
+                except ValidationError as exc:
+                    raise ChapterCompletionPolicyError("completion review coverage is invalid") from exc
+            selective = policy_revision in {SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION, ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION}
             if selective != (coverage is not None):
                 raise ChapterCompletionPolicyError("completion review policy evidence is missing or unexpected")
-            not_reviewed = coverage is not None and coverage.status == "not_reviewed"
-            if not_reviewed and evidence.scene_contract_passed is not None:
-                raise ChapterCompletionPolicyError("unreviewed prose cannot carry a semantic gate result")
+            if (policy_revision == ADVISORY_CHAPTER_COMPLETION_POLICY_REVISION) != (
+                coverage is not None and coverage.enforcement is not None
+            ):
+                raise ChapterCompletionPolicyError("completion review enforcement is missing or unexpected")
+            no_semantic_pass = coverage is not None and coverage.status != "passed"
+            if no_semantic_pass and evidence.scene_contract_passed is not None:
+                raise ChapterCompletionPolicyError("unreviewed prose or semantic advice cannot carry a passing semantic gate result")
             if coverage is not None and coverage.prose_repaired and evidence.repair_trace_digest is None:
                 raise ChapterCompletionPolicyError("repaired review requires its repair trace")
             if not evidence.prose_integrity_passed:
                 failures.add("incomplete_prose")
-            if not not_reviewed and evidence.scene_contract_passed is not True:
+            if not no_semantic_pass and evidence.scene_contract_passed is not True:
                 failures.add("scene_contract_violation")
             if not evidence.state_fact_accounting_passed:
                 failures.add("unaccounted_canonical_fact")
@@ -859,8 +875,8 @@ class ChapterCompletionPolicy:
         gate_results = ChapterCompletionGateResults(
             prose_integrity="pass",
             scene_contract=(
-                "not_reviewed" if evidence.review_coverage is not None
-                and evidence.review_coverage.status == "not_reviewed" else "pass"
+                evidence.review_coverage.status if evidence.review_coverage is not None
+                and evidence.review_coverage.status != "passed" else "pass"
             ),
             state_fact_accounting="pass",
             repair_convergence=evidence.repair_convergence,

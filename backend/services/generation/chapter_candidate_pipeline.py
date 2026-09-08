@@ -50,7 +50,7 @@ from backend.services.generation.chapter_repair_policy import (
 )
 from backend.services.generation.chapter_review_policy import (
     NOT_REVIEWED_SCHEMA, ChapterNotReviewedReceipt, ChapterReviewAuthorization,
-    not_reviewed_completion_metadata, validate_not_reviewed_receipt,
+    not_reviewed_completion_metadata, validate_not_reviewed_receipt, review_is_advisory,
 )
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_OUTLINE_SCENES,
@@ -61,6 +61,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpointV3,
     AdherenceCandidateCheckpointV4,
     AdherenceCandidateCheckpointV5,
+    AdherenceAdvisoryCheckpointV7,
     AdherenceNotReviewedCheckpointV6,
     CandidateCompletionProjectionV1,
     CandidatePipelineCheckpointConflict,
@@ -1578,6 +1579,7 @@ def _adherence_checkpoint(
     evidence: _RecordedStepEvidence,
     cycle: int,
     adherence: Mapping[str, Any],
+    review_authorization: ChapterReviewAuthorization | None = None,
 ) -> AdherenceCandidateCheckpoint:
     if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA:
         common = _checkpoint_common(
@@ -1637,10 +1639,13 @@ def _adherence_checkpoint(
     )
     try:
         if validated_current_evidence is not None:
-            checkpoint = AdherenceCandidateCheckpointV5(
+            advisory = review_is_advisory(review_authorization)
+            checkpoint_type = AdherenceAdvisoryCheckpointV7 if advisory else AdherenceCandidateCheckpointV5
+            checkpoint = checkpoint_type(
                 **{
                     **common,
-                    "schema_version": "chapter_candidate_pipeline_checkpoint.v5",
+                    "schema_version": "chapter_candidate_pipeline_checkpoint.v7" if advisory else "chapter_candidate_pipeline_checkpoint.v5",
+                    **({"review_authorization_digest": review_authorization.digest} if advisory else {}),
                 },
                 cycle=cycle,
                 decision=policy_result,
@@ -3063,9 +3068,13 @@ def _resume_trace(
     checkpoints: list[CandidatePipelineCheckpointV1] = []
     for raw_checkpoint in raw_checkpoints:
         try:
-            checkpoints.append(
-                parse_candidate_pipeline_checkpoint(raw_checkpoint)
-            )
+            checkpoint = parse_candidate_pipeline_checkpoint(raw_checkpoint)
+            if isinstance(checkpoint, AdherenceAdvisoryCheckpointV7) and (
+                not review_is_advisory(review_authorization)
+                or checkpoint.review_authorization_digest != review_authorization.digest
+            ):
+                raise ValueError("advisory checkpoint does not match its frozen authorization")
+            checkpoints.append(checkpoint)
         except Exception as exc:
             raise _blocked_resume(
                 restored,
@@ -3425,6 +3434,7 @@ def _validate_adherence_gate(
             adherence,
             outline=outline,
             prose=prose,
+            enforce_semantics=not review_is_advisory(review_authorization),
         )
     except OutlineAdherenceValidationError as exc:
         raise ChapterCandidatePipelineBlocked(str(exc)) from exc
@@ -3700,7 +3710,7 @@ def _replay_repair_policy(
                         checkpoint,
                         attempts_by_id,
                     )
-                if isinstance(
+                if not isinstance(checkpoint, AdherenceAdvisoryCheckpointV7) and isinstance(
                     checkpoint,
                     (
                         AdherenceCandidateCheckpointV4,
@@ -4854,7 +4864,7 @@ class ChapterCandidatePipeline:
                     code="candidate_adherence_stale",
                     gate="outline_adherence",
                 )
-            if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA:
+            if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA or review_is_advisory(self._deps.review_authorization):
                 _validate_adherence_gate(
                     adherence, chapter, prose=source.text,
                     review_authorization=self._deps.review_authorization,
@@ -4871,6 +4881,7 @@ class ChapterCandidatePipeline:
                     evidence=review_evidence,
                     cycle=trace.repair_cycles_used,
                     adherence=adherence,
+                    review_authorization=self._deps.review_authorization,
                 ), ledger=checkpoint_ledger)
                 if trace.repair_cycles_used > 0:
                     _charge_judge_or_schema_retries(
@@ -4879,7 +4890,7 @@ class ChapterCandidatePipeline:
                         trace=trace,
                         gate="outline_adherence",
                     )
-                if adherence.get("evidence_schema_version") in CURRENT_OUTLINE_ADHERENCE_POLICIES:
+                if not review_is_advisory(self._deps.review_authorization) and adherence.get("evidence_schema_version") in CURRENT_OUTLINE_ADHERENCE_POLICIES:
                     repair_issues = _hard_repair_issues(adherence)
                     if repair_policy.observation_count == 0:
                         convergence = repair_policy.observe_adherence(
@@ -4918,7 +4929,7 @@ class ChapterCandidatePipeline:
                                 convergence.component
                             ),
                         )
-            if adherence.get("decision") == "manual_review":
+            if adherence.get("decision") == "manual_review" and not review_is_advisory(self._deps.review_authorization):
                 outline = chapter.get("outline")
                 if not isinstance(outline, Mapping):
                     raise ChapterCandidatePipelineBlocked(
@@ -4972,6 +4983,8 @@ class ChapterCandidatePipeline:
                     ),
                 )
             except ChapterCandidatePipelineBlocked as gate_error:
+                if review_is_advisory(self._deps.review_authorization):
+                    raise
                 uses_stable_issue_policy = adherence.get(
                     "evidence_schema_version"
                 ) in CURRENT_OUTLINE_ADHERENCE_POLICIES

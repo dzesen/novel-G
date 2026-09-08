@@ -126,6 +126,9 @@ export default function BookCompletionAuditPanel({
               reviewed: audit.summary.reviewed_chapter_count,
               unreviewed: audit.summary.unreviewed_chapter_count,
             })}
+            {(audit.summary.advisory_review_chapter_count ?? 0) > 0 && (
+              <span className="block">{t("bookAuditAdvisoryReviewCount", { count: audit.summary.advisory_review_chapter_count ?? 0 })}</span>
+            )}
           </summary>
           <p className="mb-2">{t("bookAuditReviewCoverageHint")}</p>
           <ul className="grid max-h-60 gap-1 overflow-y-auto overscroll-contain">
@@ -134,14 +137,15 @@ export default function BookCompletionAuditPanel({
                 <button type="button" onClick={() => onJumpToChapter(chapter.chapter_id)} className="min-h-11 min-w-0 break-words py-2 text-left font-medium underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-current">
                   {titleForChapter(chapter.chapter_id)}
                 </button>
-                <span>{t(chapter.independent_review_status === "passed" ? "bookAuditReviewed" : "bookAuditNotReviewed")}</span>
+                <span>{t(chapter.independent_review_status === "passed" ? "bookAuditReviewed"
+                  : chapter.independent_review_status === "advisory" ? "bookAuditAdvisoryReview" : "bookAuditNotReviewed")}</span>
               </li>
             ))}
           </ul>
         </details>
       )}
 
-      {!audit.complete && groups.length > 0 && (
+      {groups.length > 0 && (
         <ul className="grid gap-2">
           {groups.map((group) => {
             const action = bookCompletionAction(group);

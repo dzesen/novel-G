@@ -1,8 +1,11 @@
+export type ReviewEnforcement = "advisory" | "strict";
+
 export interface ChapterReviewSelection {
   schema_version: "chapter_review_selection.v1";
   mode: "key_chapters" | "selected_chapters" | "all_chapters" | "no_chapters";
   selected_chapter_ids: string[];
   review_after_prose_repair: true;
+  enforcement?: ReviewEnforcement;
 }
 
 export interface ReviewChapter {
@@ -25,6 +28,7 @@ export function initialChapterReviewSelection(): ChapterReviewSelection {
     mode: "key_chapters",
     selected_chapter_ids: [],
     review_after_prose_repair: true,
+    enforcement: "advisory",
   };
 }
 

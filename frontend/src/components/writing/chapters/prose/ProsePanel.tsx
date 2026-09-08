@@ -10,6 +10,7 @@ import {
 import { useTranslations } from "next-intl";
 import ReviewValidationDetails from "./ReviewValidationDetails";
 import JudgeReviewRecords from "./JudgeReviewRecords";
+import ReviewEnforcementControl from "../batch/ReviewEnforcementControl";
 import { Button } from "@heroui/react";
 import { apiGet, apiPost } from "@/lib/api";
 import {
@@ -57,6 +58,7 @@ interface InteractiveCompletionReadiness {
   authorization_id: string;
   authorization_revision: number;
   logical_call_count: 1 | 2;
+  planning?: { chapter_review_authorization?: { selection: { enforcement?: "advisory" | "strict" } } };
   recovery_replay_limit: 1;
   maximum_paid_attempts: number;
   conservative_token_bound: number;
@@ -144,6 +146,7 @@ export default function ProsePanel({
   const [completionReadiness, setCompletionReadiness] =
     useState<InteractiveCompletionReadiness | null>(null);
   const [reviewRequested, setReviewRequested] = useState(false);
+  const [reviewEnforcement, setReviewEnforcement] = useState<"advisory" | "strict">("advisory");
   const [reviewSelectionLocked, setReviewSelectionLocked] = useState(false);
   const [completionPreviewSeen, setCompletionPreviewSeen] = useState(false);
   const [completionInspectionNotices, setCompletionInspectionNotices] =
@@ -252,6 +255,7 @@ export default function ProsePanel({
   useEffect(() => {
     setCompletionReadiness(null);
     setReviewRequested(false);
+    setReviewEnforcement("advisory");
     setReviewSelectionLocked(false);
     setCompletionPreviewSeen(false);
     setCompletionInspectionNotices([]);
@@ -356,6 +360,7 @@ export default function ProsePanel({
       authorizationRevision: readiness.authorization_revision,
       readinessDigest: readiness.digest,
       reviewRequested: readiness.logical_call_count === 2,
+      reviewEnforcement: readiness.planning?.chapter_review_authorization?.selection.enforcement ?? "strict",
     };
     let polling = true;
     let progressRequest: Promise<void> | null = null;
@@ -463,11 +468,13 @@ export default function ProsePanel({
             chapterId,
             runRevision,
             reviewRequested,
+            reviewEnforcement,
           }),
         );
         setCompletionReadiness(inspection.readiness);
         setCompletionPreviewSeen(true);
         setReviewRequested(inspection.readiness.logical_call_count === 2);
+        setReviewEnforcement(inspection.readiness.planning?.chapter_review_authorization?.selection.enforcement ?? "strict");
         setReviewSelectionLocked(Boolean(inspection.review_selection_locked)
           || inspection.readiness.schema_version === "interactive_chapter_completion_readiness.v2");
         setCompletionInspectionNotices(inspection.notices);
@@ -1053,6 +1060,20 @@ export default function ProsePanel({
               <p id="interactive-review-choice-hint" className="text-xs leading-5 text-muted">
                 {t(reviewSelectionLocked ? "completionReviewLocked" : "completionReviewOptionHint")}
               </p>
+              {reviewRequested && (
+                <ReviewEnforcementControl
+                  id="interactive-review-enforcement"
+                  value={reviewEnforcement}
+                  disabled={runActionsBlocked || reviewSelectionLocked || completionUncertain}
+                  onChange={(enforcement) => {
+                    setReviewEnforcement(enforcement);
+                    setCompletionReadiness(null);
+                    setCompletionReadinessConfirmed(false);
+                    setCompletionInspectionNotices([]);
+                    setActionError("");
+                  }}
+                />
+              )}
             </section>
           )}
           {hasText && !partialAcceptance && (

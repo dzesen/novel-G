@@ -1,6 +1,7 @@
 "use client";
 
 import { useTranslations } from "next-intl";
+import ReviewEnforcementControl from "./ReviewEnforcementControl";
 import {
   keyReviewChapterIds,
   changeChapterReviewMode,
@@ -45,6 +46,13 @@ export default function ChapterReviewControls({
       <p id="batch-chapter-review-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">
         {t(value.mode === "no_chapters" ? "chapterReviewNoneHint" : "chapterReviewHint")}
       </p>
+      <ReviewEnforcementControl
+        id="batch-review-enforcement"
+        value={value.enforcement ?? "strict"}
+        onChange={(enforcement) => onChange({ ...value, enforcement })}
+        disabled={disabled}
+        automaticRepair
+      />
       {(value.mode === "key_chapters" || value.mode === "selected_chapters") && (
         chapters.length === 0 ? (
           <p className="text-xs leading-5 text-warm-700 dark:text-muted">{t("chapterReviewLoadChapters")}</p>

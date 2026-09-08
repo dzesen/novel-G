@@ -1,7 +1,7 @@
 """批量生成作业的 HTTP 端点（轮询式，无 SSE）。设计 §9.2。"""
 from __future__ import annotations
 
-from backend.services.generation.chapter_review_policy import ChapterReviewSelection
+from backend.services.generation.chapter_review_policy import ChapterReviewSelection, default_chapter_review_selection
 
 from typing import Any, Dict, Literal, Optional
 
@@ -79,7 +79,7 @@ class StartJobRequest(ProtectedBatchGenerationParamsMixin):
         default_factory=ReferenceCardAutoCreationPolicy
     )
 
-    chapter_review_selection: ChapterReviewSelection = Field(default_factory=ChapterReviewSelection)
+    chapter_review_selection: ChapterReviewSelection = Field(default_factory=default_chapter_review_selection)
 
 
 class BatchReadinessRequest(ProtectedBatchGenerationParamsMixin):
@@ -95,7 +95,7 @@ class BatchReadinessRequest(ProtectedBatchGenerationParamsMixin):
         default_factory=ReferenceCardAutoCreationPolicy
     )
 
-    chapter_review_selection: ChapterReviewSelection = Field(default_factory=ChapterReviewSelection)
+    chapter_review_selection: ChapterReviewSelection = Field(default_factory=default_chapter_review_selection)
 
 
 class ResumeReadinessRequest(BaseModel):
@@ -249,7 +249,7 @@ async def initialize_book_structure(novel_id: str, req: StartJobRequest):
 @router.get("/volume/{volume_id}/readiness")
 async def inspect_volume_readiness(volume_id: str):
     try:
-        return await GenerationJobService.inspect_volume_readiness(volume_id, chapter_review_selection=ChapterReviewSelection())
+        return await GenerationJobService.inspect_volume_readiness(volume_id, chapter_review_selection=default_chapter_review_selection())
     except Exception as exc:
         raise _handle(exc) from exc
 
@@ -257,7 +257,7 @@ async def inspect_volume_readiness(volume_id: str):
 @router.get("/book/{novel_id}/readiness")
 async def inspect_book_readiness(novel_id: str):
     try:
-        return await GenerationJobService.inspect_book_readiness(novel_id, chapter_review_selection=ChapterReviewSelection())
+        return await GenerationJobService.inspect_book_readiness(novel_id, chapter_review_selection=default_chapter_review_selection())
     except Exception as exc:
         raise _handle(exc) from exc
 

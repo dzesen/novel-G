@@ -78,6 +78,7 @@ export interface BookCompletionAudit {
     advisory_issue_count: number;
     reviewed_chapter_count?: number | null;
     unreviewed_chapter_count?: number | null;
+    advisory_review_chapter_count?: number | null;
   };
   chapters: Array<{
     chapter_id: string;
@@ -90,7 +91,7 @@ export interface BookCompletionAudit {
     content_digest: string;
     actual_word_count: number;
     target_word_count: number | null;
-    independent_review_status?: "passed" | "not_reviewed" | null;
+    independent_review_status?: "passed" | "not_reviewed" | "advisory" | null;
   }>;
   issues: BookCompletionIssue[];
   excluded_optional_subsystems: Array<

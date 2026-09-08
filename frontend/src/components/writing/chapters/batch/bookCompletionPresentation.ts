@@ -31,6 +31,7 @@ const ISSUE_TRANSLATION_KEYS = {
   frozen_worklist_invalid: "frozenWorklistInvalid",
   frozen_worklist_drift: "frozenWorklistDrift",
   semantic_review_unresolved: "semanticReviewUnresolved",
+  semantic_review_advisory: "semanticReviewAdvisory",
   semantic_review_stale: "semanticReviewStale",
   semantic_conflict_unresolved: "semanticConflictUnresolved",
   uncertain_provider_attempt: "uncertainProviderAttempt",
