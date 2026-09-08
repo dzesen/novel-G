@@ -256,7 +256,11 @@ export interface CardImportConflict {
 
 export interface CardImportCandidate {
   candidate_id: string;
-  target_type: "character" | "lore";
+  target_type: ReferenceCardType;
+  classification?: {
+    schema_version: "worldbook_classification.v1";
+    reason_code: "explicit_metadata" | "explicit_title" | "structured_fields" | "conflicting_markers" | "unclassified";
+  };
   fields: {
     name: string;
     subtitle?: string;

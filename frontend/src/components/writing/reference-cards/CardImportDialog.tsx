@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
 import { ApiError, apiPost, apiPostForm, apiPostRaw } from "@/lib/api";
+import { cardImportClassificationKey } from "@/lib/cardImportClassification";
 import {
   CardAvatarSourceUnavailable,
   isPermanentCardAvatarTransferFailure,
@@ -1170,6 +1171,7 @@ function CandidateReview({
       (conflict) => conflict.target_card_id === decision.target_card_id,
     );
   const preview = candidate.interop_preview;
+  const classificationKey = cardImportClassificationKey(candidate.classification);
   const regexNoticePaths =
     preview?.preview_notices
       ?.filter((notice) => notice.code === "regex_present")
@@ -1215,6 +1217,9 @@ function CandidateReview({
               type: t(`candidate.type.${candidate.target_type}`),
             })}
           </p>
+          {classificationKey && (
+            <p className="mt-1 text-xs leading-5 text-muted">{metadataT(classificationKey)}</p>
+          )}
         </div>
         <label htmlFor={`decision-${candidateId}`} className="block">
           <span className="mb-1.5 block text-xs font-medium text-foreground">

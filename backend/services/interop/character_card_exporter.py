@@ -135,7 +135,10 @@ def _worldbook_entry(card: dict[str, Any], index: int) -> dict[str, Any]:
         "keys": _confirmed_keywords(card),
         "secondary_keys": [],
         "content": str(card.get("description") or ""),
-        "extensions": {},
+        "extensions": {"novel-g": {
+            **deepcopy(_NOVEL_G_EXTENSION),
+            "card_type": str(card.get("card_type") or "lore"),
+        }},
         "enabled": True,
         "insertion_order": (index + 1) * 100,
         "name": str(card.get("name") or ""),

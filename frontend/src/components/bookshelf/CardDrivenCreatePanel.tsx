@@ -28,6 +28,7 @@ import type {
   CardImportProposal,
 } from "@/types/novel";
 import { referenceMatchKind } from "../writing/generationMetadataPresentation";
+import { cardImportClassificationKey } from "@/lib/cardImportClassification";
 
 interface CardDrivenCreatePanelProps {
   onCancel: () => void;
@@ -507,6 +508,7 @@ export default function CardDrivenCreatePanel({
                     candidate.candidate_id,
                   );
                   const current = decisions[key];
+                  const classificationKey = cardImportClassificationKey(candidate.classification);
                   return (
                     <div
                       key={key}
@@ -522,12 +524,17 @@ export default function CardDrivenCreatePanel({
                               {t(`type.${candidate.target_type}`)}
                             </span>
                           </div>
+                          {classificationKey && (
+                            <p className="mt-1 text-xs leading-5 text-muted">
+                              {metadataT(classificationKey)}
+                            </p>
+                          )}
                           {candidate.fields.description && (
                             <p className="mt-2 line-clamp-4 text-xs leading-5 text-muted">
                               {candidate.fields.description}
                             </p>
                           )}
-                          {candidate.target_type === "character" &&
+                          {candidate.candidate_id === "character:0" &&
                             candidate.fields.interop && (
                               <p className="mt-2 text-xs leading-5 text-warning">
                                 {t("greyFieldsNotice")}

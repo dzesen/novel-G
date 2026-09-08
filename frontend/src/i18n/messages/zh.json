@@ -874,6 +874,9 @@
       "isolatedRiskSummary": "已隔离 {prompts} 项提示词风险、{decorators} 项 decorator 与 {assets} 项素材引用；它们不会执行或进入模型上下文。",
       "type": {
         "character": "角色",
+        "location": "地点",
+        "item": "物品",
+        "rule": "规则",
         "lore": "世界设定"
       },
       "greyFieldsNotice": "聊天处境、开场白和示例对话只作为方向构思素材；建书完成后仅保留为互操作元数据。",
@@ -2207,6 +2210,13 @@
       "sceneAgentStructureChanged": "场景数量已经在本地改变。请先保存细纲，再使用生成角色改写，避免场景序号错位。"
     },
     "generationMetadata": {
+      "referenceCardClassification": {
+        "explicitMetadata": "依据条目中的明确类型字段分类",
+        "explicitTitle": "依据条目标题中的类别标记分类",
+        "structuredFields": "依据同一资料记录中成组的结构字段分类，请核对",
+        "conflictingMarkers": "类别标记相互冲突，暂存为世界设定",
+        "unclassified": "没有足够的类别证据，暂存为世界设定"
+      },
       "listSeparator": "、",
       "steps": {
         "outline": "细纲生成",
@@ -3775,6 +3785,9 @@
         "candidate": {
           "type": {
             "character": "角色卡",
+            "location": "地点卡",
+            "item": "物品卡",
+            "rule": "规则卡",
             "lore": "世界设定卡"
           },
           "applied": "已落卡",

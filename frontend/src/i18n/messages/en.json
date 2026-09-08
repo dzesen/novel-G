@@ -874,6 +874,9 @@
       "isolatedRiskSummary": "Isolated {prompts} prompt-risk fields, {decorators} decorators, and {assets} asset references. They are never executed or added to model context.",
       "type": {
         "character": "Character",
+        "location": "Location",
+        "item": "Item",
+        "rule": "Rule",
         "lore": "World lore"
       },
       "greyFieldsNotice": "Chat scenario, greeting, and example dialogue are direction-only inspiration. After creation they remain solely as interop metadata.",
@@ -2207,6 +2210,13 @@
       "sceneAgentStructureChanged": "The local scene count changed. Save the outline before using a generation role so scene indexes cannot drift."
     },
     "generationMetadata": {
+      "referenceCardClassification": {
+        "explicitMetadata": "Classified from an explicit type field in the entry",
+        "explicitTitle": "Classified from a category marker in the entry title",
+        "structuredFields": "Classified from a coherent set of fields in one record; please review",
+        "conflictingMarkers": "Conflicting category markers; kept as lore",
+        "unclassified": "Insufficient category evidence; kept as lore"
+      },
       "listSeparator": ", ",
       "steps": {
         "outline": "outline generation",
@@ -3775,6 +3785,9 @@
         "candidate": {
           "type": {
             "character": "Character card",
+            "location": "Location card",
+            "item": "Item card",
+            "rule": "Rule card",
             "lore": "World lore card"
           },
           "applied": "Written",
