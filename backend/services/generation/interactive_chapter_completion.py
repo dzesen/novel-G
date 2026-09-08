@@ -81,6 +81,12 @@ from backend.services.generation.outline_adherence import (
 from backend.services.generation.independent_outline_review import (
     safe_independent_review_diagnostics,
 )
+from backend.services.generation.interactive_completion_versions import (
+    INTERACTIVE_COMPLETION_READINESS_SCHEMA,
+    LEGACY_INTERACTIVE_COMPLETION_READINESS_SCHEMA,
+    SELECTIVE_INTERACTIVE_COMPLETION_READINESS_SCHEMA,
+    InteractiveCompletionReadinessVersion,
+)
 from backend.services.generation.prose_completion import (
     prose_execution_plan_from_snapshot,
 )
@@ -112,15 +118,6 @@ from backend.scene_contract_versions import (
 )
 
 
-INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
-    "interactive_chapter_completion_readiness.v2"
-)
-SELECTIVE_INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
-    "interactive_chapter_completion_readiness.v3"
-)
-LEGACY_INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
-    "interactive_chapter_completion_readiness.v1"
-)
 INTERACTIVE_COMPLETION_INSPECTION_SCHEMA = (
     "interactive_chapter_completion_inspection.v1"
 )
@@ -409,10 +406,7 @@ class InteractiveCompletionPlanning(_ClosedModel):
 
 
 class InteractiveChapterCompletionReadiness(_ClosedModel):
-    schema_version: Literal[
-        "interactive_chapter_completion_readiness.v2",
-        "interactive_chapter_completion_readiness.v3",
-    ]
+    schema_version: InteractiveCompletionReadinessVersion
     digest: Digest
     authorization_id: ObjectIdText
     authorization_revision: int = Field(ge=1)

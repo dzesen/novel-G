@@ -73,6 +73,9 @@ from backend.services.generation.chapter_review_policy import (
     not_reviewed_completion_metadata, review_authorization_from_readiness,
     validate_not_reviewed_receipt, review_is_advisory,
 )
+from backend.services.generation.interactive_completion_versions import (
+    SUPPORTED_INTERACTIVE_COMPLETION_READINESS_SCHEMAS,
+)
 from backend.services.generation.outline_adherence import (
     OutlineAdherenceValidationError,
     revalidate_current_outline_adherence_evidence,
@@ -977,10 +980,8 @@ class ChapterFinalizationService:
             or str(job.get("owner_id") or "") != str(owner_id)
             or str(job.get("current_chapter_id") or "") != str(chapter_id)
             or not isinstance(readiness, Mapping)
-            or readiness.get("schema_version") not in {
-                "interactive_chapter_completion_readiness.v1",
-                "interactive_chapter_completion_readiness.v2",
-            }
+            or readiness.get("schema_version")
+            not in SUPPORTED_INTERACTIVE_COMPLETION_READINESS_SCHEMAS
             or readiness.get("authorization_id")
             != authorization.authorization_id
             or not isinstance(source, Mapping)
@@ -993,7 +994,7 @@ class ChapterFinalizationService:
             != str(content_digest)
         ):
             raise ChapterFinalizationDenied(
-                "交互式章节完成决定不能跨来源作用域写入"
+                "本次保存授权与当前章节或正文版本不一致，已暂停保存。"
             )
 
     @staticmethod
@@ -2203,10 +2204,8 @@ class ChapterFinalizationService:
                 or str(current_job.get("status") or "")
                 != "completion_running"
                 or str(current_job.get("owner_id") or "") != str(owner_id)
-                or readiness.get("schema_version") not in {
-                    "interactive_chapter_completion_readiness.v1",
-                    "interactive_chapter_completion_readiness.v2",
-                }
+                or readiness.get("schema_version")
+                not in SUPPORTED_INTERACTIVE_COMPLETION_READINESS_SCHEMAS
                 or readiness.get("authorization_id")
                 != supplied.authorization_id
                 or readiness.get("authorization_revision")
