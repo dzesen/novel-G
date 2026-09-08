@@ -22,6 +22,7 @@ from backend.llm.exceptions import (
     LLMResponseError,
     LLMSchemaError,
     LLMSchemaUnsupportedError,
+    LLMStructuredRepairError,
     LLMStructuredValidationError,
     LLMTimeoutError,
 )
@@ -48,6 +49,9 @@ from backend.services.generation.stable_reason_codes import (
     project_stable_reason_codes,
 )
 from backend.services.llm.context_builder import ContextBudgetError
+from backend.services.llm.generation_runtime import (
+    safe_structured_repair_failure_diagnostics,
+)
 from backend.services.llm.pre_dispatch_boundaries import (
     pre_dispatch_boundary_code,
     restore_pre_dispatch_boundary,
@@ -464,6 +468,7 @@ def _exception_family(chain: Iterable[BaseException]) -> str:
     """Return a bounded family name without retaining exception messages."""
     values = list(chain)
     checks: tuple[tuple[type[BaseException], str], ...] = (
+        (LLMStructuredRepairError, "structured_output"),
         (LLMStructuredValidationError, "structured_output"),
         (LLMSchemaUnsupportedError, "provider_schema_unsupported"),
         (LLMSchemaError, "structured_output"),
@@ -514,6 +519,7 @@ def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
         if (
             code in _CANDIDATE_REPAIR_EXHAUSTED_CODES.values()
             or code in _COMPONENT_REPAIR_FAILURE_CODES
+            or code == "candidate_result_projection_missing"
         ):
             return (
                 "candidate_not_committed",
@@ -522,6 +528,11 @@ def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
                     "refresh_generation_readiness",
                     "restart_generation_job",
                 ],
+            )
+        if code == "structured_output_truncated":
+            return (
+                "generated_result_rejected",
+                ["review_provider_output_limit", "refresh_generation_readiness", "restart_generation_job"],
             )
         if code == "structured_output_invalid":
             return (
@@ -833,8 +844,35 @@ def build_failure_diagnostic(
         code = failure.code
         evidence = "confirmed"
         details.update(_candidate_exception_details(failure))
+    elif any(
+        isinstance(item, ChapterCandidatePipelineBlocked)
+        and item.code in {
+            "candidate_result_projection_missing", "candidate_narrative_revision_changed",
+        }
+        for item in chain
+    ):
+        failure = next(
+            item for item in chain
+            if isinstance(item, ChapterCandidatePipelineBlocked)
+            and item.code in {
+                "candidate_result_projection_missing", "candidate_narrative_revision_changed",
+            }
+        )
+        code = failure.code
+        category = (
+            "source_changed" if code == "candidate_narrative_revision_changed"
+            else "validation_logic"
+        )
+        evidence = "confirmed"
     elif declared_diagnostic is not None:
         category, code, evidence = declared_diagnostic
+        structured_validation = safe_structured_repair_failure_diagnostics(
+            getattr(declared_failure, "diagnostics", None)
+        )
+        if structured_validation is not None:
+            details["structured_validation"] = structured_validation
+            if structured_validation.get("repair_finish_reason") == "length":
+                code = "structured_output_truncated"
         declared_reason_codes = _safe_reason_codes(
             getattr(declared_failure, "reason_codes", ())
         )

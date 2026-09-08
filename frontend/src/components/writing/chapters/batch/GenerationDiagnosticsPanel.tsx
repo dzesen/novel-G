@@ -8,6 +8,12 @@ import type {
   GenerationDiagnosticsSummary,
 } from "./batchTypes";
 import { finishReasonTranslationKey } from "../prose/prosePresentation";
+import { reviewValidationGroups } from "../prose/reviewValidationPresentation";
+import {
+  structuredValidationErrorKey,
+  structuredValidationFieldKey,
+  structuredValidationSceneNumber,
+} from "./structuredValidationPresentation";
 import {
   diagnosticActionTranslationKey,
   diagnosticImpactTranslationKey,
@@ -121,12 +127,48 @@ export function DiagnosticEventSummary({
   const consistencyIssueCount = Number(event.details.consistency_issue_count);
   const droppedReferenceCount = Number(event.details.dropped_reference_count);
   const candidateGate = event.details.candidate_gate;
+  const validationGroups = reviewValidationGroups(event.details.structured_validation);
 
   return (
     <div className="min-w-0">
       <p className="text-sm font-medium text-foreground">
-        {reasonLabel(event.code)}
+        {event.code === "structured_output_truncated"
+          ? t("diagnosticsReasonStructuredTruncatedStep", { step: stepLabel(event.step) })
+          : reasonLabel(event.code)}
       </p>
+      {validationGroups.map((group) => (
+        <div key={group.phase} className="mt-2 min-w-0 text-xs leading-5">
+          <p className="font-medium text-foreground">
+            {t(group.phase === "primary" ? "diagnosticsValidationPrimary"
+              : group.phase === "repair" ? "diagnosticsValidationRepair"
+                : "diagnosticsValidationDetails")}
+          </p>
+          <ul className="list-disc space-y-1 pl-4 text-warm-700 dark:text-muted">
+            {group.issues.map((issue, index) => {
+              const field = t(structuredValidationFieldKey(issue.path));
+              const scene = structuredValidationSceneNumber(issue.path);
+              return (
+                <li key={`${issue.path}:${issue.errorType}:${index}`} className="break-words">
+                  {t("diagnosticsValidationIssue", {
+                    field: scene === null ? field : t("diagnosticsValidationSceneField", { scene, field }),
+                    reason: t(structuredValidationErrorKey(issue.errorType)),
+                  })}
+                  {issue.path !== "$" && (
+                    <code className="block break-all text-[11px] text-muted">{issue.path}</code>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {group.truncated && <p>{t("diagnosticsValidationMore")}</p>}
+        </div>
+      ))}
+      {validationGroups.length === 0
+        && ["structured_output_invalid", "validation_rejected"].includes(event.code) && (
+        <p className="mt-1 text-xs leading-5 text-warm-700 dark:text-muted">
+          {t("diagnosticsValidationNotRecorded")}
+        </p>
+      )}
       <p className="mt-0.5 text-xs leading-5 text-warm-700 dark:text-muted">
         {t("diagnosticsEventContext", {
           category: categoryLabel(event.category),

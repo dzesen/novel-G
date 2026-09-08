@@ -296,6 +296,8 @@ def build_structured_repair_failure_diagnostics(
     *,
     primary_validation: Mapping[str, Any],
     repair_validation: Mapping[str, Any],
+    primary_finish_reason: str | None = None,
+    repair_finish_reason: str | None = None,
 ) -> dict[str, Any]:
     primary = _normalize_structured_validation_issues(primary_validation)
     repair = _normalize_structured_validation_issues(repair_validation)
@@ -306,6 +308,10 @@ def build_structured_repair_failure_diagnostics(
         "failure_type": "structured_repair_invalid",
         "primary_validation": primary,
         "repair_validation": repair,
+        **({"primary_finish_reason": normalize_finish_reason(primary_finish_reason)}
+           if primary_finish_reason is not None else {}),
+        **({"repair_finish_reason": normalize_finish_reason(repair_finish_reason)}
+           if repair_finish_reason is not None else {}),
     }
 
 
@@ -330,6 +336,8 @@ def safe_structured_repair_failure_diagnostics(
         return build_structured_repair_failure_diagnostics(
             primary_validation=value.get("primary_validation") or {},
             repair_validation=value.get("repair_validation") or {},
+            primary_finish_reason=value.get("primary_finish_reason"),
+            repair_finish_reason=value.get("repair_finish_reason"),
         )
     except ValueError:
         return None
@@ -1781,6 +1789,9 @@ class GenerationRuntime:
                 bounded_reservation(prompts.prompt_json_prompt),
             )
         require_current_settlement()
+        primary_finish_reason = normalize_finish_reason(
+            getattr(adapter, "last_finish_reason", None)
+        )
         oversized_regeneration_used = False
         try:
             enforce_structured_output_byte_cap(produced)
@@ -1857,6 +1868,10 @@ class GenerationRuntime:
                     diagnostics=build_structured_repair_failure_diagnostics(
                         primary_validation=oversized_validation,
                         repair_validation=primary_validation,
+                        primary_finish_reason=primary_finish_reason,
+                        repair_finish_reason=normalize_finish_reason(
+                            getattr(adapter, "last_finish_reason", None)
+                        ),
                     )
                 ) from None
             repair_prompt = render_structured_repair_prompt(
@@ -1901,6 +1916,10 @@ class GenerationRuntime:
                         diagnostics=build_structured_repair_failure_diagnostics(
                             primary_validation=primary_validation,
                             repair_validation=repair_validation,
+                            primary_finish_reason=primary_finish_reason,
+                            repair_finish_reason=normalize_finish_reason(
+                                getattr(adapter, "last_finish_reason", None)
+                            ),
                         )
                     ) from None
                 reviewer = self._adapter_factory(plan.reviewer_alias, None)
