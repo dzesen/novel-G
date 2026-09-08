@@ -48,6 +48,10 @@ from backend.services.generation.chapter_repair_policy import (
     default_repair_budget_limits,
     repair_next_step,
 )
+from backend.services.generation.chapter_review_policy import (
+    NOT_REVIEWED_SCHEMA, ChapterNotReviewedReceipt, ChapterReviewAuthorization,
+    not_reviewed_completion_metadata, validate_not_reviewed_receipt,
+)
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_OUTLINE_SCENES,
     MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS,
@@ -57,6 +61,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpointV3,
     AdherenceCandidateCheckpointV4,
     AdherenceCandidateCheckpointV5,
+    AdherenceNotReviewedCheckpointV6,
     CandidateCompletionProjectionV1,
     CandidatePipelineCheckpointConflict,
     CandidatePipelineCheckpointV1,
@@ -1361,6 +1366,7 @@ class ChapterCandidatePipelineDeps:
         ],
         Awaitable[StateCandidateRepairReceipt],
     ] | None = None
+    review_authorization: ChapterReviewAuthorization | None = None
 
 
 @dataclass(frozen=True)
@@ -1573,6 +1579,14 @@ def _adherence_checkpoint(
     cycle: int,
     adherence: Mapping[str, Any],
 ) -> AdherenceCandidateCheckpoint:
+    if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA:
+        common = _checkpoint_common(
+            chapter_id=chapter_id, sequence=sequence, source=source, evidence=evidence,
+        )
+        return _seal_checkpoint(AdherenceNotReviewedCheckpointV6(
+            **{**common, "schema_version": "chapter_candidate_pipeline_checkpoint.v6"},
+            cycle=cycle, validated_evidence=ChapterNotReviewedReceipt.model_validate(adherence),
+        ))
     policy_result, categories, blocking_signatures, coverage = (
         _adherence_checkpoint_projection(adherence)
     )
@@ -2262,6 +2276,8 @@ def _checkpoint_step_name(
     *,
     review_count: int,
 ) -> str:
+    if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6):
+        return "review_not_requested"
     if isinstance(checkpoint, ProseCandidateCheckpointV1):
         return (
             "prose"
@@ -2302,6 +2318,14 @@ def _validate_resumed_adherence_projection(
     adherence = reviewed.value
     if not _adherence_matches_source(adherence, source):
         raise ChapterCandidatePipelineBlocked("候选管线恢复复检身份不一致")
+    if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6):
+        try:
+            receipt = ChapterNotReviewedReceipt.model_validate(adherence)
+        except ValueError as exc:
+            raise ChapterCandidatePipelineBlocked("候选管线未审查恢复凭据无效") from exc
+        if receipt != checkpoint.validated_evidence:
+            raise ChapterCandidatePipelineBlocked("候选管线未审查恢复凭据与检查点不一致")
+        return
     if isinstance(checkpoint, AdherenceCandidateCheckpointV5):
         try:
             restored_evidence = (
@@ -2615,6 +2639,7 @@ def _project_replayed_checkpoint_prefix(
                 AdherenceCandidateCheckpointV3,
                 AdherenceCandidateCheckpointV4,
                 AdherenceCandidateCheckpointV5,
+                AdherenceNotReviewedCheckpointV6,
             ),
         ):
             review_count += 1
@@ -2693,6 +2718,7 @@ def _resume_trace(
     tail_repair_attempt_ids: tuple[str, ...],
     chapter_id: str,
     chapter: Mapping[str, Any],
+    review_authorization: ChapterReviewAuthorization | None = None,
 ) -> _RestoredPipeline:
     if not isinstance(resume, ChapterCandidatePipelineResume):
         raise ChapterCandidatePipelineBlocked("候选管线恢复协议无效")
@@ -3315,6 +3341,8 @@ def _resume_trace(
                 resume.adherence,
                 source=source,
                 chapter=chapter,
+                review_authorization=review_authorization,
+                prose_repaired=current_prose.origin == "repair",
             )
         except ChapterCandidatePipelineBlocked as exc:
             raise _blocked_resume(
@@ -3369,10 +3397,29 @@ def _validate_adherence_gate(
     chapter: Mapping[str, Any],
     *,
     prose: str,
+    review_authorization: ChapterReviewAuthorization | None = None,
+    prose_repaired: bool = False,
 ) -> dict[str, Any]:
     outline = chapter.get("outline")
     if not isinstance(outline, Mapping):
         raise ChapterCandidatePipelineBlocked("章节缺少有效章纲")
+    if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA:
+        try:
+            receipt = validate_not_reviewed_receipt(
+                adherence, review_authorization,
+                chapter_id=str(chapter.get("_id") or ""),
+                source_prose_run_id=adherence.get("source_prose_run_id"),
+                source_prose_run_revision=adherence.get("source_prose_run_revision"),
+                source_content_digest=hashlib.sha256(prose.encode("utf-8")).hexdigest(),
+                outline=outline,
+                prose_repaired=prose_repaired,
+            )
+        except ValueError as exc:
+            raise ChapterCandidatePipelineBlocked(
+                "未审查记录不符合冻结授权或当前正文", code="candidate_adherence_evidence_invalid",
+                gate="outline_adherence",
+            ) from exc
+        return not_reviewed_completion_metadata(receipt)
     try:
         return validate_complete_outline_adherence(
             adherence,
@@ -3388,6 +3435,8 @@ def _validate_resumed_state_prerequisite(
     *,
     source: ProseCandidateSource,
     chapter: Mapping[str, Any],
+    review_authorization: ChapterReviewAuthorization | None = None,
+    prose_repaired: bool = False,
 ) -> None:
     try:
         if reviewed.stage is not ChapterGenerationStage.OUTLINE_ADHERENCE:
@@ -3409,6 +3458,8 @@ def _validate_resumed_state_prerequisite(
             adherence,
             chapter,
             prose=source.text,
+            review_authorization=review_authorization,
+            prose_repaired=prose_repaired,
         )
     except ChapterCandidatePipelineBlocked as exc:
         raise ChapterCandidatePipelineBlocked(
@@ -3640,6 +3691,7 @@ def _replay_repair_policy(
                     AdherenceCandidateCheckpointV3,
                     AdherenceCandidateCheckpointV4,
                     AdherenceCandidateCheckpointV5,
+                    AdherenceNotReviewedCheckpointV6,
                 ),
             ):
                 if checkpoint.cycle > 0:
@@ -4554,6 +4606,7 @@ class ChapterCandidatePipeline:
                     tail_repair_attempt_ids=tail_repair_attempt_ids,
                     chapter_id=str(chapter.get("_id") or ""),
                     chapter=chapter,
+                    review_authorization=self._deps.review_authorization,
                 )
                 trace = restored.trace
                 checkpoint_ledger = [
@@ -4681,6 +4734,11 @@ class ChapterCandidatePipeline:
                     resumed_adherence,
                     source=source,
                     chapter=chapter,
+                    review_authorization=self._deps.review_authorization,
+                    prose_repaired=any(
+                        isinstance(item, ProseCandidateCheckpointV1) and item.origin == "repair"
+                        for item in checkpoint_ledger
+                    ),
                 )
 
         review_count = resume.review_count if resume is not None else 0
@@ -4764,7 +4822,8 @@ class ChapterCandidatePipeline:
                 )
                 review_count += 1
                 review_evidence = trace.record(
-                    (
+                    "review_not_requested" if isinstance(reviewed.value, Mapping)
+                    and reviewed.value.get("schema_version") == NOT_REVIEWED_SCHEMA else (
                         "outline_adherence"
                         if review_count == 1
                         else f"outline_adherence_recheck_{review_count}"
@@ -4794,6 +4853,15 @@ class ChapterCandidatePipeline:
                     "章纲符合度没有绑定正文候选",
                     code="candidate_adherence_stale",
                     gate="outline_adherence",
+                )
+            if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA:
+                _validate_adherence_gate(
+                    adherence, chapter, prose=source.text,
+                    review_authorization=self._deps.review_authorization,
+                    prose_repaired=any(
+                        isinstance(item, ProseCandidateCheckpointV1) and item.origin == "repair"
+                        for item in checkpoint_ledger
+                    ),
                 )
             if review_evidence is not None:
                 await self._persist_checkpoint(_adherence_checkpoint(
@@ -4897,6 +4965,11 @@ class ChapterCandidatePipeline:
                     adherence,
                     chapter,
                     prose=source.text,
+                    review_authorization=self._deps.review_authorization,
+                    prose_repaired=any(
+                        isinstance(item, ProseCandidateCheckpointV1) and item.origin == "repair"
+                        for item in checkpoint_ledger
+                    ),
                 )
             except ChapterCandidatePipelineBlocked as gate_error:
                 uses_stable_issue_policy = adherence.get(

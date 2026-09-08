@@ -87,6 +87,12 @@ def legacy_review_records(job: dict, chapter_id: str) -> list[dict]:
 
     def append_record(suffix, *, evidence, failure, source, step_id, model=None, alias=None, diagnostics=None):
         slots = [item for item in attempts if item.get("step_id") == step_id]
+        if (
+            isinstance(evidence, dict)
+            and evidence.get("schema_version") == "chapter_not_reviewed.v1"
+            and not slots and not failure
+        ):
+            return  # An authorized omission is not a failed historical Judge call.
         if not evidence and not failure and not slots:
             return
         rounds = [{

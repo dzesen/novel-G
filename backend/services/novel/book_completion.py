@@ -40,6 +40,9 @@ from backend.services.generation.chapter_completion_certificate import (
     LEGACY_CHAPTER_COMPLETION_POLICY_REVISION,
     verify_persisted_chapter_completion_certificate,
 )
+from backend.services.generation.chapter_review_policy import (
+    NOT_REVIEWED_SCHEMA, review_authorization_from_readiness,
+)
 from backend.services.generation.failure_diagnostics import (
     ActiveFailureEventState,
     ActiveFailureKind,
@@ -123,6 +126,8 @@ class BookCompletionSummary(_StrictModel):
     unresolved_thread_count: int = 0
     blocking_issue_count: int
     advisory_issue_count: int
+    reviewed_chapter_count: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
+    unreviewed_chapter_count: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
 
 
 class BookCompletionChapterAudit(_StrictModel):
@@ -136,6 +141,9 @@ class BookCompletionChapterAudit(_StrictModel):
     content_digest: str = Field(pattern=_HEX_64_PATTERN)
     actual_word_count: int
     target_word_count: int | None
+    independent_review_status: Literal["passed", "not_reviewed"] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
 
 
 class _BookCompletionReportProjection(_StrictModel):
@@ -213,6 +221,36 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+def _certificate_review_status(
+    chapter: Mapping[str, Any], authorizations: Mapping[str, Mapping[str, Any]],
+) -> tuple[str | None, str | None]:
+    acceptance = chapter.get("prose_acceptance") or {}
+    raw = acceptance.get("chapter_completion_certificate")
+    if not isinstance(raw, Mapping):
+        return None, None
+    try:
+        certificate = ChapterCompletionCertificate.model_validate(raw)
+        coverage = certificate.evidence_binding.review_coverage
+        if coverage is None:
+            return "passed", None
+        binding = certificate.authorization_binding
+        job_id = binding.job_id or binding.authorization_id
+        job = authorizations.get(job_id)
+        if job is None:
+            raise ValueError("review authorization is unavailable")
+        readiness = job.get("readiness") or {}
+        policy = review_authorization_from_readiness(readiness)
+        if (
+            policy is None or policy.digest != coverage.authorization_digest
+            or readiness.get("digest") != binding.readiness_digest
+            or policy.requires_review(str(chapter.get("_id") or ""), prose_repaired=coverage.prose_repaired) != coverage.required
+        ):
+            raise ValueError("review coverage differs from the frozen authorization")
+        return coverage.status, None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 def _outline_is_complete(value: Any) -> bool:
@@ -951,6 +989,21 @@ class BookCompletionAudit:
                     "outline_adherence": review,
                     "outline_deviation_policy": policy,
                 })
+        review_job_ids: set[ObjectId] = set()
+        for chapter in chapters:
+            raw_certificate = (chapter.get("prose_acceptance") or {}).get("chapter_completion_certificate") or {}
+            if not isinstance(raw_certificate, Mapping):
+                continue
+            binding = raw_certificate.get("authorization_binding") or {}
+            if isinstance(binding, Mapping):
+                raw_id = binding.get("job_id") or binding.get("authorization_id")
+                if isinstance(raw_id, str) and ObjectId.is_valid(raw_id):
+                    review_job_ids.add(ObjectId(raw_id))
+        review_jobs = await database[collections.GENERATION_JOBS].find(
+            {"_id": {"$in": list(review_job_ids)}, "novel_id": novel_object_id, "is_deleted": False},
+            projection={"readiness": 1},
+        ).to_list(length=None) if review_job_ids else []
+        review_jobs_by_id = {str(job["_id"]): job for job in review_jobs}
         chapter_audits: list[BookCompletionChapterAudit] = []
         formal_prose_evidence: dict[str, dict[str, str]] = {}
         current_state_count = 0
@@ -1087,6 +1140,14 @@ class BookCompletionAudit:
                             },
                         )
                     )
+            review_status, review_error = _certificate_review_status(chapter, review_jobs_by_id)
+            if review_error is not None:
+                issues.append(BookCompletionIssue(
+                    code="chapter_review_authorization_unproven", category="semantic",
+                    chapter_id=chapter_id, volume_id=volume_id, details={"reason": review_error},
+                ))
+            if prose_status != "certificate_verified_v2":
+                review_status = None
             chapter_audits.append(
                 BookCompletionChapterAudit(
                     chapter_id=chapter_id,
@@ -1094,6 +1155,7 @@ class BookCompletionAudit:
                     volume_order=volume_order.get(volume_id, 0),
                     chapter_order=int(chapter.get("order_index") or 0),
                     outline_complete=outline_complete,
+                    independent_review_status=review_status,
                     prose_status=prose_status,
                     state_status=state_status,
                     content_digest=content_digest,
@@ -1326,6 +1388,15 @@ class BookCompletionAudit:
                     continue
                 latest_chapter_progress[chapter_id] = (index, entry)
                 review = entry.get("outline_adherence")
+                if isinstance(review, dict) and review.get("schema_version") == NOT_REVIEWED_SCHEMA:
+                    audited = next((item for item in chapter_audits if item.chapter_id == chapter_id), None)
+                    current = formal_prose_evidence.get(chapter_id) or {}
+                    if audited is not None and audited.independent_review_status == "not_reviewed" and (
+                        review.get("source_content_digest") == current.get("content_digest")
+                        and review.get("source_prose_run_id") == current.get("source_prose_run_id")
+                    ):
+                        latest_reviews.pop(chapter_id, None)
+                    continue
                 if (
                     isinstance(review, dict)
                     and (
@@ -1662,6 +1733,8 @@ class BookCompletionAudit:
                 volume_count=len(volumes),
                 chapter_count=len(chapters),
                 complete_chapter_count=complete_chapter_count,
+                reviewed_chapter_count=sum(item.independent_review_status == "passed" for item in chapter_audits),
+                unreviewed_chapter_count=sum(item.independent_review_status == "not_reviewed" for item in chapter_audits),
                 current_state_count=current_state_count,
                 blocking_reference_candidate_count=len(
                     blocking_candidates

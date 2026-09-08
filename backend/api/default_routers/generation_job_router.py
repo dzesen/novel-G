@@ -1,6 +1,8 @@
 """批量生成作业的 HTTP 端点（轮询式，无 SSE）。设计 §9.2。"""
 from __future__ import annotations
 
+from backend.services.generation.chapter_review_policy import ChapterReviewSelection
+
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -77,6 +79,8 @@ class StartJobRequest(ProtectedBatchGenerationParamsMixin):
         default_factory=ReferenceCardAutoCreationPolicy
     )
 
+    chapter_review_selection: ChapterReviewSelection = Field(default_factory=ChapterReviewSelection)
+
 
 class BatchReadinessRequest(ProtectedBatchGenerationParamsMixin):
     token_budget: Optional[int] = Field(default=None, ge=1)
@@ -90,6 +94,8 @@ class BatchReadinessRequest(ProtectedBatchGenerationParamsMixin):
     reference_card_auto_creation_policy: ReferenceCardAutoCreationPolicy = Field(
         default_factory=ReferenceCardAutoCreationPolicy
     )
+
+    chapter_review_selection: ChapterReviewSelection = Field(default_factory=ChapterReviewSelection)
 
 
 class ResumeReadinessRequest(BaseModel):
@@ -174,6 +180,7 @@ async def start_volume_job(volume_id: str, req: StartJobRequest):
                 "prose_continuation_policy": req.prose_continuation_policy.to_domain().to_dict(),
             },
             prose_continuation_policy=req.prose_continuation_policy.to_domain(),
+            chapter_review_selection=req.chapter_review_selection,
             reference_card_auto_creation_policy=(
                 req.reference_card_auto_creation_policy
             ),
@@ -199,6 +206,7 @@ async def start_book_job(novel_id: str, req: StartJobRequest):
                 "prose_continuation_policy": req.prose_continuation_policy.to_domain().to_dict(),
             },
             prose_continuation_policy=req.prose_continuation_policy.to_domain(),
+            chapter_review_selection=req.chapter_review_selection,
             reference_card_auto_creation_policy=(
                 req.reference_card_auto_creation_policy
             ),
@@ -229,6 +237,7 @@ async def initialize_book_structure(novel_id: str, req: StartJobRequest):
             prose_continuation_policy=(
                 req.prose_continuation_policy.to_domain()
             ),
+            chapter_review_selection=req.chapter_review_selection,
             reference_card_auto_creation_policy=(
                 req.reference_card_auto_creation_policy
             ),
@@ -240,7 +249,7 @@ async def initialize_book_structure(novel_id: str, req: StartJobRequest):
 @router.get("/volume/{volume_id}/readiness")
 async def inspect_volume_readiness(volume_id: str):
     try:
-        return await GenerationJobService.inspect_volume_readiness(volume_id)
+        return await GenerationJobService.inspect_volume_readiness(volume_id, chapter_review_selection=ChapterReviewSelection())
     except Exception as exc:
         raise _handle(exc) from exc
 
@@ -248,7 +257,7 @@ async def inspect_volume_readiness(volume_id: str):
 @router.get("/book/{novel_id}/readiness")
 async def inspect_book_readiness(novel_id: str):
     try:
-        return await GenerationJobService.inspect_book_readiness(novel_id)
+        return await GenerationJobService.inspect_book_readiness(novel_id, chapter_review_selection=ChapterReviewSelection())
     except Exception as exc:
         raise _handle(exc) from exc
 
@@ -280,6 +289,7 @@ async def inspect_volume_readiness_with_policy(
                 req.prose_continuation_policy.to_domain()
             ),
             token_budget=req.token_budget,
+            chapter_review_selection=req.chapter_review_selection,
             reference_card_auto_creation_policy=(
                 req.reference_card_auto_creation_policy
             ),
@@ -308,6 +318,7 @@ async def inspect_book_readiness_with_policy(
                 req.prose_continuation_policy.to_domain()
             ),
             token_budget=req.token_budget,
+            chapter_review_selection=req.chapter_review_selection,
             reference_card_auto_creation_policy=(
                 req.reference_card_auto_creation_policy
             ),

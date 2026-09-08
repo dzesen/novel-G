@@ -8,6 +8,10 @@ process restart never turns a persisted paid step into a second Provider call.
 
 from __future__ import annotations
 
+from backend.services.generation.chapter_review_policy import (
+    build_not_reviewed_receipt, review_authorization_from_readiness,
+)
+
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -23,6 +27,7 @@ from backend.services.generation.candidate_repair_contracts import (
     AdherenceCandidateCheckpointV3,
     AdherenceCandidateCheckpointV4,
     AdherenceCandidateCheckpointV5,
+    AdherenceNotReviewedCheckpointV6,
     CandidatePipelineCheckpointV1,
     CandidatePipelineProgressV1,
     JobMutationRecoveryBindingV1,
@@ -644,6 +649,7 @@ def _adherence_result(
             AdherenceCandidateCheckpointV3,
             AdherenceCandidateCheckpointV4,
             AdherenceCandidateCheckpointV5,
+            AdherenceNotReviewedCheckpointV6,
         ),
     ):
         value = checkpoint.validated_evidence.model_dump(mode="json")
@@ -1035,10 +1041,12 @@ class ChapterCandidateJobRunner:
                 attempt_count=len(terminal.attempt_ids),
                 truncation_count=terminal.truncation_count,
                 outline_issue_categories=(
-                    adherence_checkpoint.issue_categories
+                    () if isinstance(adherence_checkpoint, AdherenceNotReviewedCheckpointV6)
+                    else adherence_checkpoint.issue_categories
                 ),
                 scene_coverage_count=len(
-                    adherence_checkpoint.scene_coverage
+                    () if isinstance(adherence_checkpoint, AdherenceNotReviewedCheckpointV6)
+                    else adherence_checkpoint.scene_coverage
                 ),
                 consistency_issue_count=(
                     state_checkpoint.consistency_issue_count
@@ -1073,6 +1081,10 @@ class ChapterCandidateJobRunner:
             raise ChapterCandidatePipelineBlocked("候选作业章节缺少卷身份")
         volume = await self._deps.get_volume(chapter_volume_id)
         owner_id = scope.validate_documents(novel, volume, current)
+        review_authorization = review_authorization_from_readiness(self._readiness)
+        requires_review = (
+            review_authorization.requires_review(chapter_id) if review_authorization is not None else True
+        )
         slots = await self._load_attempts(chapter_id)
         if len(slots) > self._authorized_attempt_slots:
             raise ChapterCandidatePipelineBlocked("候选作业调用容量已被扩大")
@@ -1201,6 +1213,8 @@ class ChapterCandidateJobRunner:
         )
 
         def fenced_scope(step: str) -> Any:
+            if not requires_review and active_content_repair_cycle == 0 and step.startswith("candidate-outline-adherence"):
+                raise ChapterCandidatePipelineBlocked("冻结授权未选择本章独立审查")
             scope_adapter: Any = _NarrativeFencedAttemptScope(
                 self._scope(chapter_id, step, replay_slots),
                 lambda: self._ensure_narrative_revision(
@@ -1399,6 +1413,21 @@ class ChapterCandidateJobRunner:
             source: ProseCandidateSource,
         ) -> ChapterGenerationResult:
             await self._ensure_narrative_revision(scope, expected_revision)
+            if not requires_review and active_content_repair_cycle == 0:
+                assert review_authorization is not None
+                receipt = build_not_reviewed_receipt(
+                    review_authorization, chapter_id=chapter_id,
+                    source_prose_run_id=source.source_run_id,
+                    source_prose_run_revision=source.source_run_revision,
+                    source_content_digest=source.source_content_digest,
+                    outline=target_chapter["outline"],
+                )
+                return ChapterGenerationResult(
+                    stage=ChapterGenerationStage.OUTLINE_ADHERENCE,
+                    value=receipt.model_dump(mode="json"),
+                    usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    attempts=[], truncation={}, accepted=False,
+                )
             attempt_step = (
                 "candidate-outline-adherence"
                 if active_content_repair_cycle == 0
@@ -1515,6 +1544,7 @@ class ChapterCandidateJobRunner:
                 ) from exc
 
         pipeline = ChapterCandidatePipeline(ChapterCandidatePipelineDeps(
+            review_authorization=review_authorization,
             generate_prose_candidate=generate_prose_step,
             review_prose_candidate=review_prose_step,
             generate_state_candidate=generate_state_step,

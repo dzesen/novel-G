@@ -149,17 +149,20 @@ interface InteractiveCompletionReadinessPayloadInput {
   novelId: string;
   chapterId: string;
   runRevision: number;
+  reviewRequested?: boolean;
 }
 
 export function buildInteractiveCompletionReadinessPayload({
   novelId,
   chapterId,
   runRevision,
+  reviewRequested,
 }: InteractiveCompletionReadinessPayloadInput) {
   return {
     novel_id: novelId,
     chapter_id: chapterId,
     expected_run_revision: runRevision,
+    ...(reviewRequested !== undefined ? { review_requested: reviewRequested } : {}),
   };
 }
 
@@ -179,6 +182,7 @@ export function buildInteractiveCompletionPayload({
   authorizationId,
   authorizationRevision,
   readinessDigest,
+  reviewRequested,
 }: InteractiveCompletionPayloadInput) {
   if (!/^[0-9a-f]{24}$/.test(authorizationId)) {
     throw new Error("completion authorization id is invalid");
@@ -194,6 +198,7 @@ export function buildInteractiveCompletionPayload({
     authorization_revision: authorizationRevision,
     completion_readiness_digest: readinessDigest,
     completion_readiness_confirmed: true,
+    ...(reviewRequested !== undefined ? { review_requested: reviewRequested } : {}),
   };
 }
 

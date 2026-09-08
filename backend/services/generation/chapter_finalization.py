@@ -34,12 +34,15 @@ from backend.llm.schemas.scene_contract_pydantic import (
 )
 from backend.services.generation.candidate_repair_contracts import (
     MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES,
+    ProseCandidateCheckpointV1,
     AdherenceCandidateCheckpointV5,
+    AdherenceNotReviewedCheckpointV6,
     JobMutationRecoveryBindingV1,
     parse_candidate_pipeline_checkpoint,
 )
 from backend.services.generation.chapter_completion_certificate import (
     CHAPTER_COMPLETION_POLICY_REVISION,
+    SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION,
     CHAPTER_COMPLETION_FAILURE_EVIDENCE_SCHEMA,
     ChapterBinding,
     ChapterCompletionCandidateSnapshot,
@@ -63,6 +66,11 @@ from backend.services.generation.chapter_completion_certificate import (
 )
 from backend.services.generation.chapter_repair_policy import (
     RepairFailureEvidenceV1,
+)
+from backend.services.generation.chapter_review_policy import (
+    NOT_REVIEWED_SCHEMA, ChapterNotReviewedReceipt, ChapterReviewCoverage,
+    not_reviewed_completion_metadata, review_authorization_from_readiness,
+    validate_not_reviewed_receipt,
 )
 from backend.services.generation.outline_adherence import (
     OutlineAdherenceValidationError,
@@ -203,6 +211,7 @@ def _trusted_outline_adherence_evidence(
 ) -> (
     ValidatedChapterOutlineAdherenceEvidenceV4Schema
     | ValidatedChapterOutlineAdherenceEvidenceV5Schema
+    | ChapterNotReviewedReceipt
 ):
     """Load the exact server-persisted completion evidence for finalization."""
 
@@ -225,14 +234,14 @@ def _trusted_outline_adherence_evidence(
     if raw_trusted is None:
         raw_checkpoints = job.get("candidate_pipeline_checkpoints")
         if isinstance(raw_checkpoints, list):
-            latest: AdherenceCandidateCheckpointV5 | None = None
+            latest: AdherenceCandidateCheckpointV5 | AdherenceNotReviewedCheckpointV6 | None = None
             try:
                 for raw_checkpoint in raw_checkpoints:
                     checkpoint = parse_candidate_pipeline_checkpoint(
                         raw_checkpoint
                     )
                     if (
-                        isinstance(checkpoint, AdherenceCandidateCheckpointV5)
+                        isinstance(checkpoint, (AdherenceCandidateCheckpointV5, AdherenceNotReviewedCheckpointV6))
                         and checkpoint.chapter_id == chapter_id
                     ):
                         latest = checkpoint
@@ -246,6 +255,8 @@ def _trusted_outline_adherence_evidence(
                     mode="python"
                 )
     try:
+        if isinstance(raw_trusted, Mapping) and raw_trusted.get("schema_version") == NOT_REVIEWED_SCHEMA:
+            return ChapterNotReviewedReceipt.model_validate(raw_trusted)
         return parse_current_outline_adherence_evidence(
             raw_trusted
         )
@@ -254,6 +265,14 @@ def _trusted_outline_adherence_evidence(
             "作业缺少当前章纲符合度的持久证据",
             _failure_fact("evidence_invalid", "outline_adherence"),
         ) from exc
+
+
+def _chapter_had_prose_repair(job: Mapping[str, Any], chapter_id: str) -> bool:
+    for raw in job.get("candidate_pipeline_checkpoints") or []:
+        checkpoint = parse_candidate_pipeline_checkpoint(raw)
+        if isinstance(checkpoint, ProseCandidateCheckpointV1) and checkpoint.chapter_id == chapter_id and checkpoint.origin == "repair":
+            return True
+    return False
 
 
 class ChapterFinalizationAuthorization(BaseModel):
@@ -1683,7 +1702,19 @@ class ChapterFinalizationService:
                 chapter=chapter,
                 authorization=authorization,
             )
+            review_authorization = review_authorization_from_readiness(job.get("readiness") or {})
+            not_reviewed = adherence_metadata.get("review_status") == "not_reviewed"
+            prose_repaired = _chapter_had_prose_repair(job, chapter_id)
+            review_coverage = (
+                ChapterReviewCoverage(
+                    status="not_reviewed" if not_reviewed else "passed",
+                    required=review_authorization.requires_review(chapter_id, prose_repaired=prose_repaired),
+                    authorization_digest=review_authorization.digest,
+                    prose_repaired=prose_repaired,
+                ) if review_authorization is not None else None
+            )
             evidence_bundle = ChapterCompletionEvidenceBundle(
+                review_coverage=review_coverage,
                 provider_attempt_ledger_digest=canonical_completion_digest(
                     _provider_attempt_ledger_projection(
                         job,
@@ -1697,7 +1728,7 @@ class ChapterFinalizationService:
                 scene_contract_digest=str(
                     adherence_metadata.get("outline_contract_digest") or ""
                 ),
-                beat_evidence_digest=canonical_completion_digest({
+                beat_evidence_digest=canonical_completion_digest(evidence.outline_adherence) if not_reviewed else canonical_completion_digest({
                     "schema_version": evidence.outline_adherence.get(
                         "evidence_schema_version"
                     ),
@@ -1732,7 +1763,7 @@ class ChapterFinalizationService:
                     adherence_metadata.get("quality_debt_sidecar_digest") or ""
                 ),
                 prose_integrity_passed=True,
-                scene_contract_passed=True,
+                scene_contract_passed=None if not_reviewed else True,
                 state_fact_accounting_passed=True,
                 repair_convergence=repair_convergence,
                 blocking_issue_signatures=tuple(
@@ -1749,7 +1780,7 @@ class ChapterFinalizationService:
             completion_decision = completion_policy.assess(
                 candidate_snapshot,
                 evidence_bundle,
-                CHAPTER_COMPLETION_POLICY_REVISION,
+                SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION if review_coverage is not None else CHAPTER_COMPLETION_POLICY_REVISION,
             )
             await self._persist_completion_decision(
                 authorization=authorization,
@@ -2329,62 +2360,89 @@ class ChapterFinalizationService:
                     "completion_gates",
                 ),
             )
-        try:
-            submitted_adherence = (
-                parse_current_outline_adherence_evidence(
-                    adherence
+        if adherence.get("schema_version") == NOT_REVIEWED_SCHEMA:
+            try:
+                review_authorization = review_authorization_from_readiness(job.get("readiness") or {})
+                receipt = validate_not_reviewed_receipt(
+                    adherence, review_authorization,
+                    chapter_id=str(chapter.get("_id") or ""),
+                    source_prose_run_id=str(prose_payload["run_id"]),
+                    source_prose_run_revision=int(prose_payload["expected_revision"]),
+                    source_content_digest=str(prose_payload["text_digest"]),
+                    outline=outline,
+                    prose_repaired=_chapter_had_prose_repair(job, str(chapter.get("_id") or "")),
                 )
+            except ValueError as exc:
+                raise _CompletionGateDenied(
+                    "未审查记录不符合当前章节和冻结授权",
+                    _failure_fact("evidence_invalid", "outline_adherence"),
+                ) from exc
+            trusted_receipt = _trusted_outline_adherence_evidence(
+                job=job, chapter_id=str(chapter.get("_id") or ""),
             )
-        except ValueError as exc:
-            raise _CompletionGateDenied(
-                "章纲符合度当前本地问题策略证据无效",
-                _failure_fact(
-                    "evidence_invalid",
-                    "outline_adherence",
-                ),
-            ) from exc
-        try:
-            rebuilt_adherence = revalidate_current_outline_adherence_evidence(
-                adherence,
-                outline=outline,
-                prose=prose_text,
-                source_prose_run_id=str(prose_payload["run_id"]),
-                source_prose_run_revision=int(
-                    prose_payload["expected_revision"]
-                ),
-                source_content_digest=str(prose_payload["text_digest"]),
+            if receipt != trusted_receipt:
+                raise _CompletionGateDenied(
+                    "未审查记录与作业持久证据不一致",
+                    _failure_fact("evidence_invalid", "outline_adherence"),
+                )
+            adherence_metadata = not_reviewed_completion_metadata(receipt)
+        else:
+            try:
+                submitted_adherence = (
+                    parse_current_outline_adherence_evidence(
+                        adherence
+                    )
+                )
+            except ValueError as exc:
+                raise _CompletionGateDenied(
+                    "章纲符合度当前本地问题策略证据无效",
+                    _failure_fact(
+                        "evidence_invalid",
+                        "outline_adherence",
+                    ),
+                ) from exc
+            try:
+                rebuilt_adherence = revalidate_current_outline_adherence_evidence(
+                    adherence,
+                    outline=outline,
+                    prose=prose_text,
+                    source_prose_run_id=str(prose_payload["run_id"]),
+                    source_prose_run_revision=int(
+                        prose_payload["expected_revision"]
+                    ),
+                    source_content_digest=str(prose_payload["text_digest"]),
+                )
+            except OutlineAdherenceValidationError as exc:
+                raise _CompletionGateDenied(
+                    str(exc),
+                    _failure_fact(
+                        "evidence_invalid",
+                        "outline_adherence",
+                    ),
+                ) from exc
+            trusted_adherence = _trusted_outline_adherence_evidence(
+                job=job,
+                chapter_id=str(chapter.get("_id") or ""),
             )
-        except OutlineAdherenceValidationError as exc:
-            raise _CompletionGateDenied(
-                str(exc),
-                _failure_fact(
-                    "evidence_invalid",
-                    "outline_adherence",
-                ),
-            ) from exc
-        trusted_adherence = _trusted_outline_adherence_evidence(
-            job=job,
-            chapter_id=str(chapter.get("_id") or ""),
-        )
-        if submitted_adherence != trusted_adherence:
-            raise _CompletionGateDenied(
-                "章纲符合度证据与作业持久证据不一致",
-                _failure_fact("evidence_invalid", "outline_adherence"),
-            )
-        try:
-            adherence_metadata = validate_complete_outline_adherence(
-                rebuilt_adherence,
-                outline=outline,
-                prose=prose_text,
-                require_current_evidence=True,
-            )
-        except OutlineAdherenceValidationError as exc:
-            raise _CompletionGateDenied(
-                str(exc),
-                failure_fact_from_outline_adherence_decision(
-                    rebuilt_adherence.get("decision")
-                ),
-            ) from exc
+            if submitted_adherence != trusted_adherence:
+                raise _CompletionGateDenied(
+                    "章纲符合度证据与作业持久证据不一致",
+                    _failure_fact("evidence_invalid", "outline_adherence"),
+                )
+            try:
+                adherence_metadata = validate_complete_outline_adherence(
+                    rebuilt_adherence,
+                    outline=outline,
+                    prose=prose_text,
+                    require_current_evidence=True,
+                )
+            except OutlineAdherenceValidationError as exc:
+                raise _CompletionGateDenied(
+                    str(exc),
+                    failure_fact_from_outline_adherence_decision(
+                        rebuilt_adherence.get("decision")
+                    ),
+                ) from exc
         max_repairs = _strict_int(
             authorization.get("max_repair_cycles"),
             field="正文修复次数上限",

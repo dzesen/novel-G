@@ -119,6 +119,28 @@ export default function BookCompletionAuditPanel({
         </div>
       </div>
 
+      {audit.summary.reviewed_chapter_count != null && audit.summary.unreviewed_chapter_count != null && (
+        <details data-testid="book-audit-review-coverage" className="text-xs leading-5">
+          <summary className="min-h-11 cursor-pointer py-3 font-medium focus-visible:outline-2 focus-visible:outline-current">
+            {t("bookAuditReviewCoverage", {
+              reviewed: audit.summary.reviewed_chapter_count,
+              unreviewed: audit.summary.unreviewed_chapter_count,
+            })}
+          </summary>
+          <p className="mb-2">{t("bookAuditReviewCoverageHint")}</p>
+          <ul className="grid max-h-60 gap-1 overflow-y-auto overscroll-contain">
+            {audit.chapters.filter((chapter) => chapter.independent_review_status).map((chapter) => (
+              <li key={chapter.chapter_id} className="flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                <button type="button" onClick={() => onJumpToChapter(chapter.chapter_id)} className="min-h-11 min-w-0 break-words py-2 text-left font-medium underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-current">
+                  {titleForChapter(chapter.chapter_id)}
+                </button>
+                <span>{t(chapter.independent_review_status === "passed" ? "bookAuditReviewed" : "bookAuditNotReviewed")}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
       {!audit.complete && groups.length > 0 && (
         <ul className="grid gap-2">
           {groups.map((group) => {

@@ -5,6 +5,7 @@ import type {
 
 import type { ProseContinuationPolicy } from "../prose/proseContinuation";
 import type { ReferenceCardAutoCreationPolicy } from "./referenceCardAutoCreation.ts";
+import type { ChapterReviewSelection } from "./chapterReviewPolicy.ts";
 interface StartPayloadInput {
   checkpointInterval: number | null;
   tokenBudget: number | null;
@@ -14,6 +15,7 @@ interface StartPayloadInput {
   generationParams?: Record<string, unknown>;
   proseContinuationPolicy?: ProseContinuationPolicy;
   referenceCardAutoCreationPolicy?: ReferenceCardAutoCreationPolicy;
+  chapterReviewSelection?: ChapterReviewSelection;
 }
 
 export function readinessAllowsStart(
@@ -37,6 +39,7 @@ export function buildAuthorizedStartPayload({
   generationParams = {},
   proseContinuationPolicy,
   referenceCardAutoCreationPolicy,
+  chapterReviewSelection,
 }: StartPayloadInput) {
   return {
     checkpoint_interval: checkpointInterval === null
@@ -51,6 +54,7 @@ export function buildAuthorizedStartPayload({
     ...(referenceCardAutoCreationPolicy
       ? { reference_card_auto_creation_policy: referenceCardAutoCreationPolicy }
       : {}),
+    ...(chapterReviewSelection ? { chapter_review_selection: chapterReviewSelection } : {}),
   };
 }
 

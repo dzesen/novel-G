@@ -52,11 +52,11 @@ import {
 } from "./proseContinuation";
 
 interface InteractiveCompletionReadiness {
-  schema_version: "interactive_chapter_completion_readiness.v2";
+  schema_version: "interactive_chapter_completion_readiness.v2" | "interactive_chapter_completion_readiness.v3";
   digest: string;
   authorization_id: string;
   authorization_revision: number;
-  logical_call_count: 2;
+  logical_call_count: 1 | 2;
   recovery_replay_limit: 1;
   maximum_paid_attempts: number;
   conservative_token_bound: number;
@@ -81,6 +81,7 @@ interface InteractiveCompletionReadiness {
 interface InteractiveCompletionInspection {
   schema_version: "interactive_chapter_completion_inspection.v1";
   readiness: InteractiveCompletionReadiness;
+  review_selection_locked?: boolean;
   notices: Array<"legacy_readiness_reauthorization_required">;
 }
 
@@ -142,6 +143,9 @@ export default function ProsePanel({
   const [automaticContinuationsConfirmed, setAutomaticContinuationsConfirmed] = useState(false);
   const [completionReadiness, setCompletionReadiness] =
     useState<InteractiveCompletionReadiness | null>(null);
+  const [reviewRequested, setReviewRequested] = useState(false);
+  const [reviewSelectionLocked, setReviewSelectionLocked] = useState(false);
+  const [completionPreviewSeen, setCompletionPreviewSeen] = useState(false);
   const [completionInspectionNotices, setCompletionInspectionNotices] =
     useState<InteractiveCompletionInspection["notices"]>([]);
   const [completionReadinessLoading, setCompletionReadinessLoading] =
@@ -247,6 +251,9 @@ export default function ProsePanel({
 
   useEffect(() => {
     setCompletionReadiness(null);
+    setReviewRequested(false);
+    setReviewSelectionLocked(false);
+    setCompletionPreviewSeen(false);
     setCompletionInspectionNotices([]);
     setCompletionReadinessConfirmed(false);
     setCompletionUncertain(false);
@@ -348,6 +355,7 @@ export default function ProsePanel({
       authorizationId: readiness.authorization_id,
       authorizationRevision: readiness.authorization_revision,
       readinessDigest: readiness.digest,
+      reviewRequested: readiness.logical_call_count === 2,
     };
     let polling = true;
     let progressRequest: Promise<void> | null = null;
@@ -454,9 +462,14 @@ export default function ProsePanel({
             novelId,
             chapterId,
             runRevision,
+            reviewRequested,
           }),
         );
         setCompletionReadiness(inspection.readiness);
+        setCompletionPreviewSeen(true);
+        setReviewRequested(inspection.readiness.logical_call_count === 2);
+        setReviewSelectionLocked(Boolean(inspection.review_selection_locked)
+          || inspection.readiness.schema_version === "interactive_chapter_completion_readiness.v2");
         setCompletionInspectionNotices(inspection.notices);
         setCompletionReadinessConfirmed(false);
       } catch (error) {
@@ -1019,6 +1032,30 @@ export default function ProsePanel({
 
           <ContextNotices report={stream.contextReport} />
           {hasText && !partialAcceptance && (
+            <section data-testid="interactive-review-choice" className="grid min-w-0 gap-1 border-t border-border pt-3">
+              <label className="flex min-h-11 cursor-pointer items-start gap-2 py-2">
+                <input
+                  type="checkbox"
+                  checked={reviewRequested}
+                  disabled={runActionsBlocked || reviewSelectionLocked || completionUncertain}
+                  onChange={(event) => {
+                    setReviewRequested(event.target.checked);
+                    setCompletionReadiness(null);
+                    setCompletionReadinessConfirmed(false);
+                    setCompletionInspectionNotices([]);
+                    setActionError("");
+                  }}
+                  aria-describedby="interactive-review-choice-hint"
+                  className="mt-0.5 size-4 shrink-0 accent-accent"
+                />
+                <span className="min-w-0 text-sm font-medium text-foreground">{t("completionReviewOption")}</span>
+              </label>
+              <p id="interactive-review-choice-hint" className="text-xs leading-5 text-muted">
+                {t(reviewSelectionLocked ? "completionReviewLocked" : "completionReviewOptionHint")}
+              </p>
+            </section>
+          )}
+          {hasText && !partialAcceptance && (
             <Notice tone="info">
               <section
                 data-testid="interactive-completion-readiness"
@@ -1039,6 +1076,10 @@ export default function ProsePanel({
                 )}
                 {completionReadiness && (
                   <>
+                    <p className="text-xs font-medium leading-5 text-foreground">
+                      {t(completionReadiness.logical_call_count === 2
+                        ? "completionReviewIncluded" : "completionReviewNotRequested")}
+                    </p>
                     <div className="grid gap-1 rounded-md border border-border bg-surface p-3 text-xs leading-5 text-muted sm:grid-cols-2">
                       <p>
                         {t("completionReadinessCalls", {
@@ -1398,7 +1439,7 @@ export default function ProsePanel({
                 ? t("completionInspecting")
               : partialAcceptance && !partialArmed
                 ? t("acceptPartial")
-                : overwriteArmed && !completionReadiness
+                : overwriteArmed && !completionReadiness && !completionPreviewSeen
                   ? t("overwriteConfirm")
                   : !partialAcceptance && !completionReadiness
                     ? t("completionInspect")

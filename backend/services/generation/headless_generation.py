@@ -654,12 +654,13 @@ def estimate_chapter_attempt_slots(
     ):
         # 细纲符合度审查与状态回填是两个独立 workflow；即便当前恰好
         # 选择同一 Provider，也必须按各自冻结 plan 预留。
-        slots += runtime.plan_structured(
-            WorkflowStepTarget(
-                PROSE_REMEDIATION_WORKFLOW,
-                OUTLINE_ADHERENCE_STEP,
-            )
-        ).max_semantic_attempts
+        if chapter.get("_independent_review_required") is not False:
+            slots += runtime.plan_structured(
+                WorkflowStepTarget(
+                    PROSE_REMEDIATION_WORKFLOW,
+                    OUTLINE_ADHERENCE_STEP,
+                )
+            ).max_semantic_attempts
         slots += runtime.plan_structured(
             WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
         ).max_semantic_attempts
@@ -678,12 +679,12 @@ def estimate_worklist_attempt_capacity(
     reuse_runtime = runtime is not None
     if runtime is None:
         runtime = create_generation_runtime(**runtime_kwargs)
-    adherence_recheck_slots = runtime.plan_structured(
+    adherence_recheck_slots = (runtime.plan_structured(
         WorkflowStepTarget(
             PROSE_REMEDIATION_WORKFLOW,
             OUTLINE_ADHERENCE_STEP,
         )
-    ).max_semantic_attempts
+    ).max_semantic_attempts if any(chapter.get("_independent_review_required") is not False for chapter in chapters) else 0)
     capacity = sum(
         estimate_chapter_attempt_slots(
             chapter,
@@ -692,7 +693,7 @@ def estimate_worklist_attempt_capacity(
         )
         + (
             adherence_recheck_slots
-            if str(
+            if chapter.get("_independent_review_required") is not False and str(
                 (chapter.get("state_completion") or {}).get("status")
                 or "missing"
             )

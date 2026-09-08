@@ -1,6 +1,10 @@
 """批量作业服务：CRUD、全局单作业守卫、拉起/控制进程内任务。"""
 from __future__ import annotations
 
+from backend.services.generation.chapter_review_policy import (
+    ChapterReviewSelection, review_authorization_from_readiness,
+)
+
 import asyncio
 from contextvars import Context
 import hashlib
@@ -207,6 +211,19 @@ def _get_start_lock() -> asyncio.Lock:
         _START_LOCK = asyncio.Lock()
         _START_LOCK_LOOP = loop
     return _START_LOCK
+
+
+def _persisted_chapter_review_selection(job: Mapping[str, Any]) -> ChapterReviewSelection | None:
+    review = review_authorization_from_readiness(job.get("readiness") or {})
+    return review.selection if review is not None else None
+
+
+def _review_planning_chapters(readiness: Mapping[str, Any] | None, chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    policy = review_authorization_from_readiness(readiness or {})
+    return [
+        {**chapter, "_independent_review_required": policy.requires_review(str(chapter["_id"])) if policy else True}
+        for chapter in chapters
+    ]
 
 
 def _persisted_reference_card_auto_creation_policy(
@@ -859,7 +876,7 @@ def _estimate_authorized_chapter_attempt_slots(
 ) -> int:
     """Size one chapter reservation from the already-confirmed readiness."""
     base_slots = estimate_chapter_attempt_slots(
-        dict(chapter),
+        _review_planning_chapters(job.get("readiness"), [dict(chapter)])[0],
         generation_params,
     )
     readiness = job.get("readiness")
@@ -1973,6 +1990,7 @@ class GenerationJobService:
             token_budget=job.get("token_budget"),
             generation_params=generation_params,
             authorization_revision=max(1, current_revision),
+            chapter_review_selection=_persisted_chapter_review_selection(job),
             reference_card_auto_creation_policy=(
                 _persisted_reference_card_auto_creation_policy(job)
             ),
@@ -2277,6 +2295,10 @@ class GenerationJobService:
                 ),
                 state_job_mutation_binding=state_binding,
             )
+            review_policy = review_authorization_from_readiness(current_job.get("readiness") or {})
+            review_not_requested = review_policy is not None and not review_policy.requires_review(chapter_id)
+            if review_not_requested:
+                deps = replace(deps, review_outline_adherence=None)
             if state_binding is not None:
                 generate_state = deps.generate_state
 
@@ -2301,6 +2323,14 @@ class GenerationJobService:
             async def attach_state_receipt(
                 outcome: ChapterOutcome,
             ) -> ChapterOutcome:
+                if review_not_requested:
+                    if "outline_adherence" not in outcome.steps_skipped:
+                        outcome.steps_skipped.append("outline_adherence")
+                    outcome.outline_adherence = {
+                        "decision": "not_reviewed",
+                        "review_authorization_digest": review_policy.digest,
+                        "source_content_digest": chapter_content_digest(chapter.get("content")),
+                    }
                 if state_binding is None:
                     return outcome
                 revision = await _recover_job_mutation_revision(state_binding)
@@ -3117,6 +3147,7 @@ class GenerationJobService:
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
+        chapter_review_selection: ChapterReviewSelection | None = None,
         reference_card_auto_creation_policy: (
             ReferenceCardAutoCreationPolicy | None
         ) = None,
@@ -3139,6 +3170,7 @@ class GenerationJobService:
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
             generation_params=protected_generation_params,
+            chapter_review_selection=chapter_review_selection,
             reference_card_auto_creation_policy=(
                 reference_card_auto_creation_policy
             ),
@@ -3152,6 +3184,7 @@ class GenerationJobService:
         prose_continuation_policy: ProseContinuationPolicy | None = None,
         token_budget: int | None = None,
         generation_params: Mapping[str, Any] | None = None,
+        chapter_review_selection: ChapterReviewSelection | None = None,
         reference_card_auto_creation_policy: (
             ReferenceCardAutoCreationPolicy | None
         ) = None,
@@ -3175,6 +3208,7 @@ class GenerationJobService:
             prose_continuation_policy=prose_continuation_policy,
             token_budget=token_budget,
             generation_params=protected_generation_params,
+            chapter_review_selection=chapter_review_selection,
             reference_card_auto_creation_policy=(
                 reference_card_auto_creation_policy
             ),
@@ -3889,6 +3923,7 @@ class GenerationJobService:
         outline_deviation_policy: str = PAUSE_FOR_REWRITE,
         generation_params: Mapping[str, Any] | None = None,
         prose_continuation_policy: ProseContinuationPolicy | None = None,
+        chapter_review_selection: ChapterReviewSelection | None = None,
         reference_card_auto_creation_policy: (
             ReferenceCardAutoCreationPolicy | None
         ) = None,
@@ -3914,6 +3949,7 @@ class GenerationJobService:
                 outline_deviation_policy=outline_deviation_policy,
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
+                chapter_review_selection=chapter_review_selection,
                 generation_params=generation_params_snapshot,
                 reference_card_auto_creation_policy=(
                     reference_card_auto_creation_policy
@@ -4037,6 +4073,7 @@ class GenerationJobService:
             token_budget=candidate_budget,
             generation_params=generation_params_snapshot,
             authorization_revision=max(1, current_revision + 1),
+            chapter_review_selection=_persisted_chapter_review_selection(job),
             reference_card_auto_creation_policy=(
                 _persisted_reference_card_auto_creation_policy(job)
             ),
@@ -4050,6 +4087,7 @@ class GenerationJobService:
                                outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                                generation_params: Mapping[str, Any] | None = None,
                                 prose_continuation_policy: ProseContinuationPolicy | None = None,
+                                chapter_review_selection: ChapterReviewSelection | None = None,
                                 reference_card_auto_creation_policy: (
                                     ReferenceCardAutoCreationPolicy | None
                                 ) = None,
@@ -4088,6 +4126,7 @@ class GenerationJobService:
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
                 generation_params=generation_params_snapshot,
+                chapter_review_selection=chapter_review_selection,
                 reference_card_auto_creation_policy=(
                     reference_card_auto_creation_policy
                 ),
@@ -4109,7 +4148,7 @@ class GenerationJobService:
                     or 0
                 ),
                 estimate_worklist_attempt_capacity(
-                    chapters,
+                    _review_planning_chapters(authorization, chapters),
                     generation_params_snapshot,
                 ),
             )
@@ -4137,6 +4176,7 @@ class GenerationJobService:
                              outline_deviation_policy: str = PAUSE_FOR_REWRITE,
                              generation_params: Mapping[str, Any] | None = None,
                              prose_continuation_policy: ProseContinuationPolicy | None = None,
+                             chapter_review_selection: ChapterReviewSelection | None = None,
                              reference_card_auto_creation_policy: (
                                  ReferenceCardAutoCreationPolicy | None
                              ) = None,
@@ -4174,6 +4214,7 @@ class GenerationJobService:
                 prose_continuation_policy=continuation_policy,
                 token_budget=token_budget,
                 generation_params=generation_params_snapshot,
+                chapter_review_selection=chapter_review_selection,
                 reference_card_auto_creation_policy=(
                     reference_card_auto_creation_policy
                 ),
@@ -4195,7 +4236,7 @@ class GenerationJobService:
                     or 0
                 ),
                 estimate_worklist_attempt_capacity(
-                    chapters,
+                    _review_planning_chapters(authorization, chapters),
                     generation_params_snapshot,
                 ),
             )
@@ -4591,6 +4632,7 @@ class GenerationJobService:
                     token_budget=candidate_budget,
                     generation_params=generation_params_snapshot,
                     authorization_revision=max(1, current_revision + 1),
+                    chapter_review_selection=_persisted_chapter_review_selection(job),
                     reference_card_auto_creation_policy=(
                         _persisted_reference_card_auto_creation_policy(job)
                     ),

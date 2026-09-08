@@ -5,6 +5,10 @@ Module 的 Interface 只有 ``inspect`` 与 ``authorize``。资源查询、活�
 """
 from __future__ import annotations
 
+from backend.services.generation.chapter_review_policy import (
+    ChapterReviewSelection, build_chapter_review_authorization,
+)
+
 import hashlib
 import json
 from copy import deepcopy
@@ -434,6 +438,7 @@ class GenerationReadinessModule:
         generation_params: Mapping[str, Any] | None = None,
         authorization_revision: int = 1,
         outline_deviation_policy: str = "pause_for_rewrite",
+        chapter_review_selection: ChapterReviewSelection | Mapping[str, Any] | None = None,
         reference_card_auto_creation_policy: (
             ReferenceCardAutoCreationPolicy | Mapping[str, Any] | None
         ) = None,
@@ -457,6 +462,15 @@ class GenerationReadinessModule:
             )
         )
         work = _work_summary(chapters)
+        review_authorization = (
+            build_chapter_review_authorization(work["chapters"], chapter_review_selection)
+            if chapter_review_selection is not None else None
+        )
+        if review_authorization is not None:
+            chapters = [
+                {**chapter, "_independent_review_required": review_authorization.requires_review(str(chapter["_id"]))}
+                for chapter in chapters
+            ]
         structure_snapshot = (
             dict(book_structure_initialization)
             if scope == "book"
@@ -1264,6 +1278,8 @@ class GenerationReadinessModule:
                 auto_creation_policy.model_dump(mode="json")
             ),
         }
+        if review_authorization is not None:
+            planning["chapter_review_authorization"] = review_authorization.model_dump(mode="json")
         if auto_creation_policy.enabled and has_chapter_work and not invalid_scale:
             raw_reference_repair = planning.get(
                 "reference_card_repair_plan_authorization"
@@ -1704,6 +1720,12 @@ def _base_structured_generation_budget(
         not in REUSABLE_STATE_COMPLETION_STATUSES
         for chapter in chapters
     )
+    review_count = sum(
+        chapter.get("_independent_review_required") is not False
+        and str((chapter.get("state_completion") or {}).get("status") or "missing")
+        not in REUSABLE_STATE_COMPLETION_STATUSES
+        for chapter in chapters
+    )
     raw_output_bound = values.get("max_tokens")
     calls: list[tuple[Any, int]] = []
     if outline_count:
@@ -1716,23 +1738,14 @@ def _base_structured_generation_budget(
             ),
             outline_count,
         ))
+    if review_count:
+        calls.append((
+            runtime.plan_structured(WorkflowStepTarget(PROSE_REMEDIATION_WORKFLOW, OUTLINE_ADHERENCE_STEP)),
+            review_count * 2,
+        ))
     if state_count:
-        calls.extend((
-            (
-                runtime.plan_structured(
-                    WorkflowStepTarget(
-                        PROSE_REMEDIATION_WORKFLOW,
-                        OUTLINE_ADHERENCE_STEP,
-                    )
-                ),
-                state_count * 2,
-            ),
-            (
-                runtime.plan_structured(
-                    WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
-                ),
-                state_count,
-            ),
+        calls.append((
+            runtime.plan_structured(WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)), state_count,
         ))
     provider_bounds: tuple[ProviderBudgetBound, ...] = ()
     maximum_attempts = 0

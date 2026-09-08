@@ -24,6 +24,7 @@ from pydantic import (
 from backend.services.generation.chapter_repair_policy import (
     RepairFailureEvidenceV1,
 )
+from backend.services.generation.chapter_review_policy import ChapterReviewCoverage
 
 
 CHAPTER_COMPLETION_DECISION_SCHEMA = "chapter_completion_decision.v2"
@@ -39,13 +40,16 @@ CHAPTER_COMPLETION_VERIFICATION_SCHEMA = (
 )
 LEGACY_CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v2"
 CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v3"
+SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION = "chapter_completion_policy.v4"
 SUPPORTED_CHAPTER_COMPLETION_POLICY_REVISIONS = frozenset({
     LEGACY_CHAPTER_COMPLETION_POLICY_REVISION,
     CHAPTER_COMPLETION_POLICY_REVISION,
+    SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION,
 })
 ChapterCompletionPolicyRevision = Literal[
     "chapter_completion_policy.v2",
     "chapter_completion_policy.v3",
+    "chapter_completion_policy.v4",
 ]
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
@@ -331,6 +335,9 @@ class ChapterCompletionCandidateSnapshot(_ClosedCompletionModel):
 
 
 class ChapterCompletionEvidenceBundle(_ClosedCompletionModel):
+    review_coverage: ChapterReviewCoverage | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     provider_attempt_ledger_digest: Digest
     prose_integrity_digest: Digest
     scene_contract_digest: Digest
@@ -343,7 +350,7 @@ class ChapterCompletionEvidenceBundle(_ClosedCompletionModel):
     quality_debt_status: QualityDebtStatus
     quality_debt_sidecar_digest: Digest
     prose_integrity_passed: bool
-    scene_contract_passed: bool
+    scene_contract_passed: bool | None
     state_fact_accounting_passed: bool
     repair_convergence: Literal["pass", "not_required", "failed"]
     blocking_issue_signatures: tuple[str, ...] = Field(max_length=200)
@@ -479,6 +486,9 @@ class ChapterCompletionDecision(_ClosedCompletionModel):
 
 
 class ChapterCompletionEvidenceBinding(_ClosedCompletionModel):
+    review_coverage: ChapterReviewCoverage | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     provider_attempt_ledger_digest: Digest
     prose_integrity_digest: Digest
     scene_contract_digest: Digest
@@ -494,7 +504,7 @@ class ChapterCompletionEvidenceBinding(_ClosedCompletionModel):
 
 class ChapterCompletionGateResults(_ClosedCompletionModel):
     prose_integrity: Literal["pass"]
-    scene_contract: Literal["pass"]
+    scene_contract: Literal["pass", "not_reviewed"]
     state_fact_accounting: Literal["pass"]
     repair_convergence: Literal["pass", "not_required"]
     policy_result: Literal["pass"]
@@ -532,6 +542,18 @@ class ChapterCompletionCertificate(_ClosedCompletionModel):
 
     @model_validator(mode="after")
     def validate_certificate(self) -> "ChapterCompletionCertificate":
+        coverage = self.evidence_binding.review_coverage
+        selective = self.policy_revision == SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION
+        if selective != (coverage is not None):
+            raise ValueError("completion certificate review policy is inconsistent")
+        expected_gate = (
+            "not_reviewed" if coverage is not None and coverage.status == "not_reviewed"
+            else "pass"
+        )
+        if self.gate_results.scene_contract != expected_gate:
+            raise ValueError("completion certificate misrepresents review coverage")
+        if coverage is not None and coverage.prose_repaired and self.evidence_binding.repair_trace_digest is None:
+            raise ValueError("completion certificate repaired review lacks its repair trace")
         payload = self.model_dump(mode="json", exclude={"certificate_digest"})
         if canonical_completion_digest(payload) != self.certificate_digest:
             raise ValueError("completion certificate digest mismatch")
@@ -729,9 +751,18 @@ class ChapterCompletionPolicy:
         evidence = self._parse_evidence(evidence_bundle)
         failures = set(evidence.failure_classes)
         if isinstance(evidence, ChapterCompletionEvidenceBundle):
+            coverage = evidence.review_coverage
+            selective = policy_revision == SELECTIVE_CHAPTER_COMPLETION_POLICY_REVISION
+            if selective != (coverage is not None):
+                raise ChapterCompletionPolicyError("completion review policy evidence is missing or unexpected")
+            not_reviewed = coverage is not None and coverage.status == "not_reviewed"
+            if not_reviewed and evidence.scene_contract_passed is not None:
+                raise ChapterCompletionPolicyError("unreviewed prose cannot carry a semantic gate result")
+            if coverage is not None and coverage.prose_repaired and evidence.repair_trace_digest is None:
+                raise ChapterCompletionPolicyError("repaired review requires its repair trace")
             if not evidence.prose_integrity_passed:
                 failures.add("incomplete_prose")
-            if not evidence.scene_contract_passed:
+            if not not_reviewed and evidence.scene_contract_passed is not True:
                 failures.add("scene_contract_violation")
             if not evidence.state_fact_accounting_passed:
                 failures.add("unaccounted_canonical_fact")
@@ -806,6 +837,7 @@ class ChapterCompletionPolicy:
             )
         candidate, evidence, _stored = context
         evidence_binding = ChapterCompletionEvidenceBinding(
+            review_coverage=evidence.review_coverage,
             provider_attempt_ledger_digest=(
                 evidence.provider_attempt_ledger_digest
             ),
@@ -826,7 +858,10 @@ class ChapterCompletionPolicy:
         )
         gate_results = ChapterCompletionGateResults(
             prose_integrity="pass",
-            scene_contract="pass",
+            scene_contract=(
+                "not_reviewed" if evidence.review_coverage is not None
+                and evidence.review_coverage.status == "not_reviewed" else "pass"
+            ),
             state_fact_accounting="pass",
             repair_convergence=evidence.repair_convergence,
             policy_result="pass",

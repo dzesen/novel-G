@@ -54,6 +54,11 @@ from backend.services.generation.chapter_finalization import (
     chapter_finalization_service,
     parse_chapter_finalization_authorization,
 )
+from backend.services.generation.chapter_review_policy import (
+    ChapterReviewAuthorization, ChapterReviewSelection,
+    build_chapter_review_authorization, build_not_reviewed_receipt,
+    validate_not_reviewed_receipt,
+)
 from backend.services.generation.chapter_generation_application import (
     AcceptanceAuthority,
     AcceptanceTiming,
@@ -109,6 +114,9 @@ from backend.scene_contract_versions import (
 
 INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
     "interactive_chapter_completion_readiness.v2"
+)
+SELECTIVE_INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
+    "interactive_chapter_completion_readiness.v3"
 )
 LEGACY_INTERACTIVE_COMPLETION_READINESS_SCHEMA = (
     "interactive_chapter_completion_readiness.v1"
@@ -378,12 +386,15 @@ class InteractiveCompletionProgress(_ClosedModel):
 
 
 class InteractiveCompletionPlans(_ClosedModel):
-    adherence: CandidateJobGenerationPlan
+    adherence: CandidateJobGenerationPlan | None
     state: CandidateJobGenerationPlan
 
 
 class InteractiveCompletionPlanning(_ClosedModel):
     chapter_finalization_authorization: Mapping[str, Any]
+    chapter_review_authorization: ChapterReviewAuthorization | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def validate_finalization_authority(self) -> "InteractiveCompletionPlanning":
@@ -399,7 +410,8 @@ class InteractiveCompletionPlanning(_ClosedModel):
 
 class InteractiveChapterCompletionReadiness(_ClosedModel):
     schema_version: Literal[
-        "interactive_chapter_completion_readiness.v2"
+        "interactive_chapter_completion_readiness.v2",
+        "interactive_chapter_completion_readiness.v3",
     ]
     digest: Digest
     authorization_id: ObjectIdText
@@ -415,7 +427,7 @@ class InteractiveChapterCompletionReadiness(_ClosedModel):
         default=(),
         max_length=8,
     )
-    logical_call_count: Literal[2]
+    logical_call_count: Literal[1, 2]
     recovery_replay_limit: Literal[1]
     maximum_paid_attempts: int = Field(ge=2, le=1_000)
     conservative_token_bound: int = Field(ge=1, le=1_000_000_000)
@@ -433,6 +445,16 @@ class InteractiveChapterCompletionReadiness(_ClosedModel):
 
     @model_validator(mode="after")
     def validate_identity_and_bounds(self) -> "InteractiveChapterCompletionReadiness":
+        review = self.planning.chapter_review_authorization
+        if (self.schema_version == SELECTIVE_INTERACTIVE_COMPLETION_READINESS_SCHEMA) != (review is not None):
+            raise ValueError("interactive completion review policy is inconsistent")
+        review_required = review.requires_review(self.source_binding.chapter_id) if review else True
+        if review is not None and review.chapter_ids != (self.source_binding.chapter_id,):
+            raise ValueError("interactive review authorization has a different chapter scope")
+        if (self.generation_plans.adherence is not None) != review_required:
+            raise ValueError("interactive Judge plan differs from the review authorization")
+        if self.logical_call_count != (2 if review_required else 1):
+            raise ValueError("interactive completion logical call count changed")
         attempts = sum(item.maximum_paid_attempts for item in self.provider_bounds)
         tokens = sum(item.conservative_token_bound for item in self.provider_bounds)
         if attempts != self.maximum_paid_attempts:
@@ -526,6 +548,7 @@ class InteractiveChapterCompletionInspection(_ClosedModel):
         "interactive_chapter_completion_inspection.v1"
     ] = INTERACTIVE_COMPLETION_INSPECTION_SCHEMA
     readiness: InteractiveChapterCompletionReadiness
+    review_selection_locked: bool = Field(default=False, exclude_if=lambda value: not value)
     notices: tuple[
         Literal["legacy_readiness_reauthorization_required"],
         ...,
@@ -592,17 +615,18 @@ def _build_readiness(
     *,
     source_binding: InteractiveCompletionSourceBinding,
     authorization_revision: int,
-    adherence_plan: GenerationPlan,
+    adherence_plan: GenerationPlan | None,
     state_plan: GenerationPlan,
     externalized_prose_utf8_bytes: int,
     resolve_pricing: Callable[[str], InteractiveCompletionPricing],
+    review_authorization: ChapterReviewAuthorization | None = None,
 ) -> InteractiveChapterCompletionReadiness:
     replay_multiplier = INTERACTIVE_COMPLETION_RECOVERY_REPLAY_LIMIT + 1
-    adherence_budget = structured_call_budget(adherence_plan)
+    adherence_budget = structured_call_budget(adherence_plan) if adherence_plan is not None else None
     state_budget = structured_call_budget(state_plan)
     provider_bounds = merge_provider_bounds(
         scale_provider_bounds(
-            adherence_budget.provider_bounds,
+            adherence_budget.provider_bounds if adherence_budget is not None else (),
             replay_multiplier,
         ),
         scale_provider_bounds(
@@ -615,7 +639,10 @@ def _build_readiness(
         resolve_pricing=resolve_pricing,
     )
     payload: dict[str, Any] = {
-        "schema_version": INTERACTIVE_COMPLETION_READINESS_SCHEMA,
+        "schema_version": (
+            SELECTIVE_INTERACTIVE_COMPLETION_READINESS_SCHEMA if review_authorization is not None
+            else INTERACTIVE_COMPLETION_READINESS_SCHEMA
+        ),
         "authorization_revision": authorization_revision,
         "source_binding": source_binding.model_dump(mode="json"),
         "planning": {
@@ -630,7 +657,7 @@ def _build_readiness(
             "adherence": candidate_job_generation_plan_snapshot(
                 adherence_plan,
                 call_kind="structured",
-            ).model_dump(mode="json"),
+            ).model_dump(mode="json") if adherence_plan is not None else None,
             "state": candidate_job_generation_plan_snapshot(
                 state_plan,
                 call_kind="structured",
@@ -647,7 +674,7 @@ def _build_readiness(
             for item in projected_bounds
             if item.pricing_status == "unavailable"
         ],
-        "logical_call_count": 2,
+        "logical_call_count": 2 if adherence_plan is not None else 1,
         "recovery_replay_limit": INTERACTIVE_COMPLETION_RECOVERY_REPLAY_LIMIT,
         "maximum_paid_attempts": sum(
             item.maximum_paid_attempts for item in projected_bounds
@@ -657,6 +684,8 @@ def _build_readiness(
         ),
         "externalized_prose_utf8_bytes": externalized_prose_utf8_bytes,
     }
+    if review_authorization is not None:
+        payload["planning"]["chapter_review_authorization"] = review_authorization.model_dump(mode="json")
     authorization_id = canonical_completion_digest(payload)[:24]
     with_identity = {**payload, "authorization_id": authorization_id}
     return InteractiveChapterCompletionReadiness.model_validate({
@@ -677,6 +706,7 @@ class InteractiveChapterCompletionDeps:
     recover_state_candidate: Callable[..., Awaitable[Any]]
     validate_adherence: Callable[..., Any]
     resolve_pricing: Callable[[str], InteractiveCompletionPricing]
+    plan_state_only: Callable[[], GenerationPlan] | None = None
 
     @classmethod
     def production(cls) -> "InteractiveChapterCompletionDeps":
@@ -781,6 +811,9 @@ class InteractiveChapterCompletionDeps:
             job_repo=generation_job_repo,
             finalizer=chapter_finalization_service,
             plan_completion=plan_completion,
+            plan_state_only=lambda: create_generation_runtime().plan_structured(
+                WorkflowStepTarget(STATE_WORKFLOW, STATE_STEP)
+            ),
             review_candidate=review_candidate,
             generate_state_candidate=generate_state_candidate,
             recover_state_candidate=(
@@ -1056,6 +1089,7 @@ def _execution_window_seconds(
     provider_seconds = sum(
         int(plan.timeout_seconds or 60) * int(plan.max_semantic_attempts)
         for plan in plans
+        if plan is not None
     )
     seconds = (
         provider_seconds
@@ -1295,6 +1329,7 @@ class InteractiveChapterCompletionService:
         chapter_id: str,
         run_id: str,
         run_revision: int,
+        review_requested: bool | None = None,
     ) -> InteractiveChapterCompletionReadiness:
         inspection = await self.inspect_with_notices(
             owner_id=owner_id,
@@ -1302,6 +1337,7 @@ class InteractiveChapterCompletionService:
             chapter_id=chapter_id,
             run_id=run_id,
             run_revision=run_revision,
+            review_requested=review_requested,
         )
         return inspection.readiness
 
@@ -1366,6 +1402,7 @@ class InteractiveChapterCompletionService:
         chapter_id: str,
         run_id: str,
         run_revision: int,
+        review_requested: bool | None = None,
     ) -> InteractiveChapterCompletionInspection:
         candidate, _chapter, source = await self._snapshot(
             owner_id=owner_id,
@@ -1374,14 +1411,6 @@ class InteractiveChapterCompletionService:
             run_id=run_id,
             run_revision=run_revision,
         )
-        adherence_plan, state_plan = self._deps.plan_completion()
-        if not isinstance(adherence_plan, GenerationPlan) or not isinstance(
-            state_plan, GenerationPlan
-        ):
-            raise InteractiveCompletionBlocked(
-                "interactive completion Provider plan is invalid",
-                code="interactive_plan_invalid",
-            )
         jobs = await self._deps.job_repo.find_many(
             {
                 "owner_id": to_object_id(source.owner_id),
@@ -1436,6 +1465,34 @@ class InteractiveChapterCompletionService:
             )
         else:
             authorization_revision = 1
+        review_authorization = None
+        # Active work always replays its frozen choice, including historical
+        # full-review grants. A new UI default cannot edit an existing grant.
+        if isinstance(latest, Mapping) and not legacy_active and not legacy_superseded and latest.get("status") in {
+            INTERACTIVE_COMPLETION_RUNNING, INTERACTIVE_COMPLETION_UNCERTAIN,
+            INTERACTIVE_COMPLETION_RESOLVING,
+        }:
+            frozen = InteractiveChapterCompletionReadiness.model_validate(latest.get("readiness"))
+            review_authorization = frozen.planning.chapter_review_authorization
+        elif review_requested is not None:
+            review_authorization = build_chapter_review_authorization(
+                [{"chapter_id": source.chapter_id, "volume_id": source.volume_id, "order_index": 0}],
+                ChapterReviewSelection(
+                    mode="all_chapters" if review_requested else "selected_chapters",
+                ),
+            )
+        needs_review = review_authorization.requires_review(source.chapter_id) if review_authorization else True
+        if not needs_review and self._deps.plan_state_only is not None:
+            adherence_plan = None
+            state_plan = self._deps.plan_state_only()
+        else:
+            adherence_plan, state_plan = self._deps.plan_completion()
+            if not needs_review:
+                adherence_plan = None
+        if not isinstance(state_plan, GenerationPlan) or (needs_review and not isinstance(adherence_plan, GenerationPlan)):
+            raise InteractiveCompletionBlocked(
+                "interactive completion Provider plan is invalid", code="interactive_plan_invalid",
+            )
         try:
             readiness = _build_readiness(
                 source_binding=source,
@@ -1446,6 +1503,7 @@ class InteractiveChapterCompletionService:
                     str(candidate.get("text") or "").encode("utf-8")
                 ),
                 resolve_pricing=self._deps.resolve_pricing,
+                review_authorization=review_authorization,
             )
         except (TypeError, ValueError, ValidationError) as exc:
             raise InteractiveCompletionBlocked(
@@ -1495,6 +1553,15 @@ class InteractiveChapterCompletionService:
         return InteractiveChapterCompletionInspection(
             readiness=readiness,
             notices=notices,
+            review_selection_locked=bool(
+                isinstance(latest, Mapping)
+                and not legacy_active and not legacy_superseded
+                and latest.get("status") in {
+                    INTERACTIVE_COMPLETION_RUNNING,
+                    INTERACTIVE_COMPLETION_UNCERTAIN,
+                    INTERACTIVE_COMPLETION_RESOLVING,
+                }
+            ),
         )
 
     async def _ensure_job(
@@ -1907,14 +1974,14 @@ class InteractiveChapterCompletionService:
                 seconds=_execution_window_seconds(readiness)
             ),
         )
-        adherence_plan = readiness.generation_plans.adherence
+        first_plan = readiness.generation_plans.adherence or readiness.generation_plans.state
         progress = InteractiveCompletionProgress(
-            stage="outline_adherence",
+            stage="outline_adherence" if readiness.generation_plans.adherence else "state_generation",
             stage_status="running",
             started_at=now,
             updated_at=now,
-            provider_alias=adherence_plan.provider_alias,
-            provider_model=adherence_plan.provider_model,
+            provider_alias=first_plan.provider_alias,
+            provider_model=first_plan.provider_model,
             provider_activity_count=0,
             content_chunks=0,
             content_bytes=0,
@@ -2100,120 +2167,148 @@ class InteractiveChapterCompletionService:
                 },
             )
 
-        adherence = evidence.get("outline_adherence")
-        if not isinstance(adherence, Mapping):
-            attempts = await self._deps.job_repo.list_attempt_slots(
-                readiness.authorization_id,
-                chapter_id=chapter_id,
-                step_prefix="",
+        if plans.adherence is None:
+            review_authorization = readiness.planning.chapter_review_authorization
+            if review_authorization is None:
+                raise InteractiveCompletionBlocked(
+                    "missing review selection for state-only completion", code="interactive_authorization_invalid",
+                )
+            receipt_source = {
+                "chapter_id": chapter_id,
+                "source_prose_run_id": run_id,
+                "source_prose_run_revision": run_revision,
+                "source_content_digest": source.content_digest,
+                "outline": dict(chapter["outline"]),
+            }
+            previous_receipt = evidence.get("outline_adherence")
+            receipt = (
+                validate_not_reviewed_receipt(previous_receipt, review_authorization, **receipt_source)
+                if previous_receipt is not None else
+                build_not_reviewed_receipt(review_authorization, **receipt_source)
             )
-            try:
-                adherence = dict(await self._deps.review_candidate(
-                    novel_id=novel_id,
+            adherence = receipt.model_dump(mode="json")
+            if previous_receipt is None:
+                evidence["outline_adherence"] = adherence
+                await self._update_job(
+                    readiness.authorization_id,
+                    {"interactive_completion_evidence": deepcopy(evidence), "updated_at": get_utc_now()},
+                    expected=self._execution_expected(execution.token),
+                )
+        else:
+            adherence = evidence.get("outline_adherence")
+            if not isinstance(adherence, Mapping):
+                attempts = await self._deps.job_repo.list_attempt_slots(
+                    readiness.authorization_id,
                     chapter_id=chapter_id,
-                    candidate=candidate_source,
-                    attempt_scope=JobAttemptScope(
-                        readiness.authorization_id,
-                        chapter_id,
-                        "interactive-adherence",
-                        repo=self._deps.job_repo,
-                        existing_attempt_slots=attempts,
-                        interactive_execution_token=execution.token,
-                    ),
-                    generation_plan=generation_plan_from_candidate_snapshot(
-                        plans.adherence
-                    ),
-                    stream_progress=report_review_progress,
-                ))
-            except IndependentOutlineReviewWorkflowFailed as exc:
-                await self._pause_if_provider_outcome_is_uncertain(
-                    job_id=readiness.authorization_id,
-                    execution_token=execution.token,
-                    cause=exc,
+                    step_prefix="",
                 )
-                failure_code = self._independent_review_failure_code(exc)
-                failed_progress = self._failed_outline_review_progress(
-                    failure_code=failure_code,
-                    execution=execution,
-                    provider_plan=plans.adherence,
-                    stream_phase=stream_phase,
-                    provider_activity_count=provider_activity_count,
-                    content_chunks=content_chunks,
-                    content_bytes=content_bytes,
-                    diagnostics=exc.diagnostics,
+                try:
+                    adherence = dict(await self._deps.review_candidate(
+                        novel_id=novel_id,
+                        chapter_id=chapter_id,
+                        candidate=candidate_source,
+                        attempt_scope=JobAttemptScope(
+                            readiness.authorization_id,
+                            chapter_id,
+                            "interactive-adherence",
+                            repo=self._deps.job_repo,
+                            existing_attempt_slots=attempts,
+                            interactive_execution_token=execution.token,
+                        ),
+                        generation_plan=generation_plan_from_candidate_snapshot(
+                            plans.adherence
+                        ),
+                        stream_progress=report_review_progress,
+                    ))
+                except IndependentOutlineReviewWorkflowFailed as exc:
+                    await self._pause_if_provider_outcome_is_uncertain(
+                        job_id=readiness.authorization_id,
+                        execution_token=execution.token,
+                        cause=exc,
+                    )
+                    failure_code = self._independent_review_failure_code(exc)
+                    failed_progress = self._failed_outline_review_progress(
+                        failure_code=failure_code,
+                        execution=execution,
+                        provider_plan=plans.adherence,
+                        stream_phase=stream_phase,
+                        provider_activity_count=provider_activity_count,
+                        content_chunks=content_chunks,
+                        content_bytes=content_bytes,
+                        diagnostics=exc.diagnostics,
+                    )
+                    await self._record_failure_and_pause(
+                        readiness=readiness,
+                        execution=execution,
+                        source=source,
+                        adherence=None,
+                        failure_fact=self._independent_review_failure_fact(
+                            failure_code
+                        ),
+                        pause_reason="outline_adherence_manual_review",
+                        progress=failed_progress,
+                    )
+                    raise InteractiveCompletionBlocked(
+                        str(exc),
+                        code=failure_code,
+                        diagnostics=exc.diagnostics,
+                    ) from exc
+                except (Exception, asyncio.CancelledError) as exc:
+                    await self._pause_if_provider_outcome_is_uncertain(
+                        job_id=readiness.authorization_id,
+                        execution_token=execution.token,
+                        cause=exc,
+                    )
+                    raise
+                evidence["outline_adherence"] = deepcopy(dict(adherence))
+                await self._update_job(
+                    readiness.authorization_id,
+                    {
+                        "interactive_completion_evidence": deepcopy(evidence),
+                        "updated_at": get_utc_now(),
+                    },
+                    expected=self._execution_expected(execution.token),
                 )
+            try:
+                self._deps.validate_adherence(
+                    adherence=adherence,
+                    outline=dict(chapter["outline"]),
+                    prose=str(candidate["text"]),
+                )
+            except ValueError as exc:
+                try:
+                    validated_failure_adherence = (
+                        revalidate_current_outline_adherence_evidence(
+                            adherence,
+                            outline=dict(chapter["outline"]),
+                            prose=str(candidate["text"]),
+                            source_prose_run_id=run_id,
+                            source_prose_run_revision=run_revision,
+                            source_content_digest=source.content_digest,
+                        )
+                    )
+                except OutlineAdherenceValidationError:
+                    validated_failure_adherence = None
+                    failure_fact = ChapterCompletionFailureFact(
+                        reason="evidence_invalid",
+                        observed_at="outline_adherence",
+                    )
+                else:
+                    failure_fact = failure_fact_from_outline_adherence_decision(
+                        validated_failure_adherence.get("decision")
+                    )
                 await self._record_failure_and_pause(
                     readiness=readiness,
                     execution=execution,
                     source=source,
-                    adherence=None,
-                    failure_fact=self._independent_review_failure_fact(
-                        failure_code
-                    ),
+                    adherence=validated_failure_adherence,
+                    failure_fact=failure_fact,
                     pause_reason="outline_adherence_manual_review",
-                    progress=failed_progress,
                 )
                 raise InteractiveCompletionBlocked(
                     str(exc),
-                    code=failure_code,
-                    diagnostics=exc.diagnostics,
+                    code="interactive_adherence_manual_review",
                 ) from exc
-            except (Exception, asyncio.CancelledError) as exc:
-                await self._pause_if_provider_outcome_is_uncertain(
-                    job_id=readiness.authorization_id,
-                    execution_token=execution.token,
-                    cause=exc,
-                )
-                raise
-            evidence["outline_adherence"] = deepcopy(dict(adherence))
-            await self._update_job(
-                readiness.authorization_id,
-                {
-                    "interactive_completion_evidence": deepcopy(evidence),
-                    "updated_at": get_utc_now(),
-                },
-                expected=self._execution_expected(execution.token),
-            )
-        try:
-            self._deps.validate_adherence(
-                adherence=adherence,
-                outline=dict(chapter["outline"]),
-                prose=str(candidate["text"]),
-            )
-        except ValueError as exc:
-            try:
-                validated_failure_adherence = (
-                    revalidate_current_outline_adherence_evidence(
-                        adherence,
-                        outline=dict(chapter["outline"]),
-                        prose=str(candidate["text"]),
-                        source_prose_run_id=run_id,
-                        source_prose_run_revision=run_revision,
-                        source_content_digest=source.content_digest,
-                    )
-                )
-            except OutlineAdherenceValidationError:
-                validated_failure_adherence = None
-                failure_fact = ChapterCompletionFailureFact(
-                    reason="evidence_invalid",
-                    observed_at="outline_adherence",
-                )
-            else:
-                failure_fact = failure_fact_from_outline_adherence_decision(
-                    validated_failure_adherence.get("decision")
-                )
-            await self._record_failure_and_pause(
-                readiness=readiness,
-                execution=execution,
-                source=source,
-                adherence=validated_failure_adherence,
-                failure_fact=failure_fact,
-                pause_reason="outline_adherence_manual_review",
-            )
-            raise InteractiveCompletionBlocked(
-                str(exc),
-                code="interactive_adherence_manual_review",
-            ) from exc
 
         stream_phase = None
         provider_activity_count = 0
@@ -2661,6 +2756,7 @@ class InteractiveChapterCompletionService:
         *,
         request: InteractiveCompletionRequestBinding,
         confirmed: bool,
+        review_requested: bool | None = None,
     ) -> dict[str, Any]:
         if confirmed is not True:
             raise InteractiveCompletionBlocked(
@@ -2678,6 +2774,7 @@ class InteractiveChapterCompletionService:
             chapter_id=request.chapter_id,
             run_id=request.run_id,
             run_revision=request.run_revision,
+            review_requested=review_requested,
         )
         if (
             request.authorization_id != readiness.authorization_id
@@ -2716,7 +2813,7 @@ class InteractiveChapterCompletionService:
                 raise InteractiveCompletionBlocked(
                     _STATE_FAILURE_CONTRACT[state_failure_code][1], code=state_failure_code,
                 )
-            if self._is_orphaned_settled_outline_review(job):
+            if readiness.generation_plans.adherence is not None and self._is_orphaned_settled_outline_review(job):
                 failure_code: InteractiveCompletionFailureCode = (
                     "review_result_missing_after_settlement"
                 )

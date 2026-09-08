@@ -14,6 +14,7 @@ const ISSUE_TRANSLATION_KEYS = {
   chapter_prose_missing: "chapterProseMissing",
   chapter_prose_partial: "chapterProsePartial",
   chapter_prose_completion_unproven: "chapterProseCompletionUnproven",
+  chapter_review_authorization_unproven: "chapterReviewAuthorizationUnproven",
   chapter_prose_acceptance_stale: "chapterProseAcceptanceStale",
   ai_prose_completion_gate_unproven: "aiProseCompletionGateUnproven",
   ai_prose_scene_gate_unproven: "aiProseSceneGateUnproven",

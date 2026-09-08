@@ -35,6 +35,7 @@ from backend.services.generation.chapter_repair_policy import (
     RepairComponentUsageV1,
     RepairConvergenceEvidenceV1,
 )
+from backend.services.generation.chapter_review_policy import ChapterNotReviewedReceipt
 
 
 MAX_CHAPTER_CANDIDATE_COMPONENT_REPAIRS = 8
@@ -523,6 +524,27 @@ class AdherenceCandidateCheckpointV5(_CandidatePipelineCheckpointV5):
         return self
 
 
+class AdherenceNotReviewedCheckpointV6(_CandidatePipelineCheckpointV1):
+    """A zero-call policy receipt, distinct from a passing semantic review."""
+
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v6"]
+    kind: Literal["outline_adherence"] = "outline_adherence"
+    validated_evidence: ChapterNotReviewedReceipt
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> "AdherenceNotReviewedCheckpointV6":
+        receipt = self.validated_evidence
+        if (
+            self.attempt_ids or self.truncation.truncated_section_count or self.truncation.dropped_item_count
+            or receipt.chapter_id != self.chapter_id
+            or receipt.source_prose_run_id != self.source.source_run_id
+            or receipt.source_prose_run_revision != self.source.source_run_revision
+            or receipt.source_content_digest != self.source.source_content_digest
+        ):
+            raise ValueError("not-reviewed checkpoint differs from its zero-call source receipt")
+        return self
+
+
 class StateCandidateCheckpointV1(_CandidatePipelineCheckpointV1):
     kind: Literal["state_candidate"] = "state_candidate"
     origin: Literal["initial", "repair"]
@@ -565,6 +587,7 @@ AdherenceCandidateCheckpoint = (
     | AdherenceCandidateCheckpointV3
     | AdherenceCandidateCheckpointV4
     | AdherenceCandidateCheckpointV5
+    | AdherenceNotReviewedCheckpointV6
 )
 StateCandidateCheckpoint = StateCandidateCheckpointV1 | StateCandidateCheckpointV3
 
@@ -575,6 +598,7 @@ CandidatePipelineCheckpointV1 = (
     | AdherenceCandidateCheckpointV3
     | AdherenceCandidateCheckpointV4
     | AdherenceCandidateCheckpointV5
+    | AdherenceNotReviewedCheckpointV6
     | StateCandidateCheckpointV1
     | StateCandidateCheckpointV3
 )
@@ -625,6 +649,8 @@ def candidate_checkpoint_adherence_passed(
     *,
     expected_scene_count: int,
 ) -> bool:
+    if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6):
+        return False
     indexes = tuple(item.scene_index for item in checkpoint.scene_coverage)
     policy_passed = (
         checkpoint.decision == "pass"
@@ -644,6 +670,16 @@ def candidate_checkpoint_adherence_passed(
         and indexes == tuple(range(1, expected_scene_count + 1))
         and all(item.status == "covered" for item in checkpoint.scene_coverage)
     )
+
+
+def candidate_checkpoint_review_requirement_satisfied(
+    checkpoint: AdherenceCandidateCheckpoint, *, expected_scene_count: int,
+) -> bool:
+    # Live execution and finalization separately rebind this receipt to the
+    # frozen server authorization; the reducer only validates ledger order.
+    if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6):
+        return type(expected_scene_count) is int and 1 <= expected_scene_count <= MAX_CANDIDATE_OUTLINE_SCENES
+    return candidate_checkpoint_adherence_passed(checkpoint, expected_scene_count=expected_scene_count)
 
 
 def candidate_checkpoint_state_passed(
@@ -784,7 +820,7 @@ def replay_candidate_pipeline_checkpoints(
                 ) or bool(
                     phase == "adherence"
                     and latest_adherence is not None
-                    and candidate_checkpoint_adherence_passed(
+                    and candidate_checkpoint_review_requirement_satisfied(
                         latest_adherence,
                         expected_scene_count=expected_scene_count,
                     )
@@ -847,6 +883,7 @@ def replay_candidate_pipeline_checkpoints(
                 AdherenceCandidateCheckpointV3,
                 AdherenceCandidateCheckpointV4,
                 AdherenceCandidateCheckpointV5,
+                AdherenceNotReviewedCheckpointV6,
             ),
         ):
             if (
@@ -862,7 +899,7 @@ def replay_candidate_pipeline_checkpoints(
             latest_state = None
             phase = "adherence"
             record_step(
-                "outline_adherence"
+                "review_not_requested" if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6) else "outline_adherence"
                 if review_count == 1
                 else f"outline_adherence_recheck_{review_count}",
                 checkpoint,
@@ -882,7 +919,7 @@ def replay_candidate_pipeline_checkpoints(
                 phase != "adherence"
                 or latest_adherence is None
                 or checkpoint.proposal_id in seen_state_proposal_ids
-                or not candidate_checkpoint_adherence_passed(
+                or not candidate_checkpoint_review_requirement_satisfied(
                     latest_adherence,
                     expected_scene_count=expected_scene_count,
                 )
@@ -946,7 +983,7 @@ def replay_candidate_pipeline_checkpoints(
         or latest_state is None
         or not isinstance(latest_state, StateCandidateCheckpointV3)
         or not candidate_checkpoint_completion_passed(current_prose)
-        or not candidate_checkpoint_adherence_passed(
+        or not candidate_checkpoint_review_requirement_satisfied(
             latest_adherence,
             expected_scene_count=expected_scene_count,
         )
@@ -1035,6 +1072,7 @@ def parse_candidate_pipeline_checkpoint(
         "chapter_candidate_pipeline_checkpoint.v3",
         "chapter_candidate_pipeline_checkpoint.v4",
         "chapter_candidate_pipeline_checkpoint.v5",
+        "chapter_candidate_pipeline_checkpoint.v6",
     }:
         raise ValueError("candidate checkpoint schema_version is invalid")
     if (
@@ -1048,7 +1086,7 @@ def parse_candidate_pipeline_checkpoint(
     ):
         raise ValueError("candidate checkpoint v4 kind is invalid")
     if (
-        checkpoint_version == "chapter_candidate_pipeline_checkpoint.v5"
+        checkpoint_version in {"chapter_candidate_pipeline_checkpoint.v5", "chapter_candidate_pipeline_checkpoint.v6"}
         and value.get("kind") != "outline_adherence"
     ):
         raise ValueError("candidate checkpoint v5 kind is invalid")

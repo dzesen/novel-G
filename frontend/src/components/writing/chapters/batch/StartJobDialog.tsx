@@ -10,6 +10,8 @@ import OutlineGenerationParams, {
 } from "../outline/OutlineGenerationParams";
 import ProseContinuationControls from "../prose/ProseContinuationControls";
 import ReferenceCardAutoCreationControls from "./ReferenceCardAutoCreationControls";
+import ChapterReviewControls from "./ChapterReviewControls";
+import { initialChapterReviewSelection } from "./chapterReviewPolicy";
 import {
   initialReferenceCardAutoCreationPolicy,
   type ReferenceCardType,
@@ -103,6 +105,7 @@ export default function StartJobDialog({
   const [checkpointInterval, setCheckpointInterval] = useState(5);
   const [periodicCheckpointsEnabled, setPeriodicCheckpointsEnabled] = useState(true);
   const [tokenBudget, setTokenBudget] = useState("");
+  const [chapterReviewSelection, setChapterReviewSelection] = useState(initialChapterReviewSelection);
   const [continuationPolicy, setContinuationPolicy] =
     useState<ProseContinuationPolicy>(DEFAULT_PROSE_CONTINUATION_POLICY);
   const [referenceCardAutoCreationPolicy, setReferenceCardAutoCreationPolicy] =
@@ -125,6 +128,7 @@ export default function StartJobDialog({
     ? checkpointInterval
     : null;
   const readinessConfigurationKey = JSON.stringify({
+    chapterReviewSelection,
     continuationPolicy,
     referenceCardAutoCreationPolicy,
     tokenBudget: parsedTokenBudget,
@@ -172,6 +176,7 @@ export default function StartJobDialog({
           outline_deviation_policy: outlineDeviationPolicy,
           prose_continuation_policy: continuationPolicy,
           reference_card_auto_creation_policy: referenceCardAutoCreationPolicy,
+          chapter_review_selection: chapterReviewSelection,
           ...generationOverrides,
         },
       );
@@ -189,6 +194,7 @@ export default function StartJobDialog({
       setReadinessLoading(false);
     }
   }, [
+    chapterReviewSelection,
     continuationPolicy,
     generationOverrides,
     parsedTokenBudget,
@@ -296,6 +302,7 @@ export default function StartJobDialog({
         generationParams: generationOverrides,
         proseContinuationPolicy: continuationPolicy,
         referenceCardAutoCreationPolicy,
+        chapterReviewSelection,
       });
       if (structureFlow) {
         const result = await apiPost<BookStructureInitializationResult>(
@@ -706,6 +713,14 @@ export default function StartJobDialog({
               </fieldset>
               )}
 
+              {!structureFlow && (
+                <ChapterReviewControls
+                  value={chapterReviewSelection}
+                  onChange={setChapterReviewSelection}
+                  chapters={readiness?.work.chapters}
+                  disabled={submitting}
+                />
+              )}
               <section className="grid gap-2">
                 <OutlineGenerationParams
                   value={generationParams}
@@ -760,6 +775,24 @@ export default function StartJobDialog({
 
             {readiness && !readinessLoading && (
               <div className="mt-3 grid gap-3">
+                {!structureFlow && (
+                  <>
+                    <ChapterReviewControls
+                      value={chapterReviewSelection}
+                      onChange={setChapterReviewSelection}
+                      chapters={readiness.work.chapters}
+                      disabled={submitting}
+                    />
+                    {readinessIsCurrent && readiness.planning.chapter_review_authorization && (
+                      <p data-testid="chapter-review-summary" className="text-xs leading-5 text-warm-700 dark:text-muted">
+                        {t("chapterReviewSummary", {
+                          count: readiness.planning.chapter_review_authorization.required_chapter_ids.length,
+                          total: readiness.planning.chapter_review_authorization.chapter_ids.length,
+                        })}
+                      </p>
+                    )}
+                  </>
+                )}
                 {structureFlow && readiness.work.structure ? (
                   <div className="grid min-w-0 gap-2 rounded-md border border-accent/30 bg-accent/5 p-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
                     <div className="min-w-0">
@@ -1082,6 +1115,17 @@ export default function StartJobDialog({
                 </p>
               </div>
               <dl className="grid gap-px overflow-hidden rounded-md border border-border bg-border text-sm sm:grid-cols-2">
+                {!structureFlow && readiness.planning.chapter_review_authorization && (
+                  <div className="min-w-0 bg-background p-3 sm:col-span-2">
+                    <dt className="text-xs text-warm-700 dark:text-muted">{t("chapterReviewTitle")}</dt>
+                    <dd className="mt-1 text-xs leading-5 text-foreground">
+                      {t("chapterReviewSummary", {
+                        count: readiness.planning.chapter_review_authorization.required_chapter_ids.length,
+                        total: readiness.planning.chapter_review_authorization.chapter_ids.length,
+                      })}
+                    </dd>
+                  </div>
+                )}
                 <div className="min-w-0 bg-background p-3">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationScope")}</dt>
                   <dd className="mt-1 break-words font-medium text-foreground">{targetLabel}</dd>

@@ -1,5 +1,6 @@
 import type { ChapterSummary } from "@/types/novel";
 import type { ProseRunSnapshot } from "../prose/useProseStream";
+import type { ChapterReviewAuthorization, ReviewChapter } from "./chapterReviewPolicy";
 
 import type {
   ProseContinuationAuthorization,
@@ -75,6 +76,8 @@ export interface BookCompletionAudit {
     unresolved_thread_count: number;
     blocking_issue_count: number;
     advisory_issue_count: number;
+    reviewed_chapter_count?: number | null;
+    unreviewed_chapter_count?: number | null;
   };
   chapters: Array<{
     chapter_id: string;
@@ -87,6 +90,7 @@ export interface BookCompletionAudit {
     content_digest: string;
     actual_word_count: number;
     target_word_count: number | null;
+    independent_review_status?: "passed" | "not_reviewed" | null;
   }>;
   issues: BookCompletionIssue[];
   excluded_optional_subsystems: Array<
@@ -228,11 +232,13 @@ export interface GenerationReadiness {
     chapter_count: number;
     steps: Record<"outline" | "prose" | "state", ReadinessStepCounts>;
     structure?: ReadinessStructureCounts;
+    chapters?: ReviewChapter[];
   };
   resources: Record<"character" | "location" | "item" | "rule" | "lore", number> & {
     narrative_revision: number;
   };
   planning: {
+    chapter_review_authorization?: ChapterReviewAuthorization;
     attempt_capacity: number;
     providers: string[];
     config_revision?: string;

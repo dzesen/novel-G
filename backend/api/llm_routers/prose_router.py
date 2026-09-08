@@ -161,6 +161,7 @@ class InteractiveCompletionReadinessRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
     chapter_id: str = Field(..., min_length=1)
     expected_run_revision: int = Field(ge=1)
+    review_requested: bool = False
 
 
 class InteractiveCompletionAuthorityRequest(
@@ -183,6 +184,7 @@ class CompleteInteractiveProseRunRequest(
     InteractiveCompletionAuthorityRequest
 ):
     completion_readiness_confirmed: bool = False
+    review_requested: bool | None = None
 
 
 class ResolveInteractiveCompletionRequest(
@@ -529,6 +531,7 @@ async def inspect_interactive_completion_readiness(
                 chapter_id=req.chapter_id,
                 run_id=run_id,
                 run_revision=req.expected_run_revision,
+                review_requested=req.review_requested,
             )
         )
         return inspection.model_dump(mode="json")
@@ -559,6 +562,7 @@ async def complete_interactive_prose_run(
                 request=req,
             ),
             confirmed=req.completion_readiness_confirmed,
+            review_requested=req.review_requested,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
