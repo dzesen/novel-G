@@ -253,9 +253,12 @@ export default function ProsePanel({
   }, [continuationConfigurationKey]);
 
   useEffect(() => {
-    setCompletionReadiness(null);
     setReviewRequested(false);
     setReviewEnforcement("advisory");
+  }, [novelId, chapterId]);
+
+  useEffect(() => {
+    setCompletionReadiness(null);
     setReviewSelectionLocked(false);
     setCompletionPreviewSeen(false);
     setCompletionInspectionNotices([]);
@@ -895,6 +898,62 @@ export default function ProsePanel({
           )}
           <JudgeReviewRecords key={chapterId} chapterId={chapterId} refreshKey={completionProgress?.stage_status === "failed" || completionProgress?.stage === "completed" ? `${completionProgress.authorization_id}:${completionProgress.stage_status}` : ""} />
           <div className="mb-4 grid gap-3">
+            <fieldset
+              data-testid="interactive-review-choice"
+              disabled={running || runActionsBlocked || reviewSelectionLocked || completionUncertain}
+              aria-describedby="interactive-review-choice-hint"
+              className="grid min-w-0 gap-2 border-b border-border pb-3"
+            >
+              <legend className="text-sm font-semibold text-foreground">
+                {t("completionReviewTitle")}
+              </legend>
+              <div className="flex flex-wrap gap-x-5">
+                {[false, true].map((requested) => (
+                  <label key={String(requested)} className="flex min-h-11 cursor-pointer items-center gap-2">
+                    <input
+                      type="radio"
+                      name="interactive-review-requested"
+                      value={String(requested)}
+                      checked={reviewRequested === requested}
+                      onChange={() => {
+                        setReviewRequested(requested);
+                        setCompletionReadiness(null);
+                        setCompletionReadinessConfirmed(false);
+                        setCompletionInspectionNotices([]);
+                        setActionError("");
+                      }}
+                      className="size-4 shrink-0 accent-accent"
+                    />
+                    <span className="min-w-0 text-sm font-medium text-foreground">
+                      {t(requested ? "completionReviewOption" : "completionReviewSkipOption")}
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <p id="interactive-review-choice-hint" className="text-xs leading-5 text-muted">
+                {t(reviewSelectionLocked ? "completionReviewLocked"
+                  : reviewRequested ? "completionReviewOptionHint" : "completionReviewSkipHint")}
+              </p>
+              {partialAcceptance && (
+                <p className="text-xs leading-5 text-muted">
+                  {t("completionReviewPendingHint")}
+                </p>
+              )}
+              {reviewRequested && (
+                <ReviewEnforcementControl
+                  id="interactive-review-enforcement"
+                  value={reviewEnforcement}
+                  disabled={running || runActionsBlocked || reviewSelectionLocked || completionUncertain}
+                  onChange={(enforcement) => {
+                    setReviewEnforcement(enforcement);
+                    setCompletionReadiness(null);
+                    setCompletionReadinessConfirmed(false);
+                    setCompletionInspectionNotices([]);
+                    setActionError("");
+                  }}
+                />
+              )}
+            </fieldset>
             <ProseContinuationControls
               idPrefix="single-prose"
               value={continuationPolicy}
@@ -1038,44 +1097,6 @@ export default function ProsePanel({
           </div>
 
           <ContextNotices report={stream.contextReport} />
-          {hasText && !partialAcceptance && (
-            <section data-testid="interactive-review-choice" className="grid min-w-0 gap-1 border-t border-border pt-3">
-              <label className="flex min-h-11 cursor-pointer items-start gap-2 py-2">
-                <input
-                  type="checkbox"
-                  checked={reviewRequested}
-                  disabled={runActionsBlocked || reviewSelectionLocked || completionUncertain}
-                  onChange={(event) => {
-                    setReviewRequested(event.target.checked);
-                    setCompletionReadiness(null);
-                    setCompletionReadinessConfirmed(false);
-                    setCompletionInspectionNotices([]);
-                    setActionError("");
-                  }}
-                  aria-describedby="interactive-review-choice-hint"
-                  className="mt-0.5 size-4 shrink-0 accent-accent"
-                />
-                <span className="min-w-0 text-sm font-medium text-foreground">{t("completionReviewOption")}</span>
-              </label>
-              <p id="interactive-review-choice-hint" className="text-xs leading-5 text-muted">
-                {t(reviewSelectionLocked ? "completionReviewLocked" : "completionReviewOptionHint")}
-              </p>
-              {reviewRequested && (
-                <ReviewEnforcementControl
-                  id="interactive-review-enforcement"
-                  value={reviewEnforcement}
-                  disabled={runActionsBlocked || reviewSelectionLocked || completionUncertain}
-                  onChange={(enforcement) => {
-                    setReviewEnforcement(enforcement);
-                    setCompletionReadiness(null);
-                    setCompletionReadinessConfirmed(false);
-                    setCompletionInspectionNotices([]);
-                    setActionError("");
-                  }}
-                />
-              )}
-            </section>
-          )}
           {hasText && !partialAcceptance && (
             <Notice tone="info">
               <section
