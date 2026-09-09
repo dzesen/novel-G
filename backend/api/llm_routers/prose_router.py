@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import Field
+from pydantic import BaseModel, Field, StrictBool
 from backend.services.generation.chapter_review_policy import ReviewEnforcement
 
 from backend.api.llm_routers._common import (
@@ -152,6 +152,15 @@ class AcceptProseRunRequest(ProseRequest):
     expected_run_revision: int = Field(ge=1)
     accept_partial: bool = False
     partial_acknowledgement: bool = False
+
+
+class AuthorConfirmProseRunRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    novel_id: str = Field(min_length=1)
+    chapter_id: str = Field(min_length=1)
+    expected_run_revision: int = Field(ge=1)
+    author_confirmation: StrictBool = False
 
 
 class DiscardProseRunRequest(ProseRequest):
@@ -507,6 +516,29 @@ async def accept_prose_run(
             expected_revision=req.expected_run_revision,
             accept_partial=req.accept_partial,
             partial_acknowledgement=req.partial_acknowledgement,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/prose-runs/{run_id}/accept-without-review")
+async def accept_author_confirmed_prose_run(
+    run_id: str,
+    req: AuthorConfirmProseRunRequest,
+    request: Request,
+):
+    """Save an author's exact completed draft without any model acceptance."""
+    actor = getattr(request.state, "actor", None)
+    if actor is None:
+        raise HTTPException(status_code=401, detail="需要登录")
+    try:
+        return await prose_run_module.accept_without_review(
+            owner_id=str(actor.id), novel_id=req.novel_id,
+            run_id=run_id, chapter_id=req.chapter_id,
+            expected_revision=req.expected_run_revision,
+            author_confirmation=req.author_confirmation,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

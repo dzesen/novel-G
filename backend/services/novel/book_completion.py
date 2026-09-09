@@ -34,6 +34,7 @@ from backend.scene_contract_versions import (
     current_outline_adherence_decision,
 )
 from backend.services.generation.job_planner import order_book_chapters
+from backend.services.generation.author_prose_confirmation import verify_author_prose_confirmation
 from backend.services.generation.chapter_completion_certificate import (
     ChapterCompletionCertificate,
     ChapterCompletionPolicyError,
@@ -339,7 +340,7 @@ def _prose_status(
             )
         )
         return "missing", issues
-    if state not in {"ai_complete", "manual_complete"}:
+    if state not in {"ai_complete", "manual_complete", "author_confirmed"}:
         issues.append(
             BookCompletionIssue(
                 code=(
@@ -366,7 +367,7 @@ def _prose_status(
     # An author-completed chapter and a current evidence-first AI certificate
     # both treat length as a pacing budget. Legacy AI completion keeps the 80%
     # floor because it has no equivalent current scene-evidence guarantee.
-    word_budget_is_advisory = state == "manual_complete"
+    word_budget_is_advisory = state in {"manual_complete", "author_confirmed"}
     if not acceptance_digest_current:
         issues.append(
             BookCompletionIssue(
@@ -377,6 +378,29 @@ def _prose_status(
             )
         )
     audited_state = state
+    if state == "author_confirmed":
+        try:
+            confirmation = verify_author_prose_confirmation(
+                chapter, content_digest=content_digest, owner_id=owner_id,
+            )
+            if (
+                not isinstance(source_run, Mapping)
+                or str(source_run.get("_id") or "") != confirmation.source_run_id
+                or str(source_run.get("chapter_id") or "") != chapter_id
+                or str(source_run.get("owner_id") or "") != owner_id
+                or source_run.get("status") != "accepted"
+                or source_run.get("acceptance_state") != "author_confirmed"
+                or source_run.get("accepted_text_digest") != content_digest
+                or source_run.get("revision") != confirmation.source_run_revision + 1
+            ):
+                raise ValueError("作者确认来源不一致")
+        except ValueError:
+            audited_state = "author_confirmation_unproven"
+            issues.append(BookCompletionIssue(
+                code="chapter_prose_completion_unproven", category="prose",
+                chapter_id=chapter_id, volume_id=volume_id,
+                details={"prose_acceptance_state": state, "reason": "author_confirmation_invalid"},
+            ))
     if state == "ai_complete":
         completion_status = str(acceptance.get("completion_status") or "")
         finish_reason = str(acceptance.get("finish_reason") or "")
@@ -904,7 +928,7 @@ class BookCompletionAudit:
             ObjectId(source_run_id)
             for chapter in chapters
             if isinstance(chapter.get("prose_acceptance"), dict)
-            and chapter["prose_acceptance"].get("state") == "ai_complete"
+            and chapter["prose_acceptance"].get("state") in {"ai_complete", "author_confirmed"}
             and (
                 source_run_id := str(
                     chapter["prose_acceptance"].get("source_run_id") or ""
@@ -922,6 +946,7 @@ class BookCompletionAudit:
                 projection={
                     "_id": 1,
                     "chapter_id": 1,
+                    "owner_id": 1,
                     "status": 1,
                     "acceptance_state": 1,
                     "accepted_text_digest": 1,
@@ -1153,7 +1178,9 @@ class BookCompletionAudit:
                     code="chapter_review_authorization_unproven", category="semantic",
                     chapter_id=chapter_id, volume_id=volume_id, details={"reason": review_error},
                 ))
-            if prose_status != "certificate_verified_v2":
+            if prose_status == "author_confirmed":
+                review_status = "not_reviewed"
+            elif prose_status != "certificate_verified_v2":
                 review_status = None
             chapter_audits.append(
                 BookCompletionChapterAudit(

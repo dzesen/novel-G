@@ -30,6 +30,7 @@ import {
   buildInteractiveCompletionResolutionPayload,
   buildInteractiveCompletionStatusPayload,
   buildProseAcceptPayload,
+  buildAuthorProseAcceptPayload,
   finishReasonTranslationKey,
   proseAdvisoryTranslationKey,
   proseReasonTranslationKey,
@@ -117,7 +118,7 @@ interface ProsePanelProps {
   onRunStateChanged?: () => void;
   onAccepted: (
     text: string,
-    acceptanceState: "ai_complete" | "partial_manual_required",
+    acceptanceState: "ai_complete" | "author_confirmed" | "partial_manual_required",
   ) => void;
 }
 
@@ -461,7 +462,7 @@ export default function ProsePanel({
       setActionError(t("runMissing"));
       return;
     }
-    if (!partialAcceptance && !completionReadiness) {
+    if (!partialAcceptance && reviewRequested && !completionReadiness) {
       setCompletionReadinessLoading(true);
       try {
         const inspection = await apiPost<InteractiveCompletionInspection>(
@@ -491,6 +492,7 @@ export default function ProsePanel({
     }
     if (
       !partialAcceptance
+      && reviewRequested
       && completionReadiness
       && !completionReadinessConfirmed
     ) {
@@ -499,7 +501,7 @@ export default function ProsePanel({
     }
     setAccepting(true);
     try {
-      if (!partialAcceptance && completionReadiness) {
+      if (!partialAcceptance && reviewRequested && completionReadiness) {
         await finishInteractiveCompletion(
           runId,
           runRevision,
@@ -509,14 +511,14 @@ export default function ProsePanel({
       }
       const outcome = await submitProseRunMutation({
         mutate: () => apiPost(
-          `/api/llm/prose-runs/${runId}/accept`,
-          buildProseAcceptPayload({
+          `/api/llm/prose-runs/${runId}/${partialAcceptance ? "accept" : "accept-without-review"}`,
+          partialAcceptance ? buildProseAcceptPayload({
             novelId,
             chapterId,
             runId,
             runRevision,
             partial: true,
-          }),
+          }) : buildAuthorProseAcceptPayload({ novelId, chapterId, runRevision }),
         ),
         refresh: () => restoreActive({ clearWhenMissing: true }),
       });
@@ -533,7 +535,7 @@ export default function ProsePanel({
         }
         return;
       }
-      onAccepted(stream.text, "partial_manual_required");
+      onAccepted(stream.text, partialAcceptance ? "partial_manual_required" : "author_confirmed");
       onRunStateChanged?.();
       onClose();
     } catch (error) {
@@ -825,7 +827,7 @@ export default function ProsePanel({
             >
               {t("title")}
             </h3>
-            <p className="mt-1 text-xs leading-5 text-muted">{t("description")}</p>
+            <p className="mt-1 text-xs leading-5 text-muted">{t(reviewRequested ? "description" : "authorSaveDescription")}</p>
           </div>
           <div className="flex shrink-0 gap-2">
             {running ? (
@@ -1097,7 +1099,7 @@ export default function ProsePanel({
           </div>
 
           <ContextNotices report={stream.contextReport} />
-          {hasText && !partialAcceptance && (
+          {hasText && !partialAcceptance && reviewRequested && (
             <Notice tone="info">
               <section
                 data-testid="interactive-completion-readiness"
@@ -1213,7 +1215,7 @@ export default function ProsePanel({
               </section>
             </Notice>
           )}
-          {completionProgress && (
+          {reviewRequested && completionProgress && (
             <Notice
               tone={completionProgress.stage_status === "failed"
                 ? "warning"
@@ -1289,7 +1291,7 @@ export default function ProsePanel({
           )}
           {stream.error && <Notice tone="error">{stream.error}</Notice>}
           {actionError && <Notice tone="error">{actionError}</Notice>}
-          {completionUncertain && completionReadiness && (
+          {reviewRequested && completionUncertain && completionReadiness && (
             <Notice tone="warning">
               <section className="grid min-w-0 gap-3">
                 <div>
@@ -1466,23 +1468,26 @@ export default function ProsePanel({
               !hasText
               || running
               || runActionsBlocked
-              || completionUncertain
+              || (reviewRequested && completionUncertain)
               || selectedInitialRun?.can_accept_partial === false
               || (
                 !partialAcceptance
+                && reviewRequested
                 && Boolean(completionReadiness)
                 && !completionReadinessConfirmed
               )
             }
           >
             {accepting
-              ? t(partialAcceptance ? "accepting" : "completionFinalizing")
+              ? t(partialAcceptance || !reviewRequested ? "accepting" : "completionFinalizing")
               : completionReadinessLoading
                 ? t("completionInspecting")
               : partialAcceptance && !partialArmed
                 ? t("acceptPartial")
                 : overwriteArmed && !completionReadiness && !completionPreviewSeen
                   ? t("overwriteConfirm")
+                  : !partialAcceptance && !reviewRequested
+                    ? t("authorSave")
                   : !partialAcceptance && !completionReadiness
                     ? t("completionInspect")
                     : !partialAcceptance

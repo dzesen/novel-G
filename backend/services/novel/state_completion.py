@@ -23,6 +23,7 @@ from backend.services.generation.chapter_completion_certificate import (
     ChapterCompletionPolicyError,
     verify_persisted_chapter_completion_certificate,
 )
+from backend.services.generation.author_prose_confirmation import verify_author_prose_confirmation
 
 
 StateCompletionStatus = Literal[
@@ -36,7 +37,7 @@ StateCompletionStatus = Literal[
 ]
 
 PROSE_ACCEPTANCE_ELIGIBLE_STATES = frozenset(
-    {"ai_complete", "manual_complete"}
+    {"ai_complete", "manual_complete", "author_confirmed"}
 )
 
 
@@ -65,6 +66,12 @@ def prose_is_eligible_for_state(
         return allow_unverified_legacy
     state = prose_acceptance_state(chapter)
     current_digest = chapter_content_digest(content)
+    if state == "author_confirmed":
+        try:
+            verify_author_prose_confirmation(chapter, content_digest=current_digest)
+            return True
+        except ValueError:
+            return False
     if state == "manual_complete":
         return bool(
             acceptance.get("content_origin") in {None, "manual"}

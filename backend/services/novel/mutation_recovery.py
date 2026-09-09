@@ -94,6 +94,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
         ("accept_prose_run", 1): ProseRunModule._execute_accept,
         ("accept_prose_run", 2): ProseRunModule._execute_accept,
+        ("accept_prose_run", 3): ProseRunModule._execute_accept,
         ("finalize_chapter_generation", 1): (
             ChapterFinalizationService._execute_finalize
         ),
@@ -170,6 +171,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
     }
     persistent_fence_handlers = {
         ("accept_volume_outline", 3),
+        ("accept_prose_run", 3),
     }
     return {
         key: MutationHandlerSpec(

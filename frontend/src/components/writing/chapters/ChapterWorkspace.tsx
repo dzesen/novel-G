@@ -1141,13 +1141,15 @@ export default function ChapterWorkspace({
             // 为过期本地草稿后删除。
             changeDraft({
               content: text,
-              ...(acceptanceState === "partial_manual_required"
+              ...(acceptanceState === "partial_manual_required" || acceptanceState === "author_confirmed"
                 ? { status: "writing" as const }
                 : {}),
             });
             setStructureNotice(tProse(
               acceptanceState === "partial_manual_required"
                 ? "acceptedPartialNotice"
+                : acceptanceState === "author_confirmed"
+                  ? "acceptedAuthorNotice"
                 : "acceptedCompleteNotice",
             ));
           }}

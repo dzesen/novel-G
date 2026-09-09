@@ -6,7 +6,7 @@ export interface ProseCompletionSummary {
 export function proseRequiresPartialAcknowledgement(
   completion: Pick<ProseCompletionSummary, "status" | "can_write_formal_prose">,
 ): boolean {
-  return !completion.can_write_formal_prose || completion.status === "incomplete";
+  return !completion.can_write_formal_prose || completion.status !== "complete";
 }
 
 export function proseRunHasUncertainAttempt(
@@ -121,6 +121,23 @@ interface AcceptPayloadInput {
   runId: string;
   runRevision: number;
   partial: boolean;
+}
+
+export function buildAuthorProseAcceptPayload({
+  novelId,
+  chapterId,
+  runRevision,
+}: {
+  novelId: string;
+  chapterId: string;
+  runRevision: number;
+}) {
+  return {
+    novel_id: novelId,
+    chapter_id: chapterId,
+    expected_run_revision: runRevision,
+    author_confirmation: true,
+  };
 }
 
 export function buildProseAcceptPayload({

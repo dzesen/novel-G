@@ -282,10 +282,10 @@ class ChapterService:
         if next_content.strip() and (
             (
                 explicitly_completed
-                and acceptance_state not in {"ai_complete", "manual_complete"}
+                and acceptance_state not in {"ai_complete", "manual_complete", "author_confirmed"}
             )
             or (
-                acceptance_state in {"ai_complete", "manual_complete"}
+                acceptance_state in {"ai_complete", "manual_complete", "author_confirmed"}
                 and content_changed
             )
         ):
