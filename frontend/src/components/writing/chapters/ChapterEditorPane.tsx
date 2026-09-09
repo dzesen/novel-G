@@ -7,7 +7,6 @@ import { IconButton } from "@/components/ui/IconButton";
 import { useDismissableLayer } from "@/components/ui/useDismissableLayer";
 import type { ChapterDraft } from "@/types/novel";
 import type { ChapterWorkspaceLayoutControls } from "./ChapterWorkspaceLayout";
-import JudgeReviewRecords from "./prose/JudgeReviewRecords";
 
 export type ChapterSaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
@@ -28,6 +27,7 @@ interface ChapterEditorPaneProps {
   /** flushDraft 因标题为空被拒绝、面板未能打开时的提示文案；非空时渲染在按钮下方。 */
   stateBackfillBlocked: string;
   workspaceControls: ChapterWorkspaceLayoutControls;
+  assistantActions: ReactNode;
 }
 
 function DirectoryIcon() {
@@ -82,7 +82,7 @@ function DirectoryAccess({
       >
         <DirectoryIcon />
       </IconButton>
-      <span className="hidden md:inline-flex">
+      <span className={workspaceControls.focusMode ? "hidden" : "hidden md:inline-flex"}>
         <IconButton
           label={workspaceControls.directoryVisible ? tw("hideDirectory") : tw("showDirectory")}
           size="sm"
@@ -202,6 +202,7 @@ export default function ChapterEditorPane({
   onExportNovel,
   stateBackfillBlocked,
   workspaceControls,
+  assistantActions,
 }: ChapterEditorPaneProps) {
   const t = useTranslations("writing.chapterEditor");
   const tw = useTranslations("writing.chapterEditor.workspace");
@@ -266,133 +267,67 @@ export default function ChapterEditorPane({
   };
 
   return (
-    <section className="flex h-full min-h-0 flex-1 flex-col bg-surface">
-      <header className="border-b border-border px-3 py-3 sm:px-5">
-        <div className="flex min-w-0 items-center gap-2">
-          <input
-            value={draft.title}
-            onChange={(event) => onChange({ title: event.target.value })}
-            className="min-w-0 flex-1 border-0 bg-transparent p-0 text-lg font-semibold text-foreground outline-none placeholder:text-muted focus:ring-0 sm:text-xl"
-            placeholder={t("chapterTitlePlaceholder")}
-            aria-label={t("chapterTitle")}
-          />
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={onSave}
-            disabled={saveState === "saving" || !draft.title.trim()}
-          >
-            {t("saveNow")}
-          </Button>
-          <EditorActionsMenu onExport={onExport} onExportNovel={onExportNovel} />
-        </div>
-
-        {stateBackfillBlocked && (
-          <p role="alert" className="mt-1.5 text-xs text-red-600 dark:text-red-400">
-            {stateBackfillBlocked}
-          </p>
-        )}
-
-        <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-2">
-          <div className="flex items-center gap-0.5 border-r border-border pr-2">
-            <DirectoryAccess workspaceControls={workspaceControls} />
-            <IconButton
-              label={tw("openContext")}
-              size="sm"
-              className="xl:hidden"
-              onClick={workspaceControls.openContext}
-            >
-              <ContextIcon />
-            </IconButton>
+    <section className="studio-editor">
+      <header className="studio-editor-toolbar">
+        <div className="studio-editor-tools">
+          <DirectoryAccess workspaceControls={workspaceControls} />
+          <IconButton label={tw("openContext")} size="sm" className="xl:hidden" onClick={workspaceControls.openContext}><ContextIcon /></IconButton>
+          {!workspaceControls.focusMode && (
             <span className="hidden xl:inline-flex">
-              <IconButton
-                label={workspaceControls.contextVisible ? tw("hideContext") : tw("showContext")}
-                size="sm"
-                selected={workspaceControls.contextVisible}
-                onClick={workspaceControls.toggleContext}
-              >
-                <ContextIcon />
-              </IconButton>
-            </span>
-            <IconButton
-              label={tw("openAssistant")}
-              size="sm"
-              onClick={workspaceControls.openAssistant}
-            >
-              <AssistantIcon />
-            </IconButton>
-          </div>
-          <label className="flex items-center gap-2 text-xs text-muted">
-            <span>{t("status")}</span>
-            <select
-              value={draft.status}
-              onChange={(event) => onChange({ status: event.target.value as ChapterDraft["status"] })}
-              className="rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
-            >
-              <option value="draft">{t("statuses.draft")}</option>
-              <option value="writing">{t("statuses.writing")}</option>
-              <option value="completed">{t("statuses.completed")}</option>
-            </select>
-          </label>
-          <span className="text-xs tabular-nums text-muted">{t("wordCount", { count: wordCount })}</span>
-          <SaveStateLabel state={saveState} />
-          {updatedAt && (
-            <span className="text-[11px] text-muted">
-              {t("lastSaved", { time: new Date(updatedAt).toLocaleString() })}
+              <IconButton label={workspaceControls.contextVisible ? tw("hideContext") : tw("showContext")} size="sm" selected={workspaceControls.contextVisible} onClick={workspaceControls.toggleContext}><ContextIcon /></IconButton>
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => setShowSummary((value) => !value)}
-            className="ml-auto min-h-8 rounded-md px-2 text-xs text-muted hover:bg-surface-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-          >
-            {showSummary ? t("hideSummary") : t("showSummary")}
-          </button>
+          <Button id={workspaceControls.assistantTriggerId} className="studio-assistant-trigger" variant="primary" size="sm" aria-label={tw("openAssistant")} aria-expanded={workspaceControls.assistantVisible} onClick={workspaceControls.openAssistant}>
+            <AssistantIcon /><span>{tw("assistant")}</span>
+          </Button>
         </div>
-
-        {showSummary && (
-          <textarea
-            value={draft.summary}
-            onChange={(event) => onChange({ summary: event.target.value })}
-            rows={2}
-            className="mt-3 w-full resize-y rounded-lg border border-border bg-background px-3 py-2 text-sm leading-6 text-foreground outline-none placeholder:text-muted focus:border-accent focus:ring-2 focus:ring-accent/15"
-            placeholder={t("summaryPlaceholder")}
-            aria-label={t("summary")}
-          />
-        )}
+        <span className="studio-editor-feedback">{tw("manuscript")}</span>
+        <div className="studio-editor-save">
+          <button type="button" className="studio-focus-button" aria-label={workspaceControls.focusMode ? tw("exitFocus") : tw("enterFocus")} aria-pressed={workspaceControls.focusMode} onClick={workspaceControls.toggleFocus}>
+            <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+              {workspaceControls.focusMode ? <path d="M9 3v6H3m18 0h-6V3M3 15h6v6m6 0v-6h6" /> : <path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" />}
+            </svg>
+            <span>{workspaceControls.focusMode ? tw("exitFocus") : tw("enterFocus")}</span>
+          </button>
+          <Button variant="secondary" size="sm" onClick={onSave} disabled={saveState === "saving" || !draft.title.trim()}>{t("saveNow")}</Button>
+          <EditorActionsMenu onExport={onExport} onExportNovel={onExportNovel} />
+        </div>
       </header>
+      {assistantActions}
+      {stateBackfillBlocked && <p role="alert" className="border-b border-border bg-surface px-5 py-2 text-xs text-red-600 dark:text-red-400">{stateBackfillBlocked}</p>}
 
-      <div className="min-h-0 flex-1 overflow-y-auto bg-background/35">
-        <div className="mx-auto flex min-h-full w-full max-w-[72ch] flex-col px-5 py-6 sm:px-8 sm:py-9">
-          <JudgeReviewRecords key={chapterId} chapterId={chapterId} />
-          <textarea
-            value={draft.content}
-            onChange={(event) => onChange({ content: event.target.value })}
-            className="min-h-[65vh] w-full flex-1 resize-none border-0 bg-transparent p-0 font-writing text-[17px] leading-[2.05] text-foreground outline-none placeholder:text-muted focus:ring-0"
-            placeholder={t("contentPlaceholder")}
-            spellCheck
-            aria-label={t("content")}
-          />
+      <div className="manuscript-scroll">
+        <div className="manuscript-sheet">
+          <input value={draft.title} onChange={(event) => onChange({ title: event.target.value })} className="manuscript-title" placeholder={t("chapterTitlePlaceholder")} aria-label={t("chapterTitle")} />
+          <div className="mb-6">
+            <button type="button" aria-expanded={showSummary} onClick={() => setShowSummary((value) => !value)} className="min-h-8 text-xs text-muted hover:text-foreground">
+              {showSummary ? t("hideSummary") : t("showSummary")}
+            </button>
+            {showSummary && <textarea value={draft.summary} onChange={(event) => onChange({ summary: event.target.value })} rows={2} className="mt-2 w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-sm leading-6 text-foreground outline-none placeholder:text-muted focus:border-accent" placeholder={t("summaryPlaceholder")} aria-label={t("summary")} />}
+          </div>
+          <textarea value={draft.content} onChange={(event) => onChange({ content: event.target.value })} className="manuscript-content" placeholder={t("contentPlaceholder")} spellCheck aria-label={t("content")} />
         </div>
       </div>
 
-      <footer className="flex min-h-11 flex-wrap items-center justify-between gap-2 border-t border-border bg-surface px-4 py-2 sm:px-6">
-        <p className="text-[11px] text-muted">{t("autosaveHint")}</p>
+      <footer className="studio-editor-footer">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <label className="flex items-center gap-1">
+            <span className="sr-only">{t("status")}</span>
+            <select value={draft.status} onChange={(event) => onChange({ status: event.target.value as ChapterDraft["status"] })}>
+              <option value="draft">{t("statuses.draft")}</option><option value="writing">{t("statuses.writing")}</option><option value="completed">{t("statuses.completed")}</option>
+            </select>
+          </label>
+          <span className="tabular-nums">{t("wordCount", { count: wordCount })}</span>
+          <span title={updatedAt ? t("lastSaved", { time: new Date(updatedAt).toLocaleString() }) : undefined}><SaveStateLabel state={saveState} /></span>
+        </div>
+        <p>{t("autosaveHint")}</p>
         {deleteArmed ? (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-red-600 dark:text-red-400">{t("deleteConfirm")}</span>
-            <button type="button" onClick={() => setDeleteArmed(false)} className="px-2 py-1 text-xs text-muted hover:text-foreground">
-              {t("cancel")}
-            </button>
-            <button type="button" onClick={() => void confirmDelete()} disabled={deleting} className="rounded-md bg-red-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50">
-              {deleting ? t("deleting") : t("confirmDelete")}
-            </button>
+            <button type="button" onClick={() => setDeleteArmed(false)} className="px-2 py-1 text-xs text-muted hover:text-foreground">{t("cancel")}</button>
+            <button type="button" onClick={() => void confirmDelete()} disabled={deleting} className="rounded-md bg-red-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50">{deleting ? t("deleting") : t("confirmDelete")}</button>
           </div>
-        ) : (
-          <button type="button" onClick={() => setDeleteArmed(true)} className="px-2 py-1 text-xs text-muted hover:text-red-600 dark:hover:text-red-400">
-            {t("moveToTrash")}
-          </button>
-        )}
+        ) : <button type="button" onClick={() => setDeleteArmed(true)} className="px-2 py-1 text-xs text-muted hover:text-red-600 dark:hover:text-red-400">{t("moveToTrash")}</button>}
       </footer>
     </section>
   );

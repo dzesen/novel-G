@@ -1,20 +1,24 @@
 export type ChapterWorkspaceDrawer = "directory" | "context" | "assistant";
+export type ChapterWorkspaceTool = "assistant" | "context";
 
 export interface ChapterWorkspaceLayoutState {
   directoryVisible: boolean;
-  contextVisible: boolean;
+  toolsVisible: boolean;
+  activeTool: ChapterWorkspaceTool;
   drawer: ChapterWorkspaceDrawer | null;
 }
 
 export type ChapterWorkspaceLayoutAction =
   | { type: "toggle-directory" }
-  | { type: "toggle-context" }
+  | { type: "show-tool"; tool: ChapterWorkspaceTool }
+  | { type: "hide-tools" }
   | { type: "open-drawer"; drawer: ChapterWorkspaceDrawer }
   | { type: "close-drawer" };
 
 export const initialChapterWorkspaceLayoutState: ChapterWorkspaceLayoutState = {
   directoryVisible: true,
-  contextVisible: true,
+  toolsVisible: true,
+  activeTool: "assistant",
   drawer: null,
 };
 
@@ -25,8 +29,11 @@ export function reduceChapterWorkspaceLayout(
   if (action.type === "toggle-directory") {
     return { ...state, directoryVisible: !state.directoryVisible };
   }
-  if (action.type === "toggle-context") {
-    return { ...state, contextVisible: !state.contextVisible };
+  if (action.type === "show-tool") {
+    return { ...state, toolsVisible: true, activeTool: action.tool, drawer: null };
+  }
+  if (action.type === "hide-tools") {
+    return { ...state, toolsVisible: false };
   }
   if (action.type === "open-drawer") {
     return { ...state, drawer: action.drawer };

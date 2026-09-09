@@ -26,6 +26,7 @@ from backend.scene_contract_versions import (
     CURRENT_OUTLINE_ADHERENCE_POLICIES,
     OUTLINE_ADHERENCE_ISSUE_POLICY_VERSION,
     SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 from backend.services.novel.state_completion import chapter_content_digest
@@ -310,7 +311,7 @@ def assess_outline_adherence_evidence(
 
     completion_only = result.get("schema_version") == COMPLETION_REVIEW_EVIDENCE_VERSION
 
-    if outline.get("scene_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
+    if outline.get("scene_contract_version") not in MODERN_SCENE_CONTRACT_VERSIONS:
         raise OutlineAdherenceValidationError(
             "legacy_v1 章纲不能生成当前符合度证据",
             code="outline_contract_version_mismatch",
@@ -332,7 +333,7 @@ def assess_outline_adherence_evidence(
             "当前符合度证据版本未知",
             code="provider_evidence_version_unknown",
         )
-    if parsed.outline_contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
+    if parsed.outline_contract_version != outline.get("scene_contract_version"):
         raise OutlineAdherenceValidationError(
             "当前符合度证据没有绑定当前章纲合同版本",
             code="outline_contract_version_mismatch",
@@ -760,7 +761,7 @@ def assess_outline_adherence_evidence(
     assessed = {
         "evidence_schema_version": parsed.schema_version,
         "issue_policy_version": CURRENT_OUTLINE_ADHERENCE_POLICIES[parsed.schema_version],
-        "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
+        "outline_contract_version": outline.get("scene_contract_version"),
         "outline_contract_digest": _outline_contract_digest(outline),
         "summary": parsed.summary,
         "beat_evidence": canonical_beats,
@@ -1210,7 +1211,7 @@ def validate_complete_outline_adherence(
             raise OutlineAdherenceValidationError("章纲符合度仍包含偏离问题")
 
     scenes = outline.get("scenes")
-    is_v2_outline = contract_version == SCENE_TRANSITION_CONTRACT_VERSION
+    is_v2_outline = contract_version in MODERN_SCENE_CONTRACT_VERSIONS
     evidence_metadata: dict[str, Any] = {}
     if is_v2_outline:
         if prose is None:
@@ -1252,7 +1253,7 @@ def validate_complete_outline_adherence(
             raise OutlineAdherenceValidationError("章纲符合度证据版本不匹配")
         if (
             result.get("outline_contract_version")
-            != SCENE_TRANSITION_CONTRACT_VERSION
+            != contract_version
         ):
             raise OutlineAdherenceValidationError(
                 "章纲符合度没有绑定当前章纲合同版本"
@@ -1390,7 +1391,7 @@ def validate_complete_outline_adherence(
                     )
         evidence_metadata = {
             "evidence_schema_version": expected_evidence_version,
-            "outline_contract_version": SCENE_TRANSITION_CONTRACT_VERSION,
+            "outline_contract_version": contract_version,
             "outline_contract_digest": outline_digest,
             "beat_count": len(expected_beats),
             "finding_count": len(findings),

@@ -15,9 +15,13 @@ from backend.llm.schemas.novel_pydantic import (
     MAX_CHAPTER_OUTLINE_TARGET_WORDS,
     chapter_outline_response_utf8_bytes,
 )
-from backend.scene_contract_versions import MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+from backend.scene_contract_versions import (
+    MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+    MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
+    CURRENT_SCENE_CONTRACT_VERSION,
+)
 from backend.services.llm.context_builder import (
-    DEFAULT_CONTEXT_TOKEN_BUDGET,
+    V3_CONTEXT_TOKEN_BUDGET,
     assemble_context,
     fetch_context_inputs,
 )
@@ -466,11 +470,45 @@ def _unknown_mixed_outline_prompt_envelope() -> dict[str, Any]:
         raise AssertionError("mixed V2 outline envelope no longer saturates its cap")
     return outline
 
+def _unknown_v3_outline_prompt_envelope(shape: str = "semantic") -> dict[str, Any]:
+    """Saturate current canonical bytes; keep old V2 envelopes unchanged."""
+    factories = {
+        "semantic": _unknown_outline_prompt_envelope,
+        "dense": _unknown_dense_outline_prompt_envelope,
+        "mixed": _unknown_mixed_outline_prompt_envelope,
+    }
+    outline = factories[shape]()
+    outline["scene_contract_version"] = CURRENT_SCENE_CONTRACT_VERSION
+    outline["scenes"] = outline["scenes"][:6]
+    for scene in outline["scenes"]:
+        scene["contract_version"] = CURRENT_SCENE_CONTRACT_VERSION
+    outline["target_word_count"] = sum(
+        scene["word_budget"]["target"] for scene in outline["scenes"]
+    )
+    remaining = MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES - chapter_outline_response_utf8_bytes(outline)
+    for scene in outline["scenes"]:
+        slots = [(scene, "summary")]
+        slots.extend((item, "description") for key in (
+            "preconditions", "beats", "postconditions", "forbidden_conditions"
+        ) for item in scene[key])
+        slots.extend((item, "expected_transition") for item in scene["beats"])
+        for item, key in slots:
+            characters = min(500 - len(item[key]), remaining // 4)
+            item[key] += "\U0001f600" * characters
+            remaining -= characters * 4
+            ascii_count = min(500 - len(item[key]), remaining)
+            item[key] += "x" * ascii_count
+            remaining -= ascii_count
+    if remaining or chapter_outline_response_utf8_bytes(outline) != MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES:
+        raise AssertionError("V3 outline envelope no longer saturates its cap")
+    return outline
+
+
 def _unknown_outline_context_prompt_envelope() -> str:
     """Reserve the complete prose-context budget at worst-case UTF-8 width."""
     return (
         "\U0001f600"
-        * DEFAULT_CONTEXT_TOKEN_BUDGET
+        * V3_CONTEXT_TOKEN_BUDGET
     )
 
 
@@ -517,7 +555,7 @@ async def build_batch_prose_prompt_input_bounds(
             context_text = context.to_prompt_text()
         else:
             unknown_outline_chapters += 1
-            outline_for_context = _unknown_outline_prompt_envelope()
+            outline_for_context = _unknown_v3_outline_prompt_envelope()
             # The base-call output cap must cover a one-scene, max-word outline;
             # the separate planning layer still retains the 20-scene call count.
             outline_for_execution = {
@@ -527,9 +565,9 @@ async def build_batch_prose_prompt_input_bounds(
             # Validate and truncate the real context under the runtime budget.
             # The synthetic maximum outline is an authorization envelope, not
             # persisted content, so append it only to the measured prompt. If
-            # it were inserted into assemble_context it would trip the 8k
+            # it were inserted into assemble_context it would trip the context
             # runtime guard before a real outline even exists.
-            assemble_context(context_inputs)
+            assemble_context(context_inputs, budget=V3_CONTEXT_TOKEN_BUDGET)
             context_text = "\n\n".join(filter(None, (
                 _unknown_outline_context_prompt_envelope(),
                 f"本章细纲：{outline_for_context}",

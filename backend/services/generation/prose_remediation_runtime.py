@@ -48,7 +48,7 @@ from backend.llm.schemas.novel_pydantic import (
 )
 from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 from backend.services.agent_runtime.contracts import (
@@ -104,7 +104,6 @@ from backend.services.generation.prose_token_bounds import (
     conservative_prompt_input_bound,
     structured_schema_request_payload,
 )
-from backend.services.llm.agent_orchestrator import apply_agent_profile
 from backend.services.llm.context_builder import (
     ContextBudgetError,
     assemble_context,
@@ -143,7 +142,7 @@ _TOOL_INPUT_TOKEN_BOUND = 600_000
 _MAX_PLANNER_OBSERVATIONS = 32
 _MAX_PLANNER_OBSERVATION_BYTES = 64_000
 _NO_PROVIDER_DISPATCH = {"provider_dispatch": "not_dispatched"}
-_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r4"
+_FROZEN_BUDGET_PROTOCOL = "nested-structured-total-r5"
 PROSE_REMEDIATION_RETRYABLE_REASON_CODES = (
     "adherence_provider_generation_failed",
     "adherence_review_invalid",
@@ -1772,9 +1771,7 @@ class ProseRemediationToolApplication:
         except Exception:
             return self._preflight_failure_result(operation="rewrite")
         outline = dict(chapter.get("outline") or {})
-        uses_v2_contract = require_known_scene_contract_version(outline) == (
-            SCENE_TRANSITION_CONTRACT_VERSION
-        )
+        uses_v2_contract = require_known_scene_contract_version(outline) in MODERN_SCENE_CONTRACT_VERSIONS
         scene_repair_plan: V2SceneRepairPlan | None = None
         source_checkpoint: ResumableProseCandidateCheckpoint | None = None
         if uses_v2_contract:
@@ -2488,9 +2485,7 @@ class ProseRemediationToolApplication:
                 {},
             )
             outline = dict(chapter.get("outline") or {})
-            uses_versioned_evidence = require_known_scene_contract_version(outline) == (
-                SCENE_TRANSITION_CONTRACT_VERSION
-            )
+            uses_versioned_evidence = require_known_scene_contract_version(outline) in MODERN_SCENE_CONTRACT_VERSIONS
             if uses_versioned_evidence and prompts.get("contract_version") != (
                 OUTLINE_ADHERENCE_EVIDENCE_VERSION
             ):
@@ -2516,18 +2511,8 @@ class ProseRemediationToolApplication:
                 if uses_versioned_evidence
                 else RemediationAdherenceProviderOutput
             )
-            adherence_native_prompt = apply_agent_profile(
-                "continuity_editor",
-                prompt_base
-                + "\n"
-                + prompts[with_schema_suffix],
-            )
-            adherence_json_prompt = apply_agent_profile(
-                "continuity_editor",
-                prompt_base
-                + "\n"
-                + prompts[without_schema_suffix],
-            )
+            adherence_native_prompt = prompt_base + "\n" + prompts[with_schema_suffix]
+            adherence_json_prompt = prompt_base + "\n" + prompts[without_schema_suffix]
             adherence_system_prompt = OUTLINE_ADHERENCE_SYSTEM_PROMPT
             if not _prompts_fit_bound(
                 schema=adherence_schema,

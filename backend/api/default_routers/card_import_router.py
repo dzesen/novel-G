@@ -267,6 +267,26 @@ async def apply_card_import_proposal(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/proposals/{import_proposal_id}/review-direction")
+async def review_card_import_for_direction(
+    import_proposal_id: str,
+    req: CardImportApplyRequest,
+    actor: Actor = Depends(require_authenticated_request),
+):
+    """Save reviewed candidate text and selections without formal writes or LLM calls."""
+    try:
+        return await card_import_proposal_service.review_for_direction(
+            import_proposal_id, owner_id=actor.id, digest=req.digest,
+            decisions=[item.model_dump(exclude_none=True) for item in req.decisions],
+        )
+    except StaleCardImportProposal as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (CardImportProposalError, InvalidIdError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/proposals/{import_proposal_id}/avatar")
 async def import_applied_character_card_avatar(
     import_proposal_id: str,

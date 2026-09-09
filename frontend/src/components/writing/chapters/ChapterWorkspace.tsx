@@ -20,7 +20,7 @@ import ChapterEditorPane, { type ChapterSaveState } from "./ChapterEditorPane";
 import ChapterNavigator from "./ChapterNavigator";
 import ChapterAssistantPanel from "./ChapterAssistantPanel";
 import ChapterContextInspector from "./ChapterContextInspector";
-import ChapterWorkspaceLayout from "./ChapterWorkspaceLayout";
+import ChapterWorkspaceLayout, { type ChapterWorkspaceLayoutControls } from "./ChapterWorkspaceLayout";
 import {
   chapterToDraft,
   clearLocalChapterDraft,
@@ -36,6 +36,7 @@ import type {
   StoredChapterOutline,
 } from "./outline/outlineTypes";
 import ProsePanel from "./prose/ProsePanel";
+import JudgeReviewRecordsPanel from "./prose/JudgeReviewRecordsPanel";
 import type { ProseRunSnapshot } from "./prose/useProseStream";
 import SceneIllustrationPanel from "./SceneIllustrationPanel";
 import type { LeftoverProseRun } from "./batch/batchTypes";
@@ -138,6 +139,7 @@ export default function ChapterWorkspace({
     useState<AcceptVolumeOutlineResponse | null>(null);
   const [chapterOutlineOpen, setChapterOutlineOpen] = useState(false);
   const [proseOpen, setProseOpen] = useState(false);
+  const [judgeReviewChapterId, setJudgeReviewChapterId] = useState<string | null>(null);
   const [sceneIllustrationOpen, setSceneIllustrationOpen] =
     useState(false);
   const [initialProseRun, setInitialProseRun] =
@@ -684,6 +686,7 @@ export default function ChapterWorkspace({
     setInitialProseRun(null);
     setPendingProseOpen(null);
     setChapterOutlineOpen(false);
+    setJudgeReviewChapterId(null);
     setSceneIllustrationOpen(false);
     setStateBackfillBlocked("");
     selectedChapterIdRef.current = chapterId;
@@ -782,6 +785,7 @@ export default function ChapterWorkspace({
 
   const resetChapterPanels = () => {
     setProseOpen(false);
+    setJudgeReviewChapterId(null);
     setChapterOutlineOpen(false);
     setSceneIllustrationOpen(false);
     setStateBackfillBlocked("");
@@ -905,6 +909,39 @@ export default function ChapterWorkspace({
       </div>
     );
   }
+
+  const renderAssistant = (controls: ChapterWorkspaceLayoutControls, compact = false) => (
+    <ChapterAssistantPanel
+      compact={compact}
+      hasChapter={Boolean(selectedChapterId && draft && !chapterLoading && !chapterLoadError)}
+      onOpenChapterOutline={() => {
+        controls.closeDrawer();
+        setChapterOutlineOpen(true);
+      }}
+      onOpenProse={() => {
+        controls.closeDrawer();
+        setPendingProseOpen(null);
+        setInitialProseRun(null);
+        setProseOpen(true);
+      }}
+      canGenerateProse={Boolean(chapterOutline)}
+      onOpenSceneIllustration={() => {
+        controls.closeDrawer();
+        setSceneIllustrationOpen(true);
+      }}
+      canGenerateSceneIllustration={Boolean(chapterOutline)}
+      onOpenStateBackfill={() => {
+        controls.closeDrawer();
+        void openStateBackfill();
+      }}
+      hasContent={Boolean(draft?.content?.trim())}
+      onOpenJudgeReviews={() => {
+        controls.closeDrawer();
+        document.getElementById(controls.assistantTriggerId)?.focus();
+        setJudgeReviewChapterId(selectedChapterId);
+      }}
+    />
+  );
 
   const visibleRunTargetAudit =
     runTargetAudit?.chapter_id === initialChapterId
@@ -1030,6 +1067,7 @@ export default function ChapterWorkspace({
               onExportNovel={() => void exportNovel()}
               stateBackfillBlocked={stateBackfillBlocked}
               workspaceControls={controls}
+              assistantActions={renderAssistant(controls, true)}
             />
           )}
           renderContext={() => (
@@ -1042,31 +1080,7 @@ export default function ChapterWorkspace({
               updatedAt={updatedAt}
             />
           )}
-          renderAssistant={(controls) => (
-            <ChapterAssistantPanel
-              onOpenChapterOutline={() => {
-                controls.closeDrawer();
-                setChapterOutlineOpen(true);
-              }}
-              onOpenProse={() => {
-                controls.closeDrawer();
-                setPendingProseOpen(null);
-                setInitialProseRun(null);
-                setProseOpen(true);
-              }}
-              canGenerateProse={Boolean(chapterOutline)}
-              onOpenSceneIllustration={() => {
-                controls.closeDrawer();
-                setSceneIllustrationOpen(true);
-              }}
-              canGenerateSceneIllustration={Boolean(chapterOutline)}
-              onOpenStateBackfill={() => {
-                controls.closeDrawer();
-                void openStateBackfill();
-              }}
-              hasContent={Boolean(draft?.content?.trim())}
-            />
-          )}
+          renderAssistant={renderAssistant}
         />
       </div>
 
@@ -1118,6 +1132,15 @@ export default function ChapterWorkspace({
           onClose={() => setChapterOutlineOpen(false)}
           onAccepted={() => selectedChapterId && void refreshChapterOutline(selectedChapterId)}
           existingOutline={chapterOutline}
+        />
+      )}
+
+      {judgeReviewChapterId && judgeReviewChapterId === selectedChapterId && draft && (
+        <JudgeReviewRecordsPanel
+          key={judgeReviewChapterId}
+          chapterId={judgeReviewChapterId}
+          chapterTitle={draft.title}
+          onClose={() => setJudgeReviewChapterId(null)}
         />
       )}
 

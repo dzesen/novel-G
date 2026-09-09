@@ -122,10 +122,61 @@ export const WARM_THEME: ThemePreset = {
 };
 
 
-/* 导出项 */
-export const THEME_PRESETS: ThemePreset[] = [FOREST_THEME, WARM_THEME];
+/* 墨纸 — 面向长时间写作的中性纸色与陶土强调色。 */
+export const INK_THEME: ThemePreset = {
+  "id": "ink",
+  "swatches": [
+    "#292b28",
+    "#964f39",
+    "#deddd5",
+    "#f5f4f0"
+  ],
+  "light": {
+    "--background": "#f5f4f0",
+    "--foreground": "#292b28",
+    "--color-warm-50": "#fcfbf8",
+    "--color-warm-100": "#f5f4f0",
+    "--color-warm-200": "#eae8e1",
+    "--color-warm-300": "#dbd8cf",
+    "--color-warm-400": "#bdb9ad",
+    "--color-warm-500": "#9c988b",
+    "--color-warm-600": "#7d796d",
+    "--color-warm-700": "#625e53",
+    "--color-warm-800": "#46453c",
+    "--color-warm-900": "#292b28",
+    "--color-accent": "#964f39",
+    "--color-accent-hover": "#7c3f2d",
+    "--color-surface": "#fffefa",
+    "--color-surface-secondary": "#efeee8",
+    "--color-border": "#deddd5",
+    "--color-muted": "#6d7067"
+  },
+  "dark": {
+    "--background": "#1b1d1b",
+    "--foreground": "#e8e7e0",
+    "--color-warm-50": "#1b1d1b",
+    "--color-warm-100": "#232622",
+    "--color-warm-200": "#30342e",
+    "--color-warm-300": "#42473e",
+    "--color-warm-400": "#62675c",
+    "--color-warm-500": "#85897c",
+    "--color-warm-600": "#a8aa9c",
+    "--color-warm-700": "#c7c7b8",
+    "--color-warm-800": "#deddd0",
+    "--color-warm-900": "#eeeee5",
+    "--color-accent": "#dda183",
+    "--color-accent-hover": "#edb69a",
+    "--color-surface": "#242723",
+    "--color-surface-secondary": "#292d28",
+    "--color-border": "#3c4038",
+    "--color-muted": "#a5aa9c"
+  }
+};
 
-export const DEFAULT_PRESET_ID = "forest";
+/* 导出项 */
+export const THEME_PRESETS: ThemePreset[] = [INK_THEME, FOREST_THEME, WARM_THEME];
+
+export const DEFAULT_PRESET_ID = "ink";
 
 export function getPreset(id: string): ThemePreset | undefined {
   return THEME_PRESETS.find((p) => p.id === id);
@@ -161,7 +212,7 @@ export const ALL_COLOR_KEYS = Object.keys(FOREST_THEME.light) as (keyof ThemeCol
 
 export function createDefaultCustomColors(): { light: ThemeColors; dark: ThemeColors } {
   return {
-    light: { ...FOREST_THEME.light },
-    dark: { ...FOREST_THEME.dark },
+    light: { ...INK_THEME.light },
+    dark: { ...INK_THEME.dark },
   };
 }

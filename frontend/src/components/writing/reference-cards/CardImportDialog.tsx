@@ -7,6 +7,7 @@ import { Button } from "@heroui/react";
 import { useTranslations } from "next-intl";
 import { ApiError, apiPost, apiPostForm, apiPostRaw } from "@/lib/api";
 import { cardImportClassificationKey } from "@/lib/cardImportClassification";
+import CardImportSettingEditor from "./CardImportSettingEditor";
 import {
   CardAvatarSourceUnavailable,
   isPermanentCardAvatarTransferFailure,
@@ -131,7 +132,7 @@ function isBlank(value: unknown): boolean {
     (Array.isArray(value) && value.length === 0) ||
     (typeof value === "object" &&
       !Array.isArray(value) &&
-      Object.keys(value as Record<string, unknown>).length === 0)
+      Object.values(value as Record<string, unknown>).every(isBlank))
   );
 }
 
@@ -342,6 +343,7 @@ export default function CardImportDialog({
           {
             candidate_id: candidate.candidate_id,
             action,
+            overrides: decisions[decisionKey(proposal.proposal_id, candidate.candidate_id)]?.overrides,
             overwrite_fields: [],
           } satisfies CardImportDecision,
         ]),
@@ -601,6 +603,7 @@ export default function CardImportDialog({
                     <CandidateReview
                       key={key}
                       proposalId={proposal.proposal_id}
+                      proposal={proposal}
                       candidate={candidate}
                       decision={
                         decisions[key] ?? recommendedDecision(candidate)
@@ -945,6 +948,7 @@ function SourceReview({
 }) {
   const t = useTranslations("writing.referenceCards.import");
   const pngClass = proposal.container_preview.png_chunk_classification;
+  const adaptationT = useTranslations("cardImportAdaptation");
   const pngClassification =
     pngClass === "v3"
       ? t("source.pngClassification.v3")
@@ -1058,7 +1062,11 @@ function SourceReview({
           <p className="mt-1 text-xs leading-5 text-amber-800 dark:text-amber-200">
             {t("source.riskDetail")}
           </p>
-          <ul className="mt-2 space-y-1.5 text-xs text-amber-900 dark:text-amber-100">
+          <details className="mt-2">
+            <summary className="cursor-pointer text-xs font-medium text-amber-900 dark:text-amber-100">
+              {adaptationT("isolatedDetails", { count: proposal.prompt_risk_fields.length + proposal.decorators.length + proposal.assets.length })}
+            </summary>
+          <ul className="mt-2 max-h-64 space-y-1.5 overflow-y-auto text-xs text-amber-900 dark:text-amber-100">
             {proposal.prompt_risk_fields.map((risk, index) => (
               <li
                 key={`${risk.path}:${risk.kind}:${index}`}
@@ -1109,6 +1117,7 @@ function SourceReview({
               </li>
             ))}
           </ul>
+          </details>
         </div>
       )}
 
@@ -1149,6 +1158,7 @@ function SourceReview({
 
 function CandidateReview({
   proposalId,
+  proposal,
   candidate,
   decision,
   disabled,
@@ -1156,6 +1166,7 @@ function CandidateReview({
   onDecision,
 }: {
   proposalId: string;
+  proposal: CardImportProposal;
   candidate: CardImportCandidate;
   decision: CardImportDecision;
   disabled: boolean;
@@ -1230,7 +1241,7 @@ function CandidateReview({
             disabled={disabled}
             value={decisionValue(decision)}
             onChange={(event) =>
-              onDecision(parseDecisionValue(candidate, event.target.value))
+              onDecision({ ...parseDecisionValue(candidate, event.target.value), overrides: decision.overrides })
             }
             className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm font-medium text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15 disabled:cursor-not-allowed disabled:opacity-60"
           >
@@ -1253,6 +1264,8 @@ function CandidateReview({
       </div>
 
       <MappedFields candidate={candidate} />
+      <CardImportSettingEditor proposal={proposal} candidate={candidate}
+        decision={decision} disabled={disabled} onDecision={onDecision} />
 
       {participation && (
         <div
@@ -1360,6 +1373,7 @@ function CandidateReview({
         selectedConflict && (
           <MergeDiff
             conflict={selectedConflict}
+            overrides={decision.overrides ?? {}}
             overwriteFields={decision.overwrite_fields ?? []}
             disabled={disabled}
             onChange={(overwriteFields) =>
@@ -1406,11 +1420,13 @@ function MappedFields({ candidate }: { candidate: CardImportCandidate }) {
 
 function MergeDiff({
   conflict,
+  overrides,
   overwriteFields,
   disabled,
   onChange,
 }: {
   conflict: CardImportConflict;
+  overrides: Record<string, unknown>;
   overwriteFields: string[];
   disabled: boolean;
   onChange: (fields: string[]) => void;
@@ -1499,7 +1515,7 @@ function MergeDiff({
                       {tc("useCandidate")}
                     </p>
                     <div className="mt-1">
-                      <DiffValue value={diff.imported} />
+                      <DiffValue value={field in overrides ? overrides[field] : diff.imported} />
                     </div>
                   </div>
                 </div>
@@ -1521,8 +1537,16 @@ function MergeDiff({
 
 function DiffValue({ value }: { value: unknown }) {
   const t = useTranslations("writing.referenceCards.import");
+  const metadataT = useTranslations("writing.generationMetadata");
   const [expanded, setExpanded] = useState(false);
-  const text = valueText(value);
+  const readable = (item: unknown): string => {
+    if (Array.isArray(item)) return item.filter((entry) => !isBlank(entry)).map(readable).join("\n");
+    if (item && typeof item === "object") return Object.entries(item)
+      .filter(([, entry]) => !isBlank(entry))
+      .map(([key, entry]) => `${metadataT(`referenceCardFields.${referenceCardFieldKind(key)}`)}\n${readable(entry)}`).join("\n\n");
+    return valueText(item);
+  };
+  const text = readable(value);
   const truncated = text.length > VALUE_PREVIEW_CHARS;
   const visible =
     truncated && !expanded

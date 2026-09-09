@@ -119,7 +119,7 @@ export function SceneContractDetails({ scene }: { scene: Scene }) {
         {conditionList(t("sceneContractPostconditions"), scene.postconditions)}
         {conditionList(t("sceneContractForbidden"), scene.forbidden_conditions)}
 
-        <div className="grid min-w-0 gap-1">
+        {scene.narrative_delta.length > 0 && <div className="grid min-w-0 gap-1">
           <h6 className="text-xs font-semibold text-foreground">{t("sceneContractDeltas")}</h6>
           <ul className="grid gap-1">
             {scene.narrative_delta.map((delta) => (
@@ -133,7 +133,7 @@ export function SceneContractDetails({ scene }: { scene: Scene }) {
               </li>
             ))}
           </ul>
-        </div>
+        </div>}
       </div>
     </details>
   );

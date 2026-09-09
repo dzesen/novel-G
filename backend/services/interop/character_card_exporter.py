@@ -8,6 +8,7 @@ vendor-specific extensions.
 
 from __future__ import annotations
 
+import hashlib
 from copy import deepcopy
 from typing import Any, Iterable
 
@@ -67,6 +68,15 @@ def _string_source(data: dict[str, Any], key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _export_field(card: dict[str, Any], field: str, original: str) -> str:
+    current = str(card.get(field) or "")
+    adaptation = (card.get("interop") or {}).get("adaptation") or {}
+    projected_hash = (adaptation.get("projected_hashes") or {}).get(field)
+    if projected_hash and hashlib.sha256(current.encode("utf-8")).hexdigest() == projected_hash:
+        return original
+    return current
+
+
 def _array_source(data: dict[str, Any], key: str) -> list[str]:
     value = data.get(key)
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
@@ -115,8 +125,8 @@ def _worldbook_entry(card: dict[str, Any], index: int) -> dict[str, Any]:
     raw_entry = interop.get("raw_entry") if isinstance(interop, dict) else None
     if isinstance(raw_entry, dict):
         entry = deepcopy(raw_entry)
-        entry["name"] = str(card.get("name") or "")
-        entry["content"] = str(card.get("description") or "")
+        entry["name"] = _export_field(card, "name", str(raw_entry.get("name") or card.get("name") or ""))
+        entry["content"] = _export_field(card, "description", str(raw_entry.get("content") or ""))
         display = (
             interop.get("display_metadata")
             if isinstance(interop, dict)
@@ -193,8 +203,8 @@ def build_character_card_v2(
         if source_format in {"v2", "v3"} and isinstance(raw_data, dict)
         else {}
     )
-    data["name"] = str(character.get("name") or "")
-    data["description"] = str(character.get("description") or "")
+    data["name"] = _export_field(character, "name", _string_source(raw_data, "name"))
+    data["description"] = _export_field(character, "description", _string_source(raw_data, "description"))
     details = character.get("details")
     personality = (
         details.get("personality") if isinstance(details, dict) else None

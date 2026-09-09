@@ -8,6 +8,7 @@ const FOCUSABLE = [
   "input:not([disabled])",
   "select:not([disabled])",
   "textarea:not([disabled])",
+  "summary",
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
@@ -31,9 +32,13 @@ export function useModalFocus(
     const originalOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
+    const focusableElements = () => Array.from(
+      panel?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [],
+    ).filter((element) => element.getClientRects().length > 0);
+
     const focusFirst = () => {
       const preferred = panel?.querySelector<HTMLElement>("[data-autofocus]");
-      const first = panel?.querySelector<HTMLElement>(FOCUSABLE);
+      const first = focusableElements()[0];
       (preferred ?? first ?? panel)?.focus();
     };
     const animationFrame = window.requestAnimationFrame(focusFirst);
@@ -45,7 +50,7 @@ export function useModalFocus(
         return;
       }
       if (event.key !== "Tab" || !panel) return;
-      const focusable = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
+      const focusable = focusableElements();
       if (focusable.length === 0) {
         event.preventDefault();
         panel.focus();

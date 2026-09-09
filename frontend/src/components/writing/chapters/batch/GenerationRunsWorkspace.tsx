@@ -123,6 +123,8 @@ interface GenerationRunsWorkspaceProps {
   onNavigate: (target: GenerationRunsNavigationTarget) => void;
   onOpenRootJob: (jobId: string) => void;
   onClose: () => void;
+  onOpenStatistics?: () => void;
+  onOpenRetrospective?: () => void;
   onOpenReadiness: (job: GenerationJob) => void;
   onJumpToChapter: (chapterId: string, runId?: string) => void;
   readOnly?: boolean;
@@ -343,6 +345,8 @@ export default function GenerationRunsWorkspace({
   onNavigate,
   onOpenRootJob,
   onClose,
+  onOpenStatistics,
+  onOpenRetrospective,
   onOpenReadiness,
   onJumpToChapter,
   readOnly = false,
@@ -352,6 +356,7 @@ export default function GenerationRunsWorkspace({
   const tProse = useTranslations("writing.prose");
   const locale = useLocale();
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const loadRequestRef = useRef(0);
   const loadControllerRef = useRef<AbortController | null>(null);
   const historyNovelRef = useRef<string | null>(null);
@@ -361,6 +366,9 @@ export default function GenerationRunsWorkspace({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
+  const [recordKind, setRecordKind] = useState<"jobs" | "chapters">("jobs");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [visibleRunCount, setVisibleRunCount] = useState(12);
   const [exactJob, setExactJob] = useState<GenerationJob | null>(null);
   const [settledJobId, setSettledJobId] = useState<string | undefined>(undefined);
   const [proseRuns, setProseRuns] = useState<ProseRunTelemetry[]>([]);
@@ -581,6 +589,7 @@ export default function GenerationRunsWorkspace({
   ]);
 
   useEffect(() => {
+    contentRef.current?.scrollTo({ top: 0 });
     headingRef.current?.focus();
   }, [target.chapterId, target.eventId, target.jobId, target.runId]);
 
@@ -655,14 +664,17 @@ export default function GenerationRunsWorkspace({
   const selectedRun = target.runId
     ? exactRun ?? proseRuns.find((run) => run.run_id === target.runId) ?? null
     : null;
+  // A task detail has its own server-scoped records. List filters stay on the
+  // list, so a hidden scope/provider filter cannot make this task appear empty.
+  const detailTelemetry = target.jobId ? proseRuns : filteredTelemetry;
   const selectedTelemetry = target.runId
     ? selectedRun
       ? [selectedRun]
       : []
     : target.chapterId
-      ? filteredTelemetry.filter((run) => run.chapter_id === target.chapterId)
-      : filteredTelemetry.slice(0, target.jobId ? 100 : 12);
-  const telemetryFilteredOut = !target.runId && Boolean(target.chapterId)
+      ? detailTelemetry.filter((run) => run.chapter_id === target.chapterId)
+      : detailTelemetry.slice(0, target.jobId ? 100 : visibleRunCount);
+  const telemetryFilteredOut = !target.jobId && !target.runId && Boolean(target.chapterId)
     && proseRuns.some((run) => run.chapter_id === target.chapterId)
     && selectedTelemetry.length === 0;
   const selectedDiagnosticEvent = useMemo(() => {
@@ -805,8 +817,27 @@ export default function GenerationRunsWorkspace({
     }
   }, [load, target.runId]);
 
+  const showingJob = Boolean(target.jobId);
+  const showingChapters = !showingJob && (
+    recordKind === "chapters" || Boolean(target.chapterId || target.runId)
+  );
+  const hasDetail = Boolean(target.jobId || target.chapterId || target.runId);
+  const resetFilters = () => {
+    setScopeFilter(showingChapters ? "chapter" : "all");
+    setStatusFilter("all");
+    setProviderFilter("all");
+    setModelFilter("all");
+    setReasonFilter("all");
+    setTimeFilter("all");
+  };
+  const activeFilterCount = [
+    !["all", "chapter"].includes(scopeFilter),
+    statusFilter !== "all", providerFilter !== "all", modelFilter !== "all",
+    reasonFilter !== "all", timeFilter !== "all",
+  ].filter(Boolean).length;
+
   return (
-    <section className="flex h-full min-h-0 flex-col bg-surface" aria-labelledby="generation-runs-title">
+    <section className="auto-book-records flex h-full min-h-0 flex-col" aria-labelledby="generation-runs-title">
       {resumeReviewJob && (
         <ResumeJobDialog
           job={resumeReviewJob}
@@ -822,18 +853,18 @@ export default function GenerationRunsWorkspace({
           }}
         />
       )}
-      <header className="shrink-0 border-b border-border px-4 py-4 sm:px-5">
+      <header className="auto-book-page-header shrink-0">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h2
               id="generation-runs-title"
               ref={headingRef}
               tabIndex={-1}
-              className="text-base font-semibold text-foreground outline-none"
+              className="text-xl font-semibold tracking-tight text-foreground outline-none sm:text-2xl"
             >
               {t("title")}
             </h2>
-            <p className="mt-1 max-w-3xl text-xs leading-5 text-muted">
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-muted">
               {t("description")}
             </p>
           </div>
@@ -846,18 +877,46 @@ export default function GenerationRunsWorkspace({
             >
               {refreshing ? t("refreshing") : t("refresh")}
             </button>
-            <button
+            {!readOnly && <button
               type="button"
               onClick={onClose}
               className="min-h-9 rounded-md border border-border px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary"
             >
               {t("backToEditor")}
-            </button>
+            </button>}
           </div>
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
+      <div ref={contentRef} className="auto-book-records-body min-h-0 flex-1 overflow-y-auto">
+        <div className="auto-book-record-tools">
+          <div role="group" aria-label={t("recordKindAria")} className="auto-book-record-kinds">
+            {(["jobs", "chapters"] as const).map((kind) => (
+              <button key={kind} type="button"
+                aria-pressed={kind === "chapters" ? showingChapters : !showingChapters}
+                onClick={() => {
+                  setRecordKind(kind);
+                  setScopeFilter(kind === "chapters" ? "chapter" : "all");
+                  onNavigate({});
+                }}>
+                {t(kind === "jobs" ? "kindJobs" : "kindChapters")}
+              </button>
+            ))}
+          </div>
+          {!hasDetail && <button type="button"
+            aria-expanded={filtersOpen} aria-controls="generation-run-filters"
+            onClick={() => setFiltersOpen((open) => !open)}
+            className="auto-book-filter-toggle">
+            {t("filtersTitle")}{activeFilterCount > 0 && ` (${activeFilterCount})`}
+          </button>}
+        </div>
+        {hasDetail && <button type="button" className="auto-book-back"
+          onClick={() => {
+            setRecordKind(showingJob ? "jobs" : "chapters");
+            onNavigate({});
+          }}>
+          {t("backToList")}
+        </button>}
         {loadError && (
           <section role="alert" className="mb-4 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
             <p>{loadError}</p>
@@ -884,13 +943,13 @@ export default function GenerationRunsWorkspace({
           </section>
         )}
 
-        <section aria-labelledby="generation-run-filters-title" className="mb-4 rounded-md border border-border bg-background p-3">
+        <section id="generation-run-filters" hidden={!filtersOpen || hasDetail} aria-labelledby="generation-run-filters-title" className="mb-5 border-y border-border py-4">
           <h3 id="generation-run-filters-title" className="text-sm font-semibold text-foreground">
             {t("filtersTitle")}
           </h3>
           <p className="mt-1 text-xs leading-5 text-muted">{t("loadedHistoryHint", { count: jobs.length })}</p>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-            <label className="grid gap-1 text-xs text-muted">
+          <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-3">
+            <label hidden={showingChapters} className="grid gap-1 text-xs text-muted">
               <span>{t("filterScope")}</span>
               <select
                 value={scopeFilter}
@@ -898,7 +957,6 @@ export default function GenerationRunsWorkspace({
                 className="min-h-9 min-w-0 rounded-md border border-border bg-surface px-2 text-sm text-foreground"
               >
                 <option value="all">{t("allScopes")}</option>
-                <option value="chapter">{t("scopeChapter")}</option>
                 <option value="book">{t("scopeBook")}</option>
                 <option value="volume">{t("scopeVolumeFilter")}</option>
               </select>
@@ -969,19 +1027,21 @@ export default function GenerationRunsWorkspace({
               </select>
             </label>
           </div>
+          <button type="button" onClick={resetFilters} className="mt-3 text-xs text-foreground underline underline-offset-4">{t("clearFilters")}</button>
         </section>
 
-        <div className="grid min-h-0 gap-4 lg:grid-cols-[minmax(17rem,0.85fr)_minmax(0,1.75fr)]">
+        <div className="min-h-0">
           <section
             aria-label={t("jobsListAria")}
-            className="min-w-0 rounded-md border border-border bg-background"
+            hidden={showingJob || showingChapters}
+            className="auto-book-job-list min-w-0"
           >
             <div className="border-b border-border px-3 py-2.5">
               <h3 id="generation-run-list-title" className="text-sm font-semibold text-foreground">
                 {t("jobsTitle", { count: filteredJobs.length })}
               </h3>
             </div>
-            <div className="max-h-[32rem] divide-y divide-border overflow-y-auto lg:max-h-[calc(100vh-20rem)]">
+            <div className="divide-y divide-border">
               {loading && (
                 <p role="status" className="px-3 py-4 text-sm text-muted">{t("loading")}</p>
               )}
@@ -996,7 +1056,7 @@ export default function GenerationRunsWorkspace({
                     key={job._id}
                     type="button"
                     onClick={() => onNavigate({ jobId: job._id })}
-                    className={`grid w-full gap-1 px-3 py-3 text-left hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent ${
+                    className={`auto-book-job-row grid w-full gap-1 text-left hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent ${
                       isSelected ? "bg-accent/10" : ""
                     }`}
                   >
@@ -1030,7 +1090,7 @@ export default function GenerationRunsWorkspace({
             )}
           </section>
 
-          <section aria-labelledby="generation-run-detail-title" className="min-w-0 rounded-md border border-border bg-background">
+          <section hidden={!showingJob} aria-labelledby="generation-run-detail-title" className="auto-book-job-detail min-w-0">
             {!selectedJob && !missingJob && (
               <div className="px-4 py-8 text-sm leading-6 text-muted">
                 <h3 id="generation-run-detail-title" className="font-semibold text-foreground">
@@ -1040,7 +1100,7 @@ export default function GenerationRunsWorkspace({
               </div>
             )}
             {selectedJob && (
-              <div className="grid gap-4 px-4 py-4">
+              <div className="grid gap-6">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <h3 id="generation-run-detail-title" className="break-words text-base font-semibold text-foreground">
@@ -1050,6 +1110,11 @@ export default function GenerationRunsWorkspace({
                       {t("detailStatus", { status: statusLabel(selectedJob.status, t) })}
                     </p>
                   </div>
+                  {readOnly && isRootGenerationJob(selectedJob) && <button type="button"
+                    onClick={() => onOpenRootJob(selectedJob._id)}
+                    className="min-h-9 rounded-md border border-border bg-surface px-3 text-xs font-medium text-foreground hover:bg-surface-secondary">
+                    {t("openInWorkbench")}
+                  </button>}
                   {!readOnly && isRootGenerationJob(selectedJob) && (
                     <JobActionButtons
                       job={selectedJob}
@@ -1064,9 +1129,6 @@ export default function GenerationRunsWorkspace({
                     />
                   )}
                 </div>
-
-                <GenerationJobStages key={selectedJob._id} job={selectedJob}
-                  onOpenJob={(jobId) => onNavigate({ jobId })} onOpenRootJob={onOpenRootJob} />
 
                 {actionError && (
                   <p role="alert" className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-xs leading-5 text-red-800 dark:border-red-900/70 dark:bg-red-950/30 dark:text-red-200">
@@ -1153,16 +1215,18 @@ export default function GenerationRunsWorkspace({
                   </section>
                 )}
 
-                <dl className="grid gap-3 text-xs sm:grid-cols-2 xl:grid-cols-3">
-                  <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+                <details className="auto-book-disclosure auto-book-usage">
+                  <summary>{t("usageAndAuthorization")}</summary>
+                <dl className="mt-4 grid gap-4 text-xs sm:grid-cols-2 xl:grid-cols-3">
+                  <div className="min-w-0">
                     <dt className="text-muted">{t("detailCreated")}</dt>
                     <dd className="mt-1 break-words text-foreground">{formatDate(selectedJob.created_at, locale, t("unknown"))}</dd>
                   </div>
-                  <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+                  <div className="min-w-0">
                     <dt className="text-muted">{t("detailUpdated")}</dt>
                     <dd className="mt-1 break-words text-foreground">{formatDate(selectedJob.updated_at, locale, t("unknown"))}</dd>
                   </div>
-                  <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+                  <div className="min-w-0">
                     <dt className="text-muted">{t("detailCalls")}</dt>
                     <dd className="mt-1 break-words text-foreground">
                       {t("detailCallsValue", {
@@ -1171,7 +1235,7 @@ export default function GenerationRunsWorkspace({
                       })}
                     </dd>
                   </div>
-                  <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+                  <div className="min-w-0">
                     <dt className="text-muted">{t("detailTokens")}</dt>
                     <dd className="mt-1 break-words text-foreground">
                       {t("detailTokensValue", {
@@ -1183,7 +1247,7 @@ export default function GenerationRunsWorkspace({
                       })}
                     </dd>
                   </div>
-                  <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+                  <div className="min-w-0">
                     <dt className="text-muted">{t("detailPause")}</dt>
                     <dd className="mt-1 break-words text-foreground">
                       {selectedJob.pause_reason
@@ -1191,7 +1255,7 @@ export default function GenerationRunsWorkspace({
                         : t("none")}
                     </dd>
                   </div>
-                  <div className="min-w-0 rounded-md border border-border bg-surface p-3">
+                  <div className="min-w-0">
                     <dt className="text-muted">{t("detailCurrentChapter")}</dt>
                     <dd className="mt-1 truncate text-foreground">
                       {chapters.find((chapter) => chapter._id === selectedJob.current_chapter_id)?.title ?? t("none")}
@@ -1200,7 +1264,7 @@ export default function GenerationRunsWorkspace({
                 </dl>
 
                 {selectedJob.prose_continuation_authorization && (
-                  <section aria-labelledby="generation-run-authorization-title" className="rounded-md border border-border bg-surface p-3">
+                  <section aria-labelledby="generation-run-authorization-title" className="mt-4 border-t border-border pt-4">
                     <h4 id="generation-run-authorization-title" className="text-sm font-semibold text-foreground">
                       {t("authorizationTitle")}
                     </h4>
@@ -1220,6 +1284,7 @@ export default function GenerationRunsWorkspace({
                     </div>
                   </section>
                 )}
+                </details>
 
                 <section aria-labelledby="generation-run-chapters-title">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1290,10 +1355,11 @@ export default function GenerationRunsWorkspace({
                   </div>
                 </section>
 
-                <section aria-labelledby="generation-run-events-title">
-                  <h4 id="generation-run-events-title" className="text-sm font-semibold text-foreground">
-                    {t("eventsTitle")}
-                  </h4>
+                <GenerationJobStages key={selectedJob._id} job={selectedJob}
+                  onOpenJob={(jobId) => onNavigate({ jobId })} onOpenRootJob={onOpenRootJob} />
+
+                <details key={`${selectedJob._id}:${target.eventId ?? "events"}`} open={Boolean(target.eventId)} className="auto-book-disclosure" aria-labelledby="generation-run-events-title">
+                  <summary><span id="generation-run-events-title">{t("eventsTitle")} <span className="ml-2 text-muted">{orderedDiagnostics.length}</span></span></summary>
                   <div className="mt-2 rounded-md border border-border">
                     {orderedDiagnostics.length === 0 && (
                       <p className="px-3 py-3 text-xs text-muted">{t("eventsEmpty")}</p>
@@ -1351,18 +1417,19 @@ export default function GenerationRunsWorkspace({
                   {selectedDiagnosticEvent && (
                     <p className="mt-2 text-xs leading-5 text-muted">{t("eventLocated")}</p>
                   )}
-                </section>
+                </details>
               </div>
             )}
           </section>
         </div>
 
-        <section aria-labelledby="generation-run-telemetry-title" className="mt-4 rounded-md border border-border bg-background p-4">
+        <details key={`${target.jobId ?? "all"}:${target.chapterId ?? "all"}:${target.runId ?? "all"}:${showingChapters}`}
+          hidden={!showingJob && !showingChapters}
+          open={showingChapters || Boolean(target.chapterId || target.runId)}
+          className="auto-book-disclosure auto-book-telemetry mt-6">
+          <summary><span id="generation-run-telemetry-title">{t("telemetryTitle")}</span></summary>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0">
-              <h3 id="generation-run-telemetry-title" className="text-sm font-semibold text-foreground">
-                {t("telemetryTitle")}
-              </h3>
               <p className="mt-1 text-xs leading-5 text-muted">
                 {target.jobId
                   ? target.chapterId && selectedChapter
@@ -1395,18 +1462,19 @@ export default function GenerationRunsWorkspace({
               {t("telemetryFilteredOut")}
             </p>
           )}
-          {!displayedTelemetryError && !exactRunPending && selectedTelemetry.length === 0 && (
+          {(loading || exactRunPending) && <p role="status" className="mt-3 text-sm text-muted">{t("loading")}</p>}
+          {!loading && !displayedTelemetryError && !exactRunPending && selectedTelemetry.length === 0 && (
             <p className="mt-3 text-xs text-muted">{t("telemetryEmpty")}</p>
           )}
-          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <div className="mt-4 divide-y divide-border">
             {selectedTelemetry.map((run) => (
               <article
                 key={run.run_id}
                 className={[
-                  "min-w-0 rounded-md border bg-surface p-3",
+                  "auto-book-prose-record min-w-0 py-5",
                   target.runId === run.run_id
                     ? "border-accent ring-1 ring-accent/30"
-                    : "border-border",
+                    : "",
                 ].join(" ")}
               >
                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -1423,6 +1491,14 @@ export default function GenerationRunsWorkspace({
                   </div>
                   <span className="shrink-0 text-xs text-muted">{statusLabel(run.status, t)}</span>
                 </div>
+                <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs leading-5 text-muted">
+                  <time dateTime={run.updated_at}>{formatDate(run.updated_at, locale, t("unknown"))}</time>
+                  <span>{t("runWordCount", { actual: run.completion.actual_word_count, requested: run.completion.requested_word_count })}</span>
+                  <span>{t("runSceneCount", { completed: run.completion.completed_scene_count, total: run.completion.scene_count })}</span>
+                  <button type="button" onClick={() => onJumpToChapter(run.chapter_id, run.run_id)} className="font-medium text-foreground underline underline-offset-4">{t("openChapter")}</button>
+                </div>
+                <details key={`${run.run_id}:${target.runId ?? "closed"}`} open={target.runId === run.run_id} className="auto-book-run-details mt-3">
+                  <summary className="cursor-pointer text-xs text-muted">{t("runDetails")}</summary>
                 <dl className="mt-3 grid gap-2 text-xs leading-5 text-muted sm:grid-cols-2">
                   <div>
                     <dt>{t("telemetryCalls")}</dt>
@@ -1544,10 +1620,22 @@ export default function GenerationRunsWorkspace({
                     <p className="text-xs text-muted">{t("sceneEmpty")}</p>
                   )}
                 </div>
+                </details>
               </article>
             ))}
           </div>
-        </section>
+          {!target.jobId && !target.chapterId && !target.runId && filteredTelemetry.length > visibleRunCount && <button type="button"
+            onClick={() => setVisibleRunCount((count) => count + 12)}
+            className="mt-4 min-h-10 text-sm text-foreground underline underline-offset-4">
+            {t("moreProseRecords")}
+          </button>}
+        </details>
+
+        {!hasDetail && (onOpenStatistics || onOpenRetrospective) && <footer className="auto-book-record-footer">
+          <span>{t("moreRecords")}</span>
+          {onOpenStatistics && <button type="button" onClick={onOpenStatistics}>{t("openStatistics")}</button>}
+          {onOpenRetrospective && <button type="button" onClick={onOpenRetrospective}>{t("openRetrospective")}</button>}
+        </footer>}
 
       </div>
     </section>

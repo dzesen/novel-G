@@ -4,6 +4,7 @@ from typing import Any, List, Literal, Optional
 
 from bson import ObjectId
 from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from backend.llm.schemas.reference_card_pydantic import (
     EmergentReferenceCardCandidateSchema,
@@ -13,6 +14,8 @@ from backend.llm.schemas.scene_contract_pydantic import (
     ChapterOutlineAdherenceEvidenceV3Schema,
     ChapterOutlineAdherenceEvidenceV4Schema,
     SceneTransitionContractSchema,
+    SceneTransitionContractV3Schema,
+    GeneratedSceneTransitionContractV3Schema,
     ValidatedChapterOutlineAdherenceEvidenceSchema,
     ValidatedChapterOutlineAdherenceEvidenceV3Schema,
     ValidatedChapterOutlineAdherenceEvidenceV4Schema,
@@ -23,9 +26,12 @@ from backend.llm.schemas.state_fact_pydantic import (
     ChapterStateFactEvidenceSchema,
 )
 from backend.scene_contract_versions import (
-    MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES,
     MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
     SCENE_TRANSITION_CONTRACT_VERSION,
+    CURRENT_SCENE_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
+    MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
+    outline_context_byte_cap,
 )
 
 
@@ -350,13 +356,14 @@ def chapter_outline_context_prompt_utf8_bytes(
 
 
 def _validate_v2_outline_context_size(outline: Mapping[str, Any]) -> None:
-    if outline.get("scene_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
+    version = outline.get("scene_contract_version")
+    if version not in MODERN_SCENE_CONTRACT_VERSIONS:
         return
     if chapter_outline_context_prompt_utf8_bytes(outline) > (
-        MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES
+        outline_context_byte_cap(version)
     ):
         raise ValueError(
-            "V2 chapter outline exceeds the downstream context budget"
+            f"{version} chapter outline exceeds the downstream context budget"
         )
 
 
@@ -380,7 +387,8 @@ class LegacySceneSchema(BaseModel):
     purpose: str = Field(..., min_length=1, max_length=200, description="这一场在全局的作用")
 
 
-SceneSchema = LegacySceneSchema | SceneTransitionContractSchema
+SceneSchema = (LegacySceneSchema | SceneTransitionContractSchema
+               | SceneTransitionContractV3Schema)
 
 
 class DueTargetSchema(BaseModel):
@@ -443,7 +451,7 @@ class ChapterOutlineAuthoredSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     scene_contract_version: Optional[
-        Literal["scene_transition_contract.v2"]
+        Literal["scene_transition_contract.v2", "scene_transition_contract.v3"]
     ] = Field(
         default=None,
         description="场景状态转移合同版本；为空时是只读兼容的 legacy_v1 章纲",
@@ -484,10 +492,13 @@ class ChapterOutlineAuthoredSchema(BaseModel):
             isinstance(scene, SceneTransitionContractSchema)
             for scene in self.scenes
         ]
-        if self.scene_contract_version == SCENE_TRANSITION_CONTRACT_VERSION:
-            if not all(uses_v2):
+        if self.scene_contract_version in MODERN_SCENE_CONTRACT_VERSIONS:
+            if not all(uses_v2) or any(
+                scene.contract_version != self.scene_contract_version
+                for scene in self.scenes if isinstance(scene, SceneTransitionContractSchema)
+            ):
                 raise ValueError(
-                    "scene_contract_version v2 requires every scene to use the V2 contract"
+                    "scene_contract_version requires every scene to use the same contract"
                 )
             scene_target_total = sum(
                 scene.word_budget.target
@@ -651,6 +662,64 @@ class ChapterOutlineResultSchema(V2ChapterOutlineProposalSchema):
         ):
             raise ValueError("V2 chapter outline exceeds the response byte budget")
         return self
+
+
+class CurrentNewThreadSchema(BaseModel):
+    """New proposals use the stable deadline target, without legacy wire fields."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=1000)
+    due_target: Optional[DueTargetSchema] = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    importance: Literal["main", "sub"] = "sub"
+
+
+class V3ChapterOutlineProposalSchema(ChapterOutlineProposalSchema):
+    """Explicit V3 input for acceptance and repair of existing authored data."""
+
+    scene_contract_version: Literal["scene_transition_contract.v3"]
+    scenes: List[SceneTransitionContractV3Schema] = Field(
+        ..., min_length=1, max_length=MAX_CHAPTER_OUTLINE_SCENES
+    )
+    new_threads: List[CurrentNewThreadSchema] = Field(
+        default_factory=list, max_length=10
+    )
+
+    @model_validator(mode="after")
+    def keep_context_bounded(self) -> "V3ChapterOutlineProposalSchema":
+        _validate_v2_outline_context_size(self.model_dump(mode="json"))
+        return self
+
+
+class V3ChapterOutlineResultSchema(V3ChapterOutlineProposalSchema):
+    """V3 canonical response, also used by version-preserving dependency repair."""
+
+    @model_validator(mode="after")
+    def keep_response_bounded(self) -> "V3ChapterOutlineResultSchema":
+        if chapter_outline_response_utf8_bytes(self.model_dump(mode="json")) > (
+            MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES
+        ):
+            raise ValueError("V3 chapter outline exceeds the response byte budget")
+        return self
+
+
+class CurrentChapterOutlineResultSchema(V3ChapterOutlineResultSchema):
+    """New generation: 32,000 canonical UTF-8 bytes and up to six scenes.
+
+    Fixed versions are server supplied; stored/editor limits stay at 20 scenes.
+    """
+
+    scene_contract_version: SkipJsonSchema[Literal["scene_transition_contract.v3"]] = (
+        CURRENT_SCENE_CONTRACT_VERSION
+    )
+    scenes: List[GeneratedSceneTransitionContractV3Schema] = Field(
+        ..., min_length=1, max_length=6
+    )
+    new_threads: List[CurrentNewThreadSchema] = Field(
+        default_factory=list, max_length=10
+    )
 
 
 class ChapterOutlineEditSchema(ChapterOutlineAuthoredSchema):

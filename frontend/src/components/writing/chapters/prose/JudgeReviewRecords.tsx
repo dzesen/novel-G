@@ -158,10 +158,10 @@ function ReviewRecordDetail({ record, label }: { record: ReviewDetail; label: st
   );
 }
 
-export default function JudgeReviewRecords({ chapterId, refreshKey = "" }: { chapterId: string; refreshKey?: string }) {
+export default function JudgeReviewRecords({ chapterId, refreshKey = "", collapsible = true }: { chapterId: string; refreshKey?: string; collapsible?: boolean }) {
   const t = useTranslations("writing.judgeReviews");
   const locale = useLocale();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(!collapsible);
   const [reload, setReload] = useState(0);
   const [page, setPage] = useState<ReviewPage | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
@@ -214,10 +214,7 @@ export default function JudgeReviewRecords({ chapterId, refreshKey = "" }: { cha
     finally { setMoreLoading(false); }
   };
 
-  return (
-    <details className="@container min-w-0 border-t border-border py-2" onToggle={(event) => setOpen(event.currentTarget.open)} data-testid="judge-review-records">
-      <summary className="cursor-pointer py-3 text-sm font-medium text-foreground">{t("title")}</summary>
-      {open && <div className="min-w-0 space-y-4 pb-4">
+  const content = <div className="min-w-0 space-y-4 pb-4">
         <div className="flex flex-wrap items-start justify-between gap-2"><p className="max-w-prose text-xs leading-6 text-muted">{t("description")}</p><button type="button" className={textButton} disabled={loading || moreLoading} onClick={() => setReload((value) => value + 1)}>{t("refresh")}</button></div>
         {loading && <p role="status" className="text-sm">{t("loading")}</p>}
         {error && <p role="alert" className="text-sm">{t("loadError")}</p>}
@@ -240,7 +237,16 @@ export default function JudgeReviewRecords({ chapterId, refreshKey = "" }: { cha
         {!loading && !detailError && selected.length > 0 && <div className={`grid min-w-0 gap-6 border-t border-border pt-5 ${selected.length === 2 ? "@2xl:grid-cols-2" : ""}`} data-testid="judge-review-comparison">
           {selected.map((id) => details[id] ? <ReviewRecordDetail key={id} record={details[id]} label={label(details[id])} /> : <p key={id} role="status" className="text-sm">{t("loadingDetail")}</p>)}
         </div>}
-      </div>}
+      </div>;
+
+  if (!collapsible) {
+    return <section className="@container min-w-0" data-testid="judge-review-records">{content}</section>;
+  }
+
+  return (
+    <details className="@container min-w-0 border-t border-border py-2" onToggle={(event) => setOpen(event.currentTarget.open)} data-testid="judge-review-records">
+      <summary className="cursor-pointer py-3 text-sm font-medium text-foreground">{t("title")}</summary>
+      {open && content}
     </details>
   );
 }

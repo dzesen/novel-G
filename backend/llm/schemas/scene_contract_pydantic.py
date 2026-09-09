@@ -16,6 +16,7 @@ from pydantic import (
     StringConstraints,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 
 MAX_V2_ADHERENCE_ISSUES = 20
@@ -169,6 +170,23 @@ class SceneTransitionContractSchema(BaseModel):
         if len(delta_ids) != len(set(delta_ids)):
             raise ValueError("delta_id values must be unique within a scene")
         return self
+
+
+class SceneTransitionContractV3Schema(SceneTransitionContractSchema):
+    """V3 keeps atomic evidence identities; repeated state deltas are optional."""
+
+    contract_version: Literal["scene_transition_contract.v3"]
+    narrative_delta: list[NarrativeDeltaSchema] = Field(
+        default_factory=list, max_length=20
+    )
+
+
+class GeneratedSceneTransitionContractV3Schema(SceneTransitionContractV3Schema):
+    """The generation endpoint supplies its fixed version, including per scene."""
+
+    contract_version: SkipJsonSchema[Literal["scene_transition_contract.v3"]] = (
+        "scene_transition_contract.v3"
+    )
 
 
 class ProseEvidenceSpanSchema(BaseModel):
@@ -393,6 +411,9 @@ class ChapterOutlineAdherenceEvidenceV5Schema(
     """Completion evidence without the optional quality analysis (ADR-0011)."""
 
     schema_version: Literal["chapter_outline_adherence_evidence.v5"]
+    outline_contract_version: Literal[
+        "scene_transition_contract.v2", "scene_transition_contract.v3"
+    ]
     quality_dimensions: list[None] = Field(default_factory=list, max_length=0)
 
 
@@ -443,7 +464,7 @@ class ChapterOutlineAdherenceEvidenceV4Schema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["chapter_outline_adherence_evidence.v4"]
-    outline_contract_version: Literal["scene_transition_contract.v2"]
+    outline_contract_version: Literal["scene_transition_contract.v2", "scene_transition_contract.v3"]
     summary: RequiredText500
     beat_evidence: list[BeatEvidenceSchema] = Field(..., min_length=1, max_length=400)
     findings: list[OutlineContractFindingV3Schema] = Field(
@@ -993,6 +1014,7 @@ class ValidatedChapterOutlineAdherenceEvidenceV5Schema(
 ):
     """Current completion-only projection; no quality result is fabricated."""
 
+    outline_contract_version: Literal["scene_transition_contract.v2", "scene_transition_contract.v3"]
     evidence_schema_version: Literal["chapter_outline_adherence_evidence.v5"]
     issue_policy_version: Literal["chapter_outline_issue_policy.v3"]
     quality_dimensions: list[None] = Field(default_factory=list, max_length=0)
@@ -1015,6 +1037,7 @@ class ValidatedChapterOutlineAdherenceEvidenceV4Schema(
 ):
     """V4 local projection with a source-bound quality-debt sidecar."""
 
+    outline_contract_version: Literal["scene_transition_contract.v2", "scene_transition_contract.v3"]
     evidence_schema_version: Literal["chapter_outline_adherence_evidence.v4"]
     issue_policy_version: Literal["chapter_outline_issue_policy.v2"]
     scene_quality_profiles: list[ValidatedSceneQualityProfileSchema] = Field(

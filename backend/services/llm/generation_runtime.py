@@ -9,6 +9,7 @@ from enum import Enum
 import hashlib
 from inspect import isawaitable
 import json
+import logging
 import re
 from time import perf_counter
 from typing import Any, Callable, Literal, Mapping, Protocol, Union
@@ -39,7 +40,7 @@ class StructuredOutputMode(str, Enum):
     SCHEMA_ENFORCED = "schema_enforced"
 
 
-STRUCTURED_REQUEST_BUDGET_PROTOCOL = "structured_request_budget.v2"
+STRUCTURED_REQUEST_BUDGET_PROTOCOL = "structured_request_budget.v3"
 STRUCTURED_PROGRESS_TIMEOUT_SECONDS = 0.25
 STRUCTURED_VALIDATION_ISSUES_SCHEMA_VERSION = (
     "structured_validation_issues.v1"
@@ -1372,6 +1373,7 @@ class GenerationRuntime:
         max_conservative_input_tokens: int | None = None,
         max_conservative_total_tokens: int | None = None,
         max_structured_raw_output_bytes: int | None = None,
+        max_structured_output_bytes: int | None = None,
         retry_oversized_structured_output_without_source: bool = False,
         require_settled_attempts: bool = False,
         stream_json_output: bool = False,
@@ -1447,6 +1449,13 @@ class GenerationRuntime:
             bool,
         ):
             raise ValueError("structured byte-budget regeneration flag is invalid")
+        if max_structured_output_bytes is not None and (
+            type(max_structured_output_bytes) is not int
+            or max_structured_output_bytes < 1
+            or max_structured_raw_output_bytes is None
+            or max_structured_output_bytes > max_structured_raw_output_bytes
+        ):
+            raise ValueError("structured canonical-output byte cap is invalid")
         if (
             retry_oversized_structured_output_without_source
             and max_structured_raw_output_bytes is None
@@ -1651,9 +1660,9 @@ class GenerationRuntime:
             )
             return "".join(pieces)
 
-        def enforce_structured_output_byte_cap(output: Any) -> None:
+        def enforce_structured_output_byte_cap(output: Any) -> Any:
             if max_structured_raw_output_bytes is None:
-                return
+                return output
             if isinstance(output, BaseModel):
                 rendered = json.dumps(
                     output.model_dump(mode="json"),
@@ -1662,10 +1671,55 @@ class GenerationRuntime:
                 )
             else:
                 rendered = str(output)
-            if len(rendered.encode("utf-8")) > max_structured_raw_output_bytes:
-                raise StructuredOutputByteBudgetExceeded(
-                    "structured output exceeds the frozen local-repair byte cap"
+            raw_bytes = len(rendered.encode("utf-8"))
+            canonical_bytes = None
+            scene_count = None
+            beat_count = None
+            normalized = output
+            # Bound the parser before decoding. Legacy callers keep the original
+            # raw-byte semantics; new callers repair only the bounded canonical
+            # form, so escaping/indentation never enlarges repair authorization.
+            if (
+                max_structured_output_bytes is not None
+                and raw_bytes <= max_structured_raw_output_bytes
+            ):
+                match = _FENCED_JSON.match(rendered)
+                try:
+                    decoded = json.loads(match.group(1) if match else rendered)
+                except (ValueError, RecursionError):
+                    decoded = None
+                else:
+                    canonical = json.dumps(
+                        decoded, ensure_ascii=False, separators=(",", ":")
+                    )
+                    canonical_bytes = len(canonical.encode("utf-8"))
+                    normalized = output if isinstance(output, BaseModel) else canonical
+                    if isinstance(decoded, dict) and isinstance(decoded.get("scenes"), list):
+                        scenes = decoded["scenes"]
+                        scene_count = len(scenes)
+                        beat_count = sum(
+                            len(scene.get("beats", []))
+                            for scene in scenes
+                            if isinstance(scene, dict) and isinstance(scene.get("beats"), list)
+                        )
+            if max_structured_output_bytes is not None:
+                logging.getLogger(__name__).info(
+                    "structured_output_size raw_bytes=%s canonical_bytes=%s scenes=%s beats=%s",
+                    None if isinstance(output, BaseModel) else raw_bytes,
+                    canonical_bytes, scene_count, beat_count,
                 )
+            if raw_bytes > max_structured_raw_output_bytes or (
+                max_structured_output_bytes is not None
+                and (canonical_bytes if canonical_bytes is not None else raw_bytes)
+                > max_structured_output_bytes
+            ):
+                raise StructuredOutputByteBudgetExceeded(
+                    "structured output exceeds the frozen local-repair byte cap "
+                    f"(raw_bytes={None if isinstance(output, BaseModel) else raw_bytes}, "
+                    f"canonical_bytes={canonical_bytes}, "
+                    f"scenes={scene_count}, beats={beat_count})"
+                )
+            return normalized
 
         def bounded_reservation(
             prompt: str,
@@ -1794,7 +1848,7 @@ class GenerationRuntime:
         )
         oversized_regeneration_used = False
         try:
-            enforce_structured_output_byte_cap(produced)
+            produced = enforce_structured_output_byte_cap(produced)
         except StructuredOutputByteBudgetExceeded:
             if not retry_oversized_structured_output_without_source:
                 raise
@@ -1802,7 +1856,7 @@ class GenerationRuntime:
             byte_budget_regeneration_prompt = (
                 render_structured_byte_budget_regeneration_prompt(
                     original_prompt=primary_prompt,
-                    max_bytes=int(max_structured_raw_output_bytes or 0),
+                    max_bytes=int(max_structured_output_bytes or max_structured_raw_output_bytes or 0),
                 )
             )
 
@@ -1847,7 +1901,7 @@ class GenerationRuntime:
                     ),
                 ),
             )
-            enforce_structured_output_byte_cap(produced)
+            produced = enforce_structured_output_byte_cap(produced)
         try:
             value = produced if isinstance(produced, BaseModel) else _parse_structured_text(str(produced), schema)
         except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
@@ -1899,7 +1953,7 @@ class GenerationRuntime:
                 plan, plan.provider_alias, "repair", adapter, repair_call,
                 bounded_reservation(repair_prompt),
             )
-            enforce_structured_output_byte_cap(repaired)
+            repaired = enforce_structured_output_byte_cap(repaired)
             try:
                 value = _parse_structured_text(str(repaired), schema)
             except (

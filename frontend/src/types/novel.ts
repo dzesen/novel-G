@@ -257,6 +257,16 @@ export interface CardImportConflict {
 export interface CardImportCandidate {
   candidate_id: string;
   target_type: ReferenceCardType;
+  adaptation?: {
+    version: number;
+    status: "ready" | "review_required" | "reference_only";
+    fields: Record<string, {
+      status: "ready" | "review_required" | "reference_only";
+      counts: Record<string, number>;
+      notices: string[];
+    }>;
+  };
+  direction_included?: boolean;
   classification?: {
     schema_version: "worldbook_classification.v1";
     reason_code: "explicit_metadata" | "explicit_title" | "structured_fields" | "conflicting_markers" | "unclassified";
@@ -307,6 +317,7 @@ export interface CardImportCandidate {
 
 export interface CardImportProposal {
   proposal_id: string;
+  raw_payload?: Record<string, unknown>;
   novel_id: string | null;
   source_format: "v1" | "v2" | "v3" | "worldbook_standalone";
   source_container: "json" | "png";

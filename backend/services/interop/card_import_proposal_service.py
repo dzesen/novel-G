@@ -52,6 +52,7 @@ from backend.services.interop.world_book_classification import (
     IMPORT_CARD_TYPES,
     classify_worldbook_entry,
 )
+from backend.services.interop.novel_content_adapter import ADAPTATION_VERSION, adapt_content
 from backend.services.novel.character_profile import normalize_character_profile
 from backend.services.novel.reference_card_curation import (
     REFERENCE_CARD_EDITABLE_FIELDS,
@@ -214,7 +215,8 @@ def _default_config_snapshot() -> dict[str, Any]:
     configured = get_config_value("card_import", {})
     return {
         "implementation": {
-            "mapping_version": 3,
+            "mapping_version": 4,
+            "content_adaptation_version": ADAPTATION_VERSION,
             "raw_payload_max_bytes": MAX_RAW_PAYLOAD_BYTES,
             "worldbook_raw_payload_max_bytes": (
                 MAX_WORLD_BOOK_RAW_PAYLOAD_BYTES
@@ -288,6 +290,77 @@ def _bounded_profile_projection(
         except ValueError:
             isolated.append("personality")
     return profile, isolated
+
+
+def _adapt_import_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a draft in place; source data lives separately in the proposal."""
+    reports: dict[str, dict] = {}
+    statuses: list[str] = []
+    character_name = fields.get("name")
+    if not isinstance(character_name, str) or any(marker in character_name for marker in ("{{", "<", "```")):
+        character_name = None
+
+    def visit(value: Any, path: str) -> Any:
+        if isinstance(value, str):
+            result = adapt_content(value, character_name=character_name)
+            if result.notices:
+                reports[path] = result.summary()
+                statuses.append(result.status)
+            return result.text
+        if isinstance(value, list):
+            return [visit(item, f"{path}.{index}") for index, item in enumerate(value)]
+        if isinstance(value, dict):
+            return {key: visit(item, f"{path}.{key}") for key, item in value.items()}
+        return value
+
+    for key in ("name", "description", "tags", "details", "character_profile"):
+        if key in fields:
+            fields[key] = visit(fields[key], key)
+    interop = fields.get("interop")
+    if isinstance(interop, dict):
+        for key in ("scenario", "first_mes", "mes_example", "alternate_greetings"):
+            if key in interop:
+                interop[key] = visit(interop[key], f"interop.{key}")
+    status = "ready"
+    if any(item != "ready" for item in statuses):
+        status = "review_required" if fields.get("description") else "reference_only"
+    if not fields.get("name"):
+        fields["name"] = "待整理资料"
+        status = "review_required"
+    return {
+        "version": ADAPTATION_VERSION, "status": status, "fields": reports,
+        "projected_hashes": {
+            key: hashlib.sha256(str(fields.get(key) or "").encode("utf-8")).hexdigest()
+            for key in ("name", "description")
+        },
+    }
+
+
+def _validate_adapted_decision(candidate: dict, edited: dict, overrides: dict, action: str) -> None:
+    if action == "skip":
+        return
+    adaptation = candidate.get("adaptation") or {}
+    if adaptation.get("status") in {"review_required", "reference_only"}:
+        if "description" not in overrides or not str(edited.get("description") or "").strip():
+            raise CardImportProposalError("请先核对原文并确认整理后的设定，或跳过这条资料")
+
+    def check(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                check(key)
+                check(item)
+        elif isinstance(value, list):
+            for item in value:
+                check(item)
+        elif isinstance(value, str):
+            result = adapt_content(value)
+            if result.status != "ready" or any(
+                result.counts.get(key, 0) for key in (
+                    "role_macros", "conditional_branches", "code_blocks", "excluded_fragments", "presentation_tags",
+                )
+            ):
+                raise CardImportProposalError("资料中仍含未整理的模板或代码，请编辑为小说设定后再确认")
+    check(edited)
 
 
 def _validate_worldbook_import_candidate(
@@ -570,6 +643,8 @@ class CardImportProposalService:
                 "writing_participation": {},
             },
         }
+        adaptation = _adapt_import_fields(draft)
+        draft["interop"]["adaptation"] = adaptation
         draft["interop"]["writing_participation"] = (
             reference_card_writing_participation(
                 draft,
@@ -665,11 +740,15 @@ class CardImportProposalService:
             )
         else:
             recommended_action = "create"
+        adaptation = (draft.get("interop") or {}).get("adaptation") or {}
+        if adaptation.get("status") in {"review_required", "reference_only"}:
+            recommended_action = "skip"
         return [
             {
                 "candidate_id": "character:0",
                 "target_type": "character",
                 "fields": draft,
+                "adaptation": adaptation,
                 "conflicts": conflicts,
                 "recommended_action": recommended_action,
             }
@@ -686,6 +765,13 @@ class CardImportProposalService:
         proposed: list[dict[str, Any]] = []
         for index, entry in enumerate(parsed.entries):
             classification = classify_worldbook_entry(entry)
+            fields = {
+                "name": classification.name, "subtitle": "", "description": entry.content,
+                "importance": "sub", "tags": [], "details": {},
+                **({"character_profile": normalize_character_profile({})}
+                   if classification.card_type == "character" else {}),
+            }
+            adaptation = _adapt_import_fields(fields)
             conflicts = conflicts_by_locator.get(entry.source_locator, [])
             if duplicate or len(conflicts) > 1:
                 recommended_action = "skip"
@@ -697,6 +783,8 @@ class CardImportProposalService:
                 )
             else:
                 recommended_action = "create"
+            if adaptation["status"] != "ready":
+                recommended_action = "skip"
             proposed.append(
                 {
                     "candidate_id": f"lore:{candidate_offset + index}",
@@ -705,16 +793,8 @@ class CardImportProposalService:
                         "schema_version": "worldbook_classification.v1",
                         "reason_code": classification.reason_code,
                     },
-                    "fields": {
-                        "name": classification.name,
-                        "subtitle": "",
-                        "description": entry.content,
-                        "importance": "sub",
-                        "tags": [],
-                        "details": {},
-                        **({"character_profile": normalize_character_profile({})}
-                           if classification.card_type == "character" else {}),
-                    },
+                    "fields": fields,
+                    "adaptation": adaptation,
                     "interop_preview": _worldbook_entry_preview(entry),
                     "conflicts": conflicts,
                     "recommended_action": recommended_action,
@@ -1072,6 +1152,48 @@ class CardImportProposalService:
         result["is_stale"] = result.get("status") == "stale"
         return result
 
+    async def review_for_direction(
+        self, proposal_id: str | ObjectId, *, owner_id: str | ObjectId,
+        digest: str, decisions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Bind author edits and exclusions before any paid direction request."""
+        owner = to_object_id(owner_id)
+        collection = self.db[collections.CARD_IMPORT_PROPOSALS]
+        proposal = await collection.find_one({"_id": to_object_id(proposal_id), "owner_id": owner})
+        if proposal is None:
+            raise NotFoundError("Card import proposal not found")
+        if proposal.get("novel_id") is not None:
+            raise CardImportProposalError("Only pre-novel proposals have a direction review")
+        if (proposal.get("status") != "pending_review" or not _proposal_integrity_matches(proposal)
+                or not isinstance(digest, str) or not hmac.compare_digest(digest, str(proposal.get("digest") or ""))):
+            raise StaleCardImportProposal("Card-import review no longer matches its digest")
+        if await self._current_stale_reasons(proposal, owner_id=owner):
+            raise StaleCardImportProposal("Card-import proposal changed before review")
+        normalized, _ = self._prepare_decisions(proposal, decisions, allow_review_revision=True)
+        decisions_by_id = {item["candidate_id"]: item for item in normalized}
+        candidates = deepcopy(proposal["proposed_cards"])
+        for candidate in candidates:
+            decision = decisions_by_id[candidate["candidate_id"]]
+            candidate["direction_review"] = self._decision_summary(decision)
+            candidate["direction_included"] = decision["action"] != "skip"
+            candidate["fields"].update(deepcopy(decision["candidate"]))
+        candidate_digest = _digest({"proposed_cards": candidates, "avatar_preview": proposal.get("avatar_preview")})
+        new_digest = _proposal_digest(
+            source_hash=proposal["source_hash"], novel_snapshot_digest=proposal["novel_snapshot_digest"],
+            config_digest=proposal["config_digest"], target_cards_digest=proposal["target_cards_digest"],
+            candidate_digest=candidate_digest,
+        )
+        changes = {"proposed_cards": candidates, "candidate_digest": candidate_digest,
+                   "digest": new_digest, "updated_at": get_utc_now()}
+        result = await collection.update_one(
+            {"_id": proposal["_id"], "owner_id": owner, "digest": digest,
+             "status": "pending_review", "novel_id": None}, {"$set": changes},
+        )
+        if result.matched_count != 1:
+            raise StaleCardImportProposal("Card-import proposal changed during review")
+        proposal.update(changes)
+        return _serialize_proposal(proposal)
+
     async def build_direction_context(
         self,
         references: list[dict[str, Any]],
@@ -1151,15 +1273,20 @@ class CardImportProposalService:
                     "Card-import proposal is stale: " + ", ".join(stale_reasons)
                 )
             for candidate in proposal.get("proposed_cards") or []:
+                adaptation = candidate.get("adaptation") or {}
+                if adaptation.get("fields") and "direction_review" not in candidate:
+                    raise CardImportProposalError("请先确认整理后的资料和取舍，再开始创意定向")
+                if candidate.get("direction_included") is False:
+                    continue
                 if candidate.get("target_type") == "character":
                     character_count += 1
                 elif candidate.get("target_type") in IMPORT_CARD_TYPES:
                     world_entry_count += 1
             reviewed.append(proposal)
 
-        if character_count == 0:
+        if character_count == 0 and world_entry_count == 0:
             raise CardImportProposalError(
-                "Card-driven direction requires at least one character card"
+                "Card-driven direction requires at least one character or world entry"
             )
 
         lines = [
@@ -1201,6 +1328,8 @@ class CardImportProposalService:
             source_label = str(proposal.get("source_name") or proposal["_id"])
             lines.append(f"【来源：{source_label}】")
             for candidate in proposal.get("proposed_cards") or []:
+                if candidate.get("direction_included") is False:
+                    continue
                 candidate_id = str(candidate.get("candidate_id") or "")
                 target_type = str(candidate.get("target_type") or "")
                 fields = candidate.get("fields") or {}
@@ -1609,6 +1738,8 @@ class CardImportProposalService:
         self,
         proposal: dict[str, Any],
         decisions: list[dict[str, Any]],
+        *,
+        allow_review_revision: bool = False,
     ) -> tuple[list[dict[str, Any]], str]:
         candidates = proposal.get("proposed_cards") or []
         candidate_ids = {
@@ -1672,6 +1803,7 @@ class CardImportProposalService:
                 if target_type == "character"
                 else _validate_worldbook_import_candidate(edited)
             )
+            _validate_adapted_decision(candidate, edited, overrides, action)
 
             overwrite_fields = sorted(
                 {
@@ -1725,6 +1857,15 @@ class CardImportProposalService:
                     )
             else:
                 target_card_id = None
+
+            summary = self._decision_summary({
+                "candidate_id": str(candidate["candidate_id"]), "action": action,
+                "target_card_id": target_card_id, "overrides": overrides,
+                "overwrite_fields": overwrite_fields,
+            })
+            if (not allow_review_revision and "direction_review" in candidate
+                    and _digest(summary) != _digest(candidate["direction_review"])):
+                raise StaleCardImportProposal("资料决策已改变，请重新确认整理内容并生成定向")
 
             normalized.append(
                 {
@@ -1802,6 +1943,8 @@ class CardImportProposalService:
                 isolated_fields=isolated_fields,
             ),
         }
+        if candidate_meta.get("adaptation"):
+            result["adaptation"] = deepcopy(candidate_meta["adaptation"])
         if is_primary_character:
             result["provenance"] = _external_provenance(raw_payload)
             result["raw_spec"] = raw_payload

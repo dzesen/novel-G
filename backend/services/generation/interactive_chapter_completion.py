@@ -113,7 +113,7 @@ from backend.services.llm.generation_runtime import (
 from backend.services.novel.state_proposal import state_proposal_module
 from backend.services.novel.state_fact_accounting import StateFactAccountingError
 from backend.scene_contract_versions import (
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 
@@ -1187,9 +1187,7 @@ class InteractiveChapterCompletionService:
                 "interactive completion requires a chapter outline",
                 code="interactive_outline_missing",
             )
-        if require_known_scene_contract_version(outline) != (
-            SCENE_TRANSITION_CONTRACT_VERSION
-        ):
+        if require_known_scene_contract_version(outline) not in MODERN_SCENE_CONTRACT_VERSIONS:
             raise InteractiveCompletionBlocked(
                 "interactive completion requires the current scene contract",
                 code="interactive_outline_upgrade_required",

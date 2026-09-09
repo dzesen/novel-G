@@ -279,6 +279,9 @@ export default function GenerationRoleSettings() {
         <p className="mt-1 max-w-3xl text-sm leading-6 text-muted">
           {settingsT("description")}
         </p>
+        <p className="mt-2 max-w-3xl text-sm leading-6 text-muted">
+          {settingsT("usage")}
+        </p>
       </header>
 
       {error && (

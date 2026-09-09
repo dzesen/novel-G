@@ -23,9 +23,11 @@ from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineEditSchema,
     ChapterOutlineResultSchema,
+    V3ChapterOutlineResultSchema,
 )
 from backend.scene_contract_versions import (
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    CURRENT_SCENE_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 from backend.services.llm.context_builder import fetch_roster
@@ -516,7 +518,10 @@ class ChapterService:
         """
         # 层 1a：形状校验。extra="forbid" + 必填项在此一次卡死，之后的字段访问才安全。
         try:
-            parsed = ChapterOutlineResultSchema.model_validate(outline)
+            schema = (V3ChapterOutlineResultSchema
+                      if outline.get("scene_contract_version") == CURRENT_SCENE_CONTRACT_VERSION
+                      else ChapterOutlineResultSchema)
+            parsed = schema.model_validate(outline)
         except ValidationError as exc:
             raise ValueError(f"章节细纲数据非法，未做任何写入：{exc}") from exc
         payload = parsed.model_dump()
@@ -687,23 +692,23 @@ class ChapterService:
                 "现有章纲的场景合同版本未知，必须人工复核，未做任何写入"
             ) from exc
         if (
-            existing_contract_version == SCENE_TRANSITION_CONTRACT_VERSION
+            existing_contract_version in MODERN_SCENE_CONTRACT_VERSIONS
             and payload.get("scene_contract_version")
-            != SCENE_TRANSITION_CONTRACT_VERSION
+            != existing_contract_version
         ):
             raise ValueError(
-                "已接受的 V2 场景合同不能降级为 legacy_v1，未做任何写入"
+                "已接受的场景合同必须保留版本，不能降级、升级或移除版本，未做任何写入"
             )
         if (
             existing_contract_version == "legacy_v1"
             and payload.get("scene_contract_version")
-            == SCENE_TRANSITION_CONTRACT_VERSION
+            in MODERN_SCENE_CONTRACT_VERSIONS
         ):
             raise ValueError(
-                "legacy_v1 章纲不能通过普通编辑升级为 V2；请等待显式迁移流程"
+                "legacy_v1 章纲不能通过普通编辑升级合同版本；请等待显式迁移流程"
             )
         if (
-            existing_contract_version == SCENE_TRANSITION_CONTRACT_VERSION
+            existing_contract_version in MODERN_SCENE_CONTRACT_VERSIONS
             and v2_outline_structure(existing)
             != v2_outline_structure(payload)
         ):

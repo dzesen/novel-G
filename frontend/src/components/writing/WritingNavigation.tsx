@@ -82,92 +82,28 @@ export default function WritingNavigation({
   const locale = pathname.startsWith("/en") ? "en" : "zh";
 
   return (
-    <header role="banner" data-testid="writing-shell" className="shrink-0 border-b border-border bg-background">
-      <div className="flex min-w-0 items-center gap-1.5 border-b border-border px-2 py-1.5 sm:gap-2 sm:px-4">
-        <IconButton
-          onClick={() => router.push(`/${locale}`)}
-          label={t("backToShelf")}
-        >
-          <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M19 12H5" />
-            <path d="m12 19-7-7 7-7" />
-          </svg>
+    <header role="banner" data-testid="writing-shell" className="studio-writing-nav">
+      <div className="studio-writing-identity">
+        <IconButton onClick={() => router.push(`/${locale}`)} label={t("backToShelf")}>
+          <svg aria-hidden="true" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M4 5h7v15H4zM14 5l5-1 3 15-5 1zM6.5 8h2M6.5 16h2" /></svg>
         </IconButton>
-        <div className="min-w-0 flex-1 px-1">
-          <p className="truncate text-sm font-semibold text-foreground sm:text-[15px]">
-            {novelTitle || t("untitled")}
-          </p>
-          <p className="hidden truncate text-[11px] text-muted lg:block">{t("workspaceHint")}</p>
-        </div>
-        <nav aria-label={t("supportAria")} className="flex shrink-0 items-center gap-0.5 sm:gap-1">
-          {SUPPORT_AREAS.map((area) => {
-            const active = activeArea === area;
-            return (
-              <button
-                key={area}
-                type="button"
-                onClick={() => onSelectArea(area)}
-                aria-label={t(`areas.${area}.short`)}
-                aria-current={active ? "page" : undefined}
-                className={[
-                  "inline-flex h-10 min-w-10 items-center justify-center gap-2 rounded-md px-2 text-xs font-semibold transition-colors",
-                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus",
-                  active
-                    ? "bg-accent/10 text-accent"
-                    : "text-muted hover:bg-surface-secondary hover:text-foreground",
-                ].join(" ")}
-              >
-                <AreaIcon area={area} />
-                <span className="hidden xl:inline">{t(`areas.${area}.short`)}</span>
-              </button>
-            );
-          })}
-        </nav>
-        <WritingUtilities />
+        <p title={novelTitle}>{novelTitle || t("untitled")}</p>
       </div>
-
-      <nav
-        aria-label={t("primaryAria")}
-        className="grid grid-cols-3 bg-surface"
-      >
-        {PRIMARY_AREAS.map((area, index) => {
-          const active = activeArea === area;
-          return (
-            <button
-              key={area}
-              type="button"
-              onClick={() => onSelectArea(area)}
-              aria-label={t(`areas.${area}.short`)}
-              aria-current={active ? "step" : undefined}
-              className={[
-                "relative min-h-11 min-w-0 border-r border-border px-2 py-2 text-center transition-colors last:border-r-0 sm:min-h-12 sm:px-5",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent",
-                active
-                  ? "bg-accent/10 text-accent after:absolute after:inset-x-3 after:bottom-0 after:h-0.5 after:rounded-full after:bg-accent"
-                  : "text-muted hover:bg-surface-secondary hover:text-foreground",
-              ].join(" ")}
-            >
-              <span
-                className={[
-                  "hidden text-[10px] font-medium sm:block",
-                  active ? "text-accent" : "text-muted",
-                ].join(" ")}
-              >
-                {t("stage", { number: index + 1 })}
-              </span>
-              <span className="flex min-w-0 items-center justify-center gap-1.5 sm:mt-0.5 sm:gap-2">
-                <span className="hidden shrink-0 sm:inline-flex">
-                  <AreaIcon area={area} />
-                </span>
-                <span className="truncate text-xs font-semibold sm:text-sm">
-                  {t(`areas.${area}.short`)}
-                </span>
-              </span>
-            </button>
-          );
-        })}
+      <nav aria-label={t("primaryAria")} className="studio-primary-nav">
+        {PRIMARY_AREAS.map((area) => (
+          <button key={area} type="button" onClick={() => onSelectArea(area)} aria-label={t(`areas.${area}.short`)} aria-current={activeArea === area ? "step" : undefined}>
+            <AreaIcon area={area} /><span>{t(`areas.${area}.short`)}</span>
+          </button>
+        ))}
       </nav>
-
+      <nav aria-label={t("supportAria")} className="studio-support-nav">
+        {SUPPORT_AREAS.map((area) => (
+          <button key={area} type="button" onClick={() => onSelectArea(area)} aria-label={t(`areas.${area}.short`)} aria-current={activeArea === area ? "page" : undefined}>
+            <AreaIcon area={area} /><span>{t(`areas.${area}.short`)}</span>
+          </button>
+        ))}
+      </nav>
+      <div className="studio-writing-tools"><WritingUtilities /></div>
     </header>
   );
 }

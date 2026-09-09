@@ -6,7 +6,8 @@ import { usePathname, useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { Button, Card } from "@heroui/react";
 import AICreateStepper from "./AICreateStepper";
-import { apiPostForm } from "@/lib/api";
+import { apiPost, apiPostForm } from "@/lib/api";
+import CardImportSettingEditor from "../writing/reference-cards/CardImportSettingEditor";
 import { clearAICreateCache } from "@/lib/aiCreateCache";
 import {
   deleteCardAvatarHandoffs,
@@ -102,6 +103,8 @@ export default function CardDrivenCreatePanel({
   onCancel,
 }: CardDrivenCreatePanelProps) {
   const t = useTranslations("create.cardDriven");
+  const adaptationT = useTranslations("cardImportAdaptation");
+  const [savingReview, setSavingReview] = useState(false);
   const tc = useTranslations("create");
   const tb = useTranslations("bookshelf");
   const tm = useTranslations("interopErrors.missingCharacterMetadata");
@@ -110,8 +113,7 @@ export default function CardDrivenCreatePanel({
   const router = useRouter();
   const pathname = usePathname();
   const locale = pathname.startsWith("/en") ? "en" : "zh";
-  const [characterFiles, setCharacterFiles] = useState<File[]>([]);
-  const [worldFile, setWorldFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [proposals, setProposals] = useState<CardImportProposal[]>([]);
   const [decisions, setDecisions] = useState<
     Record<string, CardImportDecision>
@@ -167,13 +169,40 @@ export default function CardDrivenCreatePanel({
     return apiPostForm<CardImportProposal>("/api/card-imports/preview", form);
   };
 
-  const handlePreview = async () => {
-    setGenerationPresetRouting(false);
-    if (characterFiles.length === 0) {
-      setError(t("characterRequired"));
+  const confirmSettingReview = async () => {
+    if (!creationSelections.some((selection) => selection.decisions.some((decision) => decision.action !== "skip"))) {
+      setError(adaptationT("nothingSelected"));
       return;
     }
-    if (characterFiles.length + (worldFile ? 1 : 0) > 32) {
+    setSavingReview(true);
+    setError("");
+    const reviewed = [...proposals];
+    try {
+      for (let index = 0; index < reviewed.length; index += 1) {
+        const selection = creationSelections[index];
+        reviewed[index] = await apiPost<CardImportProposal>(
+          `/api/card-imports/proposals/${selection.proposal_id}/review-direction`,
+          { digest: selection.digest, decisions: selection.decisions },
+        );
+        // Keep successfully saved digests when a later file needs correction.
+        setProposals([...reviewed]);
+      }
+      clearAICreateCache();
+      setStage("direction");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : adaptationT("saveFailed"));
+    } finally {
+      setSavingReview(false);
+    }
+  };
+
+  const handlePreview = async () => {
+    setGenerationPresetRouting(false);
+    if (files.length === 0) {
+      setError(t("filesRequired"));
+      return;
+    }
+    if (files.length > 32) {
       setError(t("tooManyFiles"));
       return;
     }
@@ -181,14 +210,10 @@ export default function CardDrivenCreatePanel({
     setError("");
     const staged: CardImportProposal[] = [];
     try {
-      for (const file of characterFiles) {
+      for (const file of files) {
         const proposal = await stageFile(file);
-        if (
-          !proposal.proposed_cards.some(
-            (candidate) => candidate.target_type === "character",
-          )
-        ) {
-          throw new Error(t("notCharacterCard", { name: file.name }));
+        if (proposal.proposed_cards.length === 0) {
+          throw new Error(t("noCandidates", { name: file.name }));
         }
         staged.push(proposal);
         if (proposal.avatar_preview?.importable) {
@@ -205,13 +230,12 @@ export default function CardDrivenCreatePanel({
           }
         }
       }
-      if (worldFile) {
-        const proposal = await stageFile(worldFile);
-        if (proposal.source_format !== "worldbook_standalone") {
-          throw new Error(t("notWorldBook", { name: worldFile.name }));
-        }
-        staged.push(proposal);
-      }
+      // Preserve character-first priority in the bounded direction projection.
+      staged.sort(
+        (left, right) =>
+          Number(left.source_format === "worldbook_standalone") -
+          Number(right.source_format === "worldbook_standalone"),
+      );
       const nextDecisions: Record<string, CardImportDecision> = {};
       for (const proposal of staged) {
         for (const candidate of proposal.proposed_cards) {
@@ -252,6 +276,7 @@ export default function CardDrivenCreatePanel({
         next[decisionKey(proposal.proposal_id, candidate.candidate_id)] = {
           candidate_id: candidate.candidate_id,
           action,
+          overrides: decisions[decisionKey(proposal.proposal_id, candidate.candidate_id)]?.overrides,
         };
       }
     }
@@ -296,6 +321,7 @@ export default function CardDrivenCreatePanel({
     ).catch(() => undefined);
     setProposals([]);
     setDecisions({});
+    setFiles([]);
     setStage("upload");
   };
 
@@ -303,8 +329,8 @@ export default function CardDrivenCreatePanel({
     <div className="h-full flex flex-col">
       <Card className="h-full flex flex-col overflow-hidden">
         <Card.Header className="shrink-0">
-          <div className="flex items-center justify-between gap-4 w-full">
-            <div>
+          <div className="flex flex-wrap items-center justify-between gap-4 w-full min-w-0">
+            <div className="min-w-0 flex-1">
               <h2 className="text-lg font-bold text-foreground">{t("title")}</h2>
               <p className="mt-1 text-xs text-muted">{t("subtitle")}</p>
             </div>
@@ -312,13 +338,14 @@ export default function CardDrivenCreatePanel({
               variant="ghost"
               size="sm"
               onPress={() => void discardAndCancel()}
+              isDisabled={savingReview}
             >
               {tc("entry.backToMethods")}
             </Button>
           </div>
         </Card.Header>
 
-        <Card.Content className="flex-1 overflow-y-auto">
+        <Card.Content className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           {redirecting ? (
             <div className="flex items-center justify-center h-32">
               <p className="text-sm text-muted">{tb("draftRedirect")}</p>
@@ -327,50 +354,31 @@ export default function CardDrivenCreatePanel({
             <div className="space-y-5 p-1">
               <div className="rounded-xl border border-border p-4">
                 <label
-                  htmlFor="card-driven-characters"
+                  htmlFor="card-driven-files"
                   className="block text-sm font-semibold text-foreground"
                 >
-                  {t("characterFiles")}
+                  {t("files")}
                 </label>
-                <p className="mt-1 text-xs leading-5 text-muted">
-                  {t("characterFilesHint")}
+                <p id="card-driven-files-hint" className="mt-1 text-xs leading-5 text-muted">
+                  {t("filesHint")}
                 </p>
                 <input
-                  id="card-driven-characters"
+                  id="card-driven-files"
+                  aria-describedby="card-driven-files-hint"
                   type="file"
                   multiple
                   accept=".json,.png,application/json,image/png"
+                  disabled={uploading}
                   className="mt-3 block w-full text-sm text-foreground file:mr-3 file:rounded-lg file:border-0 file:bg-primary/10 file:px-3 file:py-2 file:text-primary"
                   onChange={(event) =>
-                    setCharacterFiles(Array.from(event.target.files ?? []))
+                    setFiles(Array.from(event.target.files ?? []))
                   }
                 />
-                {characterFiles.length > 0 && (
+                {files.length > 0 && (
                   <p className="mt-2 text-xs text-muted">
-                    {t("selectedFiles", { count: characterFiles.length })}
+                    {t("selectedFiles", { count: files.length })}
                   </p>
                 )}
-              </div>
-
-              <div className="rounded-xl border border-border p-4">
-                <label
-                  htmlFor="card-driven-world"
-                  className="block text-sm font-semibold text-foreground"
-                >
-                  {t("worldFile")}
-                </label>
-                <p className="mt-1 text-xs leading-5 text-muted">
-                  {t("worldFileHint")}
-                </p>
-                <input
-                  id="card-driven-world"
-                  type="file"
-                  accept=".json,application/json"
-                  className="mt-3 block w-full text-sm text-foreground file:mr-3 file:rounded-lg file:border-0 file:bg-primary/10 file:px-3 file:py-2 file:text-primary"
-                  onChange={(event) =>
-                    setWorldFile(event.target.files?.[0] ?? null)
-                  }
-                />
               </div>
 
               <div className="rounded-xl border border-warning/40 bg-warning/5 p-4">
@@ -385,7 +393,7 @@ export default function CardDrivenCreatePanel({
               {error && (
                 <div
                   role="alert"
-                  className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/30 dark:text-red-300"
+                  className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 [overflow-wrap:anywhere] dark:bg-red-950/30 dark:text-red-300"
                 >
                   <p>{error}</p>
                   {generationPresetRouting && (
@@ -402,7 +410,7 @@ export default function CardDrivenCreatePanel({
               <Button
                 variant="primary"
                 className="w-full"
-                isDisabled={uploading || characterFiles.length === 0}
+                isDisabled={uploading || files.length === 0}
                 onPress={handlePreview}
               >
                 {uploading ? t("parsing") : t("preview")}
@@ -428,6 +436,7 @@ export default function CardDrivenCreatePanel({
                       variant="secondary"
                       size="sm"
                       onPress={() => setBulkAction("create")}
+                      isDisabled={savingReview}
                     >
                       {t("bulkCreate")}
                     </Button>
@@ -435,6 +444,7 @@ export default function CardDrivenCreatePanel({
                       variant="ghost"
                       size="sm"
                       onPress={() => setBulkAction("skip")}
+                      isDisabled={savingReview}
                     >
                       {t("bulkSkip")}
                     </Button>
@@ -448,7 +458,7 @@ export default function CardDrivenCreatePanel({
                   className="rounded-xl border border-border p-4"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h4 className="text-sm font-semibold text-foreground">
+                    <h4 className="min-w-0 text-sm font-semibold text-foreground [overflow-wrap:anywhere]">
                       {proposal.source_name || t("unnamedSource")}
                     </h4>
                     <span className="rounded-full bg-muted/20 px-2 py-1 text-xs text-muted">
@@ -534,6 +544,9 @@ export default function CardDrivenCreatePanel({
                               {candidate.fields.description}
                             </p>
                           )}
+                          <CardImportSettingEditor proposal={proposal} candidate={candidate}
+                            decision={current ?? recommendedDecision(candidate)} disabled={savingReview}
+                            onDecision={(next) => setDecisions((previous) => ({ ...previous, [key]: next }))} />
                           {candidate.candidate_id === "character:0" &&
                             candidate.fields.interop && (
                               <p className="mt-2 text-xs leading-5 text-warning">
@@ -561,15 +574,14 @@ export default function CardDrivenCreatePanel({
                           </label>
                           <select
                             id={`decision-${key}`}
+                            disabled={savingReview}
                             className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
                             value={current ? decisionValue(current) : "create"}
                             onChange={(event) =>
                               setDecisions((previous) => ({
                                 ...previous,
-                                [key]: parseDecisionValue(
-                                  candidate,
-                                  event.target.value,
-                                ),
+                                [key]: { ...parseDecisionValue(candidate, event.target.value),
+                                  overrides: previous[key]?.overrides },
                               }))
                             }
                           >
@@ -636,19 +648,17 @@ export default function CardDrivenCreatePanel({
                   variant="ghost"
                   className="sm:flex-1"
                   onPress={() => void chooseAgain()}
+                  isDisabled={savingReview}
                 >
                   {t("chooseAgain")}
                 </Button>
                 <Button
                   variant="primary"
                   className="sm:flex-[2]"
-                  onPress={() => {
-                    clearAICreateCache();
-                    setError("");
-                    setStage("direction");
-                  }}
+                  isDisabled={savingReview}
+                  onPress={() => void confirmSettingReview()}
                 >
-                  {t("confirmReview")}
+                  {savingReview ? adaptationT("saving") : t("confirmReview")}
                 </Button>
               </div>
             </div>

@@ -1,4 +1,32 @@
 {
+  "cardImportAdaptation": {
+    "open": "Review and edit novel material",
+    "name": "Reference name",
+    "description": "Adapted material",
+    "confirm": "I checked the source and confirm this material is ready to import.",
+    "editingHint": "These edits will be used for book creation and formal references. When merging, also select the fields to overwrite. The original card is retained separately.",
+    "source": "Compare with the original",
+    "sourceHint": "Original card text is shown for comparison only. Its code and templates do not run on this page.",
+    "saving": "Saving review…",
+    "saveFailed": "Could not save the review. Please try again.",
+    "nothingSelected": "Keep at least one reviewed reference.",
+    "isolatedDetails": "Show sources of isolated content ({count} items)",
+    "status": {
+      "ready": "Adapted",
+      "review_required": "Review needed",
+      "reference_only": "Source only"
+    },
+    "notices": {
+      "roles": "Player references use the protagonist role. Character placeholders use the character name or that character. Edit these roles for your novel as needed.",
+      "conditions": "Branches retain their conditions. Different branches are not simultaneous facts and do not update current character state.",
+      "structured": "Structured records have been expanded into readable fields with their hierarchy retained.",
+      "presentation": "Display tags were removed while visible text was retained.",
+      "code": "Scripts, styles and runtime code are retained only in the original source.",
+      "unknown": "Some dynamic content is unresolved and excluded. Check the original, supply the facts you need, or skip this reference.",
+      "state": "A condition uses an undefined state variable. Check its meaning before accepting.",
+      "unsupported": "This template contains unsupported syntax or exceeds local processing limits. Write novel material based on the original, or skip it."
+    }
+  },
   "authorInput": {
     "title": "Creative requirements",
     "optionalTitle": "Add creative requirements (optional)",
@@ -22,7 +50,11 @@
     "language": "Language",
     "theme": "Theme",
     "logout": "Log out",
-    "loggingOut": "Logging out…"
+    "loggingOut": "Logging out…",
+    "brand": "novel-G",
+    "home": "novel-G home",
+    "studio": "Writing studio",
+    "workspace": "Author workspace"
   },
   "auth": {
     "product": "AI Novel Generator",
@@ -68,7 +100,8 @@
     "providerDeleteMissingToken": "The configuration preview did not return a confirmation token",
     "generationRoles": {
       "title": "Generation Roles",
-      "description": "Manage role instructions, Providers, and defaults used by fixed generation capabilities. Generation roles do not plan autonomously, choose tools, or write formal content directly."
+      "description": "Manage role instructions, Providers, and defaults used by fixed generation capabilities. Generation roles do not plan autonomously, choose tools, or write formal content directly.",
+      "usage": "Choose these roles in new-book creative direction, outline scene rewriting, creative and review tools, or prompt generation for covers, portraits and scene illustrations. After saving a custom role, select it in the matching tool. Chapter outlines, prose and state extraction use fixed built-in roles with no custom instructions."
     },
     "users": {
       "title": "Local users",
@@ -111,7 +144,8 @@
       "semanticColors": "Semantic Colors",
       "scaleColors": "Color Scale (Advanced)",
       "preset_forest": "Forest",
-      "preset_warm": "Warm"
+      "preset_warm": "Warm",
+      "preset_ink": "Ink & paper"
     },
     "backup": {
       "title": "Backup & Restore",
@@ -674,7 +708,31 @@
       },
       "stepLabel": "Step",
       "providerNotExist": "Selected Provider does not exist",
-      "providerDisabled": "Selected Provider is disabled, enable it manually after saving"
+      "providerDisabled": "Selected Provider is disabled, enable it manually after saving",
+      "stepNames": {
+        "story_plan": "Story plan",
+        "blueprint": "Book blueprint",
+        "expand_idea_to_full_novel_story": "Story expansion",
+        "extract_idea": "Story elements",
+        "core_seed": "Core seed",
+        "novel_meta": "Novel setup",
+        "create_core_factions": "Core factions",
+        "reference_cards": "Reference card candidates",
+        "volume_outline": "Volume outline",
+        "chapter_outline": "Chapter outline",
+        "chapter_content": "Chapter prose",
+        "chapter_state": "Chapter state extraction",
+        "remediation_planner": "Remediation planning",
+        "prose_candidate_rewrite": "Prose candidate rewrite",
+        "outline_adherence": "Outline adherence review",
+        "scene_rewrite": "Scene rewrite",
+        "direction": "Creative direction",
+        "inspiration": "Creative inspiration",
+        "review": "Continuity review",
+        "style_consistency_review": "Style and character voice review",
+        "illustration_prompt": "Illustration prompt translation",
+        "volume_retrospective_review": "Volume retrospective"
+      }
     },
     "validation": {
       "providerNotExist": "Referenced Provider does not exist, cannot save",
@@ -682,16 +740,16 @@
     }
   },
   "bookshelf": {
-    "title": "My Bookshelf",
+    "title": "Your library",
     "newNovel": "New Novel",
     "newFromTavernCards": "New from Tavern Cards",
     "chapterCount": "{count} ch.",
     "wordCount": "{count} words",
-    "emptyGuide": "Your bookshelf is empty. Click \"New Novel\" to start your creative journey!",
+    "emptyGuide": "Bring an idea, or begin with a blank page. You decide where the story goes.",
     "noSelection": "Select a novel from the left to view details, or create a new one",
     "backToShelf": "Back to bookshelf",
     "novelCount": "{count} novels total",
-    "searchPlaceholder": "Search novels...",
+    "searchPlaceholder": "Search works or genres…",
     "deleteConfirm": "Confirm to delete \"{title}\"? This can be restored.",
     "deleteSuccess": "Moved to trash",
     "deleteFailed": "Delete failed",
@@ -704,7 +762,34 @@
     "goWriting": "Open Writing Desk",
     "aiCompleteRedirect": "AI generation complete, redirecting to writing desk...",
     "draftRedirect": "Opening the editable book blueprint…",
-    "coverAssetMissing": "Cover asset missing"
+    "coverAssetMissing": "Cover asset missing",
+    "studioDescription": "A place for every world. A little room for the next chapter.",
+    "resumeWriting": "Continue your story",
+    "allWorks": "All works",
+    "manuscript": "Manuscript",
+    "filterLabel": "Filter by writing status",
+    "filters": {
+      "all": "All works",
+      "ongoing": "Ongoing",
+      "draft": "Drafts",
+      "completed": "Completed",
+      "paused": "Paused"
+    },
+    "sortLabel": "Sort works",
+    "sortUpdated": "Recently updated",
+    "sortTitle": "By title",
+    "loading": "Opening your library…",
+    "emptyTitle": "Make room for your first story",
+    "noResults": "No matching works",
+    "noResultsHint": "Try another keyword or show all writing statuses.",
+    "clearFilters": "Clear filters",
+    "updatedOn": "Updated {date}",
+    "openWork": "Open workspace: {title}",
+    "libraryFootnote": "From an idea to a book.",
+    "loadFailed": "Your library could not be loaded",
+    "loadFailedHint": "Check that the local service is running, then try again.",
+    "detailLoadFailed": "This work could not be opened",
+    "retry": "Try again"
   },
   "novel": {
     "title": "Title",
@@ -847,17 +932,14 @@
     "cardDriven": {
       "title": "Create from Tavern Cards",
       "subtitle": "Review card mappings first, then let the Creative Director turn the characters and world into long-form directions.",
-      "characterFiles": "Character cards (at least one)",
-      "characterFilesHint": "Supports Character Card V1/V2/V3 JSON and PNG files with chara/ccv3 metadata. Embedded card avatars enter managed storage after the novel and character decisions are formally applied.",
-      "worldFile": "Standalone world card (optional)",
-      "worldFileHint": "You may also choose one SillyTavern World Info JSON file. A character_book embedded in a character card is previewed with that card.",
-      "selectedFiles": "{count} character cards selected",
+      "files": "Character cards or world books",
+      "filesHint": "Choose Tavern character-card JSON / PNG files, standalone World Info JSON files, or a mix of both, up to 32 files. World books can be used on their own. File types are detected automatically, and embedded world books are previewed with their cards.",
+      "selectedFiles": "{count} files selected",
       "safetyTitle": "Import boundaries",
       "safetyDescription": "System prompts, post-history instructions, depth prompts, regex scripts, and unknown extensions always stay isolated. scenario, first_mes, and mes_example only inform the next direction preview; they never become established facts, character state, or first-chapter prose.",
-      "characterRequired": "Choose at least one character card.",
+      "filesRequired": "Choose at least one character-card or world-book file.",
       "tooManyFiles": "You can review at most 32 character-card and world-card files at once.",
-      "notCharacterCard": "“{name}” did not produce a character candidate. Put standalone world books in the world-card field.",
-      "notWorldBook": "“{name}” is not a standalone SillyTavern world book.",
+      "noCandidates": "“{name}” contains no importable characters or world entries. Choose a character card or world book with entries.",
       "previewFailed": "Card parsing or mapping preview failed.",
       "avatarHandoffFailed": "The avatar source file could not be retained safely. Choose the file again and retry.",
       "parsing": "Parsing cards and staging proposals…",
@@ -936,11 +1018,21 @@
       "supportLabel": "Support",
       "stage": "Stage {number}",
       "areas": {
-        "blueprint": { "short": "Blueprint" },
-        "writing": { "short": "Write & revise" },
-        "auto-book": { "short": "Auto-book" },
-        "world": { "short": "World data" },
-        "continuity": { "short": "Continuity & state" }
+        "blueprint": {
+          "short": "Blueprint"
+        },
+        "writing": {
+          "short": "Write & revise"
+        },
+        "auto-book": {
+          "short": "Auto-book"
+        },
+        "world": {
+          "short": "World data"
+        },
+        "continuity": {
+          "short": "Continuity & state"
+        }
       },
       "viewAria": "Current module view",
       "views": {
@@ -1027,13 +1119,34 @@
       "decisionsTitle": "Review every domain",
       "decisionsDescription": "Counts are a factual snapshot of formal data. Choosing Not needed does not delete existing content.",
       "domains": {
-        "character": { "label": "Characters", "description": "Character identities, aliases, and portrayal data" },
-        "location": { "label": "Locations", "description": "Scene spaces and geographic data" },
-        "item": { "label": "Items", "description": "Important props and objects" },
-        "rule": { "label": "Rules", "description": "World rules, systems, and constraints" },
-        "lore": { "label": "Lore", "description": "History, culture, and background" },
-        "factions": { "label": "Factions", "description": "Groups, goals, and conflicts" },
-        "relationships": { "label": "Faction relationships", "description": "Formal relationships between factions" }
+        "character": {
+          "label": "Characters",
+          "description": "Character identities, aliases, and portrayal data"
+        },
+        "location": {
+          "label": "Locations",
+          "description": "Scene spaces and geographic data"
+        },
+        "item": {
+          "label": "Items",
+          "description": "Important props and objects"
+        },
+        "rule": {
+          "label": "Rules",
+          "description": "World rules, systems, and constraints"
+        },
+        "lore": {
+          "label": "Lore",
+          "description": "History, culture, and background"
+        },
+        "factions": {
+          "label": "Factions",
+          "description": "Groups, goals, and conflicts"
+        },
+        "relationships": {
+          "label": "Faction relationships",
+          "description": "Formal relationships between factions"
+        }
       },
       "count": "{count} formal records",
       "openDomain": "Open {domain}",
@@ -1076,17 +1189,17 @@
       "description": "Run readiness, budget authorization, volume or whole-book jobs, recovery, and diagnostics in one place. Formal prose still goes through the shared chapter service.",
       "pages": {
         "readiness": {
-          "title": "Authorize, check, and start",
-          "description": "Choose a volume or whole-book scope, freeze the budget and automation permissions, then run a zero-cost readiness check. This page has no run controls and opening it never calls a model."
+          "title": "Book workspace",
+          "description": "Choose what to generate, follow progress, and pick up paused work here."
         },
         "runs": {
-          "title": "Runs and recovery",
-          "description": "Manage progress, pauses, recovery, and unfinished drafts for the current or most recent unfinished job. Start a new job from Readiness & start."
+          "title": "Book workspace",
+          "description": "Choose what to generate, follow progress, and pick up paused work here."
         },
         "diagnostics": {
           "eyebrow": "Failure evidence and recovery",
-          "title": "Generation failure diagnostics",
-          "description": "Separate confirmed evidence, strong inference, and insufficient evidence, then show the impact and next action for each failure."
+          "title": "Exception statistics",
+          "description": "Review recorded exception categories and evidence from recent tasks. Open the relevant task to take action."
         }
       },
       "structureCount": "{volumes} volumes · {chapters} chapters",
@@ -1094,26 +1207,31 @@
       "structureLoadingOption": "Loading target volume…",
       "viewAria": "Auto-book views",
       "views": {
-        "readiness": "Readiness & start",
-        "runs": "Runs & recovery",
-        "generation-runs": "Generation records",
-        "diagnostics": "Diagnostics",
+        "readiness": "Book workspace",
+        "runs": "Book workspace",
+        "generation-runs": "Task records",
+        "diagnostics": "Exception statistics",
         "retrospective": "Experimental volume review"
       },
       "volumeLabel": "Target volume",
       "noVolumes": "No runnable volume yet",
       "startVolume": "Generate volume",
       "startBook": "Generate whole book",
-      "explicitCostHint": "Opening readiness does not call a model. Paid requests begin only after the final start action confirms the budget and call ceiling.",
-      "runsTitle": "Current job controls",
+      "explicitCostHint": "Set a budget and generation options, then review the checks before confirming the start.",
+      "runsTitle": "Current task",
       "runsDescription": "Active progress updates here. Resume pauses caused by budget, source changes, or unfinished prose from the same place.",
       "backToRuns": "Back to runs and recovery",
-      "diagnosticsUnresolvedTitle": "{count} failures still lack sufficient evidence",
-      "diagnosticsUnresolvedDescription": "The system will not guess a cause. Open the linked generation record to inspect the step, provider attempts, and timing. Newly observed known Provider failures now receive more specific classifications.",
-      "diagnosticsPrivacyHint": "Diagnostics retain only safe categories, evidence, impact, action codes, and correlation identifiers. They never retain prompts, prose, raw Provider responses, or secrets.",
+      "diagnosticsUnresolvedTitle": "{count} events have an unknown category",
+      "diagnosticsUnresolvedDescription": "These are historical events, not a count of tasks awaiting action. Check each task’s current status for what needs attention.",
+      "diagnosticsPrivacyHint": "Statistics use saved runtime events and contain only execution information and linked identifiers.",
       "loadFailed": "Failed to load the volume and chapter structure",
       "retry": "Retry",
-      "operationAria": "Auto-book runs and recovery"
+      "operationAria": "Auto-book runs and recovery",
+      "workbenchTitle": "Book workspace",
+      "workbenchDescription": "Choose what to generate, follow progress, and pick up paused work here.",
+      "newTaskTitle": "Start a new book task",
+      "allRecords": "View all records",
+      "backToRecords": "Back to task records"
     },
     "agentStudio": {
       "eyebrow": "Controlled intelligence",
@@ -1799,7 +1917,19 @@
         "assistantOutlineDescription": "Generate or revise a structured outline, then review its scenes and formal reference IDs before acceptance.",
         "assistantProseDescription": "Generate from the accepted outline. Incomplete output never enters the formal content chain.",
         "assistantIllustrationDescription": "Prepare an illustration from accepted scenes and formal character references.",
-        "assistantStateDescription": "Read saved prose and create a reviewable state proposal without writing formal state directly."
+        "assistantStateDescription": "Read saved prose and create a reviewable state proposal without writing formal state directly.",
+        "enterFocus": "Focus mode",
+        "exitFocus": "Exit focus",
+        "manuscript": "Chapter manuscript",
+        "toolsLabel": "Chapter tools",
+        "hideAssistant": "Hide AI assistant",
+        "quickActions": "AI chapter tools",
+        "assistantChooseChapter": "Choose a chapter to write with AI",
+        "assistantChooseChapterHint": "Select a chapter in the directory, or create one.",
+        "assistantReadyTitle": "Outline ready. Start writing.",
+        "assistantReadyHint": "Generate prose from the outline with AI, or keep refining the plot.",
+        "assistantStartTitle": "Shape this chapter first",
+        "assistantStartHint": "Plan scenes and plot with AI, then accept the outline before generating prose."
       },
       "status": "Status",
       "statuses": {
@@ -1968,9 +2098,16 @@
         "referenceAssetLabel": "Main reference asset",
         "referenceAssetNone": "No managed reference available",
         "referenceAssetOption": "Reference {index}",
-        "pipelineKinds": { "quick": "Quick image", "consistency": "Character consistency" },
+        "pipelineKinds": {
+          "quick": "Quick image",
+          "consistency": "Character consistency"
+        },
         "qualityStatus": "Acceptance status: {status}",
-        "qualityStatuses": { "accepted": "Accepted", "experimental": "Experimental", "drifted": "Configuration changed" },
+        "qualityStatuses": {
+          "accepted": "Accepted",
+          "experimental": "Experimental",
+          "drifted": "Configuration changed"
+        },
         "qualityAcknowledge": "I understand this pipeline has not passed the recorded 12-case acceptance set or has configuration drift.",
         "qualityAcknowledgeRequired": "Acknowledge the pipeline quality status before creating a run",
         "externalAdapterRegistered": "External LoRA registered: {name}",
@@ -1979,16 +2116,31 @@
         "createRun": "Create staged run",
         "runLabel": "Illustration run",
         "runOption": "{pipeline} · {status} · revision {revision}",
-        "runStatuses": { "active": "In progress", "finalized": "Finalized", "cancelled": "Cancelled", "failed": "Failed", "branched": "Branched" },
+        "runStatuses": {
+          "active": "In progress",
+          "finalized": "Finalized",
+          "cancelled": "Cancelled",
+          "failed": "Failed",
+          "branched": "Branched"
+        },
         "runPrerequisites": "Choose a pipeline and managed reference asset first",
         "runCreated": "Staged run created without starting a provider call",
         "branchCreated": "A new branch was created from the finalized asset",
         "timelineLabel": "Illustration stage timeline",
-        "stage": { "compose": "Compose", "identity_edit": "Identity correction", "refine": "Optional refine" },
+        "stage": {
+          "compose": "Compose",
+          "identity_edit": "Identity correction",
+          "refine": "Optional refine"
+        },
         "stageStatus": {
-          "locked": "Locked", "ready": "Ready", "running": "Running",
-          "awaiting_selection": "Choose a candidate", "selected": "Candidate selected",
-          "failed": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"
+          "locked": "Locked",
+          "ready": "Ready",
+          "running": "Running",
+          "awaiting_selection": "Choose a candidate",
+          "selected": "Candidate selected",
+          "failed": "Failed",
+          "cancelled": "Cancelled",
+          "skipped": "Skipped"
         },
         "readinessTitle": "Explicit readiness check",
         "readinessDescription": "Read-only check of frozen providers, workflows, queues, references, and acceptance evidence. It does not submit an image job.",
@@ -1997,7 +2149,10 @@
         "readinessBlocked": "Readiness is blocked",
         "readinessRequired": "Run a passing readiness check for the current run revision before starting this stage",
         "readinessCalls": "Conservative maximum provider calls for this run: {calls}",
-        "readiness": { "passed": "Ready to start explicitly", "blocked": "Blocked — resolve the issues below" },
+        "readiness": {
+          "passed": "Ready to start explicitly",
+          "blocked": "Blocked — resolve the issues below"
+        },
         "readinessIssueWithStage": "{stage}: {issue}",
         "readinessIssues": {
           "missing_required_binding": "The workflow is missing a required input; check the current pipeline configuration",
@@ -2026,8 +2181,16 @@
         "mustPreserve": "Must preserve",
         "refineStrength": "Refine strength: {value}",
         "candidateAlt": "{stage} candidate",
-        "candidateSource": { "generated": "Model generated", "imported": "External import" },
-        "candidateState": { "available": "Available", "selected": "Selected", "discarded": "Discarded", "finalized": "Finalized" },
+        "candidateSource": {
+          "generated": "Model generated",
+          "imported": "External import"
+        },
+        "candidateState": {
+          "available": "Available",
+          "selected": "Selected",
+          "discarded": "Discarded",
+          "finalized": "Finalized"
+        },
         "selectCandidate": "Select",
         "discardCandidate": "Discard",
         "restoreCandidate": "Restore",
@@ -2039,10 +2202,19 @@
         "stageAdvanced": "Next stage unlocked without starting a provider call",
         "jobStatus": "Current provider job: {status}",
         "jobStatuses": {
-          "pending": "Waiting to submit", "submitting": "Submitting", "queued": "Queued", "running": "Generating",
-          "cancelling": "Cancelling", "late_cleanup_pending": "Waiting to clean up a late result", "storing_asset": "Saving asset",
-          "finalizing": "Finalizing", "succeeded": "Completed", "failed": "Failed", "rejected": "Rejected",
-          "cancelled": "Cancelled", "cancel_failed": "Cancellation failed"
+          "pending": "Waiting to submit",
+          "submitting": "Submitting",
+          "queued": "Queued",
+          "running": "Generating",
+          "cancelling": "Cancelling",
+          "late_cleanup_pending": "Waiting to clean up a late result",
+          "storing_asset": "Saving asset",
+          "finalizing": "Finalizing",
+          "succeeded": "Completed",
+          "failed": "Failed",
+          "rejected": "Rejected",
+          "cancelled": "Cancelled",
+          "cancel_failed": "Cancellation failed"
         },
         "cancelJob": "Cancel current stage job",
         "jobCancelled": "Stage job cancelled; the run can retry from this stage",
@@ -2577,11 +2749,11 @@
       "generationRunsEntryDescription": "Inspect generation jobs, incomplete prose, and diagnostics in Generation runs.",
       "generationRunsNoCurrent": "There is no job to recover. Finished jobs remain available in Generation runs.",
       "generationRunsExceptionEntry": "This generation has an exception or recovery point. Inspect it in Generation runs.",
-      "generationRunsOpen": "View generation runs",
+      "generationRunsOpen": "View task records",
       "generationRunsOpenDiagnostic": "View this diagnosis in generation runs",
-      "diagnosticsTitle": "Recent generation diagnostics",
-      "diagnosticsDescription": "Counts failure events and affected jobs across the latest 30 batch jobs. It keeps only categories, evidence, and metrics—not prose, prompts, or secrets.",
-      "diagnosticsRefresh": "Refresh diagnostics",
+      "diagnosticsTitle": "Recent exception categories",
+      "diagnosticsDescription": "Grouped by saved event categories. Some causes are inferred; review the evidence for each event.",
+      "diagnosticsRefresh": "Refresh statistics",
       "diagnosticsLoading": "Loading diagnostics…",
       "diagnosticsLoadError": "Recent diagnostics could not be loaded. Other batch-generation controls remain available.",
       "diagnosticsRetry": "Retry",
@@ -2767,7 +2939,7 @@
       "leftoverDiscarding": "Discarding…",
       "leftoverConfirmDiscard": "Discard and restart",
       "reviewTitle": "Checkpoint review",
-      "reviewRecoveryTitle": "Resume batch generation",
+      "reviewRecoveryTitle": "Task paused, awaiting action",
       "reviewSuccessorTitle": "Restart batch generation",
       "checkpointWordCount": "Prose: {actual} actual / {target} target words ({ratio}×)",
       "checkpointWordCountOverrun": "Clearly above the target. This is review-only and will not reject prose or pause the job.",
@@ -2965,10 +3137,15 @@
       "successorConfirmTitle": "Start again from the current content?",
       "successorConfirmBody": "This job is bound to an obsolete content snapshot and cannot continue. Ending it will not delete or roll back completed chapters or author edits, and will not call a Provider. You will then review a new preflight and start confirmation for the same scope.",
       "successorConfirmYes": "End old job and run preflight",
-      "successorPreparing": "Preparing a new preflight…"
+      "successorPreparing": "Preparing a new preflight…",
+      "currentLoading": "Loading the current task…",
+      "currentEmptyTitle": "No task in progress",
+      "currentEmptyDescription": "Choose a volume or the whole book above. Progress and any issues that need your attention will appear here."
     },
     "judgeReviews": {
       "title": "Judge review records",
+      "entryDescription": "Review this chapter’s results and compare versions and evidence.",
+      "close": "Close review records",
       "description": "Read conclusions, evidence and each response. Opening, refreshing and comparing records does not call a model.",
       "refresh": "Refresh records",
       "loading": "Loading records…",
@@ -3215,7 +3392,7 @@
       }
     },
     "generationRuns": {
-      "loadedHistoryHint": "{count} root tasks loaded. Filters apply to loaded records; load earlier history for more. Stage runs stay under their root task.",
+      "loadedHistoryHint": "Filters apply to the {count} loaded book tasks and the current prose execution records.",
       "loadMoreHistory": "Load earlier records",
       "stageHistory": "Stage history",
       "stageHistoryEmpty": "This task has no separate stage runs.",
@@ -3233,8 +3410,8 @@
         "blocked": "awaiting action",
         "unknown": "execution stage"
       },
-      "title": "Generation runs",
-      "description": "Inspect batch jobs and single-chapter prose runs. Records expose operational metadata only; prose and prompts stay private.",
+      "title": "Task records",
+      "description": "Browse results by task and open execution details when you need them.",
       "backToEditor": "Back to auto-book",
       "refresh": "Refresh",
       "refreshing": "Refreshing…",
@@ -3280,8 +3457,8 @@
       "timeDay": "Past day",
       "timeWeek": "Past 7 days",
       "timeMonth": "Past month",
-      "jobsTitle": "Jobs ({count})",
-      "jobsListAria": "Job list",
+      "jobsTitle": "Book tasks ({count})",
+      "jobsListAria": "Book task list",
       "jobsEmpty": "No jobs match these filters.",
       "unknown": "unknown",
       "detailTitle": "Run detail",
@@ -3315,7 +3492,7 @@
       "chapterStepProgress": "Steps {completed} / {total} ({percent}%)",
       "chapterTokensCumulative": "{tokens} cumulative tokens",
       "openChapter": "Open chapter",
-      "eventsTitle": "Diagnostic timeline",
+      "eventsTitle": "Exception events",
       "eventsEmpty": "No structured diagnostic events are recorded for this job.",
       "eventLocated": "The deep-link target is selected in this timeline.",
       "eventTimeUnknown": "Occurrence time not recorded",
@@ -3327,8 +3504,8 @@
         "history_recorded": "Historical issue · no longer blocking"
       },
       "actionError": "Action failed: {message}",
-      "telemetryTitle": "Single-chapter prose run telemetry",
-      "telemetryDescription": "Per-scene counters are metadata only and never include prose or prompts.",
+      "telemetryTitle": "Prose execution records",
+      "telemetryDescription": "Chapter prose runs from both individual generation and book tasks.",
       "telemetryChapterDescription": "Showing run telemetry for {title}. Per-scene counters never include prose or prompts.",
       "telemetryJobDescription": "Only prose runs created directly by this job or bound through its candidate checkpoints are shown.",
       "telemetryJobChapterDescription": "Only prose runs for {title} that belong to this job are shown.",
@@ -3355,7 +3532,21 @@
       "lengthAdvisoryTitle": "Length note (does not affect completeness):",
       "sceneLengthAdvisory": "Length note: {message}",
       "advisorySeparator": "; ",
-      "sceneEmpty": "No scene-level checkpoint has been persisted yet."
+      "sceneEmpty": "No scene-level checkpoint has been persisted yet.",
+      "recordKindAria": "Record type",
+      "kindJobs": "Book tasks",
+      "kindChapters": "Chapter generation",
+      "backToList": "Back to records",
+      "clearFilters": "Clear filters",
+      "openInWorkbench": "Open in workspace",
+      "usageAndAuthorization": "Usage and authorization",
+      "runDetails": "View execution details",
+      "moreProseRecords": "Show more prose records",
+      "runWordCount": "{actual} / {requested} words",
+      "runSceneCount": "Scenes {completed} / {total}",
+      "moreRecords": "More views",
+      "openStatistics": "Exception statistics",
+      "openRetrospective": "Volume retrospective (experimental)"
     },
     "referenceCards": {
       "typeSwitcherLabel": "Reference card type",

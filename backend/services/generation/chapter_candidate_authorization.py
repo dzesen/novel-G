@@ -62,7 +62,7 @@ from backend.services.llm.generation_runtime import (
 CANDIDATE_REPAIR_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_repair_authorization.v14"
 )
-CANDIDATE_PIPELINE_REVISION = 47
+CANDIDATE_PIPELINE_REVISION = 49
 CANDIDATE_STRUCTURED_PLAN_SCHEMA = "candidate_structured_generation_plan.v4"
 CANDIDATE_JOB_EXECUTION_AUTHORIZATION_SCHEMA = (
     "chapter_candidate_job_execution_authorization.v2"
@@ -188,7 +188,7 @@ class RuntimeToolDescriptorSnapshot(_ClosedAuthorizationModel):
 
 class CandidateStructuredGenerationPlan(_ClosedAuthorizationModel):
     schema_version: Literal["candidate_structured_generation_plan.v4"]
-    runtime_budget_protocol: Literal["structured_request_budget.v2"]
+    runtime_budget_protocol: Literal["structured_request_budget.v3"]
     workflow: str = Field(min_length=1, max_length=160)
     step: str = Field(min_length=1, max_length=160)
     provider_alias: str = Field(min_length=1, max_length=160)
@@ -300,7 +300,7 @@ class CandidateJobGenerationPlan(_ClosedAuthorizationModel):
     """Closed, reconstructable identity for one initial candidate Job call."""
 
     schema_version: Literal["candidate_job_generation_plan.v1"]
-    runtime_budget_protocol: Literal["structured_request_budget.v2"]
+    runtime_budget_protocol: Literal["structured_request_budget.v3"]
     call_kind: Literal["structured", "text"]
     workflow: str = Field(min_length=1, max_length=160)
     step: str = Field(min_length=1, max_length=160)

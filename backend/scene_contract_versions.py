@@ -6,7 +6,11 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 SCENE_TRANSITION_CONTRACT_VERSION = "scene_transition_contract.v2"
-CHAPTER_OUTLINE_PROMPT_REVISION = "chapter-outline-prompt-r4"
+CURRENT_SCENE_CONTRACT_VERSION = "scene_transition_contract.v3"
+MODERN_SCENE_CONTRACT_VERSIONS = frozenset({
+    SCENE_TRANSITION_CONTRACT_VERSION, CURRENT_SCENE_CONTRACT_VERSION,
+})
+CHAPTER_OUTLINE_PROMPT_REVISION = "chapter-outline-prompt-r5"
 LEGACY_OUTLINE_ADHERENCE_EVIDENCE_VERSION = (
     "chapter_outline_adherence_evidence.v2"
 )
@@ -47,11 +51,35 @@ OUTLINE_ADHERENCE_DECISIONS = frozenset({
 # as one token and Latin text at roughly four characters per token.
 MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES = 20_000
 MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES = 16_000
+MAX_V3_OUTLINE_CONTEXT_UTF8_BYTES = 40_000
+MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES = 32_000
+# Transport protection is distinct from canonical, non-ASCII-escaped JSON.
+MAX_V3_OUTLINE_RAW_UTF8_BYTES = 128_000
 OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE = (
     "outline_response_byte_budget_exceeded"
 )
 
-SceneContractVersion = Literal["legacy_v1", "scene_transition_contract.v2"]
+SceneContractVersion = Literal[
+    "legacy_v1", "scene_transition_contract.v2", "scene_transition_contract.v3"
+]
+
+
+def outline_context_byte_cap(version: str | None) -> int:
+    return (
+        MAX_V3_OUTLINE_CONTEXT_UTF8_BYTES
+        if version == CURRENT_SCENE_CONTRACT_VERSION
+        else MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES
+    )
+
+
+def outline_response_byte_cap(version: str | None) -> int:
+    return (
+        MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES
+        if version == CURRENT_SCENE_CONTRACT_VERSION
+        else MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+    )
+
+
 OutlineAdherenceDecision = Literal["pass", "repair", "manual_review"]
 
 
@@ -77,11 +105,11 @@ def current_outline_adherence_decision(
 def require_known_scene_contract_version(
     outline: Mapping[str, Any] | None,
 ) -> SceneContractVersion:
-    """Classify only the two supported versions; unknown values fail closed."""
+    """Classify supported versions; unknown values fail closed."""
 
     version = (outline or {}).get("scene_contract_version")
     if version is None:
         return "legacy_v1"
-    if version == SCENE_TRANSITION_CONTRACT_VERSION:
-        return SCENE_TRANSITION_CONTRACT_VERSION
+    if isinstance(version, str) and version in MODERN_SCENE_CONTRACT_VERSIONS:
+        return version
     raise ValueError(f"unknown scene_contract_version: {version!r}")

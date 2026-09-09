@@ -54,7 +54,7 @@ from backend.llm.prompts.prompt_selector import (
 from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineAdherenceEvidenceV4Schema,
     ChapterOutlineAdherenceResultSchema,
-    ChapterOutlineResultSchema,
+    CurrentChapterOutlineResultSchema,
     ChapterStateResultSchema,
 )
 from backend.llm.models import TokenUsage
@@ -117,10 +117,11 @@ from backend.services.generation.outline_adherence import (
     safe_outline_adherence_validation_failure_diagnostics,
 )
 from backend.scene_contract_versions import (
-    MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+    MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
+    MAX_V3_OUTLINE_RAW_UTF8_BYTES,
     OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 from backend.services.llm.context_builder import (
@@ -462,11 +463,12 @@ def project_outline_adherence_generation_failure(
 CHAPTER_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key=CHAPTER_OUTLINE_STEP,
-        schema=ChapterOutlineResultSchema,
+        schema=CurrentChapterOutlineResultSchema,
         agent_id="chapter_planner",
         max_structured_raw_output_bytes=(
-            MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+            MAX_V3_OUTLINE_RAW_UTF8_BYTES
         ),
+        max_structured_output_bytes=MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
         retry_oversized_structured_output_without_source=True,
         structured_output_byte_budget_reason_code=(
             OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE
@@ -1785,9 +1787,7 @@ class ChapterGenerationApplicationService:
         if not chapter.get("outline"):
             raise ValueError("本章尚无可供细纲符合度检查的章节细纲")
         outline = dict(chapter["outline"])
-        uses_versioned_evidence = require_known_scene_contract_version(outline) == (
-            SCENE_TRANSITION_CONTRACT_VERSION
-        )
+        uses_versioned_evidence = require_known_scene_contract_version(outline) in MODERN_SCENE_CONTRACT_VERSIONS
         if candidate is not None:
             self._validate_prose_candidate(
                 candidate,
@@ -1827,18 +1827,8 @@ class ChapterGenerationApplicationService:
             else "outline_adherence_prompt_without_schema_suffix"
         )
         prompt_plan = PromptPlan(
-            native_schema_prompt=apply_agent_profile(
-                "continuity_editor",
-                prompt_base
-                + "\n"
-                + prompts[with_schema_suffix],
-            ),
-            prompt_json_prompt=apply_agent_profile(
-                "continuity_editor",
-                prompt_base
-                + "\n"
-                + prompts[without_schema_suffix],
-            ),
+            native_schema_prompt=prompt_base + "\n" + prompts[with_schema_suffix],
+            prompt_json_prompt=prompt_base + "\n" + prompts[without_schema_suffix],
         )
         generation_values = dict(command.generation_params or {})
         gen_kwargs = {
@@ -2172,7 +2162,7 @@ class ChapterGenerationApplicationService:
             and command.expected_run_revision >= 0
         )
         if (
-            scene_contract_version != SCENE_TRANSITION_CONTRACT_VERSION
+            scene_contract_version not in MODERN_SCENE_CONTRACT_VERSIONS
             and not resumes_frozen_legacy_run
         ):
             raise ValueError(

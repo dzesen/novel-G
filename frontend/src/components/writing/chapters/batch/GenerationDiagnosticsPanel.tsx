@@ -259,7 +259,7 @@ export default function GenerationDiagnosticsPanel({
     <section
       aria-labelledby="generation-diagnostics-title"
       className={embedded
-        ? "min-w-0 rounded-md border border-border bg-background p-4"
+        ? "min-w-0"
         : "shrink-0 border-b border-border bg-surface px-4 py-3"
       }
     >

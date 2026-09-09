@@ -46,16 +46,15 @@ export default function GenerationDiagnosticsWorkspace({
 
   return (
     <section
-      className="flex h-full min-h-0 flex-col bg-surface"
+      className="auto-book-statistics flex h-full min-h-0 flex-col"
       aria-labelledby="auto-book-diagnostics-title"
     >
-      <header className="shrink-0 border-b border-border px-4 py-4 sm:px-5">
+      <header className="auto-book-page-header shrink-0">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-xs font-medium text-accent">{t("pages.diagnostics.eyebrow")}</p>
             <h2
               id="auto-book-diagnostics-title"
-              className="mt-1 text-base font-semibold text-foreground"
+              className="text-xl font-semibold text-foreground sm:text-2xl"
             >
               {t("pages.diagnostics.title")}
             </h2>
@@ -68,21 +67,21 @@ export default function GenerationDiagnosticsWorkspace({
             onClick={onClose}
             className="min-h-9 shrink-0 rounded-md border border-border px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary"
           >
-            {t("backToRuns")}
+              {t("backToRecords")}
           </button>
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
+      <div className="auto-book-records-body min-h-0 flex-1 overflow-y-auto">
         {summary && (summary.unresolved_event_count ?? 0) > 0 && (
           <section
             aria-labelledby="diagnostics-unresolved-title"
-            className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 dark:border-amber-900/70 dark:bg-amber-950/30"
+            className="mb-6 border-b border-border pb-4"
           >
-            <h3 id="diagnostics-unresolved-title" className="text-sm font-semibold text-amber-900 dark:text-amber-100">
+            <h3 id="diagnostics-unresolved-title" className="text-sm font-semibold text-foreground">
               {t("diagnosticsUnresolvedTitle", { count: summary.unresolved_event_count ?? 0 })}
             </h3>
-            <p className="mt-1 text-xs leading-5 text-amber-800 dark:text-amber-200">
+            <p className="mt-1 text-xs leading-5 text-muted">
               {t("diagnosticsUnresolvedDescription")}
             </p>
           </section>

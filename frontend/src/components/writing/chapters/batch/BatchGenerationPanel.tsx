@@ -11,6 +11,7 @@ import {
   type GenerationJobSummary,
   type GenerationRunsNavigationTarget,
   type LeftoverProseRun,
+  chapterProgressEntries,
   isActive,
   isResumable,
   isTerminal,
@@ -30,6 +31,7 @@ import {
   bookCompletionResult,
 } from "./bookCompletionPresentation";
 import {
+  aggregateChapterProgress,
   currentJobStatusByProseRun,
   isRootGenerationJob,
   requiresResumeReadinessReview,
@@ -47,6 +49,7 @@ interface BatchGenerationPanelProps {
   novelId: string;
   initialJobId?: string;
   onJobTargetValidation: (jobId: string, valid: boolean) => void;
+  onCurrentJobChange?: (hasJob: boolean) => void;
   selectedVolumeId: string | null;
   volumes: VolumeSummary[];
   chapters: ChapterSummary[];
@@ -81,6 +84,7 @@ export default function BatchGenerationPanel({
   novelId,
   initialJobId,
   onJobTargetValidation,
+  onCurrentJobChange,
   selectedVolumeId,
   volumes,
   chapters,
@@ -114,6 +118,7 @@ export default function BatchGenerationPanel({
   const [resumeReviewOpen, setResumeReviewOpen] = useState(false);
   const [dismissed, setDismissed] = useState<string | null>(null); // 已关闭的终态作业 id
   const [jobLookupError, setJobLookupError] = useState("");
+  const [jobLookupPending, setJobLookupPending] = useState(true);
   const [jobLookupRevision, setJobLookupRevision] = useState(0);
   const [currentBookAudit, setCurrentBookAudit] =
     useState<BookCompletionAudit | null>(null);
@@ -132,6 +137,10 @@ export default function BatchGenerationPanel({
     [currentJobHidden, job],
   );
 
+  useEffect(() => {
+    if (!jobLookupPending) onCurrentJobChange?.(Boolean(job && !currentJobHidden));
+  }, [currentJobHidden, job, jobLookupPending, onCurrentJobChange]);
+
 
   // 精确 job 深链优先；URL 未指定 job 时只检查最新作业，避免越过已结束作业复活旧任务。
   useEffect(() => {
@@ -140,7 +149,9 @@ export default function BatchGenerationPanel({
     setJob(null);
     setDismissed(null);
     setJobLookupError("");
+    setJobLookupPending(true);
     if (surface === "start") {
+      setJobLookupPending(false);
       return () => controller.abort();
     }
     void (async () => {
@@ -187,6 +198,8 @@ export default function BatchGenerationPanel({
             reason instanceof Error ? reason.message : t("jobLookupFailed"),
           );
         }
+      } finally {
+        if (!controller.signal.aborted) setJobLookupPending(false);
       }
     })();
     return () => controller.abort();
@@ -418,14 +431,7 @@ export default function BatchGenerationPanel({
   ) : null;
 
   const generationRunsEntry = (
-    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-surface px-4 py-2.5">
-      <p className="min-w-0 text-xs leading-5 text-muted">
-        {!job || currentJobHidden
-          ? t("generationRunsNoCurrent")
-          : job.diagnostics?.length || job.error || job.pause_reason === "incomplete_scene"
-          ? t("generationRunsExceptionEntry")
-          : t("generationRunsEntryDescription")}
-      </p>
+    <div className="auto-book-task-footer">
       <button
         type="button"
         onClick={() => onOpenGenerationRuns(
@@ -478,15 +484,19 @@ export default function BatchGenerationPanel({
         {dialog}
         {resumeDialog}
         {jobLookupAlert}
+        {!jobLookupError && <div className="auto-book-empty" role={jobLookupPending ? "status" : undefined}>
+          <p className="text-base font-medium text-foreground">{t(jobLookupPending ? "currentLoading" : "currentEmptyTitle")}</p>
+          {!jobLookupPending && <p className="mt-2 text-sm leading-6 text-muted">{t("currentEmptyDescription")}</p>}
+        </div>}
         {leftoverPanel}
-        {generationRunsEntry}
       </>
     );
   }
 
   const volumeChapters = jobChapters(job, chapters);
   const total = volumeChapters.length;
-  const complete = volumeChapters.filter((c) => c.word_count > 0 && c.summary.trim()).length;
+  const complete = aggregateChapterProgress(chapterProgressEntries(job.progress))
+    .filter((chapter) => chapter.completedStepCount === 3).length;
   const jobScopeLabel = job.scope === "book"
     ? t("progressBook")
     : t("progressVolume", { title: volumes.find((v) => v._id === job.volume_id)?.title ?? "" });
@@ -514,12 +524,8 @@ export default function BatchGenerationPanel({
       {dialog}
       {resumeDialog}
       {jobLookupAlert}
-      {leftoverPanel}
-      {!isResumable(job.status) && generationRunsEntry}
-      <GenerationJobStages key={job._id} job={job}
-        onOpenJob={(jobId) => onOpenGenerationRuns({ jobId })} />
-
-      <div className="shrink-0 border-b border-border">
+      <div className="auto-book-task-content shrink-0">
+        <p className="auto-book-task-scope">{jobScopeLabel}</p>
         {job.scope === "book"
           && job.status === "completed"
           && !boundCurrentBookAudit
@@ -570,10 +576,10 @@ export default function BatchGenerationPanel({
         )}
         {isActive(job.status) && (
           <div className="grid gap-2 bg-surface px-4 py-3">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
-              <h3 className="truncate text-sm font-semibold text-foreground">
-                {t("progressTitle")} · {jobScopeLabel}
+              <h3 className="text-lg font-semibold text-foreground">
+                {t("progressTitle")}
               </h3>
               <p className="mt-0.5 text-xs text-muted">
                 {t("progressChapters", { done: complete, total })}
@@ -595,7 +601,7 @@ export default function BatchGenerationPanel({
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-border/40">
             <div
               className="h-full bg-accent transition-all"
-              style={{ width: total > 0 ? `${Math.round((complete / total) * 100)}%` : "0%" }}
+              style={{ width: total > 0 ? `${Math.min(100, Math.round((complete / total) * 100))}%` : "0%" }}
             />
           </div>
 
@@ -652,6 +658,9 @@ export default function BatchGenerationPanel({
           </div>
         )}
 
+        <div className="auto-book-task-evidence">
+          <GenerationJobStages key={job._id} job={job}
+            onOpenJob={(jobId) => onOpenGenerationRuns({ jobId })} />
         <ReferenceCardAutomationAuditPanel
           job={job}
           titleForChapter={titleForChapter}
@@ -661,6 +670,8 @@ export default function BatchGenerationPanel({
             onNavigateToReferenceCardCandidates
           }
         />
+        </div>
+        {generationRunsEntry}
 
         {abortIntent && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4 py-6">
@@ -712,6 +723,7 @@ export default function BatchGenerationPanel({
           </div>
         )}
       </div>
+      {leftoverPanel}
     </>
   );
 }

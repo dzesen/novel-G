@@ -48,8 +48,10 @@ export interface NarrativeDelta {
   after: string;
 }
 
+export type SceneContractVersion = "scene_transition_contract.v2" | "scene_transition_contract.v3";
+
 export interface SceneTransitionContract extends LegacyScene {
-  contract_version: "scene_transition_contract.v2";
+  contract_version: SceneContractVersion;
   scene_id: string;
   preconditions: SceneCondition[];
   beats: SceneBeat[];
@@ -68,7 +70,8 @@ export function isSceneTransitionContract(
 ): scene is SceneTransitionContract {
   return (
     "contract_version" in scene &&
-    scene.contract_version === "scene_transition_contract.v2"
+    (scene.contract_version === "scene_transition_contract.v2" ||
+      scene.contract_version === "scene_transition_contract.v3")
   );
 }
 
@@ -89,7 +92,7 @@ export interface NewThread {
 
 /** AI 输出 / accept 入参的细纲形状。 */
 export interface ChapterOutlineResult {
-  scene_contract_version?: "scene_transition_contract.v2" | null;
+  scene_contract_version?: SceneContractVersion | null;
   pov_character_card_id: string | null;
   present_character_card_ids: string[];
   mentioned_character_card_ids: string[];
@@ -104,7 +107,7 @@ export interface ChapterOutlineResult {
 
 /** 库里存的细纲形状；**不可**直接贴回 accept（见文件头注释）。 */
 export interface StoredChapterOutline {
-  scene_contract_version?: "scene_transition_contract.v2" | null;
+  scene_contract_version?: SceneContractVersion | null;
   pov_character_card_id: string | null;
   present_character_card_ids: string[];
   mentioned_character_card_ids: string[];

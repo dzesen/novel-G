@@ -150,6 +150,7 @@ class WorkflowStep:
     config_key: str | None = None
     agent_id: str | None = None
     max_structured_raw_output_bytes: int | None = None
+    max_structured_output_bytes: int | None = None
     retry_oversized_structured_output_without_source: bool = False
     structured_output_byte_budget_reason_code: str | None = None
     prompt_context: Callable[[StepContext], str] | None = None
@@ -400,6 +401,10 @@ async def run_workflow(
                 prompt_json = apply_agent_profile(step.agent_id, prompt_json)
 
             structured_kwargs = dict(gen_kwargs)
+            if step.max_structured_output_bytes is not None:
+                structured_kwargs["max_structured_output_bytes"] = (
+                    step.max_structured_output_bytes
+                )
             if step.max_structured_raw_output_bytes is not None:
                 structured_kwargs["max_structured_raw_output_bytes"] = (
                     step.max_structured_raw_output_bytes

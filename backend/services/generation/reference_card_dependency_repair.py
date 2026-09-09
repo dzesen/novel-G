@@ -35,10 +35,16 @@ from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineResultSchema,
     LegacyChapterOutlineProposalSchema,
     V2ChapterOutlineProposalSchema,
+    V3ChapterOutlineProposalSchema,
+    V3ChapterOutlineResultSchema,
 )
 from backend.scene_contract_versions import (
-    MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
     SCENE_TRANSITION_CONTRACT_VERSION,
+    CURRENT_SCENE_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
+    MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
+    MAX_V3_OUTLINE_RAW_UTF8_BYTES,
+    outline_response_byte_cap,
 )
 from backend.services.generation.chapter_candidate_authorization import (
     CandidateJobGenerationPlan,
@@ -163,7 +169,7 @@ def _generation_plan_snapshot(plan: GenerationPlan) -> CandidateJobGenerationPla
         raise ValueError("reference-card repair requires a workflow plan")
     return CandidateJobGenerationPlan.model_validate({
         "schema_version": "candidate_job_generation_plan.v1",
-        "runtime_budget_protocol": "structured_request_budget.v2",
+        "runtime_budget_protocol": "structured_request_budget.v3",
         "call_kind": "structured",
         "workflow": plan.target.workflow_name,
         "step": plan.target.step_name,
@@ -461,6 +467,8 @@ def _repair_source_schema(
     source_outline: Mapping[str, Any],
 ) -> type[ChapterOutlineProposalSchema]:
     version = source_outline.get("scene_contract_version")
+    if version == CURRENT_SCENE_CONTRACT_VERSION:
+        return V3ChapterOutlineProposalSchema
     if version == SCENE_TRANSITION_CONTRACT_VERSION:
         return V2ChapterOutlineProposalSchema
     if version is None:
@@ -472,6 +480,8 @@ def _repair_output_schema(
     source_outline: Mapping[str, Any],
 ) -> type[ChapterOutlineProposalSchema]:
     version = source_outline.get("scene_contract_version")
+    if version == CURRENT_SCENE_CONTRACT_VERSION:
+        return V3ChapterOutlineResultSchema
     if version == SCENE_TRANSITION_CONTRACT_VERSION:
         return ChapterOutlineResultSchema
     if version is None:
@@ -484,10 +494,8 @@ def _repair_output_byte_cap(
     output_token_bound: int,
 ) -> int:
     token_byte_cap = max(1, int(output_token_bound)) * 4
-    if source_outline.get("scene_contract_version") == (
-        SCENE_TRANSITION_CONTRACT_VERSION
-    ):
-        return min(token_byte_cap, MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES)
+    if source_outline.get("scene_contract_version") in MODERN_SCENE_CONTRACT_VERSIONS:
+        return min(token_byte_cap, outline_response_byte_cap(source_outline.get("scene_contract_version")))
     return token_byte_cap
 
 
@@ -549,21 +557,20 @@ def _build_prompts(
         "source_outline": _prompt_source_outline(source_outline),
         "gate_denials": list(safe_denials),
     }
-    is_v2 = source_outline.get("scene_contract_version") == (
-        SCENE_TRANSITION_CONTRACT_VERSION
-    )
+    version = source_outline.get("scene_contract_version")
+    is_v2 = version in MODERN_SCENE_CONTRACT_VERSIONS
     output_contract = (
-        "the complete current V2 chapter-outline proposal Schema"
+        f"the complete {version} chapter-outline proposal Schema"
         if is_v2
         else "the complete frozen legacy_v1 chapter-outline proposal Schema"
     )
     structure_rule = (
-        "For V2, preserve scene order and every scene_id, condition_id, beat_id, "
+        f"For {version}, preserve scene order and every scene_id, condition_id, beat_id, "
         "required flag, delta_id, delta dimension, event_key, repetition_policy, "
-        "and word_budget value exactly. You may revise only descriptive story text "
+        "and word_budget value exactly. Preserve contract_version exactly. You may revise only descriptive story text "
         "such as summary, purpose, condition/beat/transition text, narrative-delta "
         "before/after text, core conflict, and ending hook. The complete returned "
-        "V2 JSON must be at most 16,000 UTF-8 bytes; if the accepted source is "
+        f"canonical JSON must be at most {outline_response_byte_cap(version):,} UTF-8 bytes; if the accepted source is "
         "larger, compress only those editable descriptive story fields."
         if is_v2
         else "For legacy_v1, keep the legacy scene shape and do not add a contract version."
@@ -607,21 +614,18 @@ def _reference_repair_input_bound(
     Missing outlines use both the semantic-width and structural-density V2
     extrema because they may be generated before repair runs. The synthetic
     invalid output reserves the smaller of four UTF-8 bytes per authorized
-    output token and the V2 response cap for local repair/reviewer attempts;
+    output token and the version's response cap for local repair/reviewer attempts;
     frozen legacy output retains its historical token-derived bound.
     """
 
     from backend.services.generation.headless_generation import (
-        UNKNOWN_V2_OUTLINE_JSON_SEPARATOR_MARGIN,
-        _unknown_dense_outline_prompt_envelope,
-        _unknown_mixed_outline_prompt_envelope,
-        _unknown_outline_prompt_envelope,
+        _unknown_v3_outline_prompt_envelope,
     )
 
     unknown_outlines = (
-        _unknown_outline_prompt_envelope(),
-        _unknown_dense_outline_prompt_envelope(),
-        _unknown_mixed_outline_prompt_envelope(),
+        _unknown_v3_outline_prompt_envelope("semantic"),
+        _unknown_v3_outline_prompt_envelope("dense"),
+        _unknown_v3_outline_prompt_envelope("mixed"),
     )
     source_cases: list[tuple[dict[str, Any], int]] = []
     for chapter in chapters:
@@ -630,7 +634,7 @@ def _reference_repair_input_bound(
             source_cases.extend(
                 (
                     outline,
-                    UNKNOWN_V2_OUTLINE_JSON_SEPARATOR_MARGIN,
+                    MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
                 )
                 for outline in unknown_outlines
             )
@@ -690,7 +694,7 @@ def _reference_repair_input_bound(
             ),
         ]
         # Unknown outlines will be created later and may use any legal mix of
-        # scenes and nested arrays.  The compact 16KB response cap bounds its
+        # scenes and nested arrays. The compact response cap bounds their
         # data bytes; the extra margin proves coverage for every default-JSON
         # comma/colon space without enumerating a non-convex shape space.
         bounds.extend(
@@ -838,7 +842,7 @@ def validate_reference_card_repair_proposal(
     result = parsed.model_dump(mode="json")
     if (
         result.get("scene_contract_version")
-        == SCENE_TRANSITION_CONTRACT_VERSION
+        in MODERN_SCENE_CONTRACT_VERSIONS
         and _v2_structure_projection(result)
         != _v2_structure_projection(source_outline)
     ):
@@ -1501,10 +1505,18 @@ class ReferenceCardDependencyRepairService:
                         plan_authorization.max_tokens_per_logical_call
                     ),
                     max_structured_raw_output_bytes=(
+                        MAX_V3_OUTLINE_RAW_UTF8_BYTES
+                        if source_outline.get("scene_contract_version") == CURRENT_SCENE_CONTRACT_VERSION
+                        else
                         _repair_output_byte_cap(
                             source_outline,
                             plan_authorization.max_output_tokens_per_attempt,
                         )
+                    ),
+                    max_structured_output_bytes=(
+                        _repair_output_byte_cap(source_outline, plan_authorization.max_output_tokens_per_attempt)
+                        if source_outline.get("scene_contract_version") == CURRENT_SCENE_CONTRACT_VERSION
+                        else None
                     ),
                     **kwargs,
                 )

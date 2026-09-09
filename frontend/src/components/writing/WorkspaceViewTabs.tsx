@@ -23,7 +23,7 @@ export default function WorkspaceViewTabs({
   return (
     <nav
       aria-label={label}
-      className="flex shrink-0 gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-1.5 sm:px-5"
+      className="studio-view-tabs flex shrink-0 gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-1.5 sm:px-5"
     >
       {tabs.map((tab) => (
         <button

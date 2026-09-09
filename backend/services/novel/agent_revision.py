@@ -26,8 +26,8 @@ from backend.llm.schemas.novel_pydantic import (
     chapter_outline_context_prompt_utf8_bytes,
 )
 from backend.scene_contract_versions import (
-    MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES,
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
+    outline_context_byte_cap,
     require_known_scene_contract_version,
 )
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
@@ -239,7 +239,7 @@ class AgentRevisionProposalService:
             raise ValueError("Outline validation requires an outline target")
 
         version = require_known_scene_contract_version(outline)
-        if version == SCENE_TRANSITION_CONTRACT_VERSION:
+        if version in MODERN_SCENE_CONTRACT_VERSIONS:
             exact_projection = AgentRevisionProposalService._outline_edit_projection(
                 outline
             )
@@ -249,12 +249,12 @@ class AgentRevisionProposalService:
             if v2_outline_structure(outline) != v2_outline_structure(
                 parsed.model_dump(mode="python")
             ):
-                raise ValueError("Outline revision cannot change V2 contract structure")
+                raise ValueError("Outline revision cannot change versioned contract structure")
             if chapter_outline_context_prompt_utf8_bytes(exact_projection) > (
-                MAX_V2_OUTLINE_CONTEXT_UTF8_BYTES
+                outline_context_byte_cap(version)
             ):
                 raise ValueError(
-                    "V2 chapter outline exceeds the downstream context budget"
+                    "Versioned chapter outline exceeds the downstream context budget"
                 )
         elif scene is not None:
             LegacySceneSchema.model_validate(scene)

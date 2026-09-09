@@ -25,7 +25,7 @@ from backend.services.generation.prose_protocol import (
 )
 from backend.services.novel.chapter_service import count_chapter_words
 from backend.scene_contract_versions import (
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 
@@ -329,7 +329,7 @@ class ProseCompletionModule:
             safe_budget = max(1, math.floor(output_limit * self._safety_ratio))
 
         scene_contract_version = require_known_scene_contract_version(outline)
-        if scene_contract_version == SCENE_TRANSITION_CONTRACT_VERSION:
+        if scene_contract_version in MODERN_SCENE_CONTRACT_VERSIONS:
             bounded_safe_budget = v2_scene_base_call_safe_output_budget(
                 safe_budget
             )
@@ -351,7 +351,7 @@ class ProseCompletionModule:
                 reason_codes.append("requested_words_exceed_safe_output")
             if scene_count_requires_segmentation:
                 reason_codes.append("scene_count_requires_segmentation")
-        if scene_contract_version == SCENE_TRANSITION_CONTRACT_VERSION:
+        if scene_contract_version in MODERN_SCENE_CONTRACT_VERSIONS:
             minimums: list[int] = []
             targets: list[int] = []
             maximums: list[int] = []

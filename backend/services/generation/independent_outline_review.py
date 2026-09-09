@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from pydantic_core import PydanticCustomError
 
 from backend.llm.models import TokenUsage
+from backend.scene_contract_versions import MODERN_SCENE_CONTRACT_VERSIONS
 from backend.llm.exceptions import LLMError, LLMStructuredRepairError
 from backend.llm.schemas.scene_contract_pydantic import (
     BeatEvidenceSchema,
@@ -221,7 +222,7 @@ class OutlineReviewSnapshot:
         ):
             raise ValueError("independent review source is invalid")
         outline = json.loads(self.outline_json)
-        if not isinstance(outline, dict) or outline.get("scene_contract_version") != "scene_transition_contract.v2":
+        if not isinstance(outline, dict) or outline.get("scene_contract_version") not in MODERN_SCENE_CONTRACT_VERSIONS:
             raise ValueError("independent review requires a V2 outline")
         scenes = outline.get("scenes")
         if not isinstance(scenes, list) or len(scenes) != len(self.scene_ranges):

@@ -35,9 +35,10 @@ from backend.llm.prompts.prompt_selector import (
     CHAPTER_OUTLINE_PROMPT_NAME,
     load_prompt_config,
 )
-from backend.llm.schemas.novel_pydantic import ChapterOutlineResultSchema
+from backend.llm.schemas.novel_pydantic import CurrentChapterOutlineResultSchema
 from backend.scene_contract_versions import (
-    MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+    MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
+    MAX_V3_OUTLINE_RAW_UTF8_BYTES,
     OUTLINE_RESPONSE_BYTE_BUDGET_REASON_CODE,
 )
 from backend.services.generation.required_adherence_capacity import (
@@ -93,7 +94,7 @@ from backend.services.novel.style_controls import render_style_controls
 
 SUCCESSOR_ACCEPTANCE_SAMPLE_ID = "successor-representative-3000-v1"
 SUCCESSOR_ACCEPTANCE_PROTOCOL_REVISION = (
-    "required-book-successor-acceptance-r3"
+    "required-book-successor-acceptance-r4"
 )
 OUTLINE_WORKFLOW = "create_chapter_outline_by_ai"
 OUTLINE_STEP = "chapter_outline"
@@ -104,8 +105,8 @@ MAXIMUM_REAL_RUNS = 2
 READONLY_REDACTED_CONTEXT_BYTES = 4_096
 READONLY_OUTLINE_CONTEXT_BYTES = (
     READONLY_REDACTED_CONTEXT_BYTES
-    + (CHAPTER_COUNT - 1) * MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES * 2
-    + MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+    + (CHAPTER_COUNT - 1) * MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES * 2
+    + MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES
 )
 _MAX = 2**63 - 1
 _SHA256 = r"^[0-9a-f]{64}$"
@@ -207,17 +208,18 @@ class SuccessorProviderPricing(_Closed):
 
 
 class SuccessorOutlineStageAuthorization(_Closed):
-    schema_version: Literal["successor_outline_stage_authorization.v1"] = (
-        "successor_outline_stage_authorization.v1"
+    schema_version: Literal["successor_outline_stage_authorization.v2"] = (
+        "successor_outline_stage_authorization.v2"
     )
-    protocol_revision: Literal["required-outline-prestage-r1"] = (
-        "required-outline-prestage-r1"
+    protocol_revision: Literal["required-outline-prestage-r2"] = (
+        "required-outline-prestage-r2"
     )
     generation: RequiredGenerationPlanSnapshot
     prompt_protocol_digest: str = Field(pattern=_SHA256)
     chapter_count: Literal[3] = CHAPTER_COUNT
     target_word_count: Literal[3000] = TARGET_WORD_COUNT
-    maximum_response_bytes: Literal[16000] = MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES
+    maximum_response_bytes: Literal[32000] = MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES
+    maximum_raw_response_bytes: Literal[128000] = MAX_V3_OUTLINE_RAW_UTF8_BYTES
     overflow_action: Literal[
         "same_provider_concise_regeneration_without_source"
     ] = "same_provider_concise_regeneration_without_source"
@@ -397,7 +399,7 @@ class RequiredBookSuccessorAcceptanceAuthorization(_Closed):
         "required_book_successor_acceptance_authorization.v3"
     ] = "required_book_successor_acceptance_authorization.v3"
     protocol_revision: Literal[
-        "required-book-successor-acceptance-r3"
+        "required-book-successor-acceptance-r4"
     ] = SUCCESSOR_ACCEPTANCE_PROTOCOL_REVISION
     contract_digest: str = Field(pattern=_SHA256)
     authorization_revision: int = Field(ge=1, le=_MAX)
@@ -531,19 +533,19 @@ def _outline_prompt_bounds(
     )
     repair = render_structured_repair_prompt(
         original_prompt=primary,
-        schema=ChapterOutlineResultSchema,
-        produced="x" * MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+        schema=CurrentChapterOutlineResultSchema,
+        produced="x" * MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
         validation_issues=maximum_structured_validation_issues_projection(),
     )
     regeneration = render_structured_byte_budget_regeneration_prompt(
         original_prompt=primary,
-        max_bytes=MAX_V2_OUTLINE_RESPONSE_UTF8_BYTES,
+        max_bytes=MAX_V3_OUTLINE_RESPONSE_UTF8_BYTES,
     )
     protocol_digest = required_book_successor_digest({
         "primary": primary,
         "repair": repair,
         "byte_regeneration": regeneration,
-        "schema": ChapterOutlineResultSchema.model_json_schema(),
+        "schema": CurrentChapterOutlineResultSchema.model_json_schema(),
         # The value is hashed into the protocol identity and never serialized
         # into readiness.  Provider-default prompt drift must still invalidate
         # the authorization even when its token length happens to be equal.
@@ -571,7 +573,7 @@ def _representative_outline(chapter_order: int) -> dict[str, Any]:
     for scene_index in (1, 2):
         stem = f"c{chapter_order}s{scene_index}"
         scenes.append({
-            "contract_version": "scene_transition_contract.v2",
+            "contract_version": "scene_transition_contract.v3",
             "scene_id": stem,
             "summary": f"synthetic successor scene {stem}",
             "purpose": "advance the bounded synthetic acceptance task",
@@ -601,7 +603,7 @@ def _representative_outline(chapter_order: int) -> dict[str, Any]:
             "word_budget": {"min": 1200, "target": 1500, "max": 1800},
         })
     outline = {
-        "scene_contract_version": "scene_transition_contract.v2",
+        "scene_contract_version": "scene_transition_contract.v3",
         "pov_character_card_id": None,
         "present_character_card_ids": [],
         "mentioned_character_card_ids": [],
@@ -614,7 +616,7 @@ def _representative_outline(chapter_order: int) -> dict[str, Any]:
         "new_threads": [],
         "new_reference_card_candidates": [],
     }
-    return ChapterOutlineResultSchema.model_validate(outline).model_dump(
+    return CurrentChapterOutlineResultSchema.model_validate(outline).model_dump(
         mode="python"
     )
 
@@ -1171,7 +1173,7 @@ def validate_required_book_successor_acceptance_outline(
     if (
         not isinstance(outline, Mapping)
         or outline.get("scene_contract_version")
-        != "scene_transition_contract.v2"
+        != "scene_transition_contract.v3"
         or outline.get("target_word_count")
         != authorization.sample.target_word_count
         or not isinstance(raw_scenes, list)
@@ -1183,7 +1185,7 @@ def validate_required_book_successor_acceptance_outline(
     ):
         raise ValueError("successor_acceptance_outline_shape_changed")
     try:
-        parsed = ChapterOutlineResultSchema.model_validate(outline)
+        parsed = CurrentChapterOutlineResultSchema.model_validate(outline)
     except (TypeError, ValueError) as exc:
         raise ValueError("successor_acceptance_outline_invalid") from exc
     return parsed.model_dump(mode="python")

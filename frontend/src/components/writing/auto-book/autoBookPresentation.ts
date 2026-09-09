@@ -1,5 +1,5 @@
 export const AUTO_BOOK_PURPOSES = {
-  readiness: "start",
+  readiness: "operations",
   runs: "operations",
   "generation-runs": "history",
   diagnostics: "diagnostics",

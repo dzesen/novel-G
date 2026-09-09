@@ -412,8 +412,8 @@ create_volume_outline_by_ai:
 
 # 章节细纲 Prompt 配置
 create_chapter_outline_by_ai:
-  contract_version: scene_transition_contract.v2
-  prompt_revision: chapter-outline-prompt-r4
+  contract_version: scene_transition_contract.v3
+  prompt_revision: chapter-outline-prompt-r5
   chapter_outline_prompt_base: |
     你是一位资深长篇小说编辑。请为第 {chapter_order} 章《{chapter_title}》撰写章节细纲。
     本章目标字数约 {words_per_chapter} 字。
@@ -424,18 +424,18 @@ create_chapter_outline_by_ai:
     {style_controls}
 
     要求：
-    - scene_contract_version 必须精确为 scene_transition_contract.v2。
+    - scene_contract_version 和各场 contract_version 可以省略，由服务端补齐为 scene_transition_contract.v3；如提供必须精确匹配。
     - 整个章纲必须精炼。系统保存后形成的【本章细纲】上下文投影必须不超过
-      20,000 UTF-8 bytes；请把最终 JSON 响应控制在 16,000 UTF-8 bytes 以内，
+      40,000 UTF-8 bytes；请把补齐默认字段后、紧凑且不转义中文的 JSON 内容控制在 32,000 UTF-8 bytes 以内，
       避免同义复述，并优先保留可执行的条件、叙事拍与状态变化。
     - scenes：按真实的情节转折拆成 1-6 个语义完整场景。不得为了凑场景数或均分字数，
       把同一个连续动作、对话或因果事件从中间切开；每场都必须是可审计的状态转移合同：
-      - contract_version 精确为 scene_transition_contract.v2；scene_id 在本章唯一且按叙事顺序稳定编号。
+      - scene_id 在本章唯一且按叙事顺序稳定编号。
       - summary 和 purpose 保留给作者阅读。
       - preconditions / postconditions / forbidden_conditions 中每项都有本章唯一 condition_id 和可核对描述。
       - beats 把本场拆成原子叙事拍；每项给本章唯一 beat_id、description、expected_transition 和 required。
         expected_transition 必须写明这一拍使知识、关系、目标、风险、选择或情绪发生了什么变化，不能只写“提到某事”。
-      - narrative_delta 每项给本章唯一 delta_id、dimension、before、after；dimension 只能为 knowledge、relationship、goal、risk、choice、emotion；before 与 after 不得同义复述。
+      - narrative_delta 可省略或为空；只有 beats.expected_transition 和 postconditions 未覆盖的实质变化才需补充，禁止重复抄写。填写时每项给本章唯一 delta_id、dimension、before、after；dimension 只能为 knowledge、relationship、goal、risk、choice、emotion；before 与 after 不得同义复述。
       - event_key 使用稳定的小写事件键；repetition_policy 只能为 forbid、allow_if_escalated 或 allow。
       - word_budget 给出 min / target / max，满足 min <= target <= max；按本场必要 beats、冲突强度、转折和结果所需篇幅分配，
         不要求各场相等；所有场景 target 之和必须精确等于 target_word_count。
@@ -466,15 +466,17 @@ create_chapter_outline_by_ai:
       that will not matter again should not become candidates. Existing roster entries
       must continue to use their formal ids instead of being declared again.
   chapter_outline_prompt_with_schema_suffix: |
-    请严格按提供的 JSON Schema 输出。最终 JSON 响应不得超过 16,000 UTF-8 bytes，
-    且保存后的【本章细纲】上下文投影不得超过 20,000 UTF-8 bytes。
+    请严格按提供的 JSON Schema 输出。最终 JSON 响应不得超过 32,000 UTF-8 bytes，
+    且保存后的【本章细纲】上下文投影不得超过 40,000 UTF-8 bytes。
   chapter_outline_prompt_without_schema_suffix: |
-    请只输出 JSON，形如：
-    {"scene_contract_version":"scene_transition_contract.v2","pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"contract_version":"scene_transition_contract.v2","scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-1-delta-1","dimension":"goal","before":"尚未接受目标","after":"主动接受目标"}],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":800,"target":1100,"max":1500}},{"contract_version":"scene_transition_contract.v2","scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"narrative_delta":[{"delta_id":"scene-2-delta-1","dimension":"risk","before":"风险尚未暴露","after":"风险公开升级"}],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1400,"target":1900,"max":2300}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
-    整个 JSON 响应不得超过 16,000 UTF-8 bytes；不要输出 JSON 以外的任何内容。
+    请只输出 JSON；省略固定版本和无额外变化的 narrative_delta，形如：
+    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":800,"target":1100,"max":1500}},{"scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1400,"target":1900,"max":2300}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
+    整个 JSON 响应不得超过 32,000 UTF-8 bytes；不要输出 JSON 以外的任何内容。
+
 
 # 章节正文 Prompt 配置
 write_chapter_by_ai:
+  prompt_revision: chapter-prose-prompt-r2
   chapter_content_prompt_base: |
     你是一位资深长篇小说作者。请为第 {chapter_order} 章《{chapter_title}》撰写正文。
     本章目标字数约 {words_per_chapter} 字。
@@ -487,7 +489,9 @@ write_chapter_by_ai:
     要求：
     - 严格按上文【本章细纲】的场景顺序推进，不要新增细纲之外的重大情节。
     - 人物的言行必须与其卡片设定、当前状态、既有永久事实一致；
-      与永久事实冲突的写法（例如让已死之人正常出场）除非细纲明确要求，否则不要写。
+      回忆、梦境、幻觉或伪装等表现须有上下文依据，并保持其与客观事实的区别，
+      不得据此推翻正式事实或让已死之人无依据地正常出场。细纲要求不是覆盖正式事实的授权；
+      无法同时满足时，不得自行编造复活、身份替换等解释来掩盖冲突。
     - 采用上文指定的叙事视角与写作风格；没有指定时用第三人称有限视角。
     - 以场景和对话推进，避免大段旁白式总结。
     - 章末收在细纲给出的钩子上。
@@ -521,7 +525,8 @@ review_chapter_outline_adherence_by_ai:
     - 不做关键词匹配，不因正文比细纲更具体而判错，也不要为了凑问题而报告。
     - legacy_v1 的每个问题必须同时给出细纲要求和正文依据；没有可引用依据就不要报告。
     - legacy_v1 的 verdict 必须与 issues 一致：存在 error 即 fail；只有 warning 即 warn；无问题即 pass。
-    - 如果细纲声明 scene_transition_contract.v2，逐个 scene_id / beat_id 返回证据，不得把整场 covered 当作 beat 已兑现。
+    - outline_contract_version 必须与输入章纲 scene_contract_version 精确一致。
+    - 如果细纲声明 scene_transition_contract.v2 或 scene_transition_contract.v3，逐个 scene_id / beat_id 返回证据，不得把整场 covered 当作 beat 已兑现。
     - beat 状态只能为 satisfied、mentioned、contradicted、missing 或 unknown。
       只出现名词、道具或一句结果，但 expected_transition 没有发生时必须用 mentioned；正文与要求相反时用 contradicted；
       完全没有证据时用 missing；无法可靠判断时用 unknown，不得猜成 satisfied。

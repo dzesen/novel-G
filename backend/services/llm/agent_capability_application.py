@@ -762,6 +762,10 @@ def _scene_prompt(
 - 服从本章细纲、当前卷大纲、人物卡和永久事实。
 - 不新增会改变后续场景前提的重大人物、设定或转折。
 - summary 要能直接指导正文写作，purpose 要说明它对人物、冲突或全局结构的作用。
+- 本次只能返回 summary 与 purpose。当前场景含结构合同字段时，已有 beats、preconditions、
+  postconditions、forbidden_conditions、narrative_delta、event_key、repetition_policy 与 word_budget
+  都是本次不可改变的约束；新摘要和用途的含义必须与它们一致，不能暗中增加或取消必需事件、
+  改变状态条件或事件结果。没有安全的改写空间时保留原文，不得通过摘要绕过合同。
 
 {suffix}""".strip()
 

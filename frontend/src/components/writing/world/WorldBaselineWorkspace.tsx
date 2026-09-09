@@ -315,7 +315,7 @@ export default function WorldBaselineWorkspace({
                             : t("notApplicable")}
                       </p>
                     ) : (
-                      <fieldset className="min-w-0">
+                      <fieldset className="relative min-w-0">
                         <legend className="sr-only">
                           {t("decisionAria", { domain: label })}
                         </legend>

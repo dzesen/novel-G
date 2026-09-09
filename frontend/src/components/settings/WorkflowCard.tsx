@@ -43,7 +43,11 @@ const AUTO_REVIEW_KEY = "__auto_review__";
  */
 export function WorkflowCard({ config, catalog, onChange }: Props) {
   const t = useTranslations("settings.workflow");
-  const tSteps = useTranslations("settings.workflow.steps");
+  const messages = useTranslations();
+  const workflowLabel = (name: string) => {
+    const key = catalog.find((definition) => definition.name === name)?.label_key;
+    return key && messages.has(key) ? messages(key) : name;
+  };
 
   const providers = config.llm?.providers || {};
   const providerAliases = Object.keys(providers);
@@ -157,7 +161,7 @@ export function WorkflowCard({ config, catalog, onChange }: Props) {
   };
 
   return (
-    <Card className="border border-border bg-surface shadow-sm">
+    <Card data-testid="workflow-settings" className="min-w-0 border border-border bg-surface shadow-sm">
       <Card.Header className="flex-col items-start gap-2">
         <Card.Title className="text-lg font-semibold text-foreground">{t("title")}</Card.Title>
         <p className="max-w-3xl text-sm leading-6 text-muted">{t("description")}</p>
@@ -206,7 +210,7 @@ export function WorkflowCard({ config, catalog, onChange }: Props) {
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-sm font-medium">{workflowName}</span>
+                      <span className="min-w-0 text-sm font-medium">{workflowLabel(workflowName)}</span>
                       <span className="shrink-0 text-xs text-muted">{t("stepCount", { count })}</span>
                     </div>
                     <div className="mt-1 truncate text-xs text-muted">
@@ -225,7 +229,7 @@ export function WorkflowCard({ config, catalog, onChange }: Props) {
                   <div className="text-xs font-medium uppercase tracking-wide text-muted">
                     {t("selectedWorkflow")}
                   </div>
-                  <h3 className="mt-1 text-base font-semibold text-foreground">{effectiveSelectedWorkflowName}</h3>
+                  <h3 className="mt-1 text-base font-semibold text-foreground">{workflowLabel(effectiveSelectedWorkflowName)}</h3>
                 </div>
                 <div className="flex flex-wrap gap-2 text-xs text-muted">
                   <span className="rounded-md border border-border bg-surface px-2 py-1">
@@ -319,6 +323,9 @@ export function WorkflowCard({ config, catalog, onChange }: Props) {
 
             <div className="space-y-3 p-4">
               {stepNames.map((stepName) => {
+                const stepDefinition = selectedDefinition?.steps.find((step) => step.name === stepName);
+                const descriptionKey = stepDefinition?.label_key || `settings.workflow.steps.${stepName}`;
+                const nameKey = descriptionKey.replace("settings.workflow.steps.", "settings.workflow.stepNames.");
                 const stepConfig = selectedWorkflow.steps?.[stepName] || newWorkflowStepConfig();
                 const stepProvider = stepConfig.provider || "";
                 const stepTimeout = stepConfig.timeout_seconds ?? null;
@@ -329,18 +336,19 @@ export function WorkflowCard({ config, catalog, onChange }: Props) {
                 return (
                   <div
                     key={stepName}
+                    data-testid={`workflow-step-${stepName}`}
                     className="rounded-lg border border-border bg-surface-secondary/70 p-3"
                   >
                     <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-sm font-semibold text-foreground">{stepName}</span>
+                          <span className="text-sm font-semibold text-foreground">{messages.has(nameKey) ? messages(nameKey) : stepName}</span>
                           <StatusChip tone={providerStatusTone(effectiveProvider)}>
                             {providerStatusText(effectiveProvider)}
                           </StatusChip>
                         </div>
                         <p className="mt-1 text-xs leading-5 text-muted">
-                          {tSteps.has(stepName) ? tSteps(stepName) : t("customStepHint")}
+                          {messages.has(descriptionKey) ? messages(descriptionKey) : t("customStepHint")}
                         </p>
                       </div>
                     </div>

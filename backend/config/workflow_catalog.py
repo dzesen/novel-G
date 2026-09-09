@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from backend.scene_contract_versions import (
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    CURRENT_SCENE_CONTRACT_VERSION,
 )
 from backend.state_fact_contract_versions import STATE_FACT_EVIDENCE_VERSION
 
@@ -78,7 +78,7 @@ _WORKFLOW_CATALOG: tuple[WorkflowDefinition, ...] = (
             WorkflowStepDefinition(
                 name="chapter_outline",
                 label_key="settings.workflow.steps.chapter_outline",
-                contract_version=SCENE_TRANSITION_CONTRACT_VERSION,
+                contract_version=CURRENT_SCENE_CONTRACT_VERSION,
             ),
         ),
     ),

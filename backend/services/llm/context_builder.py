@@ -40,6 +40,7 @@ from backend.services.llm.outline_generation import (
 # 默认上下文预算。写到第 87 章时，"最近 K 章 + 所有活跃伏笔 + 相关卡片"
 # 必然撑爆窗口；没有预算控制，系统会在中后期以"莫名其妙的 API 报错"死掉。
 DEFAULT_CONTEXT_TOKEN_BUDGET = 8000
+V3_CONTEXT_TOKEN_BUDGET = 16_000
 
 # 最近 K 章摘要。K=5，硬编码；配置项留到有真实数据之后（设计已确认决策）。
 RECENT_CHAPTER_COUNT = 5
@@ -408,7 +409,7 @@ def _truncate_to_budget(sections: list, budget: int, priority: dict) -> tuple:
     return kept, fully_dropped, partial
 
 
-def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -> ChapterContext:
+def assemble_context(inputs: dict, budget: int | None = None) -> ChapterContext:
     """把取数结果装配成上下文包。纯函数，不碰数据库。
 
     Args:
@@ -428,6 +429,10 @@ def assemble_context(inputs: dict, budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET) -
     volume = inputs.get("volume") or {}
     chapter = inputs.get("chapter") or {}
     outline = chapter.get("outline") or {}
+    if budget is None:
+        budget = (V3_CONTEXT_TOKEN_BUDGET
+                  if outline.get("scene_contract_version") == "scene_transition_contract.v3"
+                  else DEFAULT_CONTEXT_TOKEN_BUDGET)
     cards = inputs.get("cards") or {}
     states = inputs.get("states") or {}
     chapter_order = int(chapter.get("order_index") or 0)
@@ -1441,7 +1446,7 @@ async def fetch_context_inputs(
 async def build_context(
     novel_id: str,
     chapter_id: str,
-    budget: int = DEFAULT_CONTEXT_TOKEN_BUDGET,
+    budget: int | None = None,
 ) -> ChapterContext:
     """取数 + 装配的组合入口。
 

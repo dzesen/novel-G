@@ -17,7 +17,7 @@ from backend.scene_contract_versions import (
     NARRATIVE_QUALITY_SIDECAR_SCHEMA,
     NARRATIVE_REPETITION_SIGNAL_LAYERS,
     NARRATIVE_REPETITION_SIGNAL_POLICY,
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
 )
 from backend.services.novel.state_completion import chapter_content_digest
 
@@ -318,7 +318,7 @@ def assess_narrative_quality_signals(
 ) -> dict[str, Any]:
     """Build a source-bound sidecar; quality signals never decide the hard gate."""
 
-    if outline.get("scene_contract_version") != SCENE_TRANSITION_CONTRACT_VERSION:
+    if outline.get("scene_contract_version") not in MODERN_SCENE_CONTRACT_VERSIONS:
         raise NarrativeQualitySignalError("quality signals require a V2 outline")
     run_id = str(source_prose_run_id or "").strip()
     if not run_id or len(run_id) > 128:

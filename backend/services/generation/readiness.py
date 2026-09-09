@@ -64,7 +64,7 @@ from backend.services.generation.provider_budget import (
     structured_call_budget,
 )
 from backend.scene_contract_versions import (
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 from backend.services.llm.context_builder import ContextBudgetError
@@ -704,7 +704,7 @@ class GenerationReadinessModule:
             except ValueError:
                 unknown_outline_contracts.append(chapter_id)
                 continue
-            if contract_version != SCENE_TRANSITION_CONTRACT_VERSION:
+            if contract_version not in MODERN_SCENE_CONTRACT_VERSIONS:
                 legacy_outline_prose.append(chapter_id)
         if legacy_outline_prose:
             issues.append(

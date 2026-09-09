@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.scene_contract_versions import (
     SCENE_TRANSITION_CONTRACT_VERSION,
+    MODERN_SCENE_CONTRACT_VERSIONS,
     require_known_scene_contract_version,
 )
 from backend.services.generation.prose_completion import ProseExecutionPlan
@@ -84,7 +85,7 @@ class SceneContractValidationEntry(_StrictModel):
 
 
 class SceneContractValidationProof(_StrictModel):
-    contract_version: Literal["scene_transition_contract.v2"]
+    contract_version: Literal["scene_transition_contract.v2", "scene_transition_contract.v3"]
     source_content_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     scenes: tuple[SceneContractValidationEntry, ...] = Field(
         min_length=1,
@@ -151,6 +152,7 @@ class V2SceneRepairPlan:
     target_scene_indexes: tuple[int, ...]
     targets: tuple[V2SceneRepairTarget, ...]
     protocol_revision: str = ""
+    contract_version: str = SCENE_TRANSITION_CONTRACT_VERSION
 
     @property
     def target_scene_ids(self) -> tuple[str, ...]:
@@ -273,9 +275,7 @@ def v2_scene_budgets(
     outline: Mapping[str, Any],
     plan: ProseExecutionPlan,
 ) -> tuple[V2SceneBudget, ...]:
-    if require_known_scene_contract_version(outline) != (
-        SCENE_TRANSITION_CONTRACT_VERSION
-    ):
+    if require_known_scene_contract_version(outline) not in MODERN_SCENE_CONTRACT_VERSIONS:
         return ()
     scenes = list(outline.get("scenes") or [])
     if (
@@ -334,6 +334,8 @@ def validate_v2_scene_contract_proof(
     proof = SceneContractValidationProof.model_validate(
         completion.get("scene_contract_validation")
     )
+    if proof.contract_version != outline.get("scene_contract_version"):
+        raise ValueError("scene proof does not bind the outline contract version")
     if proof.source_content_digest != chapter_content_digest(text):
         raise ValueError("V2 scene budget proof does not bind the candidate")
     if len(proof.scenes) != len(budgets):
@@ -884,6 +886,7 @@ def build_v2_scene_repair_plan(
         target_scene_indexes=normalized_targets,
         targets=tuple(targets),
         protocol_revision=plan.protocol_revision,
+        contract_version=outline["scene_contract_version"],
     )
 
 
@@ -937,7 +940,7 @@ def build_v2_scene_contract_proof_from_run(
         ))
         cursor = end + 2
     proof = SceneContractValidationProof(
-        contract_version=SCENE_TRANSITION_CONTRACT_VERSION,
+        contract_version=outline["scene_contract_version"],
         source_content_digest=chapter_content_digest(current_text),
         scenes=tuple(entries),
     )
@@ -1044,7 +1047,7 @@ def apply_v2_scene_replacements(
     if len(prose) > MAX_SCENE_REPAIR_PROSE_CHARACTERS:
         raise ValueError("V2 rewritten prose exceeds the remediation limit")
     proof = SceneContractValidationProof(
-        contract_version=SCENE_TRANSITION_CONTRACT_VERSION,
+        contract_version=repair_plan.contract_version,
         source_content_digest=chapter_content_digest(prose),
         scenes=tuple(entries),
     )

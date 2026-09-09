@@ -74,11 +74,8 @@ interface AutoBookWorkspaceProps {
 }
 
 const AUTO_BOOK_VIEWS: AutoBookView[] = [
-  "readiness",
   "runs",
   "generation-runs",
-  "diagnostics",
-  "retrospective",
 ];
 
 export default function AutoBookWorkspace({
@@ -109,6 +106,7 @@ export default function AutoBookWorkspace({
     useState(false);
   const startTriggerRef = useRef<HTMLElement | null>(null);
   const [proseRunsRevision, setProseRunsRevision] = useState(0);
+  const [hasCurrentJob, setHasCurrentJob] = useState(false);
   const structureRequestRef = useRef(0);
 
   const loadStructure = useCallback(async (silent = false) => {
@@ -227,38 +225,17 @@ export default function AutoBookWorkspace({
   const viewNav = (
     <nav
       aria-label={t("viewAria")}
-      className="grid min-w-0 grid-cols-4 gap-1 border-b border-border pb-2 sm:flex sm:overflow-x-auto"
+      className="auto-book-nav"
     >
-      {AUTO_BOOK_VIEWS.map((item, index) => (
+      {AUTO_BOOK_VIEWS.map((item) => (
         <button
           key={item}
           type="button"
           onClick={() => onNavigateView(item)}
           aria-label={t(`views.${item}`)}
-          aria-current={view === item ? "page" : undefined}
-          className={[
-            "flex min-w-0 items-center justify-center rounded-md font-medium transition-colors",
-            index < 4
-              ? "min-h-12 flex-col gap-1 px-1 text-[10px] sm:min-h-9 sm:shrink-0 sm:flex-row sm:gap-2 sm:px-3 sm:text-xs"
-              : "col-span-4 min-h-8 flex-row gap-2 border-t border-border/70 px-2 pt-1 text-[10px] sm:col-auto sm:min-h-9 sm:shrink-0 sm:border-0 sm:px-3 sm:pt-0 sm:text-xs",
-            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
-            view === item
-              ? "bg-accent/10 text-accent"
-              : "text-warm-700 hover:bg-surface-secondary hover:text-foreground dark:text-muted",
-          ].join(" ")}
+          aria-current={(item === "runs" ? purpose === "operations" : purpose !== "operations") ? "page" : undefined}
         >
-          <span
-            aria-hidden="true"
-            className={[
-              "grid size-5 place-items-center rounded-full text-[10px] tabular-nums",
-              view === item
-                ? "bg-accent text-white"
-                : "bg-surface-secondary text-warm-700 dark:text-muted",
-            ].join(" ")}
-          >
-            {index < 4 ? index + 1 : "β"}
-          </span>
-          <span className="whitespace-nowrap">{t(`views.${item}`)}</span>
+          {t(`views.${item}`)}
         </button>
       ))}
     </nav>
@@ -266,8 +243,8 @@ export default function AutoBookWorkspace({
 
   if (purpose === "history") {
     return (
-      <div className="flex h-full min-h-0 flex-col bg-surface">
-        <div className="shrink-0 px-4 pt-3 sm:px-5">{viewNav}</div>
+      <div className="auto-book-shell flex h-full min-h-0 flex-col">
+        <div className="auto-book-nav-wrap">{viewNav}</div>
         <div className="min-h-0 flex-1">
           <GenerationRunsWorkspace
             novelId={novelId}
@@ -292,6 +269,8 @@ export default function AutoBookWorkspace({
               )
             }
             onClose={() => onNavigateView("runs", {}, true)}
+            onOpenStatistics={() => onNavigateView("diagnostics")}
+            onOpenRetrospective={() => onNavigateView("retrospective")}
             onOpenRootJob={(jobId) => onNavigateView("runs", { job: jobId }, true)}
             onOpenReadiness={(job) => onNavigateView(
               "readiness",
@@ -312,8 +291,8 @@ export default function AutoBookWorkspace({
 
   if (purpose === "diagnostics") {
     return (
-      <div className="flex h-full min-h-0 flex-col bg-surface">
-        <div className="shrink-0 px-4 pt-3 sm:px-5">{viewNav}</div>
+      <div className="auto-book-shell flex h-full min-h-0 flex-col">
+        <div className="auto-book-nav-wrap">{viewNav}</div>
         <div className="min-h-0 flex-1">
           <GenerationDiagnosticsWorkspace
             novelId={novelId}
@@ -322,7 +301,7 @@ export default function AutoBookWorkspace({
               chapter: target.chapterId,
               event: target.eventId,
             })}
-            onClose={() => onNavigateView("runs", {}, true)}
+            onClose={() => onNavigateView("generation-runs", {}, true)}
           />
         </div>
       </div>
@@ -331,8 +310,8 @@ export default function AutoBookWorkspace({
 
   if (purpose === "retrospective") {
     return (
-      <div className="flex h-full min-h-0 flex-col bg-background">
-        <div className="shrink-0 px-4 pt-4 sm:px-6">{viewNav}</div>
+      <div className="auto-book-shell flex h-full min-h-0 flex-col">
+        <div className="auto-book-nav-wrap">{viewNav}</div>
         <div className="min-h-0 flex-1">
           <GenerationToolWorkspace
             novelId={novelId}
@@ -352,15 +331,16 @@ export default function AutoBookWorkspace({
   }
 
   return (
-    <div className="h-full min-h-0 overflow-y-auto bg-background">
-      <div className="mx-auto w-full max-w-7xl px-4 py-5 sm:px-6 sm:py-7">
-        <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border pb-5">
+    <div className="auto-book-shell h-full min-h-0 overflow-y-auto">
+      <div className="auto-book-nav-wrap">{viewNav}</div>
+      <div className="auto-book-workbench">
+        <div className="auto-book-workbench-heading pb-6">
           <div className="max-w-3xl min-w-0">
             <h1 className="text-xl font-semibold tracking-[-0.02em] text-foreground sm:text-2xl">
-              {t(`pages.${view}.title`)}
+              {t("workbenchTitle")}
             </h1>
             <p className="mt-2 text-sm leading-6 text-warm-700 dark:text-muted">
-              {t(`pages.${view}.description`)}
+              {t("workbenchDescription")}
             </p>
           </div>
           <div
@@ -378,11 +358,9 @@ export default function AutoBookWorkspace({
           </div>
         </div>
 
-        <div className="mt-4">{viewNav}</div>
-
-        {purpose === "start" && (
-        <section className="py-5" aria-labelledby="auto-book-start-title">
-          <div className="flex flex-wrap items-end gap-3">
+        <details className="auto-book-start" open={!hasCurrentJob}>
+          <summary id="auto-book-start-title" className="cursor-pointer text-sm font-semibold text-foreground">{t("newTaskTitle")}</summary>
+          <div className="mt-5 flex flex-wrap items-end gap-3">
             <div className="min-w-0 flex-1 sm:max-w-sm">
               <label htmlFor="auto-book-volume" className="block text-xs font-medium text-warm-700 dark:text-muted">
                 {t("volumeLabel")}
@@ -432,22 +410,17 @@ export default function AutoBookWorkspace({
               {t("startBook")}
             </button>
           </div>
-          <p id="auto-book-start-title" className="mt-2 text-xs leading-5 text-warm-700 dark:text-muted">
+          <p className="mt-3 text-xs leading-5 text-muted">
             {t("explicitCostHint")}
           </p>
-        </section>
-        )}
+        </details>
 
-        {purpose === "operations" && (
-          <section className="py-5" aria-labelledby="auto-book-runs-title">
+          <section className="auto-book-current-heading" aria-labelledby="auto-book-runs-title">
             <h2 id="auto-book-runs-title" className="text-sm font-semibold text-foreground">
               {t("runsTitle")}
             </h2>
-            <p className="mt-1 max-w-3xl text-xs leading-5 text-warm-700 dark:text-muted">
-              {t("runsDescription")}
-            </p>
+            <button type="button" onClick={() => onNavigateView("generation-runs")} className="text-xs text-muted hover:text-foreground">{t("allRecords")}</button>
           </section>
-        )}
 
         {loadError && (
           <div role="alert" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
@@ -458,20 +431,21 @@ export default function AutoBookWorkspace({
           </div>
         )}
 
-        <section className="min-w-0 border-t border-border" aria-label={t("operationAria")}>
+        <section className="auto-book-current min-w-0" aria-label={t("operationAria")}>
           <BatchGenerationPanel
             key={`${novelId}:${targets.job ?? "latest"}`}
-            surface={purpose === "start" ? "start" : "runs"}
+            surface="runs"
             novelId={novelId}
             initialJobId={targets.job}
             onJobTargetValidation={validateJobTarget}
+            onCurrentJobChange={setHasCurrentJob}
             selectedVolumeId={selectedVolumeId}
             volumes={volumes}
             chapters={chapters}
             structureLoaded={
               structureLoadedNovelId === novelId && !loadError
             }
-            startScope={purpose === "start" ? startScope : null}
+            startScope={startScope}
             preferWorldAutoSupplement={preferWorldAutoSupplement}
             onStartClose={closeStartDialog}
             onJumpToChapter={(chapterId) => onOpenWriting(chapterId)}

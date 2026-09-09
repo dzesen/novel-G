@@ -422,9 +422,9 @@ export default function CheckpointReview({
   const incompleteChapterId = job.pause_reason === "incomplete_scene" ? job.error?.chapter_id : null;
 
   return (
-    <div className="grid gap-3 border-b border-border bg-surface-secondary/40 px-4 py-3">
+    <div className="auto-book-checkpoint grid gap-4 px-4 py-3">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <h3 className="text-sm font-semibold text-foreground">
+        <h3 className="text-lg font-semibold text-foreground">
           {t(
             requiresSuccessor
               ? "reviewSuccessorTitle"
@@ -572,7 +572,7 @@ export default function CheckpointReview({
       )}
 
       {reviewWindow.length === 0 ? (
-        <p className="py-4 text-center text-xs text-muted">{t("windowEmpty")}</p>
+        job.pause_reason === "checkpoint" && <p className="py-4 text-center text-xs text-muted">{t("windowEmpty")}</p>
       ) : (
         <div className="grid max-h-[42vh] gap-2 overflow-y-auto pr-1">
           {reviewWindow.map((p) => (

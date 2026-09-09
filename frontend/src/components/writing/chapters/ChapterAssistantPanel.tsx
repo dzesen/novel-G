@@ -4,6 +4,8 @@ import { useTranslations } from "next-intl";
 import { Button } from "@/components/ui/Button";
 
 interface ChapterAssistantPanelProps {
+  hasChapter: boolean;
+  compact?: boolean;
   onOpenChapterOutline: () => void;
   onOpenProse: () => void;
   canGenerateProse: boolean;
@@ -11,6 +13,7 @@ interface ChapterAssistantPanelProps {
   canGenerateSceneIllustration: boolean;
   onOpenStateBackfill: () => void;
   hasContent: boolean;
+  onOpenJudgeReviews: () => void;
 }
 
 interface AssistantActionProps {
@@ -19,6 +22,7 @@ interface AssistantActionProps {
   onClick: () => void;
   disabled?: boolean;
   disabledReason?: string;
+  primary?: boolean;
 }
 
 function AssistantAction({
@@ -27,26 +31,22 @@ function AssistantAction({
   onClick,
   disabled,
   disabledReason,
+  primary,
 }: AssistantActionProps) {
   return (
-    <div className="border-b border-border py-4 last:border-b-0">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-          <p className="mt-1 text-xs leading-5 text-muted">{description}</p>
-          {disabled && disabledReason && (
-            <p className="mt-2 text-xs leading-5 text-amber-700 dark:text-amber-300">{disabledReason}</p>
-          )}
-        </div>
-        <Button size="sm" onClick={onClick} disabled={disabled} title={disabled ? disabledReason : undefined}>
-          {title}
-        </Button>
-      </div>
+    <div className="studio-assistant-action">
+      <Button className="studio-assistant-action-button" variant={primary ? "primary" : "secondary"} size="sm" onClick={onClick} disabled={disabled} title={disabled ? disabledReason : undefined}>
+        <span>{title}</span>
+        <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12h16m-6-6 6 6-6 6" /></svg>
+      </Button>
+      <p>{disabled && disabledReason ? disabledReason : description}</p>
     </div>
   );
 }
 
 export default function ChapterAssistantPanel({
+  hasChapter,
+  compact = false,
   onOpenChapterOutline,
   onOpenProse,
   canGenerateProse,
@@ -54,44 +54,71 @@ export default function ChapterAssistantPanel({
   canGenerateSceneIllustration,
   onOpenStateBackfill,
   hasContent,
+  onOpenJudgeReviews,
 }: ChapterAssistantPanelProps) {
   const tw = useTranslations("writing.chapterEditor.workspace");
   const tOutline = useTranslations("writing.outline");
   const tProse = useTranslations("writing.prose");
   const tSceneIllustration = useTranslations("writing.sceneIllustration");
   const tStateBackfill = useTranslations("stateBackfill");
+  const tReviews = useTranslations("writing.judgeReviews");
+
+  if (compact) {
+    return (
+      <div className="studio-ai-shortcuts" role="group" aria-label={tw("quickActions")} data-testid="chapter-ai-shortcuts">
+        <Button variant={canGenerateProse ? "secondary" : "primary"} size="sm" onClick={onOpenChapterOutline} disabled={!hasChapter}>
+          {tOutline("chapterTitle")}
+        </Button>
+        <Button variant={canGenerateProse ? "primary" : "secondary"} size="sm" onClick={onOpenProse} disabled={!hasChapter || !canGenerateProse} title={!canGenerateProse ? tProse("needOutline") : undefined}>
+          {tProse("title")}
+        </Button>
+      </div>
+    );
+  }
 
   return (
-    <div className="px-5 py-2">
-      <p className="border-b border-border py-4 text-xs leading-6 text-muted">
-        {tw("assistantSafety")}
-      </p>
+    <div className="studio-assistant-panel" data-testid="chapter-ai-assistant">
+      <div className="studio-assistant-intro">
+        <h2>{tw(!hasChapter ? "assistantChooseChapter" : canGenerateProse ? "assistantReadyTitle" : "assistantStartTitle")}</h2>
+        <p>{tw(!hasChapter ? "assistantChooseChapterHint" : canGenerateProse ? "assistantReadyHint" : "assistantStartHint")}</p>
+      </div>
       <AssistantAction
         title={tOutline("chapterTitle")}
         description={tw("assistantOutlineDescription")}
         onClick={onOpenChapterOutline}
+        disabled={!hasChapter}
+        primary={!canGenerateProse}
       />
       <AssistantAction
         title={tProse("title")}
         description={tw("assistantProseDescription")}
         onClick={onOpenProse}
-        disabled={!canGenerateProse}
-        disabledReason={tProse("needOutline")}
+        disabled={!hasChapter || !canGenerateProse}
+        disabledReason={hasChapter ? tProse("needOutline") : undefined}
+        primary={canGenerateProse}
       />
       <AssistantAction
         title={tSceneIllustration("openButton")}
         description={tw("assistantIllustrationDescription")}
         onClick={onOpenSceneIllustration}
-        disabled={!canGenerateSceneIllustration}
-        disabledReason={tSceneIllustration("needOutline")}
+        disabled={!hasChapter || !canGenerateSceneIllustration}
+        disabledReason={hasChapter ? tSceneIllustration("needOutline") : undefined}
       />
       <AssistantAction
         title={tStateBackfill("openButton")}
         description={tw("assistantStateDescription")}
         onClick={onOpenStateBackfill}
-        disabled={!hasContent}
-        disabledReason={tStateBackfill("needContent")}
+        disabled={!hasChapter || !hasContent}
+        disabledReason={hasChapter ? tStateBackfill("needContent") : undefined}
       />
+      <div className="studio-assistant-records">
+        <Button variant="quiet" size="sm" className="w-full justify-start" onClick={onOpenJudgeReviews} disabled={!hasChapter}>
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M3 11a9 9 0 1 1 2.5 7M3 4v7h7M12 7v5l3 2" /></svg>
+          {tReviews("title")}
+        </Button>
+        <p>{tReviews("entryDescription")}</p>
+      </div>
+      <p className="studio-assistant-note">{tw("assistantSafety")}</p>
     </div>
   );
 }

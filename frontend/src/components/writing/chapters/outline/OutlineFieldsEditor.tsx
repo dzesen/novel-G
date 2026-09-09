@@ -52,7 +52,8 @@ export default function OutlineFieldsEditor({
   const sceneAgentMode = Boolean(novelId && chapterId && baseScenes);
   const sceneStructureMatches = baseScenes?.length === value.scenes.length;
   const sceneContractLocked =
-    value.scene_contract_version === "scene_transition_contract.v2";
+    value.scene_contract_version === "scene_transition_contract.v2" ||
+    value.scene_contract_version === "scene_transition_contract.v3";
 
   useEffect(() => {
     if (!sceneAgentMode) return;

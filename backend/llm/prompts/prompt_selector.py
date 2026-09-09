@@ -20,7 +20,7 @@ import yaml
 from backend.scene_contract_versions import (
     CHAPTER_OUTLINE_PROMPT_REVISION,
     OUTLINE_ADHERENCE_EVIDENCE_VERSION,
-    SCENE_TRANSITION_CONTRACT_VERSION,
+    CURRENT_SCENE_CONTRACT_VERSION,
 )
 from backend.state_fact_contract_versions import STATE_FACT_EVIDENCE_VERSION
 
@@ -77,6 +77,7 @@ REQUIRED_CHAPTER_OUTLINE_PROMPT_KEYS: tuple[str, ...] = (
 )
 
 REQUIRED_PROSE_PROMPT_KEYS: tuple[str, ...] = (
+    "prompt_revision",
     "chapter_content_prompt_base",
     "chapter_content_prompt_without_schema_suffix",
 )
@@ -214,13 +215,14 @@ PROMPT_TEMPLATE_FIELDS: dict[str, set[str]] = {
 }
 
 PROMPT_CONTRACT_VERSIONS: dict[str, str] = {
-    CHAPTER_OUTLINE_PROMPT_NAME: SCENE_TRANSITION_CONTRACT_VERSION,
+    CHAPTER_OUTLINE_PROMPT_NAME: CURRENT_SCENE_CONTRACT_VERSION,
     OUTLINE_ADHERENCE_PROMPT_NAME: OUTLINE_ADHERENCE_EVIDENCE_VERSION,
     CHAPTER_STATE_PROMPT_NAME: STATE_FACT_EVIDENCE_VERSION,
 }
 
 PROMPT_REVISIONS: dict[str, str] = {
     CHAPTER_OUTLINE_PROMPT_NAME: CHAPTER_OUTLINE_PROMPT_REVISION,
+    PROSE_PROMPT_NAME: "chapter-prose-prompt-r2",
 }
 
 logger = logging.getLogger(__name__)

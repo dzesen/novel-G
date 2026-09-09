@@ -1,188 +1,23 @@
 "use client";
 
 import { useTranslations } from "next-intl";
-import { useTheme } from "next-themes";
-import { useRouter, usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
-import { useAuth } from "@/components/auth/AuthProvider";
+import { usePathname, useRouter } from "next/navigation";
+import WritingUtilities from "@/components/writing/WritingUtilities";
 
 export default function Navbar() {
   const t = useTranslations("nav");
   const router = useRouter();
   const pathname = usePathname();
-  const { theme, setTheme } = useTheme();
-  const { user, logout } = useAuth();
-  const [mounted, setMounted] = useState(false);
-  const [loggingOut, setLoggingOut] = useState(false);
-
-  useEffect(() => setMounted(true), []);
-
-  const currentLocale = pathname.startsWith("/en") ? "en" : "zh";
-
-  const switchLocale = (locale: string) => {
-    if (locale === currentLocale) return;
-    const rest = pathname.replace(/^\/(zh|en)/, "") || "/";
-    router.push(`/${locale}${rest}`);
-  };
-
-  const toggleTheme = () => {
-    setTheme(theme === "dark" ? "light" : "dark");
-  };
-
-  const goSettings = () => {
-    const section = user?.role === "admin"
-      ? ""
-      : "?section=generation-roles";
-    router.push(`/${currentLocale}/settings${section}`, { scroll: false });
-  };
-
-  const goHome = () => {
-    router.push(`/${currentLocale}`);
-  };
-
-  const handleLogout = async () => {
-    setLoggingOut(true);
-    try {
-      await logout();
-      router.replace(`/${currentLocale}/login`);
-    } finally {
-      setLoggingOut(false);
-    }
-  };
-
+  const locale = pathname.startsWith("/en") ? "en" : "zh";
   return (
-    <header className="sticky top-0 z-50 border-b border-border bg-background/80 backdrop-blur-md">
-      <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
-        <button
-          onClick={goHome}
-          className="text-lg font-bold text-foreground hover:text-primary transition-colors cursor-pointer"
-        >
-          {t("title")}
+    <header className="studio-navbar">
+      <div className="studio-navbar-inner">
+        <button type="button" className="studio-brand" onClick={() => router.push(`/${locale}`)} aria-label={t("home")}>
+          <svg aria-hidden="true" width="26" height="26" viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 23V6h5l8 14V5h5M5 23h5V9M18 20v3h5" /></svg>
+          <span>{t("brand")}</span>
         </button>
-
-        <div className="flex items-center gap-2">
-          {/* Language Segmented Toggle */}
-          <div className="flex items-center bg-surface-secondary rounded-lg p-0.5 border border-border">
-            <button
-              onClick={() => switchLocale("zh")}
-              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
-                currentLocale === "zh"
-                  ? "bg-accent text-white shadow-sm"
-                  : "text-muted hover:text-foreground"
-              }`}
-            >
-              中文
-            </button>
-            <button
-              onClick={() => switchLocale("en")}
-              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
-                currentLocale === "en"
-                  ? "bg-accent text-white shadow-sm"
-                  : "text-muted hover:text-foreground"
-              }`}
-            >
-              EN
-            </button>
-          </div>
-
-          {/* Theme Toggle */}
-          {mounted && (
-            <button
-              onClick={toggleTheme}
-              className="relative w-9 h-9 rounded-lg flex items-center justify-center text-muted hover:text-foreground hover:bg-surface-secondary border border-transparent hover:border-border transition-all duration-200"
-              title={t("theme")}
-            >
-              {/* Sun Icon */}
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className={`absolute transition-all duration-300 ${
-                  theme === "dark"
-                    ? "opacity-100 rotate-0 scale-100"
-                    : "opacity-0 -rotate-90 scale-0"
-                }`}
-              >
-                <circle cx="12" cy="12" r="4" />
-                <path d="M12 2v2" />
-                <path d="M12 20v2" />
-                <path d="m4.93 4.93 1.41 1.41" />
-                <path d="m17.66 17.66 1.41 1.41" />
-                <path d="M2 12h2" />
-                <path d="M20 12h2" />
-                <path d="m6.34 17.66-1.41 1.41" />
-                <path d="m19.07 4.93-1.41 1.41" />
-              </svg>
-              {/* Moon Icon */}
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className={`absolute transition-all duration-300 ${
-                  theme === "dark"
-                    ? "opacity-0 rotate-90 scale-0"
-                    : "opacity-100 rotate-0 scale-100"
-                }`}
-              >
-                <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-              </svg>
-            </button>
-          )}
-
-          {user && (
-            <button
-              onClick={goSettings}
-              className="w-9 h-9 rounded-lg flex items-center justify-center text-muted hover:text-foreground hover:bg-surface-secondary border border-transparent hover:border-border transition-all duration-200"
-              title={t("settings")}
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            </button>
-          )}
-
-          <div className="ml-1 hidden items-center gap-2 border-l border-border pl-3 sm:flex">
-            <div className="max-w-28 text-right leading-tight">
-              <p className="truncate text-xs font-semibold text-foreground">
-                {user?.display_name}
-              </p>
-              <p className="truncate text-[11px] text-muted">@{user?.username}</p>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={handleLogout}
-            disabled={loggingOut}
-            className="h-9 rounded-lg border border-border px-3 text-xs font-medium text-muted transition-colors hover:bg-surface-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-            title={t("logout")}
-          >
-            {loggingOut ? t("loggingOut") : t("logout")}
-          </button>
-        </div>
+        <span className="studio-navbar-label">{t("studio")}</span>
+        <div className="studio-navbar-tools"><span>{t("workspace")}</span><WritingUtilities /></div>
       </div>
     </header>
   );

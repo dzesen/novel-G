@@ -408,9 +408,12 @@ def _validate_extensions(mapping: dict[str, Any], path: str) -> dict[str, Any]:
     return _require_object(mapping["extensions"], f"{path}.extensions")
 
 
-def _validate_lorebook(value: Any, path: str, *, v3: bool) -> dict[str, Any]:
+def _validate_lorebook(value: Any, path: str, *, v3: bool) -> tuple[str, ...]:
     book = _require_object(value, path)
-    _validate_extensions(book, path)
+    # SillyTavern's World Info converter omits the book-level extensions object.
+    # Only absence is compatible; present values and entry extensions stay strict.
+    if "extensions" in book:
+        _validate_extensions(book, path)
     entries = _require_array(book, "entries", path)
     _validate_optional_type(book, "name", str, path, "字符串")
     _validate_optional_type(book, "description", str, path, "字符串")
@@ -453,7 +456,11 @@ def _validate_lorebook(value: Any, path: str, *, v3: bool) -> dict[str, Any]:
                     f"{entry_path}.position",
                     "必须是 before_char 或 after_char",
                 )
-    return book
+    return (
+        ("内嵌世界书缺少 extensions，已按空对象兼容读取；原始数据保持不变",)
+        if "extensions" not in book
+        else ()
+    )
 
 
 def _project_lorebook(book: dict[str, Any], *, v3: bool) -> dict[str, Any]:
@@ -487,6 +494,7 @@ def _project_lorebook(book: dict[str, Any], *, v3: bool) -> dict[str, Any]:
     projected = {
         key: deepcopy(value) for key, value in book.items() if key in book_fields
     }
+    projected.setdefault("extensions", {})
     projected["entries"] = [
         {
             key: deepcopy(value)
@@ -552,8 +560,9 @@ def _parse_v2(
         "$.data.tags",
     )
     extensions = _validate_extensions(data, "$.data")
+    warnings: tuple[str, ...] = ()
     if "character_book" in data:
-        _validate_lorebook(
+        warnings = _validate_lorebook(
             data["character_book"], "$.data.character_book", v3=False
         )
 
@@ -620,7 +629,7 @@ def _parse_v2(
         spec_version=version,
         fields=safe_fields,
         raw_card=deepcopy(card),
-        compatibility_warnings=(),
+        compatibility_warnings=warnings,
         prompt_risk_fields=tuple(risk_fields),
         decorators=(),
         assets=(),
@@ -767,7 +776,7 @@ def _parse_v3(
         )
     extensions = _validate_extensions(data, "$.data")
     if "character_book" in data:
-        _validate_lorebook(
+        warnings += _validate_lorebook(
             data["character_book"], "$.data.character_book", v3=True
         )
     _validate_optional_type(data, "nickname", str, "$.data", "字符串")
