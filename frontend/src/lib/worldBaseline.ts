@@ -1,4 +1,5 @@
 import type {
+  WorldBaselineView,
   WorldBaselineDecision,
   WorldBaselineDecisions,
   WorldBaselinePendingDecisions,
@@ -40,4 +41,10 @@ export function countPendingWorldBaselineDecisions(
     pending.emergent_candidates +
     pending.card_import_proposals
   );
+}
+
+
+export function reusableWorldBaselineDecisions(baseline: WorldBaselineView) {
+  return baseline.reusable_decisions
+    ?? (baseline.state === "current" ? baseline.decisions : {});
 }

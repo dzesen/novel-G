@@ -130,7 +130,15 @@ async def _material_snapshot(novel_id: str, structure_digest: str) -> dict[str, 
         "factions": factions,
         "relationships": relationships,
     }
+    domains = {
+        "character": characters,
+        **{kind: [item for item in worldbook if item.get("card_type") == kind]
+           for kind in ("location", "item", "rule", "lore")},
+        "factions": factions,
+        "relationships": relationships,
+    }
     return {
+        "domain_digests": {key: _digest(value) for key, value in domains.items()},
         "counts": counts,
         "material_digest": _digest(
             {
@@ -216,6 +224,17 @@ class WorldBaselineService:
                 stale_reasons.append("world_materials_changed")
             state = "stale" if stale_reasons else "current"
 
+        reusable_decisions = {}
+        if stored and stored.get("structure_digest") == structure_digest:
+            domain_digests = stored.get("domain_digests") or {}
+            whole_snapshot_matches = stored.get("material_digest") == material["material_digest"]
+            for key in WORLD_BASELINE_DECISION_KEYS:
+                decision = (stored.get("decisions") or {}).get(key)
+                if decision in WORLD_BASELINE_DECISION_VALUES and (
+                    whole_snapshot_matches
+                    or domain_digests.get(key) == material["domain_digests"][key]
+                ):
+                    reusable_decisions[key] = decision
         confirmed_at = stored.get("confirmed_at") if stored else None
         return {
             "schema_version": "world_baseline_view.v1",
@@ -225,6 +244,10 @@ class WorldBaselineService:
             "pending_decisions": pending,
             "stale_reasons": stale_reasons,
             "confirmed_at": _jsonable(confirmed_at),
+            "reusable_decisions": reusable_decisions,
+            "review_required_domains": [key for key in WORLD_BASELINE_DECISION_KEYS
+                                        if key not in reusable_decisions],
+            "review_digest": _digest({"material": material["material_digest"], "pending": pending}),
             "next_route": (
                 {"area": "auto-book", "view": "readiness"}
                 if state == "current"
@@ -238,6 +261,7 @@ class WorldBaselineService:
         *,
         decisions: Mapping[str, Any],
         confirmed_by: str,
+        expected_review_digest: str | None = None,
     ) -> dict[str, Any]:
         if set(decisions) != set(WORLD_BASELINE_DECISION_KEYS) or any(
             decisions.get(key) not in WORLD_BASELINE_DECISION_VALUES
@@ -269,8 +293,16 @@ class WorldBaselineService:
                 "仍有资料候选或导入决策未处理，暂不能确认基线。",
             )
         material = await _material_snapshot(novel_id, structure_digest)
+        if expected_review_digest is not None and expected_review_digest != _digest(
+            {"material": material["material_digest"], "pending": pending}
+        ):
+            raise WorldBaselineError(
+                "world_baseline_materials_changed",
+                "资料已发生变化，请刷新后复核本次变更。",
+            )
         baseline = {
             "schema_version": "world_baseline.v1",
+            "domain_digests": material["domain_digests"],
             "structure_digest": structure_digest,
             "projection_revision": "world_baseline_projection.v2",
             "material_digest": material["material_digest"],

@@ -1201,7 +1201,16 @@
       "confirmedAt": "确认时间 {time}",
       "continueAutoBook": "进入自动成书预检",
       "manualWritingHint": "世界资料初始化只约束新的自动成书启动，不阻止作者手动写作。",
-      "openWriting": "继续手动写作"
+      "openWriting": "继续手动写作",
+      "incrementalDescription": "未变化类别保留上次确认，只需复核本次变化的类别。",
+      "followUpTitle": "完成本次世界资料确认",
+      "incrementalReview": "已保留 {count} 类未变化资料的确认。请确认以下类别已复核，即可在这里完成资料确认。",
+      "confirmChanges": "确认本次资料变更",
+      "confirmChanged": "确认未完成。资料可能已变化，请刷新后重新复核。",
+      "reviewReady": "世界资料确认已完成，可返回自动成书检查并继续当前任务。",
+      "reviewPending": "还有资料决策未完成，或尚未做过首次资料确认。可打开资料初始化查看剩余事项。",
+      "returnAutoBook": "返回自动成书",
+      "openBaseline": "查看资料确认情况"
     },
     "continuity": {
       "locatingTarget": "正在核对连续性目标…",
@@ -2426,7 +2435,6 @@
       "contextSections": {
         "faction_index": "势力目录",
         "faction_cards": "本章势力设定与关系",
-
         "core_settings": "小说核心设定",
         "chapter_outline": "本章细纲",
         "present_cards": "出场人物资料",
@@ -3192,7 +3200,20 @@
       "successorPreparing": "正在准备重新预检…",
       "currentLoading": "正在读取当前任务…",
       "currentEmptyTitle": "还没有进行中的任务",
-      "currentEmptyDescription": "从上方选择一卷或整本开始。生成后的进度和需要处理的问题会显示在这里。"
+      "currentEmptyDescription": "从上方选择一卷或整本开始。生成后的进度和需要处理的问题会显示在这里。",
+      "pauseLinks": {
+        "label": "处理暂停问题",
+        "baseline": "确认世界资料变更",
+        "candidates": "审核待处理资料",
+        "curation": "审核资料提案",
+        "facts": "查看连续性问题",
+        "blueprint": "检查创作蓝图",
+        "readiness": "检查当前任务并重新确认",
+        "chapter": "打开关联章节",
+        "settings": "检查模型服务设置"
+      },
+      "readinessIssueExistingProseOutlineTitle": "已有正文缺少章细纲",
+      "readinessIssueExistingProseOutlineBody": "有 {count} 章已有正文，但缺少可用于后续核查的章细纲。请打开对应章节，复核并补齐章细纲后刷新检查。"
     },
     "judgeReviews": {
       "title": "Judge 审查记录",

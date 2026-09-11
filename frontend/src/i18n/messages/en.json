@@ -1201,7 +1201,16 @@
       "confirmedAt": "Confirmed {time}",
       "continueAutoBook": "Continue to auto-book readiness",
       "manualWritingHint": "World-data initialization gates only new auto-book starts. It does not block author-led writing.",
-      "openWriting": "Continue manual writing"
+      "openWriting": "Continue manual writing",
+      "incrementalDescription": "Previous approvals are retained for unchanged categories. Review only the categories that changed.",
+      "followUpTitle": "Finish this world-data review",
+      "incrementalReview": "Approvals for {count} unchanged categories were retained. Review the categories below to finish here.",
+      "confirmChanges": "Confirm these world-data changes",
+      "confirmChanged": "Confirmation did not complete. Data may have changed; refresh and review again.",
+      "reviewReady": "World-data review is complete. Return to automatic writing to check and continue the current job.",
+      "reviewPending": "Some material decisions remain, or the initial review has not been completed. Open world-data initialization to see what remains.",
+      "returnAutoBook": "Return to automatic writing",
+      "openBaseline": "View world-data review"
     },
     "continuity": {
       "locatingTarget": "Checking the continuity target…",
@@ -2426,7 +2435,6 @@
       "contextSections": {
         "faction_index": "Faction directory",
         "faction_cards": "Declared faction settings and relations",
-
         "core_settings": "core novel settings",
         "chapter_outline": "chapter outline",
         "present_cards": "present-character profiles",
@@ -3192,7 +3200,20 @@
       "successorPreparing": "Preparing a new preflight…",
       "currentLoading": "Loading the current task…",
       "currentEmptyTitle": "No task in progress",
-      "currentEmptyDescription": "Choose a volume or the whole book above. Progress and any issues that need your attention will appear here."
+      "currentEmptyDescription": "Choose a volume or the whole book above. Progress and any issues that need your attention will appear here.",
+      "pauseLinks": {
+        "label": "Resolve paused generation",
+        "baseline": "Confirm world-data changes",
+        "candidates": "Review pending reference cards",
+        "curation": "Review reference proposals",
+        "facts": "Review continuity issues",
+        "blueprint": "Check the book blueprint",
+        "readiness": "Review and confirm the current job",
+        "chapter": "Open related chapter",
+        "settings": "Check provider settings"
+      },
+      "readinessIssueExistingProseOutlineTitle": "Existing prose has no detailed outline",
+      "readinessIssueExistingProseOutlineBody": "{count} chapters have prose but no detailed outline for subsequent checks. Open the affected chapters, review and complete their outlines, then refresh the check."
     },
     "judgeReviews": {
       "title": "Judge review records",

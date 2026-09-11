@@ -169,6 +169,9 @@ export type WorldBaselineState =
   | "current";
 
 export interface WorldBaselineView {
+  reusable_decisions?: WorldBaselineDecisionDraft;
+  review_required_domains?: WorldBaselineDomain[];
+  review_digest?: string;
   schema_version: "world_baseline_view.v1";
   state: WorldBaselineState;
   counts: WorldBaselineCounts;

@@ -10,6 +10,7 @@ import {
   outlineAdherenceForDisplay,
 } from "./batchPresentation";
 import { requiresSuccessorJob } from "./generationRunsPresentation";
+import PauseResolutionLinks from "./PauseResolutionLinks";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
 import { checkpointPauseReasonTranslationKey, jobPauseReasonTranslationKey } from "./generationReasonPresentation";
@@ -517,6 +518,7 @@ export default function CheckpointReview({
       </div>
 
       <Banner job={job} />
+      <PauseResolutionLinks job={job} diagnostic={stopDiagnostic} />
       {hasReferenceCardBoundary
         && job.error?.candidate_names?.length ? (
           <p className="text-xs leading-5 text-amber-800 dark:text-amber-200">

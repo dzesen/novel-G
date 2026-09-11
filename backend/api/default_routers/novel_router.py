@@ -143,6 +143,7 @@ class StatusUpdate(BaseModel):
 
 
 class ConfirmWorldBaselineRequest(BaseModel):
+    expected_review_digest: Optional[str] = None
     decisions: Dict[
         Literal[
             "character",
@@ -273,6 +274,7 @@ async def confirm_world_baseline(
             novel_id,
             decisions=req.decisions,
             confirmed_by=actor.id,
+            expected_review_digest=req.expected_review_digest,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

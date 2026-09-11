@@ -15,6 +15,8 @@ import {
   isResumable,
   isTerminal,
 } from "./batchTypes";
+import PauseResolutionLinks from "./PauseResolutionLinks";
+import { pauseDestinations } from "./pauseResolution";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import ReferenceCardAutomationAuditPanel from "./ReferenceCardAutomationAuditPanel";
 import { buildReferenceCardAutomationAudit } from "./referenceCardAutomationAudit";
@@ -1145,6 +1147,9 @@ export default function GenerationRunsWorkspace({
                   />
                 )}
 
+                {!currentBlocker && ["paused", "interrupted", "failed"].includes(selectedJob.status) && (
+                  <PauseResolutionLinks job={selectedJob} />
+                )}
                 {currentBlocker && (
                   <section
                     aria-labelledby="generation-run-current-blocker-title"
@@ -1160,15 +1165,10 @@ export default function GenerationRunsWorkspace({
                       <DiagnosticEventSummary event={currentBlocker} />
                     </div>
                     <div className="mt-3 flex flex-wrap gap-2">
-                      {currentBlocker.chapter_id && (
-                        <button
-                          type="button"
-                          onClick={() => onJumpToChapter(
-                            currentBlocker.chapter_id,
-                            currentBlockerRunId ?? undefined,
-                          )}
-                          className="min-h-9 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-                        >
+                      <PauseResolutionLinks job={selectedJob} diagnostic={currentBlocker} omitChapter />
+                      {currentBlocker.chapter_id && pauseDestinations(selectedJob, currentBlocker).includes("chapter") && (
+                        <button type="button" onClick={() => onJumpToChapter(currentBlocker.chapter_id, currentBlockerRunId ?? undefined)}
+                          className="min-h-9 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium text-foreground hover:bg-surface-secondary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
                           {t("resolveOpenChapter")}
                         </button>
                       )}

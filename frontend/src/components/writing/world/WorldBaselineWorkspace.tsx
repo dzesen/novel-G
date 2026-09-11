@@ -5,6 +5,7 @@ import { useLocale, useTranslations } from "next-intl";
 import { apiGet, apiPost } from "@/lib/api";
 import {
   WORLD_BASELINE_DOMAINS,
+  reusableWorldBaselineDecisions,
   countPendingWorldBaselineDecisions,
   hasCompleteWorldBaselineDecisions,
 } from "@/lib/worldBaseline";
@@ -75,7 +76,7 @@ export default function WorldBaselineWorkspace({
         `/api/novels/${novelId}/world-baseline`,
       );
       setBaseline(result);
-      setDecisions(result.state === "stale" ? {} : result.decisions);
+      setDecisions(reusableWorldBaselineDecisions(result));
     } catch {
       setBaseline(null);
       setError(t("loadFailed"));
@@ -131,13 +132,14 @@ export default function WorldBaselineWorkspace({
     try {
       const result = await apiPost<WorldBaselineView>(
         `/api/novels/${novelId}/world-baseline/confirm`,
-        { decisions },
+        { decisions, expected_review_digest: baseline?.review_digest },
       );
       setBaseline(result);
       setDecisions(result.decisions);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : "";
       setError(detail ? `${t("confirmFailed")} ${detail}` : t("confirmFailed"));
+      setDecisions({});
     } finally {
       setConfirming(false);
     }
@@ -276,7 +278,7 @@ export default function WorldBaselineWorkspace({
               {t("decisionsTitle")}
             </h2>
             <p className="mt-2 max-w-[70ch] text-sm leading-6 text-muted">
-              {t("decisionsDescription")}
+              {t(baseline.state === "stale" ? "incrementalDescription" : "decisionsDescription")}
             </p>
             <div className="mt-4 divide-y divide-border border-y border-border">
               {WORLD_BASELINE_DOMAINS.map((domain) => {
@@ -363,6 +365,7 @@ export default function WorldBaselineWorkspace({
                 className="mt-4 rounded-md border border-danger/35 bg-danger/5 px-3 py-2.5 text-sm leading-5 text-danger"
               >
                 {error}
+                <button type="button" onClick={() => void loadBaseline()} className="ml-3 min-h-10 font-semibold underline">{t("retry")}</button>
               </p>
             )}
             <div className="mt-5 grid gap-2">

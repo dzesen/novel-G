@@ -93,6 +93,13 @@ export function readinessIssueCopy(
         title: t("readinessIssueContextTooLargeTitle"),
         body: t("readinessIssueContextTooLargeBody"),
       };
+    case "existing_prose_without_outline_requires_manual_review":
+      return {
+        title: t("readinessIssueExistingProseOutlineTitle"),
+        body: t("readinessIssueExistingProseOutlineBody", {
+          count: Number(issue.details.chapter_count ?? 0),
+        }),
+      };
     case "legacy_outline_requires_v2_regeneration":
       return {
         title: t("readinessIssueLegacyOutlineTitle"),

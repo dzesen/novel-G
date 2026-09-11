@@ -17,6 +17,7 @@ import {
 } from "./referenceCardAutoCreation";
 import { referenceCardTypeTranslationKey } from "./referenceCardAutoCreationPresentation";
 import { readinessAllowsStart } from "./readinessPresentation";
+import PauseResolutionLinks from "./PauseResolutionLinks";
 import { readinessIssueCopy } from "./readinessIssuePresentation";
 
 interface ResumeJobDialogProps {
@@ -179,6 +180,7 @@ export default function ResumeJobDialog({
           <label className="grid gap-1 text-sm">
             <span className="text-xs font-medium text-muted">{t("resumeReadinessBudgetLabel")}</span>
             <input
+              id="resume-token-budget"
               type="number"
               min={1}
               inputMode="numeric"
@@ -318,6 +320,13 @@ export default function ResumeJobDialog({
                                 : t("resumeReadinessAcknowledge")}</span>
                         </label>
                       )}
+                      <div className="mt-2">
+                        <PauseResolutionLinks job={job} issue={issue} onNavigate={onClose} />
+                        {issue.action_codes.some((code) => ["review_token_budget", "set_token_budget"].includes(code)) && (
+                          <button type="button" onClick={() => document.getElementById("resume-token-budget")?.focus()}
+                            className="min-h-10 text-sm font-semibold text-accent underline">{t("resumeReadinessBudgetLabel")}</button>
+                        )}
+                      </div>
                     </div>
                   );
                 })}

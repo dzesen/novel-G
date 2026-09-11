@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
+import WorldBaselineReviewFollowUp from "../world/WorldBaselineReviewFollowUp";
 import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type {
   EmergentReferenceCardApplyResult,
@@ -327,6 +328,8 @@ export default function CandidateReviewWorkspace({
             {success}
           </div>
         )}
+
+        {review && reviewableCandidates.length === 0 && <WorldBaselineReviewFollowUp novelId={novelId} />}
 
         {!review?.candidates.length ? (
           <div className="py-16 text-center">
