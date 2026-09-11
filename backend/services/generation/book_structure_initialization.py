@@ -27,7 +27,7 @@ from backend.llm.prompts.prompt_selector import (
     VOLUME_OUTLINE_PROMPT_NAME,
     load_prompt_config,
 )
-from backend.services.generation.provider_budget import structured_call_budget
+from backend.services.generation.provider_budget import ProviderOutputLimitMissing, structured_call_budget
 from backend.services.generation.protected_generation_params import (
     validate_protected_generation_params,
 )
@@ -367,7 +367,8 @@ async def inspect_book_structure_initialization(
             structure=structure,
             target_chapter_count=target,
         )
-        del exc
+        if isinstance(exc, ProviderOutputLimitMissing):
+            snapshot["provider_issue_reason"] = "output_token_limit_missing"
         snapshot["source_digest"] = _digest(source)
         return snapshot
 

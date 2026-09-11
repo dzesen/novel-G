@@ -2752,6 +2752,8 @@
       "readinessIssueWorldCardsMissingBody": "可以继续，但世界细节只能来自小说设定、细纲和现有正文。",
       "readinessIssueProposalPendingTitle": "有尚未处理的资料卡候选",
       "readinessIssueProposalPendingBody": "请先审查、应用或放弃候选，避免生成时读取到与候选不一致的正式资料卡。",
+      "readinessIssueOutputLimitMissingTitle": "缺少单次输出上限，无法计算生成预算",
+      "readinessIssueOutputLimitMissingBody": "建议在“系统配置 → LLM Provider 管理”中配置全局默认最大 token 数，或在本次任务中设置 Max Tokens，然后重新预检。",
       "readinessIssueProviderInvalidTitle": "Provider 工作流不可用",
       "readinessIssueProviderInvalidBody": "当前模型配置无法覆盖本次所需步骤。请先修复 Provider 或工作流引用。",
       "readinessIssueContextTooLargeTitle": "生成上下文过大",

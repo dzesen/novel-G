@@ -59,6 +59,7 @@ from backend.services.generation.reference_card_dependency_repair import (
 )
 from backend.services.generation.provider_budget import (
     ProviderBudgetBound,
+    ProviderOutputLimitMissing,
     merge_provider_bounds,
     scale_provider_bounds,
     structured_call_budget,
@@ -616,7 +617,12 @@ class GenerationReadinessModule:
                 _issue(
                     "provider_plan_invalid",
                     "blocked",
-                    details={"step": "volume_outline"},
+                    details={
+                        "step": "volume_outline",
+                        **({"reason": "output_token_limit_missing"}
+                           if (structure_snapshot or {}).get("provider_issue_reason") == "output_token_limit_missing"
+                           else {}),
+                    },
                     action_codes=["open_provider_settings"],
                 )
             )
@@ -1196,7 +1202,11 @@ class GenerationReadinessModule:
                 _issue(
                     "provider_plan_invalid",
                     "blocked",
-                    details={"message": str(exc)[:500]},
+                    details={
+                        "message": str(exc)[:500],
+                        **({"reason": "output_token_limit_missing", "provider_alias": exc.provider_alias}
+                           if isinstance(exc, ProviderOutputLimitMissing) else {}),
+                    },
                     action_codes=["open_provider_settings"],
                 )
             )

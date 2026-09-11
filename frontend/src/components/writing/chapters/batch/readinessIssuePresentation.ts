@@ -78,6 +78,12 @@ export function readinessIssueCopy(
         body: t("readinessIssueProposalPendingBody"),
       };
     case "provider_plan_invalid":
+      if (issue.details.reason === "output_token_limit_missing") {
+        return {
+          title: t("readinessIssueOutputLimitMissingTitle"),
+          body: t("readinessIssueOutputLimitMissingBody"),
+        };
+      }
       return {
         title: t("readinessIssueProviderInvalidTitle"),
         body: t("readinessIssueProviderInvalidBody"),

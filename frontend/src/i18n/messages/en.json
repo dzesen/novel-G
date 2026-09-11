@@ -2752,6 +2752,8 @@
       "readinessIssueWorldCardsMissingBody": "You can continue, but world details can only come from novel settings, outlines, and existing prose.",
       "readinessIssueProposalPendingTitle": "A reference-card proposal still needs review",
       "readinessIssueProposalPendingBody": "Review, apply, or reject the proposal first so generation does not read formal cards that conflict with pending candidates.",
+      "readinessIssueOutputLimitMissingTitle": "Output limit missing; generation budget cannot be calculated",
+      "readinessIssueOutputLimitMissingBody": "Set a global default Max Tokens in System settings → LLM Provider Management, or set Max Tokens for this job, then rerun preflight.",
       "readinessIssueProviderInvalidTitle": "Provider workflow is unavailable",
       "readinessIssueProviderInvalidBody": "The current model configuration cannot cover every required step. Fix the Provider or workflow reference first.",
       "readinessIssueContextTooLargeTitle": "Generation context is too large",

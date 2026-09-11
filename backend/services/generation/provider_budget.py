@@ -8,6 +8,14 @@ from typing import Any, Iterable
 from backend.services.llm.generation_runtime import GenerationPlan
 
 
+class ProviderOutputLimitMissing(ValueError):
+    """A planned call has neither a request cap nor a Provider default."""
+
+    def __init__(self, provider_alias: str) -> None:
+        super().__init__("structured output-token bound must be a positive integer")
+        self.provider_alias = provider_alias
+
+
 @dataclass(frozen=True)
 class ProviderBudgetBound:
     """An independent upper bound for one configured Provider alias."""
@@ -147,6 +155,11 @@ def structured_call_budget(
         plan.max_semantic_attempts,
         field="structured paid-attempt bound",
     )
+    effective_output_bound = (
+        output_token_bound if output_token_bound is not None else plan.max_output_tokens
+    )
+    if effective_output_bound is None:
+        raise ProviderOutputLimitMissing(provider_alias)
     context_tokens = _optional_positive_int(
         plan.max_context_tokens,
         field="structured context-token bound",
@@ -158,9 +171,7 @@ def structured_call_budget(
         field="structured input-token bound",
     )
     output_tokens = _positive_int(
-        output_token_bound
-        if output_token_bound is not None
-        else plan.max_output_tokens,
+        effective_output_bound,
         field="structured output-token bound",
     )
     reviewer_alias = str(plan.reviewer_alias or "").strip() or None
