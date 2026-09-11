@@ -6,7 +6,6 @@ import { ApiError, apiGet, apiPost } from "@/lib/api";
 import type { WritingTargetKey } from "@/lib/writingRoute";
 import type { ChapterSummary, VolumeSummary } from "@/types/novel";
 import {
-  chapterProgressEntries,
   type GenerationDiagnostic,
   type GenerationJob,
   type GenerationJobPage,
@@ -30,7 +29,7 @@ import {
   jobPauseReasonTranslationKey,
 } from "./generationReasonPresentation";
 import {
-  aggregateChapterProgress,
+  jobChapterProgressEntries,
   currentJobReasonCode,
   diagnosticHistoryState,
   newestDiagnostics,
@@ -645,9 +644,7 @@ export default function GenerationRunsWorkspace({
     ? exactJob?._id === target.jobId && exactJob.novel_id === novelId ? exactJob : null
     : null;
   const selectedChapterProgress = useMemo(
-    () => aggregateChapterProgress(
-      chapterProgressEntries(selectedJob?.progress ?? []),
-    ),
+    () => jobChapterProgressEntries(selectedJob?.progress ?? []),
     [selectedJob],
   );
   const orderedDiagnostics = useMemo(
@@ -1251,7 +1248,7 @@ export default function GenerationRunsWorkspace({
                     <dt className="text-muted">{t("detailPause")}</dt>
                     <dd className="mt-1 break-words text-foreground">
                       {selectedJob.pause_reason
-                        ? pauseReasonLabel(selectedJob.pause_reason)
+                        ? pauseReasonLabel(selectedJob.pause_reason_detail ?? selectedJob.pause_reason)
                         : t("none")}
                     </dd>
                   </div>
@@ -1356,7 +1353,7 @@ export default function GenerationRunsWorkspace({
                 </section>
 
                 <GenerationJobStages key={selectedJob._id} job={selectedJob}
-                  onOpenJob={(jobId) => onNavigate({ jobId })} onOpenRootJob={onOpenRootJob} />
+                  onOpenJob={(jobId) => onNavigate({ jobId })} onOpenRootJob={onOpenRootJob} onUpdateJob={setExactJob} />
 
                 <details key={`${selectedJob._id}:${target.eventId ?? "events"}`} open={Boolean(target.eventId)} className="auto-book-disclosure" aria-labelledby="generation-run-events-title">
                   <summary><span id="generation-run-events-title">{t("eventsTitle")} <span className="ml-2 text-muted">{orderedDiagnostics.length}</span></span></summary>

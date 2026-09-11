@@ -10,6 +10,7 @@ import {
 } from "react";
 import { useTheme } from "next-themes";
 import type { ThemeColors } from "@/lib/themes";
+import { normalizeThemeColors } from "@/lib/themeColorInput";
 import {
   THEME_PRESETS,
   DEFAULT_PRESET_ID,
@@ -123,14 +124,22 @@ function normalizePresetId(id: string | null): string {
 }
 
 function readThemeCustomizationState(): ThemeCustomizationState {
+  let presetId: string | null;
+  try {
+    presetId = localStorage.getItem(STORAGE_PRESET_KEY);
+  } catch {
+    // Storage may be disabled; keep the usable in-memory theme for this session.
+    return currentThemeCustomizationState;
+  }
   const stored = readStorage<StoredThemeColors>(STORAGE_CUSTOM_KEY);
+  const fallback = createDefaultCustomColors();
 
   return {
-    presetId: normalizePresetId(localStorage.getItem(STORAGE_PRESET_KEY)),
-    customColors:
-      stored?.light && stored?.dark
-        ? stored
-        : createDefaultCustomColors(),
+    presetId: normalizePresetId(presetId),
+    customColors: {
+      light: normalizeThemeColors(stored?.light, fallback.light),
+      dark: normalizeThemeColors(stored?.dark, fallback.dark),
+    },
   };
 }
 
@@ -234,7 +243,11 @@ export function ThemeCustomizationProvider({
   );
 
   const setCustomColors = useCallback((light: ThemeColors, dark: ThemeColors) => {
-    const next = { light, dark };
+    const fallback = createDefaultCustomColors();
+    const next = {
+      light: normalizeThemeColors(light, fallback.light),
+      dark: normalizeThemeColors(dark, fallback.dark),
+    };
 
     try {
       localStorage.setItem(STORAGE_PRESET_KEY, "custom");

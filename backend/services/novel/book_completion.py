@@ -789,6 +789,12 @@ class BookCompletionAudit:
                 projection={"_id": 1},
             ).to_list(length=None)
         }
+        active_faction_ids = {
+            str(item["_id"])
+            for item in await database[collections.FACTIONS].find(
+                {"novel_id": novel_object_id, "is_deleted": False}, projection={"_id": 1},
+            ).to_list(length=None)
+        }
         all_thread_ids = {
             str(item["_id"])
             for item in await database[collections.PLOT_THREADS].find(
@@ -1149,7 +1155,8 @@ class BookCompletionAudit:
                     set(worldbook_ids) - active_worldbook_ids
                 )
                 missing_threads = sorted(set(thread_ids) - all_thread_ids)
-                if missing_characters or missing_worldbook or missing_threads:
+                missing_factions = sorted(set(_reference_ids(outline.get("referenced_faction_card_ids"))) - active_faction_ids)
+                if missing_characters or missing_worldbook or missing_threads or missing_factions:
                     issues.append(
                         BookCompletionIssue(
                             code="chapter_reference_unresolved",
@@ -1164,6 +1171,7 @@ class BookCompletionAudit:
                                     missing_worldbook
                                 ),
                                 "missing_plot_thread_ids": missing_threads,
+                                **({"missing_faction_card_ids": missing_factions} if missing_factions else {}),
                             },
                         )
                     )

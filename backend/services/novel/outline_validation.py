@@ -68,6 +68,7 @@ _OUTLINE_ID_FIELDS: Tuple[Tuple[str, str, bool], ...] = (
     ("present_character_card_ids", "characters", True),
     ("mentioned_character_card_ids", "characters", True),
     ("referenced_worldbook_card_ids", "worldbook", True),
+    ("referenced_faction_card_ids", "factions", True),
     ("threads_resolved", "threads", True),
 )
 
@@ -81,7 +82,7 @@ def known_id_sets(roster: Dict[str, Any]) -> Dict[str, set]:
     """
     return {
         key: {str(entry["id"]) for entry in (roster.get(key) or [])}
-        for key in ("characters", "worldbook", "threads", "chapters")
+        for key in ("characters", "worldbook", "threads", "chapters", "factions")
     }
 
 

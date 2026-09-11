@@ -11,7 +11,6 @@ import {
   type GenerationJobSummary,
   type GenerationRunsNavigationTarget,
   type LeftoverProseRun,
-  chapterProgressEntries,
   isActive,
   isResumable,
   isTerminal,
@@ -31,7 +30,7 @@ import {
   bookCompletionResult,
 } from "./bookCompletionPresentation";
 import {
-  aggregateChapterProgress,
+  completedJobChapterCount,
   currentJobStatusByProseRun,
   isRootGenerationJob,
   requiresResumeReadinessReview,
@@ -495,8 +494,7 @@ export default function BatchGenerationPanel({
 
   const volumeChapters = jobChapters(job, chapters);
   const total = volumeChapters.length;
-  const complete = aggregateChapterProgress(chapterProgressEntries(job.progress))
-    .filter((chapter) => chapter.completedStepCount === 3).length;
+  const complete = completedJobChapterCount(job);
   const jobScopeLabel = job.scope === "book"
     ? t("progressBook")
     : t("progressVolume", { title: volumes.find((v) => v._id === job.volume_id)?.title ?? "" });

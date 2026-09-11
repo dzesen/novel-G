@@ -4,10 +4,11 @@ import logging
 from datetime import timezone
 
 from pymongo import AsyncMongoClient
-from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import ConnectionFailure
 
 from backend.config.config import get_config_value
+from backend.db.coordinated_database import CoordinatedDatabase
+from backend.db.maintenance import database_key
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ def get_client() -> AsyncMongoClient:
         raise RuntimeError("MongoDB client is not initialized. Call connect_to_mongo() first.")
     return client
 
-def get_database() -> AsyncDatabase:
+def get_database() -> CoordinatedDatabase:
     """返回当前配置指定的数据库实例。
 
     Args:
@@ -98,7 +99,7 @@ def get_database() -> AsyncDatabase:
         PyMongo Async 数据库对象。
     """
     db_name = str(get_config_value("mongo_database_name", "novel_generator"))
-    return get_client()[db_name]
+    return CoordinatedDatabase(get_client()[db_name], database_key(db_name))
 
 async def close_mongo_connection():
     """关闭 MongoDB 异步客户端连接。

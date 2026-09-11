@@ -1,6 +1,6 @@
 "use client";
 
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { Button } from "@heroui/react";
 import { type ChapterProgress, type GenerationJob, checkpointWindow } from "./batchTypes";
 import {
@@ -12,7 +12,7 @@ import {
 import { requiresSuccessorJob } from "./generationRunsPresentation";
 import { DiagnosticEventSummary } from "./GenerationDiagnosticsPanel";
 import { checkpointWordCountPresentation } from "./checkpointWordCount";
-import { jobPauseReasonTranslationKey } from "./generationReasonPresentation";
+import { checkpointPauseReasonTranslationKey, jobPauseReasonTranslationKey } from "./generationReasonPresentation";
 import { generationStepKind } from "../../generationMetadataPresentation";
 import type { ReferenceCardType } from "./referenceCardAutoCreation";
 
@@ -60,7 +60,7 @@ function Banner({ job }: { job: GenerationJob }) {
     const key = hasUncertainAttempt
       ? "reasonInterrupted"
       : job.pause_reason
-        ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonProcessRestart"
+        ? jobPauseReasonTranslationKey(job.pause_reason_detail ?? job.pause_reason) ?? "reasonProcessRestart"
         : "reasonProcessRestart";
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200">
@@ -78,9 +78,7 @@ function Banner({ job }: { job: GenerationJob }) {
       ? "reasonSourceChangedSuccessor"
       : isUncertainReferenceRepair
         ? "reasonReferenceCardRepairUncertain"
-        : job.pause_reason
-          ? jobPauseReasonTranslationKey(job.pause_reason) ?? "reasonCheckpoint"
-          : "reasonCheckpoint";
+        : checkpointPauseReasonTranslationKey(job.pause_reason, job.pause_reason_detail);
   const tone =
     job.pause_reason === "conflict" || job.pause_reason === "outline_deviation"
       ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300"
@@ -159,6 +157,7 @@ function StepTags({ progress }: { progress: ChapterProgress }) {
 }
 
 function ChapterCard({
+  novelId,
   progress,
   title,
   onJump,
@@ -167,6 +166,7 @@ function ChapterCard({
   onNavigateToPlotThreads,
   isCurrentStopCause,
 }: {
+  novelId: string;
   progress: ChapterProgress;
   title: string;
   onJump: () => void;
@@ -178,6 +178,7 @@ function ChapterCard({
   const t = useTranslations("writing.batch");
   const chapterEditorT = useTranslations("writing.chapterEditor");
   const metadataT = useTranslations("writing.generationMetadata");
+  const locale = useLocale();
   const hasConflict = progress.consistency_issues.length > 0;
   const adherence = outlineAdherenceForDisplay(progress.outline_adherence);
   const hasOutlineDeviation = adherence?.verdict === "fail";
@@ -335,6 +336,11 @@ function ChapterCard({
           ))}
           <div>{t("referenceCleanupImpact")}</div>
           <div className="flex flex-wrap gap-x-4 gap-y-1">
+            {presentation.referenceNotices.some((notice) => notice.actionTarget === "factions") && (
+              <a href={`/${locale}/writing/${encodeURIComponent(novelId)}?area=world&view=factions`} className="font-medium text-accent hover:underline">
+                {t("referenceCleanupOpenFactions")}
+              </a>
+            )}
             {presentation.referenceNotices.some(
               (notice) => notice.actionTarget === "reference_cards",
             ) && (
@@ -578,6 +584,7 @@ export default function CheckpointReview({
           {reviewWindow.map((p) => (
             <ChapterCard
               key={p.chapter_id}
+              novelId={job.novel_id}
               progress={p}
               title={titleForChapter(p.chapter_id)}
               onJump={() => onJumpToChapter(p.chapter_id)}

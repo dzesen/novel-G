@@ -19,6 +19,7 @@ from backend.db.repositories.novel_repository import novel_repo
 from backend.db.repositories.plot_thread_repository import plot_thread_repo
 from backend.db.repositories.volume_repository import volume_repo
 from backend.db.mutation import MutationCommand, commit_mutation
+from backend.db.maintenance import database_operation
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.schemas.novel_pydantic import (
     ChapterOutlineEditSchema,
@@ -134,6 +135,11 @@ class ChapterService:
             session=session,
         )
         if stored is None:
+            # Initial request validation may precede a concurrent volume delete.
+            # Recheck under the mutation lock, immediately before the insert.
+            await ChapterService._validate_scope(
+                novel_id, str(command["volume_id"]), session=session
+            )
             prepared = dict(command["chapter"])
             prepared["_id"] = to_object_id(chapter_id)
             await chapter_repo.create_chapter(prepared, session=session)
@@ -160,6 +166,16 @@ class ChapterService:
             await mutation.receipt("novel_stats", target)
         await ChapterService._refresh_narrative(session, mutation)
         return chapter_id
+
+    @staticmethod
+    @database_operation(write=True)
+    async def _commit_create_chapter(command: MutationCommand) -> str:
+        # Reject a deleted parent before recording an intent that can never
+        # complete. Keep this check and the mutation under the same lock.
+        await ChapterService._validate_scope(
+            command.novel_id, str(command.payload["volume_id"])
+        )
+        return await commit_mutation(command, ChapterService._execute_create_chapter)
 
     @staticmethod
     async def create_chapter(data: Dict[str, Any]) -> str:
@@ -195,11 +211,11 @@ class ChapterService:
             child_ids={"chapter": chapter_id},
         )
         try:
-            return await commit_mutation(command, ChapterService._execute_create_chapter)
+            return await ChapterService._commit_create_chapter(command)
         except DuplicateKeyError:
             if not auto_order:
                 raise
-            return await commit_mutation(command, ChapterService._execute_create_chapter)
+            return await ChapterService._commit_create_chapter(command)
 
     @staticmethod
     async def get_chapter(chapter_id: str) -> Dict[str, Any]:
@@ -237,6 +253,9 @@ class ChapterService:
 
     @staticmethod
     async def update_chapter(chapter_id: str, update_data: Dict[str, Any]) -> bool:
+        for field in ("title", "summary", "content", "status", "order_index"):
+            if field in update_data and update_data[field] is None:
+                raise ValueError(f"Chapter {field} cannot be null")
         if "outline" in update_data:
             raise ValueError(
                 "Chapter outline updates must use the versioned outline service"
@@ -441,6 +460,8 @@ class ChapterService:
                 "mentioned_character_card_ids": [
                     to_object_id(cid) for cid in payload["mentioned_character_card_ids"]
                 ],
+                **({"referenced_faction_card_ids": [to_object_id(cid) for cid in payload["referenced_faction_card_ids"]]}
+                   if payload.get("referenced_faction_card_ids") else {}),
                 "referenced_worldbook_card_ids": [
                     to_object_id(cid) for cid in payload["referenced_worldbook_card_ids"]
                 ],
@@ -735,6 +756,8 @@ class ChapterService:
             "mentioned_character_card_ids": [
                 to_object_id(cid) for cid in payload["mentioned_character_card_ids"]
             ],
+            **({"referenced_faction_card_ids": [to_object_id(cid) for cid in payload["referenced_faction_card_ids"]]}
+               if payload.get("referenced_faction_card_ids") else {}),
             "referenced_worldbook_card_ids": [
                 to_object_id(cid) for cid in payload["referenced_worldbook_card_ids"]
             ],

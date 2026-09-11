@@ -81,7 +81,7 @@ export default function ReferenceCardsDestination({
       onCandidateReviewChange?.(true);
       return;
     }
-    onCandidateReviewChange?.(false);
+    // The card-type callback changes the view and type in one navigation.
     onCardTypeChange(tab);
   };
 

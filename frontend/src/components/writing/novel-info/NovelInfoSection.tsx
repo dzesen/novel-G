@@ -398,8 +398,9 @@ export default function NovelInfoSection({
     if (f.type === "textarea") {
       return (
         <div key={f.key} className="space-y-2">
-          <label className="text-sm font-medium text-foreground">{label}</label>
+          <label htmlFor={`novel-${f.key}`} className="text-sm font-medium text-foreground">{label}</label>
           <AutoResizeTextarea
+            id={`novel-${f.key}`}
             value={String(val ?? "")}
             onChange={(v) => updateField(f.key, v)}
             placeholder={label}

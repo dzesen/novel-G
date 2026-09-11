@@ -17,6 +17,7 @@ import {
   TextField,
 } from "@heroui/react";
 import { apiPost } from "@/lib/api";
+import { resolveJudgeSettings } from "./judgeProviderConfig";
 import type {
   AppConfig,
   ProviderCapabilityResult,
@@ -370,6 +371,11 @@ export function ProviderCard({ config, initialAlias = "", onChange, onProviderRe
           />
 
           <div className="min-w-0 rounded-lg border border-border bg-surface px-3 py-3">
+            {selectedProvider && resolveJudgeSettings(config).providerAlias === selectedAlias && (
+              <p data-testid="provider-judge-binding" className="mb-4 break-words rounded-md bg-accent/10 px-3 py-3 text-sm leading-6 text-foreground">
+                {t("judgeBinding", { provider: selectedAlias })}
+              </p>
+            )}
             {selectedProvider ? (
               <ProviderDetail
                 alias={selectedAlias}

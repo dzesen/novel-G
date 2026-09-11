@@ -16,6 +16,9 @@ from pymongo.results import BulkWriteResult
 from pydantic import ValidationError
 
 from backend.db import collections
+from backend.db.restored_authorization import (
+    RESTORED_AUTHORITY_FIELD, require_current_authorization,
+)
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.mongo import get_database
@@ -34,6 +37,7 @@ from backend.services.generation.candidate_repair_contracts import (
     MAX_CANDIDATE_PIPELINE_PROGRESS_ENTRIES,
     MAX_CANDIDATE_OUTLINE_SCENES,
     MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
+    AdherenceNotReviewedCheckpointV6,
     CandidatePipelineCheckpointConflict,
     CandidatePipelineCompletionEvidenceV1,
     CandidatePipelineCompletionV1,
@@ -681,7 +685,8 @@ class GenerationJobRepository:
             raise JobExecutionLeaseUnavailable(
                 "Generation Job has uncertain Provider attempts"
             )
-        exact_fields: list[dict[str, Any]] = []
+        require_current_authorization(current)
+        exact_fields: list[dict[str, Any]] = [{RESTORED_AUTHORITY_FIELD: None}]
         if "has_uncertain_attempts" in current:
             exact_fields.append({"has_uncertain_attempts": False})
         else:
@@ -746,6 +751,7 @@ class GenerationJobRepository:
             "$and": [
                 {
                     "_id": to_object_id(lease.job_id),
+                    RESTORED_AUTHORITY_FIELD: None,
                     "execution_epoch": lease.epoch,
                     "execution_lease.schema_version": (
                         "job_execution_lease.v1"
@@ -924,6 +930,7 @@ class GenerationJobRepository:
         if expires_at <= now:
             raise ValueError("Generation job execution lease expiry is invalid")
         current = await self.get_job(job_id)
+        require_current_authorization(current)
         current_status = str(current.get("status") or "")
         raw_resolution = current.get("state_dispatch_resolution")
         resolution_query: dict[str, Any]
@@ -2640,16 +2647,22 @@ class GenerationJobRepository:
             expected_scene_count=expected_scene_count,
             max_repair_cycles=max_repair_cycles,
         )
+        # A not-reviewed receipt carries no semantic findings or coverage.
+        # Match the runner's honest zero projection without inventing a review;
+        # reviewed checkpoints retain the full-scene requirement below.
+        not_reviewed = isinstance(evidence.adherence, AdherenceNotReviewedCheckpointV6)
+        expected_issue_categories = () if not_reviewed else evidence.adherence.issue_categories
+        expected_review_coverage_count = 0 if not_reviewed else expected_scene_count
         if (
             entry.source != evidence.prose.source
             or entry.state_proposal_id != evidence.state.proposal_id
             or entry.attempt_count != evidence.attempt_count
             or entry.truncation_count != evidence.truncation_count
             or entry.outline_issue_categories
-            != evidence.adherence.issue_categories
+            != expected_issue_categories
             or entry.consistency_issue_count
             != evidence.state.consistency_issue_count
-            or entry.scene_coverage_count != expected_scene_count
+            or entry.scene_coverage_count != expected_review_coverage_count
             or entry.repair_cycles_used != evidence.repair_cycles_used
         ):
             raise CandidatePipelineCheckpointConflict(
@@ -4695,6 +4708,10 @@ class GenerationJobRepository:
                 "Candidate pipeline completion ledger is invalid"
             )
         validated_checkpoint = validated_checkpoints[-1]
+        if validated_checkpoint.kind != "state_candidate":
+            raise CandidatePipelineCheckpointConflict(
+                "Candidate pipeline completion ledger is incomplete"
+            )
         receipt = CandidatePipelineCompletionV1(
             schema_version="candidate_pipeline_completion.v1",
             checkpoint_id=validated_checkpoint.checkpoint_id,
@@ -6311,6 +6328,7 @@ class GenerationJobRepository:
         if requested < 0:
             raise ValueError("Attempt reservation cannot be negative")
         job = await self.get_job(job_id)
+        require_current_authorization(job)
         capacity = int(job.get("usage_attempt_capacity") or 0)
         claimed = int(job.get("usage_attempt_claimed") or 0)
         reservation = job.get("attempt_reservation") or {}
@@ -6568,6 +6586,7 @@ class GenerationJobRepository:
             slot["pre_dispatch_fence"] = fence
         query: dict[str, Any] = {
             "_id": to_object_id(job_id),
+            RESTORED_AUTHORITY_FIELD: None,
             "is_deleted": False,
             "state_dispatch_resolution": None,
             "attempt_reservation.chapter_id": str(chapter_id),
@@ -6738,6 +6757,7 @@ class GenerationJobRepository:
             return attempt_id
 
         job = await self.get_job(job_id)
+        require_current_authorization(job)
         if required_protocol == "successor_acceptance_outline":
             from backend.evaluation.required_book_successor_acceptance_outline import (
                 SuccessorAcceptanceOutlineDispatchRejected,

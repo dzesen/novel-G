@@ -19,6 +19,8 @@ export type ContextSectionKind =
   | "other_threads"
   | "minor_cards"
   | "roster"
+  | "faction_index"
+  | "faction_cards"
   | "world_entry_index"
   | "other";
 
@@ -27,6 +29,7 @@ export type ReferenceKind =
   | "pov_character"
   | "present_character"
   | "mentioned_character"
+  | "faction"
   | "world_entry"
   | "resolved_thread"
   | "thread_due_chapter"
@@ -34,7 +37,7 @@ export type ReferenceKind =
   | "thread_state"
   | "reference";
 
-export type ReferenceActionTarget = "reference_cards" | "plot_threads";
+export type ReferenceActionTarget = "reference_cards" | "plot_threads" | "factions";
 export type ReferenceMatchKind = "name" | "alias" | "existing_record";
 
 export type ReferenceCardFieldKind =
@@ -125,6 +128,8 @@ const CONTEXT_SECTIONS = new Set<ContextSectionKind>([
   "other_threads",
   "minor_cards",
   "roster",
+  "faction_index",
+  "faction_cards",
   "world_entry_index",
 ]);
 
@@ -143,6 +148,7 @@ export function referenceFieldKind(value: unknown): ReferenceKind {
   if (field === "pov_character_card_id") return "pov_character";
   if (field === "present_character_card_ids") return "present_character";
   if (field === "mentioned_character_card_ids") return "mentioned_character";
+  if (field === "referenced_faction_card_ids") return "faction";
   if (field === "referenced_worldbook_card_ids") return "world_entry";
   if (field === "threads_resolved") return "resolved_thread";
   if (/^new_threads\[\d+\]\.due_target\.chapter_id$/.test(field)) {
@@ -158,6 +164,7 @@ export function referenceFieldKind(value: unknown): ReferenceKind {
 export function referenceActionTarget(
   kind: ReferenceKind,
 ): ReferenceActionTarget {
+  if (kind === "faction") return "factions";
   return kind === "resolved_thread"
     || kind === "thread_due_chapter"
     || kind === "thread_state"

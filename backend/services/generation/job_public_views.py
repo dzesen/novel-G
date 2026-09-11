@@ -11,8 +11,10 @@ from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from backend.scene_contract_versions import current_outline_adherence_decision
-from backend.services.generation.failure_diagnostics import infer_job_diagnostics
+from backend.services.generation.failure_diagnostics import infer_job_diagnostics, authorization_pause_detail
 from backend.services.generation.job_relations import related_prose_run_ids
+from backend.services.generation.job_stage_history import project_stage_history
+from backend.services.llm.generation_runtime import safe_structured_repair_failure_diagnostics
 
 
 class _PublicModel(BaseModel):
@@ -62,6 +64,20 @@ class PublicJobProgress(_PublicModel):
     completed_at: str | None = None
 
 
+class PublicJobStageEvent(_PublicModel):
+    id: str
+    kind: Literal["request", "chapter_complete", "job_status"]
+    stage: Literal["outline", "prose", "state", "review", "other", "completion", "job"]
+    status: Literal["running", "settled", "uncertain", "completed", "paused", "failed", "interrupted", "aborted"]
+    phase: Literal["primary", "repair", "text", "other"] | None = None
+    chapter_id: str | None = None
+    order_index: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    tokens: int | None = None
+    retry_index: int | None = None
+
+
 class PublicGenerationJob(_PublicModel):
     schema_version: Literal["generation_job_public.v1"] = "generation_job_public.v1"
     id: str = Field(alias="_id")
@@ -74,6 +90,7 @@ class PublicGenerationJob(_PublicModel):
     volume_id: str | None = None
     status: str | None = None
     pause_reason: str | None = None
+    pause_reason_detail: Literal["authorization_scope_increased", "world_baseline_confirmation_required", "readiness_confirmation_required"] | None = None
     checkpoint_interval: int | None = None
     outline_deviation_policy: str | None = None
     generation_params: PublicGenerationParams = Field(default_factory=PublicGenerationParams)
@@ -82,6 +99,8 @@ class PublicGenerationJob(_PublicModel):
     tokens_reserved: int = 0
     current_chapter_id: str | None = None
     progress: list[PublicJobProgress] = Field(default_factory=list)
+    stage_history: list[PublicJobStageEvent] = Field(default_factory=list)
+    stage_history_total: int = 0
     last_checkpoint_index: int = 0
     error: dict[str, JsonValue] | None = None
     diagnostics: list[dict[str, JsonValue]] = Field(default_factory=list)
@@ -100,6 +119,7 @@ class PublicGenerationJob(_PublicModel):
     detail_version: str | None = None
     progress_count: int = 0
     progress_chapter_count: int = 0
+    completed_chapter_count: int = 0
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -115,6 +135,7 @@ class PublicJobSummary(_PublicModel):
     volume_id: str | None = None
     status: str | None = None
     pause_reason: str | None = None
+    pause_reason_detail: Literal["authorization_scope_increased", "world_baseline_confirmation_required", "readiness_confirmation_required"] | None = None
     token_budget: int | None = None
     tokens_used: int = 0
     tokens_reserved: int = 0
@@ -231,7 +252,18 @@ _DIAGNOSTIC_DETAIL_FIELDS = (
 
 
 def public_diagnostics(job: Mapping[str, Any]) -> list[dict[str, JsonValue]]:
-    return [{**_pick(event, _DIAGNOSTIC_FIELDS), "details": _pick(event.get("details"), _DIAGNOSTIC_DETAIL_FIELDS)} for event in infer_job_diagnostics(job)]
+    result = []
+    for event in infer_job_diagnostics(job):
+        raw_details = event.get("details")
+        details = _pick(raw_details, _DIAGNOSTIC_DETAIL_FIELDS)
+        validation = safe_structured_repair_failure_diagnostics(
+            raw_details.get("structured_validation") if isinstance(raw_details, Mapping) else None
+        )
+        if validation is not None:
+            details["structured_validation"] = validation
+        result.append({**_pick(event, _DIAGNOSTIC_FIELDS), "details": details})
+    return result
+
 
 
 def _public_progress(value: Any) -> list[dict[str, JsonValue]]:
@@ -283,6 +315,49 @@ _CONTINUATION_FIELDS = (
 )
 
 
+def _completed_chapter_count(job: Mapping[str, Any]) -> int:
+    """Count frozen reusable chapters and formal completion receipts once.
+
+    This is display metadata, never a replacement for the completion gate.
+    Readiness inputs remain private; only the resulting scalar is projected.
+    """
+    readiness = job.get("readiness")
+    work = readiness.get("work") if isinstance(readiness, Mapping) else None
+    chapters = work.get("chapters") if isinstance(work, Mapping) else None
+    allowed: set[str] | None = None
+    completed: set[str] = set()
+    if isinstance(chapters, list):
+        allowed = set()
+        for chapter in chapters:
+            if not isinstance(chapter, Mapping) or not chapter.get("chapter_id"):
+                continue
+            if (job.get("scope") == "volume"
+                    and str(chapter.get("volume_id")) != str(job.get("volume_id"))):
+                continue
+            chapter_id = str(chapter["chapter_id"])
+            allowed.add(chapter_id)
+            if (chapter.get("has_outline") is True and chapter.get("has_content") is True
+                    and chapter.get("state_completion_status") == "current"
+                    and chapter.get("prose_acceptance_state") in {"ai_complete", "author_confirmed"}):
+                completed.add(chapter_id)
+    for entry in job.get("progress") or []:
+        if not isinstance(entry, Mapping) or not entry.get("chapter_id"):
+            continue
+        chapter_id = str(entry["chapter_id"])
+        if allowed is not None and chapter_id not in allowed:
+            continue
+        if entry.get("schema_version") == "candidate_pipeline_progress.v1":
+            if entry.get("status") == "completed" and entry.get("finalization_status") == "committed":
+                completed.add(chapter_id)
+            continue
+        steps = {step for key in ("steps_done", "steps_skipped")
+                 for step in (entry.get(key) if isinstance(entry.get(key), list) else [])
+                 if isinstance(step, str)}
+        if {"outline", "prose", "state"} <= steps and not entry.get("incomplete_prose"):
+            completed.add(chapter_id)
+    return len(completed)
+
+
 def project_job(job: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if job is None:
         return None
@@ -290,19 +365,23 @@ def project_job(job: Mapping[str, Any] | None) -> dict[str, Any] | None:
     projected_fields = {
         "generation_params", "progress", "diagnostics", "error", "readiness",
         "reference_card_auto_creation_events", "reference_card_repair_events",
-        "prose_continuation_authorization",
+        "prose_continuation_authorization", "stage_history", "stage_history_total",
+        "completed_chapter_count", "pause_reason_detail",
     }
     source_fields = tuple("_id" if key == "id" else key for key in PublicGenerationJob.model_fields if key not in projected_fields)
     out = _pick(job, source_fields)
     out["schema_version"] = "generation_job_public.v1"
+    out["pause_reason_detail"] = authorization_pause_detail(job)
     parent_id = job.get("required_book_successor_parent_job_id")
     out["parent_job_id"] = str(parent_id) if parent_id is not None else None
     out["root_job_id"] = str(parent_id) if parent_id is not None else str(job["_id"])
     out["progress_count"] = len(job.get("progress") or [])
     out["progress_chapter_count"] = len({str(item.get("chapter_id")) for item in job.get("progress", []) if isinstance(item, Mapping) and item.get("chapter_id")})
+    out["completed_chapter_count"] = _completed_chapter_count(job)
     out["detail_version"] = detail_version(job)
     out["generation_params"] = _pick(job.get("generation_params"), PublicGenerationParams.model_fields)
     out["progress"] = _public_progress(job.get("progress"))
+    out.update(project_stage_history(job))
     # Inference still reads the original evidence, before the public projection discards it.
     out["diagnostics"] = public_diagnostics(job)
     out["related_prose_run_ids"] = list(related_prose_run_ids(job))
@@ -369,6 +448,7 @@ def project_job_summary(job: Mapping[str, Any]) -> dict[str, Any]:
         "diagnostics_count": _count(job, "diagnostics_count", "diagnostics"),
         "related_prose_run_ids": list(related_prose_run_ids(job)),
     })
+    out["pause_reason_detail"] = authorization_pause_detail(job)
     events = public_diagnostics(job)
     out["latest_diagnostic"] = events[-1] if events else None
     out["reason_codes"] = sorted(set([

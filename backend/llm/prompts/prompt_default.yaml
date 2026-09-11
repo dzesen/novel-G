@@ -470,7 +470,7 @@ create_chapter_outline_by_ai:
     且保存后的【本章细纲】上下文投影不得超过 40,000 UTF-8 bytes。
   chapter_outline_prompt_without_schema_suffix: |
     请只输出 JSON；省略固定版本和无额外变化的 narrative_delta，形如：
-    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"scenes":[{"scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":800,"target":1100,"max":1500}},{"scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1400,"target":1900,"max":2300}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
+    {"pov_character_card_id":"<名单中的id或null>","present_character_card_ids":["<名单中的id>"],"mentioned_character_card_ids":[],"referenced_worldbook_card_ids":[],"referenced_faction_card_ids":[],"scenes":[{"scene_id":"scene-1","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-1-pre-1","description":"..."}],"beats":[{"beat_id":"scene-1-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-1-post-1","description":"..."}],"forbidden_conditions":[],"event_key":"main-goal.accepted","repetition_policy":"forbid","word_budget":{"min":800,"target":1100,"max":1500}},{"scene_id":"scene-2","summary":"...","purpose":"...","preconditions":[{"condition_id":"scene-2-pre-1","description":"..."}],"beats":[{"beat_id":"scene-2-beat-1","description":"...","expected_transition":"...","required":true}],"postconditions":[{"condition_id":"scene-2-post-1","description":"..."}],"forbidden_conditions":[],"event_key":"main-risk.escalated","repetition_policy":"forbid","word_budget":{"min":1400,"target":1900,"max":2300}}],"core_conflict":"...","ending_hook":"...","target_word_count":3000,"threads_resolved":[],"new_threads":[],"new_reference_card_candidates":[]}
     整个 JSON 响应不得超过 32,000 UTF-8 bytes；不要输出 JSON 以外的任何内容。
 
 
@@ -590,6 +590,14 @@ extract_chapter_state_by_ai:
     - thread_updates[].thread_id 只能逐字复制上文【伏笔】可用 id 名单中的 id；
       不得使用人物、世界资料卡、章节或其他类型的 id，也不得根据名称猜测 id。
       名单中没有对应伏笔时就不要提交该条更新。
+    - 必须逐项核对细纲 threads_resolved 中的计划回收伏笔；不得因为到期或细纲声称要收就当成已经回收。
+      每项在 fact_evidence.facts 中使用 target_type=thread、target_id=对应正式伏笔 ID、kind=canonical_fact：
+      正文确实完成回收时，提交 resolved 更新，并用 supported 事实及精确 action_ref 绑定该动作；
+      正文没有完成回收时，以“本章完成该伏笔回收”为待核验陈述，support=unsupported、action_ref=null，
+      引用能说明悬念仍保留或尚未完成的正文并解释；只有推进时可另提有证据的 developing 更新。
+      无法判断时使用 support=unknown、action_ref=null 并解释，不得伪造正文依据。
+      有计划回收项时，逐项判断应放入 extraction_status=complete 的 facts；整次无法抽取时可用 unknown。
+      还需检查名单中的其他活跃伏笔是否在正文中被推进或回收，不能只看本章计划清单。
     - 伏笔只能推进为 developing（有推进但未收）或 resolved（本章确实收了）。
       不要新建伏笔，不要判定废弃。以**正文实际写了什么**为准：
       细纲计划要收的伏笔，正文可能根本没写到。
@@ -620,8 +628,24 @@ extract_chapter_state_by_ai:
     - 章节级客观事实若已完整写入 summary，可用 action_type=chapter_summary、
       target_id={chapter_id}、value 等于完整 summary 的 action_ref 核算。正文存在会影响后文的
       客观持久变化时，不得用 complete_no_change 逃避，也不得漏掉对应事实。
-    - spans 使用 Python 风格字符下标的左闭右开区间，quote 必须逐字复制正文对应区间；
+    - 如果正文提供 [[state-source:...]] 片段编号，优先选择真正支持该事实的编号，
+      spans 中填 start=0、end=1，quote 逐字填写完整编号（包含双中括号）。
+      本地会按当前正文编号还原真实字符区间和逐字引文，模型无需重抄片段正文。
+      编号绑定本次正文，不能自造、拼接、改写或引用上次正文的编号；每个事实仍只允许 1～2 条。
+      片段不足以支持事实时，选取另一个足够的片段或使用下述逐字引用，不能用无关片段凑数。
+    - 普通逐字 spans 使用 Python 风格字符下标的左闭右开区间，quote 必须逐字复制正文对应区间；
       不得改写、去空格或使用字节偏移。本地会复核区间并只保存 quote 哈希。
+      优先选择本章中能够唯一定位、足以支撑事实的连续原文，不得把相隔段落拼成一条 quote。
+      人名、称呼、短应答等可能重复；应连同相邻原文一起复制，使整段 quote 在本章只出现一次。
+      无法可靠计算字符位置时，可明确填 start=0、end=0，由本地按唯一逐字引文计算真实区间；
+      不要猜偏移量或为了缩短引文删改句中内容。匹配不到或出现多次都会被拒绝。
+      一条原文足以支撑事实时，只引用这一条；只有单条不足以支撑同一事实时才补第二条。
+      不要为了凑满两条而重述或拼接原文；不得为了减少引文而遗漏事实或动作。
+      标点也须原样复制，不得给截取的片段自行补上句号；可以在足以支撑事实的连续片段处结束。
+      输出前逐条检查 facts：support 为 supported 或 unsupported 时，spans 必须含 1～2 个
+      完整对象，每个均有 start、end、quote；省略 spans、空数组、用 statement 或 explanation
+      代替引用均不合格。先从本章正文复制所需原句，再填写定位；不能为通过校验而捏造引文，
+      也不能把有明确正文依据的事实改成 unknown 来省略证据。
     - extraction_status=complete 时 facts 必须非空，no_change 与 unknown_reason 必须为空；
       complete_no_change 只用于确实没有任何需核算持久变化时，facts 为空且 no_change 给出正文
       span；unknown 只用于抽取确实无法完成时，并填写 unknown_reason，不能同时给 no_change。
@@ -629,4 +653,8 @@ extract_chapter_state_by_ai:
     按给定的 JSON Schema 输出。不得省略 fact_evidence，也不得输出额外解释。
   chapter_state_prompt_without_schema_suffix: |
     只输出一个 JSON 对象，不要用代码块包裹，不要加任何解释。格式：
-    {"summary":"本章摘要","character_updates":[{"card_id":"卡片id","current_state":"当下状态","new_permanent_facts":[{"fact":"事实描述","kind":"death|injury|identity|relation|ability"}]}],"thread_updates":[{"thread_id":"伏笔id","status":"developing|resolved","evidence":"正文依据"}],"consistency_issues":[],"fact_evidence":{"schema_version":"chapter_state_fact_evidence.v1","extraction_status":"complete|complete_no_change|unknown","facts":[{"fact_id":"fact-1","kind":"canonical_fact|character_cognition|rumor|deception|temporary_fact","support":"supported|unsupported|unknown","statement":"事实陈述","target_type":"character|thread|chapter","target_id":"内部id或chapter时为null","action_ref":{"action_type":"chapter_summary|character_state|permanent_fact|thread_status","target_id":"精确内部id","value":"与候选动作逐字相同","permanent_fact_kind":null},"spans":[{"start":0,"end":4,"quote":"逐字正文"}],"explanation":"核算依据"}],"no_change":null,"unknown_reason":null}}
+    {"summary":"本章摘要","character_updates":[{"card_id":"卡片id","current_state":"当下状态","new_permanent_facts":[{"fact":"事实描述","kind":"death|injury|identity|relation|ability"}]}],"thread_updates":[{"thread_id":"伏笔id","status":"developing|resolved","evidence":"正文依据"}],"consistency_issues":[{"card_id":null,"fact":"被违反的既有永久事实","conflict":"正文中与之冲突的内容"}],"fact_evidence":{"schema_version":"chapter_state_fact_evidence.v1","extraction_status":"complete|complete_no_change|unknown","facts":[{"fact_id":"fact-1","kind":"canonical_fact|character_cognition|rumor|deception|temporary_fact","support":"supported|unsupported|unknown","statement":"事实陈述","target_type":"character|thread|chapter","target_id":"内部id或chapter时为null","action_ref":{"action_type":"chapter_summary|character_state|permanent_fact|thread_status","target_id":"精确内部id","value":"与候选动作逐字相同","permanent_fact_kind":null},"spans":[{"start":0,"end":4,"quote":"逐字正文"}],"explanation":"核算依据"}],"no_change":null,"unknown_reason":null}}
+    无冲突时 consistency_issues 必须为空数组，不得照抄示例或捏造冲突。
+    有冲突时每项只允许 card_id、fact、conflict：card_id 是涉及的内部角色卡 id，无法归属则为 null；
+    fact 必填，逐项描述被违反的既有永久事实，1～500 字；conflict 必填，说明本章正文中与之冲突的内容，1～1000 字。
+    不得用 field、evidence 等字段替代 fact 或 conflict，也不得添加这些额外字段。

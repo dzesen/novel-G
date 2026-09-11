@@ -34,6 +34,7 @@ from backend.services.image.contracts import (
     ImageCancelResult,
     ImageFailure,
     ImageGenerationRequest,
+    ImageInputAsset,
     ImageJobHandle,
     ImageProviderExpectation,
     ImageProvider,
@@ -205,6 +206,7 @@ class ImageJobProjection(BaseModel):
 
 
 class PortraitJobProjection(ImageJobProjection):
+    preserve_anchor: bool = False
     job_revision: int = Field(default=0, exclude=True)
     anchor: AppearanceAnchorSchema | None = None
 
@@ -243,6 +245,8 @@ class CharacterPortraitStateProjection(BaseModel):
     warnings: tuple[str, ...] = ()
     anchor_dependencies: tuple[AppearanceAnchorDependencyProjection, ...] = ()
     anchor_dependency_total: int = 0
+    latest_append_job: PortraitJobProjection | None = None
+    assets: tuple[PortraitAssetProjection, ...] = ()
 
 
 class ImageJobStateProjection(BaseModel):
@@ -518,6 +522,10 @@ class ManagedAssetReaderProtocol(Protocol):
 
 
 class ImageAssetMetadataRepositoryProtocol(Protocol):
+    async def list_owned_subject(
+        self, *, owner_id: Any, novel_id: Any, subject_kind: str, subject_id: str,
+    ) -> list[dict[str, Any]]: ...
+
     async def get_owned_subject_hash(
         self,
         *,
@@ -771,6 +779,7 @@ def _projection(document: dict[str, Any]) -> PortraitJobProjection:
     return PortraitJobProjection(
         job_id=_job_id(document),
         job_revision=max(0, int(document.get("job_revision") or 0)),
+        preserve_anchor=document.get("preserve_anchor") is True,
         status=public_status,
         terminal=(
             bool(document.get("is_terminal"))
@@ -849,7 +858,7 @@ def _image_job_projection(document: dict[str, Any]) -> ImageJobProjection:
     return ImageJobProjection.model_validate(
         _projection(document).model_dump(
             mode="python",
-            exclude={"anchor"},
+            exclude={"anchor", "preserve_anchor"},
             exclude_computed_fields=True,
         )
     )
@@ -861,7 +870,7 @@ def _without_portrait_fields(
     return ImageJobProjection.model_validate(
         projection.model_dump(
             mode="python",
-            exclude={"anchor"},
+            exclude={"anchor", "preserve_anchor"},
             exclude_computed_fields=True,
         )
     )
@@ -1236,6 +1245,11 @@ class SingleImageJobService:
             ),
             cleanup_job=(
                 _projection(cleanup) if cleanup is not None else None
+            ),
+            latest_append_job=(
+                _projection(latest)
+                if latest is not None and latest.get("preserve_anchor") is True
+                else None
             ),
             provider=provider_projection,
             warnings=tuple(
@@ -2567,6 +2581,10 @@ class SingleImageJobService:
             request_params={
                 "usage": str(job.get("usage") or self.usage),
                 "batch_size": 1,
+                **({
+                    "preserve_anchor": True,
+                    "anchor_reference_asset": job["anchor_before"]["reference_asset"],
+                } if job.get("preserve_anchor") is True else {}),
                 "workflow_revision": str(job["workflow_revision"]),
                 "submitted_graph_hash": (
                     handle.audit.submitted_graph_hash
@@ -2615,6 +2633,9 @@ class SingleImageJobService:
                 asset=asset,
             )
             return asset, pending
+        if job.get("preserve_anchor") is True:
+            # This is an audit snapshot, never a pending replacement anchor.
+            return asset, dict(job["anchor_before"])
         fingerprint = handle.audit.runtime_fingerprint.model_copy(deep=True)
         if not fingerprint.checkpoint_names:
             fingerprint.checkpoint_names = list(
@@ -2770,6 +2791,20 @@ class SingleImageJobService:
             )
             return _projection(completed)
 
+        if job.get("preserve_anchor") is True:
+            # Resuming this branch must never establish, reset, or restore an anchor.
+            completed, _ = await self._cas_or_winner(
+                owner_id=owner_id, novel_id=novel_id, card_id=card_id,
+                job_id=job_id, expected_revision=revision,
+                fields={
+                    "status": "succeeded", "is_terminal": True,
+                    "cleanup_pending": False, "late_cleanup_phase": None,
+                    "anchor": None, "selected_as_current": False,
+                    "completed_images": 1, "failure": None,
+                },
+            )
+            return _projection(completed)
+
         pending = self._canonical_anchor(job.get("pending_anchor"))
         if pending is None:
             failure = ImageFailure(
@@ -2864,6 +2899,39 @@ class SingleImageJobService:
         submission_fence: ImageJobSubmissionFence | None,
     ) -> ImageJobProjection:
         lineage = plan.illustration_lineage
+        slot_values = dict(plan.slot_values)
+        required_slots = plan.required_slots
+        append_warnings: list[str] = []
+        if plan.persisted_fields.get("preserve_anchor") is True:
+            frozen = plan.persisted_fields["anchor_before"]
+            if resolved.reference_mode == "none":
+                append_warnings.append(
+                    "当前立绘工作流仅使用冻结外观描述，不读取锚点图片；追加结果请人工确认后加入参考集"
+                )
+            else:
+                asset = await self.asset_repository.get_owned_subject_hash(
+                    owner_id=to_object_id(scope.owner_id),
+                    novel_id=to_object_id(scope.novel_id),
+                    subject_kind="character_portrait", subject_id=scope.subject_id,
+                    content_hash=frozen["reference_asset"],
+                )
+                if asset is None or asset.get("_id") is None:
+                    raise PortraitConfigurationError("锚点图片记录缺失，请恢复素材后再追加立绘")
+                try:
+                    content = await self.asset_reader.read_owned_asset(
+                        owner_id=scope.owner_id, asset_id=str(asset["_id"]),
+                    )
+                except (ImageAssetNotFoundError, ImageAssetIntegrityError) as error:
+                    raise PortraitConfigurationError("锚点图片缺失或损坏，请恢复素材后再追加立绘") from error
+                mime = str(asset.get("mime") or "").lower()
+                extensions = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+                if mime not in extensions:
+                    raise PortraitConfigurationError("锚点图片格式不受支持")
+                slot_values["reference_image"] = ImageInputAsset(
+                    filename=f"portrait-{frozen['reference_asset']}.{extensions[mime]}",
+                    content=content, mime_type=mime,
+                )
+                required_slots = required_slots | {"reference_image"}
         idempotency_material = {
             "owner_id": scope.owner_id,
             "novel_id": scope.novel_id,
@@ -2926,7 +2994,7 @@ class SingleImageJobService:
             "late_cleanup_attempts": 0,
             "ignored_slots": [],
             "failure": None,
-            "warnings": [],
+            "warnings": append_warnings,
             "provider_alias": resolved.alias,
             "reference_mode": resolved.reference_mode,
             "prompt": plan.prompt.model_dump(mode="json"),
@@ -2990,10 +3058,10 @@ class SingleImageJobService:
             request = ImageGenerationRequest(
                 usage=scope.usage,
                 slot_values={
-                    **dict(plan.slot_values),
+                    **slot_values,
                     "seed": chosen_seed,
                 },
-                required_slots=plan.required_slots,
+                required_slots=required_slots,
                 provider_expectation=(
                     submission_fence.expected_provider
                     if submission_fence is not None
@@ -3164,6 +3232,8 @@ class SingleImageJobService:
         seed: int | None = None,
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
+        preserve_anchor: bool = False,
+        expected_anchor_reference_asset: str | None = None,
         portrait_batch_id: str | None = None,
         submission_fence: ImageJobSubmissionFence | None = None,
     ) -> PortraitJobProjection:
@@ -3186,6 +3256,10 @@ class SingleImageJobService:
                 )
             if not submission_fence.start_claim_token:
                 raise ValueError("Batch submission fence token is required")
+        if preserve_anchor and (confirm_anchor_reset or portrait_batch_id is not None):
+            raise ValueError("追加立绘不能同时重设锚点或加入批量立绘")
+        if not preserve_anchor and expected_anchor_reference_asset is not None:
+            raise ValueError("只有追加立绘才能指定预期锚点")
         if not prompt.appearance:
             raise ValueError("appearance must not be empty for a character portrait")
         if seed is not None and (
@@ -3253,11 +3327,22 @@ class SingleImageJobService:
             novel_id=novel_id,
             card_id=card_id,
         )
-        if current_anchor is not None and not confirm_anchor_reset:
+        canonical_anchor = self._canonical_anchor(current_anchor)
+        if preserve_anchor:
+            if canonical_anchor is None:
+                raise ValueError("请先建立角色外观锚点，再追加立绘")
+            if expected_anchor_reference_asset != canonical_anchor["reference_asset"]:
+                raise AppearanceAnchorConflictError("外观锚点已变化，请刷新角色卡后重新确认追加立绘")
+            prompt = IllustrationPromptResult.model_validate({
+                **prompt.model_dump(), "appearance": canonical_anchor["descriptor"],
+            })
+        if current_anchor is not None and not confirm_anchor_reset and not preserve_anchor:
             raise PortraitAnchorResetRequired(
                 APPEARANCE_ANCHOR_RESET_WARNING
             )
         positive_prompt = _positive_prompt(prompt)
+        if preserve_anchor:
+            positive_prompt = f"Appearance: {prompt.appearance}\n{positive_prompt}"
         result = await self.start_job(
             scope=ImageJobScope(
                 owner_id=owner_id,
@@ -3280,6 +3365,7 @@ class SingleImageJobService:
                     "descriptor": prompt.appearance,
                     "anchor_before": current_anchor,
                     "confirm_anchor_reset": confirm_anchor_reset,
+                    "preserve_anchor": preserve_anchor,
                     **(
                         {"portrait_batch_id": portrait_batch_id}
                         if portrait_batch_id is not None
@@ -3300,6 +3386,7 @@ class SingleImageJobService:
                         current_anchor
                     ),
                     "confirm_anchor_reset": confirm_anchor_reset,
+                    "preserve_anchor": preserve_anchor,
                     **(
                         {"portrait_batch_id": portrait_batch_id}
                         if portrait_batch_id is not None

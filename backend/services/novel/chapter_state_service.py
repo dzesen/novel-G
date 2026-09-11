@@ -134,6 +134,10 @@ class ChapterStateService:
                         as_of_chapter_id=chapter_id,
                     )
                     states_updated += 1
+                elif update["accepted_permanent_facts"]:
+                    await character_state_repo.ensure_fact_container(
+                        novel_id, update["card_id"], session=session,
+                    )
                 for fact_index, fact in enumerate(update["accepted_permanent_facts"]):
                     child_key = f"fact_{character_index}_{fact_index}"
                     if mutation.was_received(child_key):
@@ -349,13 +353,14 @@ class ChapterStateService:
             # None 判断，不需要 try/except——首次出场的角色自然没有重复项。
             state = await character_state_repo.get_state(novel_id, update["card_id"])
             if (
-                not update.get("write_current_state", True)
+                state is None and not update.get("write_current_state", True)
                 and update["accepted_permanent_facts"]
-                and state is None
+                and await character_state_repo.collection.find_one({
+                    "novel_id": ObjectId(novel_id), "card_id": ObjectId(update["card_id"]),
+                    "is_deleted": True,
+                }, projection={"_id": 1}) is not None
             ):
-                raise ValueError(
-                    "仅追加永久事实时角色必须已有正式状态，未做任何写入"
-                )
+                raise ValueError("仅追加事实不能恢复已删除的角色状态，未做任何写入")
             existing_by_text = {
                 str(fact.get("fact", "")).strip(): fact
                 for fact in ((state or {}).get("permanent_facts") or [])

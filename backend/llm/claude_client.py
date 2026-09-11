@@ -137,14 +137,14 @@ class ClaudeClient(BaseLLMClient):
         """调用 Claude Messages API 进行普通文本生成。"""
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
 
         try:
             resp = await self._client.messages.create(**self._build_params(request))
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -167,7 +167,7 @@ class ClaudeClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result
 
     async def schema_generate(self, request: LLMRequest, schema: type[BaseModel]) -> LLMResponse:
@@ -179,7 +179,7 @@ class ClaudeClient(BaseLLMClient):
         """
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
 
         tool_def = {
@@ -198,10 +198,10 @@ class ClaudeClient(BaseLLMClient):
                 mapped = LLMSchemaUnsupportedError(
                     str(exc), provider=self.provider_name, model=model
                 )
-                log_llm_error(mapped, provider=self.provider_name, model=model)
+                log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
                 raise mapped from exc
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -228,7 +228,7 @@ class ClaudeClient(BaseLLMClient):
                 provider=self.provider_name,
                 model=model,
             )
-            log_llm_error(error, provider=self.provider_name, model=model)
+            log_llm_error(error, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise error
 
         # 验证返回的数据符合 Schema
@@ -245,7 +245,7 @@ class ClaudeClient(BaseLLMClient):
                 provider=self.provider_name,
                 model=model,
             )
-            log_llm_error(error, provider=self.provider_name, model=model)
+            log_llm_error(error, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise error from parse_exc
 
         result = LLMResponse(
@@ -259,7 +259,7 @@ class ClaudeClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result
 
     async def stream_text(
@@ -274,7 +274,7 @@ class ClaudeClient(BaseLLMClient):
         self._last_finish_reason = "unreported"
         self._last_raw_finish_reason = "unreported"
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
 
         try:
             params = self._build_params(request)
@@ -303,7 +303,7 @@ class ClaudeClient(BaseLLMClient):
                         )
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
     async def _get_stream_terminal(self, stream: Any) -> Any | None:
@@ -333,7 +333,7 @@ class ClaudeClient(BaseLLMClient):
         """
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
         tool_def = {
             "name": probe.tool_name,
@@ -390,7 +390,7 @@ class ClaudeClient(BaseLLMClient):
             final_resp = await self._client.messages.create(**final_params)
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -403,7 +403,7 @@ class ClaudeClient(BaseLLMClient):
             self._validate_probe_final_text(content, probe.expected_final_text)
         except ValueError as exc:
             mapped = LLMResponseError(str(exc), provider=self.provider_name, model=model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         first_usage = self._extract_usage(first_resp.usage)
@@ -426,5 +426,5 @@ class ClaudeClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result

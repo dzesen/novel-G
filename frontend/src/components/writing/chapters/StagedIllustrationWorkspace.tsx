@@ -83,7 +83,6 @@ export default function StagedIllustrationWorkspace(props: Props) {
   const [sceneIndex, setSceneIndex] = useState(0);
   const [showArchived, setShowArchived] = useState(false);
   const [ackQuality, setAckQuality] = useState(false);
-  const [useAdapter, setUseAdapter] = useState(false);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -165,7 +164,6 @@ export default function StagedIllustrationWorkspace(props: Props) {
         if (!active) return;
         setProfile(next);
         setReferenceAssetId(next.appearance_anchor?.reference_asset || next.references[0]?.asset_id || "");
-        setUseAdapter(false);
       })
       .catch((reason) => active && setError(message(reason, t("profileLoadFailed"))));
     return () => { active = false; };
@@ -287,7 +285,7 @@ export default function StagedIllustrationWorkspace(props: Props) {
         attempt_id: crypto.randomUUID(),
         readiness_digest: run.pipeline_snapshot.kind === "consistency" ? readiness?.readiness_digest ?? null : null,
         seed: null,
-        use_external_adapter: stage === "compose" && useAdapter,
+        use_external_adapter: false,
       };
       if (stage === "compose") {
         if (!prompt) throw new Error(t("promptRequired"));
@@ -474,11 +472,6 @@ export default function StagedIllustrationWorkspace(props: Props) {
             {pipeline && <div className={`mt-3 rounded-lg border p-3 text-xs ${pipeline.quality_status === "accepted" ? "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-100" : "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100"}`}>
               <p className="font-medium">{t("qualityStatus", { status: t(`qualityStatuses.${pipeline.quality_status}`) })}</p>
               {pipeline.quality_status !== "accepted" && <label className="mt-2 flex items-start gap-2"><input className="mt-0.5" type="checkbox" checked={ackQuality} onChange={(event) => setAckQuality(event.target.checked)} /><span>{t("qualityAcknowledge")}</span></label>}
-            </div>}
-            {profile?.external_adapter && <div className="mt-3 rounded-lg border border-border bg-surface-secondary p-3 text-xs text-muted">
-              <p className="font-medium text-foreground">{t("externalAdapterRegistered", { name: profile.external_adapter.lora_name })}</p>
-              <p className="mt-1 leading-5">{t("externalAdapterNoTraining")}</p>
-              <label className="mt-2 flex items-start gap-2"><input className="mt-0.5" type="checkbox" checked={useAdapter} onChange={(event) => setUseAdapter(event.target.checked)} /><span>{t("useExternalAdapter")}</span></label>
             </div>}
             <div className="mt-3 flex min-w-0 flex-wrap gap-2">
               <Button size="sm" variant="primary" className="bg-accent text-white" isDisabled={Boolean(busy) || !referenceAssetId || runs.some((item) => item.status === "active")} onPress={() => void createRun()}>{t("createRun")}</Button>

@@ -33,6 +33,9 @@ from backend.db.repositories.volume_repository import volume_repo
 from backend.services.novel.chapter_timeline import ChapterTimeline
 from backend.services.novel.narrative_timeline import narrative_timeline
 from backend.db.repositories.worldbook_repository import worldbook_repo
+from backend.services.llm.faction_context import (
+    declared_faction_text, faction_catalog, fetch_faction_material,
+)
 from backend.services.llm.outline_generation import (
     CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET,
 )
@@ -227,18 +230,73 @@ def _recent_chapters_section(recent: list) -> "Optional[ContextSection]":
     return ContextSection(name="recent_chapters", header="最近章节摘要：", items=items)
 
 
-def _thread_items(threads: list) -> "List[ContextItem]":
-    """把活跃伏笔装成 ContextItem 列表。两模式共用。
+def _project_thread(thread: Mapping[str, Any], timeline: ChapterTimeline) -> dict:
+    """Preserve stable targets and derive display/order from this novel's timeline.
 
-    呈现顺序：due 升序、None 最后（近的先呈现给 AI）。
-    drop_rank：-(due)，None 取极小值——due 越远越先丢，None 无截止期最先丢，与呈现顺序相反。
-    返回排好序的新列表，不修改入参。
+    Legacy local chapter numbers are deliberately not treated as book ordinals.
+    Missing/deleted targets stay unmapped instead of falling back to a stale number.
     """
-    ordered = sorted(threads, key=lambda t: (t.get("due_chapter_order") is None, t.get("due_chapter_order") or 0))
+    raw_target = thread.get("due_target")
+    target = dict(raw_target) if isinstance(raw_target, Mapping) else None
+    ordinal = None
+    label = "未设定"
+    if target is not None:
+        label = "目标无法映射，需复核"
+        if target.get("kind") == "chapter" and target.get("chapter_id") is not None:
+            target["chapter_id"] = str(target["chapter_id"])
+            try:
+                position = timeline.position(target["chapter_id"])
+            except ValueError:
+                pass
+            else:
+                ordinal = position.book_ordinal
+                label = f"{position.label}（全书第 {ordinal} 章）"
+        elif target.get("kind") == "planned_ordinal":
+            value = target.get("ordinal")
+            if type(value) is int and value > 0:
+                ordinal = value
+                label = f"全书第 {ordinal} 章（规划序号）"
+    elif thread.get("due_chapter_order") is not None:
+        label = "旧章号尚未映射，需复核"
+    return {
+        "_id": str(thread["_id"]),
+        "name": thread.get("name", ""),
+        "description": thread.get("description", ""),
+        "status": thread.get("status", ""),
+        "due_target": target,
+        "due_chapter_order": thread.get("due_chapter_order"),
+        "due_book_ordinal": ordinal,
+        "due_label": label,
+    }
+
+
+def _thread_due_ordinal(thread: Mapping[str, Any]) -> int | None:
+    # Fetched records always carry due_book_ordinal, including explicit None for
+    # unmapped legacy targets. Preserve the older pure assembly input contract.
+    value = thread.get("due_book_ordinal", thread.get("due_chapter_order"))
+    return value if type(value) is int and value > 0 else None
+
+
+def _thread_metadata(thread: Mapping[str, Any]) -> str:
+    parts = []
+    if thread.get("status"):
+        parts.append(f"状态={thread['status']}")
+    due = _thread_due_ordinal(thread)
+    label = thread.get("due_label") or (f"全书第 {due} 章" if due else "未设定")
+    parts.append(f"回收目标={label}")
+    target = thread.get("due_target") or {}
+    if target.get("kind") == "chapter" and target.get("chapter_id"):
+        parts.append(f"目标 chapter_id={target['chapter_id']}")
+    return "；".join(parts)
+
+
+def _thread_items(threads: list) -> "List[ContextItem]":
+    """Present nearest stable deadlines first, and drop distant/unscheduled first."""
+    ordered = sorted(threads, key=lambda t: (_thread_due_ordinal(t) is None, _thread_due_ordinal(t) or 0))
     return [
         ContextItem(
-            text=f"- {t['name']}：{t.get('description', '')}",
-            drop_rank=(-(t["due_chapter_order"]) if t.get("due_chapter_order") is not None else _NO_DUE_DROP_RANK),
+            text=f"- {t['name']}（{_thread_metadata(t)}）：{t.get('description', '')}",
+            drop_rank=(-_thread_due_ordinal(t) if _thread_due_ordinal(t) is not None else _NO_DUE_DROP_RANK),
         )
         for t in ordered
     ]
@@ -261,6 +319,8 @@ class ChapterContext(BaseModel):
         description="本次实际展示给细纲 Agent 的世界资料卡正式 ID，按索引呈现顺序排列",
     )
 
+    selectable_faction_card_ids: List[str] = Field(default_factory=list)
+
     @property
     def total_tokens(self) -> int:
         """全部段落的估算 token 合计。"""
@@ -282,6 +342,7 @@ SECTION_PRIORITY = {
     "threads_to_resolve": 100, # 永不截断
     "permanent_facts": 100,    # 永不截断——防止"死人复活"的唯一屏障
     "present_cards": 50,
+    "faction_cards": 50,
     "present_states": 90,
     "portrayal_context": 15,
     "dialogue_examples": 5,
@@ -438,6 +499,9 @@ def assemble_context(inputs: dict, budget: int | None = None) -> ChapterContext:
     chapter_order = int(chapter.get("order_index") or 0)
     book_ordinal = chapter.get("book_ordinal")
 
+    state_extraction = inputs.get("state_extraction") is True
+    priority = {**SECTION_PRIORITY, "state_roster": 100} if state_extraction else SECTION_PRIORITY
+    never_truncate = {name for name, weight in priority.items() if weight >= 100}
     present_ids = list(outline.get("present_character_card_ids") or [])
     sections: List[ContextSection] = []
 
@@ -567,11 +631,29 @@ def assemble_context(inputs: dict, budget: int | None = None) -> ChapterContext:
     resolving = [t for t in threads if t.get("_id") in to_resolve]
     others = [t for t in threads if t not in resolving]
 
-    if resolving:
-        lines = [f"- {t['name']}：{t.get('description', '')}" for t in resolving]
-        sections.append(_blob("threads_to_resolve", "本章需回收的伏笔：\n" + "\n".join(lines)))
-    if others:
-        sections.append(ContextSection(name="other_threads", header="活跃伏笔：", items=_thread_items(others)))
+    if state_extraction:
+        # State extraction needs a complete, non-truncatable thread identity
+        # roster. Character content remains restricted to outline-declared IDs.
+        state_roster = build_roster(
+            {cid: {"name": cards[cid]["name"]} for cid in present_ids if cid in cards},
+            {}, threads,
+        )
+        roster_section = _roster_section(state_roster)
+        roster_section.name = "state_roster"
+        sections.append(roster_section)
+    else:
+        if resolving:
+            lines = [f"- {t['name']}（{_thread_metadata(t)}）：{t.get('description', '')}" for t in resolving]
+            sections.append(_blob("threads_to_resolve", "本章需回收的伏笔：\n" + "\n".join(lines)))
+        if others:
+            sections.append(ContextSection(name="other_threads", header="活跃伏笔：", items=_thread_items(others)))
+
+    faction_text = declared_faction_text(
+        inputs.get("faction_material") or {},
+        list(outline.get("referenced_faction_card_ids") or []),
+    )
+    if faction_text:
+        sections.append(_blob("faction_cards", faction_text))
 
     worldbook_cards = inputs.get("worldbook_cards") or {}
     referenced_ids = list(outline.get("referenced_worldbook_card_ids") or [])
@@ -591,15 +673,15 @@ def assemble_context(inputs: dict, budget: int | None = None) -> ChapterContext:
     # 超预算的包，且因为 truncated_sections/dropped_item_counts 皆空，
     # prose_router 也不会发 context 帧告知前端（见该模块 §6 契约）。
     never_tokens = sum(
-        estimate_tokens(s.content) for s in sections if s.name in PROSE_NEVER_TRUNCATE
+        estimate_tokens(s.content) for s in sections if s.name in never_truncate
     )
     if never_tokens > budget:
         raise ContextBudgetError(
-            f"正文上下文的永不截断档已达 {never_tokens} tokens，超出预算 {budget}；"
-            f"很可能是 permanent_facts 过多（主要角色事实随全书线性增长）。请精简后重试。"
+            f"{'状态' if state_extraction else '正文'}上下文的永不截断档已达 {never_tokens} tokens，超出预算 {budget}；"
+            "请检查永久事实、章纲及活跃伏笔名单的规模后重试。"
         )
 
-    kept, dropped, partial = _truncate_to_budget(sections, budget, SECTION_PRIORITY)
+    kept, dropped, partial = _truncate_to_budget(sections, budget, priority)
     if dropped or partial:
         logger.warning(
             "上下文超预算，整段丢弃 %s，部分丢弃 %s（预算 %s tokens）。本章将在信息不全的情况下生成。",
@@ -705,7 +787,7 @@ def bind_context_lineage(
     }
 
 
-def build_roster(cards: dict, worldbook_cards: dict, threads: list, chapters=()) -> dict:
+def build_roster(cards: dict, worldbook_cards: dict, threads: list, chapters=(), *, faction_cards=None) -> dict:
     """由已取到的卡片/伏笔构造 roster（AI 可选中的 id 名单）。纯函数，无 IO。
 
     抽成共享函数是因为它有**两个**调用方：预览侧的 fetch_context_inputs（用它
@@ -738,10 +820,13 @@ def build_roster(cards: dict, worldbook_cards: dict, threads: list, chapters=())
             for wid, card in worldbook_cards.items()
         ],
         "threads": [
-            {"id": thread["_id"], "name": thread["name"], "brief": thread.get("description", "")}
+            {"id": thread["_id"], "name": thread["name"], "brief": thread.get("description", ""),
+             **{key: thread[key] for key in ("status", "due_target", "due_chapter_order", "due_book_ordinal", "due_label") if key in thread}}
             for thread in threads
         ],
         "chapters": [dict(chapter) for chapter in chapters],
+        **({"factions": [{"id": cid, "name": card.get("name", ""), "brief": card.get("core_goal", "")}
+                        for cid, card in faction_cards.items()]} if faction_cards else {}),
     }
 
 
@@ -794,18 +879,12 @@ async def fetch_roster(novel_id: str, after_chapter_id: str | None = None) -> di
             }
 
     thread_docs = await plot_thread_repo.list_threads(novel_id, statuses=ACTIVE_THREAD_STATUSES)
-    threads = [
-        {
-            "_id": str(thread["_id"]),
-            "name": thread.get("name", ""),
-            "description": thread.get("description", ""),
-        }
-        for thread in thread_docs
-    ]
+
 
     volume_docs = await volume_repo.get_volumes_by_novel(novel_id)
     chapter_docs = await chapter_repo.get_chapters_by_novel(novel_id)
     timeline = ChapterTimeline(volume_docs, chapter_docs)
+    threads = [_project_thread(thread, timeline) for thread in thread_docs]
     chapter_by_id = {str(chapter["_id"]): chapter for chapter in chapter_docs}
     chapters = _chapter_roster_entries(
         timeline,
@@ -813,10 +892,12 @@ async def fetch_roster(novel_id: str, after_chapter_id: str | None = None) -> di
         after_chapter_id=after_chapter_id,
     )
 
-    return build_roster(cards, worldbook_cards, threads, chapters)
+    faction_material = await fetch_faction_material(novel_id)
+    return build_roster(cards, worldbook_cards, threads, chapters,
+                        faction_cards=faction_material["cards"])
 
 
-def _roster_section(roster: dict) -> ContextSection:
+def _roster_section(roster: dict, *, for_planning: bool = False) -> ContextSection:
     """把人物/伏笔 roster 装成永不截断段落。
 
     世界资料卡刻意不在这里呈现：其完整 description 可能是数千字条目正文，数百
@@ -824,6 +905,14 @@ def _roster_section(roster: dict) -> ContextSection:
     的形式单独、有界呈现。
     """
     lines: list = []
+    if for_planning:
+        lines.append(
+            "伏笔规划要求：结合当前全书位置优先处理已到期与临近目标；安排回收时必须把正式 ID "
+            "写入 threads_resolved，并落实到场景，不能只在自然语言提及。新伏笔 description 要写清"
+            "待揭晓的问题及什么事件算完成回收。长期关系、心理变化或持续威胁不应无依据地都设为"
+            "下一章回收；期限服从卷纲与剧情条件，没有合理期限时使用 null。"
+        )
+
     for label, key in (("人物", "characters"), ("伏笔", "threads")):
         entries = roster.get(key) or []
         if not entries:
@@ -833,7 +922,8 @@ def _roster_section(roster: dict) -> ContextSection:
             aliases = " / ".join(e.get("aliases") or [])
             alias_text = f"（别名：{aliases}）" if aliases else ""
             lines.append(
-                f"- id={e['id']} {e['name']}{alias_text}：{e.get('brief', '')}"
+                f"- id={e['id']} {e['name']}{alias_text}"
+                f"{('（' + _thread_metadata(e) + '）') if key == 'threads' else ''}：{e.get('brief', '')}"
             )
     chapter_entries = roster.get("chapters") or []
     if chapter_entries:
@@ -1014,11 +1104,15 @@ def _world_entry_index_section(
 def outline_selection_roster(
     roster: dict,
     selectable_worldbook_card_ids: list[str],
+    selectable_faction_card_ids: list[str] | None = None,
 ) -> dict:
     """把 AI 结果校验的世界卡名单收窄为本次索引实际展示过的正式 ID。"""
     allowed = set(selectable_worldbook_card_ids)
     return {
         **roster,
+        **({"factions": [dict(item) for item in roster.get("factions") or []
+                         if str(item.get("id") or "") in set(selectable_faction_card_ids or [])]}
+           if roster.get("factions") else {}),
         "characters": list(roster.get("characters") or []),
         "worldbook": [
             dict(item)
@@ -1062,13 +1156,19 @@ def assemble_outline_context(
     # 只有 roster 与"去掉三段输出"是细纲模式独有。
     sections.append(_core_settings_section(novel))
 
-    sections.append(_roster_section(roster))
+    sections.append(_roster_section(roster, for_planning=True))
 
     world_entry_index, hard_index_dropped = _world_entry_index_section(
         inputs.get("worldbook_cards") or {}
     )
     if world_entry_index is not None:
         sections.append(world_entry_index)
+
+    faction_index_text, faction_ids, faction_index_dropped = faction_catalog(
+        inputs.get("faction_material") or {},
+    )
+    if faction_index_text:
+        sections.append(_blob("faction_index", faction_index_text))
 
     # 主要角色的 permanent_facts 无条件装配（死人复活屏障，细纲阶段同样需要）。
     # 这一段与正文模式的三档装配逻辑不同（这里只取主要角色），故不共用 helper。
@@ -1109,8 +1209,10 @@ def assemble_outline_context(
     kept, dropped, partial = _truncate_to_budget(
         sections,
         budget,
-        OUTLINE_SECTION_PRIORITY,
+        {**OUTLINE_SECTION_PRIORITY, "faction_index": 50},
     )
+    if faction_index_dropped and "faction_index" not in dropped:
+        partial["faction_index"] = faction_index_dropped
     if hard_index_dropped and WORLD_ENTRY_INDEX_SECTION not in dropped:
         partial[WORLD_ENTRY_INDEX_SECTION] = (
             partial.get(WORLD_ENTRY_INDEX_SECTION, 0) + hard_index_dropped
@@ -1134,6 +1236,7 @@ def assemble_outline_context(
         truncated_sections=dropped,
         dropped_item_counts=partial,
         selectable_worldbook_card_ids=selectable_worldbook_card_ids,
+        selectable_faction_card_ids=(faction_ids if any(section.name == "faction_index" for section in kept) else []),
     )
 
 
@@ -1142,6 +1245,8 @@ def normalize_outline_references(raw_outline: dict | None) -> dict | None:
     if not raw_outline:
         return None
     outline = dict(raw_outline)
+    if raw_outline.get("referenced_faction_card_ids"):
+        outline["referenced_faction_card_ids"] = [str(cid) for cid in raw_outline["referenced_faction_card_ids"]]
     outline["present_character_card_ids"] = [
         str(cid) for cid in (raw_outline.get("present_character_card_ids") or [])
     ]
@@ -1278,6 +1383,11 @@ async def fetch_context_inputs(
                 "interop": _world_entry_interop_projection(card),
             }
 
+    faction_material = await fetch_faction_material(
+        novel_id,
+        declared_card_ids=(list(declared.get("referenced_faction_card_ids") or [])
+                           if purpose == "prose" else None),
+    )
     references_loaded = perf_counter()
     projection = await narrative_timeline.context_before(novel_id, chapter_id, _directory=timeline)
     history_loaded = perf_counter()
@@ -1374,16 +1484,7 @@ async def fetch_context_inputs(
                 if str(thread["_id"]) in current_outline_thread_ids
                 and str(thread["_id"]) not in historical_thread_ids
             )
-    threads = [
-        {
-            "_id": str(t["_id"]),
-            "name": t.get("name", ""),
-            "description": t.get("description", ""),
-            "status": t.get("status", ""),
-            "due_chapter_order": t.get("due_chapter_order"),
-        }
-        for t in thread_docs
-    ]
+    threads = [_project_thread(thread, timeline) for thread in thread_docs]
 
     # roster：细纲模式喂给 AI 的可选名单，复用上面已取到的
     # cards/worldbook_cards/threads，不额外查库（见 assemble_outline_context）。
@@ -1393,7 +1494,8 @@ async def fetch_context_inputs(
         chapter_by_id,
         after_chapter_id=chapter_id,
     )
-    roster = build_roster(cards, worldbook_cards, threads, chapter_roster)
+    roster = build_roster(cards, worldbook_cards, threads, chapter_roster,
+                          faction_cards=faction_material["cards"])
 
     result = {
         "novel": {
@@ -1423,6 +1525,7 @@ async def fetch_context_inputs(
         "recent_chapters": recent,
         "cards": cards,
         "worldbook_cards": worldbook_cards,
+        "faction_material": faction_material,
         "states": states,
         "threads": threads,
         "roster": roster,

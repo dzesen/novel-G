@@ -33,6 +33,10 @@ from backend.services.generation.candidate_repair_contracts import (
     JobMutationRecoveryBindingV1,
     ProseCandidateCheckpointV1,
     StateCandidateCheckpointV1,
+    StateGenerationRejectedCheckpointV8,
+    ReviewGenerationRejectedCheckpointV9,
+    review_retry_attempt_ids,
+    MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS,
     parse_candidate_pipeline_checkpoint,
     replay_candidate_pipeline_checkpoints,
 )
@@ -58,7 +62,15 @@ from backend.services.generation.chapter_candidate_pipeline import (
     StateCandidateRepairReceipt,
     StateCandidateRepairRequest,
     replay_chapter_repair_evidence,
+    state_generation_rejection_checkpoint,
+    review_generation_rejection_checkpoint,
+    rejected_state_retry_request_id,
+    _initial_state_request_id,
 )
+from backend.services.generation.candidate_review_recovery import recognize_legacy_review_rejection
+from backend.services.generation.candidate_state_recovery import recognize_legacy_state_rejection
+from backend.services.generation.candidate_outline_recovery import recognizes_reauthorized_outline_truncation
+from backend.services.generation.chapter_finalization import ChapterFinalizationDenied
 from backend.services.generation.chapter_completion_certificate import (
     ChapterCompletionFailureFact,
 )
@@ -84,7 +96,9 @@ _JUDGE_RETRY_PHASES = frozenset({"schema_fallback", "repair", "reviewer"})
 _REPAIR_ATTEMPT_STEP_PREFIXES = (
     "candidate-prose-repair:",
     "candidate-outline-adherence-repair:",
+    "candidate-outline-adherence-retry:",
     "candidate-state-repair:",
+    "candidate-state-retry:",
 )
 
 
@@ -163,16 +177,17 @@ def _judge_retry_budget_blocked(
 class _JudgeRetryBudgetedAttemptScope:
     """Release a claimed slot before dispatch when the component is exhausted."""
 
-    def __init__(self, delegate: Any, budget: _JudgeRetryBudget) -> None:
+    def __init__(self, delegate: Any, budget: _JudgeRetryBudget, *, charge_primary: bool = False) -> None:
         self._delegate = delegate
         self._budget = budget
+        self._charge_primary = charge_primary
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
 
     async def _authorize(self, attempt_id: str, phase: str) -> str:
         try:
-            self._budget.reserve(phase)
+            self._budget.reserve("reviewer" if self._charge_primary and phase == "primary" else phase)
         except RepairBudgetExhausted as exc:
             release = getattr(self._delegate, "release_pre_dispatch", None)
             if not callable(release):
@@ -222,12 +237,13 @@ def _repair_attempt_step_identity(value: object) -> str | None:
         if not step_id.startswith(prefix):
             continue
         raw_cycle = step_id[len(prefix):]
+        maximum = MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS if prefix == "candidate-outline-adherence-retry:" else MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
         if (
             raw_cycle
             and len(raw_cycle)
-            <= len(str(MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES))
+            <= len(str(maximum))
             and all(character in "0123456789" for character in raw_cycle)
-            and 1 <= int(raw_cycle) <= MAX_CHAPTER_CANDIDATE_REPAIR_CYCLES
+            and 1 <= int(raw_cycle) <= maximum
         ):
             return step_id
     return None
@@ -243,6 +259,7 @@ def _persisted_judge_retry_usage(
         if checkpoint.cycle > 0
         for attempt_id in checkpoint.attempt_ids
     }
+    retried_review_ids = review_retry_attempt_ids(checkpoints)
     checkpointed = 0
     tail = 0
     tail_attempt_ids: list[str] = []
@@ -252,8 +269,8 @@ def _persisted_judge_retry_usage(
             continue
         attempt_id = str(slot.get("attempt_id") or "")
         phase = str(slot.get("phase") or "")
-        if attempt_id in repair_checkpoint_attempt_ids:
-            if phase in _JUDGE_RETRY_PHASES:
+        if attempt_id in repair_checkpoint_attempt_ids or attempt_id in retried_review_ids:
+            if attempt_id in retried_review_ids or phase in _JUDGE_RETRY_PHASES:
                 checkpointed += 1
             continue
         repair_step_id = _repair_attempt_step_identity(slot.get("step_id"))
@@ -261,7 +278,7 @@ def _persisted_judge_retry_usage(
             continue
         tail_attempt_ids.append(attempt_id)
         tail_step_ids.add(repair_step_id)
-        if phase in _JUDGE_RETRY_PHASES:
+        if phase in _JUDGE_RETRY_PHASES or repair_step_id.startswith("candidate-outline-adherence-retry:"):
             tail += 1
     if len(tail_step_ids) > 1:
         raise ChapterCandidatePipelineBlocked(
@@ -331,6 +348,7 @@ class ChapterCandidateJobRunnerDeps:
     recover_state_candidate: Callable[..., Awaitable[Any]]
     record_completion_failure: CandidateCompletionFailurePersistence
     finalize: Callable[..., Awaitable[Mapping[str, Any]]]
+    read_recovery_job: Callable[[str], Awaitable[Mapping[str, Any]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -861,6 +879,39 @@ class ChapterCandidateJobRunner:
                     "候选作业持久调用身份重复或缺失"
                 )
             slot_by_id[attempt_id] = slot
+        for index, checkpoint in enumerate(replay.checkpoints):
+            if isinstance(checkpoint, ReviewGenerationRejectedCheckpointV9):
+                previous = replay.checkpoints[index - 1] if index else None
+                expected_step = (
+                    f"candidate-outline-adherence-retry:{previous.sequence}"
+                    if isinstance(previous, ReviewGenerationRejectedCheckpointV9)
+                    else "candidate-outline-adherence" if checkpoint.cycle == 0
+                    else f"candidate-outline-adherence-repair:{checkpoint.cycle}"
+                )
+                group = [slot_by_id.get(attempt_id) for attempt_id in checkpoint.attempt_ids]
+                if (
+                    any(slot is None or slot.get("state") != "accounted" or slot.get("step_id") != expected_step for slot in group)
+                    or tuple(slot.get("phase") for slot in group) not in {("primary", "repair"), ("primary", "schema_fallback", "repair")}
+                ):
+                    raise ChapterCandidatePipelineBlocked("审查拒绝检查点与已结算调用组不一致", code="candidate_result_projection_missing", gate="outline_adherence")
+                continue
+            if not isinstance(checkpoint, StateGenerationRejectedCheckpointV8):
+                continue
+            group = [slot_by_id.get(attempt_id) for attempt_id in checkpoint.attempt_ids]
+            expected_step = (
+                "candidate-state" if checkpoint.origin == "initial"
+                else f"candidate-state-retry:{checkpoint.cycle}"
+            )
+            if (
+                any(slot is None or slot.get("state") != "accounted" or slot.get("step_id") != expected_step for slot in group)
+                or tuple(slot.get("phase") for slot in group) not in {
+                    ("primary", "repair"), ("primary", "schema_fallback", "repair"),
+                }
+            ):
+                raise ChapterCandidatePipelineBlocked(
+                    "状态格式失败检查点与已结算调用组不一致",
+                    code="candidate_result_projection_missing", gate="state",
+                )
         summaries: list[CandidateAttemptSummary] = []
         for attempt_id in replay.attempt_ids:
             slot = slot_by_id.get(attempt_id)
@@ -1008,6 +1059,101 @@ class ChapterCandidateJobRunner:
             adherence=adherence,
             state=state,
         )
+
+    async def _recover_legacy_review_rejection(
+        self, *, scope: CandidateJobScope, chapter: Mapping[str, Any],
+        execution: CandidateJobExecution, expected_revision: int,
+        checkpoints: tuple[CandidatePipelineCheckpointV1, ...],
+        slots: Sequence[Mapping[str, Any]],
+    ) -> tuple[CandidatePipelineCheckpointV1, ...]:
+        if self._deps.read_recovery_job is None or not checkpoints:
+            return checkpoints
+        job = await self._deps.read_recovery_job(self._execution_id)
+        evidence = recognize_legacy_review_rejection(
+            job, execution_id=self._execution_id, novel_id=scope.novel_id,
+            chapter_id=scope.chapter_id, readiness_digest=scope.readiness_digest,
+            narrative_revision=expected_revision, checkpoints=checkpoints, attempt_slots=slots,
+        )
+        if evidence is None:
+            return checkpoints
+        identity = checkpoints[0].source
+        source = await execution.recover_source(
+            owner_id=scope.owner_id, novel_id=scope.novel_id, chapter_id=scope.chapter_id,
+            run_id=identity.source_run_id, revision=identity.source_run_revision,
+            digest=identity.source_content_digest,
+        )
+        await self._ensure_narrative_revision(scope, expected_revision)
+        rejection = review_generation_rejection_checkpoint(
+            chapter_id=scope.chapter_id, sequence=len(checkpoints) + 1, source=source,
+            attempt_ids=evidence.attempt_ids, cycle=0, retry_index=evidence.retry_index,
+            diagnostics=evidence.diagnostics, failure_event_id=evidence.failure_event_id,
+        )
+        replay_candidate_pipeline_checkpoints(
+            (*checkpoints, rejection), chapter_id=scope.chapter_id,
+            expected_scene_count=len(chapter["outline"]["scenes"]),
+            max_repair_cycles=execution.repair_authorization.maximum_repair_events_per_chapter,
+        )
+        await self._deps.append_checkpoint(self._execution_id, rejection)
+        return (*checkpoints, rejection)
+
+    async def _recover_legacy_state_rejection(
+        self, *, scope: CandidateJobScope, chapter: Mapping[str, Any],
+        execution: CandidateJobExecution, expected_revision: int,
+        checkpoints: tuple[CandidatePipelineCheckpointV1, ...],
+        slots: Sequence[Mapping[str, Any]],
+    ) -> tuple[CandidatePipelineCheckpointV1, ...]:
+        if self._deps.read_recovery_job is None or len(checkpoints) < 2:
+            return checkpoints
+        job = await self._deps.read_recovery_job(self._execution_id)
+        evidence = recognize_legacy_state_rejection(
+            job, execution_id=self._execution_id, novel_id=scope.novel_id,
+            chapter_id=scope.chapter_id, readiness_digest=scope.readiness_digest,
+            narrative_revision=expected_revision, checkpoints=checkpoints, attempt_slots=slots,
+        )
+        if evidence is None:
+            return checkpoints
+        replay = replay_candidate_pipeline_checkpoints(
+            checkpoints, chapter_id=scope.chapter_id,
+            expected_scene_count=len(chapter["outline"]["scenes"]),
+            max_repair_cycles=execution.repair_authorization.maximum_repair_events_per_chapter,
+        )
+        identity = replay.current_prose.source
+        source = await execution.recover_source(
+            owner_id=scope.owner_id, novel_id=scope.novel_id, chapter_id=scope.chapter_id,
+            run_id=identity.source_run_id, revision=identity.source_run_revision,
+            digest=identity.source_content_digest,
+        )
+        request_id = (
+            _initial_state_request_id(chapter_id=scope.chapter_id, source=source)
+            if evidence.cycle == 0 else rejected_state_retry_request_id(checkpoints[-1], cycle=evidence.cycle)
+        )
+        # A stored proposal wins over an old failure message; never discard or
+        # recreate a result whose persistence may have succeeded.
+        existing = await self._deps.recover_state_candidate(
+            owner_id=scope.owner_id, novel_id=scope.novel_id, chapter_id=scope.chapter_id,
+            proposal_id=None, request_id=request_id,
+            source_run_id=identity.source_run_id,
+            source_run_revision=identity.source_run_revision,
+            source_content_digest=identity.source_content_digest,
+        )
+        if existing is not None:
+            raise ChapterCandidatePipelineBlocked(
+                "状态结果已经存在，不能按格式失败重新提取",
+                code="candidate_result_projection_missing", gate="state",
+            )
+        await self._ensure_narrative_revision(scope, expected_revision)
+        rejection = state_generation_rejection_checkpoint(
+            chapter_id=scope.chapter_id, sequence=len(checkpoints) + 1, source=source,
+            attempt_ids=evidence.attempt_ids, cycle=evidence.cycle, request_id=request_id,
+            diagnostics=evidence.diagnostics, failure_event_id=evidence.failure_event_id,
+        )
+        replay_candidate_pipeline_checkpoints(
+            (*checkpoints, rejection), chapter_id=scope.chapter_id,
+            expected_scene_count=len(chapter["outline"]["scenes"]),
+            max_repair_cycles=execution.repair_authorization.maximum_repair_events_per_chapter,
+        )
+        await self._deps.append_checkpoint(self._execution_id, rejection)
+        return (*checkpoints, rejection)
 
     @staticmethod
     def _terminal_outcome(
@@ -1226,6 +1372,7 @@ class ChapterCandidateJobRunner:
                 return _JudgeRetryBudgetedAttemptScope(
                     scope_adapter,
                     judge_retry_budget,
+                    charge_primary=step.startswith("candidate-outline-adherence-retry:"),
                 )
             return scope_adapter
 
@@ -1286,10 +1433,21 @@ class ChapterCandidateJobRunner:
                     }
                     for slot in slots
                 ):
-                    raise ChapterCandidatePipelineBlocked(
-                        "章纲 Provider 已调用但缺少正式 mutation receipt",
-                        code="candidate_result_projection_missing",
+                    recovery_job = (
+                        await self._deps.read_recovery_job(self._execution_id)
+                        if self._deps.read_recovery_job is not None else None
                     )
+                    if not isinstance(recovery_job, Mapping) or not recognizes_reauthorized_outline_truncation(
+                        recovery_job, execution_id=self._execution_id, novel_id=str(novel_id),
+                        chapter_id=chapter_id, readiness_digest=scope.readiness_digest,
+                        narrative_revision=expected_revision,
+                        authorization_revision=scope.finalization_authorization_revision,
+                        attempt_slots=slots,
+                    ):
+                        raise ChapterCandidatePipelineBlocked(
+                            "章纲 Provider 已调用但缺少正式 mutation receipt",
+                            code="candidate_result_projection_missing",
+                        )
                 if execution.outline_plan is None:
                     raise ChapterCandidatePipelineBlocked(
                         "候选作业没有冻结章纲生成计划"
@@ -1367,6 +1525,20 @@ class ChapterCandidateJobRunner:
                     code="authorization_scope_increased",
                 )
         await self._ensure_narrative_revision(scope, expected_revision)
+        checkpoints = await self._recover_legacy_review_rejection(
+            scope=scope, chapter=current, execution=execution,
+            expected_revision=expected_revision, checkpoints=checkpoints, slots=slots,
+        )
+        checkpoints = await self._recover_legacy_state_rejection(
+            scope=scope, chapter=current, execution=execution,
+            expected_revision=expected_revision, checkpoints=checkpoints, slots=slots,
+        )
+        # Recovered rejection evidence now owns its settled tail attempts. Rebind
+        # the projection without changing the already charged retry total.
+        recovered_retry_usage = _persisted_judge_retry_usage(checkpoints, replay_slots)
+        if recovered_retry_usage.total != persisted_judge_retry_usage.total:
+            raise ChapterCandidatePipelineBlocked("状态恢复改变了已结算重试用量")
+        persisted_judge_retry_usage = recovered_retry_usage
         await ensure_reserved()
         resume = (
             await self._resume(
@@ -1436,6 +1608,13 @@ class ChapterCandidateJobRunner:
                     f"{active_content_repair_cycle}"
                 )
             )
+            rejected = checkpoints[-1] if checkpoints and isinstance(checkpoints[-1], ReviewGenerationRejectedCheckpointV9) else None
+            if rejected is not None and (
+                rejected.source.source_run_id == source.source_run_id
+                and rejected.source.source_run_revision == source.source_run_revision
+                and rejected.source.source_content_digest == source.source_content_digest
+            ):
+                attempt_step = f"candidate-outline-adherence-retry:{rejected.sequence}"
             return await self._deps.review_prose_candidate(
                 target_novel,
                 target_chapter,
@@ -1452,13 +1631,20 @@ class ChapterCandidateJobRunner:
             **kwargs: Any,
         ) -> ChapterGenerationResult:
             await self._ensure_narrative_revision(scope, expected_revision)
+            reextraction_cycle = kwargs.pop("reextraction_cycle", 0)
+            if type(reextraction_cycle) is not int or not 0 <= reextraction_cycle <= max_repair_events:
+                raise ChapterCandidatePipelineBlocked("状态重新提取轮次不在冻结授权内")
             return await self._deps.generate_state_candidate(
                 target_novel,
                 target_chapter,
                 source,
-                attempt_scope=fenced_scope("candidate-state"),
+                attempt_scope=fenced_scope(
+                    f"candidate-state-retry:{reextraction_cycle}"
+                    if reextraction_cycle else "candidate-state"
+                ),
                 generation_params=self._generation_params,
                 generation_plan=execution.state_plan,
+                candidate_job_id=self._execution_id,
                 **kwargs,
             )
 
@@ -1517,7 +1703,7 @@ class ChapterCandidateJobRunner:
                     repair_cycles_used=cycles,
                     repair_trace=repair_trace,
                 )
-            except ChapterCandidatePipelineBlocked:
+            except (ChapterCandidatePipelineBlocked, ChapterFinalizationDenied):
                 raise
             except Exception as exc:
                 raise _FinalizationDependencyError(

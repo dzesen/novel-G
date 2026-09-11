@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -13,6 +14,7 @@ from pydantic import (
     StrictInt,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from backend.llm.schemas.scene_contract_pydantic import (
     ProseEvidenceSpanSchema,
@@ -104,16 +106,31 @@ class StateFactActionRefSchema(BaseModel):
         if (self.action_type == "permanent_fact") != (
             self.permanent_fact_kind is not None
         ):
-            raise ValueError(
+            raise PydanticCustomError(
+                "state_fact_permanent_kind_required_only_for_permanent_fact",
                 "permanent_fact_kind is required only for permanent facts"
             )
         return self
 
 
+def _fact_item_json_schema(schema: dict) -> None:
+    """Expose supported/unsupported span requirements without changing parsing."""
+    known = deepcopy(schema)
+    unknown = deepcopy(schema)
+    known["properties"]["support"] = {"type": "string", "enum": ["supported", "unsupported"]}
+    known["properties"]["spans"]["minItems"] = 1
+    known["required"] = [*known["required"], "spans"]
+    unknown["properties"]["support"] = {"type": "string", "enum": ["unknown"]}
+    schema.clear()
+    schema["anyOf"] = [known, unknown]
+
+
 class StateFactEvidenceItemSchema(BaseModel):
     """One Provider-observed fact, independent from whether it will be stored."""
 
-    model_config = ConfigDict(extra="forbid")
+    # Export the existing cross-field validator as two complete object branches.
+    # Complete branches also let native-schema SDKs traverse every nested ref.
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_fact_item_json_schema)
 
     fact_id: StableFactIdentity
     kind: StateFactKind
@@ -125,6 +142,12 @@ class StateFactEvidenceItemSchema(BaseModel):
     spans: list[ProseEvidenceSpanSchema] = Field(
         default_factory=list,
         max_length=2,
+        description=(
+            "For support=supported or unsupported, include 1–2 verbatim prose citations; "
+            "this field must not be omitted or empty. Each citation contains start, end "
+            "and quote copied from the chapter prose. A statement or explanation is not "
+            "a citation. Only support=unknown may omit spans or use an empty list."
+        ),
     )
     explanation: str = Field(..., min_length=1, max_length=500)
 
@@ -132,17 +155,29 @@ class StateFactEvidenceItemSchema(BaseModel):
     def validate_fact_shape(self) -> "StateFactEvidenceItemSchema":
         if self.target_type == "chapter":
             if self.target_id is not None:
-                raise ValueError("chapter fact target_id is assigned locally")
+                raise PydanticCustomError(
+                    "state_fact_chapter_target_must_be_null",
+                    "chapter fact target_id is assigned locally",
+                )
         elif self.target_id is None:
-            raise ValueError("character and thread facts require target_id")
+            raise PydanticCustomError(
+                "state_fact_target_id_required",
+                "character and thread facts require target_id",
+            )
         if self.support != "unknown" and not self.spans:
-            raise ValueError("supported or unsupported facts require prose spans")
+            raise PydanticCustomError(
+                "state_fact_prose_spans_required",
+                "supported or unsupported facts require prose spans",
+            )
         if self.action_ref is not None:
             if (
                 self.target_type != "chapter"
                 and self.action_ref.target_id != self.target_id
             ):
-                raise ValueError("fact target and action target diverged")
+                raise PydanticCustomError(
+                    "state_fact_action_target_mismatch",
+                    "fact target and action target diverged",
+                )
             expected_target = {
                 "chapter_summary": "chapter",
                 "character_state": "character",
@@ -150,7 +185,10 @@ class StateFactEvidenceItemSchema(BaseModel):
                 "thread_status": "thread",
             }[self.action_ref.action_type]
             if expected_target != self.target_type:
-                raise ValueError("fact target type and action type diverged")
+                raise PydanticCustomError(
+                    "state_fact_action_type_mismatch",
+                    "fact target type and action type diverged",
+                )
         return self
 
 
@@ -179,15 +217,26 @@ class ChapterStateFactEvidenceSchema(BaseModel):
     def validate_extraction_state(self) -> "ChapterStateFactEvidenceSchema":
         fact_ids = [fact.fact_id for fact in self.facts]
         if len(fact_ids) != len(set(fact_ids)):
-            raise ValueError("state fact ids must be unique")
+            raise PydanticCustomError(
+                "state_fact_ids_must_be_unique", "state fact ids must be unique",
+            )
         if self.extraction_status == "complete":
             if not self.facts or self.no_change is not None or self.unknown_reason:
-                raise ValueError("complete extraction requires facts only")
+                raise PydanticCustomError(
+                    "state_extraction_complete_requires_facts_only",
+                    "complete extraction requires facts only",
+                )
         elif self.extraction_status == "complete_no_change":
             if self.facts or self.no_change is None or self.unknown_reason:
-                raise ValueError("complete_no_change requires no-change evidence only")
+                raise PydanticCustomError(
+                    "state_extraction_no_change_requires_evidence_only",
+                    "complete_no_change requires no-change evidence only",
+                )
         elif self.no_change is not None or not self.unknown_reason:
-            raise ValueError("unknown extraction requires an unknown_reason")
+            raise PydanticCustomError(
+                "state_extraction_unknown_requires_reason",
+                "unknown extraction requires an unknown_reason",
+            )
         return self
 
 

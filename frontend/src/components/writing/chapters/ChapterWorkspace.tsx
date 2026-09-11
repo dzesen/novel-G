@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SCENE_ILLUSTRATION_ENABLED } from "@/lib/featureFlags";
 import { useTranslations } from "next-intl";
 import {
   ApiError,
@@ -23,6 +24,7 @@ import ChapterContextInspector from "./ChapterContextInspector";
 import ChapterWorkspaceLayout, { type ChapterWorkspaceLayoutControls } from "./ChapterWorkspaceLayout";
 import {
   chapterToDraft,
+  acknowledgeLocalChapterDraft,
   clearLocalChapterDraft,
   countChapterWords,
   downloadTextFile,
@@ -164,7 +166,7 @@ export default function ChapterWorkspace({
   const initialChapterIdRef = useRef(initialChapterId);
   const structureRequestRef = useRef(0);
   const loadSequenceRef = useRef(0);
-  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const saveQueueRef = useRef<Promise<boolean>>(Promise.resolve(true));
   const handledProseOpenRequestRef = useRef<number | null>(null);
   const handledInitialRunKeyRef = useRef<string | null>(null);
   const selectChapterRef = useRef<
@@ -476,12 +478,36 @@ export default function ChapterWorkspace({
         return;
       }
       if (cancelled) return;
-      handledInitialRunKeyRef.current = runLookupKey;
-      const run = leftovers.find(
+      let run: ProseRunSnapshot | null = leftovers.find(
         (item) =>
           (item.run_id === initialRunId || item._id === initialRunId)
           && item.chapter_id === initialChapterId,
-      );
+      ) ?? null;
+      if (!run && ["stale", "superseded"].includes(locator.status)) {
+        // 完成过的历史候选不属于未完成草稿列表，需按精确 ID 读取。
+        try {
+          const retained = await apiGet<(ProseRunSnapshot & {
+            novel_id: string; chapter_id: string;
+          }) | null>(`/api/llm/prose-runs/${encodeURIComponent(initialRunId)}/draft`);
+          if (cancelled) return;
+          if (retained?.run_id === initialRunId
+            && retained.novel_id === novelId
+            && retained.chapter_id === initialChapterId
+            && ["stale", "superseded"].includes(retained.status)) {
+            run = retained;
+          }
+        } catch (error) {
+          if (cancelled) return;
+          if (!(error instanceof ApiError && [400, 404].includes(error.status))) {
+            setRunTargetLoadError({
+              chapterId: initialChapterId, runId: initialRunId,
+              message: error instanceof Error ? error.message : t("loadFailed"),
+            });
+            return;
+          }
+        }
+      }
+      handledInitialRunKeyRef.current = runLookupKey;
       if (run) {
         setPendingProseOpen({ chapterId: initialChapterId, run });
       } else {
@@ -535,14 +561,14 @@ export default function ChapterWorkspace({
   }, [loadChapter, selectedChapterId]);
 
   const persistDraft = useCallback(
-    (chapterId: string, snapshot: ChapterDraft, revision: number): Promise<void> => {
+    (chapterId: string, snapshot: ChapterDraft, revision: number): Promise<boolean> => {
       const task = saveQueueRef.current
         .catch(() => undefined)
         .then(async () => {
           if (selectedChapterIdRef.current === chapterId) setSaveState("saving");
           try {
             await apiPut(`/api/chapters/${chapterId}`, snapshot);
-            clearLocalChapterDraft(chapterId);
+            acknowledgeLocalChapterDraft(chapterId, snapshot);
             const savedAt = new Date().toISOString();
             setChapters((current) =>
               current.map((chapter) =>
@@ -562,8 +588,10 @@ export default function ChapterWorkspace({
               setUpdatedAt(savedAt);
               setSaveState(revisionRef.current === revision ? "saved" : "dirty");
             }
+            return true;
           } catch {
             if (selectedChapterIdRef.current === chapterId) setSaveState("error");
+            return false;
           }
         });
       saveQueueRef.current = task;
@@ -598,41 +626,34 @@ export default function ChapterWorkspace({
     void persistDraft(selectedChapterId, draft, revisionRef.current);
   }, [draft, persistDraft, selectedChapterId]);
 
-  /**
-   * 显式冲一次草稿并**等待落库**，供状态回填面板在打开前调用。
-   *
-   * 状态回填在后端读 chapter.content（设计 §4.1），而正文可能还躺在
-   * 900ms 防抖的自动保存队列里。不等这一下，AI 就会为**上一版正文**
-   * 生成摘要与永久事实，且静默无感。
-   *
-   * 与 saveNow 的区别只在于**返回 Promise**：saveNow 是快捷键用的即发即忘。
-   * 标题为空时 persistDraft 会被跳过（自动保存的既有约定），此时本函数
-   * 返回 false，调用方必须据此拒绝打开面板——静默的空保存比不保存更危险。
-   */
+  /** Confirm the captured chapter and edit revision before reading formal prose for state. */
   const flushDraft = useCallback(async (): Promise<boolean> => {
-    if (!selectedChapterId || !draft) return false;
-    if (!draft.title.trim()) return false;
-    if (saveState === "dirty" || saveState === "error") {
-      await persistDraft(selectedChapterId, draft, revisionRef.current);
+    if (!selectedChapterId || !draft || !draft.title.trim()) return false;
+    const chapterId = selectedChapterId;
+    const revision = revisionRef.current;
+    const loadSequence = loadSequenceRef.current;
+    if (saveState === "dirty" || saveState === "error" || saveState === "saving") {
+      // An in-flight request can contain an older snapshot. Explicitly queue this one too.
+      if (!await persistDraft(chapterId, draft, revision)) return false;
     }
-    // saveState === "saving" 时自动保存已在途、上面的分支不会触发，但那份 PUT 仍可能
-    // 未落库；无条件等一次保存队列排空，确保后端读到的正文是最新的（设计 §4.1）。
-    // dirty/error 分支已 await 的 persistDraft 会把 saveQueueRef.current 指向自身任务，
-    // 故这一行此时是已决议的 no-op；idle/saved 时队列本就空，同样是 no-op。
     await saveQueueRef.current;
-    return true;
+    return selectedChapterIdRef.current === chapterId
+      && revisionRef.current === revision
+      && loadSequenceRef.current === loadSequence;
   }, [draft, persistDraft, saveState, selectedChapterId]);
 
   const openStateBackfill = useCallback(async () => {
     setStateBackfillBlocked("");
     const flushed = await flushDraft();
+    if (selectedChapterIdRef.current !== selectedChapterId) return;
     if (!flushed) {
-      // 标题为空 → 自动保存被跳过 → 库里的正文是旧的。如实拦住，不静默放行。
-      setStateBackfillBlocked(tStateBackfill("needTitleToSave"));
+      setStateBackfillBlocked(tStateBackfill(
+        draft?.title.trim() ? "needSavedDraft" : "needTitleToSave",
+      ));
       return;
     }
     if (selectedChapterId) onOpenStateProposal(selectedChapterId);
-  }, [flushDraft, onOpenStateProposal, selectedChapterId, tStateBackfill]);
+  }, [draft, flushDraft, onOpenStateProposal, selectedChapterId, tStateBackfill]);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -926,6 +947,7 @@ export default function ChapterWorkspace({
       }}
       canGenerateProse={Boolean(chapterOutline)}
       onOpenSceneIllustration={() => {
+        if (!SCENE_ILLUSTRATION_ENABLED) return;
         controls.closeDrawer();
         setSceneIllustrationOpen(true);
       }}
@@ -1179,7 +1201,7 @@ export default function ChapterWorkspace({
         />
       )}
 
-      {sceneIllustrationOpen &&
+      {SCENE_ILLUSTRATION_ENABLED && sceneIllustrationOpen &&
         novelId &&
         selectedChapterId &&
         chapterOutline &&

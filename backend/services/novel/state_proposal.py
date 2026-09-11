@@ -8,6 +8,7 @@ verified here and are never copied into mutation journals.
 from __future__ import annotations
 
 import hashlib
+import anyio
 import hmac
 import json
 from collections.abc import AsyncIterable, AsyncIterator, Mapping
@@ -21,7 +22,11 @@ from uuid import uuid4
 from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+from pydantic import ValidationError
 
+from backend.llm.schemas.state_fact_pydantic import StateFactSourceBindingSchema
+
+from backend.services.llm.stream_lifecycle import closing_stream
 from backend.config.config import CONFIG_PATH
 from backend.config.lifecycle import FileSecretVersionStore
 from backend.db import collections
@@ -39,7 +44,14 @@ from backend.services.generation.candidate_repair_contracts import (
 from backend.services.generation.required_chapter_state_contracts import (
     RequiredStateGenerationBinding,
 )
+from backend.services.generation.candidate_state_retention import (
+    CandidateStateRetentionBinding, capture_candidate_state_retention,
+    validate_candidate_state_retention,
+)
 from backend.services.llm.workflow_runner import parse_sse_event, sse_event
+from backend.services.llm.generation_runtime import (
+    safe_structured_repair_failure_diagnostics,
+)
 from backend.services.novel.state_completion import (
     chapter_content_digest,
     prose_acceptance_state,
@@ -54,6 +66,7 @@ from backend.services.novel.state_fact_accounting import (
     StateFactAccountingError,
     account_state_fact_evidence,
     automatic_state_fact_decision,
+    state_selection_policy,
     validate_state_fact_evidence,
 )
 
@@ -510,10 +523,19 @@ class StateProposalModule:
         })
         if proposal is None:
             raise StaleStatePreview("State proposal is outside the repair scope")
-        expires_at = proposal.get("expires_at")
+        retention = proposal.get("candidate_state_retention")
+        if retention is not None:
+            try:
+                retained = CandidateStateRetentionBinding.model_validate(retention)
+                if retained.owner_id != owner_id or retained.novel_id != novel_id or retained.chapter_id != chapter_id:
+                    raise ValueError("retention owner scope changed")
+                await validate_candidate_state_retention(retained, proposal=proposal, require_state_checkpoint=False)
+            except ValueError as exc:
+                raise StaleStatePreview("Candidate state retention is no longer current") from exc
+        expires_at = proposal.get("expires_at") or proposal.get("acceptance_expires_at")
         if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
+        if not isinstance(expires_at, datetime) or (retention is None and expires_at <= datetime.now(timezone.utc)):
             raise StaleStatePreview("State proposal is no longer live")
         return {**proposal, "owner_id": to_object_id(owner_id)}
 
@@ -566,13 +588,13 @@ class StateProposalModule:
             "proposed",
             "claimed",
             "applied",
-        }:
+        } and not (proposal.get("status") == "expired" and proposal.get("candidate_state_retention") is not None):
             raise StaleStatePreview(
                 "State repair proposal status is not recoverable"
             )
         audit = proposal.get("generation_audit")
         candidate = proposal.get("candidate")
-        expires_at = proposal.get("expires_at")
+        expires_at = proposal.get("expires_at") or proposal.get("acceptance_expires_at")
         if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if (
@@ -635,6 +657,7 @@ class StateProposalModule:
         return RecoveredStateProposal(
             value={
                 **deepcopy(candidate),
+                "selection_policy": state_selection_policy(candidate),
                 "proposal_id": str(proposal["_id"]),
                 "acceptance_token": token,
                 "proposal_expires_at": expires_at.isoformat(),
@@ -790,6 +813,7 @@ class StateProposalModule:
         return RecoveredStateProposal(
             value={
                 **deepcopy(candidate),
+                "selection_policy": state_selection_policy(candidate),
                 "proposal_id": str(proposal["_id"]),
                 "acceptance_token": token,
                 "proposal_expires_at": expires_at.isoformat(),
@@ -815,6 +839,17 @@ class StateProposalModule:
         captured_chapter = chapter or await chapter_repo.get_chapter_by_id(chapter_id)
         if str(captured_chapter.get("novel_id")) != str(novel_id):
             raise ValueError("Chapter does not belong to novel")
+        try:
+            source = StateFactSourceBindingSchema.model_validate({
+                "chapter_id": str(chapter_id),
+                "source_content_digest": source_content_digest or chapter_content_digest(captured_chapter.get("content")),
+                "source_prose_run_id": source_prose_run_id,
+                "source_prose_run_revision": source_prose_run_revision,
+            })
+        except ValidationError as exc:
+            # This is local source metadata, not Provider output. Reject it
+            # before a lease exists or a paid generation can be dispatched.
+            raise ValueError("正文来源绑定不完整或无效，未调用模型") from exc
         return StateGenerationSnapshot(
             novel_id=str(novel_id),
             chapter_id=str(chapter_id),
@@ -824,14 +859,8 @@ class StateProposalModule:
             source_content_digest=(
                 str(source_content_digest) if source_content_digest else None
             ),
-            source_prose_run_id=(
-                str(source_prose_run_id) if source_prose_run_id else None
-            ),
-            source_prose_run_revision=(
-                int(source_prose_run_revision)
-                if source_prose_run_revision is not None
-                else None
-            ),
+            source_prose_run_id=source.source_prose_run_id,
+            source_prose_run_revision=source.source_prose_run_revision,
             source_prose_acceptance_state=(
                 str(source_prose_acceptance_state)
                 if source_prose_acceptance_state
@@ -870,6 +899,7 @@ class StateProposalModule:
         required_state_generation_binding: (
             RequiredStateGenerationBinding | None
         ) = None,
+        candidate_job_id: str | None = None,
     ) -> StateProposalLease:
         """Persist a generation lease before any Provider request is started."""
         active_snapshot = snapshot or await self.capture(
@@ -983,6 +1013,13 @@ class StateProposalModule:
                     "Required state generation result must be recovered"
                 )
         proposal_id = ObjectId()
+        retention = None
+        if candidate_job_id is not None:
+            if job_binding is not None or required_binding is not None:
+                raise StaleStatePreview("Candidate retention cannot mix Job authority kinds")
+            retention = await capture_candidate_state_retention(
+                candidate_job_id, active_snapshot, str(generation_audit.get("request_id") or ""),
+            )
         now = get_utc_now()
         document = {
             "_id": proposal_id,
@@ -1006,6 +1043,7 @@ class StateProposalModule:
             "created_at": now,
             "updated_at": now,
             "is_deleted": False,
+            **({"candidate_state_retention": retention.model_dump(mode="json")} if retention else {}),
             **(
                 {
                     "job_mutation_key": job_binding.idempotency_key,
@@ -1086,6 +1124,7 @@ class StateProposalModule:
         )
         generation_audit, job_binding = _merged_generation_audit(current, audit)
         required_binding = _required_state_generation_binding(current)
+        retention = current.get("candidate_state_retention")
         update: dict[str, Any] = {
             "$set": {
                 "status": "proposed",
@@ -1097,12 +1136,12 @@ class StateProposalModule:
                 "updated_at": get_utc_now(),
                 **(
                     {"acceptance_expires_at": expires_at}
-                    if job_binding is not None or required_binding is not None
+                    if job_binding is not None or required_binding is not None or retention is not None
                     else {}
                 ),
             }
         }
-        if job_binding is not None or required_binding is not None:
+        if job_binding is not None or required_binding is not None or retention is not None:
             update["$unset"] = {"expires_at": ""}
         publish_query: dict[str, Any] = {
             "_id": lease.proposal_id,
@@ -1124,6 +1163,7 @@ class StateProposalModule:
             raise StaleStatePreview("Generation lease was published concurrently")
         return {
             **prepared,
+            "selection_policy": state_selection_policy(prepared),
             "proposal_id": str(lease.proposal_id),
             "acceptance_token": token,
             "proposal_expires_at": expires_at.isoformat(),
@@ -1228,6 +1268,11 @@ class StateProposalModule:
             )
         job_binding = _job_mutation_binding(current)
         required_binding = _required_state_generation_binding(current)
+        retention = current.get("candidate_state_retention")
+        if retention is not None:
+            await validate_candidate_state_retention(
+                CandidateStateRetentionBinding.model_validate(retention), dispatch=True,
+            )
         projection_query: dict[str, Any] = {
             "_id": lease.proposal_id,
             "status": "generating",
@@ -1288,6 +1333,11 @@ class StateProposalModule:
             )
         job_binding = _job_mutation_binding(current)
         required_binding = _required_state_generation_binding(current)
+        retention = current.get("candidate_state_retention")
+        if retention is not None:
+            await validate_candidate_state_retention(
+                CandidateStateRetentionBinding.model_validate(retention), dispatch=True,
+            )
         now = get_utc_now()
         query: dict[str, Any] = {
             "_id": lease.proposal_id,
@@ -1304,7 +1354,7 @@ class StateProposalModule:
                 "updated_at": now,
             }
         }
-        if job_binding is not None or required_binding is not None:
+        if job_binding is not None or required_binding is not None or retention is not None:
             acceptance_expires_at = current.get("expires_at")
             if not isinstance(acceptance_expires_at, datetime):
                 raise StaleStatePreview(
@@ -1340,7 +1390,7 @@ class StateProposalModule:
         required_binding = _required_state_generation_binding(current)
         query: dict[str, Any] = {
             "_id": lease.proposal_id,
-            "status": {"$in": ["generating", "dispatched", "proposed"]},
+            "status": {"$in": ["generating", "dispatched", "proposed", "failed"]},
         }
         if job_binding is not None:
             query.update(_job_mutation_binding_query(job_binding))
@@ -1376,109 +1426,142 @@ class StateProposalModule:
         """Own SSE candidate validation, publication, auditing, and failure state."""
         proposal_payload: dict[str, Any] | None = None
         generation_audit: dict[str, Any] = {}
+        failure_recorded = False
         reported_invalid_ids = False
         reported_remapped_ids = False
         try:
-            async for frame in frames:
-                parsed = parse_sse_event(frame)
-                if parsed is None:
-                    yield frame
-                    continue
-                event, event_data = parsed
-                usage = event_data.get("usage") or event_data.get("usage_so_far")
-                if isinstance(usage, dict):
-                    generation_audit["usage"] = usage
-                candidate = None
-                if (
-                    event == "step"
-                    and event_data.get("step") == state_step
-                    and event_data.get("status") == "done"
-                    and isinstance(event_data.get("data"), dict)
-                ):
-                    candidate = event_data["data"]
-                elif (
-                    event == "done"
-                    and event_data.get("success")
-                    and isinstance(event_data.get("result"), dict)
-                    and isinstance(event_data["result"].get(state_step), dict)
-                ):
-                    candidate = event_data["result"][state_step]
-                if candidate is None:
-                    yield frame
-                    continue
+            async with closing_stream(frames):
+                async for frame in frames:
+                    parsed = parse_sse_event(frame)
+                    if parsed is None:
+                        yield frame
+                        continue
+                    event, event_data = parsed
+                    usage = event_data.get("usage") or event_data.get("usage_so_far")
+                    if isinstance(usage, dict):
+                        generation_audit["usage"] = usage
+                    step_failed = (
+                        event == "step"
+                        and event_data.get("step") == state_step
+                        and event_data.get("status") == "error"
+                    )
+                    done_failed = event == "done" and event_data.get("success") is False
+                    if step_failed or done_failed:
+                        diagnostics = safe_structured_repair_failure_diagnostics(
+                            event_data.get("diagnostics")
+                        )
+                        if diagnostics is not None:
+                            generation_audit["structured_failure"] = diagnostics
+                        # The reader may close immediately after either failure frame.
+                        # Persist safe evidence first; never copy an upstream error body.
+                        if failure_recorded:
+                            await self.record_generation_audit(lease, generation_audit)
+                        else:
+                            await self.mark_failed(
+                                lease,
+                                RuntimeError(
+                                    "State generation failed structured validation"
+                                    if diagnostics is not None
+                                    else "State generation workflow failed"
+                                ),
+                                audit=generation_audit,
+                            )
+                            failure_recorded = True
+                        yield frame
+                        if done_failed:
+                            return
+                        continue
+                    candidate = None
+                    if (
+                        event == "step"
+                        and event_data.get("step") == state_step
+                        and event_data.get("status") == "done"
+                        and isinstance(event_data.get("data"), dict)
+                    ):
+                        candidate = event_data["data"]
+                    elif (
+                        event == "done"
+                        and event_data.get("success")
+                        and isinstance(event_data.get("result"), dict)
+                        and isinstance(event_data["result"].get(state_step), dict)
+                    ):
+                        candidate = event_data["result"][state_step]
+                    if candidate is None:
+                        yield frame
+                        continue
 
-                resolved, remapped = resolve_state_character_references(
-                    candidate,
-                    roster,
-                )
-                cleaned, dropped = validate_state_ids(resolved, roster)
-                if prose is not None:
-                    known = known_id_sets(roster)
-                    cleaned["fact_evidence"] = validate_state_fact_evidence(
-                        candidate.get("fact_evidence"),
-                        candidate=cleaned,
-                        prose=prose,
-                        binding={
-                            "chapter_id": lease.snapshot.chapter_id,
-                            "source_prose_run_id": (
-                                lease.snapshot.source_prose_run_id
-                            ),
-                            "source_prose_run_revision": (
-                                lease.snapshot.source_prose_run_revision
-                            ),
-                            "source_content_digest": (
-                                lease.snapshot.source_content_digest
-                                or chapter_content_digest(prose)
-                            ),
-                        },
-                        known_character_ids=known["characters"],
-                        known_thread_ids=known["threads"],
-                    )
-                    generation_audit["state_fact_evidence"] = {
-                        "schema_version": cleaned["fact_evidence"][
-                            "evidence_schema_version"
-                        ],
-                        "evidence_digest": cleaned["fact_evidence"][
-                            "evidence_digest"
-                        ],
-                        "extraction_status": cleaned["fact_evidence"][
-                            "extraction_status"
-                        ],
-                        "invalid_internal_references": cleaned[
-                            "fact_evidence"
-                        ]["invalid_internal_references"],
-                        "dangling_references": cleaned["fact_evidence"][
-                            "dangling_references"
-                        ],
-                    }
-                generation_audit["reference_resolution"] = (
-                    state_reference_resolution(
+                    resolved, remapped = resolve_state_character_references(
                         candidate,
-                        cleaned,
-                        dropped,
-                        remapped,
+                        roster,
                     )
-                )
-                if remapped and not reported_remapped_ids:
-                    yield sse_event("id_remapping", {"remapped": remapped})
-                    reported_remapped_ids = True
-                if dropped and not reported_invalid_ids:
-                    yield sse_event("id_validation", {"dropped": dropped})
-                    reported_invalid_ids = True
-                if proposal_payload is None:
-                    proposal_payload = await self.publish(
-                        lease,
-                        cleaned,
-                        audit=generation_audit,
+                    cleaned, dropped = validate_state_ids(resolved, roster)
+                    if prose is not None:
+                        known = known_id_sets(roster)
+                        cleaned["fact_evidence"] = validate_state_fact_evidence(
+                            candidate.get("fact_evidence"),
+                            candidate=cleaned,
+                            prose=prose,
+                            binding={
+                                "chapter_id": lease.snapshot.chapter_id,
+                                "source_prose_run_id": (
+                                    lease.snapshot.source_prose_run_id
+                                ),
+                                "source_prose_run_revision": (
+                                    lease.snapshot.source_prose_run_revision
+                                ),
+                                "source_content_digest": (
+                                    lease.snapshot.source_content_digest
+                                    or chapter_content_digest(prose)
+                                ),
+                            },
+                            known_character_ids=known["characters"],
+                            known_thread_ids=known["threads"],
+                        )
+                        generation_audit["state_fact_evidence"] = {
+                            "schema_version": cleaned["fact_evidence"][
+                                "evidence_schema_version"
+                            ],
+                            "evidence_digest": cleaned["fact_evidence"][
+                                "evidence_digest"
+                            ],
+                            "extraction_status": cleaned["fact_evidence"][
+                                "extraction_status"
+                            ],
+                            "invalid_internal_references": cleaned[
+                                "fact_evidence"
+                            ]["invalid_internal_references"],
+                            "dangling_references": cleaned["fact_evidence"][
+                                "dangling_references"
+                            ],
+                        }
+                    generation_audit["reference_resolution"] = (
+                        state_reference_resolution(
+                            candidate,
+                            cleaned,
+                            dropped,
+                            remapped,
+                        )
                     )
-                replacement = dict(event_data)
-                if event == "step":
-                    replacement["data"] = proposal_payload
-                else:
-                    result = dict(replacement["result"])
-                    result[state_step] = proposal_payload
-                    replacement["result"] = result
-                yield sse_event(event, replacement)
+                    if remapped and not reported_remapped_ids:
+                        yield sse_event("id_remapping", {"remapped": remapped})
+                        reported_remapped_ids = True
+                    if dropped and not reported_invalid_ids:
+                        yield sse_event("id_validation", {"dropped": dropped})
+                        reported_invalid_ids = True
+                    if proposal_payload is None:
+                        proposal_payload = await self.publish(
+                            lease,
+                            cleaned,
+                            audit=generation_audit,
+                        )
+                    replacement = dict(event_data)
+                    if event == "step":
+                        replacement["data"] = proposal_payload
+                    else:
+                        result = dict(replacement["result"])
+                        result[state_step] = proposal_payload
+                        replacement["result"] = result
+                    yield sse_event(event, replacement)
 
             if generation_audit:
                 await self.record_generation_audit(lease, generation_audit)
@@ -1488,8 +1571,25 @@ class StateProposalModule:
                     RuntimeError("State workflow ended without a proposal candidate"),
                     audit=generation_audit,
                 )
-        except BaseException as exc:
+        except StateFactAccountingError as exc:
+            # Provider 已返回，但本地证据校验失败。必须先保存失败，再交付
+            # 完整终态；向 ASGI 抛出会被浏览器误判为传输中断。
             await self.mark_failed(lease, exc, audit=generation_audit)
+            failure = {
+                "error_code": "state_fact_evidence_invalid",
+                "error": "模型返回的状态事实证据未通过正文核验，请检查正文后重新生成状态提案。",
+                "usage": generation_audit.get("usage", {}),
+            }
+            yield sse_event("step", {"step": state_step, "status": "error", **failure})
+            yield sse_event("done", {
+                "success": False,
+                "failed_step": state_step,
+                "partial_result": {},
+                **failure,
+            })
+        except BaseException as exc:
+            with anyio.move_on_after(5, shield=True):
+                await self.mark_failed(lease, exc, audit=generation_audit)
             raise
 
     async def create(
@@ -1518,6 +1618,7 @@ class StateProposalModule:
         required_state_generation_binding: (
             RequiredStateGenerationBinding | None
         ) = None,
+        candidate_job_id: str | None = None,
     ) -> dict[str, Any]:
         proposal = await self.collection.find_one({"_id": to_object_id(proposal_id)})
         if not proposal:
@@ -1578,9 +1679,20 @@ class StateProposalModule:
             raise StaleStatePreview(
                 "State proposal has no required successor binding"
             )
-        if proposal_status == "expired" and not required_handoff:
+        retained_handoff = False
+        retention = proposal.get("candidate_state_retention")
+        if candidate_job_id is not None and retention is not None:
+            try:
+                retained = CandidateStateRetentionBinding.model_validate(retention)
+                if retained.job_id != candidate_job_id:
+                    raise ValueError("retention Job changed")
+                await validate_candidate_state_retention(retained, proposal=proposal)
+            except ValueError as exc:
+                raise StaleStatePreview("Candidate state retention is no longer current") from exc
+            retained_handoff = True
+        if proposal_status == "expired" and not (required_handoff or retained_handoff):
             raise StaleStatePreview("State proposal is not available for acceptance")
-        allow_expired = required_handoff
+        allow_expired = required_handoff or retained_handoff
         if job_mutation_binding is not None:
             try:
                 supplied_job_binding = JobMutationRecoveryBindingV1.model_validate(
@@ -1641,6 +1753,7 @@ class StateProposalModule:
         required_state_generation_binding: (
             RequiredStateGenerationBinding | None
         ) = None,
+        candidate_job_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Validate a decision without consuming the proposal or creating a gap."""
         proposal = await self._load_verified_proposal(
@@ -1651,6 +1764,7 @@ class StateProposalModule:
             required_state_generation_binding=(
                 required_state_generation_binding
             ),
+            candidate_job_id=candidate_job_id,
         )
         novel_id = str(proposal["novel_id"])
         chapter = await chapter_repo.get_chapter_by_id(chapter_id)
@@ -1658,7 +1772,7 @@ class StateProposalModule:
             proposal.get("status") == "proposed"
             or (
                 proposal.get("status") == "expired"
-                and required_state_generation_binding is not None
+                and (required_state_generation_binding is not None or candidate_job_id is not None)
             )
         )
         if revalidate_deferred_source:
@@ -2455,6 +2569,7 @@ class StateProposalModule:
             )
         return {
             **deepcopy(candidate),
+            "selection_policy": state_selection_policy(candidate),
             "proposal_id": str(proposal["_id"]),
             "acceptance_token": token,
             "proposal_expires_at": expires_at.isoformat(),
@@ -2467,12 +2582,14 @@ class StateProposalModule:
         proposal_id: str,
         acceptance_token: str,
         policy: SelectAllPolicy | FactAccountingPolicy,
+        candidate_job_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Prepare a policy decision from the persisted candidate, never caller data."""
         stored = await self._load_verified_proposal(
             chapter_id=chapter_id,
             proposal_id=proposal_id,
             acceptance_token=acceptance_token,
+            candidate_job_id=candidate_job_id,
         )
         candidate = deepcopy(stored.get("candidate") or {})
         policy_decision = policy.decide(candidate)
@@ -2488,6 +2605,7 @@ class StateProposalModule:
             drop_reasons=dict(policy_decision.drop_reasons),
             policy_name=policy.name,
             policy_version=policy.version,
+            candidate_job_id=candidate_job_id,
         )
 
     async def prepare_required_state_policy_decision(

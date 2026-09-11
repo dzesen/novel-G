@@ -12,6 +12,7 @@ from backend.db.collections import NOVELS
 from backend.db.errors import InvalidIdError, NotFoundError
 from backend.services.backup.backup_service import (
     MAX_BACKUP_BYTES,
+    BackupRestoreBusyError,
     build_novel_backup,
     build_novel_text,
     create_backup_snapshot,
@@ -70,6 +71,8 @@ async def import_backup(
     try:
         payload = parse_backup(content)
         stats = await restore_backup(payload)
+    except BackupRestoreBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

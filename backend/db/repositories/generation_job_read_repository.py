@@ -58,6 +58,10 @@ _SCALARS = (
 )
 SUMMARY_PROJECTION = {
     **dict.fromkeys(_SCALARS, 1),
+    "authorization_confirmation_required": 1,
+    "authorization_revision": 1,
+    "expected_narrative_revision": 1,
+    "current_failure_event_id": 1,
     "error.step": 1,
     "error.chapter_id": 1,
     "error.reason_codes": 1,

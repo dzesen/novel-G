@@ -57,7 +57,7 @@ from backend.services.novel.chapter_service import ChapterService
 from backend.services.generation.volume_outline_generation import (
     VOLUME_OUTLINE_STEPS,
     VOLUME_OUTLINE_WORKFLOW,
-    volume_outline_params,
+    load_volume_outline_params,
 )
 
 from backend.api.default_routers.auth_router import require_owned_body_resource
@@ -127,7 +127,7 @@ async def create_volume_outline_by_ai(req: VolumeOutlineRequest, request: Reques
         raise HTTPException(status_code=400, detail=str(exc))
 
     try:
-        params = volume_outline_params(novel)
+        params = await load_volume_outline_params(novel)
     except InvalidNovelScale as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

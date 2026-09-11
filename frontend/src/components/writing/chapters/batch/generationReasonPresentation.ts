@@ -1,4 +1,9 @@
 const DIAGNOSTIC_REASON_KEYS = {
+  repair_budget_exhausted: "diagnosticsReasonRepairBudgetExhausted",
+  repair_not_converged: "diagnosticsReasonRepairNotConverged",
+  review_evidence_invalid: "diagnosticsReasonReviewEvidenceInvalid",
+  unclassified_failure: "diagnosticsReasonUnknown",
+  historical_unclassified_failure: "diagnosticsReasonUnknown",
   short_stop: "diagnosticsReasonShortStop",
   provider_length_limit: "diagnosticsReasonLength",
   provider_content_filter: "diagnosticsReasonContentFilter",
@@ -28,6 +33,9 @@ const DIAGNOSTIC_REASON_KEYS = {
   continuation_limit_reached: "diagnosticsReasonContinuationLimit",
   invalid_internal_id: "diagnosticsReasonInvalidId",
   historical_invalid_internal_id: "diagnosticsReasonInvalidId",
+  world_baseline_confirmation_required: "diagnosticsReasonWorldBaseline",
+  readiness_confirmation_required: "diagnosticsReasonReadinessConfirmation",
+  authorization_scope_increased: "diagnosticsReasonAuthorizationScope",
   validation_rejected: "diagnosticsReasonValidation",
   candidate_completion_repair_exhausted: "diagnosticsReasonCandidateCompletionExhausted",
   candidate_adherence_repair_exhausted: "diagnosticsReasonCandidateAdherenceExhausted",
@@ -76,10 +84,21 @@ const JOB_PAUSE_REASON_KEYS = {
   source_changed: "reasonSourceChanged",
   incomplete_scene: "reasonIncompleteScene",
   authorization_scope_increased: "reasonAuthorizationScopeIncreased",
+  world_baseline_confirmation_required: "reasonWorldBaselineConfirmation",
+  readiness_confirmation_required: "reasonReadinessConfirmation",
   reference_card_review: "reasonReferenceCardReview",
   reference_card_auto_creation_recovery: "reasonReferenceCardAutoCreationRecovery",
   reference_card_repair_exhausted: "reasonReferenceCardRepairExhausted",
   final_audit: "reasonFinalAudit",
+  uncertain_skipped: "reasonUncertainSkipped",
+  outline_adherence_manual_review: "reasonAdherenceManualReview",
+  repair_not_converged: "reasonRepairNotConverged",
+  repair_budget_exhausted_provider_technical_retry: "reasonProviderRetryBudgetExhausted",
+  repair_budget_exhausted_adherence_judge_retry: "reasonJudgeRetryBudgetExhausted",
+  repair_budget_exhausted_state_reextraction: "reasonStateReextractionBudgetExhausted",
+  repair_budget_exhausted_local_prose_repair: "reasonProseRepairBudgetExhausted",
+  repair_budget_exhausted_scene_regeneration: "reasonSceneRegenerationBudgetExhausted",
+  repair_budget_exhausted_outline_rollback: "reasonOutlineRollbackBudgetExhausted",
 } as const;
 
 export type DiagnosticReasonTranslationKey =
@@ -121,4 +140,38 @@ export function diagnosticActionTranslationKey(
   return DIAGNOSTIC_ACTION_KEYS[
     actionCode as keyof typeof DIAGNOSTIC_ACTION_KEYS
   ] ?? null;
+}
+
+
+/** Only an explicit checkpoint reason may claim a planned review stop. */
+export function checkpointPauseReasonTranslationKey(
+  pauseReason: string | null | undefined,
+  pauseReasonDetail?: string | null,
+): JobPauseReasonTranslationKey | "reasonPauseUnknown" {
+  return (pauseReasonDetail ? jobPauseReasonTranslationKey(pauseReasonDetail) : null)
+    ?? (pauseReason ? jobPauseReasonTranslationKey(pauseReason) : null)
+    ?? "reasonPauseUnknown";
+}
+
+const REPAIR_COMPONENT_KEYS = {
+  provider_technical_retry: "repairComponentProviderRetry",
+  adherence_judge_retry: "repairComponentJudgeRetry",
+  state_reextraction: "repairComponentStateReextraction",
+  local_prose_repair: "repairComponentProseRepair",
+  scene_regeneration: "repairComponentSceneRegeneration",
+  outline_rollback: "repairComponentOutlineRollback",
+} as const;
+
+export function diagnosticRepairBudget(details: Record<string, unknown>) {
+  const component = details.repair_component;
+  if (typeof component !== "string" || !Object.hasOwn(REPAIR_COMPONENT_KEYS, component)) return null;
+  const used = details.component_used;
+  const limit = details.component_limit;
+  if (typeof used !== "number" || !Number.isSafeInteger(used) || used < 0
+      || typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 0) return null;
+  return {
+    componentKey: REPAIR_COMPONENT_KEYS[component as keyof typeof REPAIR_COMPONENT_KEYS],
+    used,
+    limit,
+  };
 }

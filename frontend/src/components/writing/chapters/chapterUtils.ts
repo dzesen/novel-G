@@ -6,6 +6,7 @@ export { countChapterWords } from "./chapterWordCount";
 interface LocalChapterDraft {
   draft: ChapterDraft;
   savedAt: string;
+  acknowledgedDraft?: ChapterDraft;
 }
 
 export function chapterToDraft(chapter: ChapterDetail): ChapterDraft {
@@ -25,7 +26,14 @@ export function saveLocalChapterDraft(chapterId: string, draft: ChapterDraft): v
   if (typeof window === "undefined") return;
   const key = storageKey(chapterId);
   if (!key) return;
-  const value: LocalChapterDraft = { draft, savedAt: new Date().toISOString() };
+  let acknowledgedDraft: ChapterDraft | undefined;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw) acknowledgedDraft = (JSON.parse(raw) as LocalChapterDraft).acknowledgedDraft;
+  } catch {
+    // A malformed older backup must not prevent saving the current edit.
+  }
+  const value: LocalChapterDraft = { draft, savedAt: new Date().toISOString(), acknowledgedDraft };
   window.localStorage.setItem(key, JSON.stringify(value));
 }
 
@@ -40,7 +48,11 @@ export function loadNewerLocalChapterDraft(
     if (!raw) return null;
     const value = JSON.parse(raw) as LocalChapterDraft;
     if (!value?.draft || !value.savedAt) return null;
-    if (new Date(value.savedAt).getTime() <= new Date(chapter.updated_at).getTime()) {
+    const serverDraft = chapterToDraft(chapter);
+    const matchesAcknowledged = value.acknowledgedDraft && sameChapterDraft(value.acknowledgedDraft, serverDraft);
+    if (sameChapterDraft(value.draft, serverDraft) || (
+      !matchesAcknowledged && new Date(value.savedAt).getTime() <= new Date(chapter.updated_at).getTime()
+    )) {
       window.localStorage.removeItem(key);
       return null;
     }
@@ -49,6 +61,33 @@ export function loadNewerLocalChapterDraft(
     const key = storageKey(chapter._id);
     if (key) window.localStorage.removeItem(key);
     return null;
+  }
+}
+
+function sameChapterDraft(left: ChapterDraft, right: ChapterDraft): boolean {
+  // Chapter updates normalize title whitespace on the server.
+  return left.title.trim() === right.title.trim() && left.summary === right.summary
+    && left.content === right.content && left.status === right.status;
+}
+
+/** A response confirms only its snapshot; later local edits still need recovery. */
+export function acknowledgeLocalChapterDraft(chapterId: string, saved: ChapterDraft): void {
+  if (typeof window === "undefined") return;
+  const key = storageKey(chapterId);
+  if (!key) return;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return;
+    const value = JSON.parse(raw) as LocalChapterDraft;
+    if (!value?.draft) return;
+    if (sameChapterDraft(value.draft, saved)) {
+      window.localStorage.removeItem(key);
+    } else {
+      // The server timestamp can exceed the newer edit's local timestamp.
+      window.localStorage.setItem(key, JSON.stringify({ ...value, acknowledgedDraft: saved }));
+    }
+  } catch {
+    // Recovery storage failure cannot turn an acknowledged server save into a failure.
   }
 }
 

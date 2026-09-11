@@ -54,6 +54,11 @@ export interface ChapterStateResult {
     invalid_internal_references: number;
     dangling_references: number;
   };
+  selection_policy?: Record<string, {
+    eligible: boolean;
+    reason: "canonical_fact" | "temporary_fact" | "character_cognition" | "rumor" | "deception" | "unsupported_by_prose" | "legal_no_op" | "unknown";
+    requires_drop_reason: boolean;
+  }>;
   proposal_id?: string;
   acceptance_token?: string;
   proposal_expires_at?: string;

@@ -1,4 +1,4 @@
-import { setRequestLocale } from "next-intl/server";
+import { prepareLocalePage } from "@/i18n/pageLocale";
 import WritingContent from "@/components/writing/WritingContent";
 
 export const dynamic = "force-dynamic";
@@ -8,7 +8,6 @@ export default async function WritingEditPage({
 }: {
   params: Promise<{ locale: string; novelId: string }>;
 }) {
-  const { locale, novelId } = await params;
-  setRequestLocale(locale);
+  const { novelId } = await prepareLocalePage(params);
   return <WritingContent mode="edit" novelId={novelId} />;
 }

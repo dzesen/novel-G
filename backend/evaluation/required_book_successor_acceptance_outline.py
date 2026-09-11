@@ -1031,6 +1031,7 @@ def project_formal_outline(
     raw = {
         name: _jsonable(stored_outline.get(name))
         for name in ChapterOutlineResultSchema.model_fields
+        if name in stored_outline
     }
     raw["new_threads"] = []
     raw["new_reference_card_candidates"] = []

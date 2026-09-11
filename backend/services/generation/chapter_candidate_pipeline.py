@@ -11,6 +11,10 @@ from typing import Any, Awaitable, Callable, Literal, Mapping, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from backend.llm.exceptions import LLMStructuredRepairError
+from backend.services.llm.generation_runtime import safe_structured_repair_failure_diagnostics
+from backend.services.llm.workflow_runner import WorkflowFailed
+
 from backend.llm.schemas.scene_contract_pydantic import (
     MAX_V2_ADHERENCE_ISSUES,
     MAX_V3_LOCAL_ADHERENCE_ISSUES,
@@ -73,6 +77,10 @@ from backend.services.generation.candidate_repair_contracts import (
     StateCandidateCheckpoint,
     StateCandidateCheckpointV1,
     StateCandidateCheckpointV3,
+    StateGenerationRejectedCheckpointV8,
+    ReviewGenerationRejectedCheckpointV9,
+    ReviewGenerationTruncatedCheckpointV10,
+    review_retry_attempt_ids,
     candidate_pipeline_checkpoint_digest,
     is_safe_candidate_identifier,
     parse_candidate_pipeline_checkpoint,
@@ -1287,6 +1295,10 @@ class ChapterCandidatePipelineDependencyFailed(RuntimeError):
         return _exception_unattributed_usage_projection(self.progress)
 
 
+class _RecordedGenerationRejected(ChapterCandidatePipelineDependencyFailed):
+    """The failed call group has already been accounted and checkpointed."""
+
+
 def wrap_candidate_pipeline_dependency_failure(
     progress: ChapterCandidatePipelineProgress,
     cause: BaseException,
@@ -1758,6 +1770,101 @@ def _initial_state_request_id(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")).hexdigest()
+
+
+def rejected_state_retry_request_id(checkpoint: StateGenerationRejectedCheckpointV8, *, cycle: int) -> str:
+    return hashlib.sha256(json.dumps({
+        "schema_version": "rejected_state_retry_request.v1",
+        "rejected_checkpoint_id": checkpoint.checkpoint_id,
+        "cycle": cycle,
+    }, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def state_generation_rejection_checkpoint(
+    *,
+    chapter_id: str,
+    sequence: int,
+    source: ProseCandidateSource,
+    attempt_ids: tuple[str, ...],
+    cycle: int,
+    request_id: str,
+    diagnostics: Mapping[str, Any],
+    failure_event_id: str | None = None,
+) -> StateGenerationRejectedCheckpointV8:
+    safe = safe_structured_repair_failure_diagnostics(diagnostics)
+    if safe is None or any(
+        safe.get(key) != "stop"
+        for key in ("primary_finish_reason", "repair_finish_reason")
+    ):
+        raise ValueError("state rejection requires confirmed complete responses")
+    common = _checkpoint_common(
+        chapter_id=chapter_id, sequence=sequence, source=source,
+        evidence=_RecordedStepEvidence(
+            attempt_ids=attempt_ids,
+            truncation=CandidateTruncationProjectionV1(
+                schema_version="candidate_truncation_projection.v1",
+            ),
+        ),
+    )
+    return _seal_checkpoint(StateGenerationRejectedCheckpointV8(
+        **{**common, "schema_version": "chapter_candidate_pipeline_checkpoint.v8"},
+        cycle=cycle, origin="initial" if cycle == 0 else "repair",
+        request_id=request_id,
+        diagnostic_digest=hashlib.sha256(json.dumps(
+            safe, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        failure_event_id=failure_event_id,
+    ))
+
+
+def review_generation_rejection_checkpoint(
+    *, chapter_id: str, sequence: int, source: ProseCandidateSource,
+    attempt_ids: tuple[str, ...], cycle: int, retry_index: int,
+    diagnostics: Mapping[str, Any], failure_event_id: str | None = None,
+) -> ReviewGenerationRejectedCheckpointV9:
+    safe = safe_structured_repair_failure_diagnostics(diagnostics)
+    if safe is None or any(safe.get(k) not in {"stop", "length"} for k in ("primary_finish_reason", "repair_finish_reason")):
+        raise ValueError("review rejection requires known settled response termination")
+    common = _checkpoint_common(
+        chapter_id=chapter_id, sequence=sequence, source=source,
+        evidence=_RecordedStepEvidence(attempt_ids=attempt_ids, truncation=CandidateTruncationProjectionV1(schema_version="candidate_truncation_projection.v1")),
+    )
+    truncated = "length" in (safe["primary_finish_reason"], safe["repair_finish_reason"])
+    checkpoint_type = ReviewGenerationTruncatedCheckpointV10 if truncated else ReviewGenerationRejectedCheckpointV9
+    termination = {key: safe[key] for key in ("primary_finish_reason", "repair_finish_reason")} if truncated else {}
+    return _seal_checkpoint(checkpoint_type(
+        **{**common, "schema_version": "chapter_candidate_pipeline_checkpoint.v10" if truncated else "chapter_candidate_pipeline_checkpoint.v9"},
+        **termination,
+        cycle=cycle, origin="initial" if cycle == 0 else "repair", retry_index=retry_index,
+        diagnostic_digest=hashlib.sha256(json.dumps(safe, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+        failure_event_id=failure_event_id,
+    ))
+
+
+def _state_rejection_diagnostics(exc: BaseException, *, code: str = "structured_output_invalid") -> dict[str, Any] | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(16):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, (LLMStructuredRepairError, WorkflowFailed)):
+            if (
+                getattr(current, "diagnostic_category", None) != "validation_logic"
+                or getattr(current, "diagnostic_code", None) != code
+                or getattr(current, "diagnostic_evidence", None) != "confirmed"
+            ):
+                return None
+            safe = safe_structured_repair_failure_diagnostics(
+                getattr(current, "diagnostics", None),
+            )
+            if safe is not None and all(
+                safe.get(key) in ({"stop", "length"} if code == "review_evidence_invalid" else {"stop"})
+                for key in ("primary_finish_reason", "repair_finish_reason")
+            ):
+                return safe
+        current = current.__cause__
+    return None
 
 
 @dataclass
@@ -2281,6 +2388,10 @@ def _checkpoint_step_name(
     *,
     review_count: int,
 ) -> str:
+    if isinstance(checkpoint, ReviewGenerationRejectedCheckpointV9):
+        return f"review_rejected_{checkpoint.sequence}"
+    if isinstance(checkpoint, StateGenerationRejectedCheckpointV8):
+        return f"state_rejected_{checkpoint.cycle}"
     if isinstance(checkpoint, AdherenceNotReviewedCheckpointV6):
         return "review_not_requested"
     if isinstance(checkpoint, ProseCandidateCheckpointV1):
@@ -3664,11 +3775,22 @@ def _replay_repair_policy(
         raise ValueError("tail Judge/schema retry usage is invalid")
     policy = ChapterRepairPolicy(limits)
     attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
+    retried_review_ids = review_retry_attempt_ids(checkpoints)
     phase: Literal["start", "prose", "adherence", "state"] = "start"
     latest_adherence: AdherenceCandidateCheckpoint | None = None
     pending: RepairChargeV1 | None = None
     try:
         for checkpoint in checkpoints:
+            retried_review = bool(set(checkpoint.attempt_ids) & retried_review_ids)
+            if retried_review:
+                for attempt_id in checkpoint.attempt_ids:
+                    attempt = attempts_by_id.get(attempt_id)
+                    if attempt is not None and attempt.state in _CHARGED_ATTEMPT_STATES:
+                        policy.authorize(RepairComponent.ADHERENCE_JUDGE_RETRY)
+            if isinstance(checkpoint, ReviewGenerationRejectedCheckpointV9):
+                if checkpoint.cycle > 0 and not retried_review:
+                    _replay_judge_or_schema_retries(policy, checkpoint, attempts_by_id)
+                continue
             if isinstance(checkpoint, ProseCandidateCheckpointV1):
                 if checkpoint.origin == "repair":
                     component = _content_repair_component(
@@ -3704,7 +3826,7 @@ def _replay_repair_policy(
                     AdherenceNotReviewedCheckpointV6,
                 ),
             ):
-                if checkpoint.cycle > 0:
+                if checkpoint.cycle > 0 and not retried_review:
                     _replay_judge_or_schema_retries(
                         policy,
                         checkpoint,
@@ -4689,6 +4811,8 @@ class ChapterCandidatePipeline:
             raise
         except (TokenBudgetExceeded, AttemptCapacityExceeded):
             raise
+        except _RecordedGenerationRejected:
+            raise
         except Exception as exc:
             try:
                 trace.record_failure(exc)
@@ -4824,12 +4948,53 @@ class ChapterCandidatePipeline:
                 _sync_repair_policy(trace, repair_policy)
                 continue
 
+            rejected_review = (
+                checkpoint_ledger[-1] if checkpoint_ledger
+                and isinstance(checkpoint_ledger[-1], ReviewGenerationRejectedCheckpointV9)
+                else None
+            )
+            review_retry = rejected_review is not None and pending_review is None
             if pending_review is None:
-                reviewed = await self._deps.review_prose_candidate(
-                    novel_id,
-                    chapter,
-                    source,
-                )
+                if review_retry:
+                    component = RepairComponent.ADHERENCE_JUDGE_RETRY
+                    used, limit = repair_policy.used(component), repair_policy.limits.limit_for(component)
+                    if used >= limit:
+                        raise _repair_budget_blocked(RepairBudgetExhausted(component=component, used=used, limit=limit), trace=trace, policy=repair_policy, gate="outline_adherence")
+                try:
+                    reviewed = await self._deps.review_prose_candidate(novel_id, chapter, source)
+                except Exception as exc:
+                    diagnostics = _state_rejection_diagnostics(exc, code="review_evidence_invalid")
+                    raw_attempts = getattr(exc, "attempts", ())
+                    if (
+                        diagnostics is None or not isinstance(raw_attempts, (tuple, list))
+                        or not 2 <= len(raw_attempts) <= 3
+                        or any(not isinstance(a, Mapping) or a.get("state") != "accounted" for a in raw_attempts)
+                        or tuple(a.get("phase") for a in raw_attempts) not in {("primary", "repair"), ("primary", "schema_fallback", "repair")}
+                    ):
+                        raise
+                    attempt_start = len(trace.attempts)
+                    trace.record_failure(exc)
+                    attempts = tuple(trace.attempts[attempt_start:])
+                    checkpoint = review_generation_rejection_checkpoint(
+                        chapter_id=chapter_id, sequence=len(checkpoint_ledger) + 1,
+                        source=source, attempt_ids=tuple(a.attempt_id for a in attempts),
+                        cycle=trace.repair_cycles_used,
+                        retry_index=rejected_review.retry_index + 1 if review_retry else 0,
+                        diagnostics=diagnostics,
+                    )
+                    try:
+                        await self._persist_checkpoint(checkpoint, ledger=checkpoint_ledger)
+                    except Exception as persistence_error:
+                        raise _RecordedGenerationRejected(trace.snapshot()) from persistence_error
+                    trace.completed_steps.append(f"review_rejected_{checkpoint.sequence}")
+                    if review_retry:
+                        for attempt in attempts:
+                            if attempt.state in _CHARGED_ATTEMPT_STATES:
+                                _authorize_repair_component(repair_policy, RepairComponent.ADHERENCE_JUDGE_RETRY, trace=trace, gate="outline_adherence")
+                    elif trace.repair_cycles_used > 0:
+                        _charge_judge_or_schema_retries(repair_policy, _RecordedStepEvidence(attempt_ids=checkpoint.attempt_ids, truncation=checkpoint.truncation), trace=trace, gate="outline_adherence")
+                    _sync_repair_policy(trace, repair_policy)
+                    raise _RecordedGenerationRejected(trace.snapshot()) from exc
                 review_count += 1
                 review_evidence = trace.record(
                     "review_not_requested" if isinstance(reviewed.value, Mapping)
@@ -4883,7 +5048,13 @@ class ChapterCandidatePipeline:
                     adherence=adherence,
                     review_authorization=self._deps.review_authorization,
                 ), ledger=checkpoint_ledger)
-                if trace.repair_cycles_used > 0:
+                if review_retry:
+                    review_ids = set(review_evidence.attempt_ids)
+                    for attempt in trace.attempts:
+                        if attempt.attempt_id in review_ids and attempt.state in _CHARGED_ATTEMPT_STATES:
+                            _authorize_repair_component(repair_policy, RepairComponent.ADHERENCE_JUDGE_RETRY, trace=trace, gate="outline_adherence")
+                    _sync_repair_policy(trace, repair_policy)
+                elif trace.repair_cycles_used > 0:
                     _charge_judge_or_schema_retries(
                         repair_policy,
                         review_evidence,
@@ -5064,21 +5235,80 @@ class ChapterCandidatePipeline:
             state_result = resume.state
             state_checkpoint_context = None
         else:
+            rejected = (
+                checkpoint_ledger[-1]
+                if checkpoint_ledger and isinstance(
+                    checkpoint_ledger[-1], StateGenerationRejectedCheckpointV8,
+                ) else None
+            )
+            state_cycle = 0
             state_request_id = _initial_state_request_id(
                 chapter_id=chapter_id,
                 source=source,
             )
-            state_result = await self._deps.generate_state_candidate(
-                novel_id,
-                chapter,
-                source,
-                request_id=state_request_id,
+            if rejected is not None:
+                charge = _authorize_repair_component(
+                    repair_policy, RepairComponent.STATE_REEXTRACTION,
+                    trace=trace, gate="state",
+                )
+                state_cycle = _next_repair_cycle(
+                    trace.repair_cycles_used, repair_limit, gate="state",
+                    repair_failure=_repair_failure_for_charge(charge),
+                )
+                _sync_repair_policy(trace, repair_policy)
+                state_request_id = rejected_state_retry_request_id(rejected, cycle=state_cycle)
+            try:
+                state_result = await self._deps.generate_state_candidate(
+                    novel_id, chapter, source, request_id=state_request_id,
+                    **({"reextraction_cycle": state_cycle} if state_cycle else {}),
+                )
+            except Exception as exc:
+                diagnostics = _state_rejection_diagnostics(exc)
+                raw_attempts = getattr(exc, "attempts", ())
+                if (
+                    diagnostics is None
+                    or not isinstance(raw_attempts, (tuple, list))
+                    or not 2 <= len(raw_attempts) <= 4
+                    or any(
+                        not isinstance(item, Mapping)
+                        or item.get("state") != "accounted"
+                        for item in raw_attempts
+                    )
+                    or tuple(item.get("phase") for item in raw_attempts) not in {
+                        ("primary", "repair"),
+                        ("primary", "schema_fallback", "repair"),
+                    }
+                ):
+                    raise
+                attempt_start = len(trace.attempts)
+                trace.record_failure(exc)
+                attempts = tuple(trace.attempts[attempt_start:])
+                checkpoint = state_generation_rejection_checkpoint(
+                    chapter_id=chapter_id, sequence=len(checkpoint_ledger) + 1,
+                    source=source, attempt_ids=tuple(a.attempt_id for a in attempts),
+                    cycle=state_cycle, request_id=state_request_id, diagnostics=diagnostics,
+                )
+                try:
+                    await self._persist_checkpoint(checkpoint, ledger=checkpoint_ledger)
+                except Exception as persistence_error:
+                    raise _RecordedGenerationRejected(trace.snapshot()) from persistence_error
+                trace.completed_steps.append(f"state_rejected_{state_cycle}")
+                if state_cycle:
+                    trace.repair_cycles_used = state_cycle
+                    _charge_judge_or_schema_retries(
+                        repair_policy,
+                        _RecordedStepEvidence(attempt_ids=checkpoint.attempt_ids, truncation=checkpoint.truncation),
+                        trace=trace, gate="state",
+                    )
+                _sync_repair_policy(trace, repair_policy)
+                raise _RecordedGenerationRejected(trace.snapshot()) from exc
+            state_evidence = trace.record(
+                "state" if state_cycle == 0 else f"state_repair_{state_cycle}", state_result,
             )
-            state_evidence = trace.record("state", state_result)
             state_checkpoint_context = (
                 state_evidence,
-                "initial",
-                0,
+                "initial" if state_cycle == 0 else "repair",
+                state_cycle,
                 state_request_id,
             )
         while True:
@@ -5129,6 +5359,12 @@ class ChapterCandidatePipeline:
                     ),
                     fact_accounting=fact_accounting,
                 ), ledger=checkpoint_ledger)
+                if state_origin == "repair":
+                    trace.repair_cycles_used = state_cycle
+                    _charge_judge_or_schema_retries(
+                        repair_policy, state_evidence, trace=trace, gate="state",
+                    )
+                    _sync_repair_policy(trace, repair_policy)
             state_checkpoint_context = None
             if (
                 not consistency_issues

@@ -120,6 +120,18 @@ def _chapter_outline_contract_digest(outline: Mapping[str, Any]) -> str:
 class ChapterFinalizationDenied(ValueError):
     """候选、闸门或批量作业授权不允许正式提交。"""
 
+    # Formalization is a local operation. Preserve its zero-call evidence when
+    # the candidate pipeline collects a rejected finalization dependency.
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    attempts: tuple[dict[str, Any], ...] = ()
+    diagnostic_category = "validation_logic"
+    diagnostic_code = "validation_rejected"
+    diagnostic_evidence = "confirmed"
+
+    def __init__(self, message: str, *, failure_fact: ChapterCompletionFailureFact | None = None):
+        super().__init__(message)
+        self.failure_fact = failure_fact
+
 
 class _CompletionGateDenied(ChapterFinalizationDenied):
     def __init__(
@@ -1493,6 +1505,7 @@ class ChapterFinalizationService:
                         proposal_id=state_proposal_id,
                         acceptance_token=state_acceptance_token,
                         policy=FactAccountingPolicy(),
+                        candidate_job_id=authorization.job_id,
                     )
                 )
             else:
@@ -1608,7 +1621,7 @@ class ChapterFinalizationService:
                 state_proposal_id=state_proposal_id,
                 proposal_claim=proposal_claim,
             )
-            raise ChapterFinalizationDenied(str(exc)) from exc
+            raise failure from exc
         if state_command.novel_id != novel_id:
             failure = _CompletionGateDenied(
                 "正文候选与状态候选不属于同一小说",

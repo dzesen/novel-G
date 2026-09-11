@@ -62,7 +62,6 @@ export default function SceneIllustrationPanel({
     useState<IllustrationPromptResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [translating, setTranslating] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const {
     job,
@@ -217,16 +216,6 @@ export default function SceneIllustrationPanel({
     }
     return Array.from(byId.values());
   }, [job?.asset, state?.assets]);
-  const canSubmit =
-    Boolean(prompt) &&
-    selectedCharacters.length > 0 &&
-    selectedUnanchored.length === 0 &&
-    Boolean(referenceCharacter) &&
-    Boolean(provider?.available) &&
-    templateSupportsReference &&
-    !submitting &&
-    !activeJob;
-
   const formatDuration = (seconds: number): string => {
     const rounded = Math.max(0, Math.round(seconds));
     if (rounded < 60) return t("durationSeconds", { count: rounded });
@@ -285,28 +274,6 @@ export default function SceneIllustrationPanel({
       );
     } finally {
       setTranslating(false);
-    }
-  };
-
-  const submit = async () => {
-    if (!prompt || !canSubmit || !referenceCharacter) return;
-    setSubmitting(true);
-    setError(null);
-    try {
-      const next = await apiPost<SceneIllustrationJob>(jobBase, {
-        prompt,
-        scene_character_card_ids: selectedCharacters.map(
-          (character) => character.card_id,
-        ),
-        reference_character_card_id: referenceCharacter.card_id,
-      });
-      adoptJob(next);
-    } catch (reason) {
-      setError(
-        reason instanceof Error ? reason.message : t("submitFailed"),
-      );
-    } finally {
-      setSubmitting(false);
     }
   };
 
@@ -739,12 +706,8 @@ export default function SceneIllustrationPanel({
                 legacyAssets={assets}
               />
 
-              <div className="mt-6 rounded-lg border border-dashed border-border bg-surface-secondary/30 p-3">
-                <p className="text-sm font-semibold text-foreground">{t("legacyModeTitle")}</p>
-                <p className="mt-1 text-xs leading-5 text-muted">{t("legacyModeDescription")}</p>
-              </div>
-
-              <ImageJobStatusPanel                job={job}
+              {(job || cleanupJob) && <ImageJobStatusPanel
+                job={job}
                 cleanupJob={cleanupJob}
                 pollError={pollError}
                 cleanupPollError={cleanupPollError}
@@ -778,19 +741,10 @@ export default function SceneIllustrationPanel({
                   cancel: t("cancel"),
                   cancelling: t("cancelling"),
                 }}
-                primaryAction={(
-                  <Button
-                    variant="primary"
-                    className="bg-accent text-white hover:bg-accent-hover"
-                    isDisabled={!canSubmit}
-                    onPress={() => void submit()}
-                  >
-                    {submitting ? t("submitting") : t("generate")}
-                  </Button>
-                )}
+                primaryAction={null}
                 onCancel={() => void cancel()}
                 onRetryCleanup={() => void retryCleanup()}
-              />
+              />}
 
               <section
                 aria-labelledby="scene-illustration-history-title"

@@ -25,6 +25,7 @@ export function useRoster(novelId: string | null) {
   const t = useTranslations("writing.outline");
   const [characters, setCharacters] = useState<RosterEntry[]>([]);
   const [worldbook, setWorldbook] = useState<RosterEntry[]>([]);
+  const [factions, setFactions] = useState<RosterEntry[]>([]);
   const [threads, setThreads] = useState<RosterEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -34,11 +35,12 @@ export function useRoster(novelId: string | null) {
     setLoading(true);
     setError("");
     try {
-      // 六个请求彼此独立，必须一并发出：把伏笔那条单独 await 会白白多一个往返，
+      // 目录请求彼此独立，一并发出，避免多次往返。
       // 面板每次打开都慢一拍。
-      const [characterRes, threadRes, ...worldbookRes] = await Promise.all([
+      const [characterRes, threadRes, factionRes, ...worldbookRes] = await Promise.all([
         apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/character`),
         apiGet<{ data: PlotThread[] }>(`/api/plot-threads/novel/${novelId}`),
+        apiGet<{ data: Array<{ _id: string; name: string; core_goal?: string }> }>(`/api/factions/novel/${novelId}`),
         ...WORLDBOOK_TYPES.map((type) =>
           apiGet<{ data: ReferenceCard[] }>(`/api/reference-cards/novel/${novelId}/${type}`)
         ),
@@ -51,6 +53,9 @@ export function useRoster(novelId: string | null) {
           hint: card.subtitle || card.description.slice(0, 40),
         }))
       );
+      setFactions(factionRes.data.map((card) => ({
+        id: card._id, name: card.name, hint: (card.core_goal || "").slice(0, 40),
+      })));
       setWorldbook(
         worldbookRes.flatMap((res, index) =>
           res.data.map((card) => ({
@@ -89,11 +94,11 @@ export function useRoster(novelId: string | null) {
 
   const nameById = useMemo(() => {
     const map: Record<string, string> = {};
-    for (const entry of [...characters, ...worldbook, ...threads]) {
+    for (const entry of [...characters, ...worldbook, ...factions, ...threads]) {
       map[entry.id] = entry.name;
     }
     return map;
-  }, [characters, worldbook, threads]);
+  }, [characters, worldbook, factions, threads]);
 
-  return { characters, worldbook, threads, nameById, loading, error, reload: load };
+  return { characters, worldbook, factions, threads, nameById, loading, error, reload: load };
 }

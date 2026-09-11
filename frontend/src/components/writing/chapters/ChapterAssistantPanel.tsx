@@ -1,6 +1,7 @@
 "use client";
 
 import { useTranslations } from "next-intl";
+import { SCENE_ILLUSTRATION_ENABLED } from "@/lib/featureFlags";
 import { Button } from "@/components/ui/Button";
 
 interface ChapterAssistantPanelProps {
@@ -97,13 +98,15 @@ export default function ChapterAssistantPanel({
         disabledReason={hasChapter ? tProse("needOutline") : undefined}
         primary={canGenerateProse}
       />
-      <AssistantAction
-        title={tSceneIllustration("openButton")}
-        description={tw("assistantIllustrationDescription")}
-        onClick={onOpenSceneIllustration}
-        disabled={!hasChapter || !canGenerateSceneIllustration}
-        disabledReason={hasChapter ? tSceneIllustration("needOutline") : undefined}
-      />
+      {SCENE_ILLUSTRATION_ENABLED && (
+        <AssistantAction
+          title={tSceneIllustration("openButton")}
+          description={tw("assistantIllustrationDescription")}
+          onClick={onOpenSceneIllustration}
+          disabled={!hasChapter || !canGenerateSceneIllustration}
+          disabledReason={hasChapter ? tSceneIllustration("needOutline") : undefined}
+        />
+      )}
       <AssistantAction
         title={tStateBackfill("openButton")}
         description={tw("assistantStateDescription")}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List
 
 import pymongo.errors
@@ -25,7 +26,7 @@ class FactionRepository(BaseRepository):
         novel_id: str | ObjectId,
         session: AsyncClientSession | None = None,
     ) -> str:
-        """查询该小说下当前最大 active faction_id，返回下一个可用值。
+        """查询该小说下历史最大 faction_id，返回下一个可用值。
 
         Args:
             novel_id: 小说 ObjectId 或可转换字符串。
@@ -35,21 +36,14 @@ class FactionRepository(BaseRepository):
             下一个可用业务阵营 ID，格式为 fac_000001。
         """
         obj_id = novel_id if isinstance(novel_id, ObjectId) else to_object_id(novel_id)
-        cursor = self.collection.find(
-            {"novel_id": obj_id, "is_deleted": False},
-            projection={"faction_id": 1},
-            session=session,
-        ).sort("faction_id", -1).limit(1)
-        docs = await cursor.to_list(length=1)
-        if docs and docs[0].get("faction_id"):
-            # 仅解析标准 fac_000001 形式，非标准 ID 不阻塞后续自动编号。
-            current_id = docs[0]["faction_id"]
-            try:
-                num = int(current_id.split("_")[1])
-                return f"fac_{num + 1:06d}"
-            except (IndexError, ValueError):
-                pass
-        return "fac_000001"
+        docs = await self.collection.find(
+            {"novel_id": obj_id}, projection={"faction_id": 1}, session=session,
+        ).to_list(length=None)
+        # Deleted identities still own their business number; compare numerically.
+        numbers = [int(match.group(1)) for row in docs
+                   if (match := re.fullmatch(r"fac_([0-9]+)", str(row.get("faction_id") or "")))]
+        return f"fac_{max(numbers, default=0) + 1:06d}"
+
 
     async def create_faction(
         self,
@@ -75,6 +69,11 @@ class FactionRepository(BaseRepository):
         prepared = dict(data)
         prepared["novel_id"] = to_object_id(prepared["novel_id"])
 
+        if await self.exists(
+            {"novel_id": prepared["novel_id"], "faction_id": prepared["faction_id"]},
+            include_deleted=True, session=session,
+        ):
+            raise DuplicateKeyError("该 faction_id 已属于现有或已删除阵营，不能复用")
         prepared.setdefault("alias", [])
         prepared.setdefault("faction_type", "")
         prepared.setdefault("level_type", "core")
@@ -159,7 +158,7 @@ class FactionRepository(BaseRepository):
         faction_id: str,
         session: AsyncClientSession | None = None,
     ) -> Dict[str, Any]:
-        """获取指定小说下最近一次软删除的阵营。
+        """获取指定小说下身份唯一的软删除阵营。
 
         Args:
             novel_id: 小说 ObjectId 字符串。
@@ -173,10 +172,12 @@ class FactionRepository(BaseRepository):
         cursor = self.collection.find(
             {"novel_id": obj_id, "faction_id": faction_id, "is_deleted": True},
             session=session,
-        ).sort("updated_at", -1).limit(1)
-        docs = await cursor.to_list(length=1)
+        ).sort("updated_at", -1).limit(2)
+        docs = await cursor.to_list(length=2)
         if not docs:
             raise NotFoundError(f"Deleted faction with faction_id '{faction_id}' not found in novel {novel_id}")
+        if len(docs) != 1:
+            raise ValueError("历史阵营编号存在重复，无法唯一识别要恢复或删除的正式身份")
         return docs[0]
 
     async def get_deleted_factions_by_level_type(

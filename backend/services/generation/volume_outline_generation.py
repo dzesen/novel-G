@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from backend.llm.schemas.novel_pydantic import VolumeOutlineResultSchema
 from backend.novel_scale import InvalidNovelScale, invalid_novel_scale_fields
 from backend.services.llm.workflow_runner import WorkflowStep
+from backend.services.llm.faction_context import fetch_faction_material, faction_catalog
 from backend.services.generation.author_brief import novel_author_brief, render_author_brief_record
 
 
@@ -55,11 +56,24 @@ def volume_outline_params(novel: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+async def load_volume_outline_params(novel: Mapping[str, Any]) -> dict[str, Any]:
+    """Freeze the same bounded faction directory for readiness and execution."""
+    params = volume_outline_params(novel)
+    if novel.get("_id") is not None:
+        catalog, _, _ = faction_catalog(await fetch_faction_material(str(novel["_id"])))
+        if catalog:
+            params["faction_catalog"] = catalog
+    return params
+
+
 VOLUME_OUTLINE_STEPS: tuple[WorkflowStep, ...] = (
     WorkflowStep(
         key=VOLUME_OUTLINE_STEP,
         schema=VolumeOutlineResultSchema,
-        prompt_context=lambda ctx: render_author_brief_record(ctx.params.get("author_brief")),
+        prompt_context=lambda ctx: "\n\n".join(filter(None, (
+            render_author_brief_record(ctx.params.get("author_brief")),
+            ctx.params.get("faction_catalog", ""),
+        ))),
         prompt_args=lambda ctx: {
             "number_of_chapters": ctx.params["number_of_chapters"],
             "title": ctx.params["title"],

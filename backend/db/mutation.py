@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 from backend.db import collections
+from backend.db.maintenance import database_operation
 from backend.db.mongo import get_database
 from backend.db.narrative_revision import (
     NarrativeRevisionConflict,
@@ -250,6 +251,7 @@ class MutationEngine:
         self._recovery_policy = recovery_policy or RecoveryPolicy()
         self._now = now
 
+    @database_operation(write=True)
     async def execute(self, command: MutationCommand) -> Any:
         spec = self._handlers.get((command.operation, command.version))
         if spec is None:

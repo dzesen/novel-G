@@ -589,6 +589,79 @@ class StateCandidateCheckpointV3(_CandidatePipelineCheckpointV3):
         return self
 
 
+class StateGenerationRejectedCheckpointV8(_CandidatePipelineCheckpointV1):
+    """Settled state calls whose structured output was explicitly rejected.
+
+    This is failure evidence, never a state proposal or a passed state gate.
+    A later extraction consumes the existing state-reextraction allowance.
+    """
+
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v8"]
+    kind: Literal["state_generation_rejected"] = "state_generation_rejected"
+    origin: Literal["initial", "repair"]
+    request_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    failure_code: Literal["structured_output_invalid"] = "structured_output_invalid"
+    diagnostic_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    failure_event_id: str | None = Field(default=None, min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def validate_rejection(self) -> "StateGenerationRejectedCheckpointV8":
+        if (self.origin == "initial") != (self.cycle == 0):
+            raise ValueError("state rejection origin and cycle diverged")
+        if not 2 <= len(self.attempt_ids) <= 4:
+            raise ValueError("state rejection requires a bounded settled call group")
+        if self.failure_event_id is not None and not is_safe_candidate_identifier(
+            self.failure_event_id, maximum=240,
+        ):
+            raise ValueError("state rejection diagnostic identity is invalid")
+        if self.truncation.truncated_section_count or self.truncation.dropped_item_count:
+            raise ValueError("state rejection cannot claim a result projection")
+        return self
+
+
+class ReviewGenerationRejectedCheckpointV9(_CandidatePipelineCheckpointV1):
+    """Positive rejection evidence, never a semantic review result.
+
+    Retry calls consume the frozen Judge/schema component, including their
+    primary request. The source and content-repair cycle remain unchanged.
+    """
+
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v9"]
+    kind: Literal["review_generation_rejected"] = "review_generation_rejected"
+    origin: Literal["initial", "repair"]
+    retry_index: int = Field(ge=0, le=MAX_CHAPTER_CANDIDATE_PIPELINE_CHECKPOINTS)
+    failure_code: Literal["review_evidence_invalid"] = "review_evidence_invalid"
+    diagnostic_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    failure_event_id: str | None = Field(default=None, min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def validate_rejection(self) -> "ReviewGenerationRejectedCheckpointV9":
+        if (self.origin == "initial") != (self.cycle == 0):
+            raise ValueError("review rejection origin and content cycle diverged")
+        if not 2 <= len(self.attempt_ids) <= 3:
+            raise ValueError("review rejection requires a bounded settled call group")
+        if self.failure_event_id is not None and not is_safe_candidate_identifier(self.failure_event_id, maximum=240):
+            raise ValueError("review rejection diagnostic identity is invalid")
+        if self.truncation.truncated_section_count or self.truncation.dropped_item_count:
+            raise ValueError("review rejection cannot claim a result projection")
+        return self
+
+
+class ReviewGenerationTruncatedCheckpointV10(ReviewGenerationRejectedCheckpointV9):
+    """Settled length termination receipt; contains no valid review result."""
+
+    schema_version: Literal["chapter_candidate_pipeline_checkpoint.v10"]
+    kind: Literal["review_generation_truncated"] = "review_generation_truncated"
+    primary_finish_reason: Literal["stop", "length"]
+    repair_finish_reason: Literal["stop", "length"]
+
+    @model_validator(mode="after")
+    def validate_length_termination(self) -> "ReviewGenerationTruncatedCheckpointV10":
+        if "length" not in (self.primary_finish_reason, self.repair_finish_reason):
+            raise ValueError("truncated review requires explicit length termination")
+        return self
+
+
 AdherenceCandidateCheckpoint = (
     AdherenceCandidateCheckpointV1
     | AdherenceCandidateCheckpointV3
@@ -610,7 +683,27 @@ CandidatePipelineCheckpointV1 = (
     | AdherenceAdvisoryCheckpointV7
     | StateCandidateCheckpointV1
     | StateCandidateCheckpointV3
+    | StateGenerationRejectedCheckpointV8
+    | ReviewGenerationRejectedCheckpointV9
+    | ReviewGenerationTruncatedCheckpointV10
 )
+
+
+def review_retry_attempt_ids(checkpoints: Sequence[CandidatePipelineCheckpointV1]) -> frozenset[str]:
+    """Identify every paid call after an explicit review rejection.
+
+    The original primary/correction belongs to the base generation budget;
+    subsequent primary and correction calls both consume Judge/schema retries.
+    """
+    result: set[str] = set()
+    previous: CandidatePipelineCheckpointV1 | None = None
+    for checkpoint in checkpoints:
+        if isinstance(previous, ReviewGenerationRejectedCheckpointV9) and isinstance(
+            checkpoint, (*get_args(AdherenceCandidateCheckpoint), ReviewGenerationRejectedCheckpointV9),
+        ) and checkpoint.source == previous.source:
+            result.update(checkpoint.attempt_ids)
+        previous = checkpoint
+    return frozenset(result)
 
 
 @dataclass(frozen=True)
@@ -641,6 +734,7 @@ class CandidatePipelineReplayV1:
     truncation_count: int
     completed_steps: tuple[str, ...]
     truncations: tuple[tuple[str, int, int], ...]
+    latest_state_rejection: StateGenerationRejectedCheckpointV8 | None = None
 
 
 def candidate_checkpoint_completion_passed(
@@ -752,6 +846,7 @@ def replay_candidate_pipeline_checkpoints(
     previous_prose: ProseCandidateCheckpointV1 | None = None
     latest_adherence: AdherenceCandidateCheckpoint | None = None
     latest_state: StateCandidateCheckpoint | None = None
+    latest_state_rejection: StateGenerationRejectedCheckpointV8 | None = None
     phase: Literal["start", "prose", "adherence", "state"] = "start"
     repair_cycles_used = 0
     review_count = 0
@@ -875,6 +970,7 @@ def replay_candidate_pipeline_checkpoints(
             current_prose = checkpoint
             latest_adherence = None
             latest_state = None
+            latest_state_rejection = None
             phase = "prose"
             record_step(
                 "prose"
@@ -882,6 +978,21 @@ def replay_candidate_pipeline_checkpoints(
                 else f"prose_repair_{checkpoint.cycle}",
                 checkpoint,
             )
+            accepted_checkpoints = sequence
+            continue
+
+        if isinstance(checkpoint, ReviewGenerationRejectedCheckpointV9):
+            previous = checkpoints[sequence - 2] if sequence > 1 else None
+            expected_retry = previous.retry_index + 1 if isinstance(previous, ReviewGenerationRejectedCheckpointV9) else 0
+            if (
+                phase != "prose" or current_prose is None
+                or not candidate_checkpoint_completion_passed(current_prose)
+                or checkpoint.source != current_prose.source
+                or checkpoint.cycle != current_prose.cycle
+                or checkpoint.retry_index != expected_retry
+            ):
+                raise diverged("审查拒绝检查点缺少同源完整正文或重试顺序无效")
+            record_step(f"review_rejected_{checkpoint.sequence}", checkpoint)
             accepted_checkpoints = sequence
             continue
 
@@ -923,9 +1034,37 @@ def replay_candidate_pipeline_checkpoints(
             raise diverged("候选管线恢复状态正文身份无效")
         if checkpoint.request_id in seen_state_request_ids:
             raise diverged("候选管线恢复状态修复身份重复")
+        if isinstance(checkpoint, StateGenerationRejectedCheckpointV8):
+            if (
+                phase != "adherence"
+                or latest_adherence is None
+                or not candidate_checkpoint_review_requirement_satisfied(
+                    latest_adherence, expected_scene_count=expected_scene_count,
+                )
+                or (checkpoint.origin == "initial" and latest_state_rejection is not None)
+                or (
+                    checkpoint.origin == "repair"
+                    and (
+                        latest_state_rejection is None
+                        or checkpoint.cycle != repair_cycles_used + 1
+                    )
+                )
+            ):
+                raise diverged("状态格式失败检查点缺少有效前置步骤")
+            if checkpoint.origin == "repair":
+                repair_cycles_used = checkpoint.cycle
+                if repair_cycles_used > max_repair_cycles:
+                    raise diverged()
+            seen_state_request_ids.add(checkpoint.request_id)
+            latest_state_rejection = checkpoint
+            latest_state = None
+            record_step(f"state_rejected_{checkpoint.cycle}", checkpoint)
+            accepted_checkpoints = sequence
+            continue
         if checkpoint.origin == "initial":
             if (
                 phase != "adherence"
+                or latest_state_rejection is not None
                 or latest_adherence is None
                 or checkpoint.proposal_id in seen_state_proposal_ids
                 or not candidate_checkpoint_review_requirement_satisfied(
@@ -935,13 +1074,13 @@ def replay_candidate_pipeline_checkpoints(
             ):
                 raise diverged("候选管线恢复状态前置步骤无效")
         elif (
-            phase != "state"
-            or latest_state is None
+            (phase != "state" and not (phase == "adherence" and latest_state_rejection is not None))
+            or (latest_state is None and latest_state_rejection is None)
             or (
-                candidate_checkpoint_state_passed(latest_state)
+                latest_state is not None and candidate_checkpoint_state_passed(latest_state)
             )
             or checkpoint.cycle != repair_cycles_used + 1
-            or checkpoint.proposal_id == latest_state.proposal_id
+            or (latest_state is not None and checkpoint.proposal_id == latest_state.proposal_id)
         ):
             raise diverged(
                 message=(
@@ -976,6 +1115,7 @@ def replay_candidate_pipeline_checkpoints(
         seen_state_request_ids.add(checkpoint.request_id)
         seen_state_proposal_ids.add(checkpoint.proposal_id)
         latest_state = checkpoint
+        latest_state_rejection = None
         phase = "state"
         record_step(
             "state"
@@ -1018,6 +1158,7 @@ def replay_candidate_pipeline_checkpoints(
         truncation_count=truncation_count,
         completed_steps=tuple(completed_steps),
         truncations=tuple(truncations),
+        latest_state_rejection=latest_state_rejection,
     )
 
 
@@ -1083,8 +1224,20 @@ def parse_candidate_pipeline_checkpoint(
         "chapter_candidate_pipeline_checkpoint.v5",
         "chapter_candidate_pipeline_checkpoint.v6",
         "chapter_candidate_pipeline_checkpoint.v7",
+        "chapter_candidate_pipeline_checkpoint.v8",
+        "chapter_candidate_pipeline_checkpoint.v9",
+        "chapter_candidate_pipeline_checkpoint.v10",
     }:
         raise ValueError("candidate checkpoint schema_version is invalid")
+    if checkpoint_version == "chapter_candidate_pipeline_checkpoint.v10" and value.get("kind") != "review_generation_truncated":
+        raise ValueError("candidate checkpoint v10 kind is invalid")
+    if checkpoint_version == "chapter_candidate_pipeline_checkpoint.v9" and value.get("kind") != "review_generation_rejected":
+        raise ValueError("candidate checkpoint v9 kind is invalid")
+    if (
+        checkpoint_version == "chapter_candidate_pipeline_checkpoint.v8"
+        and value.get("kind") != "state_generation_rejected"
+    ):
+        raise ValueError("candidate checkpoint v8 kind is invalid")
     if (
         checkpoint_version == "chapter_candidate_pipeline_checkpoint.v3"
         and value.get("kind") not in {"outline_adherence", "state_candidate"}

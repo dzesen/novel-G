@@ -1,15 +1,14 @@
+import { hasLocale } from "next-intl";
 import { getRequestConfig } from "next-intl/server";
-import { routing } from "./routing";
+import { routing, type AppLocale } from "./routing";
+
+const messageLoaders = {
+  zh: () => import("./messages/zh.json"),
+  en: () => import("./messages/en.json"),
+} satisfies Record<AppLocale, () => Promise<{ default: unknown }>>;
 
 export default getRequestConfig(async ({ requestLocale }) => {
-  let locale = await requestLocale;
-
-  if (!locale || !routing.locales.includes(locale as "zh" | "en")) {
-    locale = routing.defaultLocale;
-  }
-
-  return {
-    locale,
-    messages: (await import(`./messages/${locale}.json`)).default,
-  };
+  const requested = await requestLocale;
+  const locale = hasLocale(routing.locales, requested) ? requested : routing.defaultLocale;
+  return { locale, messages: (await messageLoaders[locale]()).default };
 });

@@ -95,6 +95,7 @@ export default function CharacterPortraitPanel({
   const [detaching, setDetaching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [imageFailed, setImageFailed] = useState(false);
+  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const { job, pollError, cancelling, adoptJob, cancel } =
     useCharacterPortraitJob({ novelId, cardId });
   const {
@@ -119,7 +120,7 @@ export default function CharacterPortraitPanel({
           await loadCharacterPortraitInitialData(portraitPath);
         if (!active) return;
         setState(initialData.state);
-        adoptJob(initialData.state.active_job);
+        adoptJob(initialData.state.active_job ?? initialData.state.latest_append_job ?? null);
         adoptCleanupJob(
           initialData.state.cleanup_job?.job_id ===
             initialData.state.active_job?.job_id
@@ -150,7 +151,7 @@ export default function CharacterPortraitPanel({
 
   useEffect(() => {
     setImageFailed(false);
-  }, [job?.asset?.asset_id, state?.asset?.asset_id]);
+  }, [job?.asset?.asset_id, state?.asset?.asset_id, selectedAssetId]);
 
   const terminalJobId = job?.terminal ? job.job_id : null;
   useEffect(() => {
@@ -172,13 +173,18 @@ export default function CharacterPortraitPanel({
   }, [portraitPath, terminalJobId]);
 
   const completedAnchor =
-    job?.status === "succeeded" ? job.anchor : null;
+    job?.status === "succeeded" && !job.preserve_anchor ? job.anchor : null;
   const completedAsset =
     job?.status === "succeeded" ? job.asset : null;
   const anchor: AppearanceAnchor | null =
     completedAnchor ?? state?.anchor ?? null;
+  const historyAssets = useMemo(() => {
+    const images = [completedAsset, ...(state?.assets ?? []), state?.asset];
+    return Array.from(new Map(images.filter((item): item is CharacterPortraitAsset => Boolean(item))
+      .map((item) => [item.asset_id, item])).values());
+  }, [completedAsset, state?.assets, state?.asset]);
   const asset: CharacterPortraitAsset | null =
-    completedAsset ?? state?.asset ?? null;
+    historyAssets.find((item) => item.asset_id === selectedAssetId) ?? completedAsset ?? state?.asset ?? null;
   const anchorEstablishedAt = useMemo(() => {
     if (!anchor) return "";
     const parsed = new Date(anchor.established_at);
@@ -188,7 +194,9 @@ export default function CharacterPortraitPanel({
       timeStyle: "short",
     }).format(parsed);
   }, [anchor, locale]);
-  const provider = job?.provider ?? state?.provider ?? null;
+  const provider = job && !job.terminal
+    ? job.provider ?? state?.provider ?? null
+    : state?.provider ?? job?.provider ?? null;
   const warnings = useMemo(
     () =>
       Array.from(
@@ -261,9 +269,10 @@ export default function CharacterPortraitPanel({
     }
   };
 
-  const submit = async () => {
+  const submit = async (preserveAnchor = false) => {
     if (!prompt || submitting || activeJob || hasUnsavedChanges) return;
-    const resetting = Boolean(anchor);
+    if (preserveAnchor && !anchor) return;
+    const resetting = Boolean(anchor) && !preserveAnchor;
     if (
       resetting &&
       !window.confirm(t("resetWarning"))
@@ -275,10 +284,15 @@ export default function CharacterPortraitPanel({
       const next = await apiPost<CharacterPortraitJob>(
         `${portraitPath}/jobs`,
         {
-          prompt,
+          prompt: preserveAnchor && anchor ? { ...prompt, appearance: anchor.descriptor } : prompt,
           confirm_anchor_reset: resetting,
+          ...(preserveAnchor && anchor ? {
+            preserve_anchor: true,
+            expected_anchor_reference_asset: anchor.reference_asset,
+          } : {}),
         },
       );
+      setSelectedAssetId(null);
       adoptJob(next);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : t("submitFailed"));
@@ -366,7 +380,7 @@ export default function CharacterPortraitPanel({
   return (
     <section
       aria-labelledby={`portrait-title-${cardId}`}
-      className="min-w-0 border-t border-border pt-6 md:col-span-2"
+      className="min-w-0 pt-5"
     >
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
@@ -487,6 +501,22 @@ export default function CharacterPortraitPanel({
               </div>
             )}
           </div>
+          {historyAssets.length > 1 && (
+            <label className="mt-3 block min-w-0 text-sm">
+              <span className="mb-1.5 block text-muted">{t("historyLabel")}</span>
+              <select
+                aria-label={t("historyLabel")}
+                value={asset?.asset_id ?? ""}
+                onChange={(event) => setSelectedAssetId(event.target.value)}
+                className="w-full min-w-0 rounded-lg border border-border bg-surface px-3 py-2.5 text-sm text-foreground focus:outline-accent"
+              >
+                {historyAssets.map((item, index) => <option key={item.asset_id} value={item.asset_id}>
+                  {item.content_hash === anchor?.reference_asset ? t("anchorPortrait") : t("historyImage", { number: index + 1 })}
+                </option>)}
+              </select>
+              <p className="mt-2 text-xs leading-5 text-muted">{t("historyHelp")}</p>
+            </label>
+          )}
           {anchor && (
             <section
               aria-labelledby={`portrait-anchor-title-${cardId}`}
@@ -640,6 +670,14 @@ export default function CharacterPortraitPanel({
             </Button>
           </div>
 
+          {anchor && (
+            <Button variant="ghost" className="mt-3" isDisabled={loading || activeJob || translating || hasUnsavedChanges}
+              onPress={() => setPrompt({ subject: cardName, appearance: anchor.descriptor,
+                scene: t("appendSceneDefault"), style: "", negative: "" })}>
+              {t("prepareAppend")}
+            </Button>
+          )}
+
           {prompt && (
             <>
               <IllustrationPromptEditor
@@ -662,6 +700,18 @@ export default function CharacterPortraitPanel({
                 </p>
               )}
             </>
+          )}
+
+          {anchor && (
+            <p className="mt-4 text-sm leading-6 text-muted">
+              {t("anchorGenerationHelp")}
+              {provider?.reference_mode === "none" && <> {t("appendTextOnly")}</>}
+            </p>
+          )}
+          {!prompt && !loading && (
+            <p className="mt-3 text-sm leading-6 text-muted">
+              {t("promptRequired")}
+            </p>
           )}
 
           <ImageJobStatusPanel
@@ -715,9 +765,16 @@ export default function CharacterPortraitPanel({
                         : t("addToBatch")}
                   </Button>
                 )}
+                {anchor && (
+                  <Button variant="primary" className="bg-accent text-white hover:bg-accent-hover"
+                    isDisabled={!prompt || submitting || activeJob || !provider?.available || hasUnsavedChanges}
+                    onPress={() => void submit(true)}>
+                    {submitting ? t("submitting") : t("appendGenerate")}
+                  </Button>
+                )}
                 <Button
-                  variant="primary"
-                  className="bg-accent text-white hover:bg-accent-hover"
+                  variant={anchor ? "outline" : "primary"}
+                  className={anchor ? undefined : "bg-accent text-white hover:bg-accent-hover"}
                   isDisabled={
                     !prompt ||
                     submitting ||

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from backend.db import collections
 from backend.db.base import BaseRepository
+from backend.db.restored_authorization import RESTORED_AUTHORITY_FIELD
 from backend.db.errors import NotFoundError
 from backend.db.utils import get_utc_now, to_object_id
 from backend.llm.models import TokenUsage
@@ -86,6 +87,8 @@ class BlueprintRunRepository(BaseRepository):
     async def _cas(self, run_id: str, owner_id: str, change: Callable[[dict], dict]):
         for _ in range(24):
             current = await self.get_run(run_id, owner_id)
+            if current.get(RESTORED_AUTHORITY_FIELD) is not None:
+                raise BlueprintRunConflict("blueprint_new_readiness_required")
             patch = change(current)
             if not patch:
                 return current
@@ -93,7 +96,8 @@ class BlueprintRunRepository(BaseRepository):
                 raise AssertionError("Blueprint authority is immutable")
             patch["updated_at"] = self.clock()
             result = await self.collection.update_one(
-                {"_id": current["_id"], "owner_id": current["owner_id"], "revision": current["revision"]},
+                {"_id": current["_id"], "owner_id": current["owner_id"], "revision": current["revision"],
+                 RESTORED_AUTHORITY_FIELD: None},
                 {"$set": patch, "$inc": {"revision": 1}},
             )
             if result.modified_count == 1:

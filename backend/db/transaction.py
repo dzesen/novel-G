@@ -10,6 +10,7 @@ from pymongo.asynchronous.client_session import AsyncClientSession
 from pymongo.errors import OperationFailure
 
 from backend.config.config import get_config_value
+from backend.db.maintenance import database_operation
 from backend.db.errors import TransactionNotSupportedError
 from backend.db.mongo import get_client
 
@@ -115,6 +116,7 @@ async def _run_without_transaction(
     return await callback(None)
 
 
+@database_operation(write=True)
 async def run_mongo_write_unit(
     callback: Callable[[AsyncClientSession | None], Awaitable[T]],
     operation_name: str = "mongo_write_unit",

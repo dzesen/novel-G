@@ -113,8 +113,8 @@ export default function StartJobDialog({
       preferWorldAutoSupplement,
     ));
 
-  const [outlineDeviationPolicy, setOutlineDeviationPolicy] =
-    useState<OutlineDeviationPolicy>("pause_for_rewrite");
+  // Retain the safe legacy payload default; review behavior uses chapterReviewSelection.
+  const outlineDeviationPolicy: OutlineDeviationPolicy = "pause_for_rewrite";
   const [generationParams, setGenerationParams] = useState<GenerationParams>(
     () => ({ ...EMPTY_GENERATION_PARAMS }),
   );
@@ -567,50 +567,7 @@ export default function StartJobDialog({
                 </div>
               </details>
 
-              <fieldset className="grid gap-2 rounded-md border border-border bg-background p-3">
-                <legend className="px-1 text-xs font-medium text-warm-700 dark:text-muted">
-                  {t("dialogDeviationPolicyLabel")}
-                </legend>
-                <label className="flex cursor-pointer items-start gap-2 text-sm">
-                  <input
-                    type="radio"
-                    name="outline-deviation-policy"
-                    value="pause_for_rewrite"
-                    checked={outlineDeviationPolicy === "pause_for_rewrite"}
-                    onChange={() => setOutlineDeviationPolicy("pause_for_rewrite")}
-                    className="mt-0.5 size-4"
-                  />
-                  <span>
-                    <span className="font-medium text-foreground">
-                      {t("dialogDeviationPauseTitle")}
-                    </span>
-                    <span className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted">
-                      {t("dialogDeviationPauseBody")}
-                    </span>
-                  </span>
-                </label>
-                <label className="flex cursor-pointer items-start gap-2 text-sm">
-                  <input
-                    type="radio"
-                    name="outline-deviation-policy"
-                    value="accept_and_continue"
-                    checked={outlineDeviationPolicy === "accept_and_continue"}
-                    onChange={() => setOutlineDeviationPolicy("accept_and_continue")}
-                    className="mt-0.5 size-4"
-                  />
-                  <span>
-                    <span className="font-medium text-foreground">
-                      {t("dialogDeviationContinueTitle")}
-                    </span>
-                    <span className="mt-0.5 block text-xs leading-5 text-warm-700 dark:text-muted">
-                      {t("dialogDeviationContinueBody")}
-                    </span>
-                  </span>
-                </label>
-                <p className="border-t border-border pt-2 text-xs leading-5 text-warm-700 dark:text-muted">
-                  {t("dialogDeviationCostHint")}
-                </p>
-              </fieldset>
+
               </>
               )}
             </>
@@ -1123,10 +1080,12 @@ export default function StartJobDialog({
                         count: readiness.planning.chapter_review_authorization.required_chapter_ids.length,
                         total: readiness.planning.chapter_review_authorization.chapter_ids.length,
                       })}
-                      <span className="mt-1 block font-medium">
-                        {t(readiness.planning.chapter_review_authorization.selection.enforcement === "advisory"
-                          ? "reviewEnforcementAdvisory" : "reviewEnforcementStrict")}
-                      </span>
+                      {readiness.planning.chapter_review_authorization.required_chapter_ids.length > 0 && (
+                        <span className="mt-1 block font-medium">
+                          {t(readiness.planning.chapter_review_authorization.selection.enforcement === "advisory"
+                            ? "reviewEnforcementAdvisory" : "reviewEnforcementStrict")}
+                        </span>
+                      )}
                     </dd>
                   </div>
                 )}
@@ -1199,16 +1158,7 @@ export default function StartJobDialog({
                   </dd>
                 </div>
                 )}
-                {!structureFlow && (
-                <div className="min-w-0 bg-background p-3 sm:col-span-2">
-                  <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationDeviation")}</dt>
-                  <dd className="mt-1 text-xs leading-5 text-foreground">
-                    {outlineDeviationPolicy === "pause_for_rewrite"
-                      ? t("dialogDeviationPauseTitle")
-                      : t("dialogDeviationContinueTitle")}
-                  </dd>
-                </div>
-                )}
+
                 <div className="min-w-0 bg-background p-3 sm:col-span-2">
                   <dt className="text-xs text-warm-700 dark:text-muted">{t("dialogConfirmationGeneration")}</dt>
                   <dd className="mt-1 text-xs leading-5 text-foreground">

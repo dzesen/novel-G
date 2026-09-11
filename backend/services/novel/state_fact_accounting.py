@@ -23,6 +23,18 @@ from backend.llm.schemas.state_fact_pydantic import (
 class StateFactAccountingError(ValueError):
     """Provider evidence is malformed, stale, or not bound to the supplied prose."""
 
+    def __init__(
+        self, message: str, *, reason: str = "state_fact_evidence_invalid",
+        location: tuple[str | int, ...] = (),
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.location = location
+
+    def errors(self, **_kwargs: Any) -> list[dict[str, Any]]:
+        """Only machine codes and locally constructed paths enter repair guidance."""
+        return [{"loc": self.location, "type": self.reason}]
+
 
 def _digest(value: Any) -> str:
     encoded = json.dumps(
@@ -34,7 +46,10 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _canonical_span(span: Mapping[str, Any], *, prose: str) -> dict[str, Any]:
+def _canonical_span(
+    span: Mapping[str, Any], *, prose: str,
+    location: tuple[str | int, ...] = (),
+) -> dict[str, Any]:
     start = span.get("start")
     end = span.get("end")
     quote = span.get("quote")
@@ -42,17 +57,276 @@ def _canonical_span(span: Mapping[str, Any], *, prose: str) -> dict[str, Any]:
         type(start) is not int
         or type(end) is not int
         or not isinstance(quote, str)
+        or not quote
         or start < 0
         or end <= start
-        or end > len(prose)
-        or prose[start:end] != quote
     ):
-        raise StateFactAccountingError("状态事实正文 span 与当前正文不匹配")
+        raise StateFactAccountingError(
+            "状态事实正文 span 与当前正文不匹配",
+            reason="state_fact_span_bounds_invalid", location=location,
+        )
+    if end > len(prose) or prose[start:end] != quote:
+        # Reanchor a wrong model offset only when the quotation is unique.
+        # If literal matching fails, ignore CR/LF alone and map back to the
+        # original prose. Spaces, punctuation and every other character stay exact.
+        search_prose, search_quote = prose, quote
+        source_positions = None
+        located = search_prose.find(search_quote)
+        if located < 0:
+            search_quote = quote.replace("\r", "").replace("\n", "")
+            if search_quote:
+                source_positions = [index for index, char in enumerate(prose) if char not in "\r\n"]
+                search_prose = "".join(prose[index] for index in source_positions)
+                located = search_prose.find(search_quote)
+        if located < 0:
+            raise StateFactAccountingError(
+                "状态事实正文 span 与当前正文不匹配",
+                reason="state_fact_span_quote_not_found", location=location,
+            )
+        if search_prose.find(search_quote, located + 1) >= 0:
+            raise StateFactAccountingError(
+                "状态事实正文 span 与当前正文不匹配",
+                reason="state_fact_span_quote_ambiguous", location=location,
+            )
+        if source_positions is None:
+            start, end = located, located + len(search_quote)
+        else:
+            start = source_positions[located]
+            end = source_positions[located + len(search_quote) - 1] + 1
     return {
         "start": start,
         "end": end,
-        "quote_hash": hashlib.sha256(quote.encode("utf-8")).hexdigest(),
+        "quote_hash": hashlib.sha256(prose[start:end].encode("utf-8")).hexdigest(),
     }
+
+
+def _canonical_fact_spans(fact: Any, *, prose: str, fact_index: int) -> list[dict[str, Any]]:
+    path = ("fact_evidence", "facts", fact_index, "spans")
+    spans = [
+        _canonical_span(span.model_dump(mode="python"), prose=prose, location=(*path, index))
+        for index, span in enumerate(fact.spans)
+    ]
+    if spans != sorted(spans, key=lambda item: (item["start"], item["end"])):
+        raise StateFactAccountingError(
+            "状态事实正文 span 顺序无效",
+            reason="state_fact_span_order_invalid", location=path,
+        )
+    return spans
+
+
+def validate_state_fact_spans(evidence: ChapterStateFactEvidenceSchema, *, prose: str) -> None:
+    """Use the publication checks inside the existing, bounded repair attempt."""
+    for fact_index, fact in enumerate(evidence.facts):
+        _canonical_fact_spans(fact, prose=prose, fact_index=fact_index)
+    if evidence.no_change is not None:
+        for index, span in enumerate(evidence.no_change.spans):
+            _canonical_span(
+                span.model_dump(mode="python"), prose=prose,
+                location=("fact_evidence", "no_change", "spans", index),
+            )
+
+
+class StateFactActionCoverageError(StateFactAccountingError):
+    def __init__(self, issues: list[dict[str, Any]]):
+        super().__init__("状态候选动作与事实证据未逐项对应", reason=issues[0]["type"], location=issues[0]["loc"])
+        self._issues = issues
+
+    def errors(self, **_kwargs: Any) -> list[dict[str, Any]]:
+        return [dict(issue) for issue in self._issues]
+
+
+def _validate_planned_thread_resolution(parsed: Any, planned_thread_ids: Iterable[str]) -> None:
+    """Require an explicit payoff check without inventing a state mutation.
+
+    A supported resolved action proves the positive outcome. An unsupported or
+    unknown non-action fact explicitly checks the proposed payoff without falsely
+    updating it. Global unknown retains the existing manual-review boundary.
+    """
+    evidence = parsed.fact_evidence
+    if evidence.extraction_status == "unknown":
+        return
+    for thread_id in dict.fromkeys(str(tid) for tid in planned_thread_ids):
+        facts = [fact for fact in evidence.facts
+                 if fact.target_type == "thread" and fact.target_id == thread_id
+                 and fact.kind == "canonical_fact"]
+        resolved_updates = [update for update in parsed.thread_updates
+                            if update.thread_id == thread_id and update.status == "resolved"]
+        positive = [fact for fact in facts if fact.support == "supported"
+                    and fact.action_ref is not None
+                    and fact.action_ref.action_type == "thread_status"
+                    and fact.action_ref.value == "resolved"]
+        negative = [fact for fact in facts if fact.support in {"unsupported", "unknown"}
+                    and fact.action_ref is None]
+        if resolved_updates:
+            valid = len(resolved_updates) == 1 and len(positive) == 1 and not negative
+        else:
+            valid = bool(negative) and not positive
+        if not valid:
+            raise StateFactAccountingError(
+                "计划回收的伏笔缺少正文支持的回收更新，或明确的未完成／未知判断",
+                reason="state_planned_thread_unassessed",
+                location=("fact_evidence", "facts"),
+            )
+
+
+def validate_state_provider_evidence(
+    value: Any, *, prose: str, chapter_id: str, require_action_coverage: bool = False,
+    planned_thread_ids: Iterable[str] = (),
+) -> None:
+    """Expose automatic-job action linkage errors within the existing repair."""
+    import re
+    from backend.llm.schemas.novel_pydantic import ChapterStateResultSchema
+
+    parsed = ChapterStateResultSchema.model_validate(value)
+    evidence = parsed.fact_evidence
+    validate_state_fact_spans(evidence, prose=prose)
+    _validate_planned_thread_resolution(parsed, planned_thread_ids)
+    if not require_action_coverage or evidence.extraction_status == "unknown":
+        return
+    actions = _candidate_actions(parsed.model_dump(mode="python"), chapter_id=chapter_id)
+    keys = {action["semantic_key"] for action in actions}
+    covered = set()
+    issues = []
+    if evidence.no_change is not None:
+        covered.update(action["semantic_key"] for action in actions if action["action_type"] == "chapter_summary")
+    for index, fact in enumerate(evidence.facts):
+        ref = fact.action_ref
+        if ref is None:
+            continue
+        key = _action_semantic_key(action_type=ref.action_type, target_id=ref.target_id,
+            value=ref.value, permanent_fact_kind=ref.permanent_fact_kind)
+        reason = ("state_fact_action_reference_not_found" if key not in keys else
+                  "state_fact_action_claim_duplicate" if key in covered else None)
+        if reason is not None:
+            issues.append({"loc": ("fact_evidence", "facts", index, "action_ref"), "type": reason})
+        else:
+            covered.add(key)
+    for action in actions:
+        if action["semantic_key"] not in covered:
+            path = tuple(int(part) if part.isdigit() else part
+                         for part in re.findall(r"[a-z_]+|[0-9]+", action["path"]))
+            issues.append({"loc": path, "type": "state_fact_action_unaccounted"})
+    if issues:
+        raise StateFactActionCoverageError(issues)
+
+
+def _normalize_provider_zero_offset_spans(
+    container: Any, *, prose: str, location: tuple[str | int, ...],
+) -> None:
+    """Resolve an explicit 0/0 placeholder only from a unique source quote."""
+    from backend.llm.schemas.scene_contract_pydantic import ProseEvidenceSpanSchema
+
+    spans = container.get("spans") if isinstance(container, dict) else None
+    if not isinstance(spans, list):
+        return
+    for index, span in enumerate(spans):
+        if not isinstance(span, dict) or not (
+            type(span.get("start")) is int and type(span.get("end")) is int
+            and span["start"] == span["end"] == 0
+        ):
+            continue
+        # An out-of-source probe forces unique lookup even for one-character
+        # quotes at offset zero. All other span fields keep their strict schema.
+        try:
+            probe = ProseEvidenceSpanSchema.model_validate(
+                {**span, "start": len(prose), "end": len(prose) + 1}
+            )
+        except ValidationError as exc:
+            issues = [
+                {**issue, "loc": (*location, "spans", index, *issue["loc"])}
+                for issue in exc.errors(include_url=False)
+            ]
+            raise ValidationError.from_exception_data(exc.title, issues) from exc
+        canonical = _canonical_span(
+            probe.model_dump(mode="python"), prose=prose,
+            location=(*location, "spans", index),
+        )
+        span.update(start=canonical["start"], end=canonical["end"])
+
+
+def _resolve_provider_source_references(
+    holder: Any, *, catalog: Mapping[str, Any], location: tuple[str | int, ...],
+) -> None:
+    from backend.services.novel.state_evidence_catalog import STATE_SOURCE_REFERENCE_PREFIX
+
+    if not isinstance(holder, dict) or not isinstance(holder.get("spans"), list):
+        return
+    for index, span in enumerate(holder["spans"]):
+        if not isinstance(span, dict):
+            continue
+        quote = span.get("quote")
+        if not isinstance(quote, str) or not quote.startswith(STATE_SOURCE_REFERENCE_PREFIX):
+            continue
+        entry = catalog.get(quote)
+        if (entry is None or set(span) != {"start", "end", "quote"}
+                or type(span.get("start")) is not int or span["start"] != 0
+                or type(span.get("end")) is not int or span["end"] != 1):
+            raise StateFactAccountingError(
+                "状态原文编号不属于当前正文或定位占位无效",
+                reason="state_fact_source_reference_invalid",
+                location=(*location, "spans", index),
+            )
+        span.update(entry.as_span())
+
+
+def normalize_state_provider_result(
+    value: Any, *, chapter_id: str, prose: str, allow_source_references: bool = False,
+) -> Any:
+    """Compile only lossless wire-format differences before strict validation.
+
+    Formal schemas stay strict. Only the state extraction workflow opts in;
+    raw Provider output is retained before this local transformation.
+    """
+    from copy import deepcopy
+    from backend.llm.schemas.novel_pydantic import ChapterStateResultSchema
+    from backend.llm.schemas.state_fact_pydantic import StateFactEvidenceItemSchema
+
+    if not isinstance(value, dict):
+        return value
+    result = deepcopy(value)
+    catalog = None
+    if allow_source_references:
+        from backend.services.novel.state_evidence_catalog import build_state_evidence_catalog
+        catalog = {entry.reference: entry for entry in build_state_evidence_catalog(prose)}
+    evidence = result.get("fact_evidence")
+    facts = evidence.get("facts") if isinstance(evidence, dict) else None
+    if isinstance(facts, list):
+        for index, fact in enumerate(facts):
+            if not isinstance(fact, dict):
+                continue
+            # Undeclared fact-envelope metadata cannot become evidence or actions.
+            facts[index] = fact = {key: item for key, item in fact.items()
+                                   if key in StateFactEvidenceItemSchema.model_fields}
+            if fact.get("target_type") == "chapter" and fact.get("target_id") == chapter_id:
+                fact["target_id"] = None
+            if catalog is not None:
+                _resolve_provider_source_references(
+                    fact, catalog=catalog, location=("fact_evidence", "facts", index),
+                )
+            _normalize_provider_zero_offset_spans(
+                fact, prose=prose, location=("fact_evidence", "facts", index),
+            )
+    if isinstance(evidence, dict):
+        if catalog is not None:
+            _resolve_provider_source_references(
+                evidence.get("no_change"), catalog=catalog,
+                location=("fact_evidence", "no_change"),
+            )
+        _normalize_provider_zero_offset_spans(
+            evidence.get("no_change"), prose=prose, location=("fact_evidence", "no_change"),
+        )
+    parsed = ChapterStateResultSchema.model_validate(result)
+    for index, fact in enumerate(parsed.fact_evidence.facts):
+        # Every quote must independently bind to the exact prose before sorting.
+        spans = [(_canonical_span(span.model_dump(mode="python"), prose=prose,
+                                 location=("fact_evidence", "facts", index, "spans", number)), number)
+                 for number, span in enumerate(fact.spans)]
+        if spans:
+            original = result["fact_evidence"]["facts"][index]["spans"]
+            result["fact_evidence"]["facts"][index]["spans"] = [
+                original[number] for _span, number in sorted(spans, key=lambda item: (item[0]["start"], item[0]["end"]))
+            ]
+    return result
 
 
 def _action_semantic_key(
@@ -202,7 +476,7 @@ def validate_state_fact_evidence(
     action_fact_owners: dict[str, str] = {}
     dangling = 0
     canonical_facts: list[dict[str, Any]] = []
-    for fact in parsed.facts:
+    for fact_index, fact in enumerate(parsed.facts):
         target_id = (
             source_binding.chapter_id
             if fact.target_type == "chapter"
@@ -243,12 +517,7 @@ def validate_state_fact_evidence(
                 for action_id in action_ids:
                     action_fact_owners[action_id] = fact.fact_id
                 matched_action_ids.update(action_ids)
-        spans = [
-            _canonical_span(span.model_dump(mode="python"), prose=prose)
-            for span in fact.spans
-        ]
-        if spans != sorted(spans, key=lambda item: (item["start"], item["end"])):
-            raise StateFactAccountingError("状态事实正文 span 顺序无效")
+        spans = _canonical_fact_spans(fact, prose=prose, fact_index=fact_index)
         fact_signature = _digest(
             {
                 "schema_version": "state_fact_signature.v1",
@@ -289,8 +558,11 @@ def validate_state_fact_evidence(
         no_change = {
             "action_ids": no_change_action_ids,
             "spans": tuple(
-                _canonical_span(span.model_dump(mode="python"), prose=prose)
-                for span in parsed.no_change.spans
+                _canonical_span(
+                    span.model_dump(mode="python"), prose=prose,
+                    location=("fact_evidence", "no_change", "spans", index),
+                )
+                for index, span in enumerate(parsed.no_change.spans)
             ),
             "explanation": parsed.no_change.explanation,
         }
@@ -366,6 +638,55 @@ def _validated_fact_evidence(
         )
     except ValidationError as exc:
         raise StateFactAccountingError(error_message) from exc
+
+
+def _automatic_drop_reason(fact: Any) -> str | None:
+    if fact.support == "unsupported":
+        return "unsupported_by_prose"
+    return _NON_CANONICAL_DROP_REASONS.get(fact.kind)
+
+
+def state_selection_policy(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Read-only UI projection; acceptance still recomputes the full accounting."""
+    evidence = candidate.get("fact_evidence")
+    if not isinstance(evidence, Mapping):
+        return {}
+    validated = _validated_fact_evidence(evidence, error_message="状态选择证据无效")
+    actions = _candidate_actions(candidate, chapter_id=validated.source_binding.chapter_id)
+    facts_by_action: dict[str, list[Any]] = {}
+    for fact in validated.facts:
+        for action_id in fact.action_ids:
+            facts_by_action.setdefault(action_id, []).append(fact)
+    policy: dict[str, Any] = {}
+    # Empty values have selection IDs but are deliberately not narrative actions.
+    items = [*candidate.get("character_updates", []), *candidate.get("thread_updates", [])]
+    for character in candidate.get("character_updates", []):
+        items.extend(character.get("new_permanent_facts", []))
+    for item in items:
+        if item.get("selection_id"):
+            policy[item["selection_id"]] = {
+                "eligible": False, "reason": "legal_no_op", "requires_drop_reason": False,
+            }
+    for action in actions:
+        selection_id = action.get("selection_id")
+        if not selection_id:
+            continue
+        facts = facts_by_action.get(action["action_id"], [])
+        eligible = bool(facts) and all(
+            fact.kind == "canonical_fact" and fact.support == "supported" for fact in facts
+        )
+        blockers = [fact for fact in facts if fact.kind != "canonical_fact" or fact.support != "supported"]
+        reason = "canonical_fact" if eligible else (
+            next((_automatic_drop_reason(fact) or "unknown" for fact in blockers), "unknown")
+        )
+        if any(fact.support == "unknown" and fact.kind == "canonical_fact" for fact in facts):
+            reason = "unknown"
+        policy[selection_id] = {
+            "eligible": eligible,
+            "reason": reason,
+            "requires_drop_reason": not facts or any(_automatic_drop_reason(fact) is None for fact in facts),
+        }
+    return policy
 
 
 def account_state_fact_evidence(
@@ -485,11 +806,7 @@ def account_state_fact_evidence(
                 decision = "accepted"
                 accepted_actions.add(action_id)
             else:
-                automatic_reason = None
-                if fact.support == "unsupported":
-                    automatic_reason = "unsupported_by_prose"
-                elif fact.kind in _NON_CANONICAL_DROP_REASONS:
-                    automatic_reason = _NON_CANONICAL_DROP_REASONS[fact.kind]
+                automatic_reason = _automatic_drop_reason(fact)
                 action_reason = (
                     automatic_reason
                     or supplied_drop_reasons.get(action_id)

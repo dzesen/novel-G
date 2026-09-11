@@ -54,8 +54,8 @@ from backend.services.llm.generation_runtime import (
 )
 
 
-ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v6"
-REVIEW_PROTOCOL = "independent_outline_review.v7"
+ANCHOR_PROTOCOL = "exact_scene_prose_anchor_view.v8"
+REVIEW_PROTOCOL = "independent_outline_review.v9"
 ANCHOR_WIDTH = 120
 ANCHOR_BREAKS = frozenset("。！？!?；;\n")
 ANCHOR_CLOSERS = frozenset("”’\"」』）)\n\r")
@@ -69,6 +69,8 @@ REVIEW_TASK = (
     "引用默认只返回 anchor_id，服务器把该片段原文还原为精确引文；不要抄写或概述原文。"
     "锚点按原文顺序排列，文本不重叠；依次拼接同场锚点就是该场完整原文。"
     "需要连续多个片段时加 through_anchor_id，表示到该片段末尾的完整连续原文；必须同场、正序且总长最多 500 字符。"
+    "每个起点的 max_through_anchor_id 是本地计算的最远合法终点；through_anchor_id 只能选从起点到该终点之间的同场编号。"
+    "编号差不是字符数，不要自行估算长度；必要证据若分散在更远位置，按 Schema 使用两处各自合法的 spans，不得截掉关键证据后仍宣称 satisfied。"
     "例如 spans=[{\"anchor_id\":\"输入中的实际片段ID\"}]；不要输出示例占位符，不计算字符位置。"
     "选择足以证明具体状态变化的最小片段或范围，不能因为附近提到人物或事件就标为 satisfied。"
     "仅在必须精确裁剪片段内部时提供可选 quote，须为连续逐字原文，不能加省略号、改字或拼接；此时省略 through_anchor_id。"
@@ -326,7 +328,7 @@ class IndependentReviewPlan:
     writer_model: str
     input_token_bound: int
     max_response_bytes: int
-    protocol: Literal["independent_outline_review.v7"] = REVIEW_PROTOCOL
+    protocol: Literal["independent_outline_review.v9"] = REVIEW_PROTOCOL
 
     def __post_init__(self) -> None:
         if (
@@ -443,7 +445,9 @@ def _anchors(snapshot: OutlineReviewSnapshot) -> dict[str, _ProseAnchor]:
         while start < scene_range.end:
             limit = min(start + ANCHOR_WIDTH, scene_range.end)
             primary_end = limit
-            for index in range(start, limit):
+            # Pack adjacent short sentences into the bounded chunk; the first
+            # punctuation would create hundreds of redundant directory rows.
+            for index in range(limit - 1, start - 1, -1):
                 if snapshot.prose[index] in ANCHOR_BREAKS and snapshot.prose[start:index + 1].strip():
                     primary_end = index + 1
                     while primary_end < limit and snapshot.prose[primary_end] in ANCHOR_CLOSERS:
@@ -463,6 +467,32 @@ def _anchors(snapshot: OutlineReviewSnapshot) -> dict[str, _ProseAnchor]:
             ordinal += 1
             start = primary_end
     return result
+
+
+def _anchor_prompt_rows(anchors: Mapping[str, _ProseAnchor]) -> list[dict[str, str]]:
+    """Give each immutable start its longest legal same-scene endpoint.
+
+    Only the model-facing directory receives this hint. Validation still
+    materializes the chosen source range and independently enforces 500 chars.
+    The sliding endpoint keeps directory construction linear in anchor count.
+    """
+    entries = list(anchors.items())
+    rows: list[dict[str, str]] = []
+    end = 0
+    for index, (key, item) in enumerate(entries):
+        end = max(index, end)
+        while end + 1 < len(entries):
+            following = entries[end + 1][1]
+            if following.scene_id != item.scene_id or following.primary_end - item.start > MAX_QUOTE_LENGTH:
+                break
+            end += 1
+        rows.append({
+            "anchor_id": key,
+            "scene_id": item.scene_id,
+            "text": item.text[:item.primary_end - item.start],
+            "max_through_anchor_id": entries[end][0],
+        })
+    return rows
 
 
 def _assess_anchored(
@@ -612,16 +642,7 @@ class IndependentOutlineReviewer:
                 "source_content_digest": snapshot.source_content_digest,
                 "outline": json.loads(snapshot.outline_json),
                 "authorized_context": snapshot.authorized_context,
-                "anchors": [
-                    {
-                        "anchor_id": key,
-                        "scene_id": item.scene_id,
-                        # Keep overlap only in the local locator. The model
-                        # receives every source character exactly once.
-                        "text": item.text[:item.primary_end - item.start],
-                    }
-                    for key, item in anchors.items()
-                ],
+                "anchors": _anchor_prompt_rows(anchors),
             },
         })
         offset = len(self._runtime.attempts)

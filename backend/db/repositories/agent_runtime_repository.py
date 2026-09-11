@@ -15,6 +15,10 @@ from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from backend.db import collections
+from backend.db.maintenance import database_access
+from backend.db.restored_authorization import (
+    RESTORED_AUTHORITY_FIELD, require_current_authorization,
+)
 from backend.db.errors import NotFoundError
 from backend.db.mongo import get_database
 from backend.db.utils import get_utc_now, to_object_id
@@ -538,6 +542,7 @@ class AgentRuntimeRepository:
             "is_deleted": False,
         })
         if existing is not None:
+            require_current_authorization(existing)
             if (
                 existing.get("readiness_id") != readiness_object_id
                 or existing.get("authorization_digest") != str(digest)
@@ -554,6 +559,7 @@ class AgentRuntimeRepository:
                     "_id": readiness_object_id,
                     "owner_id": owner_object_id,
                     "status": "inspected",
+                    RESTORED_AUTHORITY_FIELD: None,
                     "digest": str(digest),
                     "expires_at": {"$gt": now},
                     "is_deleted": False,
@@ -579,6 +585,7 @@ class AgentRuntimeRepository:
                 readiness_id=readiness_id,
                 owner_id=owner_id,
             )
+            require_current_authorization(current)
             if current.get("status") == "inspected" and current.get("expires_at") <= now:
                 await self.readiness.update_one(
                     {"_id": readiness_object_id, "status": "inspected"},
@@ -902,11 +909,16 @@ class AgentRuntimeRepository:
                     )
         created_run = False
         try:
-            inserted = await self.runs.update_one(
-                {"_id": run_id},
-                {"$setOnInsert": run_document},
-                upsert=True,
-            )
+            async with database_access(write=True):
+                current_readiness = await self.get_readiness_owned(
+                    readiness_id=readiness_id, owner_id=owner_id,
+                )
+                require_current_authorization(current_readiness)
+                inserted = await self.runs.update_one(
+                    {"_id": run_id},
+                    {"$setOnInsert": run_document},
+                    upsert=True,
+                )
             created_run = inserted.upserted_id is not None
         except DuplicateKeyError:
             pass
@@ -1200,6 +1212,7 @@ class AgentRuntimeRepository:
             raise ValueError("conservative call bounds cannot be negative")
 
         run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        require_current_authorization(run)
         existing = _attempt_by_key(run, call_key)
         if existing is not None:
             return existing
@@ -1249,6 +1262,7 @@ class AgentRuntimeRepository:
         result = await self.runs.update_one(
             {
                 "_id": _required_object_id(run_id, "run_id"),
+                RESTORED_AUTHORITY_FIELD: None,
                 "owner_id": _required_object_id(owner_id, "owner_id"),
                 "status": "running",
                 "lease.worker_id": str(worker_id),
@@ -1293,6 +1307,7 @@ class AgentRuntimeRepository:
         result = await self.runs.update_one(
             {
                 "_id": _required_object_id(run_id, "run_id"),
+                RESTORED_AUTHORITY_FIELD: None,
                 "owner_id": _required_object_id(owner_id, "owner_id"),
                 "status": "running",
                 "lease.worker_id": str(worker_id),
@@ -1312,6 +1327,7 @@ class AgentRuntimeRepository:
             array_filters=[{"attempt.call_key": str(call_key)}],
         )
         run = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        require_current_authorization(run)
         attempt = _attempt_by_key(run, call_key)
         if attempt is None:
             raise AgentRuntimeStateConflict("Agent call reservation was not found")
@@ -1782,6 +1798,7 @@ class AgentRuntimeRepository:
         run_object_id = _required_object_id(run_id, "run_id")
         owner_object_id = _required_object_id(owner_id, "owner_id")
         current = await self.get_run_owned(run_id=run_id, owner_id=owner_id)
+        require_current_authorization(current)
         if current.get("status") not in {"ready", "running", "paused"}:
             raise AgentRuntimeLeaseUnavailable("Agent run cannot be leased")
         lease = dict(current.get("lease") or {})
@@ -1825,6 +1842,7 @@ class AgentRuntimeRepository:
         document = await self.runs.find_one_and_update(
             {
                 "_id": run_object_id,
+                RESTORED_AUTHORITY_FIELD: None,
                 "owner_id": owner_object_id,
                 "status": {"$in": ["ready", "running", "paused"]},
                 "active_step_id": active_step_id,

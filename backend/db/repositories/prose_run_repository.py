@@ -14,6 +14,7 @@ from backend.db import collections
 from backend.db.base import BaseRepository
 from backend.db.errors import NotFoundError
 from backend.db.mongo import get_database
+from backend.db.restored_authorization import RESTORED_AUTHORITY_FIELD, require_current_authorization
 from backend.db.remediation_receipts import (
     InvalidRemediationReceiptPointer,
     parse_remediation_receipt_pointer,
@@ -64,6 +65,7 @@ class ProseRunRepository(BaseRepository):
             replaced = await self.collection.update_one(
                 {
                     "_id": to_object_id(replace_run_id),
+                    RESTORED_AUTHORITY_FIELD: None,
                     "owner_id": owner_id,
                     "chapter_id": chapter_id,
                     "revision": int(expected_revision),
@@ -335,6 +337,7 @@ class ProseRunRepository(BaseRepository):
             document = await self.collection.find_one_and_update(
                 {
                     "_id": to_object_id(run_id),
+                    RESTORED_AUTHORITY_FIELD: None,
                     "owner_id": to_object_id(owner_id),
                     "is_deleted": False,
                     "revision": int(expected_revision),
@@ -534,6 +537,7 @@ class ProseRunRepository(BaseRepository):
         }
         query: dict[str, Any] = {
             "_id": to_object_id(run_id),
+            RESTORED_AUTHORITY_FIELD: None,
             "owner_id": to_object_id(owner_id),
             "is_deleted": False,
             "status": {"$in": list(CURRENT_PROSE_RUN_STATUSES)},
@@ -582,6 +586,7 @@ class ProseRunRepository(BaseRepository):
             return attempt_id
 
         current = await self.get_run(run_id, owner_id)
+        require_current_authorization(current)
         budget = current.get("token_budget")
         if reserved is None and budget is not None:
             raise TokenBudgetUnbounded(

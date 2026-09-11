@@ -21,7 +21,6 @@ import type {
   CharacterPortraitAsset,
   CharacterVisualProfile,
   CharacterVisualReference,
-  ExternalLoraAdapter,
 } from "@/types/image";
 
 interface CharacterVisualProfilePanelProps {
@@ -30,22 +29,6 @@ interface CharacterVisualProfilePanelProps {
   cardName: string;
   currentAsset: CharacterPortraitAsset | null;
 }
-
-interface AdapterDraft {
-  loraName: string;
-  triggerWord: string;
-  strength: string;
-  baseModelFamily: string;
-  versionNote: string;
-}
-
-const EMPTY_ADAPTER_DRAFT: AdapterDraft = {
-  loraName: "",
-  triggerWord: "",
-  strength: "1",
-  baseModelFamily: "",
-  versionNote: "",
-};
 
 const pendingProfileLoads = new Map<
   string,
@@ -71,19 +54,6 @@ function loadVisualProfile(path: string): Promise<CharacterVisualProfile> {
     },
   );
   return request;
-}
-
-function adapterToDraft(
-  adapter: ExternalLoraAdapter | null,
-): AdapterDraft {
-  if (!adapter) return { ...EMPTY_ADAPTER_DRAFT };
-  return {
-    loraName: adapter.lora_name,
-    triggerWord: adapter.trigger_word ?? "",
-    strength: String(adapter.strength),
-    baseModelFamily: adapter.base_model_family,
-    versionNote: adapter.version_note ?? "",
-  };
 }
 
 function optionalText(value: string | null): string | null {
@@ -118,16 +88,12 @@ export default function CharacterVisualProfilePanel({
   const [references, setReferences] = useState<
     CharacterVisualReference[]
   >([]);
-  const [adapterDraft, setAdapterDraft] = useState<AdapterDraft>(
-    EMPTY_ADAPTER_DRAFT,
-  );
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
   const [savingReferences, setSavingReferences] = useState(false);
   const [removingAssetId, setRemovingAssetId] = useState<string | null>(
     null,
   );
-  const [savingAdapter, setSavingAdapter] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [conflicted, setConflicted] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -135,29 +101,13 @@ export default function CharacterVisualProfilePanel({
     () => new Set(),
   );
 
-  const adoptProfile = useCallback(
-    (
-      next: CharacterVisualProfile,
-      options: {
-        references?: boolean;
-        adapter?: boolean;
-      } = { references: true, adapter: true },
-    ) => {
-      setProfile(next);
-      if (options.references !== false) {
-        setReferences(
-          next.references.map((reference) => ({ ...reference })),
-        );
-      }
-      if (options.adapter !== false) {
-        setAdapterDraft(adapterToDraft(next.external_adapter));
-      }
-      setFailedImages(new Set());
-      setError(null);
-      setConflicted(false);
-    },
-    [],
-  );
+  const adoptProfile = useCallback((next: CharacterVisualProfile) => {
+    setProfile(next);
+    setReferences(next.references.map((reference) => ({ ...reference })));
+    setFailedImages(new Set());
+    setError(null);
+    setConflicted(false);
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -182,8 +132,7 @@ export default function CharacterVisualProfilePanel({
   const busy =
     adding ||
     savingReferences ||
-    Boolean(removingAssetId) ||
-    savingAdapter;
+    Boolean(removingAssetId);
   const currentAssetId =
     currentAsset?.state === "available" ? currentAsset.asset_id : null;
   const currentAlreadyAdded = Boolean(
@@ -239,7 +188,7 @@ export default function CharacterVisualProfilePanel({
           reference: { asset_id: currentAssetId },
         },
       );
-      adoptProfile(next, { references: true, adapter: false });
+      adoptProfile(next);
       setNotice(t("referenceAdded"));
     } catch (reason) {
       showOperationError(reason);
@@ -259,7 +208,7 @@ export default function CharacterVisualProfilePanel({
         references: normalizedReferences,
         external_adapter: profile.external_adapter,
       });
-      adoptProfile(next, { references: true, adapter: false });
+      adoptProfile(next);
       setNotice(t("referencesSaved"));
     } catch (reason) {
       showOperationError(reason);
@@ -278,80 +227,12 @@ export default function CharacterVisualProfilePanel({
         `${profilePath}/references/${encodeURIComponent(assetId)}` +
           `?expected_revision=${profile.revision}`,
       );
-      adoptProfile(next, { references: true, adapter: false });
+      adoptProfile(next);
       setNotice(t("referenceRemoved"));
     } catch (reason) {
       showOperationError(reason);
     } finally {
       setRemovingAssetId(null);
-    }
-  };
-
-  const buildAdapter = (): ExternalLoraAdapter | null => {
-    const loraName = adapterDraft.loraName.trim();
-    const baseModelFamily = adapterDraft.baseModelFamily.trim();
-    const strength = Number(adapterDraft.strength);
-    if (!loraName || !baseModelFamily) {
-      setError(t("adapterRequired"));
-      return null;
-    }
-    if (!Number.isFinite(strength) || strength < 0 || strength > 2) {
-      setError(t("strengthInvalid"));
-      return null;
-    }
-    return {
-      kind: "lora",
-      lora_name: loraName,
-      trigger_word: optionalText(adapterDraft.triggerWord),
-      strength,
-      base_model_family: baseModelFamily,
-      version_note: optionalText(adapterDraft.versionNote),
-    };
-  };
-
-  const saveAdapter = async () => {
-    if (!profile || busy) return;
-    setError(null);
-    setNotice(null);
-    const adapter = buildAdapter();
-    if (!adapter) return;
-    setSavingAdapter(true);
-    try {
-      const next = await apiPut<CharacterVisualProfile>(
-        `${profilePath}/external-adapter`,
-        {
-          expected_revision: profile.revision,
-          external_adapter: adapter,
-        },
-      );
-      adoptProfile(next, { references: false, adapter: true });
-      setNotice(t("adapterSaved"));
-    } catch (reason) {
-      showOperationError(reason);
-    } finally {
-      setSavingAdapter(false);
-    }
-  };
-
-  const clearAdapter = async () => {
-    if (!profile?.external_adapter || busy) return;
-    setSavingAdapter(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const next = await apiPut<CharacterVisualProfile>(
-        `${profilePath}/external-adapter`,
-        {
-          expected_revision: profile.revision,
-          external_adapter: null,
-        },
-      );
-      adoptProfile(next, { references: false, adapter: true });
-      setNotice(t("adapterCleared"));
-    } catch (reason) {
-      showOperationError(reason);
-    } finally {
-      setSavingAdapter(false);
     }
   };
 
@@ -394,14 +275,10 @@ export default function CharacterVisualProfilePanel({
         )}
       </div>
 
-      <div className="mt-4 grid min-w-0 gap-2 rounded-xl border border-border bg-surface-secondary p-4 text-sm leading-6 text-foreground sm:grid-cols-2">
+      <div className="mt-4 min-w-0 rounded-xl border border-border bg-surface-secondary p-4 text-sm leading-6 text-foreground">
         <p className="min-w-0 break-words">
           <span className="font-semibold">{t("referenceBoundary")}</span>{" "}
           {t("referenceBoundaryDetail")}
-        </p>
-        <p className="min-w-0 break-words">
-          <span className="font-semibold">{t("loraBoundary")}</span>{" "}
-          {t("loraBoundaryDetail")}
         </p>
       </div>
 
@@ -638,157 +515,8 @@ export default function CharacterVisualProfilePanel({
             )}
           </div>
 
-          <div className="mt-8 min-w-0 border-t border-border pt-6">
-            <div className="min-w-0">
-              <h4 className="text-sm font-semibold text-foreground">
-                {t("adapterTitle")}
-              </h4>
-              <p className="mt-1 max-w-2xl text-sm leading-6 text-muted">
-                {t("adapterDescription")}
-              </p>
-              {profile.external_adapter && (
-                <p className="mt-3 min-w-0 break-all rounded-lg border border-accent/20 bg-accent/5 px-3 py-2 text-xs leading-5 text-foreground">
-                  {profile.external_adapter.lora_name}
-                </p>
-              )}
-            </div>
-
-            <div className="mt-4 grid min-w-0 gap-4 sm:grid-cols-2">
-              <ProfileField
-                label={t("adapterFields.loraName")}
-                value={adapterDraft.loraName}
-                maxLength={500}
-                onChange={(value) =>
-                  setAdapterDraft((current) => ({
-                    ...current,
-                    loraName: value,
-                  }))
-                }
-              />
-              <ProfileField
-                label={t("adapterFields.triggerWord")}
-                value={adapterDraft.triggerWord}
-                maxLength={300}
-                onChange={(value) =>
-                  setAdapterDraft((current) => ({
-                    ...current,
-                    triggerWord: value,
-                  }))
-                }
-              />
-              <ProfileField
-                label={t("adapterFields.strength")}
-                value={adapterDraft.strength}
-                type="number"
-                inputMode="decimal"
-                min="0"
-                max="2"
-                step="0.05"
-                onChange={(value) =>
-                  setAdapterDraft((current) => ({
-                    ...current,
-                    strength: value,
-                  }))
-                }
-              />
-              <ProfileField
-                label={t("adapterFields.baseModelFamily")}
-                value={adapterDraft.baseModelFamily}
-                maxLength={120}
-                onChange={(value) =>
-                  setAdapterDraft((current) => ({
-                    ...current,
-                    baseModelFamily: value,
-                  }))
-                }
-              />
-              <label className="min-w-0 text-sm sm:col-span-2">
-                <span className="mb-1.5 block font-medium text-foreground">
-                  {t("adapterFields.versionNote")}
-                </span>
-                <textarea
-                  value={adapterDraft.versionNote}
-                  maxLength={500}
-                  rows={3}
-                  onChange={(event) =>
-                    setAdapterDraft((current) => ({
-                      ...current,
-                      versionNote: event.target.value,
-                    }))
-                  }
-                  className="w-full min-w-0 resize-y rounded-lg border border-border bg-surface px-3 py-2.5 text-base leading-6 text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15 sm:text-sm"
-                />
-              </label>
-            </div>
-            <p className="mt-2 text-xs leading-5 text-muted">
-              {t("adapterHint")}
-            </p>
-            <div className="mt-4 flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap">
-              <Button
-                type="button"
-                variant="primary"
-                isDisabled={busy}
-                onPress={() => void saveAdapter()}
-                className="w-full bg-accent text-white hover:bg-accent-hover sm:w-auto"
-              >
-                {savingAdapter ? t("savingAdapter") : t("saveAdapter")}
-              </Button>
-              {profile.external_adapter && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  isDisabled={busy}
-                  onPress={() => void clearAdapter()}
-                  className="w-full border-red-300 text-red-700 dark:border-red-800 dark:text-red-300 sm:w-auto"
-                >
-                  {t("clearAdapter")}
-                </Button>
-              )}
-            </div>
-          </div>
         </>
       )}
     </section>
-  );
-}
-
-function ProfileField({
-  label,
-  value,
-  onChange,
-  type = "text",
-  inputMode,
-  maxLength,
-  min,
-  max,
-  step,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  type?: "text" | "number";
-  inputMode?: "text" | "decimal";
-  maxLength?: number;
-  min?: string;
-  max?: string;
-  step?: string;
-}) {
-  return (
-    <label className="min-w-0 text-sm">
-      <span className="mb-1.5 block font-medium text-foreground">
-        {label}
-      </span>
-      <input
-        type={type}
-        inputMode={inputMode}
-        value={value}
-        maxLength={maxLength}
-        min={min}
-        max={max}
-        step={step}
-        onChange={(event) => onChange(event.target.value)}
-        className="w-full min-w-0 rounded-lg border border-border bg-surface px-3 py-2.5 text-base text-foreground outline-none focus:border-accent focus:ring-2 focus:ring-accent/15 sm:text-sm"
-      />
-    </label>
   );
 }

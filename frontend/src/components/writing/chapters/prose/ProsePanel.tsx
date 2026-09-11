@@ -178,6 +178,7 @@ export default function ProsePanel({
   const [conflictRequiresSync, setConflictRequiresSync] = useState(false);
   const [initialRunResolved, setInitialRunResolved] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const draftPreviewRef = useRef<HTMLDivElement>(null);
 
   const running = stream.status === "running";
   const mutationPending = accepting
@@ -194,6 +195,11 @@ export default function ProsePanel({
     conflictRequiresSync || stream.status === "cancelled"
   );
   const hasText = stream.text.length > 0;
+  useEffect(() => {
+    if (initialRun && hasText) {
+      draftPreviewRef.current?.scrollIntoView({ block: "start" });
+    }
+  }, [initialRun, hasText]);
   const incomplete = hasText && (
     stream.status === "cancelled"
     || stream.status === "error"
@@ -1437,7 +1443,7 @@ export default function ProsePanel({
                 预览区刻意**只读**：流式写入与人工编辑并存必然打架。
                 要改就先接受、改在编辑器里——那才是编辑正文的地方（设计 §3.2）。
               */}
-              <div className="whitespace-pre-wrap rounded-md border border-border bg-background px-4 py-3 text-[15px] leading-8 text-foreground">
+              <div ref={draftPreviewRef} data-testid="prose-draft-preview" className="whitespace-pre-wrap rounded-md border border-border bg-background px-4 py-3 text-[15px] leading-8 text-foreground">
                 {stream.text}
               </div>
             </>

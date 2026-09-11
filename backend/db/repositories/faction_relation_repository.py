@@ -8,6 +8,8 @@ from bson import ObjectId
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from backend.db.base import BaseRepository
+from backend.db.faction_identity import FactionIdentityIndex
+from backend.db.repositories.faction_repository import faction_repo
 from backend.db.collections import FACTION_RELATIONS
 from backend.db.errors import DuplicateKeyError, NotFoundError
 from backend.db.utils import get_utc_now, to_object_id
@@ -75,6 +77,15 @@ class FactionRelationRepository(BaseRepository):
 
         prepared = dict(data)
         prepared["novel_id"] = to_object_id(prepared["novel_id"])
+        identities = FactionIdentityIndex(await faction_repo.collection.find(
+            {"novel_id": prepared["novel_id"]},
+            projection={"_id": 1, "faction_id": 1, "is_deleted": 1}, session=session,
+        ).to_list(length=None))
+        endpoints = identities.resolve(prepared, require_active=True)
+        if endpoints is None:
+            raise ValueError("关系端点必须唯一对应本书有效的正式势力身份")
+        for endpoint, card_id in zip(("source", "target"), endpoints):
+            prepared[f"{endpoint}_faction_card_id"] = ObjectId(card_id)
         prepared.setdefault("current_state", "")
         prepared.setdefault("core_conflict", "")
         prepared.setdefault("hidden_tension", "")

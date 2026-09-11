@@ -153,6 +153,7 @@ export default function ChapterOutlinePanel({
         present_character_card_ids: editBuffer.present_character_card_ids,
         mentioned_character_card_ids: editBuffer.mentioned_character_card_ids,
         referenced_worldbook_card_ids: editBuffer.referenced_worldbook_card_ids,
+        referenced_faction_card_ids: editBuffer.referenced_faction_card_ids ?? [],
         scenes: editBuffer.scenes,
         core_conflict: editBuffer.core_conflict,
         ending_hook: editBuffer.ending_hook,
@@ -217,8 +218,8 @@ export default function ChapterOutlinePanel({
               value={params}
               onChange={setParams}
               showSystemPrompt={false}
-              maxTokensLimit={20_000}
-              maxTokensEnableValue={20_000}
+              maxTokensLimit={64_000}
+              maxTokensEnableValue={64_000}
               maxTokensStep={1}
             />
           </div>
@@ -259,6 +260,7 @@ export default function ChapterOutlinePanel({
                 <ReadOnlyIds label={t("fieldPresent")} ids={existingOutline.present_character_card_ids} nameById={roster.nameById} />
                 <ReadOnlyIds label={t("fieldMentioned")} ids={existingOutline.mentioned_character_card_ids} nameById={roster.nameById} />
                 <ReadOnlyIds label={t("fieldWorldbook")} ids={existingOutline.referenced_worldbook_card_ids} nameById={roster.nameById} />
+                <ReadOnlyIds label={t("fieldFactions")} ids={existingOutline.referenced_faction_card_ids ?? []} nameById={roster.nameById} />
                 <ReadOnlyIds label={t("threadsPlanted")} ids={existingOutline.threads_planted} nameById={roster.nameById} />
                 <ReadOnlyIds label={t("fieldThreadsResolved")} ids={existingOutline.threads_resolved} nameById={roster.nameById} />
                 <ReadOnlyText label={t("fieldCoreConflict")} value={existingOutline.core_conflict} />

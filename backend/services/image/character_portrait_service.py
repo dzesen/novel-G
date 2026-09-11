@@ -9,9 +9,10 @@ from typing import Any, Callable, Protocol
 
 from backend.db.errors import NotFoundError
 from backend.db.repositories.chapter_repository import chapter_repo
+from backend.db.repositories.image_asset_repository import image_asset_repo
 from backend.db.repositories.image_batch_repository import image_batch_repo
 from backend.db.repositories.image_job_repository import image_job_repo
-from backend.db.utils import get_utc_now
+from backend.db.utils import get_utc_now, to_object_id
 from backend.services.image.managed_assets import (
     ImagePollAssetConsumer,
 )
@@ -123,6 +124,7 @@ class CharacterPortraitService:
         now_epoch: Callable[[], float] = time.time,
         seed_factory: Callable[[], int] = lambda: secrets.randbits(64),
     ) -> None:
+        self._assets = asset_repository or image_asset_repo
         self._anchors = anchors
         self._job_repository = jobs
         self._chapters = chapters
@@ -154,6 +156,20 @@ class CharacterPortraitService:
             card_id=card_id,
             provider_alias=provider_alias,
         )
+        history = await self._assets.list_owned_subject(
+            owner_id=to_object_id(owner_id), novel_id=to_object_id(novel_id),
+            subject_kind="character_portrait", subject_id=card_id,
+        )
+        assets = tuple(
+            PortraitAssetProjection(
+                asset_id=str(item["_id"]), content_hash=str(item.get("content_hash") or ""),
+                mime=str(item.get("mime") or ""), width=int(item.get("width") or 0),
+                height=int(item.get("height") or 0), state="available",
+                content_url=f"/api/image-assets/{item['_id']}/content",
+            )
+            for item in history if item.get("_id") is not None
+        )
+        state = state.model_copy(update={"assets": assets})
         if state.anchor is None:
             return state
         dependency_total, dependencies = await self._anchor_dependencies(
@@ -268,6 +284,8 @@ class CharacterPortraitService:
         seed: int | None = None,
         provider_alias: str | None = None,
         confirm_anchor_reset: bool = False,
+        preserve_anchor: bool = False,
+        expected_anchor_reference_asset: str | None = None,
         portrait_batch_id: str | None = None,
         submission_fence: ImageJobSubmissionFence | None = None,
     ) -> PortraitJobProjection:
@@ -279,6 +297,8 @@ class CharacterPortraitService:
             seed=seed,
             provider_alias=provider_alias,
             confirm_anchor_reset=confirm_anchor_reset,
+            preserve_anchor=preserve_anchor,
+            expected_anchor_reference_asset=expected_anchor_reference_asset,
             portrait_batch_id=portrait_batch_id,
             submission_fence=submission_fence,
         )

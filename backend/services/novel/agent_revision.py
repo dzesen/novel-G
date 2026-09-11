@@ -196,6 +196,8 @@ class AgentRevisionProposalService:
                 str(item)
                 for item in outline.get("mentioned_character_card_ids") or []
             ],
+            **({"referenced_faction_card_ids": [str(cid) for cid in outline["referenced_faction_card_ids"]]}
+               if outline.get("referenced_faction_card_ids") else {}),
             "referenced_worldbook_card_ids": [
                 str(item)
                 for item in outline.get("referenced_worldbook_card_ids") or []

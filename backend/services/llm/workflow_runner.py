@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 import json
 import logging
 import time
@@ -30,6 +31,8 @@ from backend.services.llm.generation_runtime import (
     safe_structured_repair_failure_diagnostics,
 )
 
+from backend.services.llm.pre_dispatch_boundaries import pre_dispatch_boundary_code
+
 logger = logging.getLogger(__name__)
 
 # 心跳间隔。设定生成单步就要 60–120 秒静默，正文生成更长；
@@ -37,6 +40,8 @@ logger = logging.getLogger(__name__)
 KEEPALIVE_SECONDS = 15.0
 WORKFLOW_FAILURE_DIAGNOSTIC_SCHEMA_VERSION = "workflow_failure_diagnostic.v1"
 _WORKFLOW_FAILURE_DIAGNOSTIC_CONTRACT = {
+    "token_budget_exceeded_before_dispatch": ("context_or_budget", "confirmed", True),
+    "attempt_capacity_exhausted": ("context_or_budget", "confirmed", True),
     "generation_plan_configuration_stale": (
         "source_changed",
         "confirmed",
@@ -86,6 +91,15 @@ def project_workflow_failure_diagnostic(
     *,
     diagnostic_code: str | None = None,
 ) -> dict[str, Any] | None:
+    boundary_code = pre_dispatch_boundary_code(error)
+    if boundary_code is not None:
+        return {
+            "schema_version": WORKFLOW_FAILURE_DIAGNOSTIC_SCHEMA_VERSION,
+            "category": "context_or_budget",
+            "code": boundary_code,
+            "evidence": "confirmed",
+            "provider_request_not_dispatched": True,
+        }
     code = str(
         diagnostic_code
         or getattr(error, "diagnostic_code", "")
@@ -154,6 +168,8 @@ class WorkflowStep:
     retry_oversized_structured_output_without_source: bool = False
     structured_output_byte_budget_reason_code: str | None = None
     prompt_context: Callable[[StepContext], str] | None = None
+    result_validator: Callable[[BaseModel, StepContext], None] | None = None
+    result_normalizer: Callable[[Any, StepContext], Any] | None = None
 
     @property
     def resolved_config_key(self) -> str:
@@ -401,6 +417,18 @@ async def run_workflow(
                 prompt_json = apply_agent_profile(step.agent_id, prompt_json)
 
             structured_kwargs = dict(gen_kwargs)
+            if step.result_normalizer is not None:
+                normalize_result = step.result_normalizer
+                normalization_context = StepContext(results=results, params=params)
+                structured_kwargs["result_normalizer"] = (
+                    lambda value: normalize_result(value, normalization_context)
+                )
+            if step.result_validator is not None:
+                validate_result = step.result_validator
+                validation_context = StepContext(results=results, params=params)
+                structured_kwargs["result_validator"] = (
+                    lambda value: validate_result(value, validation_context)
+                )
             if step.max_structured_output_bytes is not None:
                 structured_kwargs["max_structured_output_bytes"] = (
                     step.max_structured_output_bytes
@@ -433,8 +461,9 @@ async def run_workflow(
                 # consumer is cancelled or closes it while a heartbeat is yielded.
                 if not task.done():
                     task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await task
+                with anyio.move_on_after(5, shield=True):
+                    with suppress(asyncio.CancelledError, Exception):
+                        await task
             produced = generated.value
             step_usage = generated.usage
             if deps.on_step_completed is not None:
@@ -471,7 +500,9 @@ async def run_workflow(
                 {
                     "attempt_id": attempt.attempt_id,
                     "provider": attempt.provider_alias,
+                    "provider_alias": attempt.provider_alias,
                     "phase": attempt.phase,
+                    "state": attempt.state,
                     "usage": attempt.usage.model_dump(),
                 }
                 for attempt in failed_attempts
@@ -479,6 +510,14 @@ async def run_workflow(
             diagnostics = safe_structured_repair_failure_diagnostics(
                 getattr(exc, "diagnostics", None)
             )
+            if diagnostics is not None:
+                logger.warning(
+                    "[%s] request_id=%s step=%s structured_validation=%s",
+                    workflow_name,
+                    request_id,
+                    step.key,
+                    json.dumps(diagnostics, ensure_ascii=True),
+                )
             diagnostic = project_workflow_failure_diagnostic(
                 exc,
                 diagnostic_code=(

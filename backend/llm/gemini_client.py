@@ -162,7 +162,7 @@ class GeminiClient(BaseLLMClient):
         """调用 Gemini API 进行普通文本生成。"""
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
 
         try:
@@ -173,7 +173,7 @@ class GeminiClient(BaseLLMClient):
             )
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -188,7 +188,7 @@ class GeminiClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result
 
     async def schema_generate(self, request: LLMRequest, schema: type[BaseModel]) -> LLMResponse:
@@ -199,7 +199,7 @@ class GeminiClient(BaseLLMClient):
         """
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
 
         try:
@@ -217,10 +217,10 @@ class GeminiClient(BaseLLMClient):
                 mapped = LLMSchemaUnsupportedError(
                     str(exc), provider=self.provider_name, model=model
                 )
-                log_llm_error(mapped, provider=self.provider_name, model=model)
+                log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
                 raise mapped from exc
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -236,7 +236,7 @@ class GeminiClient(BaseLLMClient):
                 provider=self.provider_name,
                 model=model,
             )
-            log_llm_error(error, provider=self.provider_name, model=model)
+            log_llm_error(error, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise error from parse_exc
 
         result = LLMResponse(
@@ -250,7 +250,7 @@ class GeminiClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result
 
     async def stream_text(
@@ -265,7 +265,7 @@ class GeminiClient(BaseLLMClient):
         self._last_finish_reason = "unreported"
         self._last_raw_finish_reason = "unreported"
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
 
         try:
             stream = await self._client.aio.models.generate_content_stream(
@@ -301,7 +301,7 @@ class GeminiClient(BaseLLMClient):
                 usage_sink(latest_usage)
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
     async def function_call_probe(
@@ -320,7 +320,7 @@ class GeminiClient(BaseLLMClient):
         """
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
         tool = types.Tool(
             function_declarations=[
@@ -383,7 +383,7 @@ class GeminiClient(BaseLLMClient):
             )
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -392,7 +392,7 @@ class GeminiClient(BaseLLMClient):
             self._validate_probe_final_text(content, probe.expected_final_text)
         except ValueError as exc:
             mapped = LLMResponseError(str(exc), provider=self.provider_name, model=model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         first_usage = self._extract_usage(first_resp.usage_metadata)
@@ -415,5 +415,5 @@ class GeminiClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result

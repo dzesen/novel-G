@@ -38,7 +38,7 @@ export function JudgeProviderSettings({ config, onChange, onEditProvider }: Prop
   return (
     <Card className="min-w-0 border border-border bg-surface shadow-sm" data-testid="judge-provider-settings">
       <Card.Header className="flex-col items-start gap-2">
-        <Card.Title className="text-lg font-semibold text-foreground">{t("title")}</Card.Title>
+        <Card.Title className="flex flex-wrap items-center gap-2 text-lg font-semibold text-foreground">{t("title")}<span className="rounded-md bg-surface-secondary px-2 py-1 text-xs font-medium text-muted">{t("experimental")}</span></Card.Title>
         <p className="max-w-3xl text-sm leading-6 text-muted">{t("description")}</p>
       </Card.Header>
       <Card.Content className="grid min-w-0 gap-5">
@@ -78,10 +78,14 @@ export function JudgeProviderSettings({ config, onChange, onEditProvider }: Prop
           <p role="alert" className="text-sm leading-6 text-red-700 dark:text-red-300">{t("sameWriter")}</p>
         ) : null}
         <dl className="grid min-w-0 gap-4 border-y border-border py-4 sm:grid-cols-3">
-          <div className="min-w-0"><dt className="text-xs text-muted">{t("model")}</dt><dd className="mt-1 break-all text-sm font-medium">{provider?.default_model || t("notConfigured")}</dd></div>
+          <div className="min-w-0"><dt><label htmlFor={`${fieldId}-model`} className="text-xs text-muted">{t("model")}</label></dt><dd className="mt-1"><input id={`${fieldId}-model`} className={controlClass} value={provider?.default_model ?? ""} disabled={!provider} aria-describedby={`${fieldId}-model-hint`} onChange={(event) => {
+            if (!provider) return;
+            onChange({ ...config, llm: { ...config.llm, providers: { ...config.llm.providers, [providerAlias]: { ...provider, default_model: event.target.value } } } });
+          }} /></dd></div>
           <div className="min-w-0"><dt className="text-xs text-muted">{t("effectiveTimeout")}</dt><dd className="mt-1 text-sm tabular-nums">{settings.effectiveTimeout == null ? t("notConfigured") : t("seconds", { count: settings.effectiveTimeout })}</dd></div>
           <div className="min-w-0"><dt className="text-xs text-muted">{t("outputLimit")}</dt><dd className="mt-1 text-sm tabular-nums">{provider?.max_tokens == null ? t("providerDefault") : provider.max_tokens.toLocaleString()}</dd></div>
         </dl>
+        <p id={`${fieldId}-model-hint`} className="break-words text-xs leading-5 text-muted">{t("modelBindingHint", { provider: providerAlias || t("notConfigured") })}</p>
         {supportsKimiThinkingSetting(provider) && (
           <label className="grid min-w-0 max-w-xl gap-2 text-sm font-medium">
             <span id={`${fieldId}-thinking-label`}>{t("thinking")}</span>

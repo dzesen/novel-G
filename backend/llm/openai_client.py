@@ -224,7 +224,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             )
         else:
             mapped = self._map_error(exc, model)
-        log_llm_error(mapped, provider=self.provider_name, model=model)
+        log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
         raise mapped from exc
 
     @staticmethod
@@ -242,14 +242,14 @@ class OpenAICompatibleClient(BaseLLMClient):
         """调用 Chat Completions API 进行普通文本生成。"""
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
 
         try:
             resp = await self._client.chat.completions.create(**self._build_params(request))
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -265,7 +265,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result
 
     async def schema_generate(self, request: LLMRequest, schema: type[BaseModel]) -> LLMResponse:
@@ -276,7 +276,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         """
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
 
         try:
@@ -299,7 +299,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                 provider=self.provider_name,
                 model=model,
             )
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
         except Exception as exc:
             self._raise_mapped_schema_error(exc, model=model)
@@ -320,7 +320,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                 provider=self.provider_name,
                 model=model,
             )
-            log_llm_error(error, provider=self.provider_name, model=model)
+            log_llm_error(error, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise error
 
         result = LLMResponse(
@@ -334,7 +334,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result
 
     async def stream_text(
@@ -349,7 +349,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         self._last_finish_reason = "unreported"
         self._last_raw_finish_reason = "unreported"
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
 
         try:
             params = self._build_params(request)
@@ -393,7 +393,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                 await self._close_provider_stream(stream)
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
     async def function_call_probe(
@@ -412,7 +412,7 @@ class OpenAICompatibleClient(BaseLLMClient):
         """
         request = self._apply_defaults(request)
         model = self._resolve_model(request)
-        log_llm_request(request, self.provider_name)
+        log_llm_request(request, self.provider_name, secrets=(self.config.api_key,))
         start = time.perf_counter()
         tool_def = {
             "type": "function",
@@ -469,7 +469,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             final_resp = await self._client.chat.completions.create(**self._build_params(final_request))
         except Exception as exc:
             mapped = self._map_error(exc, model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -479,7 +479,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             self._validate_probe_final_text(content, probe.expected_final_text)
         except ValueError as exc:
             mapped = LLMResponseError(str(exc), provider=self.provider_name, model=model)
-            log_llm_error(mapped, provider=self.provider_name, model=model)
+            log_llm_error(mapped, provider=self.provider_name, model=model, secrets=(self.config.api_key,))
             raise mapped from exc
 
         first_usage = self._extract_usage(first_resp.usage)
@@ -502,5 +502,5 @@ class OpenAICompatibleClient(BaseLLMClient):
             success=True,
         )
         result = self._finalize_response(result)
-        log_llm_response(result)
+        log_llm_response(result, secrets=(self.config.api_key,))
         return result

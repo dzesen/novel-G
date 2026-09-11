@@ -9,6 +9,7 @@ from pymongo.errors import DuplicateKeyError
 
 from backend.db import collections
 from backend.db.base import BaseRepository
+from backend.db.restored_authorization import RESTORED_AUTHORITY_FIELD
 from backend.db.utils import get_utc_now, to_object_id
 
 
@@ -79,6 +80,7 @@ class ImageBatchRepository(BaseRepository):
     ) -> dict[str, Any] | None:
         return await self.collection.find_one(
             {
+                RESTORED_AUTHORITY_FIELD: None,
                 **self._scope(owner_id=owner_id, novel_id=novel_id),
                 "is_terminal": False,
             },
@@ -97,6 +99,7 @@ class ImageBatchRepository(BaseRepository):
     ) -> bool:
         bound = await self.collection.find_one_and_update(
             {
+                RESTORED_AUTHORITY_FIELD: None,
                 "_id": to_object_id(batch_id),
                 **self._scope(owner_id=owner_id, novel_id=novel_id),
                 "is_terminal": False,
@@ -140,6 +143,7 @@ class ImageBatchRepository(BaseRepository):
     ) -> dict[str, Any] | None:
         return await self.collection.find_one_and_update(
             {
+                RESTORED_AUTHORITY_FIELD: None,
                 "_id": to_object_id(batch_id),
                 **self._scope(owner_id=owner_id, novel_id=novel_id),
                 "revision": int(expected_revision),

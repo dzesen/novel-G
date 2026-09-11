@@ -1,158 +1,151 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { useTranslations } from "next-intl";
-import { Card, Button, Chip } from "@heroui/react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useFormatter, useTranslations } from "next-intl";
 import { apiGet, apiPost, apiDelete } from "@/lib/api";
+import { Button } from "@/components/ui/Button";
+import { Dialog } from "@/components/ui/Dialog";
 import type { NovelSummary } from "@/types/novel";
 
 interface DeletedNovel extends NovelSummary {
   deleted_at?: string;
 }
-
 interface TrashBinProps {
   open: boolean;
   onClose: () => void;
   onRestored: () => void;
 }
+type TrashAction = "restore" | "delete";
 
 export default function TrashBin({ open, onClose, onRestored }: TrashBinProps) {
   const t = useTranslations("bookshelf");
   const tn = useTranslations("novel");
+  const format = useFormatter();
   const [novels, setNovels] = useState<DeletedNovel[]>([]);
   const [loading, setLoading] = useState(false);
-  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [pending, setPending] = useState<Record<string, TrashAction>>({});
+  const [errors, setErrors] = useState<Record<string, TrashAction>>({});
+  const pendingIds = useRef(new Set<string>());
+  const listRequest = useRef<AbortController | null>(null);
+  const mounted = useRef(false);
+  const isOpen = useRef(open);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      listRequest.current?.abort();
+    };
+  }, []);
 
   const fetchDeleted = useCallback(async () => {
+    listRequest.current?.abort();
+    const request = new AbortController();
+    listRequest.current = request;
+    setLoading(true);
+    setLoadFailed(false);
     try {
-      setLoading(true);
-      const res = await apiGet<{ data: DeletedNovel[] }>("/api/novels/deleted/list");
-      setNovels(res.data);
+      const res = await apiGet<{ data: DeletedNovel[] }>("/api/novels/deleted/list", {
+        signal: request.signal,
+      });
+      if (!request.signal.aborted) setNovels(res.data);
     } catch {
-      // handle error
+      if (!request.signal.aborted) setLoadFailed(true);
     } finally {
-      setLoading(false);
+      if (listRequest.current === request) listRequest.current = null;
+      if (!request.signal.aborted) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    if (open) fetchDeleted();
+    isOpen.current = open;
+    if (open) void fetchDeleted();
+    return () => listRequest.current?.abort();
   }, [open, fetchDeleted]);
 
-  const handleRestore = async (id: string) => {
+  const handleAction = async (novel: DeletedNovel, action: TrashAction) => {
+    const id = novel._id;
+    if (pendingIds.current.has(id)) return;
+    if (action === "delete" && !confirm(t("hardDeleteConfirm", { title: novel.title }))) return;
+    pendingIds.current.add(id);
+    setPending((previous) => ({ ...previous, [id]: action }));
+    setErrors((previous) => {
+      const next = { ...previous };
+      delete next[id];
+      return next;
+    });
     try {
-      setActionLoading(id);
-      await apiPost(`/api/novels/${id}/restore`, {});
-      setNovels((prev) => prev.filter((n) => n._id !== id));
-      onRestored();
+      if (action === "restore") await apiPost(`/api/novels/${id}/restore`, {});
+      else await apiDelete(`/api/novels/${id}/hard`);
     } catch {
-      // handle error
+      if (mounted.current) setErrors((previous) => ({ ...previous, [id]: action }));
+      return;
     } finally {
-      setActionLoading(null);
+      pendingIds.current.delete(id);
+      if (mounted.current) {
+        setPending((previous) => {
+          const next = { ...previous };
+          delete next[id];
+          return next;
+        });
+      }
     }
+    if (!mounted.current) return;
+    setNovels((previous) => previous.filter((item) => item._id !== id));
+    // Replace an in-flight list with a fresh read so reopening retains other
+    // windows' additions without bringing this successfully removed item back.
+    if (isOpen.current && listRequest.current) void fetchDeleted();
+    if (action === "restore") onRestored();
   };
-
-  const handleHardDelete = async (id: string, title: string) => {
-    if (!confirm(t("hardDeleteConfirm", { title }))) return;
-    try {
-      setActionLoading(id);
-      await apiDelete(`/api/novels/${id}/hard`);
-      setNovels((prev) => prev.filter((n) => n._id !== id));
-    } catch {
-      // handle error
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-background rounded-xl shadow-xl w-full max-w-2xl mx-4 border border-border flex flex-col max-h-[80vh]">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
-          <div className="flex items-center gap-2">
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted">
-              <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
-              <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
-            </svg>
-            <h2 className="text-lg font-semibold text-foreground">{t("trashBin")}</h2>
-            <span className="text-xs text-muted">({novels.length})</span>
+    <Dialog open={open} onClose={onClose} title={t("trashBin")} closeLabel={t("closeTrash")} className="max-w-2xl">
+      <div className="p-4 sm:p-5">
+        {loading ? (
+          <p role="status" className="py-8 text-center text-sm text-muted">{t("loading")}</p>
+        ) : loadFailed ? (
+          <div role="alert" className="space-y-3 py-6 text-center">
+            <p className="text-sm text-foreground">{t("trashLoadFailed")}</p>
+            <Button onClick={() => void fetchDeleted()}>{t("retry")}</Button>
           </div>
-          <button
-            className="text-muted hover:text-foreground transition-colors"
-            onClick={onClose}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M18 6 6 18" /><path d="m6 6 12 12" />
-            </svg>
-          </button>
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4">
-          {loading ? (
-            <div className="flex items-center justify-center py-12">
-              <div className="animate-spin rounded-full h-6 w-6 border-2 border-primary border-t-transparent" />
-            </div>
-          ) : novels.length === 0 ? (
-            <div className="text-center text-muted py-12">
-              <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" className="mx-auto mb-3 opacity-30">
-                <path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
-                <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
-              </svg>
-              <p className="text-sm">{t("trashEmpty")}</p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {novels.map((novel) => (
-                <Card key={novel._id} className="transition-all">
-                  <Card.Header>
-                    <div className="flex items-center justify-between w-full">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-foreground truncate">
-                            {novel.title}
-                          </span>
-                          {novel.genre !== "unclassified" && (
-                            <Chip variant="soft" size="sm">{novel.genre}</Chip>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-3 mt-1 text-xs text-muted">
-                          <span>{tn("chapterCount")}: {novel.stats?.chapter_count ?? 0}</span>
-                          <span>{tn("totalWords")}: {(novel.stats?.total_word_count ?? 0).toLocaleString()}</span>
-                          {novel.deleted_at && (
-                            <span>{t("deletedAt")}: {new Date(novel.deleted_at).toLocaleDateString()}</span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="flex gap-2 shrink-0 ml-4">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          isDisabled={actionLoading === novel._id}
-                          onPress={() => handleRestore(novel._id)}
-                        >
-                          {t("restore")}
-                        </Button>
-                        <Button
-                          variant="danger-soft"
-                          size="sm"
-                          isDisabled={actionLoading === novel._id}
-                          onPress={() => handleHardDelete(novel._id, novel.title)}
-                        >
-                          {t("hardDelete")}
-                        </Button>
-                      </div>
+        ) : novels.length === 0 ? (
+          <p role="status" className="py-8 text-center text-sm text-muted">{t("trashEmpty")}</p>
+        ) : (
+          <ul className="space-y-3">
+            {novels.map((novel) => {
+              const action = pending[novel._id];
+              const deletedAt = novel.deleted_at ? new Date(novel.deleted_at) : null;
+              return (
+                <li key={novel._id} className="rounded-lg border border-border p-3 sm:p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1 basis-60">
+                      <h3 className="break-words text-base font-medium text-foreground">{novel.title}</h3>
+                      {novel.genre !== "unclassified" && <p className="mt-1 break-words text-sm text-muted">{novel.genre}</p>}
+                      <dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted">
+                        <div className="flex gap-1"><dt>{tn("chapterCount")}</dt><dd>{format.number(novel.stats?.chapter_count ?? 0)}</dd></div>
+                        <div className="flex gap-1"><dt>{tn("totalWords")}</dt><dd>{format.number(novel.stats?.total_word_count ?? 0)}</dd></div>
+                        {deletedAt && Number.isFinite(deletedAt.getTime()) && (
+                          <div className="flex gap-1"><dt>{t("deletedAt")}</dt><dd>{format.dateTime(deletedAt, { year: "numeric", month: "numeric", day: "numeric" })}</dd></div>
+                        )}
+                      </dl>
                     </div>
-                  </Card.Header>
-                </Card>
-              ))}
-            </div>
-          )}
-        </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" disabled={!!action} onClick={() => void handleAction(novel, "restore")}>
+                        {action === "restore" ? t("restoring") : t("restore")}
+                      </Button>
+                      <Button size="sm" variant="danger" disabled={!!action} onClick={() => void handleAction(novel, "delete")}>
+                        {action === "delete" ? t("hardDeleting") : t("hardDelete")}
+                      </Button>
+                    </div>
+                  </div>
+                  {errors[novel._id] && <p role="alert" className="mt-3 text-sm text-red-700 dark:text-red-300">{t(errors[novel._id] === "restore" ? "restoreFailed" : "hardDeleteFailed")}</p>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </div>
-    </div>
+    </Dialog>
   );
 }

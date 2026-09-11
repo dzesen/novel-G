@@ -93,7 +93,7 @@ class ChapterReviewAuthorization(_ClosedReviewModel):
 
 
 def default_chapter_review_selection() -> ChapterReviewSelection:
-    return ChapterReviewSelection(enforcement="advisory")
+    return ChapterReviewSelection(mode="no_chapters", enforcement="advisory")
 
 
 def review_is_advisory(authorization: ChapterReviewAuthorization | None) -> bool:

@@ -21,6 +21,8 @@ export default function ChapterReviewControls({
   value, onChange, chapters = [], disabled = false,
 }: Props) {
   const t = useTranslations("writing.batch");
+  const hasReviewSelection = value.mode !== "no_chapters"
+    && (value.mode !== "selected_chapters" || value.selected_chapter_ids.length > 0);
   const keyIds = keyReviewChapterIds(chapters);
   const volumeIds = [...new Set(chapters.map((chapter) => chapter.volume_id))];
   return (
@@ -46,13 +48,15 @@ export default function ChapterReviewControls({
       <p id="batch-chapter-review-hint" className="text-xs leading-5 text-warm-700 dark:text-muted">
         {t(value.mode === "no_chapters" ? "chapterReviewNoneHint" : "chapterReviewHint")}
       </p>
-      <ReviewEnforcementControl
-        id="batch-review-enforcement"
-        value={value.enforcement ?? "strict"}
-        onChange={(enforcement) => onChange({ ...value, enforcement })}
-        disabled={disabled}
-        automaticRepair
-      />
+      {hasReviewSelection && (
+        <ReviewEnforcementControl
+          id="batch-review-enforcement"
+          value={value.enforcement ?? "strict"}
+          onChange={(enforcement) => onChange({ ...value, enforcement })}
+          disabled={disabled}
+          automaticRepair
+        />
+      )}
       {(value.mode === "key_chapters" || value.mode === "selected_chapters") && (
         chapters.length === 0 ? (
           <p className="text-xs leading-5 text-warm-700 dark:text-muted">{t("chapterReviewLoadChapters")}</p>

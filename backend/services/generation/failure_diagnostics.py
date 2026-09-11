@@ -31,6 +31,7 @@ from backend.services.generation.chapter_candidate_pipeline import (
     ChapterCandidatePipelineBlocked,
 )
 from backend.services.generation.chapter_repair_policy import RepairComponent
+from backend.services.generation.chapter_completion_certificate import ChapterCompletionFailureFact
 from backend.services.generation.candidate_manual_takeover import (
     parse_candidate_manual_takeover,
 )
@@ -107,6 +108,45 @@ ACTIVE_FAILURE_PAUSE_REASONS = frozenset({
     "source_changed",
     "uncertain_attempt",
 }) | _COMPONENT_REPAIR_PAUSE_REASONS
+
+
+def authorization_pause_detail(job: Mapping[str, Any]) -> str | None:
+    """Display-only cause from the current typed recalculation, never authority."""
+    from backend.services.generation.job_authorization_contracts import (
+        OutlineAuthorizationRecalculationDecisionV1,
+    )
+    if job.get("status") != "paused" or job.get("pause_reason") != "authorization_scope_increased":
+        return None
+    raw = job.get("authorization_confirmation_required")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        decision = OutlineAuthorizationRecalculationDecisionV1.model_validate_json(json.dumps(raw))
+    except (TypeError, ValueError):
+        return None
+    if (not decision.requires_confirmation
+            or decision.chapter_id != str(job.get("current_chapter_id"))
+            or decision.authorization_revision != job.get("authorization_revision")
+            or decision.expected_narrative_revision != job.get("expected_narrative_revision")):
+        return None
+    if decision.exceeded_fields:
+        return "authorization_scope_increased"
+    if (decision.blocked_issue_codes == ("world_baseline_confirmation_required",)
+            and not decision.new_acknowledgement_codes):
+        return "world_baseline_confirmation_required"
+    return "readiness_confirmation_required"
+
+
+def _enrich_authorization_pause(event: Mapping[str, Any], job: Mapping[str, Any]) -> Mapping[str, Any]:
+    reason = authorization_pause_detail(job)
+    if (reason is None or not job.get("current_failure_event_id")
+            or event.get("event_id") != job.get("current_failure_event_id")
+            or str(event.get("chapter_id")) != str(job.get("current_chapter_id"))
+            or event.get("code") not in {"validation_rejected", "readiness_confirmation_required"}):
+        return event
+    category = "source_changed" if reason == "world_baseline_confirmation_required" else "context_or_budget"
+    return {**event, "category": category, "code": reason, "evidence": "confirmed",
+            "impact": "generation_paused_before_commit", "action_codes": ["refresh_generation_readiness"]}
 
 
 def candidate_repair_budget_pause_reason(component: object) -> str | None:
@@ -493,6 +533,8 @@ def _exception_family(chain: Iterable[BaseException]) -> str:
 
 def _diagnostic_outcome(category: str, code: str) -> tuple[str, list[str]]:
     """Map a diagnosis to a stable user-visible impact and recovery actions."""
+    if code in {"world_baseline_confirmation_required", "readiness_confirmation_required"}:
+        return "generation_paused_before_commit", ["refresh_generation_readiness"]
     if category == "model_output_incomplete":
         return (
             "formal_prose_not_written",
@@ -732,6 +774,7 @@ def build_failure_diagnostic(
     chapter_id: str,
     attempts: Iterable[Mapping[str, Any]] = (),
     occurred_at: datetime | None = None,
+    authorization_job: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Classify a runtime failure without retaining prompts, prose, or raw messages."""
     chain = _exception_chain(exc)
@@ -741,6 +784,22 @@ def build_failure_diagnostic(
     evidence = "insufficient"
     details = _attempt_details(attempt_values)
     details["exception_family"] = _exception_family(chain)
+    finalization_fact = next((
+        getattr(item, "failure_fact", None) for item in chain
+        if isinstance(getattr(item, "failure_fact", None), ChapterCompletionFailureFact)
+    ), None)
+    if finalization_fact is not None:
+        # The closed fact preserves the failed boundary, never the raw error or
+        # Pydantic input (which may contain the whole chapter).
+        try:
+            finalization_fact = ChapterCompletionFailureFact.model_validate(finalization_fact.model_dump(mode="python"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            details["finalization_validation"] = {
+                "reason": finalization_fact.reason,
+                "observed_at": finalization_fact.observed_at,
+            }
     boundary_code = next(
         filter(None, (pre_dispatch_boundary_code(item) for item in chain)),
         None,
@@ -799,6 +858,15 @@ def build_failure_diagnostic(
         )
         evidence = "confirmed"
         details.update(_safe_completion(completion))
+    elif any(isinstance(item, ChapterCandidatePipelineBlocked)
+             and item.code == "authorization_scope_increased" for item in chain):
+        category = "context_or_budget"
+        code = authorization_pause_detail({
+            **(authorization_job or {}), "status": "paused", "pause_reason": "authorization_scope_increased",
+        }) or "readiness_confirmation_required"
+        if code == "world_baseline_confirmation_required":
+            category = "source_changed"
+        evidence = "confirmed"
     elif any(
         isinstance(item, ChapterCandidatePipelineBlocked)
         and item.code in _COMPONENT_REPAIR_FAILURE_CODES
@@ -1236,7 +1304,7 @@ def infer_job_diagnostics(job: Mapping[str, Any]) -> list[dict[str, Any]]:
         values = [item for item in persisted if isinstance(item, Mapping)]
         return [
             _enrich_event(
-                _enrich_candidate_checkpoint_failure(item, job=job)
+                _enrich_authorization_pause(_enrich_candidate_checkpoint_failure(item, job=job), job)
                 if index == len(values) - 1
                 else item,
                 job_id=job_id,

@@ -97,6 +97,7 @@ export interface ChapterOutlineResult {
   present_character_card_ids: string[];
   mentioned_character_card_ids: string[];
   referenced_worldbook_card_ids: string[];
+  referenced_faction_card_ids?: string[];
   scenes: Scene[];
   core_conflict: string;
   ending_hook: string;
@@ -112,6 +113,7 @@ export interface StoredChapterOutline {
   present_character_card_ids: string[];
   mentioned_character_card_ids: string[];
   referenced_worldbook_card_ids: string[];
+  referenced_faction_card_ids?: string[];
   scenes: Scene[];
   core_conflict: string;
   ending_hook: string;

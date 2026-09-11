@@ -11,6 +11,8 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 from pydantic import BaseModel
 
 
+from backend.services.llm.stream_lifecycle import closing_stream
+
 CapabilitySource = Literal["http", "job_engine", "agent_runtime", "test"]
 
 
@@ -242,8 +244,9 @@ class CapabilityRegistry:
         raw_events = await definition.handler.stream(request, context, call)
 
         async def validated_events() -> AsyncIterator[BaseModel]:
-            async for event in raw_events:
-                yield definition.event_schema.model_validate(event)
+            async with closing_stream(raw_events):
+                async for event in raw_events:
+                    yield definition.event_schema.model_validate(event)
 
         return CapabilityStream(
             events=validated_events(),

@@ -585,12 +585,17 @@ async def _handle_candidate_chapter_failure(
 
     chapter_id = str(chapter["_id"])
     attempts = list(getattr(exc, "attempts", []) or [])
+    authorization_job = (
+        await repo.get_job(job_id)
+        if getattr(exc, "code", None) == "authorization_scope_increased" else None
+    )
     diagnostic = build_failure_diagnostic(
         exc,
         step="candidate_pipeline",
         chapter_id=chapter_id,
         attempts=attempts,
         occurred_at=get_utc_now(),
+        authorization_job=authorization_job,
     )
     await _persist_diagnostic(repo, job_id, diagnostic)
     budget_pause_reason = _pre_dispatch_pause_reason(diagnostic.get("code"))
@@ -617,7 +622,10 @@ async def _handle_candidate_chapter_failure(
     adherence_manual_review = (
         candidate_code == "candidate_adherence_manual_review"
     )
-    source_changed = diagnostic["category"] == "source_changed"
+    source_changed = (
+        diagnostic["category"] == "source_changed"
+        and not authorization_scope_increased
+    )
     source_changed = source_changed or (
         candidate_code == "candidate_narrative_revision_changed"
     )
@@ -1243,9 +1251,11 @@ async def run_job(job_id: str, deps: JobEngineDeps, control: JobControl, *, repo
                         deps.guard_book_completion_publication,
                     )
                     return
+                # Resume and chapter-completion commands already clear the
+                # failure pointer atomically; a leased runtime patch cannot.
                 await repo.update_job_fields(job_id, {
                     "status": "completed", "current_chapter_id": None,
-                    "current_failure_event_id": None, "active_slot": None,
+                    "active_slot": None,
                 })
                 return
 

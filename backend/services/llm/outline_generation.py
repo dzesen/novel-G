@@ -6,7 +6,9 @@ from collections.abc import Mapping
 from typing import Any
 
 
-CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS = 20_000
+# Reasoning providers count thinking and visible JSON against one output limit.
+# Keep the visible outline/context limits separate from this bounded call budget.
+CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS = 64_000
 CHAPTER_OUTLINE_CONTEXT_TOKEN_BUDGET = 20_000
 
 

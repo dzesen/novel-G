@@ -144,6 +144,15 @@ export default function OutlineFieldsEditor({
         />
         <RosterPicker
           mode="multi"
+          label={t("fieldFactions")}
+          options={roster.factions}
+          value={value.referenced_faction_card_ids ?? []}
+          onChange={(next) => onChange({ referenced_faction_card_ids: next as string[] })}
+          emptyText={t("factionRosterEmpty")}
+        />
+        <p className="text-xs leading-5 text-muted">{t("factionSelectionHint")}</p>
+        <RosterPicker
+          mode="multi"
           label={t("fieldThreadsResolved")}
           options={roster.threads}
           value={value.threads_resolved}

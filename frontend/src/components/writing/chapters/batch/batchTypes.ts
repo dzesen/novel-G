@@ -23,6 +23,13 @@ export type PauseReason =
   | "reference_card_auto_creation_recovery"
   | "reference_card_repair_exhausted"
   | "final_audit"
+  | "outline_adherence_manual_review" | "repair_not_converged"
+  | "repair_budget_exhausted_provider_technical_retry"
+  | "repair_budget_exhausted_adherence_judge_retry"
+  | "repair_budget_exhausted_state_reextraction"
+  | "repair_budget_exhausted_local_prose_repair"
+  | "repair_budget_exhausted_scene_regeneration"
+  | "repair_budget_exhausted_outline_rollback"
   | null;
 
 export type BookCompletionIssueCategory =
@@ -539,6 +546,20 @@ export interface GenerationDiagnosticsSummary {
   recent_events: Array<GenerationDiagnostic & { job_id: string }>;
 }
 
+export interface GenerationStageEvent {
+  id: string;
+  kind: "request" | "chapter_complete" | "job_status";
+  stage: "outline" | "prose" | "state" | "review" | "other" | "completion" | "job";
+  status: "running" | "settled" | "uncertain" | "completed" | "paused" | "failed" | "interrupted" | "aborted";
+  phase?: "primary" | "repair" | "text" | "other" | null;
+  chapter_id?: string | null;
+  order_index?: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  tokens?: number | null;
+  retry_index?: number | null;
+}
+
 export interface GenerationJob {
   _id: string;
   novel_id: string;
@@ -550,10 +571,12 @@ export interface GenerationJob {
   detail_version?: string;
   progress_count?: number;
   progress_chapter_count?: number;
+  completed_chapter_count?: number;
   scope: "volume" | "book" | "interactive_completion";
   volume_id: string | null;
   status: JobStatus;
   pause_reason: PauseReason;
+  pause_reason_detail?: "authorization_scope_increased" | "world_baseline_confirmation_required" | "readiness_confirmation_required" | null;
   checkpoint_interval: number | null;
   outline_deviation_policy?: OutlineDeviationPolicy;
   generation_params?: JobGenerationParams;
@@ -562,6 +585,8 @@ export interface GenerationJob {
   tokens_reserved?: number;
   current_chapter_id: string | null;
   progress: GenerationJobProgress[];
+  stage_history?: GenerationStageEvent[];
+  stage_history_total?: number;
   last_checkpoint_index: number;
   error: JobError | null;
   diagnostics?: GenerationDiagnostic[];
@@ -583,7 +608,7 @@ export interface GenerationJob {
 /** Bounded read view. It never contains chapter candidates or execution inputs. */
 export interface GenerationJobSummary extends Pick<GenerationJob,
   "_id" | "novel_id" | "root_job_id" | "parent_job_id" | "job_kind"
-  | "scope" | "volume_id" | "status" | "pause_reason" | "token_budget"
+  | "scope" | "volume_id" | "status" | "pause_reason" | "pause_reason_detail" | "token_budget"
   | "tokens_used" | "tokens_reserved" | "current_chapter_id"
   | "usage_attempt_capacity" | "usage_attempt_claimed" | "has_uncertain_attempts"
   | "current_stage" | "created_at" | "updated_at" | "related_prose_run_ids"

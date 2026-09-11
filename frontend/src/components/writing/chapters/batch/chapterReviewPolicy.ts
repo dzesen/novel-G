@@ -25,7 +25,7 @@ export interface ChapterReviewAuthorization {
 export function initialChapterReviewSelection(): ChapterReviewSelection {
   return {
     schema_version: "chapter_review_selection.v1",
-    mode: "key_chapters",
+    mode: "no_chapters",
     selected_chapter_ids: [],
     review_after_prose_repair: true,
     enforcement: "advisory",

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -22,6 +23,7 @@ from pydantic import (
     field_validator,
 )
 
+from backend.services.llm.stream_lifecycle import closing_stream
 from backend.llm.exceptions import (
     LLMAuthError,
     LLMConnectionError,
@@ -105,6 +107,8 @@ from backend.services.generation.independent_outline_review import (
     safe_independent_review_diagnostics,
 )
 from backend.services.generation.prose_runs import prose_revision, prose_run_module
+from backend.services.novel.state_fact_accounting import normalize_state_provider_result, validate_state_provider_evidence
+from backend.services.novel.state_evidence_catalog import render_state_evidence_source
 from backend.services.generation.protected_generation_params import (
     validate_protected_generation_params,
 )
@@ -149,6 +153,10 @@ from backend.services.llm.workflow_service import (
 from backend.services.llm.outline_generation import (
     chapter_outline_generation_kwargs,
 )
+from backend.services.generation.state_response_records import (
+    STATE_RESPONSE_RECORD_MAX_BYTES,
+    StateResponseRecording,
+)
 from backend.services.llm.workflow_runner import (
     WorkflowDeps,
     WorkflowFailed,
@@ -164,6 +172,8 @@ from backend.services.novel.legacy_chapter_completion import (
     LegacyChapterCompletionProof,
     verify_legacy_chapter_completion_for_state,
 )
+from backend.services.generation.author_prose_confirmation import verify_author_prose_confirmation
+from backend.services.generation.chapter_completion_certificate import ChapterCompletionCertificate
 from backend.services.novel.state_completion import (
     chapter_content_digest,
     prose_is_eligible_for_state,
@@ -488,12 +498,21 @@ CHAPTER_STATE_STEPS: tuple[WorkflowStep, ...] = (
         key=STATE_STEP,
         schema=ChapterStateResultSchema,
         agent_id="continuity_editor",
+        result_normalizer=lambda value, ctx: normalize_state_provider_result(
+            value, chapter_id=str(ctx.params["chapter_id"]), prose=str(ctx.params["chapter_content"]),
+            allow_source_references=ctx.params.get("state_source_references_enabled") is True,
+        ),
+        result_validator=lambda value, ctx: validate_state_provider_evidence(
+            value, prose=str(ctx.params["chapter_content"]), chapter_id=str(ctx.params["chapter_id"]),
+            require_action_coverage=ctx.params.get("require_state_action_coverage") is True,
+            planned_thread_ids=ctx.params.get("planned_thread_ids") or (),
+        ),
         prompt_args=lambda ctx: {
             "context": ctx.params["context"],
             "chapter_id": ctx.params["chapter_id"],
             "chapter_order": ctx.params["chapter_order"],
             "chapter_title": ctx.params["chapter_title"],
-            "chapter_content": ctx.params["chapter_content"],
+            "chapter_content": ctx.params.get("chapter_content_for_prompt", ctx.params["chapter_content"]),
         },
     ),
 )
@@ -756,6 +775,7 @@ class StateGenerationCommand(_ChapterGenerationCommand):
     job_mutation_binding: JobMutationRecoveryBindingV1 | None = None
     required_state_generation_binding: RequiredStateGenerationBinding | None = None
     request_id: str | None = None
+    candidate_job_id: str | None = None
     is_disconnected: Callable[[], Awaitable[bool]] | None = None
 
 
@@ -1221,6 +1241,7 @@ class ChapterGenerationApplicationService:
         roster = outline_selection_roster(
             inputs["roster"],
             context.selectable_worldbook_card_ids,
+            context.selectable_faction_card_ids,
         )
         generation_values = dict(command.generation_params or {})
         gen_kwargs = {
@@ -1440,13 +1461,32 @@ class ChapterGenerationApplicationService:
             legacy_source_run_id = (
                 legacy_proof.source_prose_run_id
                 if isinstance(legacy_proof, LegacyChapterCompletionProof)
-                else str(acceptance.get("source_run_id") or "") or None
+                else None
             )
             legacy_source_run_revision = (
                 legacy_proof.source_prose_run_revision
                 if isinstance(legacy_proof, LegacyChapterCompletionProof)
                 else None
             )
+            if candidate is None and prose_acceptance_state(chapter) == "author_confirmed":
+                confirmation = verify_author_prose_confirmation(
+                    chapter, content_digest=chapter_content_digest(chapter.get("content")),
+                )
+                legacy_source_run_id = confirmation.source_run_id
+                legacy_source_run_revision = confirmation.source_run_revision
+            elif (
+                candidate is None
+                and prose_acceptance_state(chapter) == "ai_complete"
+                and isinstance(acceptance.get("chapter_completion_certificate"), Mapping)
+            ):
+                # Eligibility above already verified this persisted certificate.
+                # Read the pair from the proof, never from mutable run state or
+                # an acceptance projection that may omit the revision.
+                certificate = ChapterCompletionCertificate.model_validate(
+                    acceptance["chapter_completion_certificate"],
+                )
+                legacy_source_run_id = certificate.source_binding.prose_run_id
+                legacy_source_run_revision = certificate.source_binding.prose_run_revision
 
             snapshot = await self._deps.state_proposals.capture(
                 command.novel_id,
@@ -1479,6 +1519,13 @@ class ChapterGenerationApplicationService:
             )
             binding = command.job_mutation_binding
             required_binding = command.required_state_generation_binding
+            if command.candidate_job_id is not None and (
+                command.authority is not AcceptanceAuthority.SYSTEM
+                or command.acceptance_timing is not AcceptanceTiming.DEFERRED
+                or candidate is None or binding is not None or required_binding is not None
+                or not command.request_id
+            ):
+                raise ValueError("候选状态保留必须绑定作业的非正式状态请求")
             if binding is not None and required_binding is not None:
                 raise ValueError("状态生成不能同时携带正式 mutation 与非正式 successor 绑定")
             if binding is not None and (
@@ -1556,12 +1603,20 @@ class ChapterGenerationApplicationService:
                     ),
                 },
                 required_state_generation_binding=required_binding,
+                **({"candidate_job_id": command.candidate_job_id} if command.candidate_job_id else {}),
             )
             inputs = await self._deps.fetch_context_inputs(
                 command.novel_id,
                 command.chapter_id,
             )
-            context = self._deps.assemble_context(inputs)
+            planned_thread_ids = list(dict.fromkeys(
+                str(thread_id) for thread_id in
+                (chapter.get("outline") or {}).get("threads_resolved") or []
+            ))
+            available_thread_ids = {str(t["id"]) for t in inputs["roster"].get("threads") or []}
+            if not set(planned_thread_ids).issubset(available_thread_ids):
+                raise ValueError("计划回收的伏笔不在当前正式名单中，请先复核细纲引用")
+            context = self._deps.assemble_context({**inputs, "state_extraction": True})
             context_text = context.to_prompt_text()
             await self._deps.state_proposals.record_pre_dispatch_projection(
                 lease,
@@ -1602,9 +1657,10 @@ class ChapterGenerationApplicationService:
                 or getattr(provider_config, "max_tokens", None)
                 or 4096
             )
+            source_for_prompt = render_state_evidence_source(content)
             estimated_input = self._deps.estimate_tokens(
                 context_text
-            ) + self._deps.estimate_tokens(content)
+            ) + self._deps.estimate_tokens(source_for_prompt)
             max_context_tokens = int(
                 getattr(provider_config, "max_context_tokens", 128000)
             )
@@ -1652,6 +1708,10 @@ class ChapterGenerationApplicationService:
                     "chapter_order": int(chapter.get("order_index") or 0),
                     "chapter_title": str(chapter.get("title") or ""),
                     "chapter_content": content,
+                    "chapter_content_for_prompt": source_for_prompt,
+                    "state_source_references_enabled": True,
+                    "planned_thread_ids": planned_thread_ids,
+                    "require_state_action_coverage": command.candidate_job_id is not None,
                 },
                 gen_kwargs=gen_kwargs,
                 runtime=runtime,
@@ -1676,6 +1736,12 @@ class ChapterGenerationApplicationService:
                 data=prepared.truncation,
             )
         command = prepared.command
+        request_id = command.request_id or uuid4().hex[:8]
+        recording = StateResponseRecording(
+            request_id=request_id, novel_id=command.novel_id, chapter_id=command.chapter_id,
+            proposal_id=str(prepared.lease.proposal_id),
+            source_content_digest=chapter_content_digest(str(prepared.params["chapter_content"])),
+        )
         await self._deps.state_proposals.mark_dispatched(prepared.lease)
         frames = self._deps.run_workflow(
             workflow_name=STATE_WORKFLOW,
@@ -1685,7 +1751,11 @@ class ChapterGenerationApplicationService:
                 {},
             ),
             params=prepared.params,
-            gen_kwargs=prepared.gen_kwargs,
+            gen_kwargs={
+                **prepared.gen_kwargs,
+                "structured_response_observer": recording.observe,
+                "max_structured_response_record_bytes": STATE_RESPONSE_RECORD_MAX_BYTES,
+            },
             cached={},
             deps=WorkflowDeps(
                 runtime=prepared.runtime,
@@ -1695,7 +1765,7 @@ class ChapterGenerationApplicationService:
                     else {}
                 ),
             ),
-            request_id=command.request_id or uuid4().hex[:8],
+            request_id=request_id,
             is_disconnected=command.is_disconnected,
             log_partial_on_disconnect=self._deps.log_partial_on_disconnect,
         )
@@ -1708,64 +1778,84 @@ class ChapterGenerationApplicationService:
         )
         dropped: dict[str, Any] = {}
         remapped: list[dict[str, Any]] = []
-        async for frame in preview:
-            parsed = parse_sse_event(frame)
-            if parsed is None:
-                yield ChapterGenerationEvent(name="keepalive", data={})
-                continue
-            name, raw_data = parsed
-            data = dict(raw_data)
-            if name == "id_validation":
-                dropped = dict(data.get("dropped") or {})
-                yield ChapterGenerationEvent(name=name, data=data)
-                continue
-            if name == "id_remapping":
-                remapped = list(data.get("remapped") or [])
-                yield ChapterGenerationEvent(name=name, data=data)
-                continue
-            proposal = _extract_state_proposal(name, data)
-            if proposal is None:
-                if name == "done" and not data.get("success"):
-                    data.setdefault(
-                        "attempts",
-                        _serialize_attempts(prepared.runtime),
-                    )
-                yield ChapterGenerationEvent(name=name, data=data)
-                continue
+        terminal_delivered = False
+        try:
+            async with closing_stream(preview):
+                async for frame in preview:
+                    parsed = parse_sse_event(frame)
+                    if parsed is None:
+                        yield ChapterGenerationEvent(name="keepalive", data={})
+                        continue
+                    name, raw_data = parsed
+                    data = dict(raw_data)
+                    if name == "done":
+                        terminal_delivered = True
+                    if name == "id_validation":
+                        dropped = dict(data.get("dropped") or {})
+                        yield ChapterGenerationEvent(name=name, data=data)
+                        continue
+                    if name == "id_remapping":
+                        remapped = list(data.get("remapped") or [])
+                        yield ChapterGenerationEvent(name=name, data=data)
+                        continue
+                    proposal = _extract_state_proposal(name, data)
+                    if proposal is None:
+                        if name == "done" and not data.get("success"):
+                            data.setdefault(
+                                "attempts",
+                                _serialize_attempts(prepared.runtime),
+                            )
+                        yield ChapterGenerationEvent(name=name, data=data)
+                        continue
 
-            if name != "done":
-                yield ChapterGenerationEvent(name=name, data=data)
-                continue
-            acceptance: dict[str, Any] = {}
-            accepted = False
-            if (
-                command.authority is AcceptanceAuthority.SYSTEM
-                and command.acceptance_timing is AcceptanceTiming.IMMEDIATE
-            ):
-                acceptance = await self._deps.state_proposals.run_auto(
-                    chapter_id=command.chapter_id,
-                    proposal=proposal,
-                    policy=FactAccountingPolicy(),
-                    job_mutation_binding=command.job_mutation_binding,
+                    if name != "done":
+                        yield ChapterGenerationEvent(name=name, data=data)
+                        continue
+                    acceptance: dict[str, Any] = {}
+                    accepted = False
+                    if (
+                        command.authority is AcceptanceAuthority.SYSTEM
+                        and command.acceptance_timing is AcceptanceTiming.IMMEDIATE
+                    ):
+                        acceptance = await self._deps.state_proposals.run_auto(
+                            chapter_id=command.chapter_id,
+                            proposal=proposal,
+                            policy=FactAccountingPolicy(),
+                            job_mutation_binding=command.job_mutation_binding,
+                        )
+                        accepted = True
+                    usage = dict(data.get("usage") or {})
+                    result = ChapterGenerationResult(
+                        stage=ChapterGenerationStage.STATE,
+                        value=proposal,
+                        usage=usage,
+                        attempts=_serialize_attempts(prepared.runtime),
+                        truncation=prepared.truncation,
+                        dropped=dropped,
+                        remapped=remapped,
+                        acceptance=dict(acceptance or {}),
+                        accepted=accepted,
+                    )
+                    yield ChapterGenerationEvent(
+                        name=name,
+                        data=data,
+                        result=result,
+                    )
+        except (asyncio.CancelledError, GeneratorExit):
+            if terminal_delivered:
+                raise
+            # The preview has closed its workflow/provider before this audit.
+            # Preserve known primary usage even if a later correction is lost.
+            with anyio.move_on_after(5, shield=True):
+                await self._deps.state_proposals.record_generation_audit(
+                    prepared.lease,
+                    {
+                        "usage": _runtime_usage(prepared.runtime),
+                        "attempts": _serialize_attempts(prepared.runtime),
+                        "uncertain_attempt_count": getattr(prepared.runtime, "uncertain_attempt_count", 0),
+                    },
                 )
-                accepted = True
-            usage = dict(data.get("usage") or {})
-            result = ChapterGenerationResult(
-                stage=ChapterGenerationStage.STATE,
-                value=proposal,
-                usage=usage,
-                attempts=_serialize_attempts(prepared.runtime),
-                truncation=prepared.truncation,
-                dropped=dropped,
-                remapped=remapped,
-                acceptance=dict(acceptance or {}),
-                accepted=accepted,
-            )
-            yield ChapterGenerationEvent(
-                name=name,
-                data=data,
-                result=result,
-            )
+            raise
 
     async def _prepare_outline_adherence(
         self,
@@ -2317,6 +2407,7 @@ class ChapterGenerationApplicationService:
                     chapter_id=command.chapter_id,
                     outline=outline,
                     context_text=context.to_prompt_text(),
+                    generation_job_id=command.generation_job_id,
                 )
             if active is not None:
                 stored_protocol = str(
@@ -2468,6 +2559,14 @@ class ChapterGenerationApplicationService:
                     "success": False,
                     "error": str(exc),
                     "completion_status": "stale",
+                    # begin() only creates/claims the local draft. No Provider
+                    # executor has started, so this failure has zero new usage.
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "attempts": [],
                 },
             )
             return

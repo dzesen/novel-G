@@ -1,15 +1,9 @@
-import { setRequestLocale } from "next-intl/server";
 import SettingsContent from "@/components/settings/SettingsContent";
+import { prepareLocalePage, type LocalePageProps } from "@/i18n/pageLocale";
 
 export const dynamic = "force-dynamic";
 
-export default async function SettingsModalPage({
-  params,
-}: {
-  params: Promise<{ locale: string }>;
-}) {
-  const { locale } = await params;
-  setRequestLocale(locale);
-
+export default async function SettingsModalPage({ params }: LocalePageProps) {
+  await prepareLocalePage(params);
   return <SettingsContent presentation="modal" />;
 }

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>novel-G</title>
+  <rect width="32" height="32" rx="7" fill="#292b28"/>
+  <g transform="translate(2 2)" fill="none" stroke="#f5f4f0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 23V6h5l8 14V5h5M5 23h5V9M18 20v3h5"/>
+  </g>
+</svg>

@@ -763,18 +763,27 @@ class GenerationReadinessModule:
         try:
             if invalid_scale:
                 raise InvalidNovelScale("Novel scale must be corrected before generation")
+            # Stored chapter stubs do not carry the novel's word target. Feed
+            # planning the same fallback as prose execution, without changing
+            # persisted chapters or an already authorized job's snapshot.
+            planning_chapters = (
+                [{**chapter, "words_per_chapter": scale["words_per_chapter"]}
+                 for chapter in chapters]
+                if isinstance(scale, Mapping) and scale.get("words_per_chapter")
+                else chapters
+            )
             planning_generation_params = generation_params
             needs_prose = work["steps"]["prose"]["generate"] > 0
             if needs_prose and self._deps.prepare_generation_params is not None:
                 planning_generation_params = await self._deps.prepare_generation_params(
                     novel_id,
-                    chapters,
+                    planning_chapters,
                     continuation_policy,
                     generation_params,
                 )
             if has_chapter_work:
                 planning = self._deps.plan_work(
-                    chapters,
+                    planning_chapters,
                     continuation_policy,
                     planning_generation_params,
                 )

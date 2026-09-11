@@ -974,12 +974,20 @@ class ProseRunModule:
         chapter_id: str,
         outline: dict[str, Any],
         context_text: str,
+        generation_job_id: str | None = None,
     ) -> dict[str, Any] | None:
         active = await prose_run_repo.find_active(
             chapter_id=chapter_id,
             owner_id=owner_id,
         )
         if active is None:
+            return None
+        if (
+            generation_job_id is not None
+            and str(active.get("generation_job_id") or "") != generation_job_id
+        ):
+            # A new Job starts its own candidate. Never silently attach it to
+            # another Job's draft or mark that draft stale while inspecting it.
             return None
         if (
             active.get("outline_revision") != prose_revision(outline)
@@ -1105,6 +1113,35 @@ class ProseRunModule:
         """Return one owned run's metadata without exposing prose or prompts."""
         run = await prose_run_repo.get_run(run_id, owner_id)
         return serialize_prose_run_telemetry(run)
+
+    async def inspect_retained_draft(
+        self,
+        *,
+        owner_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Read an exact historical draft, including completed stale candidates.
+
+        Unlike unfinished leftovers, this lookup does not filter on the old
+        completion gate. Reading it never restores authorization or changes status.
+        """
+        run = await prose_run_repo.get_run(run_id, owner_id)
+        if run.get("status") not in {"stale", "superseded"}:
+            return None
+        return {
+            "run_id": str(run["_id"]),
+            "novel_id": str(run["novel_id"]),
+            "chapter_id": str(run["chapter_id"]),
+            "revision": int(run.get("revision") or 0),
+            "status": str(run["status"]),
+            "assembled_text": prose_run_draft_text(run),
+            "completion": dict(run["completion"]) if run.get("completion") else None,
+            "reason_codes": _leftover_reason_codes(run),
+            "has_uncertain_attempt": _run_has_uncertain_attempt(run),
+            "can_resume": False,
+            "can_accept_partial": False,
+            "can_discard": not _run_has_live_lease(run),
+        }
 
     async def load_candidate_text_for_validation(
         self,

@@ -86,11 +86,11 @@ from backend.services.llm.generation_runtime import (
     render_structured_byte_budget_regeneration_prompt,
     render_structured_repair_prompt,
 )
-from backend.services.llm.outline_generation import (
-    CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS,
-)
 from backend.services.novel.style_controls import render_style_controls
 
+
+# Preserve the versioned sample limit independently of production defaults.
+FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS = 20_000
 
 SUCCESSOR_ACCEPTANCE_SAMPLE_ID = "successor-representative-3000-v1"
 SUCCESSOR_ACCEPTANCE_PROTOCOL_REVISION = (
@@ -234,13 +234,13 @@ class SuccessorOutlineStageAuthorization(_Closed):
     byte_regeneration_input_tokens_per_chapter: int = Field(ge=1, le=_MAX)
     maximum_input_tokens_per_attempt: int = Field(ge=1, le=_MAX)
     maximum_output_tokens_per_attempt: Literal[20000] = (
-        CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS
+        FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS
     )
     maximum_semantic_attempts_per_chapter: Literal[2] = 2
     maximum_provider_attempts_total: Literal[6] = 6
     maximum_input_tokens_total: int = Field(ge=1, le=_MAX)
     maximum_output_tokens_total: Literal[120000] = (
-        CHAPTER_COUNT * 2 * CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS
+        CHAPTER_COUNT * 2 * FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS
     )
     maximum_tokens_total: int = Field(ge=1, le=_MAX)
     maximum_serial_seconds_total: Literal[1800] = (
@@ -272,7 +272,7 @@ class SuccessorOutlineStageAuthorization(_Closed):
             or plan.reviewer_alias is not None
             or plan.timeout_seconds != OUTLINE_TIMEOUT_SECONDS
             or plan.max_semantic_attempts != 2
-            or plan.max_output_tokens != CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS
+            or plan.max_output_tokens != FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS
             or self.maximum_input_tokens_per_attempt
             != max(
                 self.primary_input_tokens_per_chapter,
@@ -769,7 +769,7 @@ def _outline_stage(
         or plan.max_semantic_attempts != 2
         or plan.timeout_seconds != OUTLINE_TIMEOUT_SECONDS
         or plan.max_output_tokens is None
-        or plan.max_output_tokens < CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS
+        or plan.max_output_tokens < FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS
         or plan.mode
         not in {
             StructuredOutputMode.PROMPT_JSON,
@@ -779,7 +779,7 @@ def _outline_stage(
         raise ValueError("successor_acceptance_outline_plan_unsupported")
     dispatch_plan: GenerationPlan = replace(
         plan,
-        max_output_tokens=CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS,
+        max_output_tokens=FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS,
     )
     snapshot = RequiredGenerationPlanSnapshot.freeze(
         dispatch_plan,
@@ -809,7 +809,7 @@ def _outline_stage(
         maximum_input_tokens_total=CHAPTER_COUNT * (primary + secondary),
         maximum_tokens_total=(
             CHAPTER_COUNT * (primary + secondary)
-            + CHAPTER_COUNT * 2 * CHAPTER_OUTLINE_MAX_OUTPUT_TOKENS
+            + CHAPTER_COUNT * 2 * FIXED_ACCEPTANCE_OUTLINE_MAX_OUTPUT_TOKENS
         ),
     )
 
@@ -1166,6 +1166,7 @@ def validate_required_book_successor_acceptance_outline(
         and outline.get("present_character_card_ids") == []
         and outline.get("mentioned_character_card_ids") == []
         and outline.get("referenced_worldbook_card_ids") == []
+        and not outline.get("referenced_faction_card_ids")
         and outline.get("threads_resolved") == []
         and outline.get("new_threads") == []
         and outline.get("new_reference_card_candidates") == []

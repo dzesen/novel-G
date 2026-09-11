@@ -8,9 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from bson import json_util
+from bson import ObjectId, json_util
 
 from backend.config import get_config_value
+from backend.db.maintenance import database_operation
+from backend.services.backup.restore_authority import (
+    BackupRestoreBusyError, assert_restore_quiescent, retire_restored_authority,
+)
 from backend.db.collections import (
     AGENT_DEFINITIONS,
     AGENT_REVISION_PROPOSALS,
@@ -267,18 +271,23 @@ def _record_restore_report(payload: Dict[str, Any]) -> None:
         logger.warning("Unable to write the local restore report.", exc_info=True)
 
 
-async def create_backup_snapshot() -> Dict[str, Any]:
+@database_operation(snapshot=True)
+async def create_backup_snapshot(*, validate_structure: bool = True) -> Dict[str, Any]:
     db = get_database()
     collections: Dict[str, list[dict]] = {}
     for collection_name in BACKUP_COLLECTIONS:
         collections[collection_name] = await db[collection_name].find({}).to_list(length=None)
     await _supplement_remediation_receipt_snapshot(db, collections)
-    return {
+    snapshot = {
         "format": BACKUP_FORMAT,
         "version": BACKUP_VERSION,
         "created_at": _utc_now(),
         "collections": collections,
     }
+
+    if validate_structure:
+        validate_backup_payload(snapshot)
+    return snapshot
 
 
 def serialize_backup(snapshot: Dict[str, Any], *, indent: int | None = 2) -> str:
@@ -293,6 +302,30 @@ def parse_backup(content: bytes) -> Dict[str, Any]:
     except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError("Backup file is not valid UTF-8 JSON") from exc
     return validate_backup_payload(payload)
+
+
+def _validate_core_structure_snapshot(collections: dict) -> None:
+    indexes = {}
+    for name in (NOVELS, VOLUMES, CHAPTERS):
+        index = {}
+        for row in collections.get(name, []):
+            identity = row.get("_id")
+            if not isinstance(identity, ObjectId) or identity in index:
+                raise ValueError(f"Backup collection '{name}' contains an invalid or duplicate _id")
+            index[identity] = row
+        indexes[name] = index
+    for volume in indexes[VOLUMES].values():
+        if not isinstance(volume.get("novel_id"), ObjectId) or volume["novel_id"] not in indexes[NOVELS]:
+            raise ValueError("Backup volume references a missing novel")
+    for chapter in indexes[CHAPTERS].values():
+        volume_id = chapter.get("volume_id")
+        volume = indexes[VOLUMES].get(volume_id) if isinstance(volume_id, ObjectId) else None
+        if volume is None:
+            raise ValueError("Backup chapter references a missing volume")
+        if (not isinstance(chapter.get("novel_id"), ObjectId)
+                or chapter["novel_id"] not in indexes[NOVELS]
+                or chapter["novel_id"] != volume.get("novel_id")):
+            raise ValueError("Backup chapter and volume must belong to the same existing novel")
 
 
 def validate_backup_payload(payload: Any) -> Dict[str, Any]:
@@ -311,6 +344,7 @@ def validate_backup_payload(payload: Any) -> Dict[str, Any]:
     for name, documents in collections.items():
         if not isinstance(documents, list) or any(not isinstance(item, dict) for item in documents):
             raise ValueError(f"Backup collection '{name}' must contain a document list")
+    _validate_core_structure_snapshot(collections)
     _validate_remediation_receipt_snapshot(collections)
     return payload
 
@@ -324,15 +358,22 @@ async def _replace_database_collections(collections: Dict[str, list[dict]]) -> N
             await db[collection_name].insert_many(documents)
 
 
+@database_operation(write=True, finish_on_cancel=True)
 async def restore_backup(payload: Dict[str, Any]) -> Dict[str, Any]:
     validated = validate_backup_payload(payload)
     if validated.get("scope") == "novel":
         raise ValueError("A single-novel export cannot replace the full database")
-    safety_snapshot = await create_backup_snapshot()
+    # Preserve even a structurally damaged current database before restoring a valid backup.
+    safety_snapshot = await create_backup_snapshot(validate_structure=False)
+    now = _utc_now()
+    assert_restore_quiescent(safety_snapshot["collections"], now)
+    restored_collections = retire_restored_authority(
+        validated["collections"], safety_snapshot["collections"], now,
+    )
     safety_path = await save_snapshot_file(safety_snapshot, prefix="pre-restore")
     try:
-        await _replace_database_collections(validated["collections"])
-    except Exception as exc:
+        await _replace_database_collections(restored_collections)
+    except BaseException as exc:
         logger.exception("Backup restore failed; restoring the pre-restore safety snapshot.")
         await _replace_database_collections(safety_snapshot["collections"])
         _record_restore_report(
@@ -453,6 +494,7 @@ async def build_novel_text(novel_id: str) -> tuple[str, str]:
     return filename, "\n".join(lines).strip() + "\n"
 
 
+@database_operation(snapshot=True)
 async def build_novel_backup(novel_id: str) -> Dict[str, Any]:
     novel = await novel_repo.get_novel_by_id(novel_id)
     db = get_database()
@@ -464,10 +506,13 @@ async def build_novel_backup(novel_id: str) -> Dict[str, Any]:
             {"novel_id": novel["_id"]}
         ).to_list(length=None)
     await _supplement_remediation_receipt_snapshot(db, exported)
-    return {
+    snapshot = {
         "format": BACKUP_FORMAT,
         "version": BACKUP_VERSION,
         "scope": "novel",
         "created_at": _utc_now(),
         "collections": exported,
     }
+
+    validate_backup_payload(snapshot)
+    return snapshot

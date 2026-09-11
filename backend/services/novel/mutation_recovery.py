@@ -89,7 +89,10 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         reference_card_dependency_repair_service,
     )
 
+    from backend.services.novel.faction_mutations import FACTION_MUTATION, execute_faction_mutation
+
     callbacks: dict[tuple[str, int], MutationExecutor] = {
+        (FACTION_MUTATION, 1): execute_faction_mutation,
         ("accept_chapter_outline", 1): ChapterService._execute_accept_chapter_outline,
         ("accept_chapter_state", 1): ChapterStateService._execute_accept_chapter_state,
         ("accept_prose_run", 1): ProseRunModule._execute_accept,
@@ -165,6 +168,7 @@ def _executors() -> dict[tuple[str, int], MutationHandlerSpec[Any]]:
         "apply_card_import_proposal",
     }
     persistent_fence_operations = {
+        FACTION_MUTATION,
         AUTO_CREATE_MUTATION_NAME,
         AUTO_CARD_REVERT_MUTATION_NAME,
         REFERENCE_CARD_REPAIR_MUTATION_NAME,

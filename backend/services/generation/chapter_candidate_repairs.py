@@ -1486,6 +1486,7 @@ class ChapterCandidateRepairApplication:
             generation_params=self._generation_params,
             generation_plan=state_plan,
             request_id=str(receipt["_id"]),
+            candidate_job_id=self._execution_id,
             repair_guidance=StateRepairGuidance(
                 cycle=request.cycle,
                 prior_proposal_id=request.proposal_id,

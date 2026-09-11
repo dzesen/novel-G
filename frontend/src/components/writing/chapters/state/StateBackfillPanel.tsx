@@ -6,6 +6,8 @@ import { Button } from "@heroui/react";
 import { apiPost } from "@/lib/api";
 import { useOutlineStream } from "../outline/useOutlineStream";
 import { useRoster } from "../outline/useRoster";
+import ReviewValidationDetails from "../prose/ReviewValidationDetails";
+import { reviewValidationGroups } from "../prose/reviewValidationPresentation";
 import {
   ContextNotices,
   Field,
@@ -69,6 +71,8 @@ export function StateBackfillPanel({
   const stream = useOutlineStream<ChapterStateResult>({
     path: "/api/llm/extract-chapter-state-by-ai",
     stepKey: "chapter_state",
+    // The backend sends heartbeats while the Provider is working.
+    idleTimeoutMs: 60_000,
   });
 
   const [checkedFacts, setCheckedFacts] = useState<Set<string>>(new Set());
@@ -87,11 +91,13 @@ export function StateBackfillPanel({
     setCheckedFacts(new Set());
     setCheckedCharacters(new Set(
       stream.result.character_updates
+        .filter((item) => item.selection_id && stream.result?.selection_policy?.[item.selection_id]?.eligible === true)
         .map((item) => item.selection_id)
         .filter((id): id is string => Boolean(id))
     ));
     setCheckedThreads(new Set(
       stream.result.thread_updates
+        .filter((item) => item.selection_id && stream.result?.selection_policy?.[item.selection_id]?.eligible === true)
         .map((item) => item.selection_id)
         .filter((id): id is string => Boolean(id))
     ));
@@ -143,7 +149,28 @@ export function StateBackfillPanel({
     });
   };
 
+  const canSelect = (selectionId?: string) => Boolean(
+    selectionId && stream.result?.selection_policy?.[selectionId]?.eligible === true
+  );
+  const selectionNotice = (selectionId: string) => {
+    const policy = stream.result?.selection_policy?.[selectionId];
+    if (policy?.eligible) return null;
+    const labels = {
+      canonical_fact: "selectionUnavailable",
+      temporary_fact: "selectionTemporary",
+      character_cognition: "selectionCognition",
+      rumor: "selectionRumor",
+      deception: "selectionDeception",
+      unsupported_by_prose: "selectionUnsupported",
+      legal_no_op: "selectionNoOp",
+      unknown: "selectionUnavailable",
+    } as const;
+    return <p className="mt-2 break-words text-xs text-muted">{t(labels[policy?.reason ?? "unknown"])}</p>;
+  };
   const dropReasonField = (selectionId: string) => (
+    <>
+    {selectionNotice(selectionId)}
+    {stream.result?.selection_policy?.[selectionId]?.requires_drop_reason === true && (
     <label className="mt-2 block min-w-0 text-xs text-muted">
       <span className="mb-1 block font-medium text-foreground">{t("dropReasonLabel")}</span>
       <select
@@ -158,6 +185,8 @@ export function StateBackfillPanel({
         <option value="legal_no_op">{t("dropReasonNoOp")}</option>
       </select>
     </label>
+    )}
+    </>
   );
 
   const factKindLabel = (kind: PermanentFactProposal["kind"]) => {
@@ -188,6 +217,7 @@ export function StateBackfillPanel({
     roster.nameById[threadId] ?? t("unknownThread");
 
   const result = stream.result;
+  const hasStructuredFailure = reviewValidationGroups(stream.failureDiagnostics).length > 0;
   const selectionIds = result
     ? [
         ...result.character_updates.map((item) => item.selection_id),
@@ -197,7 +227,9 @@ export function StateBackfillPanel({
         ...result.thread_updates.map((item) => item.selection_id),
       ]
     : [];
-  const hasMissingSelectionIds = selectionIds.some((id) => !id);
+  const hasMissingSelectionIds = selectionIds.some(
+    (id) => !id || !result?.selection_policy?.[id] || result.selection_policy[id].reason === "unknown"
+  );
   const hasDroppedIds = Object.values(stream.droppedIds ?? {}).some(
     (ids) => ids.length > 0
   );
@@ -234,7 +266,9 @@ export function StateBackfillPanel({
           ),
       ]
     : [];
-  const hasUnexplainedDrops = unselectedIds.some((id) => !dropReasons[id]);
+  const hasUnexplainedDrops = unselectedIds.some(
+    (id) => result?.selection_policy?.[id]?.requires_drop_reason !== false && !dropReasons[id]
+  );
 
   const accept = async () => {
     if (!stream.result) return;
@@ -252,17 +286,17 @@ export function StateBackfillPanel({
           proposal_id: stream.result.proposal_id,
           acceptance_token: stream.result.acceptance_token,
           selected_character_ids: stream.result.character_updates
-            .filter((item) => item.selection_id && checkedCharacters.has(item.selection_id))
+            .filter((item) => item.selection_id && canSelect(item.selection_id) && checkedCharacters.has(item.selection_id))
             .map((item) => item.selection_id)
             .filter((id): id is string => Boolean(id)),
           selected_fact_ids: stream.result.character_updates.flatMap((update) =>
             update.new_permanent_facts
-              .filter((fact) => fact.selection_id && checkedFacts.has(fact.selection_id))
+              .filter((fact) => fact.selection_id && canSelect(fact.selection_id) && checkedFacts.has(fact.selection_id))
               .map((fact) => fact.selection_id)
               .filter((id): id is string => Boolean(id))
           ),
           selected_thread_ids: stream.result.thread_updates
-            .filter((item) => item.selection_id && checkedThreads.has(item.selection_id))
+            .filter((item) => item.selection_id && canSelect(item.selection_id) && checkedThreads.has(item.selection_id))
             .map((item) => item.selection_id)
             .filter((id): id is string => Boolean(id)),
           drop_reasons: dropReasons,
@@ -330,7 +364,15 @@ export function StateBackfillPanel({
 
           {stream.error && (
             <Notice tone="error">
-              {stream.error === NEED_CONTENT_BACKEND_MESSAGE ? t("needContent") : stream.error}
+              <p className="break-words">
+                {hasStructuredFailure ? t("generationStructureFailed")
+                  : stream.error === NEED_CONTENT_BACKEND_MESSAGE ? t("needContent") : stream.error}
+              </p>
+              {hasStructuredFailure && (
+                <div className="mt-2 min-w-0">
+                  <ReviewValidationDetails diagnostics={stream.failureDiagnostics} />
+                </div>
+              )}
             </Notice>
           )}
           {acceptError && <Notice tone="error">{acceptError}</Notice>}
@@ -414,9 +456,9 @@ export function StateBackfillPanel({
                                 update.selection_id
                                 && checkedCharacters.has(update.selection_id)
                               )}
-                              disabled={!update.selection_id}
+                              disabled={!canSelect(update.selection_id)}
                               onChange={() => {
-                                if (update.selection_id) toggleCharacter(update.selection_id);
+                                if (update.selection_id && canSelect(update.selection_id)) toggleCharacter(update.selection_id);
                               }}
                               className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
                             />
@@ -457,9 +499,9 @@ export function StateBackfillPanel({
                                     <input
                                       type="checkbox"
                                       checked={selected}
-                                      disabled={!selectionId}
+                                      disabled={!canSelect(selectionId)}
                                       onChange={() => {
-                                        if (selectionId) toggleFact(selectionId);
+                                        if (canSelect(selectionId)) toggleFact(selectionId);
                                       }}
                                       className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
                                     />
@@ -500,9 +542,9 @@ export function StateBackfillPanel({
                             <input
                               type="checkbox"
                               checked={selected}
-                              disabled={!selectionId}
+                              disabled={!canSelect(selectionId)}
                               onChange={() => {
-                                if (selectionId) toggleThread(selectionId);
+                                if (canSelect(selectionId)) toggleThread(selectionId);
                               }}
                               className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
                             />

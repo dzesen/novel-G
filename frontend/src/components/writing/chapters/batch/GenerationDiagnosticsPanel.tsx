@@ -18,6 +18,7 @@ import {
   diagnosticActionTranslationKey,
   diagnosticImpactTranslationKey,
   diagnosticReasonTranslationKey,
+  diagnosticRepairBudget,
 } from "./generationReasonPresentation";
 
 function useDiagnosticCopy() {
@@ -55,7 +56,7 @@ function useDiagnosticCopy() {
 
   const reasonLabel = (code: string) => {
     const key = diagnosticReasonTranslationKey(code);
-    return key ? t(key) : t("diagnosticsReasonUnknown");
+    return key ? t(key) : t("diagnosticsReasonUnrecognized");
   };
 
   const stepLabel = (step: string) => {
@@ -122,6 +123,7 @@ export function DiagnosticEventSummary({
   const actions = (event.action_codes ?? [])
     .map(actionLabel)
     .filter((value): value is string => Boolean(value));
+  const repairBudget = diagnosticRepairBudget(event.details);
   const repairCyclesUsed = Number(event.details.repair_cycles_used);
   const repairCyclesLimit = Number(event.details.repair_cycles_limit);
   const consistencyIssueCount = Number(event.details.consistency_issue_count);
@@ -176,7 +178,16 @@ export function DiagnosticEventSummary({
           step: stepLabel(event.step),
         })}
       </p>
-      {candidateGate && Number.isFinite(repairCyclesUsed)
+      {repairBudget && (
+        <p className="mt-1 text-xs leading-5 text-foreground">
+          {t("diagnosticsComponentRepairUsage", {
+            component: t(repairBudget.componentKey),
+            used: repairBudget.used,
+            limit: repairBudget.limit,
+          })}
+        </p>
+      )}
+      {!repairBudget && candidateGate && Number.isFinite(repairCyclesUsed)
         && Number.isFinite(repairCyclesLimit) && (
         <p className="mt-1 text-xs leading-5 text-foreground">
           {t("diagnosticsCandidateRepairUsage", {

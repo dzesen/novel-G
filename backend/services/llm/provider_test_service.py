@@ -397,6 +397,7 @@ async def test_llm_provider_capabilities(
             alias,
             "connection",
             response.raw_response or {"content": response.content},
+            secrets=(api_key,),
         )
         if "PROVIDER_TEXT_OK" not in response.content:
             raise ValueError("文本接口返回内容未包含约定标记")
@@ -422,6 +423,7 @@ async def test_llm_provider_capabilities(
             alias,
             log_capability,
             {"chunks": chunks, "content": full_text},
+            secrets=(api_key,),
         )
         if not chunks or "PROVIDER_STREAM_OK" not in full_text:
             raise ValueError("流式接口返回内容未包含约定标记")
@@ -505,6 +507,7 @@ async def test_llm_provider_capabilities(
             alias,
             "stream_usage",
             {"usage": [item.model_dump() for item in seen]},
+            secrets=(api_key,),
         )
         if not seen:
             raise ValueError("流式响应未回报 token 用量")
@@ -533,6 +536,7 @@ async def test_llm_provider_capabilities(
             alias,
             "json_schema",
             response.raw_response or {"content": response.content},
+            secrets=(api_key,),
         )
         parsed = ProviderJsonProbeSchema.model_validate_json(response.content)
         if parsed.code != "ok":
@@ -557,6 +561,7 @@ async def test_llm_provider_capabilities(
             alias,
             "json_object",
             response.raw_response or {"content": response.content},
+            secrets=(api_key,),
         )
         parsed = ProviderJsonProbeSchema.model_validate_json(response.content)
         if parsed.code != "ok":
@@ -582,6 +587,7 @@ async def test_llm_provider_capabilities(
             alias,
             "function_calling",
             response.raw_response or {"content": response.content},
+            secrets=(api_key,),
         )
 
     # 流式不通就没必要探流式用量，只会白烧一次调用。

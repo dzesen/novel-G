@@ -89,6 +89,16 @@ class CharacterPortraitJobRequest(BaseModel):
     seed: int | None = None
     provider_alias: str | None = Field(default=None, max_length=200)
     confirm_anchor_reset: bool = False
+    preserve_anchor: bool = False
+    expected_anchor_reference_asset: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_anchor_action(self) -> "CharacterPortraitJobRequest":
+        if self.preserve_anchor and (self.confirm_anchor_reset or self.expected_anchor_reference_asset is None):
+            raise ValueError("追加立绘必须绑定当前锚点，且不能同时请求重设")
+        if not self.preserve_anchor and self.expected_anchor_reference_asset is not None:
+            raise ValueError("非追加模式不能指定预期锚点")
+        return self
 
     @field_validator("seed", mode="before")
     @classmethod
@@ -435,6 +445,8 @@ async def start_character_portrait_job(
             seed=request.seed,
             provider_alias=request.provider_alias,
             confirm_anchor_reset=request.confirm_anchor_reset,
+            preserve_anchor=request.preserve_anchor,
+            expected_anchor_reference_asset=request.expected_anchor_reference_asset,
         )
     except Exception as error:
         raise _translate_portrait_error(error) from error

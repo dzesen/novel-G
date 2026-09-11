@@ -123,6 +123,38 @@ class CharacterStateRepository(BaseRepository):
             )
         return state
 
+    async def ensure_fact_container(
+        self,
+        novel_id: str,
+        card_id: str,
+        session: AsyncClientSession | None = None,
+    ) -> None:
+        """Initialize storage for accepted facts without asserting a current state.
+
+        The application service has already validated the card and selected the
+        facts. Existing current-state values and their provenance are untouched.
+        This is explicit initialization, never an implicit append upsert.
+        """
+        now = get_utc_now()
+        await self.collection.update_one(
+            {"novel_id": to_object_id(novel_id), "card_id": to_object_id(card_id)},
+            {"$setOnInsert": {
+                "novel_id": to_object_id(novel_id),
+                "card_id": to_object_id(card_id),
+                "current_state": "",
+                "as_of_chapter_order": 0,
+                "permanent_facts": [],
+                "is_deleted": False,
+                "deleted_at": None,
+                "created_at": now,
+                "updated_at": now,
+            }},
+            upsert=True,
+            session=session,
+        )
+        # A soft-deleted projection must not silently resurrect old state/facts.
+        await self._get_state(novel_id, card_id, session=session)
+
     async def append_permanent_fact(
         self,
         novel_id: str,
@@ -142,9 +174,9 @@ class CharacterStateRepository(BaseRepository):
             实际追加成功时返回 True。
 
         Raises:
-            NotFoundError: 该角色尚无状态文档（必须先 upsert_state）。
+            NotFoundError: 该角色尚无状态文档（必须先显式初始化）。
                 没有 upsert=True 是刻意的：永久事实绝不能被静默丢弃，
-                宁可显式报错也不要凭空插入一条只有事实、没有当下状态的文档。
+                新角色的事实容器须由应用服务在接受已选事实时显式建立。
         """
         kind = str(fact.get("kind", ""))
         if kind not in FACT_KIND_VALUES:

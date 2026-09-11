@@ -1,6 +1,8 @@
 """批量作业服务：CRUD、全局单作业守卫、拉起/控制进程内任务。"""
 from __future__ import annotations
 
+from backend.db.restored_authorization import require_current_authorization
+
 from backend.services.generation.chapter_review_policy import (
     ChapterReviewSelection, review_authorization_from_readiness,
 )
@@ -383,6 +385,7 @@ def _resolve_authorized_token_budget(
 def _validate_resumable_job_authorization(
     job: Mapping[str, Any],
 ) -> dict[str, Any]:
+    require_current_authorization(job)
     params = validate_protected_generation_params(
         job.get("generation_params")
     )
@@ -2686,6 +2689,7 @@ class GenerationJobService:
                     ),
                     record_completion_failure=record_completion_failure,
                     finalize=finalize_candidate,
+                    read_recovery_job=generation_job_repo.get_job,
                 ),
             )
             try:
@@ -3309,6 +3313,7 @@ class GenerationJobService:
 
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            require_current_authorization(job)
             _reject_external_required_book_child_control(job)
             _validate_resumable_job_authorization(job)
             if not readiness_uses_required_chapter_finalization(
@@ -3438,6 +3443,7 @@ class GenerationJobService:
 
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            require_current_authorization(job)
             _reject_external_required_book_child_control(job)
             _validate_resumable_job_authorization(job)
             if not readiness_uses_required_chapter_state(job.get("readiness")):
@@ -3680,6 +3686,7 @@ class GenerationJobService:
 
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            require_current_authorization(job)
             _reject_external_required_book_child_control(job)
             _validate_resumable_job_authorization(job)
             if not readiness_uses_required_book_successor(job.get("readiness")):
@@ -3863,6 +3870,7 @@ class GenerationJobService:
 
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            require_current_authorization(job)
             _reject_external_required_book_child_control(job)
             _validate_resumable_job_authorization(job)
             if not readiness_uses_required_chapter_review(
@@ -4271,6 +4279,7 @@ class GenerationJobService:
         retry_resolution_to_launch: StateDispatchResolutionV3 | None = None
         async with _get_start_lock():
             job = await generation_job_repo.get_job(job_id)
+            require_current_authorization(job)
             _reject_external_required_book_child_control(job)
             job_mutation_recovery_binding: JobMutationRecoveryBindingV1 | None = None
             state_dispatch_binding: JobMutationRecoveryBindingV1 | None = None

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from backend.db.errors import DuplicateKeyError, InvalidIdError, NotFoundError
 from backend.services.novel.chapter_service import ChapterService
@@ -41,6 +41,14 @@ class UpdateChapterRequest(BaseModel):
     status: Optional[str] = None
     order_index: Optional[int] = Field(default=None, ge=1)
 
+    @field_validator("title", "summary", "content", "status", "order_index", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value: Any) -> Any:
+        # Omitted defaults are not validated; explicitly supplied null is not a clear operation.
+        if value is None:
+            raise ValueError("Chapter update fields cannot be null")
+        return value
+
 
 class AcceptChapterOutlineRequest(BaseModel):
     outline: dict
@@ -61,6 +69,7 @@ _OUTLINE_ID_FIELDS = (
     "present_character_card_ids",
     "mentioned_character_card_ids",
     "referenced_worldbook_card_ids",
+    "referenced_faction_card_ids",
     "threads_planted",
     "threads_resolved",
 )

@@ -621,6 +621,7 @@ export default function ReferenceCardsWorkspace({
                   <option value="sub">{t("importanceSubGeneric")}</option>
                 </select>
               </label>
+              <TextArea className="md:col-span-2" label={t("fields.tags")} value={draft.tags.join("，")} onChange={(value) => setDraft((current) => ({ ...current, tags: splitTags(value) }))} hint={t("tagsHint")} />
               <TextArea className="md:col-span-2" label={t("fields.description")} value={draft.description} onChange={(value) => setDraft((current) => ({ ...current, description: value }))} />
               {DETAIL_FIELDS[cardType].map((field) => (
                 <TextArea
@@ -630,34 +631,18 @@ export default function ReferenceCardsWorkspace({
                   onChange={(value) => setDraft((current) => ({ ...current, details: { ...current.details, [field]: value } }))}
                 />
               ))}
-              {cardType === "character" &&
-                !creating &&
-                selectedCard &&
-                novelId && (
-                  <CharacterPortraitPanel
-                    key={`${selectedCard._id}:${portraitPanelRevision}`}
-                    novelId={novelId}
-                    cardId={selectedCard._id}
-                    cardName={selectedCard.name}
-                    hasUnsavedChanges={hasUnsavedChanges}
-                    batchDraft={
-                      portraitBatchDrafts[selectedCard._id] ?? null
-                    }
-                    onBatchDraftChange={(next) =>
-                      updatePortraitBatchDraft(selectedCard._id, next)
-                    }
-                  />
-                )}
               {cardType === "character" && (
-                <section className="border-t border-border pt-6 md:col-span-2">
-                  <div className="max-w-2xl">
-                    <h3 className="text-base font-semibold text-foreground">
-                      {t("profileTitle")}
-                    </h3>
-                    <p className="mt-1 text-sm leading-6 text-muted">
-                      {t("profileDescription")}
-                    </p>
-                  </div>
+                <details
+                  key={creating ? "new-character-profile" : `profile-${selectedCard?._id}`}
+                  data-testid="character-creative-profile"
+                  className="min-w-0 border-t border-border pt-5 md:col-span-2"
+                >
+                  <summary className="cursor-pointer text-base font-semibold text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent">
+                    {t("profileTitle")}
+                  </summary>
+                  <p className="mt-3 max-w-2xl text-sm leading-6 text-muted">
+                    {t("profileDescription")}
+                  </p>
                   <div className="mt-5 grid gap-5 md:grid-cols-2">
                     <Field
                       label={t("fields.aliases")}
@@ -738,9 +723,35 @@ export default function ReferenceCardsWorkspace({
                       }
                     />
                   </div>
-                </section>
+                </details>
               )}
-              <TextArea className="md:col-span-2" label={t("fields.tags")} value={draft.tags.join("，")} onChange={(value) => setDraft((current) => ({ ...current, tags: splitTags(value) }))} hint={t("tagsHint")} />
+              {cardType === "character" &&
+                !creating &&
+                selectedCard &&
+                novelId && (
+                  <details
+                    key={selectedCard._id}
+                    data-testid="character-illustrations"
+                    className="min-w-0 border-t border-border pt-5 md:col-span-2"
+                  >
+                    <summary className="cursor-pointer text-base font-semibold text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent">
+                      {t("portrait.disclosureTitle")}
+                    </summary>
+                    <CharacterPortraitPanel
+                      key={`${selectedCard._id}:${portraitPanelRevision}`}
+                      novelId={novelId}
+                      cardId={selectedCard._id}
+                      cardName={selectedCard.name}
+                      hasUnsavedChanges={hasUnsavedChanges}
+                      batchDraft={
+                        portraitBatchDrafts[selectedCard._id] ?? null
+                      }
+                      onBatchDraftChange={(next) =>
+                        updatePortraitBatchDraft(selectedCard._id, next)
+                      }
+                    />
+                  </details>
+                )}
             </div>
           </div>
         ) : (

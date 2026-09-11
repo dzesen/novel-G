@@ -83,6 +83,7 @@ export interface ImageJob {
 }
 
 export interface CharacterPortraitJob extends ImageJob {
+  preserve_anchor?: boolean;
   anchor: AppearanceAnchor | null;
 }
 
@@ -95,6 +96,8 @@ export interface AppearanceAnchorDependency {
 }
 
 export interface CharacterPortraitState {
+  latest_append_job?: CharacterPortraitJob | null;
+  assets?: CharacterPortraitAsset[];
   anchor: AppearanceAnchor | null;
   asset: CharacterPortraitAsset | null;
   active_job: CharacterPortraitJob | null;

@@ -65,8 +65,8 @@ class ChapterHealthPosition(_StrictModel):
 
 class StoryHealthPolicies(_StrictModel):
     timeline_ordering: str = "volume_order,chapter_order,chapter_id"
-    progress_basis: str = "latest chapter with outline, prose, or writing/completed status"
-    character_presence_basis: str = "outline.present_character_card_ids"
+    progress_basis: str = "latest chapter with saved prose (word_count > 0)"
+    character_presence_basis: str = "outline.present_character_card_ids of chapters with saved prose"
     chapter_target_precedence: str = (
         "outline.target_word_count|novel.words_per_chapter|3000"
     )
@@ -216,11 +216,7 @@ def _position_view(
 
 
 def _chapter_has_progress(chapter: dict[str, Any]) -> bool:
-    return bool(
-        chapter.get("outline")
-        or _positive_int(chapter.get("word_count"))
-        or str(chapter.get("status") or "") in {"writing", "completed"}
-    )
+    return _positive_int(chapter.get("word_count")) is not None
 
 
 def _due_state(
@@ -595,7 +591,7 @@ def build_story_health_report(
     as_of = progress_positions[-1] if progress_positions else None
     outline_positions = [
         position
-        for position in scoped_positions
+        for position in progress_positions
         if chapters_by_id[position.chapter_id].get("outline")
     ]
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -22,6 +23,7 @@ from backend.llm.exceptions import (
     LLMSchemaUnsupportedError,
     LLMStructuredRepairError,
     LLMStructuredValidationError,
+    LLMTimeoutError,
 )
 from backend.llm.config import resolve_effective_system_prompt
 from backend.llm.models import TokenUsage
@@ -780,10 +782,14 @@ class ProviderCatalog:
 _FENCED_JSON = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.IGNORECASE | re.DOTALL)
 
 
-def _parse_structured_text(raw: str, schema: type[BaseModel]) -> BaseModel:
+def _parse_structured_text(
+    raw: str, schema: type[BaseModel], *,
+    normalizer: Callable[[Any], Any] | None = None,
+) -> BaseModel:
     match = _FENCED_JSON.match(raw)
     candidate = match.group(1) if match else raw
-    return schema.model_validate(json.loads(candidate))
+    payload = json.loads(candidate)
+    return schema.model_validate(normalizer(payload) if normalizer is not None else payload)
 
 
 def _add_usage(items: tuple[AttemptUsage, ...]) -> TokenUsage:
@@ -1021,7 +1027,7 @@ class GenerationRuntime:
                 # Freeze the execution contract as well as Provider settings:
                 # old interactive readiness cannot dispatch a new review protocol.
                 payload["adherence_execution_contract"] = {
-                    "review_protocol": "independent_outline_review.v7",
+                    "review_protocol": "independent_outline_review.v9",
                     "evidence_version": "chapter_outline_adherence_evidence.v5",
                     "embedded_schema_correction": EMBEDDED_SCHEMA_REPAIR_PROMPT_REVISION,
                 }
@@ -1317,9 +1323,19 @@ class GenerationRuntime:
         )
         total_before = _usage_snapshot(getattr(adapter, "total_usage", None))
         try:
-            value = await call()
+            try:
+                # SDK timeouts govern individual I/O waits and retries. The
+                # frozen workflow limit bounds the entire dispatched request.
+                async with asyncio.timeout(plan.timeout_seconds):
+                    value = await call()
+            except TimeoutError as exc:
+                raise LLMTimeoutError(
+                    "Structured request exceeded its workflow time limit",
+                    provider=provider,
+                ) from exc
         except asyncio.CancelledError:
-            await self._attempt_scope.mark_uncertain(attempt_id, "request cancelled after dispatch")
+            with anyio.move_on_after(5, shield=True):
+                await self._attempt_scope.mark_uncertain(attempt_id, "request cancelled after dispatch")
             raise
         except Exception as exc:
             if bool(getattr(exc, "provider_request_not_dispatched", False)):
@@ -1379,6 +1395,9 @@ class GenerationRuntime:
         stream_json_output: bool = False,
         stream_progress: Callable[[StructuredStreamProgress], Any] | None = None,
         structured_response_observer: Callable[[StructuredVisibleResponse], Any] | None = None,
+        max_structured_response_record_bytes: int = 65_536,
+        result_validator: Callable[[BaseModel], None] | None = None,
+        result_normalizer: Callable[[Any], Any] | None = None,
         **gen_kwargs: Any,
     ) -> StructuredGenerationResult:
         # Reject stale plans before even constructing an adapter.  Every
@@ -1392,6 +1411,13 @@ class GenerationRuntime:
             raise ValueError("structured stream progress callback is invalid")
         if structured_response_observer is not None and not callable(structured_response_observer):
             raise ValueError("structured response observer is invalid")
+        if (type(max_structured_response_record_bytes) is not int
+                or not 1 <= max_structured_response_record_bytes <= 2_097_152):
+            raise ValueError("structured response recording bound is invalid")
+        if result_normalizer is not None and not callable(result_normalizer):
+            raise ValueError("structured result normalizer is invalid")
+        if result_validator is not None and not callable(result_validator):
+            raise ValueError("structured result validator is invalid")
         if (
             stream_json_output
             and plan.mode == StructuredOutputMode.SCHEMA_ENFORCED
@@ -1471,7 +1497,10 @@ class GenerationRuntime:
         visible_parts: list[str] = []
         visible_bytes = 0
         visible_truncated = False
-        visible_cap = min(max_structured_raw_output_bytes or 65_536, 65_536)
+        visible_cap = min(
+            max_structured_raw_output_bytes or max_structured_response_record_bytes,
+            max_structured_response_record_bytes,
+        )
 
         def capture_visible(text: str) -> None:
             nonlocal visible_bytes, visible_truncated
@@ -1902,8 +1931,17 @@ class GenerationRuntime:
                 ),
             )
             produced = enforce_structured_output_byte_cap(produced)
+        def parse_result(output: Any) -> BaseModel:
+            if isinstance(output, BaseModel):
+                if result_normalizer is None:
+                    return output
+                return schema.model_validate(result_normalizer(output.model_dump(mode="python")))
+            return _parse_structured_text(str(output), schema, normalizer=result_normalizer)
+
         try:
-            value = produced if isinstance(produced, BaseModel) else _parse_structured_text(str(produced), schema)
+            value = parse_result(produced)
+            if result_validator is not None:
+                result_validator(value)
         except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
             primary_validation = project_structured_validation_issues(
                 first_error,
@@ -1928,6 +1966,12 @@ class GenerationRuntime:
                         ),
                     )
                 ) from None
+            # 在纠错派发前留下脱敏证据，即使纠错超时也不丢失首次校验原因。
+            logging.getLogger(__name__).info(
+                "structured_repair_started primary_finish_reason=%s primary_validation=%s",
+                primary_finish_reason,
+                json.dumps(primary_validation, ensure_ascii=True),
+            )
             repair_prompt = render_structured_repair_prompt(
                 original_prompt=primary_prompt,
                 schema=schema,
@@ -1955,7 +1999,9 @@ class GenerationRuntime:
             )
             repaired = enforce_structured_output_byte_cap(repaired)
             try:
-                value = _parse_structured_text(str(repaired), schema)
+                value = parse_result(repaired)
+                if result_validator is not None:
+                    result_validator(value)
             except (
                 ValidationError,
                 ValueError,
@@ -1998,6 +2044,9 @@ class GenerationRuntime:
                         provider_alias=plan.reviewer_alias,
                     ),
                 )
+                value = parse_result(value)
+                if result_validator is not None:
+                    result_validator(value)
 
         require_current_settlement()
         enforce_structured_output_byte_cap(value)

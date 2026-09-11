@@ -12,6 +12,8 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Mapping
+from backend.db.narrative_revision import narrative_revision_store
+
 from typing import Any
 from uuid import uuid4
 from backend.novel_scale import MIN_CHAPTERS, MAX_CHAPTERS
@@ -33,7 +35,7 @@ from backend.services.generation.volume_outline_generation import (
     VOLUME_OUTLINE_STEP,
     VOLUME_OUTLINE_STEPS,
     VOLUME_OUTLINE_WORKFLOW,
-    volume_outline_params,
+    load_volume_outline_params,
 )
 from backend.services.llm.generation_runtime import (
     AttemptUsage,
@@ -335,7 +337,7 @@ async def inspect_book_structure_initialization(
     overrides = _generation_overrides(generation_params)
     source = {
         "novel_id": str(novel_id),
-        "params": volume_outline_params(novel),
+        "params": await load_volume_outline_params(novel),
         "generation_params": overrides,
         "prompt_revision": "",
         "narrative_revision": int(novel.get("narrative_revision") or 0),
@@ -463,6 +465,10 @@ async def initialize_book_structure(
             "卷章结构 Provider 或提示词计划已变化，请重新预检"
         )
 
+    frozen_params = await load_volume_outline_params(novel)
+    if await narrative_revision_store.current_for_audit(novel_id) != expected_narrative_revision:
+        raise BookStructureInitializationStale("势力或其他上下文已变化，请重新预检")
+
     scope = _FixedBudgetAttemptScope(
         maximum_attempts=attempt_capacity,
         token_budget=token_budget,
@@ -478,7 +484,7 @@ async def initialize_book_structure(
                 workflow_name=VOLUME_OUTLINE_WORKFLOW,
                 steps=VOLUME_OUTLINE_STEPS,
                 prompts=prompts,
-                params=volume_outline_params(novel),
+                params=frozen_params,
                 gen_kwargs=overrides,
                 cached={},
                 deps=WorkflowDeps(

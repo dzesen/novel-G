@@ -334,6 +334,8 @@ def chapter_outline_context_prompt_utf8_bytes(
         "referenced_worldbook_card_ids": _stored_object_id_slots(
             outline.get("referenced_worldbook_card_ids")
         ),
+        **({"referenced_faction_card_ids": _stored_object_id_slots(outline.get("referenced_faction_card_ids"))}
+           if outline.get("referenced_faction_card_ids") else {}),
         "scene_contract_version": outline.get("scene_contract_version"),
         "scenes": list(outline.get("scenes") or []),
         "core_conflict": outline.get("core_conflict"),
@@ -469,6 +471,10 @@ class ChapterOutlineAuthoredSchema(BaseModel):
             "本章从世界条目紧凑索引中显式声明的地点/物品/规则/通用世界设定卡 id"
             "（worldbook 集合，非 characters）"
         ),
+    )
+    referenced_faction_card_ids: List[str] = Field(
+        default_factory=list, max_length=64, exclude_if=lambda value: not value,
+        description="本章显式使用的正式势力卡 card_id（factions 文档 ObjectId），只能从势力目录选择，不得填名称或 fac_* 业务编号",
     )
     scenes: List[SceneSchema] = Field(
         ...,

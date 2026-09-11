@@ -1,5 +1,8 @@
 from typing import Any, Dict, List
 
+from backend.db.faction_identity import FactionIdentityIndex
+from backend.db.utils import to_object_id
+
 from backend.db.repositories.faction_relation_repository import faction_relation_repo
 from backend.db.repositories.faction_repository import faction_repo
 from backend.db.repositories.novel_repository import novel_repo
@@ -9,6 +12,14 @@ class FactionRelationService:
     """
     阵营关系服务层，负责查询前校验小说和阵营作用域。
     """
+
+    @staticmethod
+    async def _valid_relations(novel_id: str, relations: list[dict]) -> list[dict]:
+        identities = FactionIdentityIndex(await faction_repo.collection.find(
+            {"novel_id": to_object_id(novel_id)},
+            projection={"_id": 1, "faction_id": 1, "is_deleted": 1},
+        ).to_list(length=None))
+        return [row for row in relations if identities.resolve(row, require_active=True) is not None]
 
     @staticmethod
     async def get_relations_by_novel(novel_id: str) -> List[Dict[str, Any]]:
@@ -21,7 +32,9 @@ class FactionRelationService:
             阵营关系文档列表。
         """
         await novel_repo.get_novel_by_id(novel_id)
-        return await faction_relation_repo.get_relations_by_novel(novel_id)
+        return await FactionRelationService._valid_relations(
+            novel_id, await faction_relation_repo.get_relations_by_novel(novel_id),
+        )
 
     @staticmethod
     async def get_relations_by_faction(novel_id: str, faction_id: str) -> List[Dict[str, Any]]:
@@ -37,4 +50,6 @@ class FactionRelationService:
         await novel_repo.get_novel_by_id(novel_id)
         # 先确认阵营属于当前小说，避免跨小说 faction_id 被误用。
         await faction_repo.get_faction(novel_id, faction_id)
-        return await faction_relation_repo.get_relations_by_faction(novel_id, faction_id)
+        return await FactionRelationService._valid_relations(
+            novel_id, await faction_relation_repo.get_relations_by_faction(novel_id, faction_id),
+        )

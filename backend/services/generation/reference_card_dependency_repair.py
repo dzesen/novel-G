@@ -104,6 +104,7 @@ _OUTLINE_ID_FIELDS = (
     "present_character_card_ids",
     "mentioned_character_card_ids",
     "referenced_worldbook_card_ids",
+    "referenced_faction_card_ids",
     "threads_resolved",
 )
 _GENERATION_OVERRIDE_KEYS = frozenset({
@@ -434,6 +435,7 @@ def _normalized_source_outline(
         "referenced_worldbook_card_ids": [
             str(item) for item in outline.get("referenced_worldbook_card_ids") or []
         ],
+        **({"referenced_faction_card_ids": [str(item) for item in outline["referenced_faction_card_ids"]]} if outline.get("referenced_faction_card_ids") else {}),
         "scenes": deepcopy(outline.get("scenes") or []),
         "core_conflict": str(outline.get("core_conflict") or ""),
         "ending_hook": str(outline.get("ending_hook") or ""),
@@ -723,6 +725,7 @@ def _narrative_projection(value: Mapping[str, Any]) -> dict[str, Any]:
             "present_character_card_ids",
             "mentioned_character_card_ids",
             "referenced_worldbook_card_ids",
+    "referenced_faction_card_ids",
             "scenes",
             "core_conflict",
             "ending_hook",
@@ -1072,6 +1075,7 @@ class ReferenceCardDependencyRepairService:
                 if result.get("scene_contract_version")
                 else {}
             ),
+            **({"referenced_faction_card_ids": [to_object_id(item) for item in result["referenced_faction_card_ids"]]} if result.get("referenced_faction_card_ids") else {}),
             "scenes": deepcopy(result["scenes"]),
             "core_conflict": result["core_conflict"],
             "ending_hook": result["ending_hook"],

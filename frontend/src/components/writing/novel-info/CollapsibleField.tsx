@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 
 interface CollapsibleFieldProps {
   label: string;
@@ -16,12 +16,15 @@ export default function CollapsibleField({
   noContentText = "",
 }: CollapsibleFieldProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const contentId = useId();
   const hasContent = value && value.trim().length > 0;
 
   return (
     <div className="border-b border-border/50 last:border-b-0">
       <button
         type="button"
+        aria-expanded={expanded}
+        aria-controls={contentId}
         className="flex items-center gap-2 w-full py-2.5 text-left group"
         onClick={() => setExpanded(!expanded)}
       >
@@ -46,8 +49,7 @@ export default function CollapsibleField({
           <span className="text-xs text-muted/60 ml-auto">{noContentText}</span>
         )}
       </button>
-      {expanded && (
-        <div className="pb-3 pl-6">
+        <div id={contentId} hidden={!expanded} className="pb-3 pl-6">
           {hasContent ? (
             <p className="text-sm text-foreground/80 whitespace-pre-wrap leading-relaxed">
               {value}
@@ -56,7 +58,6 @@ export default function CollapsibleField({
             <p className="text-sm text-muted/50 italic">{noContentText}</p>
           )}
         </div>
-      )}
     </div>
   );
 }

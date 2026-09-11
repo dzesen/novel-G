@@ -37,6 +37,8 @@ export function reviewValidationGroups(value: unknown): ReviewValidationGroup[] 
 }
 
 const VALIDATION_ERROR_KEYS = {
+  json_decode_error: "completionValidationJsonInvalid",
+  state_fact_prose_spans_required: "completionValidationProseSpansRequired",
   review_anchor_unknown: "completionValidationAnchorUnknown",
   review_quote_missing: "completionValidationQuoteMissing",
   review_quote_ambiguous: "completionValidationQuoteAmbiguous",
@@ -44,6 +46,10 @@ const VALIDATION_ERROR_KEYS = {
   review_source_mismatch: "completionValidationSourceMismatch",
   review_anchor_range_reversed: "completionValidationRangeInvalid",
   review_anchor_range_too_long: "completionValidationRangeInvalid",
+  state_fact_span_quote_not_found: "completionValidationQuoteMissing",
+  state_fact_span_quote_ambiguous: "completionValidationQuoteAmbiguous",
+  state_fact_span_bounds_invalid: "completionValidationRangeInvalid",
+  state_fact_span_order_invalid: "completionValidationRangeInvalid",
 } as const;
 
 export function reviewValidationErrorKey(errorType: string) {

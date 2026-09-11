@@ -13,6 +13,7 @@ interface UseOutlineStreamOptions {
   path: string;
   /** 工作流步骤名，如 "volume_outline" / "chapter_outline"。 */
   stepKey: string;
+  idleTimeoutMs?: number;
 }
 
 /**
@@ -21,7 +22,7 @@ interface UseOutlineStreamOptions {
  * 处理 7 类帧：step running / step done / step error / done / context /
  * id_remapping / id_validation。keepalive 注释帧由 apiPostSSE 自动忽略（无 data: 行）。
  */
-export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) {
+export function useOutlineStream<T>({ path, stepKey, idleTimeoutMs }: UseOutlineStreamOptions) {
   const tStream = useTranslations("streamErrors");
   const [status, setStatus] = useState<OutlineStreamStatus>("idle");
   const [result, setResult] = useState<T | null>(null);
@@ -29,6 +30,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
   const [droppedIds, setDroppedIds] = useState<DroppedIds | null>(null);
   const [remappedReferences, setRemappedReferences] = useState<RemappedReference[]>([]);
   const [error, setError] = useState("");
+  const [failureDiagnostics, setFailureDiagnostics] = useState<unknown>(null);
   // 每当**流**送来一份新结果就 +1；调用方经 setResult 自己改内容时不动。
   // 消费方用它判断"手上这份是不是刚换的新货"——不能用"点了生成"来判断，
   // 因为生成可能被取消或失败，那时屏幕上留着的仍是旧的那一份（见 start 里
@@ -64,6 +66,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
     setDroppedIds(null);
     setRemappedReferences([]);
     setError("");
+    setFailureDiagnostics(null);
   }, [cancel]);
 
   const start = useCallback(
@@ -75,6 +78,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
 
       setStatus("running");
       setError("");
+      setFailureDiagnostics(null);
       setContextReport(null);
       setDroppedIds(null);
       setRemappedReferences([]);
@@ -119,6 +123,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
             if (event === "step") {
               if (data.step !== stepKey) return;
               if (data.status === "error") {
+                setFailureDiagnostics(data.diagnostics ?? null);
                 setError(typeof data.error === "string" ? data.error : "生成失败");
                 setStatus("error");
               } else if (data.status === "done" && data.data) {
@@ -129,18 +134,20 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
 
             if (event === "done") {
               if (data.success) {
+                setFailureDiagnostics(null);
                 const bag = data.result as Record<string, unknown> | undefined;
                 const produced = bag?.[stepKey];
                 if (produced) acceptStreamResult(produced as T);
                 setStatus("done");
               } else {
+                if (data.diagnostics) setFailureDiagnostics(data.diagnostics);
                 const failed = typeof data.failed_step === "string" ? data.failed_step : stepKey;
                 setError((current) => current || `步骤 ${failed} 失败`);
                 setStatus("error");
               }
             }
           },
-          { ...structuredGenerationStream([stepKey]), signal: controller.signal },
+          { ...structuredGenerationStream([stepKey]), signal: controller.signal, idleTimeoutMs },
         );
       } catch (err) {
         // abort() 不会同步中断挂起的 await：旧一轮的 reader.read() 会在
@@ -168,7 +175,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
         if (abortRef.current === controller) abortRef.current = null;
       }
     },
-    [acceptStreamResult, cancel, path, stepKey, tStream]
+    [acceptStreamResult, cancel, path, stepKey, idleTimeoutMs, tStream]
   );
 
   return {
@@ -179,6 +186,7 @@ export function useOutlineStream<T>({ path, stepKey }: UseOutlineStreamOptions) 
     droppedIds,
     remappedReferences,
     error,
+    failureDiagnostics,
     start,
     cancel,
     reset,

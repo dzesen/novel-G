@@ -126,7 +126,7 @@ export default function WorldWorkspace({
         }
         onCardTypeChange={(cardType) =>
           onNavigateView(
-            view === "candidates" ? "candidates" : "library",
+            "library",
             {
               cardType,
               card: undefined,

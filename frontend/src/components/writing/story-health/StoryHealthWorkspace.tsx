@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { apiGet } from "@/lib/api";
 import type {
@@ -58,6 +58,7 @@ export default function StoryHealthWorkspace({
   const [report, setReport] = useState<StoryHealthReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestVersion = useRef(0);
 
   const numberFormatter = useMemo(
     () => new Intl.NumberFormat(locale),
@@ -65,23 +66,34 @@ export default function StoryHealthWorkspace({
   );
   const load = useCallback(async () => {
     if (!novelId) return;
+    const version = ++requestVersion.current;
     setLoading(true);
     setError(null);
     try {
-      setReport(
-        await apiGet<StoryHealthReport>(
-          `/api/story-health/novel/${novelId}`,
-        ),
-      );
+      const next = await apiGet<StoryHealthReport>(`/api/story-health/novel/${novelId}`);
+      if (version === requestVersion.current) setReport(next);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : t("loadError"));
+      if (version === requestVersion.current) setError(caught instanceof Error ? caught.message : t("loadError"));
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
   }, [novelId, t]);
 
   useEffect(() => {
+    setReport(null);
     void load();
+    const refreshVisible = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    const timer = window.setInterval(refreshVisible, 15_000);
+    window.addEventListener("focus", refreshVisible);
+    document.addEventListener("visibilitychange", refreshVisible);
+    return () => {
+      requestVersion.current += 1;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshVisible);
+      document.removeEventListener("visibilitychange", refreshVisible);
+    };
   }, [load]);
 
   const positionLabel = (position: StoryHealthChapterPosition | null) => {

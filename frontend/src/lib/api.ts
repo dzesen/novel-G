@@ -247,7 +247,34 @@ export async function apiPostSSE(
   path: string,
   data: unknown,
   onEvent: (event: string, data: Record<string, unknown>) => void,
+  options: SSECompletionContract & { signal?: AbortSignal; idleTimeoutMs?: number },
+): Promise<void> {
+  const { idleTimeoutMs, signal } = options;
+  if (idleTimeoutMs === undefined) return consumePostSSE(path, data, onEvent, options);
+  if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+    throw new RangeError("SSE idle timeout must be positive");
+  }
+  const idle = new AbortController();
+  const combinedSignal = signal ? AbortSignal.any([signal, idle.signal]) : idle.signal;
+  let timer: ReturnType<typeof setTimeout>;
+  const renew = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => idle.abort(new SSEError("interrupted")), idleTimeoutMs);
+  };
+  renew();
+  try {
+    await consumePostSSE(path, data, onEvent, { ...options, signal: combinedSignal }, renew);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+async function consumePostSSE(
+  path: string,
+  data: unknown,
+  onEvent: (event: string, data: Record<string, unknown>) => void,
   options: SSECompletionContract & { signal?: AbortSignal },
+  onActivity: () => void = () => {},
 ): Promise<void> {
   const { signal, terminalEvent, validateTerminal } = options;
   signal?.throwIfAborted();
@@ -260,6 +287,7 @@ export async function apiPostSSE(
   if (!res.ok) {
     throw await responseError(res);
   }
+  onActivity();
   const reader = res.body?.getReader();
   if (!reader) throw new SSEError("interrupted");
 
@@ -312,6 +340,7 @@ export async function apiPostSSE(
         throw new SSEError("interrupted", cause);
       });
       signal?.throwIfAborted();
+      if (value?.byteLength) onActivity();
       buffer += decoder.decode(value, { stream: !done });
       while (true) {
         const boundary = buffer.search(/[\r\n]/);

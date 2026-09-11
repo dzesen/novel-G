@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.services.llm.stream_lifecycle import closing_stream
 from backend.api.llm_routers._common import (
     GenerationParamsMixin,
     build_gen_kwargs,
@@ -105,6 +106,14 @@ def _chapter_capability_registry():
     )
 
 
+class _StateStreamingResponse(StreamingResponse):
+    async def __call__(self, scope, receive, send):
+        # Disconnect can interrupt send() while the generator is suspended at
+        # yield, so iterator-level finally blocks alone are insufficient.
+        async with closing_stream(self.body_iterator):
+            await super().__call__(scope, receive, send)
+
+
 class ChapterStateRequest(GenerationParamsMixin):
     novel_id: str = Field(..., min_length=1)
     chapter_id: str = Field(..., min_length=1)
@@ -152,13 +161,14 @@ async def extract_chapter_state_by_ai(req: ChapterStateRequest, request: Request
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        async for event in capability_stream.events:
-            if event.name == "keepalive":
-                yield sse_comment("keepalive")
-            else:
-                yield sse_event(event.name, event.data)
+        async with closing_stream(capability_stream.events):
+            async for event in capability_stream.events:
+                if event.name == "keepalive":
+                    yield sse_comment("keepalive")
+                else:
+                    yield sse_event(event.name, event.data)
 
-    return StreamingResponse(
+    return _StateStreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

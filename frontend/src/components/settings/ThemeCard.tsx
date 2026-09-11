@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslations } from "next-intl";
-import { usePathname } from "next/navigation";
+import { isHexColor } from "@/lib/themeColorInput";
 import { useThemeCustomization } from "@/components/ThemeCustomizationProvider";
 import {
   THEME_PRESETS,
@@ -15,62 +15,53 @@ import {
 /* 颜色输入行 */
 function ColorRow({
   label,
+  pickerLabel,
   value,
   onChange,
 }: {
   label: string;
+  pickerLabel: string;
   value: string;
   onChange: (v: string) => void;
 }) {
+  const inputId = useId();
+  const [draft, setDraft] = useState({ source: value, text: value });
+  const text = draft.source === value ? draft.text : value;
+  const valid = isHexColor(text);
+  const changeColor = (next: string) => {
+    const complete = isHexColor(next);
+    setDraft({ source: complete ? next : value, text: next });
+    if (complete) onChange(next);
+  };
+
   return (
-    <label className="flex items-center gap-3">
+    <div className="grid min-w-0 grid-cols-[2rem_minmax(0,1fr)_6rem] items-center gap-2">
       <input
         type="color"
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        aria-label={pickerLabel}
+        onChange={(e) => changeColor(e.target.value)}
         className="h-8 w-8 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0"
       />
-      <span className="min-w-[120px] text-sm text-foreground">{label}</span>
+      <label htmlFor={inputId} className="min-w-0 break-words text-sm text-foreground">{label}</label>
       <input
+        id={inputId}
         type="text"
-        value={value}
-        onChange={(e) => {
-          const v = e.target.value;
-          if (/^#[0-9a-fA-F]{0,6}$/.test(v)) onChange(v);
-        }}
-        className="w-24 rounded-md border border-border bg-surface px-2 py-1 text-xs font-mono text-foreground"
+        value={text}
+        aria-invalid={!valid}
+        spellCheck={false}
+        maxLength={7}
+        onChange={(e) => changeColor(e.target.value)}
+        onBlur={() => setDraft({ source: value, text: value })}
+        className="w-full min-w-0 rounded-md border border-border bg-surface px-2 py-1 text-base font-mono text-foreground sm:text-sm"
       />
-    </label>
+    </div>
   );
 }
-
-/* 根据语言切换的标签映射 */
-const LABEL_MAP: Record<string, { zh: string; en: string }> = {
-  "--background": { zh: "背景色", en: "Background" },
-  "--foreground": { zh: "文字色", en: "Text" },
-  "--color-accent": { zh: "强调色", en: "Accent" },
-  "--color-accent-hover": { zh: "强调色(悬停)", en: "Accent Hover" },
-  "--color-surface": { zh: "表面色", en: "Surface" },
-  "--color-surface-secondary": { zh: "次表面色", en: "Surface 2" },
-  "--color-border": { zh: "边框色", en: "Border" },
-  "--color-muted": { zh: "辅助文字", en: "Muted" },
-  "--color-warm-50": { zh: "色阶 50", en: "Scale 50" },
-  "--color-warm-100": { zh: "色阶 100", en: "Scale 100" },
-  "--color-warm-200": { zh: "色阶 200", en: "Scale 200" },
-  "--color-warm-300": { zh: "色阶 300", en: "Scale 300" },
-  "--color-warm-400": { zh: "色阶 400", en: "Scale 400" },
-  "--color-warm-500": { zh: "色阶 500", en: "Scale 500" },
-  "--color-warm-600": { zh: "色阶 600", en: "Scale 600" },
-  "--color-warm-700": { zh: "色阶 700", en: "Scale 700" },
-  "--color-warm-800": { zh: "色阶 800", en: "Scale 800" },
-  "--color-warm-900": { zh: "色阶 900", en: "Scale 900" },
-};
 
 /* 主题卡片组件 */
 export function ThemeCard() {
   const t = useTranslations("settings.theme");
-  const pathname = usePathname();
-  const locale = pathname.startsWith("/en") ? "en" : "zh";
 
   const {
     presetId,
@@ -108,9 +99,6 @@ export function ThemeCard() {
 
   const draft = editMode === "light" ? customLight : customDark;
 
-  /* 标签读取辅助方法 */
-  const label = (key: string) => LABEL_MAP[key]?.[locale] ?? key;
-
   return (
     <div className="space-y-6">
       {/* 预设选择区 */}
@@ -122,6 +110,8 @@ export function ThemeCard() {
           {THEME_PRESETS.map((preset) => (
             <button
               key={preset.id}
+              type="button"
+              aria-pressed={presetId === preset.id}
               onClick={() => handleSelect(preset.id)}
               className={`flex flex-col items-center gap-2 rounded-lg border-2 px-4 py-3 transition-all ${
                 presetId === preset.id
@@ -146,6 +136,8 @@ export function ThemeCard() {
 
           {/* 自定义选项 */}
           <button
+            type="button"
+            aria-pressed={presetId === "custom"}
             onClick={() => handleSelect("custom")}
             className={`flex flex-col items-center gap-2 rounded-lg border-2 px-4 py-3 transition-all ${
               presetId === "custom"
@@ -188,6 +180,8 @@ export function ThemeCard() {
             {(["light", "dark"] as const).map((m) => (
               <button
                 key={m}
+                type="button"
+                aria-pressed={editMode === m}
                 onClick={() => setEditMode(m)}
                 className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
                   editMode === m
@@ -204,11 +198,13 @@ export function ThemeCard() {
           <h4 className="mb-2 text-xs font-medium text-muted">
             {t("semanticColors")}
           </h4>
-          <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <p className="mb-3 text-sm text-muted">{t("colorInputHint")}</p>
+          <div className="mb-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
             {SEMANTIC_COLOR_KEYS.map((key) => (
               <ColorRow
-                key={key}
-                label={label(key)}
+                key={`${editMode}-${key}`}
+                label={t(`colors.${key}`)}
+                pickerLabel={t("pickerLabel", { name: t(`colors.${key}`) })}
                 value={draft[key]}
                 onChange={(v) => handleColor(key, v)}
               />
@@ -217,6 +213,8 @@ export function ThemeCard() {
 
           {/* 高级色阶颜色 */}
           <button
+            type="button"
+            aria-expanded={showScale}
             onClick={() => setShowScale((s) => !s)}
             className="flex items-center gap-1.5 text-xs font-medium text-muted hover:text-foreground transition-colors"
           >
@@ -238,11 +236,12 @@ export function ThemeCard() {
           </button>
 
           {showScale && (
-            <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <div className="mt-2 grid grid-cols-1 gap-3 lg:grid-cols-2">
               {SCALE_COLOR_KEYS.map((key) => (
                 <ColorRow
-                  key={key}
-                  label={label(key)}
+                  key={`${editMode}-${key}`}
+                  label={t(`colors.${key}`)}
+                  pickerLabel={t("pickerLabel", { name: t(`colors.${key}`) })}
                   value={draft[key]}
                   onChange={(v) => handleColor(key, v)}
                 />

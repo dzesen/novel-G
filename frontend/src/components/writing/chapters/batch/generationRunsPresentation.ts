@@ -1,6 +1,8 @@
 import {
   chapterProgressEntries,
   type ChapterProgress,
+  type CandidatePipelineProgress,
+  type GenerationJobProgress,
   type GenerationDiagnostic,
   type GenerationJob,
   type GenerationJobSummary,
@@ -91,6 +93,52 @@ export function aggregateChapterProgress(
     .sort((left, right) => left.order_index - right.order_index);
 }
 
+export type JobChapterProgressPresentation = Pick<ChapterProgressPresentation,
+  "chapter_id" | "order_index" | "tokens" | "completedStepCount" | "stepPercent"
+  | "incomplete_prose" | "completed_at">;
+
+function isCommittedCandidateProgress(entry: GenerationJobProgress): entry is CandidatePipelineProgress {
+  return "schema_version" in entry && entry.schema_version === "candidate_pipeline_progress.v1"
+    && entry.status === "completed" && entry.finalization_status === "committed";
+}
+
+/** Candidate receipts prove completion, without inventing legacy step details. */
+export function jobChapterProgressEntries(progress: GenerationJobProgress[]): JobChapterProgressPresentation[] {
+  const legacy = chapterProgressEntries(progress).filter((entry) => !(
+    "schema_version" in entry && entry.schema_version === "candidate_pipeline_progress.v1"
+  ));
+  const rows = new Map<string, JobChapterProgressPresentation>(
+    aggregateChapterProgress(legacy).map((entry) => [entry.chapter_id, entry]),
+  );
+  const candidates = progress.filter(isCommittedCandidateProgress)
+    .sort((left, right) => compareNewestFirst(left.completed_at, right.completed_at));
+  const seen = new Set<string>();
+  for (const entry of candidates) {
+    if (seen.has(entry.chapter_id)) continue;
+    seen.add(entry.chapter_id);
+    rows.set(entry.chapter_id, {
+      chapter_id: entry.chapter_id,
+      order_index: entry.order_index,
+      tokens: entry.tokens,
+      completed_at: entry.completed_at,
+      completedStepCount: JOB_CHAPTER_STEPS.length,
+      stepPercent: 100,
+    });
+  }
+  return [...rows.values()].sort((left, right) => left.order_index - right.order_index);
+}
+
+/** The server includes reusable chapters without exposing readiness inputs. */
+export function completedJobChapterCount(job: GenerationJob): number {
+  const count = job.completed_chapter_count;
+  if (typeof count === "number" && Number.isInteger(count) && count >= 0) {
+    return count;
+  }
+  // Historical API responses may lack the scalar; keep their proven receipts.
+  return jobChapterProgressEntries(job.progress)
+    .filter((chapter) => chapter.completedStepCount === 3 && !chapter.incomplete_prose).length;
+}
+
 export function newestDiagnostics(
   diagnostics: GenerationDiagnostic[] | undefined,
 ): OrderedDiagnostic[] {
@@ -103,7 +151,7 @@ export function newestDiagnostics(
 }
 
 export function currentJobReasonCode(job: GenerationJob | GenerationJobSummary): string | null {
-  if (job.pause_reason) return job.pause_reason;
+  if (job.pause_reason) return job.pause_reason_detail ?? job.pause_reason;
   if (job.status !== "failed" && job.status !== "interrupted") return null;
   return ("latest_diagnostic" in job
     ? job.latest_diagnostic?.code

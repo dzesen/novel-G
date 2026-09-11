@@ -112,6 +112,9 @@ def _serialize_relation(relation: dict) -> dict:
         relation["_id"] = str(relation["_id"])
     if "novel_id" in relation:
         relation["novel_id"] = str(relation["novel_id"])
+    for key in ("source_faction_card_id", "target_faction_card_id"):
+        if relation.get(key) is not None:
+            relation[key] = str(relation[key])
     return relation
 
 
