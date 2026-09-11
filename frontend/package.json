@@ -40,5 +40,5 @@
   "engines": {
     "node": "^22.13.0 || >=24.0.0"
   },
-  "license": "UNLICENSED"
+  "license": "AGPL-3.0-only"
 }
