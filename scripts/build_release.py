@@ -24,7 +24,7 @@ REQUIRED_FILES = frozenset({
     "VERSION", "LICENSE", "README.md", "README.zh-CN.md", "requirements.txt",
     "setup.bat", "start.bat", "verify.bat", "launcher.py", "main.py",
     "frontend/package.json", "frontend/package-lock.json",
-    "backend/config/config_default.yaml", "scripts/build_release.py",
+    "backend/config/config_default.yaml", "scripts/build_release.py", "scripts/install_local.py",
 })
 VERSION_PATTERN = re.compile(r"[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?")
 

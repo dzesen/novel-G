@@ -4,7 +4,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 title Novel-G 启动器
 set "NO_PAUSE="
-if /i "%~1"=="--no-pause" set "NO_PAUSE=1"
+for %%A in (%*) do if /i "%%~A"=="--no-pause" set "NO_PAUSE=1"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 if not defined TCL_LIBRARY if exist ".venv\tcl-runtime\tcl8.6\init.tcl" set "TCL_LIBRARY=%CD%\.venv\tcl-runtime\tcl8.6"
@@ -40,7 +40,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "" ".venv\Scripts\pythonw.exe" launcher.py
+start "" ".venv\Scripts\pythonw.exe" launcher.py %*
 if errorlevel 1 (
     echo [错误] 无法创建桌面启动器进程。
     echo [日志] %NOVEL_G_LAUNCHER_STARTUP_LOG%

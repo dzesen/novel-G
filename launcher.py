@@ -8,6 +8,7 @@ import ipaddress
 import json
 import locale
 import os
+import queue
 import shutil
 import shlex
 import signal
@@ -556,6 +557,114 @@ def get_service_status_style(
     return styles[state]
 
 
+class StartupCoordinator:
+    """Wait for real readiness off the Tk thread; apply results on the Tk thread."""
+
+    def __init__(self, backend, frontend, *, open_browser=webbrowser.open, timeout: float = 90,
+                 poll_interval: float = 0.25):
+        self.backend = backend
+        self.frontend = frontend
+        self.open_browser = open_browser
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self._events: queue.SimpleQueue = queue.SimpleQueue()
+        self._cancelled = threading.Event()
+        self._active = False
+        self._opened = False
+        self._url = ""
+
+    def start(self) -> None:
+        if self._active:
+            return
+        states = [service.get_state() for service in (self.backend, self.frontend)]
+        if "stopping" in states:
+            self.backend.write_log("[Launcher] 请等待服务停止后再次启动。\n")
+            return
+        if self._opened and all(state in {"running", "external"} for state in states):
+            return
+        self._cancelled = threading.Event()
+        self._active = True
+        self._opened = False
+        self._url = self.frontend.url
+        self.backend.start()
+        self.backend.write_log("[Launcher] 等待后端就绪，随后启动工作台…\n")
+        self._wait("backend", (self.backend,))
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self._active = False
+        self._opened = False
+
+    def _wait(self, stage: str, services: tuple) -> None:
+        threading.Thread(target=self._wait_worker, args=(self._cancelled, stage, services), daemon=True).start()
+
+    def _wait_worker(self, cancelled: threading.Event, stage: str, services: tuple) -> None:
+        deadline = time.monotonic() + self.timeout
+        detail = "服务尚未就绪"
+        while not cancelled.is_set():
+            ready = True
+            for service in services:
+                state = service.get_state()
+                if state in {"stopped", "stopping"}:
+                    self._events.put((cancelled, stage, False, f"{service.service_key} 未启动或已停止，请查看对应日志。"))
+                    return
+                if state == "starting":
+                    ready = False
+                    detail = f"{service.service_key} 仍在检查环境"
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    ready = False
+                    break
+                matched, detail = identify_novel_g_service(service.health_url, service.service_marker,
+                                                           timeout=min(1.5, remaining))
+                if cancelled.is_set():
+                    return
+                if not matched:
+                    ready = False
+                    break
+            if ready:
+                self._events.put((cancelled, stage, True, ""))
+                return
+            if time.monotonic() >= deadline:
+                self._events.put((cancelled, stage, False, f"等待服务就绪超时（{detail}）。请查看日志，修正后点击“全部启动”重试。"))
+                return
+            cancelled.wait(self.poll_interval)
+
+    def drain(self) -> None:
+        """Called only from the GUI event loop; workers never touch Tk or the browser."""
+        while True:
+            try:
+                cancelled, stage, ready, detail = self._events.get_nowait()
+            except queue.Empty:
+                return
+            if cancelled is not self._cancelled or cancelled.is_set() or not self._active:
+                continue
+            if not ready:
+                self._active = False
+                target = self.backend if stage == "backend" else self.frontend
+                target.write_log(f"[ERROR] {detail}\n")
+                continue
+            # A Stop click can happen after the health response but before this event.
+            services = (self.backend,) if stage == "backend" else (self.backend, self.frontend)
+            if any(service.get_state() not in {"running", "external"} for service in services):
+                self.cancel()
+                continue
+            if stage == "backend":
+                self.frontend.start()
+                self.frontend.write_log("[Launcher] 等待工作台就绪后自动打开浏览器…\n")
+                self._wait("frontend", (self.backend, self.frontend))
+            else:
+                self._active = False
+                try:
+                    opened = self.open_browser(self._url)
+                except Exception:
+                    opened = False
+                self._opened = bool(opened)
+                message = "工作台已就绪并打开。" if opened else f"工作台已就绪，请手动打开 {self._url}。"
+                self.frontend.write_log(f"[OK] {message}\n")
+
+
 class ServicePanel(ctk.CTkFrame):
     """单个服务的控制面板与日志窗口。"""
 
@@ -935,10 +1044,7 @@ class ServicePanel(ctk.CTkFrame):
         return full_env
 
     def _start_worker(self) -> None:
-        if self._shutdown:
-            with self._state_lock:
-                self._state = "stopped"
-            self._queue_event("status", "stopped")
+        if self._cancel_start_if_requested():
             return
 
         self._open_log_file()
@@ -959,6 +1065,9 @@ class ServicePanel(ctk.CTkFrame):
                     self._state = "stopped"
                 self._queue_event("status", "stopped")
                 return
+
+        if self._cancel_start_if_requested():
+            return
 
         if is_port_in_use(self.port):
             matched, detail = identify_novel_g_service(
@@ -982,8 +1091,9 @@ class ServicePanel(ctk.CTkFrame):
                     )
                 self._close_log_file()
                 with self._state_lock:
-                    self._state = "external"
-                self._queue_event("status", "external")
+                    cancelled = self._shutdown or self._state != "starting"
+                    self._state = "stopped" if cancelled else "external"
+                self._queue_event("status", "stopped" if cancelled else "external")
                 return
             self.write_log(
                 f"[ERROR] 端口 {self.port} 已被未知进程占用（{detail}）。"
@@ -1005,7 +1115,11 @@ class ServicePanel(ctk.CTkFrame):
         }
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
 
+        if self._cancel_start_if_requested():
+            return
         try:
             proc = subprocess.Popen(self.command, **kwargs)
         except Exception as exc:
@@ -1016,7 +1130,12 @@ class ServicePanel(ctk.CTkFrame):
             self._queue_event("status", "stopped")
             return
 
-        if self._shutdown:
+        with self._state_lock:
+            cancelled = self._shutdown or self._state != "starting"
+            if not cancelled:
+                self._proc = proc
+                self._state = "running"
+        if cancelled:
             self._kill_proc(proc)
             self._close_log_file()
             with self._state_lock:
@@ -1024,17 +1143,24 @@ class ServicePanel(ctk.CTkFrame):
             self._queue_event("status", "stopped")
             return
 
-        with self._state_lock:
-            self._proc = proc
-            self._state = "running"
-
         self._queue_event("status", "running")
         self._monitor_thread = threading.Thread(target=self._monitor_process, args=(proc,), daemon=True)
         self._monitor_thread.start()
 
+    def _cancel_start_if_requested(self) -> bool:
+        with self._state_lock:
+            cancelled = self._shutdown or self._state != "starting"
+            if cancelled:
+                self._state = "stopped"
+        if cancelled:
+            self.write_log("[Launcher] 已取消启动。\n")
+            self._close_log_file()
+            self._queue_event("status", "stopped")
+        return cancelled
+
     def start(self) -> None:
         with self._state_lock:
-            if self._state != "stopped":
+            if self._shutdown or self._state != "stopped":
                 return
             self._state = "starting"
 
@@ -1091,6 +1217,11 @@ class ServicePanel(ctk.CTkFrame):
     def stop(self) -> None:
         with self._state_lock:
             proc = self._proc
+            if self._state == "starting":
+                # The start worker observes stopping before publishing any child process.
+                self._state = "stopping"
+                self._queue_event("status", "stopping")
+                return
             if self._state == "running" and proc is not None:
                 worker = self._kill_proc
                 args = (proc,)
@@ -1135,9 +1266,14 @@ class ServicePanel(ctk.CTkFrame):
     def set_env(self, env: dict[str, str]) -> None:
         self.env = dict(env)
 
-    def is_active(self) -> bool:
+    def get_state(self) -> ServiceState:
         with self._state_lock:
-            return self._state != "stopped"
+            if self._state == "running" and (self._proc is None or self._proc.poll() is not None):
+                return "stopped"
+            return self._state
+
+    def is_active(self) -> bool:
+        return self.get_state() != "stopped"
 
 
 class App(ctk.CTk):
@@ -1155,6 +1291,7 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
         self._lan_enabled = False
         self._lan_ip: str | None = None
+        self._auto_start_id: str | None = None
 
         self.npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
 
@@ -1273,6 +1410,8 @@ class App(ctk.CTk):
         self._on_frontend_mode_change("生产模式")
         self._apply_network_mode(False)
 
+        self.startup = StartupCoordinator(self.backend, self.frontend)
+        self.after(LOG_FLUSH_INTERVAL_MS, self._drain_startup_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._atexit_cleanup)
 
@@ -1411,20 +1550,38 @@ class App(ctk.CTk):
         if self.backend.is_running():
             self.backend.write_log("[INFO] 后端调试模式已切换，重启后端后生效。\n")
 
+    def _drain_startup_events(self) -> None:
+        self.startup.drain()
+        self.after(LOG_FLUSH_INTERVAL_MS, self._drain_startup_events)
+
+    def schedule_auto_start(self) -> None:
+        self._cancel_auto_start()
+        self._auto_start_id = self.after(150, self.start_all)
+
+    def _cancel_auto_start(self) -> None:
+        if self._auto_start_id is not None:
+            self.after_cancel(self._auto_start_id)
+            self._auto_start_id = None
+
     def start_all(self) -> None:
-        self.backend.start()
-        self.frontend.start()
+        self._cancel_auto_start()
+        self.startup.start()
 
     def stop_all(self) -> None:
+        self._cancel_auto_start()
+        self.startup.cancel()
         self.backend.stop()
         self.frontend.stop()
 
     def _on_close(self) -> None:
+        self._cancel_auto_start()
+        self.startup.cancel()
         self.backend.force_cleanup()
         self.frontend.force_cleanup()
         self.destroy()
 
     def _atexit_cleanup(self) -> None:
+        self.startup.cancel()
         self.backend.force_cleanup()
         self.frontend.force_cleanup()
 
@@ -1439,6 +1596,8 @@ if __name__ == "__main__":
             app.destroy()
             print("[OK] Novel-G launcher GUI startup check passed.")
         else:
+            if "--manual" not in sys.argv[1:]:
+                app.schedule_auto_start()
             app.mainloop()
     except BaseException as exc:
         if not startup_check:
