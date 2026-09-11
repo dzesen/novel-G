@@ -12,6 +12,9 @@ from backend.services.generation.prose_protocol import (
 
 
 MAX_DISCARDED_CANDIDATE_RUNS = 200
+DISCARD_RESOLVED_ATTEMPT_STATES = frozenset({
+    "accounted", "uncertain_retry_acknowledged", "uncertain_skip_acknowledged",
+})
 
 
 def _strict_usage(value: Any) -> tuple[int, int, int] | None:
@@ -34,7 +37,7 @@ def _strict_usage(value: Any) -> tuple[int, int, int] | None:
 
 def _ordered_segment_usages(
     run: Mapping[str, Any],
-) -> tuple[str, tuple[tuple[int, int, int], ...]] | None:
+) -> tuple[str, tuple[tuple[bool, tuple[int, int, int]], ...]] | None:
     if run.get("status") != "discarded" or run.get("is_deleted") is True:
         return None
     raw_segments = run.get("segments")
@@ -44,7 +47,7 @@ def _ordered_segment_usages(
         or len(raw_segments) > 5_000
     ):
         return None
-    segments: list[tuple[int, tuple[int, int, int]]] = []
+    segments: list[tuple[bool, tuple[int, int, int]]] = []
     order_keys: list[tuple[int, int, int]] = []
     seen_sequences: set[int] = set()
     for raw_segment in raw_segments:
@@ -81,7 +84,7 @@ def _ordered_segment_usages(
             return None
         seen_sequences.add(sequence)
         order_keys.append(order_key)
-        segments.append((sequence, usage))
+        segments.append((raw_segment.get("status") == "uncertain", usage))
     base_sequences = sorted(
         sequence
         for sequence in seen_sequences
@@ -107,7 +110,7 @@ def _ordered_segment_usages(
     )
     if not isinstance(provider_alias, str) or not provider_alias:
         return None
-    return provider_alias, tuple(usage for _sequence, usage in segments)
+    return provider_alias, tuple(segments)
 
 
 def match_discarded_candidate_attempt_ids(
@@ -125,7 +128,7 @@ def match_discarded_candidate_attempt_ids(
     protected = set(protected_attempt_ids)
     if len(protected) != len(tuple(protected_attempt_ids)):
         return ()
-    candidate_slots: list[tuple[str, str, tuple[int, int, int]]] = []
+    candidate_slots: list[tuple[str, str, bool, tuple[int, int, int]]] = []
     ledger_attempt_ids: set[str] = set()
     protected_prose_seen = False
     for slot in attempt_slots:
@@ -138,11 +141,24 @@ def match_discarded_candidate_attempt_ids(
             ledger_attempt_ids.add(raw_attempt_id)
         if str(slot.get("step_id") or "") != "candidate-prose":
             continue
-        if str(slot.get("state") or "") != "accounted":
+        state = str(slot.get("state") or "")
+        if state not in DISCARD_RESOLVED_ATTEMPT_STATES:
+            # An unresolved call cannot be skipped over to match later evidence.
+            if state not in {"released_pre_dispatch"}:
+                return ()
             continue
         attempt_id = raw_attempt_id
         provider_alias = slot.get("provider_alias")
-        usage = _strict_usage(slot.get("usage"))
+        uncertain = state != "accounted"
+        if uncertain:
+            reserved = slot.get("conservative_tokens")
+            if isinstance(reserved, bool) or not isinstance(reserved, int) or reserved <= 0:
+                return ()
+            # ProseRun persists the conservative hold as synthetic usage when
+            # the provider returns no usage. Acknowledgement never refunds it.
+            usage = (0, 0, reserved)
+        else:
+            usage = _strict_usage(slot.get("usage"))
         if (
             not isinstance(attempt_id, str)
             or not attempt_id
@@ -156,7 +172,7 @@ def match_discarded_candidate_attempt_ids(
             continue
         if protected_prose_seen:
             return ()
-        candidate_slots.append((attempt_id, provider_alias, usage))
+        candidate_slots.append((attempt_id, provider_alias, uncertain, usage))
 
     if not candidate_slots or not discarded_runs:
         return ()
@@ -176,15 +192,18 @@ def match_discarded_candidate_attempt_ids(
         if len(window) != len(usages):
             return ()
         if any(
-            slot_provider != provider_alias or slot_usage != segment_usage
+            slot_provider != provider_alias
+            or slot_uncertain != segment_uncertain
+            or slot_usage != segment_usage
             for (
                 _attempt_id,
                 slot_provider,
+                slot_uncertain,
                 slot_usage,
-            ), segment_usage in zip(window, usages, strict=True)
+            ), (segment_uncertain, segment_usage) in zip(window, usages, strict=True)
         ):
             return ()
-        resolved.extend(attempt_id for attempt_id, _provider, _usage in window)
+        resolved.extend(attempt_id for attempt_id, _provider, _uncertain, _usage in window)
         offset += len(window)
     return tuple(resolved)
 
@@ -202,7 +221,7 @@ async def resolve_discarded_candidate_attempt_ids(
 
     if not any(
         str(slot.get("step_id") or "") == "candidate-prose"
-        and str(slot.get("state") or "") == "accounted"
+        and str(slot.get("state") or "") in DISCARD_RESOLVED_ATTEMPT_STATES
         and str(slot.get("attempt_id") or "") not in protected_attempt_ids
         for slot in attempt_slots
         if isinstance(slot, Mapping)

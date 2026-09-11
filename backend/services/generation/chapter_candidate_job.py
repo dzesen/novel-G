@@ -8,6 +8,10 @@ process restart never turns a persisted paid step into a second Provider call.
 
 from __future__ import annotations
 
+from backend.services.generation.discarded_candidate_recovery import (
+    DISCARD_RESOLVED_ATTEMPT_STATES,
+)
+
 from backend.services.generation.chapter_review_policy import (
     build_not_reviewed_receipt, review_authorization_from_readiness,
 )
@@ -647,7 +651,7 @@ def _validated_discarded_attempt_ids(
             slot is None
             or attempt_id in protected_attempt_ids
             or str(slot.get("step_id") or "") != "candidate-prose"
-            or str(slot.get("state") or "") != "accounted"
+            or str(slot.get("state") or "") not in DISCARD_RESOLVED_ATTEMPT_STATES
         ):
             raise ChapterCandidatePipelineBlocked(
                 "候选丢弃证据与持久调用账本不一致",

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-import time
 import json
+import os
 import re
+import sys
+import time
 from typing import Any, AsyncGenerator, Callable, NoReturn
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import openai
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
@@ -147,7 +150,16 @@ class OpenAICompatibleClient(BaseLLMClient):
 
     def __init__(self, config: LLMProviderConfig, provider_name: str = "openai") -> None:
         super().__init__(config, provider_name)
+        tls_context = httpx.create_ssl_context(trust_env=config.use_system_proxy)
+        explicit_ca = config.use_system_proxy and any(
+            os.environ.get(name) for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")
+        )
+        if sys.platform == "win32" and not explicit_ca:
+            # Retain certifi roots and include certificates already trusted by
+            # Windows. Hostname and certificate verification remain mandatory.
+            tls_context.load_default_certs()
         self._http_client = openai.DefaultAsyncHttpxClient(
+            verify=tls_context,
             trust_env=config.use_system_proxy,
             timeout=float(config.timeout_seconds),
         )
