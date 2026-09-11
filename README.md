@@ -65,7 +65,7 @@ This is a source installation. Install Python, Node.js, and MongoDB separately.
 1. In the [project repository](https://github.com/dzesen/novel-G), select **Code → Download ZIP**. Extract the source into a writable directory and open the folder containing `setup.bat` and `start.bat`.
 2. Start MongoDB. The default connection is `mongodb://localhost:27017`. For another address, copy `backend/config/config_default.yaml` to `backend/config/config.yaml` and edit `mongodb_url`.
 3. Double-click `setup.bat` to check prerequisites, install dependencies, and build the frontend. If installation fails, fix the reported problem and run it again to reuse completed steps.
-4. Double-click `start.bat`. The launcher opens the browser when services are ready. Create the administrator account on first use.
+4. Double-click `start.bat`, then click **全部启动 (Start All)**. Both services begin starting immediately, and the launcher opens the browser when both are ready. Create the administrator account on first use.
 
 The default address is [http://127.0.0.1:3000](http://127.0.0.1:3000). For daily use, run `start.bat`. See the [source installation guide](docs/source-release.zh-CN.md) for detailed installation and upgrade steps.
 
@@ -111,7 +111,7 @@ Run these commands from PowerShell in the project directory.
 | --- | --- |
 | `.\setup.bat --check` | Check the installation and MongoDB without downloading dependencies or rebuilding |
 | `.\setup.bat --repair` | After stopping services, reinstall dependencies and rebuild while preserving configuration and local data |
-| `.\start.bat --manual` | Open the launcher, then choose a mode and start services manually |
+| `.\start.bat` | Open the launcher, then choose a mode and start services manually |
 
 Checks write local logs and may create the default configuration during the first configuration check. If dependencies are ready but MongoDB is unavailable, start the database or correct the connection and run `--check` again. Installation logs are in `logs/installation/`.
 

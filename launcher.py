@@ -587,8 +587,10 @@ class StartupCoordinator:
         self._opened = False
         self._url = self.frontend.url
         self.backend.start()
-        self.backend.write_log("[Launcher] 等待后端就绪，随后启动工作台…\n")
-        self._wait("backend", (self.backend,))
+        self.frontend.start()
+        for service in (self.backend, self.frontend):
+            service.write_log("[Launcher] 已启动两端，等待后端和工作台均就绪后打开浏览器…\n")
+        self._wait("both", (self.backend, self.frontend))
 
     def cancel(self) -> None:
         self._cancelled.set()
@@ -642,27 +644,22 @@ class StartupCoordinator:
                 continue
             if not ready:
                 self._active = False
-                target = self.backend if stage == "backend" else self.frontend
-                target.write_log(f"[ERROR] {detail}\n")
+                for service in (self.backend, self.frontend):
+                    service.write_log(f"[ERROR] {detail}\n")
                 continue
             # A Stop click can happen after the health response but before this event.
-            services = (self.backend,) if stage == "backend" else (self.backend, self.frontend)
+            services = (self.backend, self.frontend)
             if any(service.get_state() not in {"running", "external"} for service in services):
                 self.cancel()
                 continue
-            if stage == "backend":
-                self.frontend.start()
-                self.frontend.write_log("[Launcher] 等待工作台就绪后自动打开浏览器…\n")
-                self._wait("frontend", (self.backend, self.frontend))
-            else:
-                self._active = False
-                try:
-                    opened = self.open_browser(self._url)
-                except Exception:
-                    opened = False
-                self._opened = bool(opened)
-                message = "工作台已就绪并打开。" if opened else f"工作台已就绪，请手动打开 {self._url}。"
-                self.frontend.write_log(f"[OK] {message}\n")
+            self._active = False
+            try:
+                opened = self.open_browser(self._url)
+            except Exception:
+                opened = False
+            self._opened = bool(opened)
+            message = "工作台已就绪并打开。" if opened else f"工作台已就绪，请手动打开 {self._url}。"
+            self.frontend.write_log(f"[OK] {message}\n")
 
 
 class ServicePanel(ctk.CTkFrame):
@@ -1291,7 +1288,6 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
         self._lan_enabled = False
         self._lan_ip: str | None = None
-        self._auto_start_id: str | None = None
 
         self.npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
 
@@ -1554,27 +1550,15 @@ class App(ctk.CTk):
         self.startup.drain()
         self.after(LOG_FLUSH_INTERVAL_MS, self._drain_startup_events)
 
-    def schedule_auto_start(self) -> None:
-        self._cancel_auto_start()
-        self._auto_start_id = self.after(150, self.start_all)
-
-    def _cancel_auto_start(self) -> None:
-        if self._auto_start_id is not None:
-            self.after_cancel(self._auto_start_id)
-            self._auto_start_id = None
-
     def start_all(self) -> None:
-        self._cancel_auto_start()
         self.startup.start()
 
     def stop_all(self) -> None:
-        self._cancel_auto_start()
         self.startup.cancel()
         self.backend.stop()
         self.frontend.stop()
 
     def _on_close(self) -> None:
-        self._cancel_auto_start()
         self.startup.cancel()
         self.backend.force_cleanup()
         self.frontend.force_cleanup()
@@ -1586,8 +1570,8 @@ class App(ctk.CTk):
         self.frontend.force_cleanup()
 
 
-if __name__ == "__main__":
-    startup_check = "--check-startup" in sys.argv[1:]
+def main(argv: list[str] | None = None) -> None:
+    startup_check = "--check-startup" in (sys.argv[1:] if argv is None else argv)
     try:
         app = App()
         if startup_check:
@@ -1596,8 +1580,6 @@ if __name__ == "__main__":
             app.destroy()
             print("[OK] Novel-G launcher GUI startup check passed.")
         else:
-            if "--manual" not in sys.argv[1:]:
-                app.schedule_auto_start()
             app.mainloop()
     except BaseException as exc:
         if not startup_check:
@@ -1639,3 +1621,7 @@ if __name__ == "__main__":
                 except Exception:
                     pass
         raise
+
+
+if __name__ == "__main__":
+    main()

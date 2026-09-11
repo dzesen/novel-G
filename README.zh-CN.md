@@ -65,7 +65,7 @@
 1. 在[项目仓库](https://github.com/dzesen/novel-G)选择 **Code → Download ZIP** 下载源码，解压到可写目录，进入包含 `setup.bat` 和 `start.bat` 的文件夹。
 2. 启动 MongoDB。默认连接为 `mongodb://localhost:27017`；使用其他地址时，先将 `backend/config/config_default.yaml` 复制为 `backend/config/config.yaml`，修改 `mongodb_url`。
 3. 双击 `setup.bat`。脚本检查环境、安装依赖并构建前端。安装失败后，修正问题并重新运行即可复用已完成的步骤。
-4. 双击 `start.bat`。启动器等待服务就绪后自动打开浏览器，首次进入时创建管理员账号。
+4. 双击 `start.bat`，在启动器中点击“全部启动”。前后端同时开始启动，均就绪后自动打开浏览器，首次进入时创建管理员账号。
 
 默认访问地址为 [http://127.0.0.1:3000](http://127.0.0.1:3000)。日常使用只需运行 `start.bat`。详细安装与升级步骤见[源码安装指南](docs/source-release.zh-CN.md)。
 
@@ -111,7 +111,7 @@
 | --- | --- |
 | `.\setup.bat --check` | 检查安装与 MongoDB，不下载依赖或重新构建 |
 | `.\setup.bat --repair` | 关闭服务后重新安装依赖和构建，保留配置与本地数据 |
-| `.\start.bat --manual` | 打开启动器后手动选择模式并启动服务 |
+| `.\start.bat` | 打开启动器后手动选择模式并启动服务 |
 
 检查会记录本地日志，首次配置检查可能创建默认配置。若依赖已就绪但 MongoDB 连接失败，启动数据库或修正连接后再执行 `--check`。安装日志位于 `logs/installation/`。
 
