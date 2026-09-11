@@ -57,19 +57,21 @@ call :ensure_tk_runtime
 if errorlevel 1 goto :failed
 
 echo [3/5] 安装后端依赖...
+".venv\Scripts\python.exe" -m pip install --upgrade pip==26.2.1
+if errorlevel 1 goto :failed
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 if errorlevel 1 goto :failed
 
 echo [4/5] 安装前端依赖...
 where npm.cmd >nul 2>nul
 if errorlevel 1 (
-    echo [错误] 未找到 npm，请安装 Node.js 20.9 或更高版本。
+    echo [错误] 未找到 npm，请安装 Node.js 22.13+ 或 24 LTS。
     call :pause_if_needed
     exit /b 1
 )
-node -e "const [a,b]=process.versions.node.split('.').map(Number); process.exit(a>20 || (a===20 && b>=9) ? 0 : 1)"
+node -e "const [a,b]=process.versions.node.split('.').map(Number); process.exit(a>=24 || (a===22 && b>=13) ? 0 : 1)"
 if errorlevel 1 (
-    echo [错误] Node.js 版本过低，请安装 Node.js 20.9 或更高版本。
+    echo [错误] Node.js 版本过低，请安装 Node.js 22.13+ 或 24 LTS。
     call :pause_if_needed
     exit /b 1
 )

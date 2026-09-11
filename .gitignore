@@ -17,3 +17,15 @@ config.yaml
 config.yaml.bak
 publish-public.ps1
 PUBLIC_RELEASE.md
+
+# Release artifacts and local-only credentials
+/dist/
+/test-results/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/config.json

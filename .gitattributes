@@ -1,3 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 *.bat text eol=crlf
+
+# Local editor settings and issue scratch work are not release payloads.
+/.claude export-ignore
+/work export-ignore

@@ -1310,7 +1310,7 @@ class App(ctk.CTk):
         node_path = shutil.which("node")
         npm_path = shutil.which(self.npm_cmd)
         if not node_path or not npm_path:
-            return False, "[ERROR] 未找到 Node.js 或 npm，请安装 Node.js 20.9+ 后重新运行 setup.bat。"
+            return False, "[ERROR] 未找到 Node.js 或 npm，请安装 Node.js 22.13+ 或 24 LTS 后重新运行 setup.bat。"
 
         try:
             result = subprocess.run(
@@ -1325,10 +1325,10 @@ class App(ctk.CTk):
             version_text = result.stdout.strip().lstrip("v")
             version_parts = tuple(int(part) for part in version_text.split(".")[:3])
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            return False, "[ERROR] 无法识别 Node.js 版本，请重新安装 Node.js 20.9+。"
+            return False, "[ERROR] 无法识别 Node.js 版本，请重新安装 Node.js 22.13+ 或 24 LTS。"
 
-        if version_parts < (20, 9, 0):
-            return False, f"[ERROR] 当前 Node.js 为 {version_text}，前端需要 20.9.0 或更高版本。"
+        if version_parts < (22, 13, 0) or version_parts[0] == 23:
+            return False, f"[ERROR] 当前 Node.js 为 {version_text}，前端需要 Node.js 22.13+ 或 24 LTS。"
 
         next_package = FRONTEND_DIR / "node_modules" / "next" / "package.json"
         if not next_package.is_file():
