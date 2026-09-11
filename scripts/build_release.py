@@ -4,28 +4,65 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import posixpath
 import re
 import subprocess
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED_PARTS = frozenset({
     ".git", ".venv", "node_modules", ".next", "__pycache__", ".pytest_cache",
     ".npm-cache", "reports", "logs", "backups", "managed-assets", "static",
-    "dist", "test-results", ".claude", ".superpowers", ".impeccable", "work",
+    "dist", "test-results", "playwright-report", "coverage", ".claude",
+    ".superpowers", ".impeccable", "work", "tests", "e2e",
 })
 PRIVATE_NAMES = frozenset({
     "config.yaml", "config.yaml.bak", "config.json", ".config-secret-versions.json",
     ".provider-capabilities.json", "publish-public.ps1", "PUBLIC_RELEASE.md",
 })
-REQUIRED_FILES = frozenset({
-    "VERSION", "LICENSE", "README.md", "README.zh-CN.md", "requirements.txt",
-    "setup.bat", "start.bat", "verify.bat", "launcher.py", "main.py",
-    "frontend/package.json", "frontend/package-lock.json",
-    "backend/config/config_default.yaml", "scripts/build_release.py", "scripts/install_local.py",
+PRIVATE_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx", ".pyc"})
+DOCUMENT_SUFFIXES = frozenset({".md", ".markdown", ".rst"})
+PUBLIC_DOCUMENTS = frozenset({
+    "docs/source-release.zh-CN.md",
+    "docs/user-guide.zh-CN.md",
+    "docs/troubleshooting.zh-CN.md",
+    "docs/known-limitations.zh-CN.md",
+    "docs/contributing.zh-CN.md",
+    "docs/security.zh-CN.md",
+    "docs/license-status.zh-CN.md",
+    "docs/third-party-notices.zh-CN.md",
+    "docs/releases/0.1.0-rc.1.zh-CN.md",
+    "docs/releases/0.1.0-rc.2.zh-CN.md",
+    "docs/releases/0.1.0-rc.3.zh-CN.md",
 })
+# The production job repository imports the outline journal, which has these
+# transitive dependencies. Keep this closure until that coupling is removed.
+RUNTIME_EVALUATION_FILES = frozenset({
+    "backend/evaluation/__init__.py",
+    "backend/evaluation/batch_job_acceptance_sample.py",
+    "backend/evaluation/required_book_successor_acceptance.py",
+    "backend/evaluation/required_book_successor_acceptance_identity.py",
+    "backend/evaluation/required_book_successor_acceptance_ledger.py",
+    "backend/evaluation/required_book_successor_acceptance_outline.py",
+    "backend/evaluation/required_book_successor_judge_probe.py",
+    "backend/evaluation/required_book_successor_judge_probe_execution.py",
+    "backend/evaluation/required_book_successor_judge_probe_store.py",
+})
+RELEASE_FILES = frozenset({
+    ".gitattributes", ".gitignore", "VERSION", "LICENSE", "README.md", "README.zh-CN.md",
+    "requirements.txt", "setup.bat", "start.bat", "launcher.py", "main.py",
+    "frontend/.gitignore", "frontend/package.json", "frontend/package-lock.json",
+    "frontend/next.config.ts", "frontend/tsconfig.json", "frontend/postcss.config.mjs",
+    "frontend/eslint.config.mjs", "scripts/build_release.py", "scripts/install_local.py",
+}) | PUBLIC_DOCUMENTS | RUNTIME_EVALUATION_FILES
+RUNTIME_TREES = ("backend", "frontend/src", "frontend/public")
+DEVELOPMENT_PATHS = ("backend/evaluation", "backend/verification.py")
+REQUIRED_FILES = (RELEASE_FILES - {"LICENSE"}) | {
+    "backend/config/config_default.yaml", "backend/preflight.py", "backend/diagnostics.py",
+}
 VERSION_PATTERN = re.compile(r"[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?")
 
 
@@ -37,12 +74,82 @@ def excluded_path(name: str) -> bool:
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or "\\" in name or ":" in name:
         raise ValueError(f"Unsafe archive path: {name}")
-    return (
+    if (
         any(part in EXCLUDED_PARTS for part in path.parts)
         or path.name in PRIVATE_NAMES
         or path.name == ".env" or path.name.startswith(".env.")
-        or path.suffix.lower() in {".pem", ".key", ".p12", ".pfx", ".pyc"}
-    )
+        or path.suffix.lower() in PRIVATE_SUFFIXES
+    ):
+        return True
+    if name in RELEASE_FILES:
+        return False
+    if path.suffix.lower() in DOCUMENT_SUFFIXES:
+        return True
+    if any(name == prefix or name.startswith(prefix + "/") for prefix in DEVELOPMENT_PATHS):
+        return True
+    return not any(name.startswith(prefix + "/") for prefix in RUNTIME_TREES)
+
+
+def release_attributes() -> str:
+    """Render the matching policy for git archive and GitHub source downloads."""
+    lines = [
+        "# Auto detect text files and perform LF normalization",
+        "* text=auto",
+        "*.bat text eol=crlf",
+        "",
+        "# Application source exports only. The private checkout keeps development files.",
+        "# Generated from scripts/build_release.py; regression tests enforce parity.",
+        "* export-ignore",
+    ]
+    directories: set[str] = set()
+    for name in RELEASE_FILES | set(RUNTIME_TREES):
+        directories.update(str(parent) for parent in PurePosixPath(name).parents if str(parent) != ".")
+    directories.update(RUNTIME_TREES)
+    for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
+        lines.append(f"/{directory} -export-ignore")
+    for directory in RUNTIME_TREES:
+        lines.append(f"/{directory}/** -export-ignore")
+    for name in DEVELOPMENT_PATHS:
+        lines.append(f"/{name} export-ignore")
+    # Excluding the directory itself would prevent archive from visiting the
+    # exact production dependencies that are re-included below.
+    lines.append("/backend/evaluation -export-ignore")
+    lines.append("/backend/evaluation/** export-ignore")
+    for suffix in sorted(DOCUMENT_SUFFIXES):
+        pattern = "".join(
+            f"[{char.lower()}{char.upper()}]" if char.isalpha() else char
+            for char in suffix
+        )
+        lines.append(f"*{pattern} export-ignore")
+    for name in sorted(RELEASE_FILES):
+        lines.append(f"/{name} -export-ignore")
+    for part in sorted(EXCLUDED_PARTS):
+        lines.extend((f"{part} export-ignore", f"**/{part}/** export-ignore"))
+    for name in sorted(PRIVATE_NAMES):
+        lines.append(f"{name} export-ignore")
+    lines.extend((".env export-ignore", ".env.* export-ignore"))
+    for suffix in sorted(PRIVATE_SUFFIXES):
+        pattern = "".join(
+            f"[{char.lower()}{char.upper()}]" if char.isalpha() else char
+            for char in suffix
+        )
+        lines.append(f"*{pattern} export-ignore")
+    return "\n".join(lines) + "\n"
+
+
+def validate_document_links(documents: dict[str, bytes], included: set[str]) -> None:
+    """Reject local Markdown links whose targets would be missing from the package."""
+    for name, data in documents.items():
+        content = data.decode("utf-8-sig")
+        for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", content):
+            link = urlsplit(target.strip("<>"))
+            if link.scheme or link.netloc or not link.path:
+                continue
+            resolved = posixpath.normpath(
+                posixpath.join(str(PurePosixPath(name).parent), unquote(link.path))
+            )
+            if resolved not in included:
+                raise ValueError(f"Public document link is outside the release: {name} -> {resolved}")
 
 
 def build_release(root: Path, output_dir: Path, ref: str = "HEAD", *, preview: bool = False) -> dict[str, object]:
@@ -62,13 +169,13 @@ def build_release(root: Path, output_dir: Path, ref: str = "HEAD", *, preview: b
         meta, raw_name = record.split(b"\t", 1)
         mode, kind, oid = meta.decode("ascii").split()
         name = raw_name.decode("utf-8")
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            raise ValueError(f"Release source cannot contain symlinks or submodules: {name}")
         if excluded_path(name):
             excluded.append(name)
             continue
-        if kind != "blob" or mode not in {"100644", "100755"}:
-            raise ValueError(f"Release source cannot contain symlinks or submodules: {name}")
         files[name] = (mode, oid)
-    required = REQUIRED_FILES - {"LICENSE"} if preview else REQUIRED_FILES
+    required = REQUIRED_FILES if preview else REQUIRED_FILES | {"LICENSE"}
     missing = required - files.keys()
     if missing:
         raise ValueError(f"Missing release inputs: {', '.join(sorted(missing))}")
@@ -76,6 +183,12 @@ def build_release(root: Path, output_dir: Path, ref: str = "HEAD", *, preview: b
     lock = json.loads(_git(root, "show", f"{commit}:frontend/package-lock.json"))
     if package["version"] != version or lock["version"] != version:
         raise ValueError("VERSION and frontend package versions differ")
+    documents = {
+        name: _git(root, "cat-file", "blob", oid)
+        for name, (_mode, oid) in files.items()
+        if PurePosixPath(name).suffix.lower() in DOCUMENT_SUFFIXES
+    }
+    validate_document_links(documents, set(files))
     epoch = int(_git(root, "show", "-s", "--format=%ct", commit))
     stamp = time.gmtime(max(315532800, min(epoch, 4354819198)))[:6]
     prefix = f"novel-g-{version}"
@@ -89,7 +202,8 @@ def build_release(root: Path, output_dir: Path, ref: str = "HEAD", *, preview: b
         "format": "novel-g-source-release", "version": version, "commit": commit,
         "distribution": "private-review" if preview else "source-release",
         "license": package.get("license", "UNCONFIRMED"),
-        "source_epoch": epoch, "excluded": sorted(excluded), "files": {},
+        "source_epoch": epoch, "content_profile": "application-source-v1",
+        "excluded_file_count": len(excluded), "files": {},
     }
     temporary = archive.with_suffix(".zip.tmp")
     try:
