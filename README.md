@@ -6,7 +6,7 @@
 
 Novels and reference material live in your configured MongoDB database. Manual writing requires no model API key. You choose and configure the providers used for AI features.
 
-[Features](#features) · [Quick start](#quick-start) · [User guide](docs/user-guide.zh-CN.md) · [Troubleshooting](docs/troubleshooting.zh-CN.md) · [License and origin](#license-and-origin)
+[Features](#features) · [Screenshots](#screenshots) · [Quick start](#quick-start) · [User guide](docs/user-guide.zh-CN.md) · [Troubleshooting](docs/troubleshooting.zh-CN.md) · [License and origin](#license-and-origin)
 
 The current source version is [0.1.0-rc.3](VERSION), a prerelease. The installation workflow targets Windows, with local and trusted LAN use described below.
 
@@ -23,6 +23,28 @@ The current source version is [0.1.0-rc.3](VERSION), a prerelease. The installat
 | Illustrations and covers | Covers, character portraits, and scene illustrations through compatible image APIs or ComfyUI workflows |
 
 The writing workflow covers **idea → story direction → world references → volume outline → chapter outline → prose → state updates**. Start from a blank project, AI inspiration, or imported character cards.
+
+## Screenshots
+
+The screenshots use fictional novels and example model settings.
+
+### Bookshelf
+
+Browse your novels, check writing progress, and return to your current chapter.
+
+![Bookshelf with four example novels and a continue-writing shortcut](frontend/public/readme/bookshelf-en.png)
+
+### Chapter workspace
+
+Keep the volume and chapter list, prose editor, and AI assistance together while writing.
+
+![Chapter workspace with the chapter list, prose editor, and AI assistant](frontend/public/readme/writing-en.png)
+
+### Workflow settings
+
+Choose the model and generation settings for each workflow step.
+
+![Workflow settings showing model selection and parameters for two generation steps](frontend/public/readme/workflow-settings-en.png)
 
 ## Quick start
 
