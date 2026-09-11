@@ -1,0 +1,131 @@
+name: Verify public source
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NOVEL_G_RUN_PROVIDER_SMOKE: '0'
+      NEXT_TELEMETRY_DISABLED: '1'
+      PYTHONUTF8: '1'
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Check public source and history boundaries
+        run: |
+          python - <<'PY'
+          from pathlib import Path, PurePosixPath
+          import json
+          import subprocess
+          from scripts.build_release import (
+              DOCUMENT_SUFFIXES, REQUIRED_FILES, excluded_path,
+              release_attributes, validate_document_links,
+          )
+          def git(*args):
+              return subprocess.check_output(['git', *args])
+          metadata = {'.github/workflows/source-checks.yml'}
+          def inspect_tree(commit):
+              paths = set()
+              for entry in git('ls-tree', '-r', '-z', commit).split(b'\0'):
+                  if not entry:
+                      continue
+                  attributes, raw_name = entry.split(b'\t', 1)
+                  mode, kind, _ = attributes.decode('ascii').split()
+                  name = raw_name.decode('utf-8')
+                  if kind != 'blob' or mode not in {'100644', '100755'}:
+                      raise SystemExit('Unsupported object in public source')
+                  if any(ord(char) < 32 for char in name):
+                      raise SystemExit('Invalid public source path')
+                  if excluded_path(name) and name not in metadata:
+                      raise SystemExit('Internal content found in public history')
+                  paths.add(name)
+              return paths
+          commits = git('rev-list', '--all').decode().splitlines()
+          for commit in commits:
+              inspect_tree(commit)
+          included = {name for name in inspect_tree('HEAD') if not excluded_path(name)}
+          if not (REQUIRED_FILES | {'LICENSE'}).issubset(included):
+              raise SystemExit('Required source file is missing')
+          if Path('.gitattributes').read_text(encoding='utf-8') != release_attributes():
+              raise SystemExit('Archive policy does not match source policy')
+          documents = {
+              name: Path(name).read_bytes() for name in included
+              if PurePosixPath(name).suffix.lower() in DOCUMENT_SUFFIXES
+          }
+          validate_document_links(documents, included)
+          package = json.loads(Path('frontend/package.json').read_text(encoding='utf-8'))
+          lock = json.loads(Path('frontend/package-lock.json').read_text(encoding='utf-8'))
+          licenses = (package['license'], lock['license'], lock['packages']['']['license'])
+          if set(licenses) != {'AGPL-3.0-only'}:
+              raise SystemExit('Project license metadata is inconsistent')
+          print(f'Public source validated: {len(included)} files, {len(commits)} commits')
+          PY
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip==26.2.1
+          .venv/bin/python -m pip install -r requirements.txt
+          npm ci --prefix frontend
+      - name: Compile and import backend
+        run: |
+          .venv/bin/python -m compileall -q backend scripts main.py launcher.py
+          .venv/bin/python -c "import main; import backend.db.repositories.generation_job_repository; import backend.evaluation.required_book_successor_acceptance_outline"
+      - name: Lint and build frontend
+        run: |
+          npm run lint --prefix frontend
+          npm run build --prefix frontend
+      - name: Check runtime requirements
+        run: .venv/bin/python -m backend.preflight
+      - name: Audit dependencies
+        run: |
+          npm audit --prefix frontend --audit-level=low
+          python -m venv reports/audit-env
+          reports/audit-env/bin/python -m pip install pip-audit==2.10.1
+          reports/audit-env/bin/python -m pip_audit --path .venv/lib/python3.12/site-packages
+      - name: Scan public history for credentials
+        run: |
+          mkdir -p reports/gitleaks
+          curl --fail --location --silent --show-error https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o reports/gitleaks/gitleaks.tar.gz
+          curl --fail --location --silent --show-error https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt -o reports/gitleaks/checksums.txt
+          expected=$(grep ' gitleaks_8.30.1_linux_x64.tar.gz$' reports/gitleaks/checksums.txt | cut -d ' ' -f 1)
+          test -n "$expected"
+          echo "$expected  reports/gitleaks/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf reports/gitleaks/gitleaks.tar.gz -C reports/gitleaks
+          reports/gitleaks/gitleaks git . --log-opts=--all --ignore-gitleaks-allow --redact=100 --no-banner
+      - name: Build source archive
+        run: .venv/bin/python scripts/build_release.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success()
+        with:
+          name: source-${{ github.sha }}
+          path: dist/*
+          retention-days: 14

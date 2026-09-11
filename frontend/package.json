@@ -8,9 +8,7 @@
     "build": "next build",
     "start": "next start --hostname 127.0.0.1",
     "start:lan": "next start --hostname 0.0.0.0",
-    "lint": "eslint",
-    "test": "node --experimental-strip-types --test tests/*.test.mjs",
-    "test:e2e": "playwright test"
+    "lint": "eslint"
   },
   "dependencies": {
     "@heroui/react": "^3.0.1",
