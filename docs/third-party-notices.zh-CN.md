@@ -18,4 +18,4 @@ Novel-G 采用 [GNU AGPL v3.0](../LICENSE)（`AGPL-3.0-only`）。LICENSE 文本
 
 主要 Python 依赖包括 FastAPI / Pydantic / PyYAML / AnyIO / pytest（MIT）、Uvicorn / httpx（BSD-3-Clause）、OpenAI SDK / Google GenAI SDK / PyMongo / python-multipart（Apache-2.0）、CustomTkinter（其包内许可）等；确切版本见 `requirements.txt`。前端依赖及各包声明的许可记录在 `frontend/package-lock.json`。
 
-后续若制作捆绑运行环境的离线包，应另行收集全部直接与间接依赖的许可证、版权及原生库通知；本次源码安装包不作该捆绑。
+源码包不捆绑运行环境。[Windows 桌面预览版](windows-desktop.zh-CN.md)另行随附运行时及第三方通知，并在同一 Release 提供应用与 MongoDB 对应源码；各组件继续遵循各自许可。

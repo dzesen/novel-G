@@ -301,6 +301,7 @@ export function newImageProviderConfig(
 }
 
 export interface AppConfig {
+  desktop_managed?: boolean;
   config_version?: number;
   mongodb_url: string;
   mongo_database_name: string;
@@ -850,9 +851,15 @@ export function buildConfigPatch(
       return [alias, editable];
     }),
   );
+  const editableConfig: Record<string, unknown> = { ...config };
+  delete editableConfig.desktop_managed;
+  if (config.desktop_managed) {
+    delete editableConfig.mongodb_url;
+    delete editableConfig.mongo_database_name;
+  }
   return {
     changes: {
-      ...config,
+      ...editableConfig,
       llm: { ...config.llm, providers },
       image_providers: { ...config.image_providers, providers: imageProviders },
     },

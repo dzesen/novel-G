@@ -27,6 +27,7 @@ PRIVATE_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx", ".pyc"})
 DOCUMENT_SUFFIXES = frozenset({".md", ".markdown", ".rst"})
 PUBLIC_DOCUMENTS = frozenset({
     "docs/source-release.zh-CN.md",
+    "docs/windows-desktop.zh-CN.md",
     "docs/user-guide.zh-CN.md",
     "docs/troubleshooting.zh-CN.md",
     "docs/known-limitations.zh-CN.md",
@@ -51,13 +52,37 @@ RUNTIME_EVALUATION_FILES = frozenset({
     "backend/evaluation/required_book_successor_judge_probe_execution.py",
     "backend/evaluation/required_book_successor_judge_probe_store.py",
 })
+DESKTOP_RELEASE_FILES = frozenset({
+    "desktop/licenses/WebView2-Fixed-License.txt",
+    "desktop/licenses/installer-license.txt",
+    'desktop/NovelG.Desktop/App.xaml',
+    'desktop/NovelG.Desktop/App.xaml.cs',
+    'desktop/NovelG.Desktop/DesktopController.cs',
+    'desktop/NovelG.Desktop/DesktopOptions.cs',
+    'desktop/NovelG.Desktop/MainWindow.xaml',
+    'desktop/NovelG.Desktop/MainWindow.xaml.cs',
+    'desktop/NovelG.Desktop/NovelG.Desktop.csproj',
+    'desktop/NovelG.Desktop/OriginPolicy.cs',
+    'desktop/NovelG.Desktop/RuntimeManifest.cs',
+    'desktop/NovelG.Desktop/UiText.cs',
+    'desktop/NovelG.Desktop/app.manifest',
+    'desktop/NovelG.Desktop/packages.lock.json',
+    'desktop/backend.spec',
+    'desktop/build.ps1',
+    'desktop/collect_notices.py',
+    'desktop/fetch_runtime.py',
+    'desktop/installer.iss',
+    'desktop/prepare_frontend.py',
+    'desktop/runtime-lock.json',
+    'desktop/stage_runtime.py',
+})
 RELEASE_FILES = frozenset({
     ".gitattributes", ".gitignore", "VERSION", "LICENSE", "README.md", "README.zh-CN.md",
     "requirements.txt", "setup.bat", "start.bat", "launcher.py", "main.py",
     "frontend/.gitignore", "frontend/package.json", "frontend/package-lock.json",
     "frontend/next.config.ts", "frontend/tsconfig.json", "frontend/postcss.config.mjs",
     "frontend/eslint.config.mjs", "scripts/build_release.py", "scripts/install_local.py",
-}) | PUBLIC_DOCUMENTS | RUNTIME_EVALUATION_FILES
+}) | PUBLIC_DOCUMENTS | RUNTIME_EVALUATION_FILES | DESKTOP_RELEASE_FILES
 RUNTIME_TREES = ("backend", "frontend/src", "frontend/public")
 DEVELOPMENT_PATHS = ("backend/evaluation", "backend/verification.py")
 REQUIRED_FILES = (RELEASE_FILES - {"LICENSE"}) | {

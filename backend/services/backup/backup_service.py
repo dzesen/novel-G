@@ -62,6 +62,7 @@ from backend.db.collections import (
     WORLDBOOK,
 )
 from backend.db.mongo import get_database
+from backend.runtime_paths import desktop_data_root
 from backend.db.remediation_receipts import (
     InvalidRemediationReceiptPointer,
     parse_remediation_receipt_pointer,
@@ -257,7 +258,7 @@ def get_backup_directory(*, create: bool = True) -> Path:
     raw_directory = str(settings.get("directory", "backups")).strip() or "backups"
     path = Path(raw_directory)
     if not path.is_absolute():
-        path = Path.cwd() / path
+        path = (desktop_data_root() or Path.cwd()) / path
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path.resolve()

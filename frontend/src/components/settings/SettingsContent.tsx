@@ -206,7 +206,7 @@ export default function SettingsContent({
     }
 
     const hasMongo =
-      config.mongodb_url !== undefined || config.mongo_database_name !== undefined;
+      !config.desktop_managed && (config.mongodb_url !== undefined || config.mongo_database_name !== undefined);
     const msg = hasMongo ? t("saveSuccessMongo") : t("saveSuccess");
     await saveConfig(config, msg, {
       confirmProviderDeletion: (preview) => {

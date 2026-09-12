@@ -6,10 +6,10 @@ const ALIAS_REGEX = /^[a-zA-Z0-9_]+$/;
 
 export function validateConfig(config: AppConfig, t: TFunc): string | null {
   // Database fields
-  if (!config.mongodb_url?.trim()) {
+  if (!config.desktop_managed && !config.mongodb_url?.trim()) {
     return t("database.required") + ": mongodb_url";
   }
-  if (!config.mongo_database_name?.trim()) {
+  if (!config.desktop_managed && !config.mongo_database_name?.trim()) {
     return t("database.required") + ": mongo_database_name";
   }
   if (config.mongo_timeout_ms < 0) {

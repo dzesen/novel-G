@@ -234,6 +234,7 @@
       }
     },
     "database": {
+      "desktopManaged": "数据库由桌面版自动管理，无需配置连接地址。小说保存在本机数据目录。",
       "title": "数据库配置",
       "mongodbUrl": "MongoDB 连接地址",
       "mongodbUrlPlaceholder": "mongodb://localhost:27017",

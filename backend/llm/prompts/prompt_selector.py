@@ -24,6 +24,8 @@ from backend.scene_contract_versions import (
 )
 from backend.state_fact_contract_versions import STATE_FACT_EVIDENCE_VERSION
 
+from backend.runtime_paths import data_path, desktop_data_root
+
 PROMPT_DIR = Path(__file__).resolve().parent
 CUSTOM_PROMPT_FILENAME = "prompt.yaml"
 DEFAULT_PROMPT_FILENAME = "prompt_default.yaml"
@@ -477,9 +479,13 @@ def resolve_prompt_selection(prompt_dir: Path | None = None, *, emit_warning: bo
     Raises:
         PromptConfigError: 默认提示词文件不可读取或自身校验失败时抛出。
     """
+    use_desktop_custom = prompt_dir is None and desktop_data_root() is not None
     prompt_dir = Path(prompt_dir or PROMPT_DIR)
     default_path = prompt_dir / DEFAULT_PROMPT_FILENAME
-    custom_path = prompt_dir / CUSTOM_PROMPT_FILENAME
+    custom_path = (
+        data_path("backend", "llm", "prompts", CUSTOM_PROMPT_FILENAME)
+        if use_desktop_custom else prompt_dir / CUSTOM_PROMPT_FILENAME
+    )
 
     default_data = _read_yaml_mapping(default_path)
     validate_prompt_data(default_data, source_path=default_path)

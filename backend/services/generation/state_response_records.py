@@ -14,7 +14,9 @@ from backend.services.generation.judge_review_records import configured_secrets,
 from backend.services.llm.generation_runtime import StructuredVisibleResponse
 
 
-STATE_RESPONSE_RECORD_ROOT = Path(__file__).resolve().parents[3] / "reports" / "diagnostics" / "state-responses"
+from backend.runtime_paths import data_path
+
+STATE_RESPONSE_RECORD_ROOT = data_path("reports", "diagnostics", "state-responses")
 STATE_RESPONSE_RECORD_MAX_BYTES = 1_048_576
 logger = logging.getLogger(__name__)
 

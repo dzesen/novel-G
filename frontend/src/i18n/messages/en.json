@@ -234,6 +234,7 @@
       }
     },
     "database": {
+      "desktopManaged": "The desktop app manages the database connection. Your novels stay in the local data folder.",
       "title": "Database Configuration",
       "mongodbUrl": "MongoDB URL",
       "mongodbUrlPlaceholder": "mongodb://localhost:27017",

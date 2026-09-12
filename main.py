@@ -127,8 +127,11 @@ app.add_middleware(
 # Register routes
 import os
 
-os.makedirs("static/covers", exist_ok=True)
-app.mount("/static/covers", StaticFiles(directory="static/covers"), name="static_covers")
+from backend.runtime_paths import data_path
+
+COVER_DIRECTORY = data_path("static", "covers")
+COVER_DIRECTORY.mkdir(parents=True, exist_ok=True)
+app.mount("/static/covers", StaticFiles(directory=str(COVER_DIRECTORY)), name="static_covers")
 
 app.include_router(auth_router)
 app.include_router(agent_router)

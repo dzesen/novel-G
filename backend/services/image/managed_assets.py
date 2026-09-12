@@ -44,9 +44,9 @@ from backend.services.image.illustration_lineage import (
 )
 
 
-MANAGED_IMAGE_ASSET_ROOT = (
-    Path(__file__).resolve().parents[3] / "managed-assets" / "images"
-)
+from backend.runtime_paths import data_path
+
+MANAGED_IMAGE_ASSET_ROOT = data_path("managed-assets", "images")
 _CONTENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _ASSET_FILENAME_PATTERN = re.compile(
     r"^(?P<content_hash>[0-9a-f]{64})(?P<extension>\.(?:png|jpg|gif|webp))$"

@@ -16,8 +16,10 @@ from backend.config.image_providers import (
 )
 from backend.config.workflow_catalog import WORKFLOW_STEPS
 
-CONFIG_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = CONFIG_DIR / "config_default.yaml"
+from backend.runtime_paths import data_path, desktop_data_root, resource_path
+
+CONFIG_DIR = data_path("backend", "config")
+DEFAULT_CONFIG_PATH = resource_path("backend", "config", "config_default.yaml")
 CONFIG_PATH = CONFIG_DIR / "config.yaml"
 
 _FALLBACK_DEFAULT_CONFIG: Dict[str, Any] = {
@@ -770,6 +772,8 @@ def ensure_config_files() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     if not DEFAULT_CONFIG_PATH.exists():
+        if desktop_data_root() is not None:
+            raise FileNotFoundError("Desktop package is missing the default configuration")
         _write_yaml(DEFAULT_CONFIG_PATH, _FALLBACK_DEFAULT_CONFIG)
 
     if not CONFIG_PATH.exists():

@@ -12,7 +12,9 @@ router = APIRouter(
     dependencies=[Depends(require_authenticated_request)],
 )
 
-COVER_DIR = "static/covers"
+from backend.runtime_paths import data_path
+
+COVER_DIR = str(data_path("static", "covers"))
 MAX_COVER_BYTES = 2 * 1024 * 1024
 os.makedirs(COVER_DIR, exist_ok=True)
 

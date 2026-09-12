@@ -29,3 +29,7 @@ PUBLIC_RELEASE.md
 *.p12
 *.pfx
 /config.json
+
+# Windows desktop build outputs
+/desktop/**/bin/
+/desktop/**/obj/

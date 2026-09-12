@@ -11,10 +11,11 @@ from functools import wraps
 from pathlib import Path
 
 from backend.config.config import get_config_value
+from backend.runtime_paths import data_path
 
 # Task identity matters: create_task copies ContextVars but must not inherit a held lock.
 _ACCESS: ContextVar[tuple | None] = ContextVar("database_access", default=None)
-_LOCK_DIRECTORY = Path(__file__).resolve().parents[2] / "reports" / "database-locks"
+_LOCK_DIRECTORY = data_path("reports", "database-locks")
 
 
 def database_key(database_name: str | None = None) -> str:

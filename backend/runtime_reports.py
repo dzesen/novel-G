@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+from backend.runtime_paths import data_root
+
+ROOT_DIR = data_root()
 REPORTS_DIR = ROOT_DIR / "reports"
 
 

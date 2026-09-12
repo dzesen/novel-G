@@ -1,5 +1,23 @@
 const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "");
 
+declare global {
+  interface Window {
+    __NOVEL_G_DESKTOP__?: Readonly<{ apiBase: string }>;
+  }
+}
+
+export function getDesktopApiBase(): string | null {
+  if (typeof window === "undefined" || window.location.protocol !== "http:" || window.location.hostname !== "127.0.0.1") return null;
+  const value = window.__NOVEL_G_DESKTOP__?.apiBase;
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    const port = Number(url.port);
+    if (url.protocol === "http:" && url.hostname === "127.0.0.1" && port >= 1024 && port <= 65535 && !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash) return url.origin;
+  } catch { /* An invalid host hint must not change API routing. */ }
+  return null;
+}
+
 interface ApiAuthHooks {
   getCsrfToken: () => string | null;
   onUnauthorized: () => void;
@@ -27,6 +45,8 @@ export function configureApiAuth(hooks: ApiAuthHooks): void {
 }
 
 export function getApiBase(): string {
+  const desktopBase = getDesktopApiBase();
+  if (desktopBase) return desktopBase;
   if (CONFIGURED_API_BASE) return CONFIGURED_API_BASE;
   if (typeof window !== "undefined") {
     return `${window.location.protocol}//${window.location.hostname}:8000`;

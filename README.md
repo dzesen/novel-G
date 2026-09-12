@@ -10,6 +10,8 @@ Novels and reference material live in your configured MongoDB database. Manual w
 
 The current source version is [0.1.0-rc.3](VERSION), a prerelease. The installation workflow targets Windows, with local and trusted LAN use described below.
 
+**Windows desktop preview**: [Download the complete installer](https://github.com/dzesen/novel-G/releases/tag/desktop-v0.1.0-preview.1) · [Installation and data guide](docs/windows-desktop.zh-CN.md). Database included; Microsoft VC++ x64 Runtime is a prerequisite. Unsigned preview; tested on Windows 10, Windows 11 validation pending.
+
 ## Features
 
 | Feature | What it provides |

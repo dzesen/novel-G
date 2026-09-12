@@ -507,6 +507,10 @@ def _provider_issues(raw_config: dict[str, Any]) -> list[ConfigIssue]:
 
 def _redact_config(raw_config: dict[str, Any]) -> dict[str, Any]:
     redacted = deepcopy(raw_config)
+    if "_desktop_runtime" in redacted:
+        redacted.pop("_desktop_runtime", None)
+        redacted.pop("mongodb_url", None)
+        redacted["desktop_managed"] = True
     providers = redacted.get("llm", {}).get("providers", {})
     if isinstance(providers, dict):
         for provider in providers.values():
@@ -526,6 +530,13 @@ def _redact_config(raw_config: dict[str, Any]) -> dict[str, Any]:
             else:
                 provider.pop("has_api_key", None)
     return redacted
+
+
+def _guard_desktop_runtime_patch(raw_config: dict[str, Any], changes: dict[str, Any]) -> None:
+    if {"_desktop_runtime", "desktop_managed"}.intersection(changes):
+        raise ValueError("Desktop runtime settings cannot be edited through the configuration API")
+    if "_desktop_runtime" in raw_config and {"mongodb_url", "mongo_database_name"}.intersection(changes):
+        raise ValueError("The desktop application manages its database connection")
 
 
 def _merge_patch(
@@ -1118,6 +1129,7 @@ class ConfigLifecycle:
     def preview(self, request: ConfigPatch) -> ConfigChangePreview:
         with self._lock:
             before = self._store.read()
+            _guard_desktop_runtime_patch(before, request.changes)
             current_view = self.get_view()
             if request.expected_revision != current_view.revision:
                 raise ConfigConflictError("Configuration revision is stale; reload before saving")
@@ -1323,6 +1335,7 @@ class ConfigLifecycle:
             before = self._store.read()
             current_view = self.get_view()
             secret_state_before = self._secret_store.snapshot_state()
+            _guard_desktop_runtime_patch(before, request.changes)
             if request.expected_revision != current_view.revision:
                 raise ConfigConflictError("Configuration revision is stale; reload before saving")
             if _contains_forbidden_secret_field(request.changes):
