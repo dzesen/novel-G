@@ -1,10 +1,16 @@
 # Windows 桌面预览版
 
-版本 `0.1.0-preview.1`，发布日期 2026-09-12。采用 WPF + WebView2，包含 Python 后端、Node.js 前端和独立 MongoDB 数据库。
+版本 `0.1.0-preview.2`，发布日期 2026-09-14。采用 WPF + WebView2，包含 Python 后端、Node.js 前端和独立 MongoDB 数据库。
+
+## 本次更新
+
+- 修复书库更新时间显示为 `Invalid Date`，恢复按更新时间排序。
+- 创意定向默认输出上限从 4,096 调整到 16,384 token；手动指定的上限仍优先。
+- 蓝图结构化输出修复失败时提供可操作的错误说明；不会自动扩大用户已授权的调用范围。
 
 ## 下载与安装
 
-从 [GitHub Release](https://github.com/dzesen/novel-G/releases/tag/desktop-v0.1.0-preview.1) 下载 `Novel-G-Desktop-0.1.0-preview.1-win-x64-setup.exe`。安装包内置 Python、Node.js、MongoDB、.NET 和 WebView2。系统须预先安装 Microsoft Visual C++ x64 运行库 14.51.36247 或更新版本；本包不额外捆绑 VC++，也不安装 Visual Studio。缺少该依赖时，安装器会提示并可打开[微软官方下载说明](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)，安装运行库后重新运行本安装包。已具备运行库的电脑可离线安装 Novel-G。`SHA256SUMS.txt` 用于核对附件完整性。
+从 [GitHub Release](https://github.com/dzesen/novel-G/releases/tag/desktop-v0.1.0-preview.2) 下载 `Novel-G-Desktop-0.1.0-preview.2-win-x64-setup.exe`。安装包内置 Python、Node.js、MongoDB、.NET 和 WebView2。系统须预先安装 Microsoft Visual C++ x64 运行库 14.51.36247 或更新版本；本包不额外捆绑 VC++，也不安装 Visual Studio。缺少该依赖时，安装器会提示并可打开[微软官方下载说明](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)，安装运行库后重新运行本安装包。已具备运行库的电脑可离线安装 Novel-G。`SHA256SUMS.txt` 用于核对附件完整性。
 
 运行安装包，完成后打开 Novel-G，点击“全部启动”。首次进入工作台创建本机管理员。手动建书和写作不需要模型 API Key；AI 功能和 ComfyUI 由用户自行配置，模型权重不包含在包内。
 

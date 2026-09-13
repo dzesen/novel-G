@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -10,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.api.default_routers.agent_router import get_agent_catalog
 from backend.api.default_routers.auth_router import require_authenticated_request
 from backend.db.errors import InvalidIdError, NotFoundError
+from backend.llm.exceptions import LLMStructuredRepairError
 from backend.services.auth.identity_service import Actor
 from backend.services.auth.novel_access_service import (
     NovelAccessService,
@@ -36,6 +38,9 @@ from backend.services.llm.agent_catalog import AgentCatalog
 from backend.services.llm.agent_context import StaleAgentContext
 from backend.services.llm.agent_run import AgentRunStore, agent_run_store
 from backend.services.llm.capability_registry import CapabilityCall
+from backend.services.llm.generation_runtime import (
+    safe_structured_repair_failure_diagnostics,
+)
 
 
 router = APIRouter(
@@ -73,6 +78,25 @@ async def generate_creative_direction(
         return execution.value.model_dump()
     except HTTPException:
         raise
+    except LLMStructuredRepairError as exc:
+        diagnostics = safe_structured_repair_failure_diagnostics(exc.diagnostics)
+        truncated = bool(diagnostics and diagnostics.get("repair_finish_reason") == "length")
+        logger.warning(
+            "[creative_director] structured output failed agent_id=%s diagnostics=%s",
+            request.agent_id, json.dumps(diagnostics, ensure_ascii=True),
+        )
+        raise HTTPException(status_code=502, detail={
+            "code": "creative_direction_truncated" if truncated else "creative_direction_invalid",
+            "message": (
+                "创意定向达到输出上限而被截断，修正后仍未完整返回。"
+                "请在高级参数中提高最大输出 token，或使用输出更精简的模型后重新生成。"
+                "本次未创建小说，重试会产生新的模型调用。"
+                if truncated else
+                "创意定向输出未通过格式校验，同一模型修正一次后仍不符合要求。"
+                "可调整补充要求或模型后重新生成。本次未创建小说，重试会产生新的模型调用。"
+            ),
+            "diagnostics": diagnostics,
+        }) from exc
     except (
         CardImportProposalError,
         StaleCardImportProposal,

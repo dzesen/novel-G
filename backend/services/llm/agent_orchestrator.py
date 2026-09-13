@@ -172,8 +172,8 @@ _AGENT_PROFILES: tuple[AgentProfile, ...] = (
             "不得替用户确认方向，或把候选描述成已保存的小说事实。"
         ),
         capabilities=("novel_direction",),
-        version=2,
-        generation_params={"temperature": 0.85, "max_tokens": 4096},
+        version=3,
+        generation_params={"temperature": 0.85, "max_tokens": 16384},
     ),
     AgentProfile(
         agent_id="creative_inspiration",

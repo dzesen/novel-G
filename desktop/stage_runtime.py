@@ -34,7 +34,7 @@ def stage(output: Path, toolchain: Path, build: Path, frontend: Path):
         shutil.copy2(node / name, output / "node" / name)
     shutil.copy2(ROOT / "LICENSE", output / "LICENSE.txt")
     shutil.copy2(ROOT / "desktop/runtime-lock.json", output / "runtime-lock.json")
-    manifest = {"schema_version":1, "version":"0.1.0-preview.1", "backend":"backend/novel-g-service.exe",
+    manifest = {"schema_version":1, "version":"0.1.0-preview.2", "backend":"backend/novel-g-service.exe",
                 "node":"node/node.exe", "frontend":"frontend/server.js", "mongodb":"mongodb/bin/mongod.exe", "webview2":"webview2"}
     (output / "desktop-runtime.json").write_text(json.dumps(manifest, indent=2))
     forbidden = {"config.yaml", "config.yaml.bak", "prompt.yaml", ".config-secret-versions.json"}

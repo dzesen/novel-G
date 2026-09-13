@@ -8,7 +8,7 @@
 [Setup]
 AppId={{3985130B-3D70-4184-AF92-3B633FCA6D39}
 AppName=Novel-G Desktop Preview
-AppVersion=0.1.0
+AppVersion=0.1.0-preview.2
 AppPublisher=Novel-G
 DefaultDirName={localappdata}\Programs\Novel-G
 DefaultGroupName=Novel-G
@@ -18,7 +18,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.19045
 OutputDir={#OutputPath}
-OutputBaseFilename=Novel-G-Desktop-0.1.0-preview.1-win-x64-setup
+OutputBaseFilename=Novel-G-Desktop-0.1.0-preview.2-win-x64-setup
 Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern
