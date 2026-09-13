@@ -121,6 +121,8 @@ def release_attributes() -> str:
         "# Auto detect text files and perform LF normalization",
         "* text=auto",
         "*.bat text eol=crlf",
+        "# Preserve the upstream fixture bytes used by the interop checksum regression.",
+        "/tests/fixtures/interop/quixiai-hexis-tars-v2.json -text",
         "",
         "# Application source exports only. The private checkout keeps development files.",
         "# Generated from scripts/build_release.py; regression tests enforce parity.",

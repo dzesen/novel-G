@@ -52,6 +52,7 @@ class NovelRepository(BaseRepository):
             projection={"_id": 1, "title": 1, "subtitle": 1, 
                         "genre": 1, "status": 1, "tags": 1, 
                         "cover_image": 1, "cover_asset_id": 1,
+                        "created_at": 1, "updated_at": 1,
                         "current_chapter_count": 1, "current_word_count": 1
                     }
         )
@@ -64,6 +65,7 @@ class NovelRepository(BaseRepository):
             projection={"_id": 1, "title": 1, "subtitle": 1,
                         "genre": 1, "status": 1, "tags": 1,
                         "cover_image": 1, "cover_asset_id": 1,
+                        "created_at": 1, "updated_at": 1,
                         "current_chapter_count": 1, "current_word_count": 1,
                         "deleted_at": 1
                     }

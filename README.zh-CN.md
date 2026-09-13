@@ -10,7 +10,7 @@
 
 当前源码版本为 [0.1.0-rc.3](VERSION)，属于预发布版本。安装流程面向 Windows，本机与可信局域网使用方式见下文。
 
-**Windows 桌面版**：[下载完整安装包](https://github.com/dzesen/novel-G/releases/tag/desktop-v0.1.0-preview.1) · [安装与数据说明](docs/windows-desktop.zh-CN.md)。内置数据库，需系统 VC++ x64 运行库；未签名预览版，Windows 10 已实测，Windows 11 待验收。
+**Windows 桌面版**：[下载完整安装包](https://github.com/dzesen/novel-G/releases/tag/desktop-v0.1.0-preview.2) · [安装与数据说明](docs/windows-desktop.zh-CN.md)。内置数据库，需系统 VC++ x64 运行库；未签名预览版，Windows 10 已实测，Windows 11 待验收。
 
 ## 功能概览
 
